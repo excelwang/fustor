@@ -173,6 +173,3 @@ def discover_schema(ctx, source_id, admin_user, admin_password):
         click.echo(f"An unexpected error occurred: {e}", err=True)
         logger.error(f"An unexpected error occurred while discovering schema for '{source_id}': {e}", exc_info=True)
         ctx.exit(1)
-
-if __name__ == "__main__":
-    cli()

@@ -17,8 +17,6 @@ dependencies = [
     "httpx"
 ]
 
-[project.scripts]
-fustor-fusion = "fustor_fusion.cli:cli"
 
 [project.optional-dependencies]
 dev = [

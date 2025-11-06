@@ -243,6 +243,3 @@ def apikey_delete(ctx, id: int):
             except Exception as e:
                 click.echo(f"Error deleting API key: {e}", err=True)
     asyncio.run(_delete())
-
-if __name__ == "__main__":
-    cli()

@@ -12,6 +12,3 @@ def cli():
 def start(host: str, port: int, reload: bool):
     """Starts the Fustor Fusion API server."""
     uvicorn.run("fustor_fusion.main:app", host=host, port=port, reload=reload)
-
-if __name__ == "__main__":
-    cli()

@@ -18,8 +18,6 @@ dependencies = [
     "fustor-pusher-echo"
 ]
 
-[project.scripts]
-fustor-agent = "fustor_agent.cli:cli"
 
 [project.optional-dependencies]
 dev = [
