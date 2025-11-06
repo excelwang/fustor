@@ -10,7 +10,7 @@ async def test_create_datastore_valid(authorized_client):
     payload = {
         "name": "search_db",
     }
-    response = authorized_client.post(base_path, json=payload)
+    response = await authorized_client.post(base_path, json=payload, follow_redirects=True)
     assert response.status_code == 201, response.json()
 
 async def test_create_submitstore_valid(authorized_client):
@@ -31,5 +31,5 @@ async def test_create_submitstore_valid(authorized_client):
             }
         }
     }
-    response = authorized_client.post(base_path, json=payload)
+    response = await authorized_client.post(base_path, json=payload, follow_redirects=True)
     assert response.status_code == 201, response.json()

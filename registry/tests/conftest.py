@@ -8,15 +8,15 @@ from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 from fustor_registry.main import app
-from fustor_registry.db.database import get_db
+from fustor_registry.database import get_db
 from fustor_registry.models import StateBase as Base
-from fustor_registry.models import User, UserLevel
-from fustor_registry.auth.security import pwd_context, create_access_token
+from fustor_registry.models import UserModel as User, UserLevel
+from fustor_registry.security import create_access_token, hash_password
 
 # Use an in-memory SQLite database for testing
 TEST_DATABASE_URL = "sqlite+aiosqlite:///:memory:"
 
-@pytest_asyncio.fixture(scope="session")
+@pytest_asyncio.fixture(scope="function")
 async def test_db_engine():
     engine = create_async_engine(TEST_DATABASE_URL, echo=False)
     async with engine.begin() as conn:
@@ -48,10 +48,10 @@ async def override_get_db(test_db_session):
 
 @pytest_asyncio.fixture(scope="function")
 async def test_admin_user(override_get_db, test_db_session):
-    hashed_password = pwd_context.hash("admin_password")
+    hashed_password = hash_password("admin_password")
     admin_user = User(
         email="admin@example.com",
-        hashed_password=hashed_password,
+        password=hashed_password,
         level=UserLevel.ADMIN,
         name="Admin User"
     )
@@ -61,7 +61,7 @@ async def test_admin_user(override_get_db, test_db_session):
     return admin_user
 
 @pytest_asyncio.fixture(scope="function")
-async def admin_test_client(override_get_db, test_admin_user) -> AsyncClient:
+async def authorized_client(override_get_db, test_admin_user) -> AsyncClient:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         # Log in the admin user to get a token
         login_data = {
@@ -73,4 +73,22 @@ async def admin_test_client(override_get_db, test_admin_user) -> AsyncClient:
         token = response.json()["access_token"]
         
         client.headers["Authorization"] = f"Bearer {token}"
+        yield client
+
+@pytest_asyncio.fixture(scope="function")
+async def test_datastore(authorized_client):
+    payload = {
+        "name": "test_datastore",
+    }
+    response = await authorized_client.post("/v1/datastores", json=payload, follow_redirects=True)
+    assert response.status_code == 201, response.text
+    return response.json()
+
+@pytest_asyncio.fixture(scope="function")
+async def invalid_token():
+    return "invalid_token_string"
+
+@pytest_asyncio.fixture(scope="function")
+async def unauthenticated_client() -> AsyncClient:
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         yield client
