@@ -18,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]
-fustor-fusion = "fustor_fusion.main:app"
+fustor-fusion = "fustor_fusion.cli:cli"
 
 [project.optional-dependencies]
 dev = [

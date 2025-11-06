@@ -24,8 +24,8 @@ async def lifespan(app: FastAPI):
     异步初始化数据库和管理员用户
     """
     try:
-        if not register_config.FUSTOR_REGISTER_DB_URL:
-            print("FUSTOR_REGISTER_DB_URL not set, skipping database initialization.")
+        if not register_config.FUSTOR_REGISTRY_DB_URL:
+            print("FUSTOR_REGISTRY_DB_URL not set, skipping database initialization.")
             yield
             return
 
@@ -47,7 +47,7 @@ async def lifespan(app: FastAPI):
             
             if not admin_user:
                 # 调试日志
-                print(f"正在初始化管理员用户，使用数据库: {register_config.FUSTOR_REGISTER_DB_URL}")
+                print(f"正在初始化管理员用户，使用数据库: {register_config.FUSTOR_REGISTRY_DB_URL}")
                 # 创建admin用户
                 hashed_password = hash_password("admin")
                 

@@ -1,6 +1,6 @@
 import httpx
 from typing import List, Dict, Any
-from ..config import ingestor_config
+from ..config import fusion_config
 from fustor_registry.api.internal.keys_api import InternalDatastoreConfigResponse # Moved import to top
 
 class RegisterServiceClient:
@@ -39,4 +39,4 @@ class RegisterServiceClient:
             print(f"Request error fetching datastore configs: {e}")
             return None
 
-fustor_registry_client = RegisterServiceClient(ingestor_config.FUSTOR_REGISTER_SERVICE_URL)
+fustor_registry_client = RegisterServiceClient(fusion_config.FUSTOR_FUSION_REGISTRY_URL)

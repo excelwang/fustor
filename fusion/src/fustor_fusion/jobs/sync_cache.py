@@ -3,7 +3,7 @@ import logging
 from ..clients.register import fustor_registry_client
 from ..auth.cache import api_key_cache
 from ..auth.datastore_cache import datastore_config_cache
-from ..config import ingestor_config
+from ..config import fusion_config
 from ..runtime_objects import task_manager # CORRECTED IMPORT
 
 logger = logging.getLogger(__name__)

@@ -11,9 +11,10 @@ from .database import get_db
 from .models import UserModel, UserLevel, TokenBlacklistModel
 from .config import register_config
 
-SECRET_KEY = register_config.SECRET_KEY
-ACCESS_TOKEN_EXPIRE_MINUTES = register_config.ACCESS_TOKEN_EXPIRE_MINUTES
-REFRESH_TOKEN_EXPIRE_DAYS = register_config.REFRESH_TOKEN_EXPIRE_DAYS
+SECRET_KEY = register_config.FUSTOR_CORE_SECRET_KEY
+ALGORITHM = register_config.FUSTOR_CORE_JWT_ALGORITHM
+ACCESS_TOKEN_EXPIRE_MINUTES = register_config.FUSTOR_CORE_JWT_ACCESS_TOKEN_EXPIRE_MINUTES
+REFRESH_TOKEN_EXPIRE_DAYS = register_config.FUSTOR_CORE_JWT_REFRESH_TOKEN_EXPIRE_DAYS
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl=f"/v1/auth/login")
 ALGORITHM = "HS256"

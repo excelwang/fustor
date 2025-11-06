@@ -15,7 +15,7 @@ root_logger.setLevel(logging.WARNING)  # Set the desired level
 
 # Create a console handler
 console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
+console_handler.setLevel(logging.DEBUG)
 
 # Create a formatter and set it for the handlers
 formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -28,7 +28,7 @@ root_logger.addHandler(console_handler)
 # logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
 
 # --- Ingestor Service Specific Imports ---
-from .config import ingestor_config
+from .config import fusion_config
 from .auth.cache import api_key_cache
 from .jobs.sync_cache import sync_caches_job
 from .core.session_manager import session_manager
@@ -89,6 +89,7 @@ async def per_datastore_processing_loop(datastore_id: int):
 
 
 logger = logging.getLogger(__name__) # Re-initialize logger after setting levels
+logging.getLogger("fustor_fusion.auth.dependencies").setLevel(logging.DEBUG)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -114,7 +115,7 @@ async def lifespan(app: FastAPI):
     # Schedule periodic cache synchronization
     async def periodic_sync():
         while True:
-            await asyncio.sleep(ingestor_config.API_KEY_CACHE_SYNC_INTERVAL_SECONDS)
+            await asyncio.sleep(fusion_config.API_KEY_CACHE_SYNC_INTERVAL_SECONDS)
             logger.info("Performing periodic cache synchronization...")
             await sync_caches_job() # No need to check return value for periodic sync, just log errors
 

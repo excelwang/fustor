@@ -1,18 +1,26 @@
+from __future__ import annotations
 import os
 import yaml
 import logging
 from typing import Optional
-from dotenv import load_dotenv
+from dotenv import load_dotenv, find_dotenv
 from pydantic import ValidationError
 import tempfile
+from pathlib import Path
 
 from fustor_core.models.config import AppConfig, SourceConfig, PusherConfig, SyncConfig, SourceConfigDict, PusherConfigDict, SyncConfigDict
+# Order of .env loading: ~/.fustor/.env (highest priority), then FUAGENT_CONFIG_DIR/.env (if different), then project root .env
+home_fustor_dir = Path.home() / ".fustor"
+CONFIG_DIR = str(home_fustor_dir)
 
-load_dotenv()
+# Order of .env loading: ~/.fustor/.env (highest priority), then project root .env
+home_dotenv_path = home_fustor_dir / ".env"
+if home_dotenv_path.is_file():
+    load_dotenv(home_dotenv_path) # Load from ~/.fustor/.env first
 
-# Default configuration directory is ~/.fustor_agent if not specified by environment variable.
-# This ensures a consistent, absolute path regardless of the execution directory.
-CONFIG_DIR = os.getenv('FUAGENT_CONFIG_DIR', "/etc/fustor_agent")
+# Load .env from project root (lowest priority) - will not override already set variables
+load_dotenv(find_dotenv())
+
 CONFIG_FILE_NAME = 'config.yaml'
 STATE_FILE_NAME = 'fustor_agent.state.json'
 

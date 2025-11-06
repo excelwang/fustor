@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.scripts]
-fustor-registry = "fustor_registry.main:app"
+fustor-registry = "fustor_registry.cli:cli"
 
 [project.optional-dependencies]
 dev = [

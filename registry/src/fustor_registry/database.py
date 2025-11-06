@@ -30,7 +30,7 @@ def create_db_engine(url: str) -> Engine:
     )
 
 # --- Create engine for State database only ---
-register_engine = create_db_engine(register_config.FUSTOR_REGISTER_DB_URL) # CORRECTED USAGE
+register_engine = create_db_engine(register_config.FUSTOR_REGISTRY_DB_URL) # CORRECTED USAGE
 
 # --- Create a single Session factory for State database only ---
 AsyncSessionLocal: async_sessionmaker[AsyncSession] = async_sessionmaker(
