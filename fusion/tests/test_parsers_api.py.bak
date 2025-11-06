@@ -1,0 +1,51 @@
+"""
+Test script to verify the parsers API
+"""
+import asyncio
+from fustor_fusion.parsers.manager import get_directory_tree, get_file_info, search_files, get_all_files, get_directory_stats
+
+
+async def test_parsers_api():
+    print("Testing parsers API...")
+    
+    # Test all the functions with no database session (should work with in-memory structure)
+    print("1. Testing get_directory_tree with no DB session...")
+    try:
+        tree = await get_directory_tree("/")
+        print(f"   Result: {tree}")
+    except Exception as e:
+        print(f"   Error: {e}")
+    
+    print("\n2. Testing get_file_info with no DB session...")
+    try:
+        file_info = await get_file_info("/nonexistent")
+        print(f"   Result: {file_info}")
+    except Exception as e:
+        print(f"   Error: {e}")
+    
+    print("\n3. Testing search_files with no DB session...")
+    try:
+        files = await search_files("test")
+        print(f"   Result: {files}")
+    except Exception as e:
+        print(f"   Error: {e}")
+    
+    print("\n4. Testing get_all_files with no DB session...")
+    try:
+        all_files = await get_all_files()
+        print(f"   Result: {all_files}")
+    except Exception as e:
+        print(f"   Error: {e}")
+    
+    print("\n5. Testing get_directory_stats with no DB session...")
+    try:
+        stats = await get_directory_stats()
+        print(f"   Result: {stats}")
+    except Exception as e:
+        print(f"   Error: {e}")
+    
+    print("\nParsers API test completed!")
+
+
+if __name__ == "__main__":
+    asyncio.run(test_parsers_api())

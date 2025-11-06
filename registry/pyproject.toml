@@ -1,0 +1,41 @@
+[project]
+name = "fustor-registry"
+version = "0.1.0"
+description = "Registry service for Fustor (Control Plane)"
+authors = [
+    {name = "Huajin Wang", email = "wanghuajin999@163.com"},
+]
+license = {text = "MIT"}
+requires-python = ">=3.12"
+dependencies = [
+    "click",
+    "fastapi[all]",
+    "uvicorn",
+    "pydantic",
+    "pydantic-settings",
+    "sqlalchemy",
+    "aiosqlite",
+    "asyncpg",
+    "psycopg2-binary",
+    "passlib[bcrypt,jwt]",
+    "python-jose[cryptography]",
+    "cachetools"
+]
+
+[project.scripts]
+fustor-registry = "fustor_registry.main:app"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "pytest-asyncio>=0.23.0"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

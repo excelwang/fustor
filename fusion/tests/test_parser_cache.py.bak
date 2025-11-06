@@ -1,0 +1,89 @@
+
+"""
+Test script to verify the caching behavior of the parsers module.
+"""
+import asyncio
+from unittest.mock import patch, AsyncMock
+from datetime import datetime
+
+import pytest
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker
+
+from fustor_core.models import StateBase
+from fustor_fusion.parsers.main import get_directory_tree, reset_directory_tree, process_event
+
+# Use an in-memory SQLite database for testing
+DATABASE_URL = "sqlite+aiosqlite:///./test_parser_cache.db"
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+AsyncSessionLocal = sessionmaker(
+    bind=engine, class_=AsyncSession, expire_on_commit=False
+)
+
+@pytest.fixture(scope="function")
+async def db_session() -> AsyncSession:
+    """Fixture to create a new database session for each test function."""
+    async with engine.begin() as conn:
+        await conn.run_sync(StateBase.metadata.create_all)
+
+    session = AsyncSessionLocal()
+    try:
+        yield session
+    finally:
+        await session.close()
+        async with engine.begin() as conn:
+            await conn.run_sync(StateBase.metadata.drop_all)
+
+@pytest.mark.asyncio
+@patch('fustor.parsers.main.ParserManager.initialize_parsers', new_callable=AsyncMock)
+async def test_parser_caching_behavior(mock_initialize_parsers, db_session: AsyncSession):
+    """
+    Tests the caching logic of the parser manager.
+    1. Verifies that the parser is loaded from DB on the first call.
+    2. Verifies that the cached parser is used on the second call.
+    3. Verifies that the cache is invalidated after a reset.
+    4. Verifies that the cache is invalidated after a processing event.
+    """
+    datastore_id = 1
+    
+    # --- Test 1: First call should load from DB ---
+    print("\n1. First call to get_directory_tree...")
+    await get_directory_tree(path="/", db_session=db_session, datastore_id=datastore_id)
+    mock_initialize_parsers.assert_called_once()
+    print("   - OK: initialize_parsers was called once.")
+
+    # --- Test 2: Second call should use cache ---
+    print("\n2. Second call to get_directory_tree...")
+    await get_directory_tree(path="/", db_session=db_session, datastore_id=datastore_id)
+    mock_initialize_parsers.assert_called_once() # Should still be 1
+    print("   - OK: initialize_parsers was not called again (cache hit).")
+
+    # --- Test 3: Reset should invalidate the cache ---
+    print("\n3. Resetting the directory tree...")
+    await reset_directory_tree(db_session=db_session, datastore_id=datastore_id)
+    
+    print("\n4. Calling get_directory_tree after reset...")
+    await get_directory_tree(path="/", db_session=db_session, datastore_id=datastore_id)
+    assert mock_initialize_parsers.call_count == 2
+    print("   - OK: initialize_parsers was called again (cache reloaded).")
+    
+    # --- Test 4: process_event should invalidate the cache ---
+    print("\n5. Processing an event...")
+    create_event = {
+        "event_type": "create",
+        "payload": {
+            "path": "/test.txt", "name": "test.txt", "size": 1,
+            "modified_time": datetime.now().isoformat(),
+            "created_time": datetime.now().isoformat(),
+            "content_type": "file"
+        }
+    }
+    await process_event(create_event, db_session=db_session, datastore_id=datastore_id)
+
+    print("\n6. Calling get_directory_tree after event processing...")
+    await get_directory_tree(path="/", db_session=db_session, datastore_id=datastore_id)
+    assert mock_initialize_parsers.call_count == 3
+    print("   - OK: initialize_parsers was called again after event (cache reloaded).")
+
+    print("\nParser caching test completed successfully!")

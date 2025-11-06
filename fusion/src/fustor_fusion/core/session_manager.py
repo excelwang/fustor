@@ -1,0 +1,276 @@
+import asyncio
+import time
+from typing import Dict, Optional
+from datetime import datetime
+from dataclasses import dataclass
+import logging
+
+logger = logging.getLogger(__name__)
+
+@dataclass
+class SessionInfo:
+    session_id: str
+    datastore_id: int
+    last_activity: float
+    created_at: float
+    task_id: Optional[str] = None  # 该session关联的task_id
+    allow_concurrent_push: Optional[bool] = None
+    session_timeout_seconds: Optional[int] = None
+    client_ip: Optional[str] = None  # 该session的客户端IP
+    cleanup_task: Optional[asyncio.Task] = None  # Reference to the cleanup task for this session
+
+
+class SessionManager:
+    """
+    内存中的session管理器，用于跟踪所有活跃的session
+    """
+    def __init__(self, default_session_timeout: int = 30):  # 30-second default timeout
+        # {datastore_id: {session_id: SessionInfo}}
+        self._sessions: Dict[int, Dict[str, SessionInfo]] = {}
+        self._lock = asyncio.Lock()
+        self._default_session_timeout = default_session_timeout
+        self._periodic_cleanup_task: Optional[asyncio.Task] = None
+    
+    async def create_session_entry(self, datastore_id: int, session_id: str, 
+                                 task_id: Optional[str] = None, 
+                                 client_ip: Optional[str] = None,
+                                 allow_concurrent_push: Optional[bool] = None,
+                                 session_timeout_seconds: Optional[int] = None) -> SessionInfo:
+        """
+        创建新的会话条目并启动其清理任务。
+        """
+        timeout = session_timeout_seconds or self._default_session_timeout
+        
+        async with self._lock:
+            if datastore_id not in self._sessions:
+                self._sessions[datastore_id] = {}
+            
+            now = time.time()
+            
+            session_info = SessionInfo(
+                session_id=session_id,
+                datastore_id=datastore_id,
+                last_activity=now,
+                created_at=now,
+                task_id=task_id,
+                allow_concurrent_push = allow_concurrent_push,
+                session_timeout_seconds = session_timeout_seconds,
+                client_ip=client_ip
+            )
+            self._sessions[datastore_id][session_id] = session_info
+            # Create a new cleanup task for this session
+            session_info.cleanup_task = asyncio.create_task(
+                self._schedule_session_cleanup(datastore_id, session_id, timeout)
+            )
+            return session_info
+
+    async def keep_session_alive(self, datastore_id: int, session_id: str, 
+                               client_ip: Optional[str] = None) -> Optional[SessionInfo]:
+        """
+        更新现有会话的活跃时间并重置其清理任务。
+        """
+        async with self._lock:
+            if datastore_id not in self._sessions or session_id not in self._sessions[datastore_id]:
+                return None # Session not found
+            
+            session_info = self._sessions[datastore_id][session_id]
+            session_info.last_activity = time.time()
+            if client_ip:
+                session_info.client_ip = client_ip
+
+            # Cancel the old cleanup task
+            if session_info.cleanup_task:
+                session_info.cleanup_task.cancel()
+
+            # Create a new cleanup task with the updated timeout
+            timeout = session_info.session_timeout_seconds or self._default_session_timeout
+            session_info.cleanup_task = asyncio.create_task(
+                self._schedule_session_cleanup(datastore_id, session_id, timeout)
+            )
+            return session_info
+    async def _schedule_session_cleanup(self, datastore_id: int, session_id: str, timeout_seconds: int):
+        """
+        Schedule cleanup for a single session after timeout.
+        """
+        from ..datastore_state_manager import datastore_state_manager
+        
+        try:
+            # Wait for the timeout period
+            await asyncio.sleep(timeout_seconds)
+            
+            # Check if the session is expired after the sleep
+            async with self._lock:
+                if (datastore_id in self._sessions and 
+                    session_id in self._sessions[datastore_id]):
+                    
+                    session_info = self._sessions[datastore_id][session_id]
+                    current_time = time.time()
+                    
+                    # Only remove if the session hasn't been updated since scheduling
+                    if current_time - session_info.last_activity >= timeout_seconds:
+                        del self._sessions[datastore_id][session_id]
+                        
+                        # Clean up empty datastore entries
+                        if not self._sessions[datastore_id]:
+                            del self._sessions[datastore_id]
+                        
+                        # Release any associated lock in the datastore state manager
+                        await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+                        
+                        logger.info(f"Session {session_id} on datastore {datastore_id} expired and removed")
+        except asyncio.CancelledError:
+            # Task was cancelled, which is fine
+            pass
+        except Exception as e:
+            logger.error(f"Error in session {session_id} cleanup: {e}", exc_info=True)
+            # Ensure session gets removed on error to prevent stuck sessions
+            async with self._lock:
+                if (datastore_id in self._sessions and 
+                    session_id in self._sessions[datastore_id]):
+                    del self._sessions[datastore_id][session_id]
+                    if not self._sessions[datastore_id]:
+                        del self._sessions[datastore_id]
+                    
+                    # Release any associated lock in the datastore state manager
+                    await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+    
+    async def get_session_info(self, datastore_id: int, session_id: str) -> Optional[SessionInfo]:
+        """
+        获取session信息
+        """
+        async with self._lock:
+            if datastore_id not in self._sessions:
+                return None
+            
+            return self._sessions[datastore_id].get(session_id)
+    
+    async def get_datastore_sessions(self, datastore_id: int) -> Dict[str, SessionInfo]:
+        """
+        获取特定datastore的所有session信息
+        """
+        async with self._lock:
+            return self._sessions.get(datastore_id, {}).copy()
+    
+    async def remove_session(self, datastore_id: int, session_id: str) -> bool:
+        """
+        移除一个session
+        """
+        async with self._lock:
+            if datastore_id not in self._sessions:
+                return False
+            
+            if session_id not in self._sessions[datastore_id]:
+                return False
+            
+            # Cancel the cleanup task if it exists
+            session_info = self._sessions[datastore_id][session_id]
+            if session_info.cleanup_task:
+                session_info.cleanup_task.cancel()
+                try:
+                    await session_info.cleanup_task
+                except asyncio.CancelledError:
+                    pass
+            
+            del self._sessions[datastore_id][session_id]
+            
+            # 如果datastore没有更多session了，删除该datastore的条目
+            if not self._sessions[datastore_id]:
+                del self._sessions[datastore_id]
+            
+            return True
+
+    async def cleanup_expired_sessions(self):
+        """
+        Clean up all expired sessions across all datastores
+        """
+        from ..datastore_state_manager import datastore_state_manager
+        
+        async with self._lock:
+            current_time = time.time()
+            expired_sessions = []
+            
+            for datastore_id, datastore_sessions in self._sessions.items():
+                for session_id, session_info in datastore_sessions.items():
+                    timeout = session_info.session_timeout_seconds or self._default_session_timeout
+                    if current_time - session_info.last_activity >= timeout:
+                        expired_sessions.append((datastore_id, session_id, session_info.cleanup_task))
+            
+            # Remove expired sessions
+            for datastore_id, session_id, cleanup_task in expired_sessions:
+                if (datastore_id in self._sessions and 
+                    session_id in self._sessions[datastore_id]):
+                    
+                    # Cancel the cleanup task
+                    if cleanup_task:
+                        cleanup_task.cancel()
+                        try:
+                            await cleanup_task
+                        except asyncio.CancelledError:
+                            pass
+                    
+                    # Remove the session
+                    del self._sessions[datastore_id][session_id]
+                    
+                    # If datastore has no more sessions, remove the datastore entry
+                    if not self._sessions[datastore_id]:
+                        del self._sessions[datastore_id]
+                    
+                    # Release any associated lock in the datastore state manager
+                    await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+                    
+                    logger.info(f"Session {session_id} on datastore {datastore_id} expired and removed by periodic cleanup")
+
+    async def terminate_session(self, datastore_id: int, session_id: str) -> bool:
+        """
+        Explicitly terminate a session (useful for clean shutdowns)
+        """
+        from ..datastore_state_manager import datastore_state_manager
+        
+        # First, try to remove the session
+        success = await self.remove_session(datastore_id, session_id)
+        
+        # Then, ensure the lock is also released from the datastore state manager
+        if success:
+            await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+        
+        return success
+
+    async def start_periodic_cleanup(self, interval_seconds: int = 60):
+        """
+        Start a background task that periodically cleans up expired sessions.
+        """
+        if self._periodic_cleanup_task and not self._periodic_cleanup_task.done():
+            self._periodic_cleanup_task.cancel()
+        
+        self._periodic_cleanup_task = asyncio.create_task(
+            self._run_periodic_cleanup(interval_seconds)
+        )
+        logger.info(f"Started periodic session cleanup, interval: {interval_seconds}s")
+    
+    async def _run_periodic_cleanup(self, interval_seconds: int):
+        """
+        Background task that runs periodic cleanup of expired sessions.
+        """
+        try:
+            while True:
+                await asyncio.sleep(interval_seconds)
+                await self.cleanup_expired_sessions()
+        except asyncio.CancelledError:
+            logger.info("Periodic session cleanup task was cancelled")
+            raise  # Re-raise to properly handle cancellation
+    
+    async def stop_periodic_cleanup(self):
+        """
+        Stop the periodic cleanup task.
+        """
+        if self._periodic_cleanup_task and not self._periodic_cleanup_task.done():
+            self._periodic_cleanup_task.cancel()
+            try:
+                await self._periodic_cleanup_task
+            except asyncio.CancelledError:
+                pass
+        logger.info("Stopped periodic session cleanup")
+
+
+# 全局session管理器实例
+session_manager = SessionManager()

@@ -1,0 +1,18 @@
+/* === NEW: Styles for the log preview component === */
+.log-preview .log-line {
+    font-family: monospace;
+    font-size: 0.8rem;
+    white-space: pre-wrap;
+    word-break: break-all;
+    padding: 2px 0;
+}
+
+.log-preview .log-line .timestamp {
+    color: #999;
+    margin-right: 10px;
+}
+
+.log-preview .log-line .level-INFO { color: #28a745; }
+.log-preview .log-line .level-WARNING { color: #ffc107; }
+.log-preview .log-line .level-ERROR { color: #dc3545; }
+.log-preview .log-line .level-CRITICAL { background-color: #dc3545; color: white; }

@@ -1,0 +1,25 @@
+[project]
+name = "fustor-source-elasticsearch"
+version = "0.1.0"
+description = "An Elasticsearch source for Fustor Agent"
+authors = [
+    {name = "Huajin Wang", email = "wanghuajin999@163.com"},
+]
+license = {text = "MIT"}
+requires-python = ">=3.12"
+dependencies = [
+    "elasticsearch>=9.2.0",
+    "fustor-core",
+]
+
+[build-system]
+
+requires = ["setuptools>=61.0"]
+
+build-backend = "setuptools.build_meta"
+
+
+
+[tool.setuptools.packages.find]
+
+where = ["src"]
