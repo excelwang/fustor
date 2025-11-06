@@ -8,7 +8,8 @@ authors = [
 license = {text = "MIT"}
 requires-python = ">=3.12"
 dependencies = [
-    "fustor-core"
+    "fustor-core",
+    "pymysql>=1.0.0"
 ]
 
 [project.optional-dependencies]
@@ -16,8 +17,7 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "pytest-asyncio>=0.23.0",
-    "pymysql>=1.0.0"
+    "pytest-asyncio>=0.23.0"
 ]
 
 [build-system]
@@ -31,3 +31,6 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 
 where = ["src"]
+
+[project.entry-points."fustor_agent.drivers.sources"]
+mysql = "fustor_source_mysql:MysqlDriver"

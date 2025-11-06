@@ -17,3 +17,6 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[project.entry-points."fustor_agent.drivers.pushers"]
+openapi = "fustor_pusher_openapi:OpenApiDriver"
