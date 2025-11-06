@@ -3,7 +3,7 @@ import uvicorn
 import asyncio
 import json
 import os
-from .client import RegistryClient
+from fustor_registry_client.client import RegistryClient
 
 # Define a path for storing the token
 TOKEN_FILE = os.path.expanduser("~/.fustor/registry_token")

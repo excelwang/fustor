@@ -1,11 +1,6 @@
 from typing import Dict, Optional, List, Any
-from pydantic import BaseModel
-from fustor_registry.api.internal.keys_api import InternalDatastoreConfigResponse
-
-class DatastoreConfig(BaseModel):
-    datastore_id: int
-    allow_concurrent_push: bool
-    session_timeout_seconds: int
+from fustor_common.models import DatastoreConfig
+from fustor_registry_client.models import InternalDatastoreConfigResponse
 
 class DatastoreConfigCache:
     def __init__(self):

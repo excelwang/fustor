@@ -1,28 +1,14 @@
+from typing import List, Optional
+
 from fastapi import APIRouter, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel, ConfigDict
-from typing import List, Optional
+from fustor_registry_client.models import InternalApiKeyResponse, InternalDatastoreConfigResponse
 
 from fustor_registry.database import get_db
-from fustor_registry.models import UserAPIKeyModel, DatastoreModel # Removed ParserConfigModel import
+from fustor_registry.models import UserAPIKeyModel, DatastoreModel
 
 internal_keys_router = APIRouter()
-
-class InternalApiKeyResponse(BaseModel):
-    key: str
-    datastore_id: int # Added datastore_id
-    model_config = ConfigDict(from_attributes=True)
-
-# Removed InternalParserConfigResponse
-
-class InternalDatastoreConfigResponse(BaseModel):
-    datastore_id: int
-    allow_concurrent_push: bool
-    session_timeout_seconds: int
-    # Removed parser_configs: List[InternalParserConfigResponse] = []
-
-    model_config = ConfigDict(from_attributes=True)
 
 @internal_keys_router.get("/api-keys", response_model=List[InternalApiKeyResponse], summary="获取所有API密钥及其关联的存储库ID (内部接口)")
 async def get_all_api_keys(

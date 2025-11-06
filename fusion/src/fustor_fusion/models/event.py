@@ -1,8 +1,6 @@
 from pydantic import BaseModel, Field
-from fustor_core.models import ResponseBase
-
-class EventBase(BaseModel):
-    content: dict = Field(default_factory=dict, description="日志内容")
+from fustor_common.models import ResponseBase
+from fustor_event_model.models import EventBase
 
 class EventCreate(EventBase):
     pass
