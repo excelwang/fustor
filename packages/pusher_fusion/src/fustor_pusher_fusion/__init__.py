@@ -31,14 +31,39 @@ class FusionDriver(PusherDriver):
             raise RuntimeError("Failed to create session with Fusion service.")
 
     async def push(self, events: List[EventBase], **kwargs) -> Dict:
-        # This will be implemented next
-        self.logger.info(f"Pushing {len(events)} events...")
-        return {"snapshot_needed": False}
+        if not self.session_id:
+            self.logger.error("Cannot push events: session_id is not set.")
+            return {"snapshot_needed": False}
+
+        event_dicts = [event.model_dump(mode='json') for event in events]
+        source_type = kwargs.get("source_type", "message")
+
+        success = await self.fusion_client.push_events(
+            session_id=self.session_id,
+            events=event_dicts,
+            source_type=source_type
+        )
+
+        if success:
+            self.logger.info(f"Successfully pushed {len(events)} events.")
+            return {"snapshot_needed": False}
+        else:
+            self.logger.error(f"Failed to push {len(events)} events.")
+            return {"snapshot_needed": False}
 
     async def heartbeat(self, **kwargs) -> Dict:
-        # This will be implemented next
-        self.logger.info("Sending heartbeat...")
-        return {"status": "ok"}
+        if not self.session_id:
+            self.logger.error("Cannot send heartbeat: session_id is not set.")
+            return {"status": "error", "message": "Session ID not set"}
+
+        success = await self.fusion_client.send_heartbeat(self.session_id)
+
+        if success:
+            self.logger.info("Heartbeat sent successfully.")
+            return {"status": "ok"}
+        else:
+            self.logger.error("Failed to send heartbeat.")
+            return {"status": "error", "message": "Failed to send heartbeat"}
 
     @classmethod
     async def get_needed_fields(cls, **kwargs) -> Dict[str, Any]:

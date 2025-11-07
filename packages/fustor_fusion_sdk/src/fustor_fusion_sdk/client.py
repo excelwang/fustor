@@ -1,6 +1,6 @@
 
 import httpx
-from typing import Optional
+from typing import Optional, List, Dict, Any
 
 class FusionClient:
     def __init__(self, base_url: str, api_key: str):
@@ -23,6 +23,42 @@ class FusionClient:
         except Exception as e:
             print(f"An error occurred: {e}")
             return None
+
+    async def push_events(self, session_id: str, events: List[Dict[str, Any]], source_type: str) -> bool:
+        """
+        Pushes a batch of events to the Fusion service.
+        """
+        try:
+            payload = {
+                "session_id": session_id,
+                "events": events,
+                "source_type": source_type
+            }
+            response = await self.client.post("/ingestor-api/v1/events/", json=payload)
+            response.raise_for_status()
+            return True
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP error occurred during event push: {e.response.status_code} - {e.response.text}")
+            return False
+        except Exception as e:
+            print(f"An error occurred during event push: {e}")
+            return False
+
+    async def send_heartbeat(self, session_id: str) -> bool:
+        """
+        Sends a heartbeat to the Fusion service to keep the session alive.
+        """
+        try:
+            headers = {"session-id": session_id}
+            response = await self.client.post("/ingestor-api/v1/sessions/heartbeat", headers=headers)
+            response.raise_for_status()
+            return True
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP error occurred during heartbeat: {e.response.status_code} - {e.response.text}")
+            return False
+        except Exception as e:
+            print(f"An error occurred during heartbeat: {e}")
+            return False
 
     async def __aenter__(self):
         return self
