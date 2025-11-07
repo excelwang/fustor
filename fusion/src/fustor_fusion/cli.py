@@ -11,4 +11,4 @@ def cli():
 @click.option("--reload", is_flag=True, help="Enable auto-reloading.")
 def start(host: str, port: int, reload: bool):
     """Starts the Fustor Fusion API server."""
-    uvicorn.run("fustor_fusion.main:app", host=host, port=port, reload=reload)
+    uvicorn.run("fustor_fusion.main:app", host=host, port=port, reload=reload, log_config=None)

@@ -1,31 +1,23 @@
 from fastapi import FastAPI, APIRouter, Request, HTTPException, status
 from fastapi.responses import FileResponse
 import os
-import logging
-from contextlib import asynccontextmanager
 import asyncio
+from contextlib import asynccontextmanager
 from typing import Optional
 
 import sys
+import logging
 
-# --- Forcefully suppress SQLAlchemy INFO logs at the earliest possible moment ---
-logging.getLogger('sqlalchemy.engine').setLevel(logging.WARNING)
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.WARNING)  # Set the desired level
+from fustor_common.logging_config import setup_logging
 
-# Create a console handler
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.DEBUG)
+# Setup logging for Fusion service
+setup_logging(
+    log_directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
+    base_logger_name="fustor_fusion",
+    level=os.environ.get("FUSION_LOG_LEVEL", "INFO").upper()
+)
 
-# Create a formatter and set it for the handlers
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-console_handler.setFormatter(formatter)
-
-# Add the handlers to the root logger
-root_logger.addHandler(console_handler)
-
-# Silence uvicorn.access logger
-# logging.getLogger("uvicorn.access").setLevel(logging.CRITICAL)
+logger = logging.getLogger(__name__)
 
 # --- Ingestor Service Specific Imports ---
 from .config import fusion_config
@@ -36,10 +28,6 @@ from .datastore_state_manager import datastore_state_manager
 from .queue_integration import queue_based_ingestor, get_events_from_queue
 from .in_memory_queue import memory_event_queue
 from fustor_event_model.models import EventBase
-
-# from .runtime import datastore_event_manager # Removed
-# from .processing_manager import ParserProcessingTaskManager # Removed
-# from .runtime_objects import task_manager as runtime_task_manager # Removed
 
 # --- Parser Module Imports ---
 from .parsers.manager import process_event as process_single_event # Renamed to avoid conflict

@@ -9,7 +9,7 @@ import sys
 import subprocess
 import time
 
-from .logging_setup import setup_logging
+from fustor_common.logging_config import setup_logging
 from . import CONFIG_DIR, CONFIG_FILE_NAME, ConfigurationError
 
 # Use an absolute path for the config directory to ensure consistency
@@ -48,9 +48,9 @@ def cli():
 @click.option("--no-console-log", is_flag=True, hidden=True, help="Internal: Disable console logging.")
 def start(reload, port, daemon, verbose, no_console_log):
     """Starts the FuAgent monitoring service (in the foreground by default)."""
-    log_level = logging.DEBUG if verbose else logging.INFO
+    log_level = "DEBUG" if verbose else "INFO"
     # Disable console logging if --no-console-log is passed (used by daemonized process)
-    setup_logging(ABSOLUTE_CONFIG_DIR, level=log_level, console_output=(not no_console_log))
+    setup_logging(ABSOLUTE_CONFIG_DIR, base_logger_name="fustor_agent", level=log_level.upper(), console_output=(not no_console_log))
     logger = logging.getLogger("fustor_agent")
 
     if daemon:
@@ -155,7 +155,7 @@ def stop():
 def discover_schema(ctx, source_id, admin_user, admin_password):
     """Discovers and caches the schema for a given source configuration."""
     # Setup with default INFO level for this one-off command
-    setup_logging(ABSOLUTE_CONFIG_DIR, level=logging.INFO)
+    setup_logging(ABSOLUTE_CONFIG_DIR, base_logger_name="fustor_agent", level="INFO")
     logger = logging.getLogger("fustor_agent")
 
     click.echo(f"Attempting to discover and cache schema for source: {source_id}...")
