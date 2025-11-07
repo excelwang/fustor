@@ -21,6 +21,7 @@ async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
     db: AsyncSession = Depends(get_db)
 ):
+    print(f"LOGIN ATTEMPT: Username={form_data.username}, Password={form_data.password}")
     user = (await db.execute(
         select(UserModel).where(
             UserModel.email == form_data.username,

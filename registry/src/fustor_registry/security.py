@@ -96,12 +96,12 @@ def create_refresh_token(data: dict):
     encoded_jwt = jwt.encode(data, SECRET_KEY, algorithm=ALGORITHM)
     return encoded_jwt
 
-def hash_password(password: str, salt = secrets.token_hex(16)) -> str:
-    """使用pbkdf2_hmac进行密码哈希"""
-    return f"{salt}${hashlib.pbkdf2_hmac('sha256', password.encode(), salt.encode(), 100000).hex()}"
+from passlib.context import CryptContext
 
-def verify_password(password: str, hashed: str) -> bool:
-    """验证密码与哈希是否匹配"""
-    salt = hashed.split("$")[0]
-    new_hash = hash_password(password, salt)
-    return secrets.compare_digest(new_hash, hashed)
+pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
+
+def verify_password(plain_password: str, hashed_password: str) -> bool:
+    return pwd_context.verify(plain_password, hashed_password)
+
+def hash_password(password: str) -> str:
+    return pwd_context.hash(password)

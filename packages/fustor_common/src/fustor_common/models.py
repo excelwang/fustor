@@ -8,6 +8,7 @@ class ResponseBase(BaseModel):
 class ApiKeyBase(BaseModel):
     id: Optional[int] = None
     name: str = Field(..., min_length=3, max_length=50)
+    key: Optional[str] = None
     datastore_id: int = Field(..., description="关联的存储库ID")
 
 class MessageResponse(BaseModel):

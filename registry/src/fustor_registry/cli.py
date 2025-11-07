@@ -41,7 +41,7 @@ def login(ctx, email: str, password: str):
                 token = await client.login(email=email, password=password)
                 os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
                 with open(TOKEN_FILE, "w") as f:
-                    f.write(token)
+                    f.write(token.access_token)
                 click.echo("Login successful. Token saved.")
             except Exception as e:
                 click.echo(f"Login failed: {e}", err=True)
@@ -62,7 +62,8 @@ def datastore_list(ctx):
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             datastores = await client.list_datastores()
-            click.echo(json.dumps(datastores, indent=2, ensure_ascii=False))
+            datastores_dict = [ds.model_dump() for ds in datastores]
+            click.echo(json.dumps(datastores_dict, indent=2, ensure_ascii=False))
     asyncio.run(_list())
 
 @datastore.command("create")
@@ -89,7 +90,8 @@ def datastore_create(ctx, name: str, meta_items: tuple[str], visible: bool, allo
                         click.echo(f"Warning: Invalid meta item format '{item}'. Expected KEY=VALUE.", err=True)
                 
                 datastore = await client.create_datastore(name=name, meta=meta_dict if meta_dict else None, visible=visible, allow_concurrent_push=allow_concurrent_push, session_timeout_seconds=session_timeout)
-                click.echo(json.dumps(datastore, indent=2, ensure_ascii=False))
+                datastore_dict = datastore.model_dump()
+                click.echo(json.dumps(datastore_dict, indent=2, ensure_ascii=False))
             except Exception as e:
                 click.echo(f"Error creating datastore: {e}", err=True)
     asyncio.run(_create())
@@ -173,7 +175,8 @@ def apikey_list(ctx):
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             api_keys = await client.list_api_keys()
-            click.echo(json.dumps(api_keys, indent=2, ensure_ascii=False))
+            api_keys_dict = [key.model_dump() for key in api_keys]
+            click.echo(json.dumps(api_keys_dict, indent=2, ensure_ascii=False))
     asyncio.run(_list())
 
 @apikey.command("create")
@@ -189,7 +192,8 @@ def apikey_create(ctx, name: str, datastore_id: int):
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             try:
                 api_key = await client.create_api_key(name=name, datastore_id=datastore_id)
-                click.echo(json.dumps(api_key, indent=2, ensure_ascii=False))
+                api_key_dict = api_key.model_dump()
+                click.echo(json.dumps(api_key_dict, indent=2, ensure_ascii=False))
             except Exception as e:
                 click.echo(f"Error creating API key: {e}", err=True)
     asyncio.run(_create())

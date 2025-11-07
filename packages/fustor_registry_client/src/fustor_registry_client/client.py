@@ -23,8 +23,8 @@ class RegistryClient:
         return response.json()
 
     async def login(self, email: str, password: str) -> TokenResponse:
-        payload = {"username": email, "password": password}
-        response = await self.client.post("/v1/auth/login", json=payload)
+        data = {"username": email, "password": password}
+        response = await self.client.post("/v1/auth/login", data=data)
         response.raise_for_status()
         return TokenResponse(**response.json())
 
