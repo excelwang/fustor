@@ -6,6 +6,7 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi.staticfiles import StaticFiles
 import os
+import logging # NEW: Import logging
 
 from .database import register_engine, get_db
 from .models import StateBase, UserModel, UserLevel
@@ -18,14 +19,33 @@ from .apikey.router import router as apikey_router
 from .datastore.router import router as datastores_router
 from .api.internal.keys_api import internal_keys_router # CORRECTED
 
+from fustor_common.logging_config import setup_logging # NEW: Import setup_logging
+
+# NEW: Define log directory and file name
+REGISTRY_LOG_DIR = os.path.join(os.path.expanduser("~/.fustor"), "logs")
+REGISTRY_LOG_FILE_NAME = "fustor_registry.log"
+
+# NEW: Get logger for this module
+logger = logging.getLogger("fustor_registry")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     异步初始化数据库和管理员用户
     """
+    # NEW: Setup logging at the beginning of lifespan
+    setup_logging(
+        log_directory=REGISTRY_LOG_DIR,
+        base_logger_name="fustor_registry",
+        level=logging.INFO,
+        log_file_name=REGISTRY_LOG_FILE_NAME,
+        console_output=True
+    )
+    logger.info("Registry service starting up...")
+
     try:
         if not register_config.FUSTOR_REGISTRY_DB_URL:
-            print("FUSTOR_REGISTRY_DB_URL not set, skipping database initialization.")
+            logger.warning("FUSTOR_REGISTRY_DB_URL not set, skipping database initialization.")
             yield
             return
 
@@ -47,7 +67,7 @@ async def lifespan(app: FastAPI):
             
             if not admin_user:
                 # 调试日志
-                print(f"正在初始化管理员用户，使用数据库: {register_config.FUSTOR_REGISTRY_DB_URL}")
+                logger.info(f"正在初始化管理员用户，使用数据库: {register_config.FUSTOR_REGISTRY_DB_URL}")
                 # 创建admin用户
                 hashed_password = hash_password("admin")
                 
@@ -62,14 +82,12 @@ async def lifespan(app: FastAPI):
                 db.add(admin_user)
                 await db.commit()
                 await db.refresh(admin_user)
-                print(f"管理员用户 {admin_user.email} 已创建")
+                logger.info(f"管理员用户 {admin_user.email} 已创建")
     except Exception as e:
-        print(f"数据库初始化失败: {str(e)}")
-        # 开发时打印完整错误
-        import traceback
-        traceback.print_exc()
+        logger.error(f"数据库初始化失败: {str(e)}", exc_info=True) # Use exc_info=True to log traceback
     
     yield
+    logger.info("Registry service shutting down...") # NEW: Log shutdown
 
 
 app = FastAPI(
