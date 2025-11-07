@@ -5,9 +5,7 @@ from sqlalchemy.orm import relationship, declarative_base
 
 StateBase = declarative_base()
 
-class UserLevel(str, Enum):
-    NORMAL = "normal"
-    ADMIN = "admin"
+from fustor_common.enums import UserLevel
 
 class UserModel(StateBase):
     __tablename__ = "users"

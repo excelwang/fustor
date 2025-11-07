@@ -26,9 +26,7 @@ STATE_FILE_NAME = 'fustor_agent.state.json'
 
 STATE_FILE_PATH = os.path.join(CONFIG_DIR, STATE_FILE_NAME)
 
-class ConfigurationError(Exception):
-    """自定义配置错误异常"""
-    pass
+from fustor_common.exceptions import ConfigurationError
 
 _app_config_instance: Optional[AppConfig] = None 
 
