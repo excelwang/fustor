@@ -100,7 +100,7 @@ def setup_logging(
             },
             'uvicorn.access': {
                 'handlers': ['file', 'error_file'],
-                'level': logging.WARNING, # Keep access logs less verbose
+                'level': numeric_level, # Use the configured level for access logs
                 'propagate': False
             }
         },
