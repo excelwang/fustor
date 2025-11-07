@@ -18,7 +18,7 @@ import os
 from fustor_core.drivers import SourceDriver
 from fustor_core.models.config import SourceConfig, PasswdCredential
 from fustor_core.exceptions import DriverError
-from fustor_core.models.event import EventBase, InsertEvent, UpdateEvent, DeleteEvent
+from fustor_event_model.models import EventBase, InsertEvent, UpdateEvent, DeleteEvent
 
 logger = logging.getLogger("fustor_agent.driver.mysql")
 
@@ -131,7 +131,7 @@ class MysqlDriver(SourceDriver):
                         
                         rows = [{columns[i]: _normalize_row(col) for i, col in enumerate(row)} for row in batch]
                         if rows:
-                            event = InsertEvent(schema, table_name, rows, index=binlog_start_pos_int)
+                            event = InsertEvent(event_schema, table_name, rows, index=binlog_start_pos_int)
                             yield event
                 
                 snapshot_conn.commit()
@@ -193,16 +193,16 @@ class MysqlDriver(SourceDriver):
                             event_index = _generate_event_index(streamer.log_file, streamer.log_pos)
                             event = None
                             if hasattr(binlog_event, 'rows') and binlog_event.rows:
-                                table_key = f"{binlog_event.schema}.{binlog_event.table}"
+                                table_key = f"{binlog_event.event_schema}.{binlog_event.table}"
                                 if isinstance(binlog_event, WriteRowsEvent):
                                     rows = [_normalize_row(self._get_row_with_column_names(table_key, row['values'])) for row in binlog_event.rows]
-                                    event = InsertEvent(binlog_event.schema, binlog_event.table, rows, index=event_index)
+                                    event = InsertEvent(binlog_event.event_schema, binlog_event.table, rows, index=event_index)
                                 elif isinstance(binlog_event, UpdateRowsEvent):
                                     rows = [_normalize_row(self._get_row_with_column_names(table_key, row['after_values'])) for row in binlog_event.rows]
-                                    event = UpdateEvent(binlog_event.schema, binlog_event.table, rows, index=event_index)
+                                    event = UpdateEvent(binlog_event.event_schema, binlog_event.table, rows, index=event_index)
                                 elif isinstance(binlog_event, DeleteRowsEvent):
                                     rows = [_normalize_row(self._get_row_with_column_names(table_key, row['values'])) for row in binlog_event.rows]
-                                    event = DeleteEvent(binlog_event.schema, binlog_event.table, rows, index=event_index)
+                                    event = DeleteEvent(binlog_event.event_schema, binlog_event.table, rows, index=event_index)
                             
                             if event:
                                 filtered_event = _filter_event_rows(event, required_fields_tracker.get_fields() if required_fields_tracker else set())
@@ -523,7 +523,7 @@ def _filter_event_rows(event: EventBase, required_fields: Set[str]) -> Optional[
     if not required_fields:
         return event
     
-    event_prefix = f"{event.schema}.{event.table}."
+    event_prefix = f"{event.event_schema}.{event.table}."
     if not any(f.startswith(event_prefix) for f in required_fields):
         return None
 
@@ -531,7 +531,7 @@ def _filter_event_rows(event: EventBase, required_fields: Set[str]) -> Optional[
     for row in event.rows:
         filtered_row = {}
         for field_name, field_value in row.items():
-            full_field_name = f"{event.schema}.{event.table}.{field_name}"
+            full_field_name = f"{event.event_schema}.{event.table}.{field_name}"
             if full_field_name in required_fields:
                 filtered_row[field_name] = field_value
         
@@ -539,7 +539,7 @@ def _filter_event_rows(event: EventBase, required_fields: Set[str]) -> Optional[
             filtered_rows.append(filtered_row)
     
     if filtered_rows:
-        new_event = type(event)(event.schema, event.table, filtered_rows)
+        new_event = type(event)(event.event_schema, event.table, filtered_rows)
         new_event.fields = list(filtered_rows[0].keys())
         new_event.index = event.index
         return new_event

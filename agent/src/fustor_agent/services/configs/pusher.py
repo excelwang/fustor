@@ -8,10 +8,11 @@ from fustor_core.models.config import AppConfig, PusherConfig
 from fustor_agent.services.instances.sync import SyncInstanceService
 from fustor_agent.services.common import config_lock
 from .base import BaseConfigService
+from fustor_agent_sdk.interfaces import PusherConfigServiceInterface # Import the interface
 
 logger = logging.getLogger("fustor_agent")
 
-class PusherConfigService(BaseConfigService[PusherConfig]):
+class PusherConfigService(BaseConfigService[PusherConfig], PusherConfigServiceInterface): # Inherit from the interface
     """
     Manages the lifecycle of PusherConfig objects.
     This service is responsible for CRUD operations on pusher configurations

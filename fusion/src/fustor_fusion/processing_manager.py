@@ -2,10 +2,11 @@ import asyncio
 import logging
 from typing import Dict, Set, Callable, Coroutine, Any, List
 from fustor_registry.api.internal.keys_api import InternalDatastoreConfigResponse
+from fustor_fusion_sdk.interfaces import ParserProcessingTaskManagerInterface # Import the interface
 
 logger = logging.getLogger(__name__)
 
-class ParserProcessingTaskManager:
+class ParserProcessingTaskManager(ParserProcessingTaskManagerInterface): # Inherit from the interface
     """
     Starts, stops, and tracks the per-datastore event processing tasks.
     """

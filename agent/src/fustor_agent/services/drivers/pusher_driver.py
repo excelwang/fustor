@@ -3,10 +3,11 @@ from importlib.metadata import entry_points
 from typing import Any, Dict, Tuple, List
 
 from fustor_core.exceptions import DriverError, ConfigError
+from fustor_agent_sdk.interfaces import PusherDriverServiceInterface # Import the interface
 
 logger = logging.getLogger("fustor_agent")
 
-class PusherDriverService:
+class PusherDriverService(PusherDriverServiceInterface): # Inherit from the interface
     """
     A service for discovering and interacting with Pusher driver classes.
     This service only handles non-instance operations, like discovery and pre-flight checks.

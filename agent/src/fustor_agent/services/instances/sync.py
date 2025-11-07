@@ -6,6 +6,7 @@ from .base import BaseInstanceService
 from fustor_core.models.states import SyncState
 from fustor_agent.runtime.sync import SyncInstance
 from fustor_core.exceptions import NotFoundError
+from fustor_agent_sdk.interfaces import SyncInstanceServiceInterface # Import the interface
 
 if TYPE_CHECKING:
     from fustor_agent.services.configs.sync import SyncConfigService
@@ -17,7 +18,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("fustor_agent")
 
-class SyncInstanceService(BaseInstanceService):
+class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # Inherit from the interface
     def __init__(
         self, 
         sync_config_service: "SyncConfigService",

@@ -76,7 +76,7 @@ def sync_instance(
 async def test_snapshot_stops_on_419_error(sync_instance):
     # Arrange
     # Mock the source_driver_instance to yield a single EventBase object
-    mock_event = InsertEvent(schema="test", table="data", rows=[{"id": 1, "value": "test"}])
+    mock_event = InsertEvent(event_schema="test", table="data", rows=[{"id": 1, "value": "test"}])
     # The iterator should yield individual EventBase objects
     sync_instance.source_driver_instance.get_snapshot_iterator.return_value = iter([mock_event])
 

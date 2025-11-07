@@ -13,6 +13,7 @@ from ..datastore_state_manager import datastore_state_manager
 
 # Import the queue-based ingestion
 from ..queue_integration import queue_based_ingestor, add_events_batch_to_queue, get_position_from_queue, update_position_in_queue
+from fustor_event_model.models import EventBase, EventType # Import EventBase and EventType
 
 # Import the parsers module
 from ..parsers.manager import ParserManager # CORRECTED
@@ -45,7 +46,7 @@ class BatchIngestPayload(BaseModel):
     Defines the generic payload for receiving a batch of events from any client.
     """
     session_id: str
-    events: List[Dict[str, Any]]
+    events: List[Dict[str, Any]] # Events are received as dicts
     source_type: str # 'message' or 'snapshot'
 # --- End Ingestion Models ---
 
@@ -81,9 +82,30 @@ async def ingest_event_batch(
     try:
         if payload.events:
             latest_index = 0
-            for event in payload.events:
-                if isinstance(event, dict) and isinstance(event.get("index"), int):
-                    latest_index = max(latest_index, event["index"])
+            event_objects_to_add: List[EventBase] = []
+            for event_dict in payload.events:
+                # Infer event_type, schema, table, index, and fields from the dict
+                # Default to UPDATE if not specified, as it's the most common for generic data
+                event_type = EventType(event_dict.get("event_type", EventType.UPDATE.value))
+                event_schema = event_dict.get("event_schema", "default_schema") # Use event_schema
+                table = event_dict.get("table", "default_table")
+                index = event_dict.get("index", -1)
+                rows = event_dict.get("rows", [])
+                fields = event_dict.get("fields", list(rows[0].keys()) if rows else [])
+
+                # Create EventBase object
+                event_obj = EventBase(
+                    event_type=event_type,
+                    event_schema=event_schema, # Use event_schema
+                    table=table,
+                    index=index,
+                    rows=rows,
+                    fields=fields
+                )
+                event_objects_to_add.append(event_obj)
+
+                if isinstance(index, int):
+                    latest_index = max(latest_index, index)
 
             # Update position in memory queue
             if latest_index > 0:
@@ -91,7 +113,7 @@ async def ingest_event_batch(
 
             # Add events to the in-memory queue for high-throughput ingestion
             # Pass task_id for position tracking
-            total_events_added = await add_events_batch_to_queue(datastore_id, payload.events, si.task_id)
+            total_events_added = await add_events_batch_to_queue(datastore_id, event_objects_to_add, si.task_id)
             
         # Notify the background task that there are new events
         try:

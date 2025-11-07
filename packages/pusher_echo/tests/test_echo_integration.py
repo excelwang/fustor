@@ -63,8 +63,7 @@ async def test_echo_sync_instance_triggers_snapshot():
     
     # Mock an event to simulate push
     from fustor_core.models.event import UpdateEvent
-    mock_events = [UpdateEvent(schema="test", table="files", rows=[{"file_path": "/tmp/test.txt", "size": 100}])]
-    
+    mock_events = [UpdateEvent(event_schema="test", table="files", rows=[{"file_path": "/tmp/test.txt", "size": 100}])]    
     # When the echo pusher is called with a task ID that starts with "echo", 
     # it should return snapshot_needed=True, which should trigger the snapshot sync
     result = await echo_driver.push(mock_events, task_id="echo-sync-fs", agent_id="test-agent")
@@ -92,8 +91,7 @@ async def test_snapshot_trigger_once_and_only_once():
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-driver", config)
-    events = [UpdateEvent(schema="test", table="test", rows=[{"id": 1}])]
-
+    events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1}])]
     # First push should trigger a snapshot
     result1 = await driver.push(events, task_id="any-task-id", agent_id="test-agent")
     assert result1 == {"snapshot_needed": True}, "Should trigger snapshot on the first push"

@@ -10,6 +10,7 @@ import logging
 import os
 from pathlib import Path
 import json
+from fustor_event_model.models import EventBase, EventType # Added EventBase and EventType import
 
 
 logger = logging.getLogger(__name__)
@@ -97,56 +98,40 @@ class DirectoryStructureParser:
         self.logger = logging.getLogger(__name__)
         self.datastore_id = datastore_id
 
-    async def process_event(self, event: Dict[str, Any]) -> bool:
+    async def process_event(self, event: EventBase) -> bool:
         """ 
         Processes a single event by applying it directly to the in-memory cache.
         """
         self.logger.info(f"Processing event: {event}")
 
-        # 1. Parse and normalize event payload
-        try:
-            event_type, payload = self._parse_and_normalize_event(event)
-            path = payload['path']
-            self.logger.info(f"Parsed event: type={event_type}, path={path}")
-        except ValueError as e:
-            self.logger.warning(f"Invalid event format: {e}. Event: {event}")
+        # 1. Extract information from EventBase
+        if event.table == "initial_trigger":
+            self.logger.info(f"Skipping initial trigger event: {event}")
+            return True
+
+        if not event.rows:
+            self.logger.warning(f"Event has no rows. Skipping. Event: {event}")
             return False
+        
+        # Assuming one row per event for file system changes
+        payload = event.rows[0]
+        path = payload.get('path') or payload.get('file_path')
+        if not path:
+            self.logger.warning(f"Path is missing in event payload. Event: {event}")
+            return False
+
+        event_type = event.event_type
 
         # 2. Apply change to in-memory cache directly
         async with self._lock:
-            self.logger.info(f"Applying change to in-memory cache for path: {path}, type: {event_type}")
-            if event_type in ["create", "update"]:
-                await self._process_create_update_in_memory(payload)
-            elif event_type == "delete":
+            self.logger.info(f"Applying change to in-memory cache for path: {path}, type: {event_type.value}")
+            if event_type in [EventType.INSERT, EventType.UPDATE]:
+                await self._process_create_update_in_memory(payload, path)
+            elif event_type == EventType.DELETE:
                 await self._process_delete_in_memory(path)
 
         self.logger.info(f"Successfully processed event for path: {path}")
         return True
-
-    def _parse_and_normalize_event(self, event: Dict[str, Any]) -> tuple[str, Dict[str, Any]]:
-        """Parses different event formats and returns a standardized payload."""
-        if "payload" in event and "path" in event["payload"]:
-            event_type = event.get("event_type", "").lower()
-            payload = event["payload"]
-        elif "file_path" in event:
-            path = event["file_path"]
-            event_type = event.get("_event_type", "update").lower()
-            payload = {
-                "path": path,
-                "name": os.path.basename(path) if path else "",
-                "size": event.get("size", 0),
-                "modified_time": self._format_timestamp(event.get("modified_time")),
-                "created_time": self._format_timestamp(event.get("created_time")),
-                "content_type": "directory" if event.get("is_dir") else "file",
-                "metadata": event.get("metadata", {})
-            }
-        else:
-            raise ValueError("Unknown event format")
-
-        if not payload.get("path"):
-            raise ValueError("Path is missing in event payload")
-        
-        return event_type, payload
 
     def _format_timestamp(self, timestamp: Any) -> str:
         """Safely formats a timestamp into an ISO string."""
@@ -156,9 +141,8 @@ class DirectoryStructureParser:
             return timestamp # Assuming it's already ISO format
         return datetime.now().isoformat()
 
-    async def _process_create_update_in_memory(self, payload: Dict[str, Any]):
+    async def _process_create_update_in_memory(self, payload: Dict[str, Any], path: str):
         """Process a create/update operation directly in the in-memory cache."""
-        path = payload['path']
         path_obj = Path(path)
         parent_path = str(path_obj.parent)
         if parent_path != "/" and parent_path.endswith("/"):
@@ -167,11 +151,11 @@ class DirectoryStructureParser:
         await self._ensure_directory_in_memory(parent_path)
         parent_node = self._directory_path_map[parent_path]
 
-        if payload['content_type'] == 'directory':
+        if payload.get('is_dir'):
             if path not in self._directory_path_map:
                 dir_node = DirectoryNode(
                     path=path, name=path_obj.name,
-                    created_time=datetime.fromisoformat(payload['created_time']),
+                    created_time=datetime.fromtimestamp(payload['created_time']),
                     metadata=payload.get('metadata', {})
                 )
                 parent_node.add_child(path_obj.name, dir_node)
@@ -179,9 +163,9 @@ class DirectoryStructureParser:
         else:
             file_node = FileNode(
                 path=path, name=path_obj.name, size=payload['size'],
-                modified_time=datetime.fromisoformat(payload['modified_time']),
-                created_time=datetime.fromisoformat(payload['created_time']),
-                content_type=payload['content_type'],
+                modified_time=datetime.fromtimestamp(payload['modified_time']),
+                created_time=datetime.fromtimestamp(payload['created_time']),
+                content_type="file", # Set content_type to 'file' for files
                 metadata=payload.get('metadata', {})
             )
             parent_node.add_child(path_obj.name, file_node)

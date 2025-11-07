@@ -15,7 +15,7 @@ from typing import (
 )
 
 # Forward-referencing models to avoid circular imports if drivers.py is imported by models
-from fustor_core.models.event import EventBase
+from fustor_event_model.models import EventBase # Import EventBase from fustor_event_model
 from fustor_core.models.config import SourceConfig, PusherConfig
 
 

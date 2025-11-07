@@ -1,6 +1,7 @@
 from typing import Dict, Optional, Any, List
+from fustor_agent_sdk.interfaces import BaseInstanceServiceInterface # Import the interface
 
-class BaseInstanceService:
+class BaseInstanceService(BaseInstanceServiceInterface): # Inherit from the interface
     """实例服务的抽象基类。"""
     def __init__(self):
         self.pool: Dict[str, Any] = {}

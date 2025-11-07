@@ -1,6 +1,7 @@
 from typing import Dict, Optional, List, Any
+from fustor_fusion_sdk.interfaces import ApiKeyCacheInterface # Import the interface
 
-class ApiKeyCache:
+class ApiKeyCache(ApiKeyCacheInterface): # Inherit from the interface
     def __init__(self):
         self._cache: Dict[str, int] = {}
 

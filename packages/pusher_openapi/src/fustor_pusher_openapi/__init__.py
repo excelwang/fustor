@@ -9,7 +9,7 @@ from urllib.parse import urljoin
 from fustor_core.drivers import PusherDriver
 from fustor_core.exceptions import DriverError
 from fustor_core.models.config import PusherConfig, PasswdCredential, ApiKeyCredential
-from fustor_core.models.event import EventBase
+from fustor_event_model.models import EventBase
 from fustor_core.utils.retry import retry
 
 logger = logging.getLogger("fustor_agent.driver.openapi")
@@ -178,21 +178,13 @@ class OpenApiDriver(PusherDriver):
         session_id = kwargs.get("session_id")
         source_type = kwargs.get("source_type", "message")
 
-        enhanced_events = []
-        for event in events:
-            event_type_value = event.event_type.value if hasattr(event, 'event_type') and event.event_type else 'unknown'
-            for row in event.rows:
-                enhanced_row = dict(row)
-                enhanced_row["_event_type"] = event_type_value
-                enhanced_events.append(enhanced_row)
-
         envelope = {
             "session_id": session_id,
-            "events": enhanced_events,
+            "events": [event.model_dump(mode='json') for event in events], # Send EventBase objects as dicts
             "source_type": source_type
         }
 
-        logger.info(f"Pushing batch of {len(enhanced_events)} events for pusher '{self.id}' (session: {session_id or 'N/A'}).")
+        logger.info(f"Pushing batch of {len(events)} events for pusher '{self.id}' (session: {session_id or 'N/A'}).")
 
         spec, _ = await self._get_all_post_endpoints_details(self.client, self.endpoint)
 

@@ -7,7 +7,7 @@ from typing import Any, Dict, List
 
 from fustor_core.drivers import PusherDriver
 from fustor_core.models.config import PusherConfig
-from fustor_core.models.event import EventBase
+from fustor_event_model.models import EventBase
 
 
 class EchoDriver(PusherDriver):

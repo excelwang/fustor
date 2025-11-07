@@ -6,10 +6,11 @@ from fustor_agent.services.instances.sync import SyncInstanceService
 from .base import BaseConfigService
 from .source import SourceConfigService
 from .pusher import PusherConfigService
+from fustor_agent_sdk.interfaces import SyncConfigServiceInterface # Import the interface
 
 logger = logging.getLogger("fustor_agent")
 
-class SyncConfigService(BaseConfigService[SyncConfig]):
+class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterface): # Inherit from the interface
     """
     Manages SyncConfig objects.
     """

@@ -16,7 +16,7 @@ import threading
 from typing import Any, Dict, Iterator, List, Tuple
 from fustor_core.drivers import SourceDriver
 from fustor_core.models.config import SourceConfig
-from fustor_core.models.event import EventBase, UpdateEvent, DeleteEvent
+from fustor_event_model.models import EventBase, UpdateEvent, DeleteEvent
 
 from .components import _WatchManager
 from .event_handler import OptimizedWatchEventHandler, get_file_metadata
@@ -235,11 +235,14 @@ class FSDriver(SourceDriver):
                         files_processed_count += 1
                 
                 if len(batch) >= batch_size:
-                    yield UpdateEvent(schema=self.uri, table="files", rows=batch, index=snapshot_time)
+                    # Extract fields from the first row if batch is not empty
+                    fields = list(batch[0].keys()) if batch else []
+                    yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields)
                     batch = []
             
             if batch:
-                yield UpdateEvent(schema=self.uri, table="files", rows=batch, index=snapshot_time)
+                fields = list(batch[0].keys()) if batch else []
+                yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields)
 
             if error_count > 0:
                 logger.warning(f"[{stream_id}] Skipped {error_count} paths in total due to permission or other errors.")

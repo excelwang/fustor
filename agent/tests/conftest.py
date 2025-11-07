@@ -123,8 +123,8 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
     mocker.patch.object(test_app_instance.pusher_driver_service, '_get_driver_by_type', return_value=mock_pusher_driver)
 
     message_data = [
-        InsertEvent(schema='mock_db', table='mock_table', rows=[{'id': 101, 'name': 'realtime_1'}], index=start_position + 1),
-        InsertEvent(schema='mock_db', table='mock_table', rows=[{'id': 102, 'name': 'realtime_2'}], index=start_position + 2),
+        InsertEvent(event_schema='mock_db', table='mock_table', rows=[{'id': 101, 'name': 'realtime_1'}], index=start_position + 1),
+        InsertEvent(event_schema='mock_db', table='mock_table', rows=[{'id': 102, 'name': 'realtime_2'}], index=start_position + 2),
     ]
     spy_get_message_iterator = mocker.patch.object(
         test_app_instance.source_driver_service,

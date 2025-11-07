@@ -35,6 +35,7 @@ from .core.session_manager import session_manager
 from .datastore_state_manager import datastore_state_manager
 from .queue_integration import queue_based_ingestor, get_events_from_queue
 from .in_memory_queue import memory_event_queue
+from fustor_event_model.models import EventBase
 
 # from .runtime import datastore_event_manager # Removed
 # from .processing_manager import ParserProcessingTaskManager # Removed
@@ -63,18 +64,22 @@ async def per_datastore_processing_loop(datastore_id: int):
 
             logger.info(f"Found {len(events)} events in queue for datastore {datastore_id}. Starting processing.")
             processed_count = 0
-            for event_wrapper in events:
+            for event_obj in events:
                 try:
-                    # Process each event individually - no database session needed anymore
-                    result = await process_single_event(event_wrapper.content, datastore_id=datastore_id)
-                    if all(result.values()): # Assuming all parsers must succeed
+                    # Store the original event_obj.id before processing, as processed_event is a dict
+                    event_id_for_logging = getattr(event_obj, 'id', 'N/A')
+                    logger.debug(f"DEBUG: Type of event_obj: {type(event_obj)}")
+                    logger.debug(f"DEBUG: event_obj.id: {getattr(event_obj, 'id', 'N/A')}")
+                    logger.debug(f"DEBUG: event_obj has rows: {hasattr(event_obj, 'rows')}")
+                    processed_event = await process_single_event(event_obj, datastore_id)
+                    if all(processed_event.values()): # Assuming all parsers must succeed
                         processed_count += 1
-                        logger.info(f"Successfully processed event {event_wrapper.id} for datastore {datastore_id}.")
+                        logger.info(f"Successfully processed event {event_id_for_logging} for datastore {datastore_id}.")
                     else:
-                        logger.warning(f"Event {event_wrapper.id} for datastore {datastore_id} partially processed or failed: {result}")
+                        logger.warning(f"Event {event_id_for_logging} for datastore {datastore_id} partially processed or failed: {processed_event}")
                         # Depending on policy, might move to dead-letter or retry later
                 except Exception as e:
-                    logger.error(f"Error processing event {event_wrapper.id} for datastore {datastore_id}: {e}", exc_info=True)
+                    logger.error(f"Error processing event {event_id_for_logging} for datastore {datastore_id}: {e}", exc_info=True)
                     # No database session to rollback, just continue
                     
             logger.info(f"Processed {processed_count} events for datastore {datastore_id}.")

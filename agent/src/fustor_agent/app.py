@@ -10,6 +10,7 @@ from typing import Dict, Any
 import fustor_agent
 
 from . import get_app_config, STATE_FILE_PATH
+from fustor_agent_sdk.utils import get_or_generate_agent_id # Import the utility function
 
 # Import existing config and instance services
 from .services.configs.source import SourceConfigService
@@ -40,22 +41,7 @@ class App:
         self.logger.info("Initializing application...")
 
         # --- Agent ID Loading/Generation ---
-        agent_id_path = os.path.join(fustor_agent.CONFIG_DIR, 'fustor_agent.id')
-        try:
-            with open(agent_id_path, 'r', encoding='utf-8') as f:
-                self.agent_id = f.read().strip()
-                if not self.agent_id:
-                    raise FileNotFoundError # Treat empty file as not found
-            self.logger.info(f"Loaded existing Agent ID: {self.agent_id}")
-        except FileNotFoundError:
-            self.agent_id = str(uuid.uuid4())
-            self.logger.info(f"No existing Agent ID found. Generated new ID: {self.agent_id}")
-            try:
-                with open(agent_id_path, 'w', encoding='utf-8') as f:
-                    f.write(self.agent_id)
-            except IOError as e:
-                self.logger.error(f"FATAL: Could not write Agent ID to file {agent_id_path}: {e}")
-                raise
+        self.agent_id = get_or_generate_agent_id(fustor_agent.CONFIG_DIR, self.logger)
         
         # 1. Load static configuration
         self._app_config = get_app_config()

@@ -9,10 +9,11 @@ from fustor_agent.services.instances.sync import SyncInstanceService
 from .base import BaseConfigService
 from fustor_agent.services.common import config_lock
 from fustor_agent.services import schema_cache # Import schema_cache at the top level
+from fustor_agent_sdk.interfaces import SourceConfigServiceInterface # Import the interface
 
 logger = logging.getLogger("fustor_agent")
 
-class SourceConfigService(BaseConfigService[SourceConfig]):
+class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceInterface): # Inherit from the interface
     """
     Manages the lifecycle of SourceConfig objects.
     This service is responsible for CRUD operations on source configurations

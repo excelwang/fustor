@@ -4,10 +4,11 @@ from importlib.metadata import entry_points
 from typing import Any, Dict, Tuple, List
 
 from fustor_core.exceptions import DriverError, ConfigError
+from fustor_agent_sdk.interfaces import SourceDriverServiceInterface # Import the interface
 
 logger = logging.getLogger("fustor_agent")
 
-class SourceDriverService:
+class SourceDriverService(SourceDriverServiceInterface): # Inherit from the interface
     """
     A service for discovering and interacting with Source driver classes.
     This service only handles non-instance operations, like discovery and pre-flight checks.
@@ -30,6 +31,7 @@ class SourceDriverService:
                     discovered[ep.name] = ep.load()
                 except Exception as e:
                     logger.error(f"Failed to load source driver plugin '{ep.name}': {e}", exc_info=True)
+            print(f"DEBUG: Discovered source drivers: {discovered}") # Added debug print
         except Exception as e:
             logger.error(f"Error while discovering entry points: {e}", exc_info=True)
         return discovered

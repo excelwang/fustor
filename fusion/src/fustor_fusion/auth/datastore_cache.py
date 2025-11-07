@@ -1,8 +1,9 @@
 from typing import Dict, Optional, List, Any
 from fustor_common.models import DatastoreConfig
 from fustor_registry_client.models import InternalDatastoreConfigResponse
+from fustor_fusion_sdk.interfaces import DatastoreConfigCacheInterface # Import the interface
 
-class DatastoreConfigCache:
+class DatastoreConfigCache(DatastoreConfigCacheInterface): # Inherit from the interface
     def __init__(self):
         self._cache: Dict[int, DatastoreConfig] = {}
 

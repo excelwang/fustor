@@ -4,7 +4,7 @@ from collections import deque
 from typing import Dict, List, Optional, Any, Set
 
 from fustor_core.models.config import FieldMapping
-from fustor_core.models.event import EventBase
+from fustor_event_model.models import EventBase
 from fustor_core.exceptions import TransientSourceBufferFullError
 
 logger = logging.getLogger("fustor_agent")

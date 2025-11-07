@@ -10,6 +10,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict
 from uuid import uuid4
+from fustor_event_model.models import EventBase
 
 
 logger = logging.getLogger(__name__)
@@ -20,7 +21,7 @@ class QueuedEvent:
     """Represents an event in the queue."""
     id: str
     datastore_id: int
-    content: Dict[str, Any]
+    event: EventBase # Changed content to event, type is EventBase
     timestamp: float = field(default_factory=time.time)
     processing_attempts: int = 0
 
@@ -44,13 +45,13 @@ class InMemoryEventQueue:
         # Positions to track the highest processed index for each (datastore_id, task_id) combination
         self._positions: Dict[Tuple[int, str], int] = {} # task_id can be a unique string
 
-    async def add_event(self, datastore_id: int, content: Dict[str, Any], task_id: Optional[str] = None) -> str:
+    async def add_event(self, datastore_id: int, event: EventBase, task_id: Optional[str] = None) -> str:
         """
         Add an event to the queue for a specific datastore.
 
         Args:
             datastore_id: The ID of the datastore
-            content: The event to add
+            event: The EventBase object to add
             task_id: Optional task ID for position tracking
 
         Returns:
@@ -60,7 +61,7 @@ class InMemoryEventQueue:
         queued_event = QueuedEvent(
             id=event_id,
             datastore_id=datastore_id,
-            content=content
+            event=event
         )
 
         queue_key = datastore_id
@@ -71,22 +72,22 @@ class InMemoryEventQueue:
             self._stats["total_events_sent"] += 1
 
             # Update position if task_id is provided and event has index
-            if task_id and isinstance(content, dict) and "index" in content:
+            if task_id and event.index != -1:
                 current_position = self._positions.get((datastore_id, task_id), 0)
-                new_index = content["index"]
-                if isinstance(new_index, int) and new_index > current_position:
+                new_index = event.index
+                if new_index > current_position:
                     self._positions[(datastore_id, task_id)] = new_index
 
         logger.debug(f"Added event {event_id} to datastore {datastore_id} queue")
         return event_id
 
-    async def add_events_batch(self, datastore_id: int, events: List[Dict[str, Any]], task_id: Optional[str] = None) -> int:
+    async def add_events_batch(self, datastore_id: int, events: List[EventBase], task_id: Optional[str] = None) -> int:
         """
         Add a batch of events for a specific datastore.
 
         Args:
             datastore_id: The ID of the datastore
-            events: List of events to add
+            events: List of EventBase objects to add
             task_id: Optional task ID for position tracking
 
         Returns:
@@ -101,9 +102,9 @@ class InMemoryEventQueue:
                 added_count += 1
 
                 # Track the maximum index for position update
-                if task_id and isinstance(event, dict) and "index" in event:
-                    index_value = event["index"]
-                    if isinstance(index_value, int) and index_value > max_index:
+                if task_id and event.index != -1:
+                    index_value = event.index
+                    if index_value > max_index:
                         max_index = index_value
             except Exception as e:
                 logger.error(f"Failed to add event to datastore {datastore_id}: {e}")

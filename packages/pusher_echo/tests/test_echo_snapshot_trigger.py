@@ -13,18 +13,7 @@ from fustor_core.models.event import UpdateEvent
 
 
 @pytest.mark.asyncio
-async def test_echo_pusher_requests_snapshot_for_echo_tasks():
-    """Test that echo pusher returns snapshot_needed=True for echo tasks."""
-    # 1. Arrange
-    config = PusherConfig(
-        driver="echo", 
-        endpoint="dummy",  # Required field
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-echo", config)
-    
-    # Simulate events
-    events = [UpdateEvent(schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
+events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
 
     # 2. Act
     result = await driver.push(events, task_id="echo-sync-fs", agent_id="test-agent")
@@ -45,10 +34,7 @@ async def test_echo_pusher_requests_snapshot_on_first_push_for_any_task():
     driver = EchoDriver("test-echo", config)
     
     # Simulate events
-    events = [UpdateEvent(schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
-
-    # 2. Act
-    result = await driver.push(events, task_id="other-sync-task", agent_id="test-agent")
+    events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
 
     # 3. Assert
     assert result == {"snapshot_needed": True}
@@ -66,7 +52,7 @@ async def test_echo_pusher_requests_snapshot_on_first_push_with_missing_task_id(
     driver = EchoDriver("test-echo", config)
     
     # Simulate events
-    events = [UpdateEvent(schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
+    events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
 
     # 2. Act
     result = await driver.push(events, agent_id="test-agent")  # No task_id provided
@@ -94,10 +80,7 @@ async def test_echo_pusher_logs_properly():
     handler = logging.StreamHandler(log_stream)
     logger = logging.getLogger(f"fustor_agent.pusher.echo.test-echo")
     logger.addHandler(handler)
-    logger.setLevel(logging.INFO)
-    
-    # Simulate events
-    events = [UpdateEvent(schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
+    events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
 
     # 2. Act
     result = await driver.push(events, task_id="echo-sync-fs", agent_id="test-agent", is_snapshot_end=True)
@@ -129,10 +112,10 @@ async def test_echo_pusher_maintains_statistics():
     driver = EchoDriver("test-stats", config)
     
     # First batch of events
-    events1 = [UpdateEvent(schema="test", table="test", rows=[{"id": 1}, {"id": 2}])]
+    events1 = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1}, {"id": 2}])]
     
     # Second batch of events
-    events2 = [UpdateEvent(schema="test", table="test", rows=[{"id": 3}])]
+    events2 = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 3}])]
 
     # 2. Act
     result1 = await driver.push(events1, task_id="echo-task-1", agent_id="test-agent")

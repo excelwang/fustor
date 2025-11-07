@@ -9,6 +9,7 @@ from .file_directory_parser import DirectoryStructureParser
 import logging
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession  # Keep import for compatibility with function signatures
+from fustor_event_model.models import EventBase # Added EventBase import
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ _cache_lock = asyncio.Lock()
 class EventParser(Protocol):
     """Protocol defining the interface for event parsers"""
     
-    async def process_event(self, event: Dict[str, Any]) -> bool:
+    async def process_event(self, event: EventBase) -> bool:
         """Process a single event and update the data view"""
         ...
     
@@ -52,7 +53,7 @@ class ParserManager:
             )
             self.logger.info(f"Parser initialized for datastore {self.datastore_id}")
     
-    async def process_event(self, event: Dict[str, Any]) -> Dict[str, bool]:
+    async def process_event(self, event: EventBase) -> Dict[str, bool]:
         """Process an event with all applicable parsers and return results"""
         results = {}
         
@@ -114,7 +115,7 @@ async def get_cached_parser_manager(datastore_id: int) -> 'ParserManager':
 
 
 # Interface for processing events
-async def process_event(event: Dict[str, Any], datastore_id: int) -> Dict[str, bool]:
+async def process_event(event: EventBase, datastore_id: int) -> Dict[str, bool]:
     """Process a single event with all available parsers"""
     logger.info(f"Processing single event in manager for datastore {datastore_id}")
     # Use the cached manager for processing events to keep the in-memory view consistent

@@ -1,26 +1,12 @@
 import asyncio
 import time
 from typing import Dict, Optional
-from datetime import datetime
-from dataclasses import dataclass
 import logging
+from fustor_fusion_sdk.interfaces import SessionManagerInterface, SessionInfo # Import the interface and SessionInfo
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class SessionInfo:
-    session_id: str
-    datastore_id: int
-    last_activity: float
-    created_at: float
-    task_id: Optional[str] = None  # 该session关联的task_id
-    allow_concurrent_push: Optional[bool] = None
-    session_timeout_seconds: Optional[int] = None
-    client_ip: Optional[str] = None  # 该session的客户端IP
-    cleanup_task: Optional[asyncio.Task] = None  # Reference to the cleanup task for this session
-
-
-class SessionManager:
+class SessionManager(SessionManagerInterface): # Inherit from the interface
     """
     内存中的session管理器，用于跟踪所有活跃的session
     """

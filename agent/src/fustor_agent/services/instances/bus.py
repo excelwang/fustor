@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from fustor_agent.services.drivers.source_driver import SourceDriverService
 
 logger = logging.getLogger("fustor_agent")
+from fustor_agent_sdk.interfaces import EventBusServiceInterface # Import the interface
 
 class EventBusInstanceRuntime:
     def __init__(self, source_id, source_config: SourceConfig, source_signature: Any, source_driver_service: "SourceDriverService", initial_start_position: int = 0, loop: Optional[asyncio.AbstractEventLoop] = None):
@@ -194,7 +195,7 @@ class EventBusInstanceRuntime:
             statistics=self.statistics
         )
 
-class EventBusService(BaseInstanceService):
+class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit from the interface
     def __init__(self, source_configs: Dict[str, SourceConfig], source_driver_service: "SourceDriverService"):
         super().__init__()
         self.source_configs = source_configs

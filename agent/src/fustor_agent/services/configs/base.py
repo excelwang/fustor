@@ -8,12 +8,13 @@ from fustor_agent.services.common import config_lock
 from fustor_agent.services.instances.sync import SyncInstanceService
 from fustor_core.models.states import SyncState
 from fustor_core.exceptions import ConfigError, NotFoundError, ConflictError
+from fustor_agent_sdk.interfaces import BaseConfigService # Import the interface
 
 logger = logging.getLogger("fustor_agent")
 
 T = TypeVar('T') # 用于泛型类型提示
 
-class BaseConfigService(Generic[T]):
+class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the interface
     """
     一个通用的配置管理服务基类，封装了对配置项的CRUD、启用/禁用等通用逻辑。
     """

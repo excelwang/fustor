@@ -69,8 +69,8 @@ async def test_bus_producer_loop_and_transient_error(source_config, mock_source_
     mock_driver_instance._stop_driver_event = threading.Event()
     # The mock iterator that will produce more events than the queue can handle
     def mock_iterator(*args, **kwargs):
-        yield InsertEvent(schema="s", table="t", rows=[{"id": 1}], index=1)
-        yield InsertEvent(schema="s", table="t", rows=[{"id": 2}], index=2)
+        yield InsertEvent(event_schema="s", table="t", rows=[{"id": 1}], index=1)
+        yield InsertEvent(event_schema="s", table="t", rows=[{"id": 2}], index=2)
     
     # The mock driver must return only the iterator (new format)
     mock_driver_instance.get_message_iterator.return_value = mock_iterator()
