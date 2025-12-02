@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fustor Bio-Fusion Demo - Unified Directory API Explorer</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Vue.js 3 -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+    <!-- Axios for HTTP requests -->
+    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
+    <style>
+        body {
+            background-color: #212529; /* Dark background */
+            color: #f8f9fa; /* Light text */
+        }
+        .container-fluid {
+            padding-top: 20px;
+        }
+        .card {
+            background-color: #343a40; /* Darker card background */
+            border-color: #495057;
+            margin-bottom: 15px;
+        }
+        .card-header {
+            background-color: #495057;
+            color: #f8f9fa;
+        }
+        .btn-primary {
+            background-color: #007bff;
+            border-color: #007bff;
+        }
+        .btn-primary:hover {
+            background-color: #0056b3;
+            border-color: #0056b3;
+        }
+        .list-group-item {
+            background-color: #343a40;
+            color: #f8f9fa;
+            border-color: #495057;
+        }
+        .badge {
+            font-size: 0.75em;
+            padding: 0.4em 0.6em;
+            border-radius: 0.25rem;
+        }
+        .badge-mysql { background-color: #6c757d; } /* Grey */
+        .badge-nfs_hot { background-color: #dc3545; } /* Red */
+        .badge-nfs_cold { background-color: #17a2b8; } /* Cyan */
+        .badge-oss { background-color: #ffc107; } /* Yellow */
+        .badge-es { background-color: #28a745; } /* Green */
+        .badge-system { background-color: #007bff; } /* Blue */
+
+        .json-output {
+            background-color: #282c34;
+            color: #abb2bf;
+            padding: 15px;
+            border-radius: 5px;
+            overflow-x: auto;
+            font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, Courier, monospace;
+        }
+        pre { margin: 0; }
+        .log-entry {
+            font-size: 0.85em;
+            color: #adb5bd;
+        }
+    </style>
+</head>
+<body>
+    <div id="app" class="container-fluid">
+        <h1 class="mb-4 text-center text-primary">Fustor Bio-Fusion Demo - Unified Directory API Explorer</h1>
+        <div class="row">
+            <!-- Left Panel: Source Controls -->
+            <div class="col-md-4">
+                <h3 class="mb-3">Source Controls (Simulated Agents)</h3>
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        MySQL (Projects)
+                        <span class="badge bg-success">Online</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="input-group mb-3">
+                            <input type="text" class="form-control" v-model="mysqlProjectName" placeholder="Project Name">
+                            <button class="btn btn-primary" @click="triggerMock('mysql_project', {project_name: mysqlProjectName})">Create Project</button>
+                        </div>
+                        <small class="text-muted">New project: {{ mysqlProjectName }}</small>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        NFS Hot (Raw Data)
+                        <span class="badge bg-success">Online</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="input-group mb-3">
+                            <input type="text" class="form-control" v-model="nfsHotProjectId" placeholder="Project ID">
+                            <input type="text" class="form-control" v-model="nfsHotFilename" placeholder="Filename">
+                            <input type="number" class="form-control" v-model.number="nfsHotSize" placeholder="Size (MB)">
+                            <button class="btn btn-primary" @click="triggerMock('nfs_hot_file', {project_id: nfsHotProjectId, filename: nfsHotFilename, size_mb: nfsHotSize})">Add File</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        NFS Cold (Archived Data)
+                        <span class="badge bg-success">Online</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="input-group mb-3">
+                            <input type="text" class="form-control" v-model="nfsColdProjectId" placeholder="Project ID">
+                            <input type="text" class="form-control" v-model="nfsColdFilename" placeholder="Filename">
+                            <input type="number" class="form-control" v-model.number="nfsColdSize" placeholder="Size (GB)">
+                            <button class="btn btn-primary" @click="triggerMock('nfs_cold_file', {project_id: nfsColdProjectId, filename: nfsColdFilename, size_gb: nfsColdSize})">Archive File</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        OSS (Public Datasets)
+                        <span class="badge bg-success">Online</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="input-group mb-3">
+                            <input type="text" class="form-control" v-model="ossProjectId" placeholder="Project ID">
+                            <input type="text" class="form-control" v-model="ossDatasetName" placeholder="Dataset Name">
+                            <input type="text" class="form-control" v-model="ossPublicUrl" placeholder="Public URL">
+                            <button class="btn btn-primary" @click="triggerMock('oss_dataset', {project_id: ossProjectId, dataset_name: ossDatasetName, public_url: ossPublicUrl})">Add Dataset Link</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        ES (PubMed Publications)
+                        <span class="badge bg-success">Online</span>
+                    </div>
+                    <div class="card-body">
+                        <div class="input-group mb-3">
+                            <input type="text" class="form-control" v-model="esProjectId" placeholder="Project ID">
+                            <input type="text" class="form-control" v-model="esTitle" placeholder="Title">
+                            <input type="text" class="form-control" v-model="esPubmedId" placeholder="PubMed ID">
+                            <button class="btn btn-primary" @click="triggerMock('es_publication', {project_id: esProjectId, title: esTitle, pubmed_id: esPubmedId})">Add Publication</button>
+                        </div>
+                    </div>
+                </div>
+                <div class="d-grid gap-2">
+                    <button class="btn btn-warning" @click="clearStore">Clear All Data</button>
+                </div>
+            </div>
+
+            <!-- Right Panel: Unified Directory API Explorer -->
+            <div class="col-md-8">
+                <h3 class="mb-3">Unified Directory API Explorer</h3>
+                <div class="card mb-3">
+                    <div class="card-header">API Endpoint</div>
+                    <div class="card-body">
+                        <div class="input-group">
+                            <span class="input-group-text">GET</span>
+                            <input type="text" class="form-control" :value="apiEndpoint" readonly>
+                            <select class="form-select" v-model="selectedProjectId" @change="fetchData">
+                                <option value="ALL">ALL Projects</option>
+                                <option v-for="proj in currentProjects" :value="proj.id">{{ proj.name }}</option>
+                            </select>
+                            <button class="btn btn-primary" @click="fetchData">Refresh</button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h4>API Response</h4>
+                    <div>
+                        <button class="btn btn-sm btn-outline-light me-2" @click="toggleView('table')" :class="{'active': currentView === 'table'}">Table View</button>
+                        <button class="btn btn-sm btn-outline-light" @click="toggleView('json')" :class="{'active': currentView === 'json'}">JSON View</button>
+                    </div>
+                </div>
+
+                <div v-if="loading" class="text-center text-info mb-3">Loading...</div>
+                <div v-if="error" class="alert alert-danger">{{ error }}</div>
+
+                <div v-if="currentView === 'table'" class="table-responsive">
+                    <table class="table table-dark table-striped table-hover">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Type</th>
+                                <th>Logical Path</th>
+                                <th>Source</th>
+                                <th>Size</th>
+                                <th>Last Modified</th>
+                                <th>URL / Details</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr v-if="!unifiedDirectory.length && !loading">
+                                <td colspan="7" class="text-center text-muted">No data available. Create some projects and items!</td>
+                            </tr>
+                            <template v-for="item in sortedDirectory" :key="item.id">
+                                <tr :class="{'table-info': item.isNew}">
+                                    <td>
+                                        <i :class="getIcon(item.type)" class="me-2"></i>
+                                        {{ item.name }}
+                                    </td>
+                                    <td>
+                                        <span :class="getBadgeClass(item.type)">{{ item.type }}</span>
+                                    </td>
+                                    <td>{{ item.path }}</td>
+                                    <td>
+                                        <span :class="getBadgeClass(item.source_type)">{{ item.source_type }}</span>
+                                    </td>
+                                    <td>{{ formatSize(item.size) }}</td>
+                                    <td>{{ formatDateTime(item.last_modified) }}</td>
+                                    <td>
+                                        <a v-if="item.url" :href="item.url" target="_blank" class="text-info">{{ item.url.length > 30 ? item.url.substring(0,27) + '...' : item.url }}</a>
+                                        <span v-else-if="item.extra_metadata">{{ JSON.stringify(item.extra_metadata).substring(0, 50) + '...' }}</span>
+                                        <span v-else>-</span>
+                                    </td>
+                                </tr>
+                            </template>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div v-if="currentView === 'json'" class="json-output">
+                    <pre>{{ JSON.stringify(unifiedDirectory, null, 2) }}</pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const app = Vue.createApp({
+            data() {
+                return {
+                    apiBaseUrl: window.location.origin,
+                    unifiedDirectory: [],
+                    currentProjects: [],
+                    selectedProjectId: 'ALL',
+                    loading: false,
+                    error: null,
+                    currentView: 'table', // 'table' or 'json'
+
+                    // Mock agent input fields
+                    mysqlProjectName: 'Project_Gamma',
+                    nfsHotProjectId: 'project_alpha',
+                    nfsHotFilename: 'sequencing_results.fastq',
+                    nfsHotSize: 100,
+                    nfsColdProjectId: 'project_alpha',
+                    nfsColdFilename: 'archived_run_001.bam',
+                    nfsColdSize: 50,
+                    ossProjectId: 'project_alpha',
+                    ossDatasetName: 'public_ref_genome.fasta',
+                    ossPublicUrl: 'https://public-data.oss.com/ref_genome.fasta',
+                    esProjectId: 'project_alpha',
+                    esTitle: 'New Cancer Marker Discovery',
+                    esPubmedId: '38123456',
+                };
+            },
+            computed: {
+                apiEndpoint() {
+                    let endpoint = `${this.apiBaseUrl}/api/unified_directory`;
+                    if (this.selectedProjectId) {
+                        endpoint += `?project_id=${this.selectedProjectId}`;
+                    }
+                    return endpoint;
+                },
+                sortedDirectory() {
+                    const projects = this.unifiedDirectory.filter(item => item.type === 'directory');
+                    const items = this.unifiedDirectory.filter(item => item.type !== 'directory');
+
+                    let sortedItems = items.sort((a, b) => {
+                        const pathA = a.path || a.name;
+                        const pathB = b.path || b.name;
+                        return pathA.localeCompare(pathB);
+                    });
+
+                    // If "ALL Projects" is selected, group by project_id and display projects first
+                    if (this.selectedProjectId === 'ALL') {
+                        let result = [];
+                        projects.forEach(proj => {
+                            result.push(proj);
+                            result.push(...sortedItems.filter(item => item.project_id === proj.id));
+                        });
+                        return result;
+                    }
+                    return sortedItems;
+                }
+            },
+            methods: {
+                async fetchData() {
+                    this.loading = true;
+                    this.error = null;
+                    try {
+                        const response = await axios.get(this.apiEndpoint);
+                        this.unifiedDirectory = response.data;
+                        this.updateProjectList();
+                    } catch (err) {
+                        this.error = 'Failed to fetch data: ' + (err.response?.data?.detail || err.message);
+                    } finally {
+                        this.loading = false;
+                    }
+                },
+                async triggerMock(endpoint, data) {
+                    this.loading = true;
+                    this.error = null;
+                    try {
+                        const response = await axios.post(`${this.apiBaseUrl}/api/mock/${endpoint}`, data);
+                        console.log(`Triggered mock ${endpoint}:`, response.data);
+                        // Refresh data after trigger
+                        await this.fetchData();
+                    } catch (err) {
+                        this.error = 'Failed to trigger mock event: ' + (err.response?.data?.detail || err.message);
+                    } finally {
+                        this.loading = false;
+                    }
+                },
+                async clearStore() {
+                    this.loading = true;
+                    this.error = null;
+                    try {
+                        await axios.post(`${this.apiBaseUrl}/api/clear_store`);
+                        await this.fetchData();
+                        alert('Demo store cleared!');
+                    } catch (err) {
+                        this.error = 'Failed to clear store: ' + (err.response?.data?.detail || err.message);
+                    } finally {
+                        this.loading = false;
+                    }
+                },
+                toggleView(view) {
+                    this.currentView = view;
+                },
+                formatSize(bytes) {
+                    if (bytes === null || bytes === undefined) return '-';
+                    if (bytes === 0) return '0 Bytes';
+                    const k = 1024;
+                    const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+                    const i = Math.floor(Math.log(bytes) / Math.log(k));
+                    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+                },
+                formatDateTime(isoString) {
+                    if (!isoString) return '-';
+                    const date = new Date(isoString);
+                    return date.toLocaleString();
+                },
+                getBadgeClass(sourceType) {
+                    return `badge badge-${sourceType.toLowerCase().replace(/[^a-z0-9]/g, '_')}`;
+                },
+                getIcon(itemType) {
+                    switch (itemType) {
+                        case 'directory': return 'bi bi-folder-fill'; // Bootstrap Icons
+                        case 'file': return 'bi bi-file-earmark';
+                        case 'link': return 'bi bi-link-45deg';
+                        case 'metadata': return 'bi bi-journal-richtext';
+                        default: return 'bi bi-question-circle';
+                    }
+                },
+                updateProjectList() {
+                    // Filter out unique projects that are of type 'directory'
+                    const uniqueProjects = {};
+                    this.unifiedDirectory.forEach(item => {
+                        if (item.type === 'directory') {
+                            uniqueProjects[item.id] = { id: item.id, name: item.name };
+                        }
+                    });
+                    this.currentProjects = Object.values(uniqueProjects);
+                }
+            },
+            mounted() {
+                this.fetchData();
+                // Fetch data every 5 seconds to simulate real-time updates
+                setInterval(this.fetchData, 5000); 
+            }
+        });
+
+        app.mount('#app');
+    </script>
+    <!-- Bootstrap Icons (Optional, for better icons) -->
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.3/font/bootstrap-icons.css">
+    <!-- Bootstrap JS (Optional, if you need interactive components like modals) -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

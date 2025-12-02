@@ -16,7 +16,8 @@ members = [
     "packages/source_fs",
     "packages/source_mysql",
     "packages/source_oss",
-    "packages/web_ui"
+    "packages/web_ui",
+    "packages/demo_bio_fusion"
 ]
 
 [tool.uv.sources]
@@ -37,6 +38,7 @@ fustor-source-fs = { workspace = true }
 fustor-source-mysql = { workspace = true }
 fustor-source-oss = { workspace = true }
 fustor-web-ui = { workspace = true }
+fustor-demo = { workspace = true }
 
 [tool.pytest.ini_options]
 pythonpath = [
@@ -50,7 +52,8 @@ pythonpath = [
     "packages/source_fs/src",
     "packages/source_mysql/src",
     "packages/source_oss/src",
-    "packages/web_ui/src"
+    "packages/web_ui/src",
+    "packages/demo_bio_fusion/src"
 ]
 testpaths = [
     "agent/tests",
