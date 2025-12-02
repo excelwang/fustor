@@ -24,7 +24,7 @@ class AMQPQueueConfig(BaseModel):
     
 class PollingQueueConfig(BaseModel):
     """Configuration for polling-based incremental sync."""
-    interval_seconds: int = Field(30, ge=5, description="Polling interval in seconds.")
+    interval_seconds: int = Field(30, ge=1, description="Polling interval in seconds.")
 
 class OssDriverParams(BaseModel):
     """

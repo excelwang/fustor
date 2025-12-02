@@ -1,4 +1,5 @@
 import logging
+import asyncio
 from typing import Dict, Any, Iterator, Tuple, Optional
 import boto3
 from botocore.exceptions import ClientError
