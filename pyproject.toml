@@ -4,11 +4,18 @@ members = [
     "fusion",
     "registry",
     "packages/core",
+    "packages/fustor_agent_sdk",
+    "packages/fustor_cli",
+    "packages/fustor_common",
+    "packages/fustor_event_model",
+    "packages/fustor_fusion_sdk",
+    "packages/fustor_registry_client",
     "packages/pusher_echo",
     "packages/pusher_openapi",
     "packages/source_elasticsearch",
     "packages/source_fs",
     "packages/source_mysql",
+    "packages/source_oss",
     "packages/web_ui"
 ]
 
@@ -17,11 +24,18 @@ fustor-agent = { workspace = true }
 fustor-fusion = { workspace = true }
 fustor-registry = { workspace = true }
 fustor-core = { workspace = true }
+fustor-agent-sdk = { workspace = true }
+fustor-cli = { workspace = true }
+fustor-common = { workspace = true }
+fustor-event-model = { workspace = true }
+fustor-fusion-sdk = { workspace = true }
+fustor-registry-client = { workspace = true }
 fustor-pusher-echo = { workspace = true }
 fustor-pusher-openapi = { workspace = true }
 fustor-source-elasticsearch = { workspace = true }
 fustor-source-fs = { workspace = true }
 fustor-source-mysql = { workspace = true }
+fustor-source-oss = { workspace = true }
 fustor-web-ui = { workspace = true }
 
 [tool.pytest.ini_options]
@@ -35,14 +49,24 @@ pythonpath = [
     "packages/source_elasticsearch/src",
     "packages/source_fs/src",
     "packages/source_mysql/src",
+    "packages/source_oss/src",
     "packages/web_ui/src"
 ]
 testpaths = [
     "agent/tests",
     "fusion/tests",
     "registry/tests",
-    "packages/*/tests"
+    "packages/*/tests",
+    "packages/source_oss/tests"
 ]
 addopts = "-v --tb=short"
 asyncio_default_fixture_loop_scope = "function"
 norecursedirs = ["tests"]
+
+[dependency-groups]
+dev = [
+    "freezegun>=1.5.5",
+    "moto[s3]>=5.1.18",
+    "pytest>=8.4.2",
+    "pytest-asyncio>=1.2.0",
+]
