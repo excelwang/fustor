@@ -17,6 +17,8 @@ from fustor_demo.mock_agents import (
     mock_es_add_publication
 )
 
+from fustor_demo.auto_generator import generator
+
 logger = logging.getLogger("fustor_demo")
 
 # Get the directory where main.py is located
@@ -32,6 +34,14 @@ app = FastAPI(
     description="Demonstrates unified directory service from 5 heterogeneous data sources.",
     version="0.1.0",
 )
+
+@app.on_event("startup")
+async def startup_event():
+    await generator.start()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    await generator.stop()
 
 # Mount static files to serve the frontend UI
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
