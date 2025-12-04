@@ -15,7 +15,8 @@ dependencies = [
     "pydantic-settings",
     "sqlalchemy",
     "httpx",
-    "fustor_registry_client"
+    "fustor_registry_client",
+    "python-json-logger>=4.0.0",
 ]
 
 
