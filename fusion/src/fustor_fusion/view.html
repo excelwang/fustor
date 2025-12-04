@@ -3,450 +3,763 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>实时元数据整合演示</title>
+    <title>Fustor Fusion 监控仪表盘</title>
     <style>
-        /* CSS样式与您提供的一致，此处省略以保持简洁 */
         :root {
             --font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-            --color-bg: #f4f7f6;
-            --color-panel-bg: #ffffff;
-            --color-header-text: #1a237e; /* 学术深蓝 */
-            --color-text-primary: #212121;
-            --color-text-secondary: #5f6368;
-            --color-border: #dfe1e5;
-            --color-live: #d93025; /* 红色 "Live" 状态 */
-            --color-latency-good: #34a853;
-            --color-latency-medium: #fbbc04;
-            --color-latency-bad: #ea4335;
-            --icon-folder: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='%235f6368' viewBox='0 0 16 16'%3E%3Cpath d='M.54 3.87.5 3a2 2 0 0 1 2-2h3.672a2 2 0 0 1 1.414.586l.828.828A2 2 0 0 0 9.828 3h3.982a2 2 0 0 1 2 2v1h-16v-1a2 2 0 0 1 2-2h.54zM0 6v7a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V6H0z'/%3E%3C/svg%3E");
-            --icon-file: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='%235f6368' viewBox='0 0 16 16'%3E%3Cpath d='M4 0h8a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V2a2 2 0 0 1 2-2zm0 1a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1H4z'/%3E%3C/svg%3E");
+            --color-bg: #f0f2f5;
+            --color-card-bg: #ffffff;
+            --color-primary: #1890ff;
+            --color-text-main: #000000d9;
+            --color-text-secondary: #00000073;
+            --color-border: #d9d9d9;
+            --color-success: #52c41a;
+            --color-warning: #faad14;
+            --color-error: #f5222d;
+            --shadow-card: 0 1px 2px -2px rgba(0, 0, 0, 0.16), 0 3px 6px 0 rgba(0, 0, 0, 0.12), 0 5px 12px 4px rgba(0, 0, 0, 0.09);
         }
-        body { font-family: var(--font-family); background-color: var(--color-bg); margin: 0; padding: 1rem; color: var(--color-text-primary); display: flex; min-height: calc(100vh - 2rem); overflow: hidden; }
-        main { display: flex; flex-grow: 1; gap: 1.5rem; width: 100%; }
-        main > .panel.gsa-panel { flex: 2; }
-        main > .panel.stats-panel { flex: 1; }
-        .panel { display: flex; flex-direction: column; background: var(--color-panel-bg); border: 1px solid var(--color-border); border-radius: 8px; box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04), 0 1px 2px rgba(0, 0, 0, 0.06); overflow: hidden; }
-        .panel-header { padding: 1rem 1.5rem; border-bottom: 1px solid var(--color-border); display: flex; justify-content: space-between; align-items: center; flex-shrink: 0; }
-        .panel-header h2 { margin: 0; color: var(--color-header-text); font-weight: 600; }
-        .status-indicator { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8rem; font-weight: 500; color: var(--color-live); }
-        .status-indicator::before { content: ''; width: 8px; height: 8px; background-color: var(--color-live); border-radius: 50%; animation: pulse 1s infinite; }
-        @keyframes pulse { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
-        .content-area { flex-grow: 1; padding: 1.5rem; overflow-y: auto; font-size: 0.9rem; line-height: 1.5; }
-        .loading-text, .error-text, .no-data { color: var(--color-text-secondary); font-style: italic; }
-        .error-text { color: var(--color-live); font-weight: 500; }
-        .tree-view { font-family: "Menlo", "Consolas", monospace; }
-        .tree-item { display: flex; align-items: center; padding: 0.15rem 0; white-space: nowrap; }
-        .tree-children.collapsed { display: none; }
-        .tree-caret { width: 16px; height: 16px; flex-shrink: 0; cursor: pointer; background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' fill='%235f6368' viewBox='0 0 16 16'%3E%3Cpath fill-rule='evenodd' d='M4.646 1.646a.5.5 0 0 1 .708 0l6 6a.5.5 0 0 1 0 .708l-6 6a.5.5 0 0 1-.708-.708L10.293 8 4.646 2.354a.5.5 0 0 1 0-.708z'/%3E%3C/svg%3E"); background-repeat: no-repeat; background-position: center; transition: transform 0.2s ease-in-out; }
-        .tree-caret.expanded { transform: rotate(90deg); }
-        .tree-placeholder { width: 16px; height: 16px; flex-shrink: 0; }
-        .tree-item .icon { width: 16px; height: 16px; flex-shrink: 0; margin: 0 0.25rem; }
-        .tree-item.type-folder .icon { background: var(--icon-folder) no-repeat center center; }
-        .tree-item.type-file .icon { background: var(--icon-file) no-repeat center center; }
-        .tree-item.type-folder .name { font-weight: 600; }
-        .stats-panel .content-area { display: flex; flex-direction: column; gap: 1.5rem; background-color: #f8f9fa; }
-        .stat-card { background-color: var(--color-panel-bg); border: 1px solid var(--color-border); border-radius: 6px; padding: 1rem; }
-        .stat-card h4 { margin: 0 0 0.5rem 0; font-weight: 500; font-size: 0.9rem; color: var(--color-text-secondary); }
-        .stat-card .value { font-family: "Menlo", "Consolas", monospace; font-weight: 600; font-size: 1.75rem; color: var(--color-header-text); }
-        .stat-card .unit { font-size: 0.8rem; margin-left: 0.5rem; color: var(--color-text-secondary); }
-        .stat-bar-container { background-color: #e9ecef; border-radius: 4px; height: 8px; margin-top: 1rem; overflow: hidden; }
-        .stat-bar { height: 100%; width: 0%; border-radius: 4px; background-color: var(--color-latency-good); transition: width 0.3s ease-out, background-color 0.3s ease-out; }
-        .stat-bar.latency-good { background-color: var(--color-latency-good); }
-        .stat-bar.latency-medium { background-color: var(--color-latency-medium); }
-        .stat-bar.latency-bad { background-color: var(--color-latency-bad); }
-        .staleness-grid { font-family: "Menlo", "Consolas", monospace; font-size: 0.85rem; display: grid; grid-template-columns: auto 1fr; gap: 0.75rem 1rem; align-items: center; }
-        .staleness-grid .level-label { font-weight: 500; color: var(--color-text-secondary); }
-        .staleness-grid .level-value { font-weight: 600; color: var(--color-text-primary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .staleness-grid .level-value .days { color: var(--color-header-text); margin-left: 0.5rem; }
-        .panel-header .header-controls { display: flex; align-items: center; }
-        .control-btn { margin-right: 1rem; padding: 0.3rem 0.8rem; border: 1px solid var(--color-border); border-radius: 4px; background-color: #f8f9fa; cursor: pointer; font-size: 0.8rem; color: var(--color-text-secondary); transition: background-color 0.2s; }
-        .control-btn:hover { background-color: #e9ecef; }
+
+        body {
+            font-family: var(--font-family);
+            background-color: var(--color-bg);
+            margin: 0;
+            padding: 0;
+            color: var(--color-text-main);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* 1. 顶部导航栏 */
+        .app-header {
+            background-color: #001529;
+            color: white;
+            padding: 0 24px;
+            height: 64px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+        }
+
+        .app-header .brand h1 {
+            margin: 0;
+            font-size: 1.25rem;
+            font-weight: 600;
+            letter-spacing: 1px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .app-header .brand .logo-icon {
+            font-size: 1.5rem;
+        }
+
+        .app-header .controls {
+            display: flex;
+            align-items: center;
+            gap: 20px;
+        }
+
+        .api-key-wrapper {
+            display: flex;
+            gap: 8px;
+        }
+
+        input#api-key-input {
+            background: rgba(255,255,255,0.1);
+            border: 1px solid rgba(255,255,255,0.2);
+            color: white;
+            padding: 6px 12px;
+            border-radius: 4px;
+            outline: none;
+            width: 200px;
+            transition: all 0.3s;
+        }
+
+        input#api-key-input:focus {
+            background: rgba(255,255,255,0.2);
+            border-color: var(--color-primary);
+        }
+
+        button.btn-primary {
+            background-color: var(--color-primary);
+            border: none;
+            color: white;
+            padding: 6px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-weight: 500;
+            transition: background 0.3s;
+        }
+
+        button.btn-primary:hover {
+            background-color: #40a9ff;
+        }
+
+        .refresh-status {
+            font-size: 0.85rem;
+            color: rgba(255,255,255,0.8);
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .indicator {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: var(--color-text-secondary);
+        }
+
+        .indicator.live {
+            background-color: var(--color-success);
+            box-shadow: 0 0 8px var(--color-success);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.4; }
+            100% { opacity: 1; }
+        }
+
+        /* 主体布局 */
+        main {
+            flex: 1;
+            padding: 24px;
+            display: flex;
+            flex-direction: column;
+            gap: 24px;
+            max-width: 1200px;
+            margin: 0 auto;
+            width: 100%;
+            box-sizing: border-box;
+        }
+
+        /* 2. 拓扑图区域 */
+        .topology-section {
+            background: var(--color-card-bg);
+            border-radius: 8px;
+            padding: 40px;
+            min-height: 280px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            box-shadow: var(--shadow-card);
+            position: relative;
+            overflow: hidden;
+        }
+
+        .sources-column {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+            z-index: 2;
+            min-width: 150px;
+        }
+
+        .source-node {
+            background: #f9f9f9;
+            border: 2px solid #e8e8e8;
+            padding: 12px 16px;
+            border-radius: 6px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            transition: all 0.3s;
+            position: relative;
+        }
+        
+        .source-node.active {
+            border-color: var(--color-primary);
+            background: #e6f7ff;
+        }
+
+        .source-icon {
+            font-size: 1.2rem;
+        }
+
+        .source-name {
+            font-weight: 600;
+            font-size: 0.9rem;
+            color: var(--color-text-main);
+        }
+
+        .fusion-core {
+            z-index: 2;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            width: 140px;
+            height: 140px;
+            border-radius: 50%;
+            background: radial-gradient(circle, #1890ff 0%, #0050b3 100%);
+            color: white;
+            box-shadow: 0 0 20px rgba(24, 144, 255, 0.4);
+            position: relative;
+        }
+
+        .fusion-core::after {
+            content: '';
+            position: absolute;
+            top: -10px; bottom: -10px; left: -10px; right: -10px;
+            border: 2px dashed rgba(24, 144, 255, 0.3);
+            border-radius: 50%;
+            animation: spin 10s linear infinite;
+        }
+
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+
+        .core-icon { font-size: 2.5rem; margin-bottom: 5px; }
+        .core-label { font-weight: bold; font-size: 1rem; }
+        .core-status { font-size: 0.75rem; opacity: 0.8; text-transform: uppercase; margin-top: 4px;}
+
+        /* 连接线动画 */
+        .flow-lines {
+            position: absolute;
+            top: 0; left: 0; width: 100%; height: 100%;
+            z-index: 1;
+            pointer-events: none;
+        }
+        
+        .flow-line {
+            position: absolute;
+            height: 2px;
+            background: linear-gradient(90deg, transparent, var(--color-primary), transparent);
+            background-size: 50% 100%;
+            opacity: 0.3;
+            transform-origin: left center;
+        }
+
+        .flow-particle {
+            position: absolute;
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background-color: var(--color-primary);
+            box-shadow: 0 0 6px var(--color-primary);
+            offset-path: path('M0,0 L100,0'); /* Placeholder, set via JS */
+            animation: flow 1.5s linear infinite;
+        }
+        
+        @keyframes flow {
+            0% { offset-distance: 0%; opacity: 0; }
+            10% { opacity: 1; }
+            90% { opacity: 1; }
+            100% { offset-distance: 100%; opacity: 0; }
+        }
+
+        /* 3. 核心指标区域 */
+        .metrics-section {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
+        }
+
+        .metric-card {
+            background: var(--color-card-bg);
+            border-radius: 8px;
+            padding: 24px;
+            box-shadow: var(--shadow-card);
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            border-left: 4px solid transparent;
+        }
+        
+        .metric-card:nth-child(1) { border-left-color: #1890ff; }
+        .metric-card:nth-child(2) { border-left-color: #52c41a; }
+        .metric-card:nth-child(3) { border-left-color: #faad14; grid-column: span 1; } /* Adjusted for 3 cols */
+
+        .metric-header {
+            display: flex;
+            align-items: center;
+            margin-bottom: 16px;
+            color: var(--color-text-secondary);
+            font-size: 0.9rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .metric-header svg { margin-right: 8px; width: 16px; height: 16px; fill: currentColor; }
+
+        .metric-body {
+            display: flex;
+            align-items: baseline;
+        }
+
+        .metric-value {
+            font-size: 2.5rem;
+            font-weight: bold;
+            color: var(--color-text-main);
+            font-family: 'Roboto Mono', monospace;
+        }
+
+        .metric-unit {
+            margin-left: 8px;
+            color: var(--color-text-secondary);
+            font-size: 1rem;
+        }
+
+        .metric-footer {
+            margin-top: 12px;
+            font-size: 0.85rem;
+            color: var(--color-text-secondary);
+            display: flex;
+            align-items: center;
+        }
+
+        /* 特殊样式：陈旧度 */
+        .staleness-info {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        
+        .staleness-path {
+            font-family: 'Menlo', monospace;
+            background: #f5f5f5;
+            padding: 4px 8px;
+            border-radius: 4px;
+            font-size: 0.8rem;
+            color: #595959;
+            word-break: break-all;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 10px;
+            font-size: 0.75rem;
+            font-weight: 600;
+            margin-right: 8px;
+        }
+        
+        .badge.good { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
+        .badge.warn { background: #fffbe6; color: #faad14; border: 1px solid #ffe58f; }
+        .badge.bad { background: #fff1f0; color: #f5222d; border: 1px solid #ffa39e; }
+
+        /* 状态遮罩 */
+        .overlay {
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,0.5);
+            z-index: 1000;
+            display: none;
+            align-items: center;
+            justify-content: center;
+        }
+        
+        .overlay.active { display: flex; }
+        
+        .modal {
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            text-align: center;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+        }
+
     </style>
 </head>
 <body>
+
+    <header class="app-header">
+        <div class="brand">
+            <span class="logo-icon">⚡</span>
+            <h1>Fustor Fusion Monitor</h1>
+        </div>
+        <div class="controls">
+            <div class="api-key-wrapper">
+                <input type="password" id="api-key-input" placeholder="输入 API Key 以连接" />
+                <button id="btn-connect" class="btn-primary">连接</button>
+            </div>
+            <div class="refresh-status">
+                <span class="indicator" id="status-indicator"></span>
+                <span id="status-text">未连接</span>
+            </div>
+        </div>
+    </header>
+
     <main>
-        <div class="panel gsa-panel">
-            <div class="panel-header">
-                <h2>NFS实时目录视图</h2>
-                <div class="header-controls">
-                    <button id="toggle-refresh-btn" class="control-btn">停止刷新</button>
-                    <span class="status-indicator" id="gsa-status">LIVE</span>
+        <!-- 拓扑图 -->
+        <section class="topology-section" id="topology-container">
+            <div class="flow-lines" id="flow-canvas"></div>
+
+            <!-- 左侧源 -->
+            <div class="sources-column" id="sources-left">
+                <!-- 动态插入 -->
+            </div>
+
+            <!-- 中心节点 -->
+            <div class="fusion-core" id="fusion-center">
+                <div class="core-icon">⚙️</div>
+                <div class="core-label">FUSION</div>
+                <div class="core-status">ACTIVE</div>
+            </div>
+
+            <!-- 右侧源 -->
+            <div class="sources-column" id="sources-right">
+                <!-- 动态插入 -->
+            </div>
+        </section>
+
+        <!-- 核心指标 -->
+        <section class="metrics-section">
+            
+            <!-- 1. 数据量 -->
+            <div class="metric-card">
+                <div class="metric-header">
+                    <svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+                    总处理文件量
+                </div>
+                <div class="metric-body">
+                    <div class="metric-value" id="val-volume">--</div>
+                    <div class="metric-unit">Files</div>
+                </div>
+                <div class="metric-footer">
+                    累计摄入数据
                 </div>
             </div>
-            <div class="content-area" id="gsa-content">
-                <div class="loading-text">正在初始化并拉取数据...</div>
-            </div>
-        </div>
-        <div class="panel stats-panel">
-            <div class="panel-header">
-                <h2>实时统计</h2>
-            </div>
-            <div class="content-area">
-                <div class="stat-card">
-                    <h4>总数据量</h4>
-                    <div>
-                        <span class="value" id="stats-volume">--</span>
-                        <span class="unit" id="stats-volume-unit"></span>
-                    </div>
+
+            <!-- 2. 延迟 -->
+            <div class="metric-card">
+                <div class="metric-header">
+                    <svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+                    最新同步延迟
                 </div>
-                <div class="stat-card">
-                    <h4>同步延迟</h4>
-                    <div>
-                        <span class="value" id="stats-latency">--</span>
-                        <span class="unit">ms</span>
-                    </div>
-                    <div class="stat-bar-container">
-                        <div class="stat-bar" id="latency-bar"></div>
-                    </div>
+                <div class="metric-body">
+                    <div class="metric-value" id="val-latency">--</div>
+                    <div class="metric-unit">ms</div>
                 </div>
-                <div class="stat-card">
-                    <h4>文件夹陈旧状态</h4>
-                    <div class="staleness-grid">
-                        <span class="level-label">二级目录:</span><span class="level-value" id="staleness-level-2">--</span>
-                        <span class="level-label">三级目录:</span><span class="level-value" id="staleness-level-3">--</span>
-                        <span class="level-label">四级目录:</span><span class="level-value" id="staleness-level-4">--</span>
-                        <span class="level-label">五级目录:</span><span class="level-value" id="staleness-level-5">--</span>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <h4>剩余存储空间</h4>
-                    <div>
-                        <span class="value">N/A</span>
-                    </div>
+                <div class="metric-footer">
+                    <span class="badge" id="badge-latency">--</span> 实时状态
                 </div>
             </div>
-        </div>
+
+            <!-- 3. 陈旧度 -->
+            <div class="metric-card">
+                <div class="metric-header">
+                    <svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+                    最旧目录滞后
+                </div>
+                <div class="metric-body">
+                    <div class="metric-value" id="val-staleness-days">--</div>
+                    <div class="metric-unit">Days</div>
+                </div>
+                <div class="metric-footer staleness-info">
+                    <div class="staleness-path" id="val-staleness-path">等待数据...</div>
+                </div>
+            </div>
+
+        </section>
     </main>
+
+    <!-- 需要输入的提示模态框 -->
+    <div class="overlay" id="auth-overlay">
+        <div class="modal">
+            <h2>需要认证</h2>
+            <p>请输入 API Key 以连接到 Fusion 服务</p>
+            <!-- 复用顶部输入框逻辑，此处仅作为遮罩 -->
+        </div>
+    </div>
 
     <script>
         (function() {
-            // --- 1. API 配置 & DOM 引用 ---
-            const API_BASE_URL = '/ingest-api/v1/events';
-            const API_HEADERS = { 
-                'accept': 'application/json',
-                'x-api-key': 'JrL1Eee4bl2ZVDmQ-3YBx36SOXilL9EE77QhsjG1m-Q'
-            };
-            const eventsEl = document.getElementById('gsa-content');
-            let errorCount = 0;
+            // --- 配置与状态 ---
+            const API_BASE = '/ingest-api/v1/events';
+            // 注意：这里使用 MOCK 开关。如果后端准备好了，设为 false。
+            const MOCK_MODE = true; 
             
-            const STATS_API_URL = `${API_BASE_URL}/stats`;
-            const EVENTS_API_URL = `${API_BASE_URL}/latest/100`;
-            const STATS_POLLING_INTERVAL = 2000;
-            const EVENTS_POLLING_INTERVAL = 500;
-            
-            const statsVolumeEl = document.getElementById('stats-volume');
-            const statsVolumeUnitEl = document.getElementById('stats-volume-unit');
-            const statsLatencyEl = document.getElementById('stats-latency');
-            const latencyBarEl = document.getElementById('latency-bar');
-            const stalenessLevelEls = {
-                2: document.getElementById('staleness-level-2'),
-                3: document.getElementById('staleness-level-3'),
-                4: document.getElementById('staleness-level-4'),
-                5: document.getElementById('staleness-level-5'),
+            const state = {
+                apiKey: localStorage.getItem('fustor_api_key') || '',
+                isConnected: false,
+                pollingInterval: null,
+                sources: [], // 存储当前活跃源
+                lastSourceIds: ''
             };
 
-            // --- 2. 核心数据拉取函数 ---
-            async function fetchData(url) {
-                const response = await fetch(url, { method: 'GET', headers: API_HEADERS, mode: 'cors' });
-                if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
-                return await response.json();
-            }
+            // --- DOM 元素 ---
+            const els = {
+                apiKeyInput: document.getElementById('api-key-input'),
+                btnConnect: document.getElementById('btn-connect'),
+                statusIndicator: document.getElementById('status-indicator'),
+                statusText: document.getElementById('status-text'),
+                sourcesLeft: document.getElementById('sources-left'),
+                sourcesRight: document.getElementById('sources-right'),
+                fusionCenter: document.getElementById('fusion-center'),
+                flowCanvas: document.getElementById('flow-canvas'),
+                valVolume: document.getElementById('val-volume'),
+                valLatency: document.getElementById('val-latency'),
+                badgeLatency: document.getElementById('badge-latency'),
+                valStalenessDays: document.getElementById('val-staleness-days'),
+                valStalenessPath: document.getElementById('val-staleness-path'),
+            };
 
-            // --- 3. 渲染与交互逻辑 ---
-            function buildFileTree(data) {
-                const root = { type: 'root', children: {} };
-                for (const event of data) {
-                    let eventContent = event.content;
-                    // Handle the nested structure
-                    if (eventContent?.events?.content) {
-                        eventContent = eventContent.events.content;
-                    }
-
-                    // Now, eventContent is either a string (file path) or an object
-                    const filePath = typeof eventContent === 'string' ? eventContent : eventContent.file_path;
-
-                    if (!filePath) continue;
-
-                    const parts = filePath.split('/').filter(Boolean);
-                    let currentNode = root;
-                    for (let i = 0; i < parts.length; i++) {
-                        const part = parts[i];
-                        const isLastPart = i === parts.length - 1;
-                        if (!currentNode.children[part]) {
-                            currentNode.children[part] = isLastPart 
-                                ? { type: 'file', ...(typeof eventContent === 'object' ? eventContent : { file_path: filePath }) }
-                                : { type: 'folder', children: {} };
-                        }
-                        if (!isLastPart) {
-                            currentNode = currentNode.children[part];
-                        }
-                    }
-                }
-                return root;
-            }
-            
-            function renderTreeView(treeNode, depth = 0) {
-                const fragment = document.createDocumentFragment();
-                const childKeys = Object.keys(treeNode.children).sort((a, b) => a.localeCompare(b, undefined, {numeric: true}));
-                for (const key of childKeys) {
-                    const child = treeNode.children[key];
-                    const itemEl = document.createElement('div');
-                    itemEl.className = 'tree-item';
-                    itemEl.style.paddingLeft = `${depth * 24}px`;
-                    if (child.type === 'folder') {
-                        itemEl.classList.add('type-folder');
-                        const childrenId = `tree-children-${Math.random().toString(36).substring(2, 9)}`;
-                        const isCollapsed = depth >= 10;
-                        const caretClass = isCollapsed ? 'tree-caret' : 'tree-caret expanded';
-                        const childrenClass = isCollapsed ? 'tree-children collapsed' : 'tree-children';
-                        itemEl.innerHTML = `<span class="${caretClass}" data-target="${childrenId}"></span><span class="icon"></span><span class="name">${escapeHTML(key)}</span>`;
-                        fragment.appendChild(itemEl);
-                        const childrenContainer = document.createElement('div');
-                        childrenContainer.id = childrenId;
-                        childrenContainer.className = childrenClass;
-                        childrenContainer.appendChild(renderTreeView(child, depth + 1));
-                        fragment.appendChild(childrenContainer);
-                    } else {
-                        itemEl.classList.add('type-file');
-                        itemEl.innerHTML = `<span class="tree-placeholder"></span><span class="icon"></span><span class="name">${escapeHTML(key)}</span>`;
-                        fragment.appendChild(itemEl);
-                    }
-                }
-                return fragment;
-            }
-
-            function renderEventView(data) {
-                if (!data || data.length === 0) {
-                    eventsEl.innerHTML = '<div class="no-data">等待新的事件数据...</div>';
-                    return;
-                }
-                calculateAndRenderOtherStats(data);
-                const tree = buildFileTree(data);
-                eventsEl.innerHTML = '';
-                const treeViewContainer = document.createElement('div');
-                treeViewContainer.className = 'tree-view';
-                treeViewContainer.appendChild(renderTreeView(tree, 0));
-                eventsEl.appendChild(treeViewContainer);
-            }
-            
-            function renderError(error) {
-                errorCount++;
-                eventsEl.innerHTML = `<div class="error-text">数据拉取失败: ${escapeHTML(error.message)} (已连续失败 ${errorCount} 次)</div>`;
-                resetStats();
-            }
-
-            // --- 4. 统计计算与渲染 ---
-            function renderStats(statsData) {
-                const totalSize = statsData.total_size_bytes;
-                const formattedSize = formatBytes(totalSize);
-                statsVolumeEl.textContent = formattedSize.value;
-                statsVolumeUnitEl.textContent = formattedSize.unit;
-            }
-
-            function calculateAndRenderOtherStats(eventData) {
-                let syncLatency = null;
-                if (eventData && eventData.length > 0) {
-                    const latestEvent = eventData.reduce((latest, current) => 
-                        (!latest || new Date(current.created_at) > new Date(latest.created_at)) ? current : latest
-                    );
-
-                    let eventContent = latestEvent.content;
-                    if (eventContent?.events?.content) {
-                        eventContent = eventContent.events.content;
-                    }
-
-                    const modifiedTime = eventContent?.modified_time;
-
-                    if (latestEvent && latestEvent.created_at && modifiedTime) {
-                        
-                        // --- 核心修改在这里 ---
-                        // 1. 获取来自后端的、不带时区信息的 created_at 字符串
-                        let createdAtString = latestEvent.created_at;
-
-                        // 2. 检查字符串是否缺少时区信息 (不以'Z'结尾，且倒数第6位不是'+'或'-')
-                        if (!createdAtString.endsWith('Z') && !['+','-'].includes(createdAtString.slice(-6, -5))) {
-                            // 3. 假设该时间是后端服务器的CST (UTC+8)时区，手动为其补上时区偏移
-                            createdAtString += "+08:00";
-                        }
-                        
-                        // 4. 使用修正后的字符串创建Date对象
-                        const createdAt = new Date(createdAtString);
-                        const modifiedAt = new Date(modifiedTime * 1000);
-                        syncLatency = createdAt.getTime() - modifiedAt.getTime();
-                    }
-                }
-
-                if(syncLatency !== null) {
-                    statsLatencyEl.textContent = syncLatency;
-                    const maxLatencyForBar = 2000;
-                    const latencyPercentage = Math.min(100, (syncLatency / maxLatencyForBar) * 100);
-                    latencyBarEl.style.width = `${latencyPercentage}%`;
-                    latencyBarEl.className = 'stat-bar';
-                    if (syncLatency > 1500) latencyBarEl.classList.add('latency-bad');
-                    else if (syncLatency > 500) latencyBarEl.classList.add('latency-medium');
-                    else latencyBarEl.classList.add('latency-good');
+            // --- 初始化 ---
+            function init() {
+                if (state.apiKey) {
+                    els.apiKeyInput.value = state.apiKey;
+                    connect();
                 } else {
-                    statsLatencyEl.textContent = '--';
-                    latencyBarEl.style.width = '0%';
+                    updateStatus(false);
                 }
 
-                const stalenessResults = calculateStalenessByLevel(eventData);
-                for (let level = 2; level <= 5; level++) {
-                    const el = stalenessLevelEls[level];
-                    const result = stalenessResults[level];
-                    if (result) {
-                        el.innerHTML = `${escapeHTML(result.path)} <span class="days">(${result.days} 天)</span>`;
-                        el.title = `${result.path} (${result.days} 天未更新)`;
-                    } else {
-                        el.textContent = '无';
-                        el.title = '';
+                els.btnConnect.addEventListener('click', () => {
+                    const key = els.apiKeyInput.value.trim();
+                    if (key) {
+                        localStorage.setItem('fustor_api_key', key);
+                        state.apiKey = key;
+                        connect();
                     }
+                });
+            }
+
+            // --- 连接控制 ---
+            function connect() {
+                updateStatus(true, '连接中...');
+                if (state.pollingInterval) clearInterval(state.pollingInterval);
+                
+                // 立即执行一次
+                fetchStats();
+                
+                // 启动轮询
+                state.pollingInterval = setInterval(fetchStats, 3000);
+                state.isConnected = true;
+            }
+
+            function updateStatus(active, text) {
+                if (active) {
+                    els.statusIndicator.classList.add('live');
+                    els.statusText.textContent = text || '实时监控中';
+                } else {
+                    els.statusIndicator.classList.remove('live');
+                    els.statusText.textContent = text || '未连接';
                 }
             }
 
-            function calculateStalenessByLevel(data) {
-                const folderLatestTimes = new Map();
-                for (const event of data) {
-                    let eventContent = event.content;
-                    if (eventContent?.events?.content) {
-                        eventContent = eventContent.events.content;
+            // --- 数据获取 (Mock / Real) ---
+            async function fetchStats() {
+                try {
+                    let data;
+                    if (MOCK_MODE) {
+                        // 模拟 API 延迟
+                        await new Promise(r => setTimeout(r, 300)); 
+                        data = getMockData();
+                    } else {
+                        const res = await fetch(`${API_BASE}/stats`, {
+                            headers: { 
+                                'accept': 'application/json',
+                                'x-api-key': state.apiKey
+                            }
+                        });
+                        if (!res.ok) throw new Error('API Error');
+                        data = await res.json();
                     }
+                    
+                    render(data);
+                    updateStatus(true, '实时监控中');
+                } catch (e) {
+                    console.error(e);
+                    updateStatus(false, '连接失败');
+                }
+            }
 
-                    const filePath = eventContent?.file_path;
-                    const modifiedTime = eventContent?.modified_time;
-
-                    if (!filePath || !modifiedTime) continue;
-
-                    const fileModifiedDate = new Date(modifiedTime * 1000);
-                    const parts = filePath.split('/').filter(Boolean);
-                    let currentPath = '';
-                    for (let i = 0; i < parts.length - 1; i++) {
-                        currentPath += `/${parts[i]}`;
-                        const existingTime = folderLatestTimes.get(currentPath);
-                        if (!existingTime || fileModifiedDate > existingTime) {
-                            folderLatestTimes.set(currentPath, fileModifiedDate);
+            // --- 模拟数据生成器 ---
+            function getMockData() {
+                // 模拟数据波动
+                const baseVolume = 145200;
+                const randomInc = Math.floor(Math.random() * 10);
+                const latencyBase = 120;
+                const latencyNoise = Math.floor(Math.random() * 200) - 50; // -50 to 150
+                
+                return {
+                    // 模拟返回的活跃源列表
+                    sources: [
+                        { id: 'mysql_core_db', type: 'DB' },
+                        { id: 'oss_img_bucket', type: 'OSS' },
+                        { id: 'fs_logs_watcher', type: 'FS' }
+                    ],
+                    metrics: {
+                        total_volume: baseVolume + randomInc + Date.now() % 1000, // Fake increment
+                        latency_ms: Math.max(10, latencyBase + latencyNoise),
+                        oldest_directory: {
+                            path: '/data/archive/logs/2024/01',
+                            age_days: 42
                         }
                     }
-                }
-                const foldersByLevel = { 2: [], 3: [], 4: [], 5: [] };
-                for (const [path, time] of folderLatestTimes.entries()) {
-                    const level = path.split('/').length - 1;
-                    if (foldersByLevel[level]) {
-                        foldersByLevel[level].push({ path, time });
-                    }
-                }
-                const now = new Date();
-                const results = { 2: null, 3: null, 4: null, 5: null };
-                for (let level = 2; level <= 5; level++) {
-                    if (foldersByLevel[level].length > 0) {
-                        const oldest = foldersByLevel[level].reduce((oldest, current) => (current.time < oldest.time ? current : oldest));
-                        results[level] = { path: oldest.path, days: Math.floor((now - oldest.time) / 86400000) };
-                    }
-                }
-                return results;
-            }
-            
-            function resetStats() {
-                statsVolumeEl.textContent = '--';
-                statsVolumeUnitEl.textContent = '';
-                statsLatencyEl.textContent = '--';
-                latencyBarEl.style.width = '0%';
-                for (let level = 2; level <= 5; level++) {
-                    stalenessLevelEls[level].textContent = '--';
-                    stalenessLevelEls[level].title = '';
-                }
+                };
             }
 
-            // --- 5. 辅助工具 & 启动轮询 ---
-            function formatBytes(bytes, decimals = 2) {
-                if (bytes === 0) return { value: '0', unit: 'Bytes' };
-                const k = 1024;
-                const dm = decimals < 0 ? 0 : decimals;
-                const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB', 'PB'];
-                const i = Math.floor(Math.log(bytes) / Math.log(k));
-                return { value: parseFloat((bytes / Math.pow(k, i)).toFixed(dm)), unit: sizes[i] };
-            }
-            
-            function escapeHTML(str) {
-                if (str === null || str === undefined) return '';
-                return String(str).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m]);
-            }
-            
-            async function pollEvents() {
-                try {
-                    const eventData = await fetchData(EVENTS_API_URL);
-                    renderEventView(eventData);
-                    errorCount = 0;
-                } catch(error) {
-                    renderError(error);
-                }
+            // --- 渲染逻辑 ---
+            function render(data) {
+                renderMetrics(data.metrics);
+                renderTopology(data.sources);
             }
 
-            async function pollStats() {
-                try {
-                    const statsData = await fetchData(STATS_API_URL);
-                    renderStats(statsData);
-                } catch(error) {
-                    console.error("Failed to fetch stats:", error);
-                    resetStats();
-                }
+            function renderMetrics(metrics) {
+                // 1. Volume
+                els.valVolume.textContent = metrics.total_volume.toLocaleString();
+
+                // 2. Latency
+                const lat = metrics.latency_ms;
+                els.valLatency.textContent = lat;
+                
+                let badgeClass = 'good';
+                let badgeText = '健康';
+                if (lat > 1000) { badgeClass = 'warn'; badgeText = '缓慢'; }
+                if (lat > 5000) { badgeClass = 'bad'; badgeText = '阻塞'; }
+                
+                els.badgeLatency.className = `badge ${badgeClass}`;
+                els.badgeLatency.textContent = badgeText;
+                els.valLatency.style.color = badgeClass === 'good' ? 'var(--color-text-main)' : (badgeClass === 'warn' ? 'var(--color-warning)' : 'var(--color-error)');
+
+                // 3. Staleness
+                const stale = metrics.oldest_directory;
+                els.valStalenessDays.textContent = stale.age_days;
+                els.valStalenessPath.textContent = stale.path;
+                
+                const staleColor = stale.age_days > 30 ? 'var(--color-warning)' : 'var(--color-text-main)';
+                els.valStalenessDays.style.color = staleColor;
             }
-            
-            eventsEl.addEventListener('click', function (e) {
-                const caret = e.target.closest('.tree-caret');
-                if (!caret) return;
-                const targetId = caret.dataset.target;
-                const childrenContainer = document.getElementById(targetId);
-                if (childrenContainer) {
-                    caret.classList.toggle('expanded');
-                    childrenContainer.classList.toggle('collapsed');
+
+            function renderTopology(sources) {
+                // 检查源列表是否变化，如果没变就不重绘 DOM 以保持动画流畅
+                const sourceIds = sources.map(s => s.id).join(',');
+                if (state.lastSourceIds === sourceIds) return;
+                state.lastSourceIds = sourceIds;
+
+                els.sourcesLeft.innerHTML = '';
+                els.sourcesRight.innerHTML = '';
+                
+                // 清空连线
+                while (els.flowCanvas.firstChild) {
+                    els.flowCanvas.removeChild(els.flowCanvas.firstChild);
                 }
+
+                // 分配源到左右
+                sources.forEach((s, idx) => {
+                    const node = document.createElement('div');
+                    node.className = 'source-node active';
+                    node.id = `source-node-${idx}`;
+                    node.innerHTML = `
+                        <span class="source-icon">📦</span>
+                        <span class="source-name">${s.id}</span>
+                    `;
+
+                    if (idx % 2 === 0) {
+                        els.sourcesLeft.appendChild(node);
+                    } else {
+                        els.sourcesRight.appendChild(node);
+                    }
+                });
+
+                // 重绘连线 (需要等待 DOM 布局完成)
+                requestAnimationFrame(drawFlowLines);
+            }
+
+            function drawFlowLines() {
+                const centerRect = els.fusionCenter.getBoundingClientRect();
+                const centerPoint = {
+                    x: centerRect.left + centerRect.width / 2,
+                    y: centerRect.top + centerRect.height / 2
+                };
+
+                const containerRect = document.getElementById('topology-container').getBoundingClientRect();
+
+                const sourceNodes = document.querySelectorAll('.source-node');
+                sourceNodes.forEach(node => {
+                    const nodeRect = node.getBoundingClientRect();
+                    // 找最近的边缘点
+                    const isLeft = nodeRect.left < centerRect.left;
+                    
+                    const startPoint = {
+                        x: isLeft ? (nodeRect.right) : (nodeRect.left),
+                        y: nodeRect.top + nodeRect.height / 2
+                    };
+                    
+                    // 转换为相对于 container 的坐标
+                    const x1 = startPoint.x - containerRect.left;
+                    const y1 = startPoint.y - containerRect.top;
+                    const x2 = (isLeft ? centerRect.left : centerRect.right) - containerRect.left;
+                    const y2 = centerPoint.y - containerRect.top;
+
+                    // 创建连线 (SVG 或 CSS 变换)
+                    // 这里为了简单演示，使用带动画的 CSS 粒子
+                    createParticleFlow(x1, y1, x2, y2);
+                });
+            }
+
+            function createParticleFlow(x1, y1, x2, y2) {
+                // 计算角度和距离
+                const dx = x2 - x1;
+                const dy = y2 - y1;
+                const dist = Math.sqrt(dx*dx + dy*dy);
+                const angle = Math.atan2(dy, dx) * 180 / Math.PI;
+
+                // 容器
+                const lineContainer = document.createElement('div');
+                lineContainer.className = 'flow-line-container';
+                lineContainer.style.position = 'absolute';
+                lineContainer.style.left = `${x1}px`;
+                lineContainer.style.top = `${y1}px`;
+                lineContainer.style.width = `${dist}px`;
+                lineContainer.style.height = '2px'; // 厚度
+                lineContainer.style.transform = `rotate(${angle}deg)`;
+                lineContainer.style.transformOrigin = '0 0';
+                
+                // 背景线
+                const bgLine = document.createElement('div');
+                bgLine.style.width = '100%';
+                bgLine.style.height = '100%';
+                bgLine.style.background = 'var(--color-primary)';
+                bgLine.style.opacity = '0.1';
+                lineContainer.appendChild(bgLine);
+
+                // 粒子
+                const particle = document.createElement('div');
+                particle.className = 'flow-particle';
+                // 调整粒子动画，使其在直线上运动
+                particle.style.position = 'absolute';
+                particle.style.left = '0';
+                particle.style.top = '-2px'; // 居中
+                particle.style.animation = `flowParticle 1.5s linear infinite`;
+                
+                // 动态注入 keyframes 也可以，或者直接利用 left 0->100%
+                // 这里复用 CSS 中的 flow 定义，但需要 offset-path 支持较差，改用 left
+                particle.style.offsetPath = 'none'; // 覆盖默认
+                particle.style.animation = 'none';
+                // 使用 JS 简单动画或更通用的 CSS left 动画
+                particle.animate([
+                    { left: '0%', opacity: 0 },
+                    { opacity: 1, offset: 0.1 },
+                    { opacity: 1, offset: 0.9 },
+                    { left: '100%', opacity: 0 }
+                ], {
+                    duration: 1500 + Math.random() * 1000, // 随机速度
+                    iterations: Infinity
+                });
+
+                lineContainer.appendChild(particle);
+                els.flowCanvas.appendChild(lineContainer);
+            }
+
+            // 窗口大小改变时重绘连线
+            window.addEventListener('resize', () => {
+                // 清空旧线
+                 while (els.flowCanvas.firstChild) {
+                    els.flowCanvas.removeChild(els.flowCanvas.firstChild);
+                }
+                drawFlowLines();
             });
 
-            // 启动轮询控制
-            let eventsIntervalId = null;
-            let statsIntervalId = null;
-            let isPolling = false; 
-            const toggleRefreshBtn = document.getElementById('toggle-refresh-btn');
-            const gsaStatusEl = document.getElementById('gsa-status');
+            // 启动
+            init();
 
-            function startPolling() {
-                if (isPolling) return;
-
-                pollEvents();
-                pollStats();
-
-                eventsIntervalId = setInterval(pollEvents, EVENTS_POLLING_INTERVAL);
-                statsIntervalId = setInterval(pollStats, STATS_POLLING_INTERVAL);
-                
-                isPolling = true;
-                toggleRefreshBtn.textContent = '停止刷新';
-                gsaStatusEl.style.display = 'flex';
-            }
-
-            function stopPolling() {
-                if (!isPolling) return;
-
-                clearInterval(eventsIntervalId);
-                clearInterval(statsIntervalId);
-                eventsIntervalId = null;
-                statsIntervalId = null;
-                
-                isPolling = false;
-                toggleRefreshBtn.textContent = '开始刷新';
-                gsaStatusEl.style.display = 'none';
-            }
-
-            toggleRefreshBtn.addEventListener('click', () => {
-                if (isPolling) {
-                    stopPolling();
-                } else {
-                    startPolling();
-                }
-            });
-
-            // 启动轮询
-            startPolling();
         })();
     </script>
 </body>
