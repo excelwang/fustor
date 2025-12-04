@@ -15,11 +15,74 @@ from ..datastore_state_manager import datastore_state_manager
 from ..queue_integration import queue_based_ingestor, add_events_batch_to_queue, get_position_from_queue, update_position_in_queue
 from fustor_event_model.models import EventBase, EventType # Import EventBase and EventType
 
-# Import the parsers module
-from ..parsers.manager import ParserManager # CORRECTED
+from ..parsers.manager import ParserManager, get_directory_stats # CORRECTED
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
 ingestion_router = APIRouter(tags=["Ingestion"])
+
+@ingestion_router.get("/stats", summary="Get global ingestion statistics")
+async def get_global_stats():
+    """
+    Get aggregated statistics across all active datastores for the monitoring dashboard.
+    """
+    active_datastores = datastore_config_cache.get_all_active_datastores()
+    
+    sources = []
+    total_volume = 0
+    min_latency_ms = None # Use None to indicate no data
+    oldest_dir_info = {"path": "N/A", "age_days": 0}
+    max_staleness_seconds = -1
+
+    now = datetime.now().timestamp()
+
+    for ds_config in active_datastores:
+        ds_id = ds_config.id
+        sources.append({
+            "id": ds_config.name or f"Datastore {ds_id}",
+            "type": "Fusion" # Or derive from config if available
+        })
+
+        try:
+            stats = await get_directory_stats(datastore_id=ds_id)
+            
+            # 1. Volume
+            total_volume += stats.get("total_files", 0)
+
+            # 2. Latency (Freshness)
+            # We want the SMALLEST gap between now and the latest file time (i.e., most fresh)
+            latest_ts = stats.get("latest_file_timestamp")
+            if latest_ts:
+                latency = (now - latest_ts) * 1000 # ms
+                # Latency can't be negative ideally, but clocks vary
+                latency = max(0, latency) 
+                
+                if min_latency_ms is None or latency < min_latency_ms:
+                    min_latency_ms = latency
+
+            # 3. Staleness (Oldest Directory)
+            # We want the LARGEST gap between now and the oldest directory time
+            oldest = stats.get("oldest_directory")
+            if oldest and oldest.get("timestamp"):
+                age_seconds = now - oldest["timestamp"]
+                if age_seconds > max_staleness_seconds:
+                    max_staleness_seconds = age_seconds
+                    oldest_dir_info = {
+                        "path": f"[{ds_config.name}] {oldest['path']}",
+                        "age_days": int(age_seconds / 86400)
+                    }
+
+        except Exception as e:
+            logger.error(f"Failed to get stats for datastore {ds_id}: {e}")
+
+    return {
+        "sources": sources,
+        "metrics": {
+            "total_volume": total_volume,
+            "latency_ms": int(min_latency_ms) if min_latency_ms is not None else 0,
+            "oldest_directory": oldest_dir_info
+        }
+    }
 
 
 @ingestion_router.get("/position", summary="获取同步源的最新检查点位置")

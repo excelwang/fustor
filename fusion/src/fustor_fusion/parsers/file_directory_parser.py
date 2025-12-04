@@ -48,6 +48,7 @@ class DirectoryNode:
     created_time: Optional[datetime] = None
     modified_time: Optional[datetime] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
+    subtree_max_mtime: float = 0.0
     
     def add_child(self, name: str, node: Any) -> None:
         """Add a child node (file or directory) to this directory"""
@@ -80,7 +81,8 @@ class DirectoryNode:
             "children": children_dict,
             "created_time": self.created_time.isoformat() if self.created_time else None,
             "modified_time": self.modified_time.isoformat() if self.modified_time else None,
-            "metadata": self.metadata
+            "metadata": self.metadata,
+            "subtree_max_mtime": self.subtree_max_mtime
         }
 
 
@@ -133,13 +135,29 @@ class DirectoryStructureParser:
         self.logger.info(f"Successfully processed event for path: {path}")
         return True
 
-    def _format_timestamp(self, timestamp: Any) -> str:
-        """Safely formats a timestamp into an ISO string."""
-        if isinstance(timestamp, (int, float)):
-            return datetime.fromtimestamp(timestamp).isoformat()
-        if isinstance(timestamp, str):
-            return timestamp # Assuming it's already ISO format
-        return datetime.now().isoformat()
+    def _propagate_mtime_update(self, path: str, timestamp: float):
+        """Propagate the modification time up the directory tree."""
+        path_obj = Path(path)
+        # Start bubbling from the immediate parent
+        current_path = str(path_obj.parent)
+        if current_path != "/" and current_path.endswith("/"):
+            current_path = current_path.rstrip("/")
+            
+        while True:
+            node = self._directory_path_map.get(current_path)
+            if node:
+                if timestamp > node.subtree_max_mtime:
+                    node.subtree_max_mtime = timestamp
+                else:
+                    break # Optimization: Stop if parent is already newer
+            
+            if current_path == "/":
+                break
+
+            path_obj = Path(current_path)
+            current_path = str(path_obj.parent)
+            if current_path != "/" and current_path.endswith("/"):
+                current_path = current_path.rstrip("/")
 
     async def _process_create_update_in_memory(self, payload: Dict[str, Any], path: str):
         """Process a create/update operation directly in the in-memory cache."""
@@ -148,45 +166,67 @@ class DirectoryStructureParser:
         if parent_path != "/" and parent_path.endswith("/"):
             parent_path = parent_path.rstrip("/")
 
-        await self._ensure_directory_in_memory(parent_path)
-        parent_node = self._directory_path_map[parent_path]
+        # Determine timestamp for this event
+        ts = payload.get('modified_time') or payload.get('created_time') or datetime.now().timestamp()
 
+        await self._ensure_directory_in_memory(parent_path, timestamp=ts)
+        parent_node = self._directory_path_map[parent_path]
+        
         if payload.get('is_dir'):
             if path not in self._directory_path_map:
                 dir_node = DirectoryNode(
                     path=path, name=path_obj.name,
-                    created_time=datetime.fromtimestamp(payload['created_time']),
-                    metadata=payload.get('metadata', {})
+                    created_time=datetime.fromtimestamp(payload.get('created_time', ts)),
+                    modified_time=datetime.fromtimestamp(payload.get('modified_time', ts)),
+                    metadata=payload.get('metadata', {}),
+                    subtree_max_mtime=ts # Initialize with own timestamp
                 )
                 parent_node.add_child(path_obj.name, dir_node)
                 self._directory_path_map[path] = dir_node
+            else:
+                # Update existing directory mtime
+                node = self._directory_path_map[path]
+                # Also update the node's own modified_time if payload has it
+                node.modified_time = datetime.fromtimestamp(payload.get('modified_time', ts))
+                if ts > node.subtree_max_mtime:
+                    node.subtree_max_mtime = ts
         else:
             file_node = FileNode(
                 path=path, name=path_obj.name, size=payload['size'],
-                modified_time=datetime.fromtimestamp(payload['modified_time']),
-                created_time=datetime.fromtimestamp(payload['created_time']),
-                content_type="file", # Set content_type to 'file' for files
+                modified_time=datetime.fromtimestamp(payload.get('modified_time', ts)),
+                created_time=datetime.fromtimestamp(payload.get('created_time', ts)),
+                content_type="file",
                 metadata=payload.get('metadata', {})
             )
             parent_node.add_child(path_obj.name, file_node)
-            # Remove from file map if it exists (in case a directory was converted to file)
             if path in self._file_path_map:
                 del self._file_path_map[path]
             self._file_path_map[path] = file_node
 
-    async def _ensure_directory_in_memory(self, dir_path: str) -> DirectoryNode:
+        # Propagate timestamp up the tree
+        self._propagate_mtime_update(path, ts)
+
+    async def _ensure_directory_in_memory(self, dir_path: str, timestamp: float = None) -> DirectoryNode:
         """Ensures a directory path exists in the in-memory cache, creating it if necessary."""
         if dir_path in self._directory_path_map:
             return self._directory_path_map[dir_path]
+
+        ts = timestamp if timestamp is not None else datetime.now().timestamp()
 
         path_obj = Path(dir_path)
         parent_path = str(path_obj.parent)
         if parent_path != "/" and parent_path.endswith("/"):
             parent_path = parent_path.rstrip("/")
 
-        parent_node = await self._ensure_directory_in_memory(parent_path)
+        parent_node = await self._ensure_directory_in_memory(parent_path, timestamp=ts)
 
-        new_dir_node = DirectoryNode(path=dir_path, name=path_obj.name, created_time=datetime.now())
+        new_dir_node = DirectoryNode(
+            path=dir_path, 
+            name=path_obj.name, 
+            created_time=datetime.fromtimestamp(ts),
+            modified_time=datetime.fromtimestamp(ts), # Implicit directories inherit child's timestamp
+            subtree_max_mtime=ts # Implicit directories inherit child's timestamp
+        )
         parent_node.add_child(path_obj.name, new_dir_node)
         self._directory_path_map[dir_path] = new_dir_node
         return new_dir_node
@@ -283,9 +323,31 @@ class DirectoryStructureParser:
             # Calculate total size
             total_size = sum(file_node.size for file_node in self._file_path_map.values())
             
+            # 1. Latest File Timestamp (Sync Latency)
+            # Directly use the root's subtree_max_mtime which bubbled up
+            latest_file_time = self.root.subtree_max_mtime
+            
+            # 2. Oldest Directory (Staleness)
+            # Find the direct child of root with the SMALLEST subtree_max_mtime
+            oldest_dir_time = None
+            oldest_dir_path = None
+            
+            for child in self.root.children.values():
+                if isinstance(child, DirectoryNode):
+                    ts = child.subtree_max_mtime
+                    # Only consider non-zero timestamps (active directories)
+                    if ts > 0:
+                        if oldest_dir_time is None or ts < oldest_dir_time:
+                            oldest_dir_time = ts
+                            oldest_dir_path = child.path
+            
             return {
                 "total_files": total_files,
                 "total_directories": total_dirs,
                 "total_size_bytes": total_size,
-                "root": self.root.to_dict()
+                "latest_file_timestamp": latest_file_time if latest_file_time > 0 else None,
+                "oldest_directory": {
+                    "path": oldest_dir_path,
+                    "timestamp": oldest_dir_time
+                } if oldest_dir_path else None
             }
