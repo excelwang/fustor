@@ -44,11 +44,12 @@ def cli():
 
 @cli.command()
 @click.option("--reload", is_flag=True, help="Enable auto-reloading of the server on code changes (foreground only).")
-@click.option("-p", "--port", default=8106, help="Port to run the server on.")
+@click.option("-p", "--port", default=8103, help="Port to run the server on.")
+@click.option("-h", "--host", default="127.0.0.1", help="Host to bind the server to.")
 @click.option("-D", "--daemon", is_flag=True, help="Run the service as a background daemon.")
 @click.option("-V", "--verbose", is_flag=True, help="Enable verbose (DEBUG level) logging.")
 @click.option("--no-console-log", is_flag=True, hidden=True, help="Internal: Disable console logging.")
-def start(reload, port, daemon, verbose, no_console_log):
+def start(reload, port, host, daemon, verbose, no_console_log):
     """Starts the FuAgent monitoring service (in the foreground by default)."""
     log_level = "DEBUG" if verbose else "INFO"
     # Disable console logging if --no-console-log is passed (used by daemonized process)
@@ -62,14 +63,19 @@ def start(reload, port, daemon, verbose, no_console_log):
             return
         
         click.echo("Starting FuAgent in the background...")
-        command = [sys.executable, '-m', 'fustor_agent.cli', 'start', f'--port={port}', '--no-console-log']
-        if verbose:
-            command.append('--verbose')
-        
-        # Note: Reload is not recommended for daemon mode as it can cause issues.
-        # If a user really wants it, they can add it manually, but we won't pass it by default.
-
-        subprocess.Popen(command, stdout=None, stderr=None, stdin=None, close_fds=True)
+        # Use a common daemon launcher function to avoid module path issues
+        import fustor_common.daemon as daemon_module
+        daemon_module.start_daemon(
+            service_module_path='fustor_agent.api.routes',
+            app_var_name='web_app',
+            pid_file_name='agent.pid',
+            log_file_name='agent.log',
+            display_name='FuAgent',
+            port=port,
+            host=host,  # Use the host parameter
+            verbose=verbose,
+            reload=reload  # Pass reload parameter
+        )
         time.sleep(2) # Give the daemon time to start and write its PID file
         pid = _is_running()
         if pid:
@@ -93,7 +99,7 @@ def start(reload, port, daemon, verbose, no_console_log):
 
         click.echo("\n" + "="*60)
         click.echo("FuAgent ")
-        click.echo(f"Web : http://127.0.0.1:{port}/ui")
+        click.echo(f"Web : http://{host}:{port}/ui")
         click.echo("="*60 + "\n")
         
         app_to_run = web_app
@@ -102,7 +108,7 @@ def start(reload, port, daemon, verbose, no_console_log):
 
         uvicorn.run(
             app_to_run,
-            host="127.0.0.1",
+            host=host,
             port=port,
             log_config=None,
             access_log=True,

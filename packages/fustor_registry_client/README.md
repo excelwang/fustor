@@ -22,7 +22,7 @@ from fustor_registry_client.client import RegistryClient
 from fustor_registry_client.models import UserCreate, UserUpdate
 
 # Assuming RegistryClient is initialized with the Registry service URL
-client = RegistryClient(base_url="http://localhost:8002")
+client = RegistryClient(base_url="http://localhost:8101")
 
 # Example: Create a new user
 new_user = UserCreate(username="testuser", email="test@example.com", password="securepassword")

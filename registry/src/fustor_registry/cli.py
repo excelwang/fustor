@@ -45,11 +45,12 @@ def cli():
 
 @cli.command()
 @click.option("--reload", is_flag=True, help="Enable auto-reloading of the server on code changes (foreground only).")
-@click.option("-p", "--port", default=8107, help="Port to run the server on.")
+@click.option("-p", "--port", default=8101, help="Port to run the server on.")
+@click.option("-h", "--host", default="127.0.0.1", help="Host to bind the server to.")
 @click.option("-D", "--daemon", is_flag=True, help="Run the service as a background daemon.")
 @click.option("-V", "--verbose", is_flag=True, help="Enable verbose (DEBUG level) logging.")
 @click.option("--no-console-log", is_flag=True, hidden=True, help="Internal: Disable console logging for daemon process.")
-def start(reload, port, daemon, verbose, no_console_log):
+def start(reload, port, host, daemon, verbose, no_console_log):
     """Starts the Fustor Registry service (in the foreground by default)."""
     log_level = "DEBUG" if verbose else "INFO"
     
@@ -72,20 +73,18 @@ def start(reload, port, daemon, verbose, no_console_log):
             return
         
         click.echo("Starting Fustor Registry in the background...")
-        command = [sys.executable, '-m', 'fustor_registry.cli', 'start', f'--port={port}', '--no-console-log']
-        if verbose:
-            command.append('--verbose')
-        
-        # Detach the child process
-        # Using preexec_fn=os.setsid ensures the child process is not killed when the parent exits
-        # and redirects stdout/stderr to /dev/null
-        process = subprocess.Popen(
-            command, 
-            stdout=subprocess.DEVNULL, 
-            stderr=subprocess.DEVNULL, 
-            stdin=subprocess.DEVNULL, 
-            close_fds=True,
-            preexec_fn=os.setsid # Detach from parent process group
+        # Use a common daemon launcher function to avoid module path issues
+        import fustor_common.daemon as daemon_module
+        daemon_module.start_daemon(
+            service_module_path='fustor_registry.main',
+            app_var_name='app',
+            pid_file_name='registry.pid',
+            log_file_name='registry.log',
+            display_name='Fustor Registry',
+            port=port,
+            host=host,  # Use the host parameter
+            verbose=verbose,
+            reload=reload  # Pass reload parameter
         )
         # Write PID to file in the daemon process
         # The child process needs to write its own PID, not the parent's subprocess PID
@@ -105,6 +104,7 @@ def start(reload, port, daemon, verbose, no_console_log):
 
     try:
         os.makedirs(HOME_FUSTOR_DIR, exist_ok=True) # Ensure ~/.fustor exists for PID file
+        # Write PID file in both modes, as the actual server process needs to own it
         with open(REGISTRY_PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
 
@@ -112,7 +112,7 @@ def start(reload, port, daemon, verbose, no_console_log):
 
         click.echo("\n" + "="*60)
         click.echo("Fustor Registry")
-        click.echo(f"Web : http://127.0.0.1:{port}")
+        click.echo(f"Web : http://{host}:{port}")
         click.echo("="*60 + "\n")
         
         app_to_run = fastapi_app
@@ -121,7 +121,7 @@ def start(reload, port, daemon, verbose, no_console_log):
 
         uvicorn.run(
             app_to_run,
-            host="127.0.0.1",
+            host=host,
             port=port,
             log_config=None, # Logging handled by setup_logging
             access_log=True,

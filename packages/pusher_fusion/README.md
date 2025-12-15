@@ -24,7 +24,7 @@ Example (conceptual configuration in Fustor Agent):
 pushers:
   my-fusion-pusher:
     driver_type: fusion
-    endpoint: http://localhost:8003/ingestor-api/v1/
+    endpoint: http://localhost:8102/ingestor-api/v1/
     credential:
       type: api_key
       key: YOUR_FUSION_API_KEY

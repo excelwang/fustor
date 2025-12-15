@@ -49,7 +49,7 @@ fustor fusion --help
 Example:
 
 ```bash
-fustor fusion start --port 8003
+fustor fusion start --port 8102
 ```
 
 ### Agent Service Commands

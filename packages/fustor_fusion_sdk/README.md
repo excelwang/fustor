@@ -22,7 +22,7 @@ from fustor_fusion_sdk.client import FusionClient
 from fustor_fusion_sdk.models import IngestDataRequest
 
 # Assuming FusionClient is initialized with the Fusion service URL
-client = FusionClient(base_url="http://localhost:8003")
+client = FusionClient(base_url="http://localhost:8102")
 
 # Example: Ingest data
 data_to_ingest = IngestDataRequest(

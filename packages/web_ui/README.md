@@ -15,7 +15,7 @@ This package is part of the Fustor monorepo and is typically installed in editab
 
 ## Usage
 
-The `fustor-web-ui` is usually served by the Fustor Agent service itself. Once the Fustor Agent is running, you can access the web UI through your web browser at the Agent's configured address (e.g., `http://localhost:8106`).
+The `fustor-web-ui` is usually served by the Fustor Agent service itself. Once the Fustor Agent is running, you can access the web UI through your web browser at the Agent's configured address (e.g., `http://localhost:8103`).
 
 This UI provides:
 *   A **Dashboard** for an overview of system health and running tasks.
