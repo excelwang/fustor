@@ -6,7 +6,7 @@ authors = [
     {name = "Huajin Wang", email = "wanghuajin999@163.com"},
 ]
 license = {text = "MIT"}
-requires-python = ">=3.12"
+requires-python = ">=3.11"
 dependencies = [
     "elasticsearch>=9.2.0",
     "fustor-core",
