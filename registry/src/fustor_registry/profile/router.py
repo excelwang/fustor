@@ -1,9 +1,15 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.exceptions import RequestValidationError
+from fastapi import Body
+
 from sqlalchemy.ext.asyncio import AsyncSession
-from ..models import UserModel
+from sqlalchemy import select
+
 from ..database import get_db
-from ..security import get_current_user, verify_password
-from .model import ProfileUpdate, PasswordUpdate, ProfileResponse
+from ..models import UserModel
+from ..security import get_current_user, verify_password, hash_password
+from fustor_common.models import MessageResponse
+from .model import PasswordUpdate, ProfileUpdate, ProfileResponse
 
 router = APIRouter(prefix="/profile", tags=["个人信息管理"])
 @router.get("/",
@@ -56,7 +62,7 @@ async def update_profile(
     return db_user
 
 @router.put("/password",
-           response_model=ProfileResponse,
+           response_model=MessageResponse,
            status_code=status.HTTP_200_OK,
            summary="修改密码",
            responses={
@@ -74,15 +80,12 @@ async def change_password(
     """
     db_user = await db.get(UserModel, current_user.id)
     if not db_user:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="用户不存在")
-    
+        raise HTTPException(status_code=404, detail="用户不存在")
+
     if not verify_password(password_data.old_password, db_user.password):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="旧密码不正确"
-        )
+        raise HTTPException(status_code=400, detail="旧密码不正确")
     
-    db_user.password = password_data.password
+    db_user.password = hash_password(password_data.password)
     await db.commit()
     await db.refresh(db_user)
-    return db_user
+    return MessageResponse(message="密码更新成功")

@@ -216,6 +216,11 @@ class FSDriver(SourceDriver):
                             if metadata:
                                 batch.append(metadata)
                                 files_processed_count += 1
+                                if len(batch) >= batch_size:
+                                    # Extract fields from the first row if batch is not empty
+                                    fields = list(batch[0].keys()) if batch else []
+                                    yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields)
+                                    batch = []
                     except (FileNotFoundError, PermissionError, OSError) as e:
                         error_count += 1
                         logger.debug(f"[fs] Error processing file during snapshot: {file_path} - {str(e)}")

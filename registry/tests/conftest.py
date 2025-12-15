@@ -2,6 +2,7 @@ import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from unittest.mock import patch, MagicMock
 import asyncio
+import logging
 
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
@@ -69,7 +70,7 @@ async def authorized_client(override_get_db, test_admin_user) -> AsyncClient:
             "password": "admin_password"
         }
         response = await client.post("/v1/auth/login", data=login_data, headers={"Content-Type": "application/x-www-form-urlencoded"})
-        assert response.status_code == 200, response.json()
+        assert response.status_code == 200, response.text
         token = response.json()["access_token"]
         
         client.headers["Authorization"] = f"Bearer {token}"

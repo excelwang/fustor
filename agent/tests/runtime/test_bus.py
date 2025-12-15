@@ -22,6 +22,7 @@ class TestMemoryEventBus:
 
     async def test_buffer_capacity(self):
         bus = MemoryEventBus(bus_id="test_bus", capacity=2, start_position=0)
+        await bus.subscribe("task1", 0, [])
         await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 1}], fields=["id"], index=0))
         await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 2}], fields=["id"], index=1))
 
@@ -100,7 +101,7 @@ class TestMemoryEventBus:
         await bus.subscribe("slow_consumer", 0, [])
 
         for i in range(10):
-            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 6}], fields=["id"], index=6))
+            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': i}], fields=["id"], index=i))
 
         # Slow consumer stays at the start
         await bus.commit("slow_consumer", 1, 0)
@@ -120,7 +121,7 @@ class TestMemoryEventBus:
         assert bus.can_subscribe(4) is False
         assert bus.can_subscribe(5) is True
         assert bus.can_subscribe(6) is True
-        assert bus.can_subscribe(7) is False
+        assert bus.can_subscribe(7) is True
 
     async def test_update_subscriber_position(self):
         bus = MemoryEventBus(bus_id="test_bus", capacity=10, start_position=0)

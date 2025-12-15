@@ -23,7 +23,7 @@ async def test_echo_driver_logs_update_events(caplog):
     # Create UpdateEvent similar to what fs would generate
     update_events = [
         UpdateEvent(
-            schema="/home/test",
+            event_schema="/home/test",
             table="files", 
             rows=[
                 {
@@ -40,7 +40,8 @@ async def test_echo_driver_logs_update_events(caplog):
                     "created_time": 1699999100.0,
                     "is_dir": True
                 }
-            ]
+            ],
+            fields=["file_path", "size", "modified_time", "created_time", "is_dir"]
         )
     ]
 
@@ -69,12 +70,13 @@ async def test_echo_driver_logs_delete_events(caplog):
     # Create DeleteEvent similar to what fs would generate
     delete_events = [
         DeleteEvent(
-            schema="/home/test",
+            event_schema="/home/test",
             table="files", 
             rows=[
                 {"file_path": "/home/test/old_file.txt"},
                 {"file_path": "/home/test/old_dir"}
-            ]
+            ],
+            fields=["file_path"]
         )
     ]
 
@@ -103,9 +105,10 @@ async def test_echo_driver_logs_with_snapshot_end_flag(caplog):
     
     events = [
         UpdateEvent(
-            schema="test_schema",
+            event_schema="test_schema",
             table="test_table", 
-            rows=[{"id": 1, "name": "test"}]
+            rows=[{"id": 1, "name": "test"}],
+            fields=["id", "name"]
         )
     ]
 
@@ -141,9 +144,10 @@ async def test_echo_driver_logs_with_multiple_flags(caplog):
     
     events = [
         InsertEvent(
-            schema="test_schema",
+            event_schema="test_schema",
             table="test_table", 
-            rows=[{"id": 1, "name": "test"}]
+            rows=[{"id": 1, "name": "test"}],
+            fields=["id", "name"]
         )
     ]
 
@@ -177,7 +181,7 @@ async def test_echo_driver_logs_first_event_data(caplog):
     # Create an event with structured data
     events = [
         UpdateEvent(
-            schema="test_schema",
+            event_schema="test_schema",
             table="files", 
             rows=[
                 {
@@ -194,7 +198,8 @@ async def test_echo_driver_logs_first_event_data(caplog):
                     "created_time": 1699999100.0,
                     "is_dir": False
                 }
-            ]
+            ],
+            fields=["file_path", "size", "modified_time", "created_time", "is_dir"]
         )
     ]
 

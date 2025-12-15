@@ -12,7 +12,7 @@ async def test_echo_driver_push(caplog):
     # 1. Arrange
     config = PusherConfig(driver="echo", endpoint="", credential=PasswdCredential(user="test"))
     driver = EchoDriver("test-echo-id", config)
-    events = [InsertEvent(event_schema="test_schema", table="test_table", rows=[{"id": 1, "msg": "hello"}])]
+    events = [InsertEvent(event_schema="test_schema", table="test_table", rows=[{"id": 1, "msg": "hello"}], fields=["id", "msg"])]
     # 2. Act & 3. Assert - Check logging
     with caplog.at_level(logging.INFO):
         result = await driver.push(events, agent_id="agent-1", task_id="task-1", is_snapshot_end=True)
@@ -56,11 +56,11 @@ async def test_echo_driver_cumulative_push(caplog):
 
     # First batch
     events1 = [
-        InsertEvent(event_schema="test_schema", table="files", rows=[{"id": 1}, {"id": 2}]),    ]
+        InsertEvent(event_schema="test_schema", table="files", rows=[{"id": 1}, {"id": 2}], fields=["id"]),    ]
     
     # Second batch
     events2 = [
-        InsertEvent(event_schema="test_schema", table="files", rows=[{"id": 3}])
+        InsertEvent(event_schema="test_schema", table="files", rows=[{"id": 3}], fields=["id"])
     ]
 
     # Clear any previous log records

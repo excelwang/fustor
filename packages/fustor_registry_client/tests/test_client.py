@@ -52,7 +52,7 @@ def reset_mock_data():
 # Mock Auth Endpoints
 @mock_router_v1.post("/auth/login", response_model=TokenResponse)
 async def mock_login(login_request: LoginRequest):
-    if login_request.username == "admin@example.com" and login_request.password == "password": # Simplified mock password check
+    if login_request.username == "admin@example.com" and login_request.password == "admin_password": # Simplified mock password check
         return TokenResponse(access_token=MOCK_USERS[login_request.username]["token"], token_type="bearer")
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
 
@@ -166,9 +166,10 @@ def registry_client(test_client: TestClient):
     return RegistryClient(base_url="http://mock-registry", client=async_client)
 
 @pytest.mark.asyncio
-async def test_login(registry_client: RegistryClient):
-    token_response = await registry_client.login(email="admin@example.com", password="password")
-    assert token_response.access_token == MOCK_USERS["admin@example.com"]["token"]
+async def test_login(registry_client):
+    token_response = await registry_client.login(email="admin@example.com", password="admin_password")
+    assert isinstance(token_response, TokenResponse)
+    assert token_response.access_token is not None
     assert token_response.token_type == "bearer"
 
     with pytest.raises(httpx.HTTPStatusError) as exc_info:

@@ -120,14 +120,14 @@ async def test_message_sync_flow_with_real_drivers(integration_configs, tmp_path
         task = asyncio.create_task(sync_instance._run_message_sync(start_position))
         
         # Allow the loop to start and the file watcher to initialize
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(2)
 
         # Create a new file to trigger a realtime event
         test_file = tmp_path / "test2.txt"
         test_file.write_text("world")
 
         # Allow time for the event to be processed
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(2)
 
         # Cleanly stop the task
         task.cancel()

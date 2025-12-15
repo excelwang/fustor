@@ -23,7 +23,8 @@ def mock_watch_manager(mocker):
     manager.watches = {}
     manager.lru_cache = MagicMock()
     manager.lru_cache.get_oldest.return_value = (None, 0)
-    mocker.patch('fustor_source_fs.components._WatchManager', return_value=manager)
+    # Patch where it is imported in fustor_source_fs/__init__.py
+    mocker.patch('fustor_source_fs._WatchManager', return_value=manager)
     return manager
 
 def test_snapshot_finds_files_and_generates_events(fs_config, tmp_path: Path, mock_watch_manager):
@@ -44,7 +45,7 @@ def test_snapshot_finds_files_and_generates_events(fs_config, tmp_path: Path, mo
         mock_tracker.get_fields.return_value = {
             "test-fs.files.file_path",
             "test-fs.files.size",
-            "test-fs.files.is_directory" # Add is_directory to expected fields
+            "test-fs.files.is_dir" # Add is_dir to expected fields
         }
 
         # Act
@@ -64,7 +65,7 @@ def test_snapshot_finds_files_and_generates_events(fs_config, tmp_path: Path, mo
             assert isinstance(event, UpdateEvent)
             for row in event.rows:
                 file_path = row['file_path']
-                is_directory = row.get('is_directory', False) # Default to False if not present
+                is_directory = row.get('is_dir', False) # Default to False if not present
 
                 all_processed_paths.add(file_path)
                 if is_directory:
@@ -76,7 +77,7 @@ def test_snapshot_finds_files_and_generates_events(fs_config, tmp_path: Path, mo
                 assert 'size' in row
                 assert 'modified_time' in row
                 assert 'created_time' in row
-                assert 'is_directory' in row # Ensure the flag is always present
+                assert 'is_dir' in row # Ensure the flag is always present
 
         # Assert all expected items (files and directories) were processed
         expected_paths = {

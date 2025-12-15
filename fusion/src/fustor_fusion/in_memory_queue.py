@@ -246,6 +246,26 @@ class InMemoryEventQueue:
         queue = self._queues.get(queue_key)
         return queue.qsize() if queue else 0
 
+    async def clear_datastore_data(self, datastore_id: int):
+        """
+        Clears the event queue and all position tracking for a given datastore.
+        """
+        async with self._lock:
+            # Clear the queue for the datastore
+            if datastore_id in self._queues:
+                # Draining the queue to prevent dangling references (though not strictly necessary for deletion)
+                while not self._queues[datastore_id].empty():
+                    self._queues[datastore_id].get_nowait()
+                del self._queues[datastore_id]
+                logger.info(f"Cleared event queue for datastore {datastore_id}.")
+            
+            # Clear all positions associated with this datastore
+            keys_to_delete = [key for key in self._positions if key[0] == datastore_id]
+            for key in keys_to_delete:
+                del self._positions[key]
+            if keys_to_delete:
+                logger.info(f"Cleared {len(keys_to_delete)} position entries for datastore {datastore_id}.")
+
 
 # Global instance
 memory_event_queue = InMemoryEventQueue()

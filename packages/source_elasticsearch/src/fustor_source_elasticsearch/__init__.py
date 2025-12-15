@@ -98,7 +98,8 @@ class ElasticsearchDriver(SourceDriver):
                     break
                 
                 rows = [_normalize_doc(h) for h in hits]
-                yield InsertEvent(event_schema=index_name, table=index_name, rows=rows, index=snapshot_time)
+                fields = list(rows[0].keys()) if rows else []
+                yield InsertEvent(event_schema=index_name, table=index_name, rows=rows, fields=fields, index=snapshot_time)
                 
                 search_after = hits[-1]['sort']
         finally:
@@ -150,7 +151,7 @@ class ElasticsearchDriver(SourceDriver):
                     if ts_str:
                         dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
                         current_ts_ms = int(dt.timestamp() * 1000)
-                        yield UpdateEvent(event_schema=index_name, table=index_name, rows=[doc], index=current_ts_ms)
+                        yield UpdateEvent(event_schema=index_name, table=index_name, rows=[doc], fields=list(doc.keys()), index=current_ts_ms)
                         last_ts_iso = dt.isoformat()
         
         return _iterator_func()
