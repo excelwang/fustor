@@ -246,6 +246,13 @@ class _WatchManager:
                 self.inotify.add_watch(path.encode('utf-8'))
                 self.lru_cache.put(path, WatchEntry(timestamp_to_use))
             except OSError as e:
+                # Catch ENOENT (2) - File not found, likely deleted before we could watch it
+                # Catch ENOTDIR (20) - Not a directory (can happen if a file replaced a dir)
+                # Catch EACCES (13) - Permission denied
+                if e.errno in (2, 20, 13):
+                     logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), it may strictly no longer exist or be inaccessible.")
+                     return
+
                 if e.errno == 28:
                     new_limit = len(self.lru_cache)
                     relative_age_days = (time.time() - timestamp_to_use) / 86400

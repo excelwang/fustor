@@ -13,7 +13,16 @@ class TestENOENTHandling:
     """Tests for handling ENOENT (No such file or directory) errors."""
     
     def test_schedule_nonexistent_path(self):
-        """Test that schedule method handles non-existent paths gracefully."""
+        """
+        Test the race condition where a directory is identified as 'hot' during the pre-scan phase,
+        but is deleted before the watch can be established.
+        
+        Scenario:
+        1. Pre-scan identifies '/path/to/hot/dir'.
+        2. External process deletes '/path/to/hot/dir'.
+        3. Agent attempts to call schedule('/path/to/hot/dir').
+        4. inotify.add_watch fails with ENOENT.
+        """
         with tempfile.TemporaryDirectory() as temp_dir:
             # Create a mock event handler
             mock_event_handler = MagicMock()
@@ -25,11 +34,12 @@ class TestENOENTHandling:
                 min_monitoring_window_days=30.0
             )
             
-            # Create a path that doesn't exist
-            nonexistent_path = os.path.join(temp_dir, "nonexistent", "path", "that", "does", "not", "exist")
+            # Simulate a path that was found during pre-scan but now doesn't exist
+            hot_dir_path = os.path.join(temp_dir, "hot_directory_from_prescan")
             
-            # Verify the path doesn't exist before scheduling
-            assert not os.path.exists(nonexistent_path)
+            # Verify the path doesn't exist (simulating deletion after pre-scan)
+            assert not os.path.exists(hot_dir_path)
             
-            # Call schedule method - this should currently raise FileNotFoundError (bug reproduction)
-            watch_manager.schedule(nonexistent_path)
+            # Call schedule method - this simulates the agent attempting to watch the identified hot dir.
+            # This should currently raise FileNotFoundError (bug reproduction).
+            watch_manager.schedule(hot_dir_path)
