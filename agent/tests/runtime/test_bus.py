@@ -8,8 +8,8 @@ from fustor_core.models.config import FieldMapping
 class TestMemoryEventBus:
     async def test_put_and_get_events(self):
         bus = MemoryEventBus(bus_id="test_bus", capacity=10, start_position=0)
-        event1 = InsertEvent(event_schema="s", table="t", rows=[{'id': 1}], index=0)
-        event2 = InsertEvent(event_schema="s", table="t", rows=[{'id': 2}], index=1)
+        event1 = InsertEvent(event_schema="s", table="t", rows=[{'id': 1}], fields=["id"], index=0)
+        event2 = InsertEvent(event_schema="s", table="t", rows=[{'id': 2}], fields=["id"], index=1)
 
         await bus.subscribe("task1", 0, [])
         await bus.put(event1)
@@ -22,10 +22,10 @@ class TestMemoryEventBus:
 
     async def test_buffer_capacity(self):
         bus = MemoryEventBus(bus_id="test_bus", capacity=2, start_position=0)
-        await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 1}], index=0))
-        await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 2}], index=1))
+        await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 1}], fields=["id"], index=0))
+        await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 2}], fields=["id"], index=1))
 
-        put_task = asyncio.create_task(bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 3}], index=2)))
+        put_task = asyncio.create_task(bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 3}], fields=["id"], index=2)))
         
         await asyncio.sleep(0.01) # Give the put task time to block
         assert len(bus.buffer) == 2
@@ -44,7 +44,7 @@ class TestMemoryEventBus:
         bus.mark_as_failed("Test failure")
         assert bus.failed is True
         with pytest.raises(EventBusFailedError):
-            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 1}], index=0))
+            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 1}], fields=["id"], index=0))
 
     async def test_subscribe_and_unsubscribe(self):
         bus = MemoryEventBus(bus_id="test_bus", capacity=10, start_position=0)
@@ -82,7 +82,7 @@ class TestMemoryEventBus:
         await bus.subscribe("task2", 0, [])
 
         for i in range(5):
-            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': i}], index=i))
+            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': i}], fields=["id"], index=i))
         
         assert len(bus.buffer) == 5
         await bus.commit("task1", 3, 2)
@@ -100,7 +100,7 @@ class TestMemoryEventBus:
         await bus.subscribe("slow_consumer", 0, [])
 
         for i in range(10):
-            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 6}], index=6))
+            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 6}], fields=["id"], index=6))
 
         # Slow consumer stays at the start
         await bus.commit("slow_consumer", 1, 0)
@@ -114,8 +114,8 @@ class TestMemoryEventBus:
     async def test_can_subscribe(self):
         bus = MemoryEventBus(bus_id="test_bus", capacity=10, start_position=5)
         for i in range(5, 10):
-            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': i}], index=i))
-        await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 5}], index=5))
+            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': i}], fields=["id"], index=i))
+        await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 5}], fields=["id"], index=5))
 
         assert bus.can_subscribe(4) is False
         assert bus.can_subscribe(5) is True
