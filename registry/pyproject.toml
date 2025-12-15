@@ -2,39 +2,25 @@
 name = "fustor-registry"
 version = "0.1.0"
 description = "Registry service for Fustor (Control Plane)"
-authors = [
-    {name = "Huajin Wang", email = "wanghuajin999@163.com"},
-]
-license = {text = "MIT"}
 requires-python = ">=3.11"
-dependencies = [
-    "click",
-    "fastapi[all]",
-    "uvicorn",
-    "pydantic",
-    "pydantic-settings",
-    "greenlet==3.2.2",
-    "sqlalchemy==2.0.41",
-    "aiosqlite",
-    "asyncpg==0.30.0",
-    "psycopg2-binary",
-    "passlib[bcrypt]",
-    "python-jose[cryptography]",
-    "cachetools"
-]
-
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "ruff>=0.1.0",
-    "mypy>=1.0.0",
-    "pytest-asyncio>=0.23.0"
-]
+dependencies = [ "click", "fastapi[all]", "uvicorn", "pydantic", "pydantic-settings", "greenlet==3.2.2", "sqlalchemy==2.0.41", "aiosqlite", "asyncpg==0.30.0", "psycopg2-binary", "passlib[bcrypt]", "python-jose[cryptography]", "cachetools",]
+[[project.authors]]
+name = "Huajin Wang"
+email = "wanghuajin999@163.com"
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = [ "setuptools>=61.0",]
 build-backend = "setuptools.build_meta"
 
+["project.urls"]
+Homepage = "https://github.com/excelwang/fustor/registry"
+"Bug Tracker" = "https://github.com/excelwang/fustor/issues"
+
+[project.license]
+text = "MIT"
+
+[project.optional-dependencies]
+dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0",]
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = [ "src",]

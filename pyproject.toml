@@ -12,6 +12,7 @@ members = [
     "packages/fustor_registry_client",
     "packages/pusher_echo",
     "packages/pusher_openapi",
+    "packages/pusher_fusion",
     "packages/source_elasticsearch",
     "packages/source_fs",
     "packages/source_mysql",
@@ -33,6 +34,7 @@ fustor-fusion-sdk = { workspace = true }
 fustor-registry-client = { workspace = true }
 fustor-pusher-echo = { workspace = true }
 fustor-pusher-openapi = { workspace = true }
+fustor-pusher-fusion = { workspace = true }
 fustor-source-elasticsearch = { workspace = true }
 fustor-source-fs = { workspace = true }
 fustor-source-mysql = { workspace = true }
@@ -48,6 +50,7 @@ pythonpath = [
     "packages/core/src",
     "packages/pusher_echo/src",
     "packages/pusher_openapi/src",
+    "packages/pusher_fusion/src",
     "packages/source_elasticsearch/src",
     "packages/source_fs/src",
     "packages/source_mysql/src",

@@ -3,15 +3,15 @@ name = "fustor-registry-client"
 version = "0.1.0"
 description = "Client for Fustor Registry service"
 requires-python = ">=3.11"
-dependencies = [
-    "httpx>=0.27.0",
-    "pydantic>=2.11.7",
-    "fustor-common",
-]
+dependencies = [ "httpx>=0.27.0", "pydantic>=2.11.7", "fustor-common",]
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = [ "setuptools>=61.0",]
 build-backend = "setuptools.build_meta"
 
+["project.urls"]
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/fustor_registry_client"
+"Bug Tracker" = "https://github.com/excelwang/fustor/issues"
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = [ "src",]

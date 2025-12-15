@@ -2,18 +2,22 @@
 name = "fustor-web-ui"
 version = "0.1.0"
 description = "Web UI for Fustor Agent"
-authors = [
-    {name = "Huajin Wang", email = "wanghuajin999@163.com"},
-]
-license = {text = "MIT"}
 requires-python = ">=3.11"
-dependencies = [
-    "fustor-core"
-]
+dependencies = [ "fustor-core",]
+[[project.authors]]
+name = "Huajin Wang"
+email = "wanghuajin999@163.com"
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = [ "setuptools>=61.0",]
 build-backend = "setuptools.build_meta"
 
+["project.urls"]
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/web_ui"
+"Bug Tracker" = "https://github.com/excelwang/fustor/issues"
+
+[project.license]
+text = "MIT"
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = [ "src",]

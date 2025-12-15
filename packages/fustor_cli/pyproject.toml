@@ -2,20 +2,18 @@
 name = "fustor-cli"
 version = "0.1.0"
 description = "Unified CLI for Fustor services"
-dependencies = [
-    "click>=8.0.0",
-    "fustor-agent",
-    "fustor-fusion",
-    "fustor-registry",
-    "fustor-common",
-]
+dependencies = [ "click>=8.0.0", "fustor-agent", "fustor-fusion", "fustor-registry", "fustor-common",]
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = [ "setuptools>=61.0",]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages.find]
-where = ["src"]
+["project.urls"]
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/fustor_cli"
+"Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 [project.scripts]
 fustor = "fustor_cli.main:cli"
+
+[tool.setuptools.packages.find]
+where = [ "src",]

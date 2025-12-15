@@ -2,35 +2,26 @@
 name = "fustor-agent"
 version = "0.1.0"
 description = "realtime data sync agent for various data sources"
-authors = [
-    {name = "Huajin Wang", email = "wanghuajin999@163.com"},
-]
-license = {text = "MIT"}
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = [
-    "click>=8.1.7",
-    "fastapi>=0.115.13",
-    "uvicorn[standard]>=0.34.3",
-    "pydantic>=2.11.7",
-    "fustor-core",
-    "fustor-source-fs",
-    "fustor-pusher-echo"
-]
-
-
-[project.optional-dependencies]
-dev = [
-    "pytest>=8.0.0",
-    "ruff>=0.1.0",
-    "mypy>=1.0.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-mock>=3.0.0"
-]
+dependencies = [ "click>=8.1.7", "fastapi>=0.115.13", "uvicorn[standard]>=0.34.3", "pydantic>=2.11.7", "fustor-core", "fustor-source-fs", "fustor-pusher-echo",]
+[[project.authors]]
+name = "Huajin Wang"
+email = "wanghuajin999@163.com"
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = [ "setuptools>=61.0",]
 build-backend = "setuptools.build_meta"
 
+["project.urls"]
+Homepage = "https://github.com/excelwang/fustor/agent"
+"Bug Tracker" = "https://github.com/excelwang/fustor/issues"
+
+[project.license]
+text = "MIT"
+
+[project.optional-dependencies]
+dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0", "pytest-mock>=3.0.0",]
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = [ "src",]

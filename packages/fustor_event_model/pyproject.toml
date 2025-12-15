@@ -3,13 +3,15 @@ name = "fustor-event-model"
 version = "0.1.0"
 description = "Event models and schemas for Fustor services"
 requires-python = ">=3.11"
-dependencies = [
-    "pydantic>=2.11.7",
-]
+dependencies = [ "pydantic>=2.11.7",]
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = [ "setuptools>=61.0",]
 build-backend = "setuptools.build_meta"
 
+["project.urls"]
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/fustor_event_model"
+"Bug Tracker" = "https://github.com/excelwang/fustor/issues"
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = [ "src",]

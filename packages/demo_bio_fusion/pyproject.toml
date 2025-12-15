@@ -2,20 +2,19 @@
 name = "fustor-demo"
 version = "0.1.0"
 description = "Fustor Bio-Fusion Demo for unified directory service"
-dependencies = [
-    "fastapi[all]>=0.104.1",
-    "uvicorn>=0.23.2",
-    "fustor-core",
-    "fustor-event-model",
-    "pydantic>=2.0.0",
-    "httpx>=0.25.0", # For making requests to the demo API
-]
+dependencies = [ "fastapi[all]>=0.104.1", "uvicorn>=0.23.2", "fustor-core", "fustor-event-model", "pydantic>=2.0.0", "httpx>=0.25.0",]
 requires-python = ">=3.11"
-license = { text = "MIT" }
 
 [build-system]
-requires = ["setuptools>=61.0"]
+requires = [ "setuptools>=61.0",]
 build-backend = "setuptools.build_meta"
 
+["project.urls"]
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/demo_bio_fusion"
+"Bug Tracker" = "https://github.com/excelwang/fustor/issues"
+
+[project.license]
+text = "MIT"
+
 [tool.setuptools.packages.find]
-where = ["src"]
+where = [ "src",]
