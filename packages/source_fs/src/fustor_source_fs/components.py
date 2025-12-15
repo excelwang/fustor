@@ -24,6 +24,30 @@ from watchdog.events import (
 
 logger = logging.getLogger("fustor_agent.driver.fs")
 
+def contains_surrogate_characters(path: str) -> bool:
+    """Checks if a string contains surrogate characters."""
+    try:
+        path.encode('utf-8')
+        return False
+    except UnicodeEncodeError:
+        return True
+
+def safe_path_encode(path: str) -> bytes:
+    """Safely encodes a path to bytes, handling surrogate characters using filesystem encoding."""
+    try:
+        return os.fsencode(path)
+    except Exception:
+        # Fallback for extreme cases or non-string inputs, though fsencode is robust
+        return path.encode('utf-8', errors='replace')
+
+def safe_path_handling(path: str) -> str:
+    """Safely handles path strings, normalizing surrogate characters if present."""
+    if contains_surrogate_characters(path):
+        # Replace surrogate characters with underscores or question marks
+        # by encoding with replacement and decoding back
+        return path.encode('utf-8', errors='replace').decode('utf-8')
+    return path
+
 @dataclasses.dataclass(frozen=True)
 class WatchEntry:
     """Simplified entry for the LRU cache, just holds the timestamp."""
@@ -110,7 +134,8 @@ class _WatchManager:
         # Directly use the low-level Inotify class
         # We watch the root path non-recursively just to initialize the instance.
         # All other watches are added dynamically.
-        self.inotify = Inotify(root_path.encode('utf-8'), recursive=False)
+        # Use safe_path_encode to handle potential surrogate characters in root_path
+        self.inotify = Inotify(safe_path_encode(root_path), recursive=False)
 
         self._stop_event = threading.Event()
         self.inotify_thread = threading.Thread(target=self._event_processing_loop, daemon=True)
@@ -132,6 +157,7 @@ class _WatchManager:
                             paired_move_from_paths.add(os.fsdecode(src_path_from))
 
                 for event in raw_events:
+                        # Use fsdecode to safely decode bytes to str, it handles surrogates correctly
                         src_path_str = os.fsdecode(event.src_path)
 
                         # Handle paired moves (MOVED_FROM + MOVED_TO)
@@ -234,7 +260,7 @@ class _WatchManager:
 
                     logger.info(f"Watch limit reached. Evicting watch for {evicted_path} (relative age: {relative_age_days:.2f} days).")
                     try:
-                        self.inotify.remove_watch(evicted_path.encode('utf-8'))
+                        self.inotify.remove_watch(safe_path_encode(evicted_path))
                     except (KeyError, OSError) as e:
                         logger.warning(f"Error removing evicted watch for {evicted_path}: {e}")
                     self.unschedule_recursive(evicted_path)
@@ -243,13 +269,21 @@ class _WatchManager:
                     return
 
             try:
-                self.inotify.add_watch(path.encode('utf-8'))
+                self.inotify.add_watch(safe_path_encode(path))
                 self.lru_cache.put(path, WatchEntry(timestamp_to_use))
             except OSError as e:
                 # Catch ENOENT (2) - File not found, likely deleted before we could watch it
                 # Catch ENOTDIR (20) - Not a directory (can happen if a file replaced a dir)
                 # Catch EACCES (13) - Permission denied
-                if e.errno in (2, 20, 13):
+                if e.errno == 2: # ENOENT
+                    if os.path.exists(path):
+                        # Path exists, but inotify reports ENOENT. This is problematic for inotify.
+                        logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), path exists but inotify rejected it. (Consider renaming if possible).")
+                    else:
+                        # Path truly does not exist.
+                        logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), it may strictly no longer exist or be inaccessible.")
+                    return
+                if e.errno in (20, 13): # ENOTDIR, EACCES
                      logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), it may strictly no longer exist or be inaccessible.")
                      return
 
@@ -285,7 +319,7 @@ class _WatchManager:
             paths_to_remove_from_lru = [p for p in list(self.lru_cache.cache.keys()) if p == path or p.startswith(path + os.sep)]
             for p in paths_to_remove_from_lru:
                 try:
-                    self.inotify.remove_watch(p.encode('utf-8'))
+                    self.inotify.remove_watch(safe_path_encode(p))
                 except (KeyError, OSError) as e:
                     logger.warning(f"Error removing watch during recursive unschedule for {p}: {e}")
                 self.lru_cache.remove(p)
