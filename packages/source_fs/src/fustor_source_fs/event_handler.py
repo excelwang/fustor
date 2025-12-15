@@ -68,8 +68,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 row = {"file_path": del_path}
                 delete_event = DeleteEvent(
                     schema=self.watch_manager.root_path,
+                    event_schema=self.watch_manager.root_path,
                     table="files",
                     rows=[row],
+                    fields=list(row.keys()),
                     index=int(time.time() * 1000)
                 )
                 self.event_queue.put(delete_event)
@@ -79,8 +81,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 if metadata:
                     update_event = UpdateEvent(
                         schema=self.watch_manager.root_path,
+                        event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],
+                        fields=list(metadata.keys()),
                         index=int(time.time() * 1000)
                     )
                     self.event_queue.put(update_event)
@@ -93,8 +97,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 row = {"file_path": subdir_del_path}
                 delete_event = DeleteEvent(
                     schema=self.watch_manager.root_path,
+                    event_schema=self.watch_manager.root_path,
                     table="files",
                     rows=[row],
+                    fields=list(row.keys()),
                     index=int(time.time() * 1000)
                 )
                 self.event_queue.put(delete_event)
@@ -104,8 +110,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 if metadata:
                     update_event = UpdateEvent(
                         schema=self.watch_manager.root_path,
+                        event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],
+                        fields=list(metadata.keys()),
                         index=int(time.time() * 1000)
                     )
                     self.event_queue.put(update_event)
@@ -118,8 +126,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 if metadata:
                     update_event = UpdateEvent(
                         schema=self.watch_manager.root_path,
+                        event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],
+                        fields=list(metadata.keys()),
                         index=int(time.time() * 1000)
                     )
                     self.event_queue.put(update_event)
@@ -138,8 +148,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             row = {"file_path": event.src_path}
             delete_event = DeleteEvent(
                 schema=self.watch_manager.root_path,
+                event_schema=self.watch_manager.root_path,
                 table="files",
                 rows=[row],
+                fields=list(row.keys()),
                 index=int(time.time() * 1000)
             )
             self.event_queue.put(delete_event)
@@ -162,8 +174,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             delete_row = {"file_path": event.src_path}
             delete_event = DeleteEvent(
                 schema=self.watch_manager.root_path,
+                event_schema=self.watch_manager.root_path,
                 table="files",
                 rows=[delete_row],
+                fields=list(delete_row.keys()),
                 index=int(time.time() * 1000)
             )
             self.event_queue.put(delete_event)
@@ -182,8 +196,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 if metadata:
                     update_event = UpdateEvent(
                         schema=self.watch_manager.root_path,
+                        event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],
+                        fields=list(metadata.keys()),
                         index=int(time.time() * 1000)
                     )
                     self.event_queue.put(update_event)
@@ -214,8 +230,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 if metadata:
                     update_event = UpdateEvent(
                         schema=self.watch_manager.root_path,
+                        event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],
+                        fields=list(metadata.keys()),
                         index=int(time.time() * 1000)
                     )
                     self.event_queue.put(update_event)
