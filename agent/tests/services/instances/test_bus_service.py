@@ -7,7 +7,7 @@ from fustor_agent.services.instances.bus import EventBusService, EventBusInstanc
 from fustor_core.models.config import SourceConfig, PasswdCredential
 from fustor_core.models.states import EventBusState
 from fustor_core.exceptions import DriverError, TransientSourceBufferFullError
-from fustor_core.models.event import InsertEvent
+from fustor_event_model.models import InsertEvent
 
 @pytest.fixture
 def mock_source_driver_service():

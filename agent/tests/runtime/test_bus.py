@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 from fustor_agent.runtime.bus import MemoryEventBus, EventBusFailedError
-from fustor_core.models.event import EventBase, InsertEvent
+from fustor_event_model.models import EventBase, InsertEvent
 from fustor_core.models.config import FieldMapping
 
 @pytest.mark.asyncio
@@ -100,7 +100,7 @@ class TestMemoryEventBus:
         await bus.subscribe("slow_consumer", 0, [])
 
         for i in range(10):
-        await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 6}], index=6))
+            await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 6}], index=6))
 
         # Slow consumer stays at the start
         await bus.commit("slow_consumer", 1, 0)
@@ -113,6 +113,7 @@ class TestMemoryEventBus:
 
     async def test_can_subscribe(self):
         bus = MemoryEventBus(bus_id="test_bus", capacity=10, start_position=5)
+        for i in range(5, 10):
             await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': i}], index=i))
         await bus.put(InsertEvent(event_schema="s", table="t", rows=[{'id': 5}], index=5))
 

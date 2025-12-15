@@ -5,7 +5,7 @@ import time
 
 from fustor_source_fs import FSDriver
 from fustor_core.models.config import SourceConfig, PasswdCredential
-from fustor_core.models.event import UpdateEvent
+from fustor_event_model.models import UpdateEvent
 
 @pytest.fixture
 def fs_config(tmp_path: Path):
@@ -26,7 +26,7 @@ def mock_watch_manager(mocker):
     mocker.patch('fustor_source_fs.components._WatchManager', return_value=manager)
     return manager
 
-    def test_snapshot_finds_files_and_generates_events(fs_config, tmp_path: Path, mock_watch_manager):
+def test_snapshot_finds_files_and_generates_events(fs_config, tmp_path: Path, mock_watch_manager):
         """Test that get_snapshot_iterator finds files and directories and yields UpdateEvent correctly."""
         # Arrange
         dir1_path = tmp_path / "dir1"

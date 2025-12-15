@@ -3,7 +3,7 @@ from unittest.mock import MagicMock, AsyncMock
 
 from fustor_source_elasticsearch import ElasticsearchDriver
 from fustor_core.models.config import SourceConfig, PasswdCredential
-from fustor_core.models.event import InsertEvent
+from fustor_event_model.models import InsertEvent
 
 @pytest.fixture
 def es_config():

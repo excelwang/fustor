@@ -4,7 +4,7 @@ import logging
 from io import StringIO
 from fustor_pusher_echo import EchoDriver
 from fustor_core.models.config import PusherConfig, PasswdCredential
-from fustor_core.models.event import InsertEvent
+from fustor_event_model.models import InsertEvent
 
 @pytest.mark.asyncio
 async def test_echo_driver_push(caplog):

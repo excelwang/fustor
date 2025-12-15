@@ -9,11 +9,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fustor_pusher_echo import EchoDriver
 from fustor_core.models.config import PusherConfig, PasswdCredential
-from fustor_core.models.event import UpdateEvent
-
+from fustor_event_model.models import UpdateEvent
 
 @pytest.mark.asyncio
-events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
+async def test_echo_pusher_requests_snapshot_on_first_push():
+    """Test that echo pusher requests snapshot on the first push."""
+    # 1. Arrange
+    config = PusherConfig(
+        driver="echo", 
+        endpoint="dummy",  # Required field
+        credential=PasswdCredential(user="test")
+    )
+    driver = EchoDriver("test-echo", config)
+    
+    # Simulate events
+    events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
 
     # 2. Act
     result = await driver.push(events, task_id="echo-sync-fs", agent_id="test-agent")
@@ -35,6 +45,9 @@ async def test_echo_pusher_requests_snapshot_on_first_push_for_any_task():
     
     # Simulate events
     events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
+
+    # 2. Act
+    result = await driver.push(events, task_id="some-other-task", agent_id="test-agent")
 
     # 3. Assert
     assert result == {"snapshot_needed": True}
@@ -80,6 +93,7 @@ async def test_echo_pusher_logs_properly():
     handler = logging.StreamHandler(log_stream)
     logger = logging.getLogger(f"fustor_agent.pusher.echo.test-echo")
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO) # Ensure INFO logs are captured
     events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}])]
 
     # 2. Act
