@@ -50,10 +50,11 @@ def reset_mock_data():
     yield
 
 # Mock Auth Endpoints
+from fastapi import Form
 @mock_router_v1.post("/auth/login", response_model=TokenResponse)
-async def mock_login(login_request: LoginRequest):
-    if login_request.username == "admin@example.com" and login_request.password == "admin_password": # Simplified mock password check
-        return TokenResponse(access_token=MOCK_USERS[login_request.username]["token"], token_type="bearer")
+async def mock_login(username: str = Form(), password: str = Form()):
+    if username == "admin@example.com" and password == "admin_password": # Simplified mock password check
+        return TokenResponse(access_token=MOCK_USERS[username]["token"], token_type="bearer")
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Incorrect username or password")
 
 # Mock Datastore Endpoints
@@ -136,7 +137,7 @@ def test_client():
 import httpx
 from httpx import Request, Response, AsyncBaseTransport
 
-class TestClientTransport(AsyncBaseTransport):
+class _ClientTransport(AsyncBaseTransport):
     def __init__(self, test_client: TestClient):
         self._test_client = test_client
 
@@ -161,7 +162,7 @@ class TestClientTransport(AsyncBaseTransport):
 
 @pytest.fixture
 def registry_client(test_client: TestClient):
-    transport = TestClientTransport(test_client)
+    transport = _ClientTransport(test_client)
     async_client = httpx.AsyncClient(transport=transport, base_url="http://mock-registry")
     return RegistryClient(base_url="http://mock-registry", client=async_client)
 

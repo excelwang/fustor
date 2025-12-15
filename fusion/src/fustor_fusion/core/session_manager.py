@@ -3,6 +3,7 @@ import time
 from typing import Dict, Optional
 import logging
 from fustor_fusion_sdk.interfaces import SessionManagerInterface, SessionInfo # Import the interface and SessionInfo
+from ..in_memory_queue import memory_event_queue # NEW
 
 logger = logging.getLogger(__name__)
 
@@ -99,6 +100,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         # Clean up empty datastore entries
                         if not self._sessions[datastore_id]:
                             del self._sessions[datastore_id]
+                            from ..in_memory_queue import memory_event_queue
+                            await memory_event_queue.clear_datastore_data(datastore_id)
+                            logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain.")
                         
                         # Release any associated lock in the datastore state manager
                         await datastore_state_manager.unlock_for_session(datastore_id, session_id)
@@ -162,6 +166,8 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             # 如果datastore没有更多session了，删除该datastore的条目
             if not self._sessions[datastore_id]:
                 del self._sessions[datastore_id]
+                await memory_event_queue.clear_datastore_data(datastore_id)
+                logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain after removal.")
             
             return True
 
@@ -200,6 +206,8 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     # If datastore has no more sessions, remove the datastore entry
                     if not self._sessions[datastore_id]:
                         del self._sessions[datastore_id]
+                        await memory_event_queue.clear_datastore_data(datastore_id)
+                        logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain after cleanup.")
                     
                     # Release any associated lock in the datastore state manager
                     await datastore_state_manager.unlock_for_session(datastore_id, session_id)
@@ -218,6 +226,12 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         # Then, ensure the lock is also released from the datastore state manager
         if success:
             await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+            # Check if this was the last session for the datastore
+            async with self._lock:
+                if datastore_id in self._sessions and not self._sessions[datastore_id]:
+                    del self._sessions[datastore_id] # Clean up the empty dict entry
+                    await memory_event_queue.clear_datastore_data(datastore_id)
+                    logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain after termination.")
         
         return success
 

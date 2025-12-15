@@ -65,6 +65,9 @@ testpaths = [
 addopts = "-v --tb=short"
 asyncio_default_fixture_loop_scope = "function"
 norecursedirs = ["tests"]
+filterwarnings = [
+    "ignore:pythonjsonlogger.jsonlogger:DeprecationWarning",
+]
 
 [dependency-groups]
 dev = [
