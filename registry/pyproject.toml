@@ -13,11 +13,11 @@ dependencies = [
     "uvicorn",
     "pydantic",
     "pydantic-settings",
-    "sqlalchemy",
+    "sqlalchemy==2.0.41",
     "aiosqlite",
     "asyncpg",
     "psycopg2-binary",
-    "passlib[bcrypt,jwt]",
+    "passlib[bcrypt]",
     "python-jose[cryptography]",
     "cachetools"
 ]
