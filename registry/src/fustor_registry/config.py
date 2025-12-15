@@ -2,9 +2,11 @@ import os
 from pathlib import Path
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from fustor_common.paths import get_fustor_home_dir # NEW import
 
 # Determine the path to the .env file in the user's home directory
-home_dotenv_path = Path.home() / ".fustor" / ".env"
+HOME_FUSTOR_DIR = get_fustor_home_dir() # Use the common function
+home_dotenv_path = HOME_FUSTOR_DIR / ".env" # Correctly derive home_dotenv_path
 
 # Load environment variables from the home directory .env file if it exists
 if home_dotenv_path.is_file():
@@ -19,7 +21,7 @@ if project_dotenv_path.is_file():
     load_dotenv(project_dotenv_path)
 
 class RegisterServiceConfig(BaseModel):
-    FUSTOR_REGISTRY_DB_URL: str = os.getenv("FUSTOR_REGISTRY_DB_URL", "sqlite+aiosqlite:///./fustor-register.db") # Default to sqlite for dev
+    FUSTOR_REGISTRY_DB_URL: str = os.getenv("FUSTOR_REGISTRY_DB_URL", f"sqlite+aiosqlite:///{HOME_FUSTOR_DIR / 'register.db'}") # Default to sqlite in ~/.fustor
     FUSTOR_CORE_SECRET_KEY: str = os.getenv("FUSTOR_CORE_SECRET_KEY", "super-secret-key") # Change this in production
     FUSTOR_CORE_JWT_ALGORITHM: str = os.getenv("FUSTOR_CORE_JWT_ALGORITHM", "HS256")
     FUSTOR_CORE_JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("FUSTOR_CORE_JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 30))

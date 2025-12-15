@@ -19,28 +19,11 @@ from .apikey.router import router as apikey_router
 from .datastore.router import router as datastores_router
 from .api.internal.keys_api import internal_keys_router # CORRECTED
 
-from fustor_common.logging_config import setup_logging # NEW: Import setup_logging
-
-# NEW: Define log directory and file name
-REGISTRY_LOG_DIR = os.path.join(os.path.expanduser("~/.fustor"), "logs")
-REGISTRY_LOG_FILE_NAME = "fustor_registry.log"
-
-# NEW: Get logger for this module
-logger = logging.getLogger("fustor_registry")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """
     异步初始化数据库和管理员用户
     """
-    # NEW: Setup logging at the beginning of lifespan
-    setup_logging(
-        log_directory=REGISTRY_LOG_DIR,
-        base_logger_name="fustor_registry",
-        level=logging.INFO,
-        log_file_name=REGISTRY_LOG_FILE_NAME,
-        console_output=True
-    )
     logger.info("Registry service starting up...")
 
     try:

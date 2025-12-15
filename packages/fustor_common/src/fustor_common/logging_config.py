@@ -6,25 +6,33 @@ import os
 import sys
 
 def setup_logging(
-    log_directory: str,
+    log_file_path: str, # Now accepts full path
     base_logger_name: str,
     level: int = logging.INFO,
-    log_file_name: str = 'fustor.log',
     console_output: bool = True
 ):
     """
     通用日志配置函数。
 
     Args:
-        log_directory (str): 日志文件存放的目录。
+        log_file_path (str): 日志文件存放的完整路径。
         base_logger_name (str): 您的应用程序的基础logger名称（例如，"fustor_agent"或"fustor_fusion"）。
         level (int): 控制台和文件处理程序的最低日志级别。
-        log_file_name (str): 日志文件的名称。
         console_output (bool): 是否将日志输出到控制台。
     """
-    # 确保日志目录存在
+    # 确保日志文件所在的目录存在
+    log_directory = os.path.dirname(log_file_path)
     os.makedirs(log_directory, exist_ok=True)
-    log_file_path = os.path.join(log_directory, log_file_name)
+    
+    # Truncate the log file at startup
+    if os.path.exists(log_file_path):
+        try:
+            with open(log_file_path, 'w', encoding='utf8'):
+                pass  # Open and immediately close to truncate
+        except IOError as e:
+            # Log the error, but don't prevent further logging
+            logging.getLogger(base_logger_name).error(f"Failed to truncate log file {log_file_path}: {e}")
+
 
     if isinstance(level, str):
         numeric_level = getattr(logging, level.upper(), logging.INFO)
@@ -71,41 +79,32 @@ def setup_logging(
                 'level': numeric_level,
                 'formatter': 'color_console',
                 'stream': sys.stdout
-            },
-            'error_file': {
-                'class': 'logging.handlers.RotatingFileHandler',
-                'level': logging.ERROR,
-                'formatter': 'standard',
-                'filename': os.path.join(log_directory, 'fustor_error.log'),
-                'maxBytes': 10485760, # 10MB
-                'backupCount': 2,
-                'encoding': 'utf8'
             }
         },
         'loggers': {
             base_logger_name: {
-                'handlers': ['file', 'error_file'],
+                'handlers': ['file'],
                 'level': numeric_level,
                 'propagate': False
             },
             'uvicorn': {
-                'handlers': ['file', 'error_file'],
+                'handlers': ['file'],
                 'level': numeric_level,
                 'propagate': False
             },
             'uvicorn.error': {
-                'handlers': ['file', 'error_file'],
+                'handlers': ['file'],
                 'level': numeric_level,
                 'propagate': False
             },
             'uvicorn.access': {
-                'handlers': ['file', 'error_file'],
+                'handlers': ['file'],
                 'level': numeric_level, # Use the configured level for access logs
                 'propagate': False
             }
         },
         'root': {
-            'handlers': ['file', 'error_file'],
+            'handlers': ['file'],
             'level': logging.ERROR, # Keep root at ERROR to avoid noise
             'propagate': True, # Allow root to emit to its handlers for unhandled exceptions
         }

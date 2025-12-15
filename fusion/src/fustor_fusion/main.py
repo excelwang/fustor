@@ -8,15 +8,6 @@ from typing import Optional
 import sys
 import logging
 
-from fustor_common.logging_config import setup_logging
-
-# Setup logging for Fusion service
-setup_logging(
-    log_directory=os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs"),
-    base_logger_name="fustor_fusion",
-    level=os.environ.get("FUSION_LOG_LEVEL", "INFO").upper()
-)
-
 logger = logging.getLogger(__name__)
 
 # --- Ingestor Service Specific Imports ---
@@ -162,13 +153,3 @@ async def read_web_api_root():
 @app.get("/view", tags=["UI"])
 async def read_web_api_root(request: Request):
     return FileResponse(f"{ui_dir}/view.html")
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=8003,
-        log_level="warning",
-        access_log=True
-    )

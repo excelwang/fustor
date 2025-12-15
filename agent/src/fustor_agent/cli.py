@@ -10,17 +10,18 @@ import subprocess
 import time
 
 from fustor_common.logging_config import setup_logging
+from fustor_common.paths import get_fustor_home_dir # NEW import
 from . import CONFIG_DIR, CONFIG_FILE_NAME, ConfigurationError
 
-# Use an absolute path for the config directory to ensure consistency
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-ABSOLUTE_CONFIG_DIR = os.path.join(PROJECT_ROOT, CONFIG_DIR)
-PID_FILE = os.path.join(ABSOLUTE_CONFIG_DIR, "fustor_agent.pid")
+# Define common logging path
+HOME_FUSTOR_DIR = get_fustor_home_dir() # Use the common function
+AGENT_LOG_FILE = os.path.join(HOME_FUSTOR_DIR, "agent.log") # Renamed from fustor_agent.log
+
+# PID file location
+PID_FILE = os.path.join(HOME_FUSTOR_DIR, "agent.pid") # Renamed from fustor_agent.pid
 
 
 def _is_running():
-    """Check if the daemon is already running by checking the PID file."""
-    if not os.path.exists(PID_FILE):
         return False
     try:
         with open(PID_FILE, 'r') as f:
@@ -50,7 +51,7 @@ def start(reload, port, daemon, verbose, no_console_log):
     """Starts the FuAgent monitoring service (in the foreground by default)."""
     log_level = "DEBUG" if verbose else "INFO"
     # Disable console logging if --no-console-log is passed (used by daemonized process)
-    setup_logging(ABSOLUTE_CONFIG_DIR, base_logger_name="fustor_agent", level=log_level.upper(), console_output=(not no_console_log))
+    setup_logging(log_file_path=AGENT_LOG_FILE, base_logger_name="fustor_agent", level=log_level.upper(), console_output=(not no_console_log))
     logger = logging.getLogger("fustor_agent")
 
     if daemon:
@@ -155,7 +156,7 @@ def stop():
 def discover_schema(ctx, source_id, admin_user, admin_password):
     """Discovers and caches the schema for a given source configuration."""
     # Setup with default INFO level for this one-off command
-    setup_logging(ABSOLUTE_CONFIG_DIR, base_logger_name="fustor_agent", level="INFO")
+    setup_logging(log_file_path=AGENT_LOG_FILE, base_logger_name="fustor_agent", level="INFO")
     logger = logging.getLogger("fustor_agent")
 
     click.echo(f"Attempting to discover and cache schema for source: {source_id}...")

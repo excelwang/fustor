@@ -21,8 +21,8 @@ if home_dotenv_path.is_file():
 # Load .env from project root (lowest priority) - will not override already set variables
 load_dotenv(find_dotenv())
 
-CONFIG_FILE_NAME = 'config.yaml'
-STATE_FILE_NAME = 'fustor_agent.state.json'
+CONFIG_FILE_NAME = 'agent-config.yaml' # Renamed from config.yaml
+STATE_FILE_NAME = 'agent-state.json'
 
 STATE_FILE_PATH = os.path.join(CONFIG_DIR, STATE_FILE_NAME)
 
