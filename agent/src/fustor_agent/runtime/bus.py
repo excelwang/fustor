@@ -85,7 +85,7 @@ class MemoryEventBus:
                 event.index = self._next_event_index
                 self._next_event_index += 1
             self.buffer.append(event)
-            logger.debug(f"Bus '{self.id}': Put event with index {event.index}. Buffer size: {len(self.buffer)}/{self.capacity}")
+            logger.info(f"Bus '{self.id}': Put event with index {event.index}. Buffer size: {len(self.buffer)}/{self.capacity}")
             if len(self.buffer) < self.capacity:
                 self._producer_can_put.set()
             self._consumer_can_get.set()
