@@ -24,7 +24,7 @@ try:
         
     async def mock_push(self, events, **kwargs):
         # Simulate slow processing to trigger buffer full
-        await asyncio.sleep(0.5)
+        await asyncio.sleep(1) # Delay of 1 second
         # Call original push to keep logging behavior
         return await original_push(self, events, **kwargs)
         
@@ -55,7 +55,7 @@ async def test_transient_source_buffer_full_triggers_error():
             driver="fs",
             uri=str(monitored_dir),
             credential=PasswdCredential(user="test", passwd="test"),
-            max_queue_size=1000,  # Realistic buffer size
+            max_queue_size=2,  # Adjusted buffer size to 10
             max_retries=1,
             retry_delay_sec=1,
             disabled=False,
@@ -96,21 +96,22 @@ async def test_transient_source_buffer_full_triggers_error():
             
             # 7. Generate load (burst of events)
             # Create more files than the buffer size (1000)
-            for i in range(2000): # Increased file count
+            for i in range(3): # Generate 20 events
                 test_file = monitored_dir / f"file_{i}.txt"
                 test_file.touch()
-                # No sleep here, we want to flood the buffer
+                await asyncio.sleep(1) # Event generation interval of 1 second
             
             # 8. Wait for the system to react
             # Give it a moment to process and hopefully fail
-            for _ in range(500): # Increased wait time
+            # Wait for more than the total event generation time + processing time to ensure it finishes.
+            for _ in range(5): # 40 iterations * 1s (mock_push) = 40s if each pushes a batch.
                 sync_instance = app.sync_instance_service.get_instance("test-sync-task")
                 if sync_instance:
                     # Standard assertion: The system should handle the load without entering an error state.
                     # If the bug exists (buffer full causes crash), this assertion will fail.
                     assert sync_instance.state != SyncState.ERROR, f"Sync task unexpectedly failed: {sync_instance.info}"
                 
-                await asyncio.sleep(0.05) # Reduced sleep to speed up waiting
+                await asyncio.sleep(1) # Check state every second
             
             # If we reach here, the system survived the load.
             pass

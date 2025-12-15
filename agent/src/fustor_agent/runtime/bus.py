@@ -65,6 +65,7 @@ class MemoryEventBus:
                 if is_transient:
                     raise TransientSourceBufferFullError(
                         f"瞬态数据源的事件总线 '{self.id}' 缓冲区已满 (容量: {self.capacity})。为防止数据丢失，任务已停止。"
+                        f"建议将缓冲区大小增加至 {self.capacity * 2}。"
                     )
                 self._producer_can_put.clear()
                 logger.debug(f"Bus '{self.id}': Buffer full, producer is waiting.")

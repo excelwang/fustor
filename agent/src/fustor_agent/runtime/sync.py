@@ -2,6 +2,7 @@ import asyncio
 import logging
 import queue
 import threading
+import time
 from typing import Optional, Any, TYPE_CHECKING, Dict
 from datetime import datetime, timezone
 
@@ -333,7 +334,10 @@ class SyncInstance:
                 
                 current_event.rows = final_rows_for_push
                 try:
+                    push_start_time = time.monotonic()
                     await self.pusher_driver_instance.push(events=[current_event], session_id=self.session_id, source_type='snapshot')
+                    push_duration = time.monotonic() - push_start_time
+                    logger.info(f"Sync '{self.id}' snapshot push latency: {push_duration:.4f} seconds")
                 except Exception as e:
                     # Check if this is the SessionObsoletedError specifically
                     if "Session is obsolete" in str(e):
@@ -435,11 +439,14 @@ class SyncInstance:
                 )
                 continue
 
+            push_start_time = time.monotonic()
             response_dict = await self.pusher_driver_instance.push(
                 events=events_to_push, 
                 session_id=self.session_id,
                 is_snapshot_end=False
             )
+            push_duration = time.monotonic() - push_start_time
+            logger.info(f"Sync '{self.id}' push latency: {push_duration:.4f} seconds")
 
             pushed_rows_count = sum(len(e.rows) for e in events_to_push)
             self._statistics["events_pushed"] += pushed_rows_count
