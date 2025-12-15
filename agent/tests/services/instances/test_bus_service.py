@@ -88,7 +88,7 @@ async def test_bus_producer_loop_and_transient_error(source_config, mock_source_
     await bus_runtime._produce_loop()
 
     assert bus_runtime.state == EventBusState.ERROR
-    assert "缓冲区已满" in bus_runtime.info
+    assert "Event buffer is filled with no extra space left!" in bus_runtime.info
     assert len(bus_runtime.internal_bus.buffer) == 1
     assert bus_runtime.internal_bus.buffer[0].index == 1
 
