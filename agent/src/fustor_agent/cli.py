@@ -22,6 +22,7 @@ PID_FILE = os.path.join(HOME_FUSTOR_DIR, "agent.pid") # Renamed from fustor_agen
 
 
 def _is_running():
+    if not os.path.exists(PID_FILE):
         return False
     try:
         with open(PID_FILE, 'r') as f:
@@ -83,8 +84,8 @@ def start(reload, port, daemon, verbose, no_console_log):
         return
 
     try:
-        if not os.path.exists(ABSOLUTE_CONFIG_DIR):
-            os.makedirs(ABSOLUTE_CONFIG_DIR)
+        if not os.path.exists(CONFIG_DIR):
+            os.makedirs(CONFIG_DIR)
         with open(PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
 
@@ -113,7 +114,7 @@ def start(reload, port, daemon, verbose, no_console_log):
     except ConfigurationError as e:
         click.echo("="*60)
         click.echo(click.style(f"FuAgent Configuration Error: {e}", fg="red"))
-        click.echo(f"Please check your configuration file at: '{os.path.join(ABSOLUTE_CONFIG_DIR, CONFIG_FILE_NAME)}'")
+        click.echo(f"Please check your configuration file at: '{os.path.join(CONFIG_DIR, CONFIG_FILE_NAME)}'")
         click.echo("="*60)
     except Exception as e:
         logger.critical(f"An unexpected error occurred during startup: {e}", exc_info=True)
@@ -162,7 +163,7 @@ def discover_schema(ctx, source_id, admin_user, admin_password):
     click.echo(f"Attempting to discover and cache schema for source: {source_id}...")
     try:
         from .app import App
-        app_instance = App(config_dir=ABSOLUTE_CONFIG_DIR)
+        app_instance = App(config_dir=CONFIG_DIR)
         asyncio.run(app_instance.source_config_service.discover_and_cache_fields(
             source_id, admin_user, admin_password
         ))

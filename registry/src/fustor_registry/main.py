@@ -19,6 +19,9 @@ from .apikey.router import router as apikey_router
 from .datastore.router import router as datastores_router
 from .api.internal.keys_api import internal_keys_router # CORRECTED
 
+# Create logger instance
+logger = logging.getLogger("fustor_registry")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """

@@ -53,8 +53,8 @@ def start(reload, port, daemon, verbose, no_console_log):
     """Starts the Fustor Registry service (in the foreground by default)."""
     log_level = "DEBUG" if verbose else "INFO"
     
-    # Ensure log directory exists for the COMMON_LOG_FILE
-    os.makedirs(os.path.dirname(COMMON_LOG_FILE), exist_ok=True)
+    # Ensure log directory exists for the REGISTRY_LOG_FILE
+    os.makedirs(os.path.dirname(REGISTRY_LOG_FILE), exist_ok=True)
 
     # Setup logging for the registry CLI
     setup_logging(
@@ -135,7 +135,7 @@ def start(reload, port, daemon, verbose, no_console_log):
         logger.critical(f"Fustor Registry Configuration Error: {e}", exc_info=True)
         click.echo("="*60)
         click.echo(click.style(f"Fustor Registry Configuration Error: {e}", fg="red"))
-        click.echo(f"Please check your configuration file at: '{os.path.join(REGISTRY_CONFIG_DIR, REGISTRY_CONFIG_FILE_NAME)}'")
+        click.echo("Please check your environment variables and .env file in the home directory.")
         click.echo("="*60)
     except Exception as e:
         logger.critical(f"An unexpected error occurred during startup: {e}", exc_info=True)
