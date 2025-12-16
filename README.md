@@ -51,8 +51,37 @@ Fustor Monorepo 包含以下主要服务和可插拔组件：
 - pytest - 测试框架
 - dotenv - 环境变量管理
 
-## 🔧 安装运行
+## 🔧 安装
 
+按需安装服务。
+
+-  **安装 agent**
+```bash
+pip install fustor-agent
+```
+
+-  **安装 registry**
+```bash
+pip install fustor-registry
+```
+
+-  **安装 fusion**
+```bash
+pip install fustor-fusion
+```
+
+**运行环境配置**
+    ```bash
+    mkdir -p ～/.fustor
+    cp .env.example ～/.fustor/.env  # 请按实际修改配置
+    ```
+
+**启动开发服务器 (示例: Registry 服务)**
+    ```bash
+    fustor-registry start -D
+    ```
+
+## 🧪 开发与测试
 本项目使用 `uv` 进行高效的依赖管理和环境设置。
 
 1.  **安装 uv 包管理器**
@@ -73,29 +102,10 @@ Fustor Monorepo 包含以下主要服务和可插拔组件：
     uv sync --extra dev
     ```
 
-4.  **复制环境配置**
+4.  **运行测试 (示例: Registry 服务)**
     ```bash
-    cp .env.example .env  # 请按实际修改数据库配置
+    uv run pytest 
     ```
-
-5.  **启动开发服务器 (示例: Registry 服务)**
-    ```bash
-    uv run python -m uvicorn registry.src.fustor_registry.main:app --reload
-    ```
-    *   要启动其他服务，请替换 `registry.src.fustor_registry.main:app` 为对应服务的入口点。
-
-## 🧪 开发与测试
-
-1.  **安装依赖**
-    ```bash
-    uv sync --extra dev
-    ```
-
-2.  **运行测试 (示例: Registry 服务)**
-    ```bash
-    uv run pytest registry/tests/
-    ```
-    *   要运行其他服务的测试，请替换 `registry/tests/` 为对应服务的测试目录。
 
 ## 📚 附加文档
 
