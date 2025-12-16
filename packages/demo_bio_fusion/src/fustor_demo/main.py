@@ -105,5 +105,10 @@ async def clear_store():
 
 # Main entry point for uvicorn
 if __name__ == "__main__":
+    import logging
     import uvicorn
+    # Configure uvicorn to use DEBUG level for access logs to reduce verbosity
+    uvicorn_logger = logging.getLogger("uvicorn.access")
+    uvicorn_logger.setLevel(logging.DEBUG)
+
     uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

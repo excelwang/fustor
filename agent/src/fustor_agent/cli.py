@@ -106,6 +106,10 @@ def start(reload, port, host, daemon, verbose, no_console_log):
         if reload:
             app_to_run = "fustor_agent.api.routes:web_app"
 
+        # Configure uvicorn to use DEBUG level for access logs to reduce verbosity
+        uvicorn_logger = logging.getLogger("uvicorn.access")
+        uvicorn_logger.setLevel(logging.DEBUG)
+
         uvicorn.run(
             app_to_run,
             host=host,
