@@ -17,7 +17,7 @@ from .profile.router import router as profile_router
 from .auth.router import router as auth_router
 from .apikey.router import router as apikey_router
 from .datastore.router import router as datastores_router
-from .api.client.keys_api import client_keys_router # CORRECTED
+from .api.client.api import client_keys_router # CORRECTED
 
 # Create logger instance
 logger = logging.getLogger("fustor_registry")

@@ -3,7 +3,7 @@ import os
 from typing import Optional, Dict, Any, List
 
 from fustor_common.models import TokenResponse, MessageResponse, DatastoreBase, ApiKeyBase
-from fustor_registry_client.models import InternalApiKeyResponse, InternalDatastoreConfigResponse
+from fustor_registry_client.models import ClientApiKeyResponse, ClientDatastoreConfigResponse
 
 class RegistryClient:
     def __init__(self, base_url: str, token: Optional[str] = None, client: Optional[httpx.AsyncClient] = None):
@@ -80,13 +80,13 @@ class RegistryClient:
         response_data = await self._request("DELETE", f"/v1/keys/{key_id}")
         return MessageResponse(**response_data)
 
-    async def get_internal_api_keys(self) -> List[InternalApiKeyResponse]:
-        response_data = await self._request("GET", "/internal/api-keys")
-        return [InternalApiKeyResponse(**data) for data in response_data]
+    async def get_client_api_keys(self) -> List[ClientApiKeyResponse]:
+        response_data = await self._request("GET", "/client/api-keys")
+        return [ClientApiKeyResponse(**data) for data in response_data]
 
-    async def get_internal_datastores_config(self) -> List[InternalDatastoreConfigResponse]:
-        response_data = await self._request("GET", "/internal/datastores-config")
-        return [InternalDatastoreConfigResponse(**data) for data in response_data]
+    async def get_client_datastores_config(self) -> List[ClientDatastoreConfigResponse]:
+        response_data = await self._request("GET", "/client/datastores-config")
+        return [ClientDatastoreConfigResponse(**data) for data in response_data]
 
     async def __aenter__(self):
         return self

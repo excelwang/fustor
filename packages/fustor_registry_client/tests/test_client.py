@@ -3,13 +3,13 @@ from fastapi import FastAPI, APIRouter, Depends, HTTPException, status
 from fastapi.testclient import TestClient
 from typing import List, Dict, Any, Optional
 from fustor_registry_client.client import RegistryClient
-from fustor_registry_client.models import InternalApiKeyResponse, InternalDatastoreConfigResponse
+from fustor_registry_client.models import ClientApiKeyResponse, ClientDatastoreConfigResponse
 from fustor_common.models import TokenResponse, MessageResponse, DatastoreBase, ApiKeyBase, Password, LoginRequest
 
 # --- Mock FastAPI App for Registry Service ---
 mock_app = FastAPI()
 mock_router_v1 = APIRouter(prefix="/v1")
-mock_internal_router = APIRouter(prefix="/internal")
+mock_client_router = APIRouter(prefix="/client")
 
 # Mock data
 MOCK_DATASTORES = {
@@ -110,16 +110,16 @@ async def mock_delete_api_key(key_id: int):
     del MOCK_API_KEYS[key_id]
     return MessageResponse(message="API Key deleted successfully")
 
-# Mock Internal Endpoints
-@mock_internal_router.get("/api-keys", response_model=List[InternalApiKeyResponse])
-async def mock_get_internal_api_keys():
-    return [InternalApiKeyResponse(key=data["key"], name=data["name"], datastore_id=data["datastore_id"]) for data in MOCK_API_KEYS.values()]
+# Mock Client Endpoints
+@mock_client_router.get("/api-keys", response_model=List[ClientApiKeyResponse])
+async def mock_get_client_api_keys():
+    return [ClientApiKeyResponse(key=data["key"], name=data["name"], datastore_id=data["datastore_id"]) for data in MOCK_API_KEYS.values()]
 
-@mock_internal_router.get("/datastores-config", response_model=List[InternalDatastoreConfigResponse])
-async def mock_get_internal_datastores_config():
+@mock_client_router.get("/datastores-config", response_model=List[ClientDatastoreConfigResponse])
+async def mock_get_client_datastores_config():
     configs = []
     for ds_id, ds_data in MOCK_DATASTORES.items():
-        configs.append(InternalDatastoreConfigResponse(
+        configs.append(ClientDatastoreConfigResponse(
             datastore_id=ds_id,
             allow_concurrent_push=ds_data["allow_concurrent_push"],
             session_timeout_seconds=ds_data["session_timeout_seconds"]
@@ -127,7 +127,7 @@ async def mock_get_internal_datastores_config():
     return configs
 
 mock_app.include_router(mock_router_v1)
-mock_app.include_router(mock_internal_router)
+mock_app.include_router(mock_client_router)
 
 @pytest.fixture
 def test_client():
@@ -244,13 +244,13 @@ async def test_delete_api_key(registry_client: RegistryClient):
     assert 101 not in MOCK_API_KEYS
 
 @pytest.mark.asyncio
-async def test_get_internal_api_keys(registry_client: RegistryClient):
-    internal_keys = await registry_client.get_internal_api_keys()
-    assert len(internal_keys) == len(MOCK_API_KEYS)
-    assert all(isinstance(ik, InternalApiKeyResponse) for ik in internal_keys)
+async def test_get_client_api_keys(registry_client: RegistryClient):
+    client_keys = await registry_client.get_client_api_keys()
+    assert len(client_keys) == len(MOCK_API_KEYS)
+    assert all(isinstance(ik, ClientApiKeyResponse) for ik in client_keys)
 
 @pytest.mark.asyncio
-async def test_get_internal_datastores_config(registry_client: RegistryClient):
-    internal_configs = await registry_client.get_internal_datastores_config()
-    assert len(internal_configs) == len(MOCK_DATASTORES)
-    assert all(isinstance(ic, InternalDatastoreConfigResponse) for ic in internal_configs)
+async def test_get_client_datastores_config(registry_client: RegistryClient):
+    client_configs = await registry_client.get_client_datastores_config()
+    assert len(client_configs) == len(MOCK_DATASTORES)
+    assert all(isinstance(ic, ClientDatastoreConfigResponse) for ic in client_configs)

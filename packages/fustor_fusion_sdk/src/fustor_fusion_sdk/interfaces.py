@@ -25,19 +25,19 @@ class ApiKeyCacheInterface(Protocol):
         ...
 
 from fustor_common.models import DatastoreConfig
-from fustor_registry_client.models import InternalDatastoreConfigResponse
+from fustor_registry_client.models import ClientDatastoreConfigResponse
 
 class DatastoreConfigCacheInterface(Protocol):
     """
     Interface for managing datastore config cache.
     """
-    def set_cache(self, datastore_configs_data: List[InternalDatastoreConfigResponse]):
+    def set_cache(self, datastore_configs_data: List[ClientDatastoreConfigResponse]):
         ...
 
     def get_datastore_config(self, datastore_id: int) -> Optional[DatastoreConfig]:
         ...
 
-from fustor_registry_client.models import InternalDatastoreConfigResponse
+from fustor_registry_client.models import ClientDatastoreConfigResponse
 
 class ParserProcessingTaskManagerInterface(Protocol):
     """
@@ -49,7 +49,7 @@ class ParserProcessingTaskManagerInterface(Protocol):
     async def stop_processing_for_datastore(self, datastore_id: int):
         ...
 
-    async def sync_tasks(self, latest_datastore_configs: List[InternalDatastoreConfigResponse]):
+    async def sync_tasks(self, latest_datastore_configs: List[ClientDatastoreConfigResponse]):
         ...
 
     async def shutdown(self):

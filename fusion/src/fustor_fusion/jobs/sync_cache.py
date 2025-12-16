@@ -21,7 +21,7 @@ async def sync_caches_job() -> None:
     }
     async with RegistryClient(**client_config) as fustor_registry_client:
         # Sync API keys
-        api_keys_data = await fustor_registry_client.get_internal_api_keys()
+        api_keys_data = await fustor_registry_client.get_client_api_keys()
         if api_keys_data is not None:
             api_keys_dict = [key.model_dump() for key in api_keys_data]
             api_key_cache.set_cache(api_keys_dict)
@@ -31,7 +31,7 @@ async def sync_caches_job() -> None:
             raise RuntimeError("Failed to fetch API keys from register service.")
 
         # Sync datastore configs
-        datastore_configs_data = await fustor_registry_client.get_internal_datastores_config()
+        datastore_configs_data = await fustor_registry_client.get_client_datastores_config()
         if datastore_configs_data is not None:
             datastore_config_cache.set_cache(datastore_configs_data)
             logger.info(f"Datastore config cache synced. Total configs: {len(datastore_config_cache._cache)}")

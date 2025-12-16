@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from typing import Dict, Set, Callable, Coroutine, Any, List
-from fustor_registry.api.internal.keys_api import InternalDatastoreConfigResponse
+from fustor_registry.api.client.api import ClientDatastoreConfigResponse
 from fustor_fusion_sdk.interfaces import ParserProcessingTaskManagerInterface # Import the interface
 
 logger = logging.getLogger(__name__)
@@ -42,7 +42,7 @@ class ParserProcessingTaskManager(ParserProcessingTaskManagerInterface): # Inher
             else:
                 logger.warning(f"No running task found for datastore {datastore_id} to stop.")
 
-    async def sync_tasks(self, latest_datastore_configs: List[InternalDatastoreConfigResponse]):
+    async def sync_tasks(self, latest_datastore_configs: List[ClientDatastoreConfigResponse]):
         """
         Compares the latest set of datastore configurations with the currently running tasks
         and starts/stops tasks accordingly.
