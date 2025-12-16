@@ -10,7 +10,10 @@ import time
 import json
 from pathlib import Path
 import secrets
+from jose import jwt
+from datetime import datetime, timezone
 from fustor_registry_client.client import RegistryClient
+from .config import register_config
 
 from fustor_common.logging_config import setup_logging
 from fustor_common.exceptions import ConfigurationError # Re-use common ConfigurationError
@@ -83,13 +86,45 @@ def _is_running():
 
 @click.group()
 @click.option("--base-url", default="http://127.0.0.1:8101", help="Base URL for the Registry API.")
-@click.option("--token", envvar="FUSTOR_REGISTRY_TOKEN", help="JWT Token for authentication. Can be set via FUSTOR_REGISTRY_TOKEN environment variable.")
 @click.pass_context
-def cli(ctx, base_url: str, token: str):
+def cli(ctx, base_url: str):
     ctx.ensure_object(dict)
     ctx.obj["BASE_URL"] = base_url
-    # Use token from command line/env
-    ctx.obj["TOKEN"] = token
+    # Try to read token from temporary file
+    token_file_path = Path(HOME_FUSTOR_DIR) / "registry-client-access-token.tmp"
+    if token_file_path.exists():
+        try:
+            with open(token_file_path, 'r') as f:
+                stored_token = f.read().strip()
+                if stored_token:
+                    # Check if the token is still valid (not expired)
+                    try:
+                        # Decode the token to check its expiration
+                        payload = jwt.decode(stored_token, register_config.FUSTOR_CORE_SECRET_KEY, algorithms=[register_config.FUSTOR_CORE_JWT_ALGORITHM])
+                        exp = payload.get("exp")
+                        if exp:
+                            # Check if token is expired
+                            if datetime.now(timezone.utc).timestamp() > exp:
+                                # Token is expired, remove the temp file and set token to None
+                                os.remove(token_file_path)
+                                ctx.obj["TOKEN"] = None
+                                click.echo("Stored token has expired. Please run 'fustor registry login' again.", err=True)
+                            else:
+                                # Token is still valid
+                                ctx.obj["TOKEN"] = stored_token
+                        else:
+                            # No expiration claim found, assume token is invalid
+                            ctx.obj["TOKEN"] = None
+                    except jwt.JWTError:
+                        # Token is invalid/corrupted, remove the temp file
+                        os.remove(token_file_path)
+                        ctx.obj["TOKEN"] = None
+                else:
+                    ctx.obj["TOKEN"] = None
+        except Exception:
+            ctx.obj["TOKEN"] = None
+    else:
+        ctx.obj["TOKEN"] = None
 
 @cli.command()
 @click.option("--host", default="127.0.0.1", help="Host address to bind to.")
@@ -214,14 +249,20 @@ def start(reload, port, host, daemon, verbose, no_console_log):
 @click.option("--password", prompt=True, hide_input=True, help="Admin user password.")
 @click.pass_context
 def login(ctx, email: str, password: str):
-    """Logs in to the Registry and prints the JWT token."""
+    """Logs in to the Registry and saves the JWT token to a temporary file."""
 
     async def _login():
         async with RegistryClient(base_url=ctx.obj["BASE_URL"]) as client:
             try:
-                token = await client.login(email=email, password=password)
-                click.echo(f"Login successful. Access token: {token.access_token}")
-                click.echo("Note: Token is not saved to disk. Use it directly in your requests.")
+                token_response = await client.login(email=email, password=password)
+
+                # Save token to a temporary file in HOME_FUSTOR_DIR
+                token_file_path = Path(HOME_FUSTOR_DIR) / "registry-client-access-token.tmp"
+
+                with open(token_file_path, 'w') as f:
+                    f.write(token_response.access_token)
+
+                click.echo("Login successful. Token saved to temporary file.")
             except Exception as e:
                 click.echo(f"Login failed: {e}", err=True)
     asyncio.run(_login())
