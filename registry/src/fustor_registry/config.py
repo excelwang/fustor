@@ -21,7 +21,7 @@ if project_dotenv_path.is_file():
     load_dotenv(project_dotenv_path)
 
 class RegisterServiceConfig(BaseModel):
-    FUSTOR_REGISTRY_DB_URL: str = os.getenv("FUSTOR_REGISTRY_DB_URL", f"sqlite+aiosqlite:///{HOME_FUSTOR_DIR / 'register.db'}") # Default to sqlite in ~/.fustor
+    FUSTOR_REGISTRY_DB_URL: str = os.getenv("FUSTOR_REGISTRY_DB_URL", f"sqlite+aiosqlite:///{HOME_FUSTOR_DIR / 'registry.db'}") # Default to sqlite in ~/.fustor
     FUSTOR_CORE_SECRET_KEY: str = os.getenv("FUSTOR_CORE_SECRET_KEY", "super-secret-key") # Change this in production
     FUSTOR_CORE_JWT_ALGORITHM: str = os.getenv("FUSTOR_CORE_JWT_ALGORITHM", "HS256")
     FUSTOR_CORE_JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("FUSTOR_CORE_JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 30))
