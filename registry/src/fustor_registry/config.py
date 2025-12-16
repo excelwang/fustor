@@ -26,6 +26,6 @@ class RegisterServiceConfig(BaseModel):
     FUSTOR_CORE_JWT_ALGORITHM: str = os.getenv("FUSTOR_CORE_JWT_ALGORITHM", "HS256")
     FUSTOR_CORE_JWT_ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("FUSTOR_CORE_JWT_ACCESS_TOKEN_EXPIRE_MINUTES", 30))
     FUSTOR_CORE_JWT_REFRESH_TOKEN_EXPIRE_DAYS: int = int(os.getenv("FUSTOR_CORE_JWT_REFRESH_TOKEN_EXPIRE_DAYS", 7))
-    FUSTOR_REGISTRY_API_TOKEN: str = os.getenv("FUSTOR_REGISTRY_API_TOKEN", "") # API token for internal services
+    FUSTOR_REGISTRY_CLIENT_TOKEN: str = os.getenv("FUSTOR_REGISTRY_CLIENT_TOKEN", "") # API token for client services
 
 register_config = RegisterServiceConfig()

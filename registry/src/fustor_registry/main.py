@@ -17,7 +17,7 @@ from .profile.router import router as profile_router
 from .auth.router import router as auth_router
 from .apikey.router import router as apikey_router
 from .datastore.router import router as datastores_router
-from .api.internal.keys_api import internal_keys_router # CORRECTED
+from .api.client.keys_api import client_keys_router # CORRECTED
 
 # Create logger instance
 logger = logging.getLogger("fustor_registry")
@@ -91,7 +91,7 @@ router_v1.include_router(datastores_router)
 router_v1.include_router(admin_router)
 
 app.include_router(router_v1)
-app.include_router(internal_keys_router, prefix="/internal", tags=["Internal"]) # NEW: Include internal router
+app.include_router(client_keys_router, prefix="/client", tags=["Client"]) # NEW: Include client router
 
 ui_dir = os.path.join(os.path.dirname(__file__), "ui")
 app.mount("/assets", StaticFiles(directory=f"{ui_dir}/assets", html=True), name="assets")

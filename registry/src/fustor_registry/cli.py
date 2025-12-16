@@ -22,8 +22,6 @@ HOME_FUSTOR_DIR = get_fustor_home_dir() # Use the common function
 REGISTRY_PID_FILE = os.path.join(HOME_FUSTOR_DIR, "registry.pid") # Renamed from fustor_registry.pid
 REGISTRY_LOG_FILE = os.path.join(HOME_FUSTOR_DIR, "registry.log") # Renamed from fustor_registry.log
 
-# Define a path for storing the token
-TOKEN_FILE = os.path.expanduser("~/.fustor/registry_token")
 
 def ensure_registry_token():
     """
@@ -31,7 +29,7 @@ def ensure_registry_token():
     If no token is set in environment variables, generates a random one and stores it in the .env file.
     """
     from .config import register_config
-    token = register_config.FUSTOR_REGISTRY_API_TOKEN
+    token = register_config.FUSTOR_REGISTRY_CLIENT_TOKEN
 
     # If no token is set in environment variables, generate one
     if not token:
@@ -48,16 +46,16 @@ def ensure_registry_token():
                 env_content = f.read()
 
         # Check if the token is already in the file
-        token_line_prefix = "FUSTOR_REGISTRY_API_TOKEN="
+        token_line_prefix = "FUSTOR_REGISTRY_CLIENT_TOKEN="
         token_exists = any(line.startswith(token_line_prefix) for line in env_content.split('\n'))
 
         # If token doesn't exist in the file, append it
         if not token_exists:
             with open(env_file_path, 'a') as f:
-                f.write(f"\nFUSTOR_REGISTRY_API_TOKEN={token}\n")
+                f.write(f"\nFUSTOR_REGISTRY_CLIENT_TOKEN={token}\n")
 
         # Update the register_config so that the token is available for this session
-        os.environ["FUSTOR_REGISTRY_API_TOKEN"] = token
+        os.environ["FUSTOR_REGISTRY_CLIENT_TOKEN"] = token
         return token
     else:
         return token
@@ -90,10 +88,7 @@ def _is_running():
 def cli(ctx, base_url: str, token: str):
     ctx.ensure_object(dict)
     ctx.obj["BASE_URL"] = base_url
-    # Prioritize token from command line/env, then from file
-    if not token and os.path.exists(TOKEN_FILE):
-        with open(TOKEN_FILE, "r") as f:
-            token = f.read().strip()
+    # Use token from command line/env
     ctx.obj["TOKEN"] = token
 
 @cli.command()
@@ -110,7 +105,7 @@ def start_fg(host: str, port: int, reload: bool):
 @click.option("-h", "--host", default="127.0.0.1", help="Host to bind the server to.")
 @click.option("-D", "--daemon", is_flag=True, help="Run the service as a background daemon.")
 @click.option("-V", "--verbose", is_flag=True, help="Enable verbose (DEBUG level) logging.")
-@click.option("--no-console-log", is_flag=True, hidden=True, help="Internal: Disable console logging for daemon process.")
+@click.option("--no-console-log", is_flag=True, hidden=True, help="Client: Disable console logging for daemon process.")
 def start(reload, port, host, daemon, verbose, no_console_log):
     """Starts the Fustor Registry service (in the foreground by default)."""
     log_level = "DEBUG" if verbose else "INFO"
@@ -219,15 +214,14 @@ def start(reload, port, host, daemon, verbose, no_console_log):
 @click.option("--password", prompt=True, hide_input=True, help="Admin user password.")
 @click.pass_context
 def login(ctx, email: str, password: str):
-    """Logs in to the Registry and saves the JWT token."""
+    """Logs in to the Registry and prints the JWT token."""
+
     async def _login():
         async with RegistryClient(base_url=ctx.obj["BASE_URL"]) as client:
             try:
                 token = await client.login(email=email, password=password)
-                os.makedirs(os.path.dirname(TOKEN_FILE), exist_ok=True)
-                with open(TOKEN_FILE, "w") as f:
-                    f.write(token.access_token)
-                click.echo("Login successful. Token saved.")
+                click.echo(f"Login successful. Access token: {token.access_token}")
+                click.echo("Note: Token is not saved to disk. Use it directly in your requests.")
             except Exception as e:
                 click.echo(f"Login failed: {e}", err=True)
     asyncio.run(_login())

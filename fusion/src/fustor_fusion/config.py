@@ -21,7 +21,7 @@ if project_dotenv_path.is_file():
 
 class FusionServiceConfig(BaseModel):
     FUSTOR_FUSION_REGISTRY_URL: str = os.getenv("FUSTOR_FUSION_REGISTRY_URL", "http://127.0.0.1:8101")
-    FUSTOR_FUSION_REGISTRY_TOKEN: str = os.getenv("FUSTOR_FUSION_REGISTRY_TOKEN", "")
+    FUSTOR_REGISTRY_CLIENT_TOKEN: str = os.getenv("FUSTOR_REGISTRY_CLIENT_TOKEN", "")
     FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: int = int(os.getenv("FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS", 60))
     # Add other ingestor specific configs here
 

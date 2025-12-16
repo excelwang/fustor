@@ -17,7 +17,7 @@ async def sync_caches_job() -> None:
 
     client_config = {
         "base_url": fusion_config.FUSTOR_FUSION_REGISTRY_URL,
-        "token": fusion_config.FUSTOR_FUSION_REGISTRY_TOKEN
+        "token": fusion_config.FUSTOR_REGISTRY_CLIENT_TOKEN
     }
     async with RegistryClient(**client_config) as fustor_registry_client:
         # Sync API keys
