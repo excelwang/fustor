@@ -5,6 +5,23 @@ import logging.config
 import os
 import sys
 
+class UvicornAccessFilter(logging.Filter):
+    """
+    Filter to suppress uvicorn.access logs when system level is INFO,
+    but allow them when system level is DEBUG.
+    """
+    def __init__(self, normal_level: int = logging.INFO):
+        super().__init__()
+        self.normal_level = normal_level
+
+    def filter(self, record):
+        # If it's a uvicorn.access log, only allow it through if system level is DEBUG
+        if record.name.startswith('uvicorn.access'):
+            return self.normal_level <= logging.DEBUG
+        # For other logs, apply normal level filtering
+        else:
+            return record.levelno >= self.normal_level
+
 def setup_logging(
     log_file_path: str, # Now accepts full path
     base_logger_name: str,
@@ -67,18 +84,26 @@ def setup_logging(
         'handlers': {
             'file': {
                 'class': 'logging.handlers.RotatingFileHandler',
-                'level': numeric_level,
+                'level': logging.DEBUG,  # Set to DEBUG so it can catch DEBUG level logs
                 'formatter': 'standard',
                 'filename': log_file_path,
                 'maxBytes': 10485760, # 10MB
                 'backupCount': 5,
-                'encoding': 'utf8'
+                'encoding': 'utf8',
+                'filters': ['uvicorn_access_filter']  # Add the custom filter
             },
             'console': {
                 'class': 'logging.StreamHandler',
-                'level': numeric_level,
+                'level': logging.DEBUG,  # Set to DEBUG for the same reason
                 'formatter': 'color_console',
-                'stream': sys.stdout
+                'stream': sys.stdout,
+                'filters': ['uvicorn_access_filter']  # Add the custom filter
+            }
+        },
+        'filters': {
+            'uvicorn_access_filter': {
+                '()': UvicornAccessFilter,
+                'normal_level': numeric_level
             }
         },
         'loggers': {
@@ -99,7 +124,7 @@ def setup_logging(
             },
             'uvicorn.access': {
                 'handlers': ['file'],
-                'level': numeric_level, # Use the configured level for access logs
+                'level': logging.INFO,  # Standard level for access logs
                 'propagate': False
             }
         },

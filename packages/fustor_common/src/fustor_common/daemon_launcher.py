@@ -61,12 +61,13 @@ def main():
         
         logger.info(f"{args.display_name} daemon starting on {args.host}:{args.port}")
         
+        # Import and run uvicorn
+        import uvicorn
         # Configure uvicorn to use DEBUG level for access logs to reduce verbosity
+        # Need to set this after import but before run, and ensure it persists
         uvicorn_logger = logging.getLogger("uvicorn.access")
         uvicorn_logger.setLevel(logging.DEBUG)
 
-        # Import and run uvicorn
-        import uvicorn
         uvicorn.run(
             app,
             host=args.host,
