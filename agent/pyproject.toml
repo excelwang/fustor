@@ -3,7 +3,7 @@ name = "fustor-agent"
 dynamic = ["version"]
 description = "realtime data sync agent for various data sources"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [ "click>=8.1.7", "fastapi>=0.115.13", "uvicorn[standard]>=0.34.3", "pydantic>=2.11.7", "fustor-core", "fustor-source-fs", "fustor-pusher-echo",]
 [[project.authors]]
 name = "Huajin Wang"

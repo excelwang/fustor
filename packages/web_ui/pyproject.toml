@@ -2,7 +2,7 @@
 name = "fustor-web-ui"
 dynamic = ["version"]
 description = "Web UI for Fustor Agent"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [ "fustor-core",]
 [[project.authors]]
 name = "Huajin Wang"

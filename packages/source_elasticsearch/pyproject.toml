@@ -2,7 +2,7 @@
 name = "fustor-source-elasticsearch"
 dynamic = ["version"]
 description = "An Elasticsearch source for Fustor Agent"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 dependencies = [ "elasticsearch>=9.2.0", "fustor-core",]
 [[project.authors]]
 name = "Huajin Wang"

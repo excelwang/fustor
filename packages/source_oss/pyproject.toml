@@ -3,7 +3,7 @@ name = "fustor-source-oss"
 dynamic = ["version"]
 description = "Fustor Source Driver for S3-compatible object storage (OSS)"
 dependencies = [ "boto3>=1.28.0,<2.0.0", "fustor-core", "pydantic>=2.0.0,<3.0.0",]
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 
 [build-system]
 requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
