@@ -214,7 +214,6 @@ def test_eviction_log_shows_correct_age(fs_config: SourceConfig, tmp_path: Path,
     finally:
         watch_manager.stop()
 
-@pytest.mark.xfail(reason="DriverError not propagated as expected or stop_event not set in test context.")
 def test_min_monitoring_window_raises_error(fs_config: SourceConfig, tmp_path: Path, caplog):
     """
     Tests that if an evicted watch is newer than the min_monitoring_window_days threshold,
@@ -224,13 +223,6 @@ def test_min_monitoring_window_raises_error(fs_config: SourceConfig, tmp_path: P
     caplog.set_level(logging.ERROR) # Capture ERROR logs
     watch_limit = 2
     min_window_days = 10
-
-    driver = FSDriver('test-fs-id', fs_config)
-    # The FSDriver passes its own stop_event to the WatchManager
-    # So we can assert on driver.stop_event
-    watch_manager = driver.watch_manager
-    watch_manager.watch_limit = watch_limit
-    watch_manager.min_monitoring_window_days = min_window_days
 
     with patch('time.time') as mock_time:
         base_time = 1000000000
@@ -247,38 +239,40 @@ def test_min_monitoring_window_raises_error(fs_config: SourceConfig, tmp_path: P
         dir2.mkdir()
         dir3.mkdir()
 
+        driver = FSDriver('test-fs-id', fs_config)
+        # The FSDriver passes its own stop_event to the WatchManager
+        # So we can assert on driver.stop_event
+        watch_manager = driver.watch_manager
+        watch_manager.watch_limit = watch_limit
+        watch_manager.min_monitoring_window_days = min_window_days
+
         watch_manager.start()
 
         watch_manager.schedule(str(dir2), newest_mtime)
         watch_manager.schedule(str(dir1), evicted_mtime)
 
-        # Act
+        # Act & Assert
         # This schedule will be newer than dir2, triggering the eviction of dir1.
         # The relative age of dir1 is (base_time - evicted_mtime) = 5 days.
-        # Since 5 < 10 (min_window_days), it should trigger the error path.
-        # We expect a DriverError to be raised here, but it's caught within the driver.
-        # So we assert on side effects (logs, stop_event) instead.
-        try:
+        # Since 5 < 10 (min_window_days), it should trigger the error path and raise DriverError.
+        with pytest.raises(DriverError):
             watch_manager.schedule(str(dir3), trigger_mtime)
-        except DriverError:
-            pass # Expect DriverError and handle it to continue assertions
 
-    # Assert
-    # Check that the stop_event was set (meaning the driver was told to stop)
-    assert driver.watch_manager.stop_driver_event.is_set()
+        # Check that the stop_event was set (meaning the driver was told to stop)
+        assert driver.watch_manager.stop_driver_event.is_set()
 
-    # Check for the specific error message in the logs
-    error_log_found = False
-    expected_error_substring = (
-        f"Watch limit reached and an active watch for {str(dir1)} "
-        f"(relative age: 5.00 days) is about to be evicted. "
-        f"This is below the configured min_monitoring_window_days ({min_window_days} days). "
-        f"Stopping driver to prevent data loss."
-    )
-    for record in caplog.records:
-        if record.levelno == logging.ERROR and expected_error_substring in record.message:
-            error_log_found = True
-            break
-    assert error_log_found, f"Expected error log not found. Logs: {caplog.text}"
+        # Check for the specific error message in the logs
+        error_log_found = False
+        expected_error_substring = (
+            f"Watch limit reached and an active watch for {str(dir1)} "
+            f"(relative age: 5.00 days) is about to be evicted. "
+            f"This is below the configured min_monitoring_window_days ({min_window_days} days). "
+            f"Stopping driver to prevent data loss."
+        )
+        for record in caplog.records:
+            if record.levelno == logging.ERROR and expected_error_substring in record.message:
+                error_log_found = True
+                break
+        assert error_log_found, f"Expected error log not found. Logs: {caplog.text}"
 
-    watch_manager.stop()
+        watch_manager.stop()
