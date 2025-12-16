@@ -83,9 +83,6 @@ publish_package "packages/pusher_fusion" "fustor-pusher-fusion"
 publish_package "fusion" "fustor-fusion"
 publish_package "agent" "fustor-agent"
 
-# --- Phase 5: CLI ---
-echo "--- Phase 5: Publishing CLI ---"
-publish_package "packages/fustor_cli" "fustor-cli"
 
 echo "----------------------------------------------------"
 echo "PyPI publishing script finished."

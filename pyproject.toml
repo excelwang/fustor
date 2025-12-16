@@ -5,7 +5,6 @@ members = [
     "registry",
     "packages/core",
     "packages/fustor_agent_sdk",
-    "packages/fustor_cli",
     "packages/fustor_common",
     "packages/fustor_event_model",
     "packages/fustor_fusion_sdk",
@@ -27,7 +26,6 @@ fustor-fusion = { workspace = true }
 fustor-registry = { workspace = true }
 fustor-core = { workspace = true }
 fustor-agent-sdk = { workspace = true }
-fustor-cli = { workspace = true }
 fustor-common = { workspace = true }
 fustor-event-model = { workspace = true }
 fustor-fusion-sdk = { workspace = true }
