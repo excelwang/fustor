@@ -275,6 +275,7 @@ class _WatchManager:
                 # Catch ENOENT (2) - File not found, likely deleted before we could watch it
                 # Catch ENOTDIR (20) - Not a directory (can happen if a file replaced a dir)
                 # Catch EACCES (13) - Permission denied
+                # Catch EINVAL (22) - Invalid argument, which can happen with special filesystems or very long paths
                 if e.errno == 2: # ENOENT
                     if os.path.exists(path):
                         # Path exists, but inotify reports ENOENT. This is problematic for inotify.
@@ -286,6 +287,9 @@ class _WatchManager:
                 if e.errno in (20, 13): # ENOTDIR, EACCES
                      logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), it may strictly no longer exist or be inaccessible.")
                      return
+                if e.errno == 22: # EINVAL - Invalid argument
+                    logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), invalid argument. This can happen with special filesystems, bind mounts, or unusual path characters.")
+                    return
 
                 if e.errno == 28:
                     new_limit = len(self.lru_cache)
