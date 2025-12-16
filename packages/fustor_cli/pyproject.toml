@@ -2,6 +2,7 @@
 name = "fustor-cli"
 dynamic = ["version"]
 description = "Unified CLI for Fustor services"
+license = "MIT"
 dependencies = [ "click>=8.0.0", "fustor-agent", "fustor-fusion", "fustor-registry", "fustor-common",]
 
 [build-system]

@@ -95,5 +95,4 @@ publish_package "packages/fustor_cli" "fustor-cli"
 
 echo "----------------------------------------------------"
 echo "PyPI publishing script finished."
-echo "Remember to uncomment 'uv publish' or 'twine upload dist/*' in the script for actual publishing."
 echo "----------------------------------------------------"
