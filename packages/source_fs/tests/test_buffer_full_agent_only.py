@@ -14,26 +14,6 @@ from fustor_core.models.config import SourceConfig, PusherConfig, SyncConfig, Pa
 from fustor_agent.app import App
 from fustor_core.models.states import SyncState
 
-# We need to patch the Echo driver to avoid the AttributeError seen earlier
-try:
-    from fustor_pusher_echo import EchoDriver
-    original_create_session = EchoDriver.create_session
-    original_push = EchoDriver.push
-    
-    async def mock_create_session(self, task_id):
-        return {"session_id": "mock-session-id", "suggested_heartbeat_interval_seconds": 10}
-        
-    async def mock_push(self, events, **kwargs):
-        # Simulate slow processing to trigger buffer full
-        await asyncio.sleep(1) # Delay of 1 second
-        # Call original push to keep logging behavior
-        return await original_push(self, events, **kwargs)
-        
-    EchoDriver.create_session = mock_create_session
-    EchoDriver.push = mock_push
-except ImportError:
-    pass
-
 @pytest.mark.xfail(reason="Expected to fail: Buffer full bug reproduction")
 @pytest.mark.asyncio
 async def test_transient_source_buffer_full_triggers_error(caplog):

@@ -43,8 +43,7 @@ class FusionClient:
         """
         try:
             # Sanitize task_id to handle any surrogate characters before JSON serialization
-            sanitized_task_id = sanitize_surrogate_characters(task_id)
-            payload = {"task_id": sanitized_task_id}
+            payload = {"task_id": task_id}
             response = await self.client.post("/ingestor-api/v1/sessions/", json=payload)
             response.raise_for_status()
             return response.json().get("session_id")
