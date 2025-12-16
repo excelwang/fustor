@@ -219,7 +219,7 @@ class _WatchManager:
                             with self._lock:
                                 if src_path_str in self.lru_cache:
                                     self.lru_cache.remove(src_path_str)
-                                    logger.debug(f"Removed watch for '{src_path_str}' from LRU cache due to IGNORED event.")
+                                    logger.debug(f"Removed watch for '{safe_path_handling(src_path_str)}' from LRU cache due to IGNORED event.")
 
             except KeyError as e:
                 logger.debug(f"Ignoring event for untracked watch descriptor: {str(e)}")
@@ -237,7 +237,7 @@ class _WatchManager:
             
             oldest = self.lru_cache.get_oldest()
             if oldest and oldest[1].timestamp >= timestamp_to_use and is_eviction_needed:
-                logger.debug(f"New watch for {path} (ts {timestamp_to_use:.2f}) is older than oldest in cache (ts {oldest[1].timestamp:.2f}). Skipping.")
+                logger.debug(f"New watch for {safe_path_handling(path)} (ts {timestamp_to_use:.2f}) is older than oldest in cache (ts {oldest[1].timestamp:.2f}). Skipping.")
                 return
 
             if is_eviction_needed:
@@ -258,14 +258,14 @@ class _WatchManager:
                             self.stop_driver_event.set()
                         raise DriverError(error_msg)
 
-                    logger.info(f"Watch limit reached. Evicting watch for {evicted_path} (relative age: {relative_age_days:.2f} days).")
+                    logger.info(f"Watch limit reached. Evicting watch for {safe_path_handling(evicted_path)} (relative age: {relative_age_days:.2f} days).")
                     try:
                         self.inotify.remove_watch(safe_path_encode(evicted_path))
                     except (KeyError, OSError) as e:
-                        logger.warning(f"Error removing evicted watch for {evicted_path}: {e}")
+                        logger.warning(f"Error removing evicted watch for {safe_path_handling(evicted_path)}: {e}")
                     self.unschedule_recursive(evicted_path)
                 else:
-                    logger.warning(f"Watch limit of {self.watch_limit} reached, but LRU cache is empty. Cannot schedule new watch for {path}.")
+                    logger.warning(f"Watch limit of {self.watch_limit} reached, but LRU cache is empty. Cannot schedule new watch for {safe_path_handling(path)}.")
                     return
 
             try:
@@ -279,16 +279,16 @@ class _WatchManager:
                 if e.errno == 2: # ENOENT
                     if os.path.exists(path):
                         # Path exists, but inotify reports ENOENT. This is problematic for inotify.
-                        logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), path exists but inotify rejected it. (Consider renaming if possible).")
+                        logger.warning(f"[fs] Could not schedule watch for {safe_path_handling(path)} (errno={e.errno}), path exists but inotify rejected it. (Consider renaming if possible).")
                     else:
                         # Path truly does not exist.
-                        logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), it may strictly no longer exist or be inaccessible.")
+                        logger.warning(f"[fs] Could not schedule watch for {safe_path_handling(path)} (errno={e.errno}), it may strictly no longer exist or be inaccessible.")
                     return
                 if e.errno in (20, 13): # ENOTDIR, EACCES
-                     logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), it may strictly no longer exist or be inaccessible.")
+                     logger.warning(f"[fs] Could not schedule watch for {safe_path_handling(path)} (errno={e.errno}), it may strictly no longer exist or be inaccessible.")
                      return
                 if e.errno == 22: # EINVAL - Invalid argument
-                    logger.warning(f"[fs] Could not schedule watch for {path} (errno={e.errno}), invalid argument. This can happen with special filesystems, bind mounts, or unusual path characters.")
+                    logger.warning(f"[fs] Could not schedule watch for {safe_path_handling(path)} (errno={e.errno}), invalid argument. This can happen with special filesystems, bind mounts, or unusual path characters.")
                     return
 
                 if e.errno == 28:
@@ -315,7 +315,7 @@ class _WatchManager:
                     self.watch_limit = new_limit
                     return self.schedule(path, timestamp_to_use) # Retry the schedule call after adjusting the limit
                 else:
-                    logger.error(f"OS error scheduling watch for {path}: {e}", exc_info=True)
+                    logger.error(f"OS error scheduling watch for {safe_path_handling(path)}: {e}", exc_info=True)
                     raise
 
     def unschedule_recursive(self, path: str):
@@ -336,7 +336,7 @@ class _WatchManager:
                     if os.path.isdir(current_path):
                         self.schedule(current_path, timestamp)
                 except (OSError, PermissionError) as e:
-                    logger.warning(f"[fs] Error accessing path during touch: {current_path} - {str(e)}")
+                    logger.warning(f"[fs] Error accessing path during touch: {safe_path_handling(current_path)} - {str(e)}")
                 
                 if not is_recursive_upward or len(current_path) <= len(self.root_path):
                     break

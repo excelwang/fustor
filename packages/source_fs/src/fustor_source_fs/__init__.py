@@ -18,7 +18,7 @@ from fustor_core.drivers import SourceDriver
 from fustor_core.models.config import SourceConfig
 from fustor_event_model.models import EventBase, UpdateEvent, DeleteEvent
 
-from .components import _WatchManager
+from .components import _WatchManager, safe_path_handling
 from .event_handler import OptimizedWatchEventHandler, get_file_metadata
 
 logger = logging.getLogger("fustor_agent.driver.fs")
@@ -149,8 +149,8 @@ class FSDriver(SourceDriver):
                 oldest_age = time.time() - oldest_dir[1]  # Difference in seconds
                 logger.info(
                     f"[fs] Pre-scan completed: processed {total_entries} entries, "
-                    f"errors: {error_count}, newest_dir: {newest_dir[0]} (age: {newest_age/86400:.2f} days), "
-                    f"oldest_dir: {oldest_dir[0]} (age: {oldest_age/86400:.2f} days)"
+                    f"errors: {error_count}, newest_dir: {safe_path_handling(newest_dir[0])} (age: {newest_age/86400:.2f} days), "
+                    f"oldest_dir: {safe_path_handling(oldest_dir[0])} (age: {oldest_age/86400:.2f} days)"
                 )
 
             logger.info(f"[fs] Found {len(mtime_map)} total directories. Building capacity-aware, hierarchy-complete watch set...")
@@ -194,7 +194,7 @@ class FSDriver(SourceDriver):
             def handle_walk_error(e: OSError):
                 nonlocal error_count
                 error_count += 1
-                logger.debug(f"[{stream_id}] Error during snapshot walk, skipping path: {e.filename} - {e.strerror}")
+                logger.debug(f"[{stream_id}] Error during snapshot walk, skipping path: {safe_path_handling(e.filename)} - {e.strerror}")
 
             temp_mtime_map: Dict[str, float] = {}
 
@@ -223,7 +223,7 @@ class FSDriver(SourceDriver):
                                     batch = []
                     except (FileNotFoundError, PermissionError, OSError) as e:
                         error_count += 1
-                        logger.debug(f"[fs] Error processing file during snapshot: {file_path} - {str(e)}")
+                        logger.debug(f"[fs] Error processing file during snapshot: {safe_path_handling(file_path)} - {str(e)}")
 
                 for dirname in dirs:
                     dirpath = os.path.join(root, dirname)
@@ -328,7 +328,7 @@ class FSDriver(SourceDriver):
         except Exception:
             user = "unknown"
 
-        logger.info(f"[fs] Checking permissions for user '{user}' on path: {path}")
+        logger.info(f"[fs] Checking permissions for user '{user}' on path: {safe_path_handling(path)}")
         
         if not os.path.exists(path):
             return (False, f"路径不存在: {path}")
