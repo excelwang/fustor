@@ -40,13 +40,7 @@ publish_package() {
 
     echo "Publishing package: $package_name to PyPI..."
     # Ensure you are logged in to PyPI or have credentials configured (e.g., via ~/.pypirc)
-    # Use 'uv publish' or 'twine upload dist/*'
-    # uv publish dist/*
-
-    # For demonstration, I will echo the twine command. Uncomment the line above for actual publishing.
-    echo "Command to publish (uncomment 'uv publish' in script to enable): twine upload dist/*"
-    # twine upload dist/*
-
+    uv publish dist/*
 
     if [ $? -ne 0 ]; then
         echo "Error: Publish failed for $package_name. Aborting."
