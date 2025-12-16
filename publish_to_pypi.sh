@@ -22,7 +22,8 @@ publish_package() {
     rm -rf dist/ build/ *.egg-info
 
     echo "Building package: $package_name..."
-    uv build
+    # Force output to local dist/ directory to ensure the publish step finds it
+    uv build --out-dir dist
 
     if [ $? -ne 0 ]; then
         echo "Error: Build failed for $package_name. Aborting."
@@ -30,10 +31,17 @@ publish_package() {
         exit 1
     fi
 
+    # Check if dist directory has files
+    if [ -z "$(ls -A dist)" ]; then
+       echo "Error: Build succeeded but 'dist' directory is empty. Cannot publish."
+       popd > /dev/null
+       exit 1
+    fi
+
     echo "Publishing package: $package_name to PyPI..."
     # Ensure you are logged in to PyPI or have credentials configured (e.g., via ~/.pypirc)
     # Use 'uv publish' or 'twine upload dist/*'
-    # uv publish
+    # uv publish dist/*
 
     # For demonstration, I will echo the twine command. Uncomment the line above for actual publishing.
     echo "Command to publish (uncomment 'uv publish' in script to enable): twine upload dist/*"

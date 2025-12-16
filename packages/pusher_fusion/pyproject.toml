@@ -22,6 +22,7 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/packages/pusher_fusi
 fusion = "fustor_pusher_fusion:FusionDriver"
 
 [tool.setuptools_scm]
+root = "../.."
 version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
