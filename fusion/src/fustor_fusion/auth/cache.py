@@ -12,8 +12,6 @@ class ApiKeyCache(ApiKeyCacheInterface): # Inherit from the interface
         """
         new_cache = {item['key']: item['datastore_id'] for item in api_keys_data if 'key' in item and 'datastore_id' in item}
         self._cache = new_cache
-        print(f"API Key cache updated. Total keys: {len(self._cache)}")
-
     def get_datastore_id(self, api_key: str) -> Optional[int]:
         """
         Retrieves the datastore_id for a given API key.

@@ -112,7 +112,7 @@ async def add_event_to_queue(datastore_id: int, event: EventBase, task_id: Optio
     """
     Add an event to the in-memory queue.
     """
-    return await queue_based_ingestor.add_event(datastore_id, content, task_id)
+    return await queue_based_ingestor.add_event(datastore_id, event, task_id)
 
 
 async def add_events_batch_to_queue(datastore_id: int, events: List[EventBase], task_id: Optional[str] = None) -> int:

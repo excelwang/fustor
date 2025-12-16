@@ -22,7 +22,6 @@ api_router.include_router(drivers_api.router, prefix="/drivers", tags=["Drivers"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("DEBUG: Inside startup_event")
     # Ensure CONFIG_DIR is absolute for App initialization
     project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     absolute_config_dir = os.path.join(project_root, CONFIG_DIR)

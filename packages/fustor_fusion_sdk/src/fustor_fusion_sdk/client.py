@@ -5,6 +5,32 @@ from typing import Optional, List, Dict, Any
 
 logger = logging.getLogger(__name__)
 
+def contains_surrogate_characters(text: str) -> bool:
+    """Check if text contains surrogate characters."""
+    try:
+        text.encode('utf-8')
+        return False
+    except UnicodeEncodeError:
+        return True
+
+def sanitize_surrogate_characters(obj: Any) -> Any:
+    """
+    Recursively sanitize an object by replacing surrogate characters with safe alternatives.
+    """
+    if isinstance(obj, str):
+        if contains_surrogate_characters(obj):
+            # Encode with replacement and decode back to handle surrogate characters
+            return obj.encode('utf-8', errors='replace').decode('utf-8')
+        return obj
+    elif isinstance(obj, dict):
+        return {key: sanitize_surrogate_characters(value) for key, value in obj.items()}
+    elif isinstance(obj, list):
+        return [sanitize_surrogate_characters(item) for item in obj]
+    elif isinstance(obj, tuple):
+        return tuple(sanitize_surrogate_characters(item) for item in obj)
+    else:
+        return obj
+
 class FusionClient:
     def __init__(self, base_url: str, api_key: str):
         self.base_url = base_url
@@ -16,7 +42,9 @@ class FusionClient:
         Creates a new session and returns the session ID.
         """
         try:
-            payload = {"task_id": task_id}
+            # Sanitize task_id to handle any surrogate characters before JSON serialization
+            sanitized_task_id = sanitize_surrogate_characters(task_id)
+            payload = {"task_id": sanitized_task_id}
             response = await self.client.post("/ingestor-api/v1/sessions/", json=payload)
             response.raise_for_status()
             return response.json().get("session_id")
@@ -32,10 +60,14 @@ class FusionClient:
         Pushes a batch of events to the Fusion service.
         """
         try:
+            # Sanitize events to handle any surrogate characters before JSON serialization
+            sanitized_events = [sanitize_surrogate_characters(event) for event in events]
+            sanitized_source_type = sanitize_surrogate_characters(source_type)
+
             payload = {
                 "session_id": session_id,
-                "events": events,
-                "source_type": source_type
+                "events": sanitized_events,
+                "source_type": sanitized_source_type
             }
             response = await self.client.post("/ingestor-api/v1/events/", json=payload)
             response.raise_for_status()

@@ -31,7 +31,7 @@ class SourceDriverService(SourceDriverServiceInterface): # Inherit from the inte
                     discovered[ep.name] = ep.load()
                 except Exception as e:
                     logger.error(f"Failed to load source driver plugin '{ep.name}': {e}", exc_info=True)
-            print(f"DEBUG: Discovered source drivers: {discovered}") # Added debug print
+            logger.debug(f"DEBUG: Discovered source drivers: {discovered}") # Added debug print
         except Exception as e:
             logger.error(f"Error while discovering entry points: {e}", exc_info=True)
         return discovered
