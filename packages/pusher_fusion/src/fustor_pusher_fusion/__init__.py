@@ -59,7 +59,7 @@ class FusionDriver(PusherDriver):
         success = await self.fusion_client.send_heartbeat(self.session_id)
 
         if success:
-            self.logger.info("Heartbeat sent successfully.")
+            self.logger.debug("Heartbeat sent successfully.")
             return {"status": "ok"}
         else:
             self.logger.error("Failed to send heartbeat.")
