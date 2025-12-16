@@ -1,6 +1,9 @@
 
 import httpx
+import logging
 from typing import Optional, List, Dict, Any
+
+logger = logging.getLogger(__name__)
 
 class FusionClient:
     def __init__(self, base_url: str, api_key: str):
@@ -18,10 +21,10 @@ class FusionClient:
             response.raise_for_status()
             return response.json().get("session_id")
         except httpx.HTTPStatusError as e:
-            print(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
+            logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
             return None
         except Exception as e:
-            print(f"An error occurred: {e}")
+            logger.error(f"An error occurred: {e}")
             return None
 
     async def push_events(self, session_id: str, events: List[Dict[str, Any]], source_type: str) -> bool:
@@ -38,10 +41,10 @@ class FusionClient:
             response.raise_for_status()
             return True
         except httpx.HTTPStatusError as e:
-            print(f"HTTP error occurred during event push: {e.response.status_code} - {e.response.text}")
+            logger.error(f"HTTP error occurred during event push: {e.response.status_code} - {e.response.text}")
             return False
         except Exception as e:
-            print(f"An error occurred during event push: {e}")
+            logger.error(f"An error occurred during event push: {e}")
             return False
 
     async def send_heartbeat(self, session_id: str) -> bool:
@@ -54,10 +57,10 @@ class FusionClient:
             response.raise_for_status()
             return True
         except httpx.HTTPStatusError as e:
-            print(f"HTTP error occurred during heartbeat: {e.response.status_code} - {e.response.text}")
+            logger.error(f"HTTP error occurred during heartbeat: {e.response.status_code} - {e.response.text}")
             return False
         except Exception as e:
-            print(f"An error occurred during heartbeat: {e}")
+            logger.error(f"An error occurred during heartbeat: {e}")
             return False
 
     async def __aenter__(self):
