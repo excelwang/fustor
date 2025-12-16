@@ -1,6 +1,6 @@
 [project]
 name = "fustor-core"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Core components for Fustor services and plugins"
 requires-python = ">=3.11"
 dependencies = [ "pydantic>=2.11.7",]
@@ -9,8 +9,12 @@ name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [build-system]
-requires = [ "setuptools>=61.0",]
+requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/packages/core"

@@ -1,10 +1,10 @@
 [build-system]
-requires = [ "hatchling",]
-build-backend = "hatchling.build"
+requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "fustor_pusher_fusion"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Fustor agent pusher driver for the Fustor Fusion service."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -20,6 +20,10 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/packages/pusher_fusi
 
 [project.entry-points."fustor_agent.drivers.pushers"]
 fusion = "fustor_pusher_fusion:FusionDriver"
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+local_scheme = "dirty-tag"
 
 [tool.setuptools.packages.find]
 where = [ "src",]

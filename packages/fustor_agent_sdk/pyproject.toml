@@ -1,12 +1,16 @@
 [project]
 name = "fustor-agent-sdk"
-version = "0.1.0"
+dynamic = ["version"]
 description = "SDK for Fustor Agent service"
 dependencies = [ "fustor-core", "fustor-registry-client",]
 
 [build-system]
-requires = [ "setuptools>=61.0",]
+requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/packages/fustor_agent_sdk"

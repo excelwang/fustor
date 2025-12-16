@@ -1,13 +1,17 @@
 [project]
 name = "fustor-source-oss"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Fustor Source Driver for S3-compatible object storage (OSS)"
 dependencies = [ "boto3>=1.28.0,<2.0.0", "fustor-core", "pydantic>=2.0.0,<3.0.0",]
 requires-python = ">=3.11"
 
 [build-system]
-requires = [ "setuptools>=61.0",]
+requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+version_scheme = "post-release"
+local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/packages/source_oss"
