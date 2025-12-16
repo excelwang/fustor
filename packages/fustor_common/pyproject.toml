@@ -2,7 +2,7 @@
 name = "fustor-common"
 dynamic = ["version"]
 description = "Common utilities and models for Fustor services"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 dependencies = [ "colorlog>=6.10.1", "pydantic>=2.11.7", "pydantic-settings>=2.3.4",]
 

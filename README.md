@@ -1,6 +1,6 @@
 # Fustor 数据管理平台 (Monorepo)
 
-![](https://img.shields.io/badge/Python-3.10%2B-blue)
+![](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![](https://img.shields.io/badge/FastAPI-0.104.1-green)
 ![](https://img.shields.io/badge/SQLAlchemy-2.0.23-orange)
 

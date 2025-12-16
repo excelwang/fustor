@@ -7,7 +7,7 @@ name = "fustor_pusher_fusion"
 dynamic = ["version"]
 description = "Fustor agent pusher driver for the Fustor Fusion service."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "MIT"
 classifiers = [ "Programming Language :: Python :: 3", "Operating System :: OS Independent",]
 dependencies = [ "fustor-core", "fustor-fusion-sdk",]
