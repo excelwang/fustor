@@ -3,7 +3,7 @@ name = "fustor-registry"
 dynamic = ["version"]
 description = "Registry service for Fustor (Control Plane)"
 requires-python = ">=3.11"
-dependencies = [ "click", "fastapi[all]", "uvicorn", "pydantic", "pydantic-settings", "greenlet==3.2.2", "sqlalchemy==2.0.41", "aiosqlite", "passlib[bcrypt]", "python-jose[cryptography]", "cachetools",]
+dependencies = [ "click", "fastapi[all]", "uvicorn", "pydantic", "pydantic-settings", "greenlet==3.2.2", "sqlalchemy==2.0.41", "aiosqlite", "passlib[bcrypt]", "python-jose[cryptography]", "cachetools", "fustor-registry-client",]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
