@@ -237,7 +237,7 @@ def datastore_list(ctx):
     """Lists all datastores."""
     async def _list():
         if not ctx.obj["TOKEN"]:
-            click.echo("Error: Not logged in. Please run 'fustor-registry login' first or provide --token.", err=True)
+            click.echo("Error: Not logged in. Please run 'fustor registry login' first or provide --token.", err=True)
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             datastores = await client.list_datastores()
@@ -256,7 +256,7 @@ def datastore_create(ctx, name: str, meta_items: tuple[str], visible: bool, allo
     """Creates a new datastore."""
     async def _create():
         if not ctx.obj["TOKEN"]:
-            click.echo("Error: Not logged in. Please run 'fustor-registry login' first or provide --token.", err=True)
+            click.echo("Error: Not logged in. Please run 'fustor registry login' first or provide --token.", err=True)
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             try:
@@ -282,7 +282,7 @@ def datastore_get(ctx, id: int):
     """Gets a datastore by ID."""
     async def _get():
         if not ctx.obj["TOKEN"]:
-            click.echo("Error: Not logged in. Please run 'fustor-registry login' first or provide --token.", err=True)
+            click.echo("Error: Not logged in. Please run 'fustor registry login' first or provide --token.", err=True)
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             try:
@@ -304,7 +304,7 @@ def datastore_update(ctx, id: int, name: str, meta_items: tuple[str], visible: b
     """Updates a datastore by ID."""
     async def _update():
         if not ctx.obj["TOKEN"]:
-            click.echo("Error: Not logged in. Please run 'fustor-registry login' first or provide --token.", err=True)
+            click.echo("Error: Not logged in. Please run 'fustor registry login' first or provide --token.", err=True)
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             try:
@@ -329,7 +329,7 @@ def datastore_delete(ctx, id: int):
     """Deletes a datastore by ID."""
     async def _delete():
         if not ctx.obj["TOKEN"]:
-            click.echo("Error: Not logged in. Please run 'fustor-registry login' first or provide --token.", err=True)
+            click.echo("Error: Not logged in. Please run 'fustor registry login' first or provide --token.", err=True)
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             try:
@@ -350,7 +350,7 @@ def apikey_list(ctx):
     """Lists all API keys."""
     async def _list():
         if not ctx.obj["TOKEN"]:
-            click.echo("Error: Not logged in. Please run 'fustor-registry login' first or provide --token.", err=True)
+            click.echo("Error: Not logged in. Please run 'fustor registry login' first or provide --token.", err=True)
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             api_keys = await client.list_api_keys()
@@ -366,7 +366,7 @@ def apikey_create(ctx, name: str, datastore_id: int):
     """Creates a new API key."""
     async def _create():
         if not ctx.obj["TOKEN"]:
-            click.echo("Error: Not logged in. Please run 'fustor-registry login' first or provide --token.", err=True)
+            click.echo("Error: Not logged in. Please run 'fustor registry login' first or provide --token.", err=True)
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             try:
@@ -384,7 +384,7 @@ def apikey_get(ctx, id: int):
     """Gets an API key by ID."""
     async def _get():
         if not ctx.obj["TOKEN"]:
-            click.echo("Error: Not logged in. Please run 'fustor-registry login' first or provide --token.", err=True)
+            click.echo("Error: Not logged in. Please run 'fustor registry login' first or provide --token.", err=True)
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             try:
@@ -417,7 +417,7 @@ def apikey_delete(ctx, id: int):
     """Deletes an API key by ID."""
     async def _delete():
         if not ctx.obj["TOKEN"]:
-            click.echo("Error: Not logged in. Please run 'fustor-registry login' first or provide --token.", err=True)
+            click.echo("Error: Not logged in. Please run 'fustor registry login' first or provide --token.", err=True)
             return
         async with RegistryClient(base_url=ctx.obj["BASE_URL"], token=ctx.obj["TOKEN"]) as client:
             try:
