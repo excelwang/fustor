@@ -82,7 +82,7 @@ def _is_running():
 
 
 @click.group()
-@click.option("--base-url", default="http://127.0.0.1:8107", help="Base URL for the Registry API.")
+@click.option("--base-url", default="http://127.0.0.1:8101", help="Base URL for the Registry API.")
 @click.option("--token", envvar="FUSTOR_REGISTRY_TOKEN", help="JWT Token for authentication. Can be set via FUSTOR_REGISTRY_TOKEN environment variable.")
 @click.pass_context
 def cli(ctx, base_url: str, token: str):
@@ -93,7 +93,7 @@ def cli(ctx, base_url: str, token: str):
 
 @cli.command()
 @click.option("--host", default="127.0.0.1", help="Host address to bind to.")
-@click.option("--port", default=8107, type=int, help="Port to bind to.")
+@click.option("--port", default=8101, type=int, help="Port to bind to.")
 @click.option("--reload", is_flag=True, help="Enable auto-reloading.")
 def start_fg(host: str, port: int, reload: bool):
     """Starts the Fustor Registry API server in foreground mode."""
@@ -101,7 +101,7 @@ def start_fg(host: str, port: int, reload: bool):
 
 @cli.command()
 @click.option("--reload", is_flag=True, help="Enable auto-reloading of the server on code changes (foreground only).")
-@click.option("-p", "--port", default=8107, help="Port to run the server on.")
+@click.option("-p", "--port", default=8101, help="Port to run the server on.")
 @click.option("-h", "--host", default="127.0.0.1", help="Host to bind the server to.")
 @click.option("-D", "--daemon", is_flag=True, help="Run the service as a background daemon.")
 @click.option("-V", "--verbose", is_flag=True, help="Enable verbose (DEBUG level) logging.")
