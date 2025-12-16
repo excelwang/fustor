@@ -16,8 +16,7 @@ build-backend = "setuptools.build_meta"
 Homepage = "https://github.com/excelwang/fustor/tree/master/packages/pusher_openapi"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
-[project.license]
-text = "MIT"
+license = "MIT"
 
 [project.entry-points."fustor_agent.drivers.pushers"]
 openapi = "fustor_pusher_openapi:OpenApiDriver"

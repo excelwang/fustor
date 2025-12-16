@@ -13,8 +13,7 @@ build-backend = "setuptools.build_meta"
 Homepage = "https://github.com/excelwang/fustor/tree/master/packages/source_oss"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
-[project.license]
-text = "MIT"
+license = "MIT"
 
 [project.entry-points."fustor_agent.drivers.sources"]
 source_oss = "fustor_source_oss.driver:OssSourceDriver"

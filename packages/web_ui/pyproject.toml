@@ -16,8 +16,7 @@ build-backend = "setuptools.build_meta"
 Homepage = "https://github.com/excelwang/fustor/tree/master/packages/web_ui"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
-[project.license]
-text = "MIT"
+license = "MIT"
 
 [tool.setuptools.packages.find]
 where = [ "src",]
