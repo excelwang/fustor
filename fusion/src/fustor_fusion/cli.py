@@ -46,7 +46,7 @@ def cli():
 @cli.command()
 @click.option("--reload", is_flag=True, help="Enable auto-reloading of the server on code changes (foreground only).")
 @click.option("-p", "--port", default=8102, help="Port to run the server on.")
-@click.option("-h", "--host", default="127.0.0.1", help="Host to bind the server to.")
+@click.option("-h", "--host", default="0.0.0.0", help="Host to bind the server to.")
 @click.option("-D", "--daemon", is_flag=True, help="Run the service as a background daemon.")
 @click.option("-V", "--verbose", is_flag=True, help="Enable verbose (DEBUG level) logging.")
 @click.option("--no-console-log", is_flag=True, hidden=True, help="Internal: Disable console logging for daemon process.")
