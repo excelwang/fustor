@@ -8,6 +8,8 @@ import sys
 import subprocess
 import time
 import json
+from pathlib import Path
+import secrets
 from fustor_registry_client.client import RegistryClient
 
 from fustor_common.logging_config import setup_logging
@@ -22,6 +24,43 @@ REGISTRY_LOG_FILE = os.path.join(HOME_FUSTOR_DIR, "registry.log") # Renamed from
 
 # Define a path for storing the token
 TOKEN_FILE = os.path.expanduser("~/.fustor/registry_token")
+
+def ensure_registry_token():
+    """
+    Ensures that a registry API token exists.
+    If no token is set in environment variables, generates a random one and stores it in the .env file.
+    """
+    from .config import register_config
+    token = register_config.FUSTOR_REGISTRY_API_TOKEN
+
+    # If no token is set in environment variables, generate one
+    if not token:
+        # Generate a random API token
+        token = secrets.token_urlsafe(32)  # Generates a secure random token
+
+        # Store it in the .env file in HOME_FUSTOR_DIR
+        env_file_path = HOME_FUSTOR_DIR / ".env"
+
+        # Read the current content of the .env file
+        env_content = ""
+        if env_file_path.exists():
+            with open(env_file_path, 'r') as f:
+                env_content = f.read()
+
+        # Check if the token is already in the file
+        token_line_prefix = "FUSTOR_REGISTRY_API_TOKEN="
+        token_exists = any(line.startswith(token_line_prefix) for line in env_content.split('\n'))
+
+        # If token doesn't exist in the file, append it
+        if not token_exists:
+            with open(env_file_path, 'a') as f:
+                f.write(f"\nFUSTOR_REGISTRY_API_TOKEN={token}\n")
+
+        # Update the register_config so that the token is available for this session
+        os.environ["FUSTOR_REGISTRY_API_TOKEN"] = token
+        return token
+    else:
+        return token
 
 
 def _is_running():
@@ -94,6 +133,10 @@ def start(reload, port, host, daemon, verbose, no_console_log):
             click.echo(f"Fustor Registry is already running with PID: {pid}")
             return
 
+        # Ensure API token exists before starting the service daemon
+        token = ensure_registry_token()
+        logger.info(f"Registry API token ensured for daemon mode (length: {len(token)})")
+
         click.echo("Starting Fustor Registry in the background...")
         # Use a common daemon launcher function to avoid module path issues
         fustor_daemon.start_daemon(
@@ -125,6 +168,11 @@ def start(reload, port, host, daemon, verbose, no_console_log):
 
     try:
         os.makedirs(HOME_FUSTOR_DIR, exist_ok=True) # Ensure ~/.fustor exists for PID file
+
+        # Ensure API token exists before starting the service
+        token = ensure_registry_token()
+        logger.info(f"Registry API token ensured (length: {len(token)})")
+
         # Write PID file in both modes, as the actual server process needs to own it
         with open(REGISTRY_PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
