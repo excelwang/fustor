@@ -68,8 +68,12 @@ def main():
         uvicorn_logger = logging.getLogger("uvicorn.access")
         uvicorn_logger.setLevel(logging.DEBUG)
 
+        app_to_run = app
+        if args.reload:
+            app_to_run = f"{args.module_path}:{args.app_var}"
+
         uvicorn.run(
-            app,
+            app_to_run,
             host=args.host,
             port=args.port,
             log_config=None,  # Logging handled separately

@@ -21,4 +21,10 @@ class DatastoreConfigCache(DatastoreConfigCacheInterface): # Inherit from the in
         """
         return self._cache.get(datastore_id)
 
+    def get_all_active_datastores(self) -> List[DatastoreConfig]:
+        """
+        Returns a list of all active datastore configurations in the cache.
+        """
+        return list(self._cache.values())
+
 datastore_config_cache = DatastoreConfigCache()

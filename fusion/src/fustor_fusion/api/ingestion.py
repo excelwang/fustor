@@ -21,27 +21,45 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 ingestion_router = APIRouter(tags=["Ingestion"])
 
-@ingestion_router.get("/stats", summary="Get global ingestion statistics")
+@ingestion_router.get("/stats", summary="Get global ingestion statistics", dependencies=[Depends(get_datastore_id_from_api_key)])
 async def get_global_stats():
     """
-    Get aggregated statistics across all active datastores for the monitoring dashboard.
+    Get aggregated statistics across all active datastores and sessions for the monitoring dashboard.
     """
     active_datastores = datastore_config_cache.get_all_active_datastores()
     
-    sources = []
+    sources_map = {} # deduplicate by task_id
     total_volume = 0
-    min_latency_ms = None # Use None to indicate no data
+    max_latency_ms = 0
     oldest_dir_info = {"path": "N/A", "age_days": 0}
     max_staleness_seconds = -1
 
     now = datetime.now().timestamp()
 
     for ds_config in active_datastores:
-        ds_id = ds_config.id
-        sources.append({
-            "id": ds_config.name or f"Datastore {ds_id}",
-            "type": "Fusion" # Or derive from config if available
-        })
+        ds_id = ds_config.datastore_id
+        
+        # Collect active sources (sessions) for this datastore
+        ds_sessions = await session_manager.get_datastore_sessions(ds_id)
+        for s_id, s_info in ds_sessions.items():
+            task_id = s_info.task_id or f"Task-{s_id[:6]}"
+            
+            # Shorten UUID part for display if format is UUID:Name
+            display_id = task_id
+            if ":" in task_id:
+                parts = task_id.split(":", 1)
+                uuid_part = parts[0]
+                name_part = parts[1]
+                if len(uuid_part) > 8:
+                    display_id = f"{uuid_part[:8]}...:{name_part}"
+            elif len(task_id) > 20:
+                display_id = f"{task_id[:8]}..."
+
+            if task_id not in sources_map:
+                sources_map[task_id] = {
+                    "id": display_id,
+                    "type": "Agent"
+                }
 
         try:
             stats = await get_directory_stats(datastore_id=ds_id)
@@ -49,26 +67,20 @@ async def get_global_stats():
             # 1. Volume
             total_volume += stats.get("total_files", 0)
 
-            # 2. Latency (Freshness)
-            # We want the SMALLEST gap between now and the latest file time (i.e., most fresh)
-            latest_ts = stats.get("latest_file_timestamp")
-            if latest_ts:
-                latency = (now - latest_ts) * 1000 # ms
-                # Latency can't be negative ideally, but clocks vary
-                latency = max(0, latency) 
-                
-                if min_latency_ms is None or latency < min_latency_ms:
-                    min_latency_ms = latency
+            # 2. Latency (Processing Lag)
+            # Use the fixed latency from parser (Now - Event_Timestamp at time of parsing)
+            ds_latency = stats.get("last_event_latency_ms", 0)
+            if ds_latency > max_latency_ms:
+                max_latency_ms = ds_latency
 
             # 3. Staleness (Oldest Directory)
-            # We want the LARGEST gap between now and the oldest directory time
             oldest = stats.get("oldest_directory")
             if oldest and oldest.get("timestamp"):
                 age_seconds = now - oldest["timestamp"]
                 if age_seconds > max_staleness_seconds:
                     max_staleness_seconds = age_seconds
                     oldest_dir_info = {
-                        "path": f"[{ds_config.name}] {oldest['path']}",
+                        "path": f"[{ds_id}] {oldest['path']}",
                         "age_days": int(age_seconds / 86400)
                     }
 
@@ -76,10 +88,10 @@ async def get_global_stats():
             logger.error(f"Failed to get stats for datastore {ds_id}: {e}")
 
     return {
-        "sources": sources,
+        "sources": list(sources_map.values()),
         "metrics": {
             "total_volume": total_volume,
-            "latency_ms": int(min_latency_ms) if min_latency_ms is not None else 0,
+            "latency_ms": int(max_latency_ms),
             "oldest_directory": oldest_dir_info
         }
     }
@@ -182,7 +194,7 @@ async def ingest_event_batch(
         try:
             await datastore_event_manager.notify(datastore_id)
         except Exception as e:
-            logger.error(f"Failed to notify event manager for datastore {datastore_id}: {e}", exc_info=True)
+            logger.error(f"Failed to notify event manager for datastore {ds_id}: {e}", exc_info=True)
 
     except Exception as e:
         logger.error(f"处理批量事件失败 (task: {si.task_id}): {e}", exc_info=True)

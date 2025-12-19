@@ -2,12 +2,13 @@
 File directory structure parser.
 Parses received file metadata events and maintains a real-time directory structure view in memory.
 """
-from typing import Dict, List, Optional, Any, Set
+from typing import Dict, List, Optional, Any, Set, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 import asyncio
 import logging
 import os
+import time
 from pathlib import Path
 import json
 from fustor_event_model.models import EventBase, EventType # Added EventBase and EventType import
@@ -54,13 +55,19 @@ class DirectoryNode:
         """Add a child node (file or directory) to this directory"""
         self.children[name] = node
         # Update directory modification time
-        self.modified_time = datetime.now()
+        now = datetime.now()
+        self.modified_time = now
+        # Ensure subtree_max_mtime tracks its own latest modification
+        self.subtree_max_mtime = max(self.subtree_max_mtime, now.timestamp())
     
     def remove_child(self, name: str) -> bool:
         """Remove a child node by name"""
         if name in self.children:
             del self.children[name]
-            self.modified_time = datetime.now()
+            now = datetime.now()
+            self.modified_time = now
+            # Ensure subtree_max_mtime tracks its own latest modification
+            self.subtree_max_mtime = max(self.subtree_max_mtime, now.timestamp())
             return True
         return False
     
@@ -93,12 +100,15 @@ class DirectoryStructureParser:
     """
     
     def __init__(self, datastore_id: Optional[int] = None):
-        self.root = DirectoryNode("/", "/", created_time=datetime.now())
+        self.root = DirectoryNode("/", "/", created_time=datetime.now(), modified_time=datetime.now())
         self._lock = asyncio.Lock() # To protect in-memory operations
         self._file_path_map: Dict[str, FileNode] = {}
         self._directory_path_map: Dict[str, DirectoryNode] = {"/": self.root}
         self.logger = logging.getLogger(__name__)
         self.datastore_id = datastore_id
+        self._last_event_latency: float = 0.0
+        # Cache for the oldest directory: (path, timestamp)
+        self._cached_oldest_dir: Optional[Tuple[str, float]] = None
 
     async def process_event(self, event: EventBase) -> bool:
         """ 
@@ -115,6 +125,12 @@ class DirectoryStructureParser:
             self.logger.warning(f"Event has no rows. Skipping. Event: {event}")
             return False
         
+        # Calculate processing latency: Now - Event Timestamp (index)
+        # event.index is in milliseconds for source_fs
+        now_ms = time.time() * 1000
+        if event.index > 0:
+            self._last_event_latency = max(0, now_ms - event.index)
+        
         # Assuming one row per event for file system changes
         payload = event.rows[0]
         path = payload.get('path') or payload.get('file_path')
@@ -126,6 +142,9 @@ class DirectoryStructureParser:
 
         # 2. Apply change to in-memory cache directly
         async with self._lock:
+            # Check cache invalidation before modification
+            self._check_cache_invalidation(path)
+            
             self.logger.info(f"Applying change to in-memory cache for path: {path}, type: {event_type.value}")
             if event_type in [EventType.INSERT, EventType.UPDATE]:
                 await self._process_create_update_in_memory(payload, path)
@@ -135,6 +154,23 @@ class DirectoryStructureParser:
         self.logger.info(f"Successfully processed event for path: {path}")
         return True
 
+    def _check_cache_invalidation(self, updated_path: str):
+        """
+        Invalidate the oldest directory cache if the updated path is part of the cached oldest path.
+        """
+        if self._cached_oldest_dir:
+            cached_path = self._cached_oldest_dir[0]
+            # If the updated path is a prefix of the cached path (or equal),
+            # it means the oldest path (or its parent) is being modified/touched.
+            # This makes it potentially 'newer', so we must invalidate.
+            
+            u_path = updated_path.rstrip('/')
+            c_path = cached_path.rstrip('/')
+            
+            if c_path == u_path or c_path.startswith(u_path + '/'):
+                self.logger.debug(f"Invalidating oldest dir cache due to update on {updated_path}")
+                self._cached_oldest_dir = None
+
     def _propagate_mtime_update(self, path: str, timestamp: float):
         """Propagate the modification time up the directory tree."""
         path_obj = Path(path)
@@ -143,13 +179,27 @@ class DirectoryStructureParser:
         if current_path != "/" and current_path.endswith("/"):
             current_path = current_path.rstrip("/")
             
+        # The wave of update starts with the child's timestamp
+        wave_ts = timestamp
+
         while True:
             node = self._directory_path_map.get(current_path)
             if node:
-                if timestamp > node.subtree_max_mtime:
-                    node.subtree_max_mtime = timestamp
+                # The directory's subtree max is the maximum of:
+                # 1. Its current max (already includes previous bubbles)
+                # 2. The incoming wave from a child
+                # 3. Its own modified_time (the 'dir.mtime' part)
+                own_ts = node.modified_time.timestamp() if node.modified_time else 0
+                new_max = max(wave_ts, own_ts)
+
+                if new_max > node.subtree_max_mtime:
+                    node.subtree_max_mtime = new_max
+                    # The wave continues upwards, now carrying the parent's new max
+                    wave_ts = new_max
                 else:
-                    break # Optimization: Stop if parent is already newer
+                    # Optimization: If this directory is already as new or newer than the wave,
+                    # its ancestors must also be, so we can stop.
+                    break
             
             if current_path == "/":
                 break
@@ -314,6 +364,30 @@ class DirectoryStructureParser:
         path = kwargs.get("path", "/")
         return await self.get_directory_tree(path) if path else self.root.to_dict()
     
+    def _find_oldest_directory_recursive(self, node: DirectoryNode) -> Tuple[Optional[str], float]:
+        """
+        Recursively find the oldest directory by greedily following the oldest active child path.
+        Returns tuple of (path, timestamp).
+        """
+        # 1. Identify active directory children (ignore files and inactive dirs)
+        active_subdirs = [
+            child for child in node.children.values() 
+            if isinstance(child, DirectoryNode) and child.subtree_max_mtime > 0
+        ]
+        
+        if not active_subdirs:
+            # No active subdirectories, so this node is the end of the line
+            # Only return it if it has a valid timestamp itself
+            if node.subtree_max_mtime > 0:
+                return node.path, node.subtree_max_mtime
+            return None, 0.0
+        
+        # 2. Find the child with the oldest subtree timestamp
+        oldest_subdir = min(active_subdirs, key=lambda x: x.subtree_max_mtime)
+        
+        # 3. Recurse down
+        return self._find_oldest_directory_recursive(oldest_subdir)
+
     async def get_directory_stats(self) -> Dict[str, Any]:
         """Get statistics about the directory structure"""
         async with self._lock:
@@ -327,25 +401,15 @@ class DirectoryStructureParser:
             # Directly use the root's subtree_max_mtime which bubbled up
             latest_file_time = self.root.subtree_max_mtime
             
-            # 2. Oldest Directory (Staleness)
-            # Find the direct child of root with the SMALLEST subtree_max_mtime
-            oldest_dir_time = None
-            oldest_dir_path = None
-            
-            for child in self.root.children.values():
-                if isinstance(child, DirectoryNode):
-                    ts = child.subtree_max_mtime
-                    # Only consider non-zero timestamps (active directories)
-                    if ts > 0:
-                        if oldest_dir_time is None or ts < oldest_dir_time:
-                            oldest_dir_time = ts
-                            oldest_dir_path = child.path
+            # 2. Oldest Directory (Staleness) - Drill Down Strategy
+            oldest_dir_path, oldest_dir_time = self._find_oldest_directory_recursive(self.root)
             
             return {
                 "total_files": total_files,
                 "total_directories": total_dirs,
                 "total_size_bytes": total_size,
                 "latest_file_timestamp": latest_file_time if latest_file_time > 0 else None,
+                "last_event_latency_ms": self._last_event_latency, 
                 "oldest_directory": {
                     "path": oldest_dir_path,
                     "timestamp": oldest_dir_time
