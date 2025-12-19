@@ -1,118 +1,154 @@
-# Fustor 数据管理平台 (Monorepo)
+# Fustor 数据管理平台
 
 ![](https://img.shields.io/badge/Python-3.11%2B-blue)
 ![](https://img.shields.io/badge/FastAPI-0.104.1-green)
 ![](https://img.shields.io/badge/SQLAlchemy-2.0.23-orange)
 
-Fustor 是一个新一代科研数据融合存储平台，采用 Monorepo 架构管理多个独立服务和可插拔组件。它提供统一的元数据管理和数据检索服务，包括统一目录、统一关联和统一监控服务。
+Fustor 是一个新一代科研数据融合存储平台，提供统一的元数据管理和数据检索服务。本文档旨在指导不同角色的用户从零开始部署和使用 Fustor 平台。
 
-## 📍 核心能力
+## 🚀 快速开始
 
-### 1. 数据汇交流程
-```
-文件数据生命周期流程图：
+### 1. 环境准备
 
-[临时存储区] →（完整性检查） → [归档存储区] →（公开条件满足） → [公开存储区]
-```
+所有服务均基于 Python 3.11+。推荐使用 `uv` 进行包管理，也可以使用 `pip`。
 
-### 2. 数据检索流程
-```
-普通用户可通过关键字和图查询接口对元数据进行全文检索和关联检索。对于检索到的数据集。
-- 公开数据集：直接下载其文件数据
-- 受控数据集：需经管理员审批通过后可下载其文件数据
-```
-
-## 📦 功能模块与服务
-
-Fustor Monorepo 包含以下主要服务和可插拔组件：
-
-*   **Registry 服务**: 负责元数据管理、存储环境、数据存储库、用户、API Key 和凭据管理。提供统一的注册和发现机制。
-    *   详细文档请参见 `registry/docs/README.md`。
-*   **Agent 服务**: 轻量级、可扩展的实时数据供给工具。监听数据源变更，并根据需求方的 OpenAPI schema 将数据推送到指定端点。
-    *   详细文档请参见 `agent/README.md`。
-*   **Fusion 服务**: 负责数据摄取和处理。
-    *   详细文档请参见 `fusion/docs/README.md`。
-*   **Packages**: 包含 `fustor_common` (通用工具和模型)、`fustor_fusion_sdk` (Fusion 服务 SDK) 以及各种 `source_*` 和 `pusher_*` 驱动。
-    *   详细文档请参见 `packages/README.md`。
-
-## 🛠️ 技术栈
-
-### 核心框架
-- **FastAPI** - 高性能API框架
-- **SQLAlchemy 2.0** - 异步ORM引擎
-- **Pydantic v2** - 数据模型验证
-
-### 数据库
-- PostgreSQL 15+ (生产环境)
-- SQLite (开发/测试环境)
-
-### 生态工具
-- uv - 极速Python包管理
-- pytest - 测试框架
-- dotenv - 环境变量管理
-
-## 🔧 安装
-
-按需安装服务。
-
--  **安装 agent**
 ```bash
-pip install fustor-agent
+# 1. 安装 uv (推荐)
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# 2. 创建并激活虚拟环境
+uv venv .venv
+source .venv/bin/activate
 ```
 
--  **安装 registry**
-```bash
-pip install fustor-registry
-```
+### 2. 角色操作手册
 
--  **安装 fusion**
-```bash
-pip install fustor-fusion
-```
+请根据您的角色选择相应的操作指南：
 
-**运行环境配置**
+#### 🧑‍💼 Registry Admin (平台管理员)
+**职责**: 部署 Registry 服务，创建 Datastore，生成 API Key。
+
+1.  **安装 Registry**:
     ```bash
-    mkdir -p ～/.fustor
-    cp .env.example ～/.fustor/.env  # 请按实际修改配置
+    pip install fustor-registry
+    # 或者在源码目录下: uv sync --extra registry
     ```
 
-**启动开发服务器 (示例: Registry 服务)**
+2.  **初始化配置**:
     ```bash
+    mkdir -p ~/.fustor
+    # 复制 .env.example 到 ~/.fustor/.env 并配置数据库连接等
+    ```
+
+3.  **启动 Registry 服务**:
+    ```bash
+    # 启动服务 (默认端口 8101)
     fustor-registry start -D
     ```
 
-## 🧪 开发与测试
-本项目使用 `uv` 进行高效的依赖管理和环境设置。
+4.  **管理操作**:
+    *   访问 Swagger UI: `http://localhost:8101/docs`
+    *   **创建 Datastore**: 调用 `POST /api/v1/admin/datastores` 创建一个新的数据存储库 (例如 "My Research Data")。
+    *   **生成 API Key**: 调用 `POST /api/v1/admin/apikeys` 为该 Datastore 生成一个 API Key。**请妥善保存此 Key，后续 Fusion 和 Agent 都需要用到。**
 
-1.  **安装 uv 包管理器**
+---
+
+#### 👨‍🔧 Fusion Admin (融合服务管理员)
+**职责**: 部署 Fusion 服务，连接 Registry，管理服务启停。
+
+1.  **安装 Fusion**:
     ```bash
-    curl -LsSf https://astral.sh/uv/install.sh | sh
+    pip install fustor-fusion
+    # 或者在源码目录下: uv sync --extra fusion
     ```
 
-2.  **创建并激活虚拟环境**
+2.  **配置连接**:
+    在 `~/.fustor/.env` 中配置 Registry 的地址：
     ```bash
-    python3 -m venv .venv
-    source .venv/bin/activate
+    FUSTOR_REGISTRY_URL=http://localhost:8101
     ```
 
-3.  **同步开发环境**
-    在项目根目录执行以下**单条命令**，即可将所有核心应用、本地插件以及测试工具全部安装到虚拟环境中。
-
+3.  **启动 Fusion 服务**:
     ```bash
-    uv sync --extra dev
+    # 启动服务 (默认端口 8102)
+    fustor-fusion start -D
+    
+    # 停止服务
+    fustor-fusion stop
     ```
 
-4.  **运行测试 (示例: Registry 服务)**
+---
+
+#### 👷 Source Admin (数据源管理员)
+**职责**: 部署 Agent 服务，配置数据源，将数据推送给 Fusion。
+
+1.  **安装 Agent**:
     ```bash
-    uv run pytest 
+    pip install fustor-agent
+    # 以及你需要的数据源插件，例如:
+    pip install fustor-source-fs
     ```
 
-## 📚 附加文档
+2.  **配置 Agent (`agent-config.yaml`)**:
+    在 `~/.fustor/agent-config.yaml` 中配置 Source 和 Pusher。
+    
+    ```yaml
+    # 示例配置：监控本地目录并推送到 Fusion
+    
+    sources:
+      - id: "local-fs-source"
+        type: "fs"
+        config:
+          uri: "/path/to/your/data"  # 监控的目录
+          driver_params:
+            min_monitoring_window_days: 30
 
-*   **开发与贡献指南**: `development/DEVELOPER_GUIDE.md`
-*   **Registry 服务文档**: `registry/docs/README.md`
-*   **Agent 服务文档**: `agent/README.md`
-*   **Fusion 服务文档**: `fusion/docs/README.md`
-*   **Packages 文档**: `packages/README.md`
+    pushers:
+      - id: "fusion-pusher"
+        type: "fusion"
+        config:
+          # Fusion 的接收地址
+          endpoint: "http://localhost:8102/ingestor-api/v1/events" 
+          # 从 Registry Admin 处获取的 API Key
+          credential: "YOUR_API_KEY_HERE" 
 
-每个服务和包的详细文档都可以在其各自的 `docs/` 目录下找到。
+    syncs:
+      - id: "sync-job-1"
+        source_id: "local-fs-source"
+        pusher_id: "fusion-pusher"
+        # 自动启动
+        enabled: true 
+    ```
+
+3.  **启动 Agent 服务**:
+    ```bash
+    # 启动服务 (默认端口 8100)
+    fustor-agent start -D
+    ```
+    Agent 启动后会自动读取配置并开始同步数据。
+
+---
+
+#### 🕵️ Fusion User (数据用户)
+**职责**: 查看数据，监控系统状态。
+
+1.  **访问监控仪表盘 (Dashboard)**:
+    *   打开浏览器访问: `http://localhost:8102/view`
+    *   输入 **API Key** 进行连接。
+    *   您将看到实时的网络拓扑图、数据吞吐量、同步延迟和陈旧度指标。
+
+2.  **浏览文件目录**:
+    *   Fusion 提供了文件系统风格的 API。
+    *   **获取根目录**: `GET /views/fs/tree?path=/`
+    *   **搜索文件**: `GET /views/fs/search?pattern=*.txt`
+    *   *(注：需在请求 Header 中带上 `X-API-Key`)*
+
+## 📦 模块详情
+
+*   **Registry**: 核心元数据管理。详见 `registry/docs/README.md`。
+*   **Fusion**: 数据摄取与处理。详见 `fusion/docs/README.md`。
+*   **Agent**: 数据采集与推送。详见 `agent/README.md`。
+
+## 🛠️ 开发与贡献
+
+如果您想参与 Fustor 的开发，请参考 `development/DEVELOPER_GUIDE.md`。
