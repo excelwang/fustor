@@ -158,7 +158,7 @@ async def ingest_event_batch(
     # Handle snapshot end signal
     if payload.is_snapshot_end:
         logger.info(f"Received snapshot end signal for datastore {datastore_id} from session {payload.session_id}")
-        await datastore_state_manager.set_snapshot_complete(datastore_id, True)
+        await datastore_state_manager.set_snapshot_complete(datastore_id, payload.session_id)
 
     try:
         if payload.events:

@@ -20,7 +20,7 @@ class DatastoreState:
     updated_at: datetime = field(default_factory=datetime.now)
     created_at: datetime = field(default_factory=datetime.now)
     authoritative_session_id: Optional[str] = None
-    is_snapshot_complete: bool = False
+    completed_snapshot_session_id: Optional[str] = None
 
 
 class DatastoreStateManager:
@@ -35,24 +35,42 @@ class DatastoreStateManager:
         async with self._lock:
             return self._states.get(datastore_id)
     
-    async def set_snapshot_complete(self, datastore_id: int, complete: bool = True):
-        """设置数据存储的快照完成状态"""
+    async def set_snapshot_complete(self, datastore_id: int, session_id: str):
+        """设置数据存储的快照完成状态（绑定到特定会话）"""
         async with self._lock:
             if datastore_id in self._states:
-                self._states[datastore_id].is_snapshot_complete = complete
-                self._states[datastore_id].updated_at = datetime.now()
+                state = self._states[datastore_id]
+                state.completed_snapshot_session_id = session_id
+                state.updated_at = datetime.now()
+                logger.info(f"Datastore {datastore_id} snapshot marked complete by session {session_id}")
             else:
+                # 理论上 session 存在时状态一定已初始化，此处作为兜底
                 self._states[datastore_id] = DatastoreState(
                     datastore_id=datastore_id,
-                    is_snapshot_complete=complete
+                    completed_snapshot_session_id=session_id
                 )
-            logger.info(f"Datastore {datastore_id} snapshot complete status set to {complete}")
 
     async def is_snapshot_complete(self, datastore_id: int) -> bool:
-        """检查数据存储的快照是否已完成"""
+        """
+        检查数据存储的快照是否已完成。
+        逻辑：必须存在已完成的 Session ID，且该 ID 必须与当前权威 Session ID 一致。
+        """
         async with self._lock:
             state = self._states.get(datastore_id)
-            return bool(state and state.is_snapshot_complete)
+            if not state:
+                return False
+            
+            # 如果没有设置权威 Session，则认为未完成
+            if not state.authoritative_session_id:
+                return False
+                
+            # 只有当最近一次完成的快照 Session 就是当前的权威 Session 时，才认为数据可用
+            is_complete = (state.completed_snapshot_session_id == state.authoritative_session_id)
+            if not is_complete and state.completed_snapshot_session_id:
+                logger.debug(f"Datastore {datastore_id} has a completed snapshot ({state.completed_snapshot_session_id}), "
+                             f"but it is no longer authoritative (current: {state.authoritative_session_id})")
+            
+            return is_complete
     
     async def set_state(self, datastore_id: int, status: str, locked_by_session_id: Optional[str] = None) -> DatastoreState:
         """设置指定数据存储的状态"""
