@@ -10,7 +10,12 @@ from pathlib import Path
 
 from fustor_core.models.config import AppConfig, SourceConfig, PusherConfig, SyncConfig, SourceConfigDict, PusherConfigDict, SyncConfigDict
 # Order of .env loading: ~/.fustor/.env (highest priority), then FUAGENT_CONFIG_DIR/.env (if different), then project root .env
-home_fustor_dir = Path.home() / ".fustor"
+env_fustor_home = os.getenv("FUSTOR_HOME")
+if env_fustor_home:
+    home_fustor_dir = Path(env_fustor_home) / ".fustor"
+else:
+    home_fustor_dir = Path.home() / ".fustor"
+
 CONFIG_DIR = str(home_fustor_dir)
 
 # Order of .env loading: ~/.fustor/.env (highest priority), then project root .env

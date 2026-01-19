@@ -54,7 +54,7 @@ class FusionClient:
             logger.error(f"An error occurred: {e}")
             return None
 
-    async def push_events(self, session_id: str, events: List[Dict[str, Any]], source_type: str) -> bool:
+    async def push_events(self, session_id: str, events: List[Dict[str, Any]], source_type: str, is_snapshot_end: bool = False) -> bool:
         """
         Pushes a batch of events to the Fusion service.
         """
@@ -66,7 +66,8 @@ class FusionClient:
             payload = {
                 "session_id": session_id,
                 "events": sanitized_events,
-                "source_type": sanitized_source_type
+                "source_type": sanitized_source_type,
+                "is_snapshot_end": is_snapshot_end
             }
             response = await self.client.post("/ingestor-api/v1/events/", json=payload)
             response.raise_for_status()

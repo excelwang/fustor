@@ -3,6 +3,7 @@ members = [
     "agent",
     "fusion",
     "registry",
+    "benchmark",
     "packages/core",
     "packages/fustor_agent_sdk",
     "packages/fustor_common",

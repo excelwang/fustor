@@ -20,6 +20,7 @@ class DatastoreState:
     updated_at: datetime = field(default_factory=datetime.now)
     created_at: datetime = field(default_factory=datetime.now)
     authoritative_session_id: Optional[str] = None
+    is_snapshot_complete: bool = False
 
 
 class DatastoreStateManager:
@@ -33,6 +34,25 @@ class DatastoreStateManager:
         """获取指定数据存储的状态"""
         async with self._lock:
             return self._states.get(datastore_id)
+    
+    async def set_snapshot_complete(self, datastore_id: int, complete: bool = True):
+        """设置数据存储的快照完成状态"""
+        async with self._lock:
+            if datastore_id in self._states:
+                self._states[datastore_id].is_snapshot_complete = complete
+                self._states[datastore_id].updated_at = datetime.now()
+            else:
+                self._states[datastore_id] = DatastoreState(
+                    datastore_id=datastore_id,
+                    is_snapshot_complete=complete
+                )
+            logger.info(f"Datastore {datastore_id} snapshot complete status set to {complete}")
+
+    async def is_snapshot_complete(self, datastore_id: int) -> bool:
+        """检查数据存储的快照是否已完成"""
+        async with self._lock:
+            state = self._states.get(datastore_id)
+            return bool(state and state.is_snapshot_complete)
     
     async def set_state(self, datastore_id: int, status: str, locked_by_session_id: Optional[str] = None) -> DatastoreState:
         """设置指定数据存储的状态"""

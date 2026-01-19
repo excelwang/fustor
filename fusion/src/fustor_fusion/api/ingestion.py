@@ -123,6 +123,7 @@ class BatchIngestPayload(BaseModel):
     session_id: str
     events: List[Dict[str, Any]] # Events are received as dicts
     source_type: str # 'message' or 'snapshot'
+    is_snapshot_end: bool = False
 # --- End Ingestion Models ---
 
 
@@ -153,6 +154,11 @@ async def ingest_event_batch(
         if not is_authoritative:
             logger.warning(f"Received snapshot push from outdated session '{payload.session_id}' for datastore {datastore_id}. Rejecting with 419.")
             raise HTTPException(status_code=419, detail="A newer sync session has been started. This snapshot task is now obsolete and should stop.")
+
+    # Handle snapshot end signal
+    if payload.is_snapshot_end:
+        logger.info(f"Received snapshot end signal for datastore {datastore_id} from session {payload.session_id}")
+        await datastore_state_manager.set_snapshot_complete(datastore_id, True)
 
     try:
         if payload.events:

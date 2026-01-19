@@ -37,11 +37,13 @@ class FusionDriver(PusherDriver):
 
         event_dicts = [event.model_dump(mode='json') for event in events]
         source_type = kwargs.get("source_type", "message")
+        is_snapshot_end = kwargs.get("is_snapshot_end", False)
 
         success = await self.fusion_client.push_events(
             session_id=self.session_id,
             events=event_dicts,
-            source_type=source_type
+            source_type=source_type,
+            is_snapshot_end=is_snapshot_end
         )
 
         if success:

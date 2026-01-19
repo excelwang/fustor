@@ -8,11 +8,21 @@ from typing import Dict, Any, Optional
 
 from ..parsers.manager import get_directory_tree, search_files, get_directory_stats, reset_directory_tree
 from ..auth.dependencies import get_datastore_id_from_api_key
+from ..datastore_state_manager import datastore_state_manager
 
 logger = logging.getLogger(__name__)
 
 parser_router = APIRouter(tags=["Parsers - Data Views"])
 
+async def check_snapshot_status(datastore_id: int):
+    """Checks if the initial snapshot sync is complete for the datastore."""
+    is_complete = await datastore_state_manager.is_snapshot_complete(datastore_id)
+    if not is_complete:
+        logger.warning(f"Access denied to datastore {datastore_id}: Initial snapshot sync not complete.")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Initial snapshot sync in progress. Service temporarily unavailable for this datastore."
+        )
 
 @parser_router.get("/fs/tree", summary="Get directory tree structure")
 async def get_directory_tree_api(
@@ -20,6 +30,7 @@ async def get_directory_tree_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Optional[Dict[str, Any]]:
     """Get the directory structure tree starting from the specified path."""
+    await check_snapshot_status(datastore_id)
     logger.info(f"API request for directory tree: path={path}, datastore_id={datastore_id}")
     result = await get_directory_tree(path, datastore_id=datastore_id)
     logger.info(f"Directory tree result for path '{path}': {result}")
@@ -31,6 +42,7 @@ async def search_files_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> list:
     """Search for files matching the specified pattern."""
+    await check_snapshot_status(datastore_id)
     logger.info(f"API request for file search: pattern={pattern}, datastore_id={datastore_id}")
     result = await search_files(pattern, datastore_id=datastore_id)
     logger.info(f"File search result for pattern '{pattern}': found {len(result)} files")
@@ -42,6 +54,7 @@ async def get_directory_stats_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Dict[str, Any]:
     """Get statistics about the current directory structure."""
+    await check_snapshot_status(datastore_id)
     logger.info(f"API request for directory stats: datastore_id={datastore_id}")
     result = await get_directory_stats(datastore_id=datastore_id)
     logger.info(f"Directory stats result: {result}")
@@ -59,6 +72,7 @@ async def reset_directory_tree_api(
     """
     Reset the directory tree structure by clearing all entries for a specific datastore.
     """
+    await check_snapshot_status(datastore_id)
     logger.info(f"API request to reset directory tree for datastore {datastore_id}")
     success = await reset_directory_tree(datastore_id)
     
