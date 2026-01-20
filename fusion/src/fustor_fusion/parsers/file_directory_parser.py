@@ -33,19 +33,28 @@ class DirectoryNode:
                 'created_time': self.created_time
             })
 
+        # Base case for recursion depth
+        if max_depth is not None and max_depth <= 0:
+            return result
+
         if recursive:
-            if max_depth is not None and max_depth <= 0:
-                return result
-                
             result['children'] = {}
-            for child in self.children.values():
+            for child_name, child in self.children.items():
                 child_dict = child.to_dict(
-                    recursive=recursive, 
+                    recursive=True, 
                     max_depth=max_depth - 1 if max_depth is not None else None,
                     only_path=only_path
                 )
-                if child_dict:
-                    result['children'][child.name] = child_dict
+                if child_dict is not None:
+                    result['children'][child_name] = child_dict
+        else:
+            # Non-recursive mode: return children as a LIST of direct metadata
+            result['children'] = []
+            for child in self.children.values():
+                # For non-recursive items, we don't pass recursion or depth down
+                child_dict = child.to_dict(recursive=False, max_depth=0, only_path=only_path)
+                if child_dict is not None:
+                    result['children'].append(child_dict)
         
         return result
 
@@ -169,8 +178,6 @@ class DirectoryStructureParser:
             parent = self._directory_path_map.get(parent_path)
             if parent and name in parent.children:
                 del parent.children[name]
-
-    from fustor_event_model.models import EventBase, EventType
 
     async def process_event(self, event: Any) -> bool:
         """ 
