@@ -92,13 +92,13 @@ async def create_session(
             detail="New session cannot be created due to current active sessions"
         )
     
-    if datastore_config.allow_concurrent_push:
-        logger.info(f"Datastore {datastore_id} allows concurrent push. Setting new authoritative session {session_id} and resetting parser.")
-        
-        # 1. Set the new session as authoritative
-        await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
+    # Always set the new session as authoritative to enable status tracking
+    await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
 
-        # 2. Reset the parser state (memory only)
+    if datastore_config.allow_concurrent_push:
+        logger.info(f"Datastore {datastore_id} allows concurrent push. Resetting parser.")
+        
+        # Reset the parser state (memory only)
         try:
             await reset_directory_tree(datastore_id)
             logger.info(f"Successfully reset parser for datastore {datastore_id}.")
