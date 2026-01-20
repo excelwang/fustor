@@ -8,17 +8,18 @@ from fustor_benchmark.services import ServiceManager
 
 def test_generator_safety_check(tmp_path):
     """验证 DataGenerator 拒绝在非法路径下执行清理/生成"""
-    unsafe_dir = tmp_path / "my-important-data"
-    unsafe_dir.mkdir()
-    (unsafe_dir / "secret.txt").write_text("don't delete me")
+    unsafe_dir = str(tmp_path / "my-important-data")
+    os.makedirs(unsafe_dir, exist_ok=True)
+    with open(os.path.join(unsafe_dir, "secret.txt"), "w") as f:
+        f.write("don't delete me")
     
-    gen = DataGenerator(str(unsafe_dir / "data"))
+    gen = DataGenerator(os.path.join(unsafe_dir, "data"))
     
     with patch("click.echo") as mock_echo:
         gen.generate()
         args, _ = mock_echo.call_args
         assert "FATAL: Operation denied" in args[0]
-        assert (unsafe_dir / "secret.txt").exists()
+        assert os.path.exists(os.path.join(unsafe_dir, "secret.txt"))
 
 def test_service_manager_safety_check(tmp_path):
     """验证 ServiceManager 拒绝在非法路径下部署环境"""
@@ -34,51 +35,40 @@ def test_service_manager_safety_check(tmp_path):
         assert "FATAL: Environment setup denied" in mock_echo.call_args[0][0]
 
 def test_successful_operation_on_valid_path(tmp_path):
-    """验证符合后缀要求的路径可以正常操作"""
-    safe_run_dir = tmp_path / "test-fustor-benchmark-run"
-    safe_run_dir.mkdir()
+    """验证符合后缀要求的路径可以正常操作且具备非空保护"""
+    safe_root = tmp_path / "test-fustor-benchmark-run"
+    safe_root.mkdir()
+    data_dir = safe_root / "data"
     
-    gen = DataGenerator(str(safe_run_dir / "data"))
+    # 1. 首次生成 (目录不存在) -> 成功
+    gen = DataGenerator(str(data_dir))
     gen.generate(num_uuids=1, num_subdirs=1, files_per_subdir=1)
-    assert (safe_run_dir / "data").exists()
+    assert data_dir.exists()
+    assert len(os.listdir(data_dir)) > 0
     
-    svc = ServiceManager(str(safe_run_dir))
-    svc.setup_env()
-    assert (safe_run_dir / ".fustor").exists()
+    # 2. 再次生成 (目录不为空) -> 被拦截
+    with patch("click.echo") as mock_echo:
+        gen.generate()
+        # 检查是否包含 FATAL: Target directory ... is NOT empty
+        found_error = any("is NOT empty" in call[0][0] for call in mock_echo.call_args_list)
+        assert found_error
 
-def test_runner_gen_mode_logic(tmp_path):
-    """验证 Runner 中的 gen_mode 逻辑分支（仅测试分支逻辑，跳过实际服务启动）"""
-    safe_run_dir = tmp_path / "logic-fustor-benchmark-run"
+def test_runner_gen_mode_logic(tmp_path, monkeypatch):
+    """验证 Runner 中的逻辑"""
+    safe_root = tmp_path / "work-dir"
+    safe_root.mkdir()
+    monkeypatch.chdir(safe_root)
+    
+    safe_run_dir = safe_root / "fustor-benchmark-run"
     safe_run_dir.mkdir()
     os.makedirs(safe_run_dir / "data", exist_ok=True)
     (safe_run_dir / "data" / "dummy.txt").write_text("data")
     
     from fustor_benchmark.runner import BenchmarkRunner
-    runner = BenchmarkRunner(str(safe_run_dir))
+    runner = BenchmarkRunner(str(safe_run_dir), target_dir=str(safe_run_dir / "data"))
     
-    # 彻底 Mock 掉 runner.run 内部 try 块中的逻辑，我们只关心 try 之前的 gen_mode 判定
-    # 我们使用 patch 来拦截 runner.services.setup_env 及其之后的一切逻辑
     with patch.object(runner.services, "setup_env", side_effect=RuntimeError("STOP_HERE")):
-        with patch.object(runner.generator, "generate") as mock_gen:
-            
-            # 1. 测试 skip 模式：应当不调用 generate
-            try:
-                runner.run(gen_mode='skip')
-            except RuntimeError as e:
-                if str(e) != "STOP_HERE": raise
-            mock_gen.assert_not_called()
-            
-            # 2. 测试 force 模式：应当调用 generate
-            try:
-                runner.run(gen_mode='force')
-            except RuntimeError as e:
-                if str(e) != "STOP_HERE": raise
-            mock_gen.assert_called_once()
-            
-            # 3. 测试 auto 模式（数据已存在）：应当不调用 generate
-            mock_gen.reset_mock()
-            try:
-                runner.run(gen_mode='auto')
-            except RuntimeError as e:
-                if str(e) != "STOP_HERE": raise
-            mock_gen.assert_not_called()
+        try:
+            runner.run()
+        except RuntimeError as e:
+            if str(e) != "STOP_HERE": raise

@@ -12,54 +12,62 @@ from .services import ServiceManager
 
 def run_find_recursive_metadata_task(args):
     """
-    Simulates a recursive metadata retrieval: `find <dir> -type f -ls`
-    This matches the recursive nature of Fusion's tree API for a subdirectory.
+    Simulates a recursive metadata retrieval and realistic parsing.
+    Includes type detection, path splitting, and object instantiation.
     """
     data_dir, subdir = args
     target = os.path.join(data_dir, subdir.lstrip('/'))
     
-    # Recursive search for all descendant files with metadata
-    cmd = ["find", target, "-type", "f", "-ls"]
+    # %p: path, %y: type, %s: size, %T@: mtime, %C@: ctime
+    cmd = ["find", target, "-printf", "%p|%y|%s|%T@|%C@\n"]
         
     start = time.time()
-    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    
+    lines = result.stdout.splitlines()
+    parsed_data = []
+    for line in lines:
+        parts = line.split('|')
+        if len(parts) == 5:
+            path = parts[0]
+            name = os.path.basename(path)
+            content_type = "directory" if parts[1] == 'd' else "file"
+            
+            node = {
+                "name": name,
+                "path": path,
+                "content_type": content_type,
+                "size": int(parts[2]),
+                "modified_time": float(parts[3]),
+                "created_time": float(parts[4])
+            }
+            parsed_data.append(node)
+            
     return time.time() - start
 
 class BenchmarkRunner:
-    def __init__(self, run_dir):
-        self.run_dir = os.path.abspath(run_dir) # Ensure absolute path
-        # Derived directories
-        self.data_dir = os.path.join(self.run_dir, "data")
+    def __init__(self, run_dir, target_dir):
+        self.run_dir = os.path.abspath(run_dir)
         self.env_dir = os.path.join(self.run_dir, ".fustor")
+        self.data_dir = os.path.abspath(target_dir)
         
         self.services = ServiceManager(self.run_dir) 
+        self.services.data_dir = self.data_dir
         self.generator = DataGenerator(self.data_dir)
 
     def _calculate_stats(self, latencies, total_time, count):
         """Calculate rich statistics from a list of latencies (in seconds)."""
         if not latencies:
-            return {
-                "qps": 0, "avg": 0, "min": 0, "max": 0, "stddev": 0,
-                "p50": 0, "p95": 0, "p99": 0
-            }
+            return {"qps": 0, "avg": 0, "min": 0, "max": 0, "stddev": 0, "p50": 0, "p95": 0, "p99": 0}
         
-        # Convert to milliseconds for presentation
         l_ms = sorted([l * 1000 for l in latencies])
         qps = count / total_time
-        
-        # Calculate percentiles
         qs = statistics.quantiles(l_ms, n=100) if len(l_ms) >= 2 else [l_ms[0]] * 100
         
         return {
-            "qps": qps,
-            "avg": statistics.mean(l_ms),
-            "min": min(l_ms),
-            "max": max(l_ms),
+            "qps": qps, "avg": statistics.mean(l_ms), "min": min(l_ms), "max": max(l_ms),
             "stddev": statistics.stdev(l_ms) if len(l_ms) >= 2 else 0,
-            "p50": statistics.median(l_ms),
-            "p95": qs[94],
-            "p99": qs[98],
-            "raw": l_ms # Keep raw data for charting
+            "p50": statistics.median(l_ms), "p95": qs[94], "p99": qs[98], "raw": l_ms
         }
 
     def _discover_leaf_targets_via_api(self, api_key: str, depth: int):
@@ -112,7 +120,7 @@ class BenchmarkRunner:
             return ["/"]
 
         if not targets:
-            click.echo(click.style(f"No targets found at relative depth {depth}.", fg="yellow"))
+            click.echo(click.style(f"No targets found at relative depth {depth}."), fg="yellow")
             targets = ["/"]
         else:
             example_path = random.choice(targets)
@@ -122,7 +130,7 @@ class BenchmarkRunner:
         return targets
 
     def run_concurrent_baseline(self, targets, concurrency=20, requests_count=100):
-        click.echo(f"Running Concurrent OS Baseline (Recursive find -ls): {concurrency} workers, {requests_count} requests...")
+        click.echo(f"Running Concurrent OS Baseline (Recursive find + parsing): {concurrency} workers, {requests_count} requests...")
         tasks = [(self.data_dir, t) for t in [random.choice(targets) for _ in range(requests_count)]]
         latencies = []
         start_total = time.time()
@@ -168,18 +176,15 @@ class BenchmarkRunner:
                 if not is_ok: raise RuntimeError(f"Agent reported error during sync: {log_msg}")
                 if int(elapsed) % 30 < 5: click.echo(f"  [Agent] Status: {log_msg}")
             try:
-                # Optimized readiness check: only fetch root level metadata
                 res = requests.get(
                     f"{fusion_url}/views/fs/tree", 
                     params={"path": "/", "max_depth": 1, "only_path": "true"}, 
                     headers=headers, 
                     timeout=5
                 )
-                
                 if res.status_code == 200:
                     click.echo(f"  [Fusion] READY (200 OK) after {elapsed:.1f}s.")
                     break
-            
                 elif res.status_code == 503:
                     if int(elapsed) % 5 == 0:
                         click.echo(f"  [Fusion] Still syncing... (Elapsed: {int(elapsed)}s)")
@@ -200,7 +205,7 @@ class BenchmarkRunner:
     <title>Fustor Benchmark Report</title>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
-        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 40px; background: #f4f7f6; color: #333; }
+        body { font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif; margin: 40px; background: #f4f7f6; color: #333; }
         .container { max-width: 1100px; margin: auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
         h1 { color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom: 15px; margin-top: 0; }
         .summary { display: flex; justify-content: space-between; margin: 30px -10px; }
@@ -271,8 +276,8 @@ class BenchmarkRunner:
             <thead>
                 <tr>
                     <th>Metric (ms)</th>
-                    <th>OS (find -ls)</th>
-                    <th>Fusion API</th>
+                    <th>OS (find + Parsing)</th>
+                    <th>Fusion API (Structured)</th>
                     <th>Improvement</th>
                 </tr>
             </thead>
@@ -314,65 +319,56 @@ class BenchmarkRunner:
     </script>
 </body>
 </html>
-""";
-        # Calculate speedups
+"""
         g_avg = results['os']['avg'] / results['fusion']['avg'] if results['fusion']['avg'] > 0 else 0
         def get_p(stats, p):
             raw = stats['raw']; idx = int(len(raw) * p / 100)
             return raw[min(idx, len(raw)-1)]
 
         html = template.replace("{{timestamp}}", results['timestamp']) \
-                       .replace("{{op_type}}", results['metadata']['operation_type']) \
-                       .replace("{{total_files}}", f"{results['metadata']['total_files_in_scope']:,}") \
-                       .replace("{{total_dirs}}", f"{results['metadata'].get('total_directories_in_scope', 0):,}") \
-                       .replace("{{target_count}}", str(results['target_directory_count'])) \
-                       .replace("{{depth}}", str(results['depth'])) \
-                       .replace("{{reqs}}", str(results['requests'])) \
-                       .replace("{{concurrency}}", str(results['concurrency'])) \
-                       .replace("{{os_avg}}", f"{results['os']['avg']:.2f}") \
-                       .replace("{{fusion_avg}}", f"{results['fusion']['avg']:.2f}") \
-                       .replace("{{os_p50}}", f"{results['os']['p50']:.2f}") \
-                       .replace("{{fusion_p50}}", f"{results['fusion']['p50']:.2f}") \
-                       .replace("{{os_p95}}", f"{results['os']['p95']:.2f}") \
-                       .replace("{{fusion_p95}}", f"{results['fusion']['p95']:.2f}") \
-                       .replace("{{os_p99}}", f"{results['os']['p99']:.2f}") \
-                       .replace("{{fusion_p99}}", f"{results['fusion']['p99']:.2f}") \
-                       .replace("{{os_qps}}", f"{results['os']['qps']:.1f}") \
-                       .replace("{{fusion_qps}}", f"{results['fusion']['qps']:.1f}") \
-                       .replace("{{os_min}}", f"{results['os']['min']:.2f}") \
-                       .replace("{{os_max}}", f"{results['os']['max']:.2f}") \
-                       .replace("{{fusion_min}}", f"{results['fusion']['min']:.2f}") \
-                       .replace("{{fusion_max}}", f"{results['fusion']['max']:.2f}") \
-                       .replace("{{os_p75}}", f"{get_p(results['os'], 75):.2f}") \
-                       .replace("{{os_p90}}", f"{get_p(results['os'], 90):.2f}") \
-                       .replace("{{fusion_p75}}", f"{get_p(results['fusion'], 75):.2f}") \
-                       .replace("{{fusion_p90}}", f"{get_p(results['fusion'], 90):.2f}") \
-                       .replace("{{gain}}", f"{g_avg:.1f}") \
-                       .replace("{{gain_avg}}", f"{g_avg:.1f}") \
-                       .replace("{{gain_p50}}", f"{results['os']['p50']/results['fusion']['p50']:.1f}" if results['fusion']['p50'] > 0 else "N/A") \
-                       .replace("{{gain_p95}}", f"{results['os']['p95']/results['fusion']['p95']:.1f}" if results['fusion']['p95'] > 0 else "N/A") \
-                       .replace("{{gain_p99}}", f"{results['os']['p99']/results['fusion']['p99']:.1f}" if results['fusion']['p99'] > 0 else "N/A") \
-                       .replace("{{gain_qps}}", f"{results['fusion']['qps']/results['os']['qps']:.1f}" if results['os']['qps'] > 0 else "N/A")
+            .replace("{{op_type}}", results['metadata']['operation_type']) \
+            .replace("{{total_files}}", f"{results['metadata']['total_files_in_scope']:,}") \
+            .replace("{{total_dirs}}", f"{results['metadata'].get('total_directories_in_scope', 0):,}") \
+            .replace("{{target_count}}", str(results['target_directory_count'])) \
+            .replace("{{depth}}", str(results['depth'])) \
+            .replace("{{reqs}}", str(results['requests'])) \
+            .replace("{{concurrency}}", str(results['concurrency'])) \
+            .replace("{{os_avg}}", f"{results['os']['avg']:.2f}") \
+            .replace("{{fusion_avg}}", f"{results['fusion']['avg']:.2f}") \
+            .replace("{{os_p50}}", f"{results['os']['p50']:.2f}") \
+            .replace("{{fusion_p50}}", f"{results['fusion']['p50']:.2f}") \
+            .replace("{{os_p95}}", f"{results['os']['p95']:.2f}") \
+            .replace("{{fusion_p95}}", f"{results['fusion']['p95']:.2f}") \
+            .replace("{{os_p99}}", f"{results['os']['p99']:.2f}") \
+            .replace("{{fusion_p99}}", f"{results['fusion']['p99']:.2f}") \
+            .replace("{{os_qps}}", f"{results['os']['qps']:.1f}") \
+            .replace("{{fusion_qps}}", f"{results['fusion']['qps']:.1f}") \
+            .replace("{{os_min}}", f"{results['os']['min']:.2f}") \
+            .replace("{{os_max}}", f"{results['os']['max']:.2f}") \
+            .replace("{{fusion_min}}", f"{results['fusion']['min']:.2f}") \
+            .replace("{{fusion_max}}", f"{results['fusion']['max']:.2f}") \
+            .replace("{{os_p75}}", f"{get_p(results['os'], 75):.2f}") \
+            .replace("{{os_p90}}", f"{get_p(results['os'], 90):.2f}") \
+            .replace("{{fusion_p75}}", f"{get_p(results['fusion'], 75):.2f}") \
+            .replace("{{fusion_p90}}", f"{get_p(results['fusion'], 90):.2f}") \
+            .replace("{{gain}}", f"{g_avg:.1f}") \
+            .replace("{{gain_avg}}", f"{g_avg:.1f}") \
+            .replace("{{gain_p50}}", f"{results['os']['p50']/results['fusion']['p50']:.1f}" if results['fusion']['p50'] > 0 else "N/A") \
+            .replace("{{gain_p95}}", f"{results['os']['p95']/results['fusion']['p95']:.1f}" if results['fusion']['p95'] > 0 else "N/A") \
+            .replace("{{gain_p99}}", f"{results['os']['p99']/results['fusion']['p99']:.1f}" if results['fusion']['p99'] > 0 else "N/A") \
+            .replace("{{gain_qps}}", f"{results['fusion']['qps']/results['os']['qps']:.1f}" if results['os']['qps'] > 0 else "N/A")
 
         with open(output_path, "w") as f: f.write(html)
 
-    def run(self, concurrency=20, reqs=200, target_depth=5, gen_mode='auto'):
-        # Data Generation Strategy
+    def run(self, concurrency=20, reqs=200, target_depth=5):
+        # Data integrity check
         data_exists = os.path.exists(self.data_dir) and len(os.listdir(self.data_dir)) > 0 if os.path.exists(self.data_dir) else False
-        
-        if gen_mode == 'force':
-            click.echo("Gen-mode: FORCE. Re-generating data...")
-            self.generator.generate()
-        elif gen_mode == 'skip':
-            click.echo(f"Gen-mode: SKIP. Using existing data in {self.data_dir}")
-            if not data_exists:
-                raise RuntimeError(f"Data directory '{self.data_dir}' is missing or empty, but gen-mode is set to 'skip'.")
-        else: # auto
-            if not data_exists:
-                click.echo(f"Gen-mode: AUTO. Data missing in {self.data_dir}. Generating...")
-                self.generator.generate()
-            else:
-                click.echo(f"Gen-mode: AUTO. Data exists in {self.data_dir}. Skipping generation.")
+        if not data_exists:
+            click.echo(click.style(f"FATAL: Data directory '{self.data_dir}' is empty or missing.", fg="red", bold=True))
+            click.echo(click.style("Please run 'generate' first.", fg="yellow"))
+            raise RuntimeError("Benchmark data missing")
+
+        click.echo(f"Using data directory: {self.data_dir}")
         
         try:
             self.services.setup_env()
@@ -380,33 +376,27 @@ class BenchmarkRunner:
             self.services.start_fusion(); self.services.start_agent(api_key)
             time.sleep(2)
             is_ok, msg = self.services.check_agent_logs()
-            if not is_ok: raise RuntimeError(f"Agent failed to initialize correctly: {msg}")
+            if not is_ok: raise RuntimeError(f"Agent failed: {msg}")
             click.echo("Agent health check passed.")
             
             self.wait_for_sync(api_key)
-            
-            # Discover targets
             targets = self._discover_leaf_targets_via_api(api_key, target_depth)
             
-            # Run benchmarks
             os_stats = self.run_concurrent_baseline(targets, concurrency, reqs)
             fusion_stats = self.run_concurrent_fusion(api_key, targets, concurrency, reqs)
             
-            # Fetch final stats AFTER benchmark to ensure total accuracy
             fusion_url = f"http://localhost:{self.services.fusion_port}"
             res_stats = requests.get(f"{fusion_url}/views/fs/stats", headers={"X-API-Key": api_key})
             stats_data = res_stats.json() if res_stats.status_code == 200 else {}
             total_files = stats_data.get("total_files", 0)
             total_dirs = stats_data.get("total_directories", 0)
             
-            click.echo(f"Final System Stats: {total_files:,} files, {total_dirs:,} directories.")
-            
-            # Prepare results object with rich metadata
             final_results = {
                 "metadata": {
                     "operation_type": "RECURSIVE_METADATA_GET",
                     "total_files_in_scope": total_files,
-                    "total_directories_in_scope": total_dirs
+                    "total_directories_in_scope": total_dirs,
+                    "source_path": self.data_dir
                 },
                 "depth": target_depth, "requests": reqs, "concurrency": concurrency,
                 "target_directory_count": len(targets),
@@ -414,7 +404,6 @@ class BenchmarkRunner:
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
 
-            # Save JSON and HTML to results directory
             results_dir = os.path.join(self.run_dir, "results")
             os.makedirs(results_dir, exist_ok=True)
             json_path = os.path.join(results_dir, "stress-find.json")
@@ -423,12 +412,11 @@ class BenchmarkRunner:
             with open(json_path, "w") as f: json.dump(final_results, f, indent=2)
             self.generate_html_report(final_results, html_path)
 
-            # Output Scorecard to console
             click.echo("\n" + "="*60)
             click.echo(f"RECURSIVE METADATA RETRIEVAL PERFORMANCE (DEPTH {target_depth})")
             click.echo(f"Data Scale: {total_files:,} files | Targets: {len(targets)}")
             click.echo("="*60)
-            click.echo(f"{ 'Metric (ms)':<25} | {'OS (find -ls)':<18} | {'Fusion API':<18}")
+            click.echo(f"{ 'Metric (ms)':<25} | {'OS (find + Parsing)':<18} | {'Fusion API (Structured)':<18}")
             click.echo("-" * 65)
             click.echo(f"{ 'Avg Latency':<25} | {os_stats['avg']:10.2f} ms      | {fusion_stats['avg']:10.2f} ms")
             click.echo(f"{ 'P50 Latency':<25} | {os_stats['p50']:10.2f} ms      | {fusion_stats['p50']:10.2f} ms")

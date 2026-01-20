@@ -20,22 +20,26 @@
 ## 快速使用
 
 ### 1. 数据生成
-构建一个包含 1000 个 UUID 目录，每个目录下 1000 个文件（总计 100 万文件）的测试集：
+数据生成器通过以下三个维度的乘积来确定最终的文件总量：
+*   `--num-dirs` (默认 1000): UUID 目录的数量。
+*   `--num-subdirs` (默认 4): 每个 UUID 目录下的子目录数量。
+*   `--files-per-subdir` (默认 250): 每个子目录下的文件数量。
+
+**默认规模**: $1000 \times 4 \times 250 = 1,000,000$ 个文件。
+
+构建一个包含 1000 个 UUID 目录（总计 100 万文件）的测试集：
 ```bash
-uv run fustor-benchmark generate fustor-benchmark-run --num-dirs 1000
+uv run fustor-benchmark generate fustor-benchmark-run/data --num-dirs 1000
 ```
 
 ### 2. 执行压测
 运行全链路同步并执行并发性能对比：
 ```bash
-# 全自动模式 (推荐)：数据缺失时自动生成
-uv run fustor-benchmark run fustor-benchmark-run -d 5 -c 20 -n 100
+# 执行压测 (必须指定数据路径)
+uv run fustor-benchmark run fustor-benchmark-run/data -d 5 -c 20 -n 100
 
-# 强制重生成数据
-uv run fustor-benchmark run fustor-benchmark-run -m force
-
-# 仅使用现有数据，禁止任何生成行为
-uv run fustor-benchmark run fustor-benchmark-run -m skip
+# 使用外部 NFS 生产数据
+uv run fustor-benchmark run /mnt/nfs_data -d 5
 ```
 *   `-d`: 探测深度。
 *   `-c`: 并发数。

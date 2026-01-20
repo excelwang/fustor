@@ -3,6 +3,7 @@ API endpoints for the parsers module.
 Provides REST endpoints to access parsed data views.
 """
 from fastapi import APIRouter, Query, Header, Depends, status, HTTPException
+from fastapi.responses import ORJSONResponse
 import logging
 from typing import Dict, Any, Optional
 
@@ -35,7 +36,7 @@ async def check_snapshot_status(datastore_id: int):
             detail=detail
         )
 
-@parser_router.get("/fs/tree", summary="Get directory tree structure")
+@parser_router.get("/fs/tree", summary="Get directory tree structure", response_class=ORJSONResponse)
 async def get_directory_tree_api(
     path: str = Query("/", description="Directory path to retrieve (default: '/')"),
     recursive: bool = Query(True, description="Whether to recursively retrieve the entire subtree"),
@@ -45,11 +46,13 @@ async def get_directory_tree_api(
 ) -> Optional[Dict[str, Any]]:
     """Get the directory structure tree starting from the specified path."""
     await check_snapshot_status(datastore_id)
-    # If max_depth is set, we imply recursive behavior
     effective_recursive = recursive if max_depth is None else True
     logger.debug(f"API request for directory tree: path={path}, recursive={effective_recursive}, max_depth={max_depth}, only_path={only_path}, datastore_id={datastore_id}")
     result = await get_directory_tree(path, datastore_id=datastore_id, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
-    return result
+    
+    if result is None:
+        return ORJSONResponse(content={"detail": "Not found"}, status_code=404)
+    return ORJSONResponse(content=result)
 
 @parser_router.get("/fs/search", summary="Search for files by pattern")
 async def search_files_api(

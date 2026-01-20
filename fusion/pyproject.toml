@@ -3,7 +3,19 @@ name = "fustor-fusion"
 dynamic = ["version"]
 description = "Fusion service for Fustor"
 requires-python = ">=3.11"
-dependencies = [ "click", "fastapi[all]", "uvicorn", "pydantic", "pydantic-settings", "greenlet==3.2.2", "sqlalchemy==2.0.41", "httpx", "fustor_registry_client", "python-json-logger>=4.0.0", "fustor-fusion-sdk",]
+dependencies = [
+    "fastapi[all]",
+    "uvicorn",
+    "sqlalchemy>=2.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings",
+    "aiosqlite",
+    "httpx",
+    "orjson",
+    "fustor-common",
+    "fustor-registry-client",
+    "fustor-event-model"
+]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"

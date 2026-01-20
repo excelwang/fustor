@@ -30,15 +30,20 @@ class DataGenerator:
 
     def generate(self, num_uuids: int = 1000, num_subdirs: int = 4, files_per_subdir: int = 250):
         # Safety Check: Only allow operations in directories ending with 'fustor-benchmark-run'
-        # Note: self.base_dir is typically run-dir/data, so we check the parent run-dir
         run_dir = os.path.dirname(self.base_dir)
         if not run_dir.endswith("fustor-benchmark-run"):
-            click.echo(click.style(f"FATAL: Operation denied. Target run-dir '{run_dir}' must end with 'fustor-benchmark-run' for safety.", fg="red", bold=True))
+            click.echo(click.style(f"FATAL: Operation denied. Target path must be within a 'fustor-benchmark-run' directory.", fg="red", bold=True))
             return
 
-        if os.path.exists(self.base_dir):
-            click.echo(f"Cleaning up old data in {self.base_dir}...")
-            shutil.rmtree(self.base_dir)
+        # NEW: Strictly prevent overwriting non-empty directories
+        if os.path.exists(self.base_dir) and len(os.listdir(self.base_dir)) > 0:
+            click.echo(click.style(f"FATAL: Target directory '{self.base_dir}' is NOT empty.", fg="red", bold=True))
+            click.echo(click.style("To prevent data loss, generate will not automatically delete existing content.", fg="yellow"))
+            click.echo(click.style("Please manually clear the directory if you wish to re-generate.", fg="cyan"))
+            return
+
+        if not os.path.exists(self.base_dir):
+            os.makedirs(self.base_dir, exist_ok=True)
 
         total_files = num_uuids * num_subdirs * files_per_subdir
         click.echo(f"Generating {total_files:,} files in 1000 UUID directories...")
