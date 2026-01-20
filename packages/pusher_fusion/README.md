@@ -20,7 +20,7 @@ To use the `fustor-pusher-fusion` driver, configure a Pusher in your Fustor Agen
 Example (conceptual configuration in Fustor Agent):
 
 ```yaml
-# ~/.fustor/config.yaml
+# Fustor 主目录下的 agent-config.yaml
 pushers:
   my-fusion-pusher:
     driver_type: fusion

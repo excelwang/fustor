@@ -10,11 +10,14 @@ pip install fustor-registry
 
 ## 配置
 
-在 `~/.fustor/.env` 中配置数据库连接（支持 SQLite/PostgreSQL）：
+Fustor Registry 使用一个主目录来存放配置、日志和数据库。
+*   **默认路径**: `~/.fustor`
+*   **自定义路径**: 设置 `FUSTOR_HOME` 环境变量。
 
-```bash
-# 示例：使用 SQLite
-DATABASE_URL=sqlite+aiosqlite:///~/.fustor/registry.db
+在 Fustor 主目录下的 `.env` 中配置数据库连接（支持 SQLite/PostgreSQL）：
+
+```env
+DATABASE_URL=sqlite+aiosqlite:///registry.db
 ```
 
 ## 命令指南

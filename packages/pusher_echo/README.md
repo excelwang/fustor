@@ -26,7 +26,7 @@ This driver is particularly useful for:
 Example (conceptual configuration in Fustor Agent):
 
 ```yaml
-# ~/.fustor/config.yaml
+# Fustor 主目录下的 agent-config.yaml
 pushers:
   my-echo-pusher:
     driver_type: echo

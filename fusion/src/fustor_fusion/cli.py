@@ -100,7 +100,7 @@ def start(reload, port, host, daemon, verbose, no_console_log):
         return
 
     try:
-        os.makedirs(HOME_FUSTOR_DIR, exist_ok=True) # Ensure ~/.fustor exists for PID file
+        os.makedirs(HOME_FUSTOR_DIR, exist_ok=True) # Ensure Fustor home directory exists for PID file
         with open(FUSION_PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
 

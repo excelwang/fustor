@@ -23,7 +23,7 @@ To use the `fustor-pusher-openapi` driver, configure a Pusher in your Fustor Age
 Example (conceptual configuration in Fustor Agent):
 
 ```yaml
-# ~/.fustor/config.yaml
+# Fustor 主目录下的 agent-config.yaml
 pushers:
   my-openapi-pusher:
     driver_type: openapi

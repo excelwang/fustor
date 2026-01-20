@@ -8,9 +8,10 @@ import yaml
 import click
 
 class ServiceManager:
-    def __init__(self, env_dir: str, data_dir: str):
-        self.env_dir = os.path.abspath(env_dir)
+    def __init__(self, data_dir: str):
         self.data_dir = os.path.abspath(data_dir)
+        # Unified environment directory: {data-dir}/.fustor
+        self.env_dir = os.path.join(self.data_dir, ".fustor")
         self.registry_port = 18101
         self.fusion_port = 18102
         self.agent_port = 18100
@@ -30,7 +31,7 @@ class ServiceManager:
         
         # Registry DB config
         with open(os.path.join(self.env_dir, ".env"), "w") as f:
-            f.write(f"DATABASE_URL=sqlite+aiosqlite:///{self.env_dir}/registry.db\n")
+            f.write(f"FUSTOR_REGISTRY_DB_URL=sqlite+aiosqlite:///{self.env_dir}/registry.db\n")
             f.write(f"FUSTOR_FUSION_REGISTRY_URL=http://localhost:{self.registry_port}\n")
             f.write(f"FUSTOR_REGISTRY_CLIENT_TOKEN={self.client_token}\n")
 
@@ -132,24 +133,29 @@ class ServiceManager:
 
     def start_agent(self, api_key: str):
         # 1. Write Config
-        # Agent expects a Dict structure {id: config}, not a List
-        # Matching SourceConfig, PusherConfig, SyncConfig models
+        # Aligning with the user's "normal" config for maximum performance
         config = {
             "sources": {
                 "bench-fs": {
                     "driver": "fs",
                     "uri": self.data_dir,
-                    "credential": {"user": "admin", "passwd": ""},
+                    "credential": {"user": "admin"},
                     "disabled": False,
+                    "is_transient": True,
+                    "max_queue_size": 100000,
+                    "max_retries": 1,
                     "driver_params": {"min_monitoring_window_days": 1}
                 }
             },
             "pushers": {
                 "bench-fusion": {
                     "driver": "fusion",
-                    "endpoint": f"http://localhost:{self.fusion_port}/ingestor-api/v1/events",
+                    "endpoint": f"http://127.0.0.1:{self.fusion_port}",
                     "credential": {"key": api_key},
-                    "disabled": False
+                    "disabled": False,
+                    "batch_size": 1000,
+                    "max_retries": 10,
+                    "retry_delay_sec": 5
                 }
             },
             "syncs": {
@@ -160,9 +166,8 @@ class ServiceManager:
                 }
             }
         }
-        dot_fustor = os.path.join(self.env_dir, ".fustor")
-        os.makedirs(dot_fustor, exist_ok=True)
-        with open(os.path.join(dot_fustor, "agent-config.yaml"), "w") as f:
+        # Config is written directly to env_dir ({data-dir}/.fustor)
+        with open(os.path.join(self.env_dir, "agent-config.yaml"), "w") as f:
             yaml.dump(config, f)
             
         # 2. Start Process
@@ -178,6 +183,42 @@ class ServiceManager:
         self.processes.append(p)
         
         self._wait_for_service(f"http://localhost:{self.agent_port}/", "Agent")
+
+    def check_agent_logs(self, lines=100):
+        """Peeks at the agent log for errors and success indicators."""
+        log_path = os.path.join(self.env_dir, "agent.log")
+        if not os.path.exists(log_path):
+            return False, "Log file not found yet"
+        
+        try:
+            with open(log_path, "r") as f:
+                content = f.readlines()[-lines:]
+            
+            error_keywords = ["ERROR", "Exception", "Traceback", "404 -", "failed to start", "ConfigurationError", "崩溃"]
+            success_keywords = ["initiated successfully", "Uvicorn running", "Application startup complete"]
+            
+            has_error = False
+            error_msg = ""
+            has_success = False
+
+            for line in content:
+                # 检查错误
+                if any(kw in line for kw in error_keywords):
+                    has_error = True
+                    error_msg = line.strip()
+                # 检查成功标志
+                if any(kw in line for kw in success_keywords):
+                    has_success = True
+
+            if has_error:
+                return False, f"Detected Error: {error_msg}"
+            
+            if not has_success:
+                return True, "Starting up... (no success signal yet)"
+                
+            return True, "OK (Success signals detected)"
+        except Exception as e:
+            return True, f"Could not read log: {e}"
 
     def stop_all(self):
         click.echo("Stopping all services...")

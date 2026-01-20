@@ -23,7 +23,7 @@ To use the `fustor-source-elasticsearch` driver, configure a Source in your Fust
 Example (conceptual configuration in Fustor Agent):
 
 ```yaml
-# ~/.fustor/config.yaml
+# Fustor 主目录下的 agent-config.yaml
 sources:
   my-es-source:
     driver_type: elasticsearch

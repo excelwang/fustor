@@ -197,7 +197,7 @@ def start(reload, port, host, daemon, verbose, no_console_log):
         return
 
     try:
-        os.makedirs(HOME_FUSTOR_DIR, exist_ok=True) # Ensure ~/.fustor exists for PID file
+        os.makedirs(HOME_FUSTOR_DIR, exist_ok=True) # Ensure Fustor home directory exists for PID file
 
         # Ensure API token exists before starting the service
         token = ensure_registry_token()

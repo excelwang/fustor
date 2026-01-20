@@ -9,19 +9,17 @@ import tempfile
 from pathlib import Path
 
 from fustor_core.models.config import AppConfig, SourceConfig, PusherConfig, SyncConfig, SourceConfigDict, PusherConfigDict, SyncConfigDict
-# Order of .env loading: ~/.fustor/.env (highest priority), then FUAGENT_CONFIG_DIR/.env (if different), then project root .env
-env_fustor_home = os.getenv("FUSTOR_HOME")
-if env_fustor_home:
-    home_fustor_dir = Path(env_fustor_home) / ".fustor"
-else:
-    home_fustor_dir = Path.home() / ".fustor"
+from fustor_common.paths import get_fustor_home_dir
+
+# Standardize Fustor home directory across all services
+home_fustor_dir = get_fustor_home_dir()
 
 CONFIG_DIR = str(home_fustor_dir)
 
-# Order of .env loading: ~/.fustor/.env (highest priority), then project root .env
+# Order of .env loading: CONFIG_DIR/.env (highest priority), then project root .env
 home_dotenv_path = home_fustor_dir / ".env"
 if home_dotenv_path.is_file():
-    load_dotenv(home_dotenv_path) # Load from ~/.fustor/.env first
+    load_dotenv(home_dotenv_path) 
 
 # Load .env from project root (lowest priority) - will not override already set variables
 load_dotenv(find_dotenv())

@@ -126,15 +126,14 @@ async def process_event(event: EventBase, datastore_id: int) -> Dict[str, bool]:
 # It is effectively replaced by the logic in per_datastore_processing_loop in main.py
 
 
-async def get_directory_tree(path: str = "/", datastore_id: int = None) -> Optional[Dict[str, Any]]:
+async def get_directory_tree(path: str = "/", datastore_id: int = None, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
     """Get the directory tree from the file directory parser"""
-    logger.info(f"Getting directory tree for path '{path}' in datastore {datastore_id}")
+    logger.info(f"Getting directory tree for path '{path}' in datastore {datastore_id} (recursive={recursive}, max_depth={max_depth}, only_path={only_path})")
     if datastore_id:
         manager = await get_cached_parser_manager(datastore_id)
         parser = await manager.get_file_directory_parser()
         if parser:
-            tree = await parser.get_directory_tree(path)
-            logger.info(f"Directory tree for path '{path}': {tree}")
+            tree = await parser.get_directory_tree(path, recursive=recursive, max_depth=max_depth, only_path=only_path)
             return tree
     logger.info(f"Could not retrieve directory tree for path '{path}' in datastore {datastore_id}")
     return None
@@ -173,17 +172,9 @@ async def get_parser_with_db(datastore_id: int) -> ParserManager:
     return await get_cached_parser_manager(datastore_id)
 
 
-async def get_directory_from_db(datastore_id: int, path: str = "/") -> Optional[Dict[str, Any]]:
+async def get_directory_from_db(datastore_id: int, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
     """Get the directory structure from memory (previously from the database)"""
-    logger.info(f"Getting directory from memory for path '{path}' in datastore {datastore_id}")
-    manager = await get_cached_parser_manager(datastore_id)
-    parser = await manager.get_file_directory_parser()
-    if parser:
-        result = await parser.get_data_view(path=path) if path else await parser.get_data_view()
-        logger.info(f"Directory from memory for path '{path}' in datastore {datastore_id}: {result}")
-        return result
-    logger.info(f"Could not retrieve directory from memory for path '{path}' in datastore {datastore_id}")
-    return None
+    return await get_directory_tree(path, datastore_id=datastore_id, recursive=recursive, max_depth=max_depth, only_path=only_path)
 
 
 async def reset_directory_tree(datastore_id: int) -> bool:

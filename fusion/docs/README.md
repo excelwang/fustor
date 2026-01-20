@@ -11,7 +11,11 @@ pip install fustor-fusion
 ## 配置
 
 Fusion 需要连接到 Registry 服务以验证 API Key。
-在 `~/.fustor/.env` 文件中配置：
+Fustor Fusion 使用一个主目录来存放配置和日志。
+*   **默认路径**: `~/.fustor`
+*   **自定义路径**: 设置 `FUSTOR_HOME` 环境变量。
+
+在 Fustor 主目录下的 `.env` 文件中配置：
 
 ```bash
 FUSTOR_REGISTRY_URL=http://localhost:8101

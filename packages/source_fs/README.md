@@ -27,7 +27,7 @@ To use the `fustor-source-fs` driver, configure a Source in your Fustor Agent se
 Example (conceptual configuration in Fustor Agent):
 
 ```yaml
-# ~/.fustor/config.yaml
+# Fustor 主目录下的 agent-config.yaml
 sources:
   my-fs-source:
     driver_type: fs

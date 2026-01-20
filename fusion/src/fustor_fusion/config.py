@@ -2,9 +2,10 @@ import os
 from pathlib import Path
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from fustor_common.paths import get_fustor_home_dir
 
-# Determine the path to the .env file in the user's home directory
-home_fustor_dir = Path.home() / ".fustor"
+# Standardize Fustor home directory across all services
+home_fustor_dir = get_fustor_home_dir()
 home_dotenv_path = home_fustor_dir / ".env"
 
 # Load environment variables from the home directory .env file if it exists

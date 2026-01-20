@@ -27,13 +27,17 @@ async def check_snapshot_status(datastore_id: int):
 @parser_router.get("/fs/tree", summary="Get directory tree structure")
 async def get_directory_tree_api(
     path: str = Query("/", description="Directory path to retrieve (default: '/')"),
+    recursive: bool = Query(True, description="Whether to recursively retrieve the entire subtree"),
+    max_depth: Optional[int] = Query(None, description="Maximum depth of recursion"),
+    only_path: bool = Query(False, description="Return only paths, excluding metadata like size and timestamps"),
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Optional[Dict[str, Any]]:
     """Get the directory structure tree starting from the specified path."""
     await check_snapshot_status(datastore_id)
-    logger.info(f"API request for directory tree: path={path}, datastore_id={datastore_id}")
-    result = await get_directory_tree(path, datastore_id=datastore_id)
-    logger.info(f"Directory tree result for path '{path}': {result}")
+    # If max_depth is set, we imply recursive behavior
+    effective_recursive = recursive if max_depth is None else True
+    logger.info(f"API request for directory tree: path={path}, recursive={effective_recursive}, max_depth={max_depth}, only_path={only_path}, datastore_id={datastore_id}")
+    result = await get_directory_tree(path, datastore_id=datastore_id, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
     return result
 
 @parser_router.get("/fs/search", summary="Search for files by pattern")

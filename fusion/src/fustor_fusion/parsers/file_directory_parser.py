@@ -28,16 +28,20 @@ class FileNode:
     content_type: str = "file"
     metadata: Dict[str, Any] = field(default_factory=dict)
     
-    def to_dict(self) -> Dict[str, Any]:
-        return {
+    def to_dict(self, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Dict[str, Any]:
+        result = {
             "path": self.path,
             "name": self.name,
             "size": self.size,
-            "modified_time": self.modified_time.isoformat(),
-            "created_time": self.created_time.isoformat(),
             "content_type": self.content_type,
-            "metadata": self.metadata
         }
+        if not only_path:
+            result.update({
+                "modified_time": self.modified_time.isoformat(),
+                "created_time": self.created_time.isoformat(),
+                "metadata": self.metadata
+            })
+        return result
 
 
 @dataclass
@@ -75,22 +79,49 @@ class DirectoryNode:
         """Get a child node by name"""
         return self.children.get(name)
     
-    def to_dict(self) -> Dict[str, Any]:
-        children_dict = {}
-        for name, child in self.children.items():
-            if isinstance(child, (FileNode, DirectoryNode)):
-                children_dict[name] = child.to_dict()
-        
-        return {
+    def to_dict(self, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Dict[str, Any]:
+        result = {
             "path": self.path,
             "name": self.name,
             "content_type": "directory",
-            "children": children_dict,
-            "created_time": self.created_time.isoformat() if self.created_time else None,
-            "modified_time": self.modified_time.isoformat() if self.modified_time else None,
-            "metadata": self.metadata,
-            "subtree_max_mtime": self.subtree_max_mtime
         }
+        
+        if not only_path:
+            result.update({
+                "created_time": self.created_time.isoformat() if self.created_time else None,
+                "modified_time": self.modified_time.isoformat() if self.modified_time else None,
+                "metadata": self.metadata,
+                "subtree_max_mtime": self.subtree_max_mtime
+            })
+        
+        # If max_depth is set and reached 0, stop recursing and don't return children
+        if max_depth is not None and max_depth <= 0:
+            return result
+
+        if recursive:
+            children_dict = {}
+            next_max_depth = max_depth - 1 if max_depth is not None else None
+            for name, child in self.children.items():
+                if isinstance(child, (FileNode, DirectoryNode)):
+                    children_dict[name] = child.to_dict(recursive=True, max_depth=next_max_depth, only_path=only_path)
+            result["children"] = children_dict
+        else:
+            # When not recursive, we still return the children keys but with shallow info
+            children_list = []
+            for name, child in self.children.items():
+                if isinstance(child, (FileNode, DirectoryNode)):
+                    # Return basic info for children in a list format for flatter retrieval
+                    child_info = {
+                        "name": child.name,
+                        "path": child.path,
+                        "content_type": "directory" if isinstance(child, DirectoryNode) else "file",
+                    }
+                    if not only_path and isinstance(child, FileNode):
+                        child_info["size"] = child.size
+                    children_list.append(child_info)
+            result["children"] = children_list
+            
+        return result
 
 
 class DirectoryStructureParser:
@@ -309,7 +340,7 @@ class DirectoryStructureParser:
 
             del self._directory_path_map[path]
 
-    async def get_directory_tree(self, path: str = "/") -> Optional[Dict[str, Any]]:
+    async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
         """Get the directory structure. If the path is a file, returns the file's metadata."""
         async with self._lock:
             # Normalize the path for lookup: remove trailing slash except for root
@@ -321,12 +352,12 @@ class DirectoryStructureParser:
             # 1. Try to find it as a directory first.
             dir_node = self._directory_path_map.get(lookup_path)
             if dir_node:
-                return dir_node.to_dict()
+                return dir_node.to_dict(recursive=recursive, max_depth=max_depth, only_path=only_path)
 
             # 2. If not a directory, check if it's a known file.
             file_node = self._file_path_map.get(lookup_path)
             if file_node:
-                return file_node.to_dict()
+                return file_node.to_dict(recursive=recursive, max_depth=max_depth, only_path=only_path)
 
             # 3. If it's neither a known directory nor a known file, return None.
             return None
@@ -342,7 +373,7 @@ class DirectoryStructureParser:
             
             file_node = self._file_path_map.get(lookup_path)
             if file_node:
-                return file_node.to_dict()
+                return file_node.to_dict(recursive=True)
             return None
     
     async def search_files(self, pattern: str) -> List[Dict[str, Any]]:
@@ -351,18 +382,21 @@ class DirectoryStructureParser:
             results = []
             for path, file_node in self._file_path_map.items():
                 if pattern.lower() in path.lower():
-                    results.append(file_node.to_dict())
+                    results.append(file_node.to_dict(recursive=True))
             return results
     
     async def get_all_files(self) -> List[Dict[str, Any]]:
         """Get all files in the directory structure"""
         async with self._lock:
-            return [file_node.to_dict() for file_node in self._file_path_map.values()]
+            return [file_node.to_dict(recursive=True) for file_node in self._file_path_map.values()]
     
     async def get_data_view(self, **kwargs) -> Dict[str, Any]:
         """Get the current data view - default to directory tree from root"""
         path = kwargs.get("path", "/")
-        return await self.get_directory_tree(path) if path else self.root.to_dict()
+        recursive = kwargs.get("recursive", True)
+        max_depth = kwargs.get("max_depth")
+        only_path = kwargs.get("only_path", False)
+        return await self.get_directory_tree(path, recursive=recursive, max_depth=max_depth, only_path=only_path) if path else self.root.to_dict(recursive=recursive, max_depth=max_depth, only_path=only_path)
     
     def _find_oldest_directory_recursive(self, node: DirectoryNode) -> Tuple[Optional[str], float]:
         """

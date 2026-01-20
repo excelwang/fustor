@@ -66,7 +66,7 @@ async def get_metrics(
                 f'# TYPE fustor_agent_sync_push_latency_seconds summary' # Using summary type for sum/count
             )
             metrics_output.append(
-                f'fustor_agent_sync_push_latency_seconds_sum{{sync_id="{sync_id}",source_id="{sync_instance.config.source}",pusher_id="{sync_instance.config.pusher}"}} {total_latency}'
+                f'fustor_agent_sync_push_latency_seconds_sum{{sync_id="{sync_id}",source_id="{sync_instance.config.source}",pusher_id="{sync_instance.config.pusher}"}} {total_latency:g}'
             )
             metrics_output.append(
                 f'fustor_agent_sync_push_latency_seconds_count{{sync_id="{sync_id}",source_id="{sync_instance.config.source}",pusher_id="{sync_instance.config.pusher}"}} {count_latency}'

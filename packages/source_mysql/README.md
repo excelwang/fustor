@@ -26,7 +26,7 @@ To use the `fustor-source-mysql` driver, configure a Source in your Fustor Agent
 Example (conceptual configuration in Fustor Agent):
 
 ```yaml
-# ~/.fustor/config.yaml
+# Fustor 主目录下的 agent-config.yaml
 sources:
   my-mysql-source:
     driver_type: mysql

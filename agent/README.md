@@ -10,9 +10,13 @@ pip install fustor-agent
 pip install fustor-source-fs
 ```
 
-## 配置指南 (`agent-config.yaml`)
+### 1. 配置
 
-Agent 的核心配置文件位于 `~/.fustor/agent-config.yaml`。你需要定义 `sources` (数据源)、`pushers` (推送目标) 和 `syncs` (同步任务)。
+Fustor Agent 使用一个主目录来存放配置和状态。
+*   **默认路径**: `~/.fustor`
+*   **自定义路径**: 设置 `FUSTOR_HOME` 环境变量。
+
+Agent 的核心配置文件位于 Fustor 主目录下的 `agent-config.yaml`。你需要定义 `sources` (数据源)、`pushers` (推送目标) 和 `syncs` (同步任务)。
 
 ### 1. 配置 Source (数据源)
 

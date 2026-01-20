@@ -35,9 +35,14 @@ source .venv/bin/activate
     ```
 
 2.  **初始化配置**:
+    Fustor 使用一个主目录来存放配置、日志和数据库。
+    *   **默认路径**: `~/.fustor`
+    *   **自定义路径**: 设置 `FUSTOR_HOME` 环境变量。
+
     ```bash
+    # 创建主目录（以默认路径为例）
     mkdir -p ~/.fustor
-    # 复制 .env.example 到 ~/.fustor/.env 并配置数据库连接等
+    # 复制 .env.example 到主目录下的 .env 并配置数据库连接等
     ```
 
 3.  **启动 Registry 服务**:
@@ -63,7 +68,7 @@ source .venv/bin/activate
     ```
 
 2.  **配置连接**:
-    在 `~/.fustor/.env` 中配置 Registry 的地址：
+    在 Fustor 主目录下的 `.env` 中配置 Registry 的地址：
     ```bash
     FUSTOR_REGISTRY_URL=http://localhost:8101
     ```
@@ -90,7 +95,7 @@ source .venv/bin/activate
     ```
 
 2.  **配置 Agent (`agent-config.yaml`)**:
-    在 `~/.fustor/agent-config.yaml` 中配置 Source 和 Pusher。
+    在 Fustor 主目录下的 `agent-config.yaml` 中配置 Source 和 Pusher。
     
     ```yaml
     # 示例配置：监控本地目录并推送到 Fusion
