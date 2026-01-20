@@ -10,6 +10,7 @@ from ..runtime import datastore_event_manager
 from ..core.session_manager import session_manager
 from ..auth.datastore_cache import datastore_config_cache
 from ..datastore_state_manager import datastore_state_manager
+from ..processing_manager import processing_manager
 
 # Import the queue-based ingestion
 from ..queue_integration import queue_based_ingestor, add_events_batch_to_queue, get_position_from_queue, update_position_in_queue
@@ -194,13 +195,16 @@ async def ingest_event_batch(
 
             # Add events to the in-memory queue for high-throughput ingestion
             # Pass task_id for position tracking
-            total_events_added = await add_events_batch_to_queue(datastore_id, event_objects_to_add, si.task_id)
+            await add_events_batch_to_queue(datastore_id, event_objects_to_add, si.task_id)
+            
+            # Ensure background processor is running for this datastore
+            await processing_manager.ensure_processor(datastore_id)
             
         # Notify the background task that there are new events
         try:
             await datastore_event_manager.notify(datastore_id)
         except Exception as e:
-            logger.error(f"Failed to notify event manager for datastore {ds_id}: {e}", exc_info=True)
+            logger.error(f"Failed to notify event manager for datastore {datastore_id}: {e}", exc_info=True)
 
     except Exception as e:
         logger.error(f"处理批量事件失败 (task: {si.task_id}): {e}", exc_info=True)

@@ -1,79 +1,93 @@
 import asyncio
 import logging
-from typing import Dict, Set, Callable, Coroutine, Any, List
-from fustor_registry.api.client.api import ClientDatastoreConfigResponse
-from fustor_fusion_sdk.interfaces import ParserProcessingTaskManagerInterface # Import the interface
+from typing import Dict, List, Optional, Any
+from collections import defaultdict
+from .queue_integration import get_events_from_queue
+from .parsers.manager import process_event as process_single_event
+from .runtime import datastore_event_manager
+from .in_memory_queue import memory_event_queue
 
 logger = logging.getLogger(__name__)
 
-class ParserProcessingTaskManager(ParserProcessingTaskManagerInterface): # Inherit from the interface
-    """
-    Starts, stops, and tracks the per-datastore event processing tasks.
-    """
-    def __init__(self, processing_coro: Callable[[int], Coroutine[Any, Any, None]]):
-        self._running_tasks: Dict[int, asyncio.Task] = {} # Keyed by datastore_id
+class ProcessingManager:
+    def __init__(self):
+        self._tasks: Dict[int, asyncio.Task] = {}
         self._lock = asyncio.Lock()
-        self._processing_coro = processing_coro
+        # 追踪每个数据存储正在处理中（已出队但未完成解析）的事件数量
+        self._inflight_counts: Dict[int, int] = defaultdict(int)
 
-    async def start_processing_for_datastore(self, datastore_id: int):
-        """Starts a new processing task for a datastore if not already running."""
-        engine_key = datastore_id
+    def get_inflight_count(self, datastore_id: int) -> int:
+        """获取当前正在内存解析中的事件数"""
+        return self._inflight_counts.get(datastore_id, 0)
+
+    async def ensure_processor(self, datastore_id: int):
+        """确保指定数据存储的处理循环正在运行"""
         async with self._lock:
-            if engine_key in self._running_tasks:
-                logger.warning(f"Task for datastore {datastore_id} is already running.")
-                return
+            if datastore_id not in self._tasks or self._tasks[datastore_id].done():
+                task = asyncio.create_task(self._per_datastore_processing_loop(datastore_id))
+                self._tasks[datastore_id] = task
+                logger.info(f"Started dynamic background processing task for datastore {datastore_id}.")
 
-            logger.info(f"Starting event processing task for datastore {datastore_id}.")
-            task = asyncio.create_task(self._processing_coro(datastore_id))
-            self._running_tasks[engine_key] = task
+    async def sync_tasks(self, datastore_configs: List[Any]):
+        """根据配置同步处理任务 (由 sync_cache 调用)"""
+        for config in datastore_configs:
+            # DatastoreConfig object usually has datastore_id
+            ds_id = getattr(config, 'datastore_id', None)
+            if ds_id is not None:
+                await self.ensure_processor(ds_id)
 
-    async def stop_processing_for_datastore(self, datastore_id: int):
-        """Stops a running processing task for a datastore."""
-        engine_key = datastore_id
-        async with self._lock:
-            task = self._running_tasks.pop(engine_key, None)
-            if task:
-                logger.info(f"Stopping event processing task for datastore {datastore_id}.")
-                task.cancel()
+    async def _per_datastore_processing_loop(self, datastore_id: int):
+        """优化的后台处理循环：事件驱动 + 状态追踪"""
+        log = logging.getLogger(f"fustor.processor.{datastore_id}")
+        log.info(f"Processing loop started for datastore {datastore_id}")
+        
+        while True:
+            try:
+                # 1. 尝试获取一批事件
+                events = await get_events_from_queue(datastore_id)
+                
+                if not events:
+                    # 2. 如果队列为空，挂起等待唤醒
+                    await datastore_event_manager.wait_for_event(datastore_id)
+                    continue
+
+                # --- 关键：增加处理中计数 ---
+                count = len(events)
+                self._inflight_counts[datastore_id] += count
+                
                 try:
-                    await task
-                except asyncio.CancelledError:
-                    logger.info(f"Task for datastore {datastore_id} cancelled successfully.")
-            else:
-                logger.warning(f"No running task found for datastore {datastore_id} to stop.")
+                    processed_count = 0
+                    for event_obj in events:
+                        try:
+                            await process_single_event(event_obj, datastore_id)
+                            processed_count += 1
+                        except Exception as e:
+                            log.error(f"Error processing event: {e}", exc_info=True)
+                    
+                    if processed_count > 0:
+                        log.info(f"Processed {processed_count} events. Queue: {memory_event_queue.get_queue_size(datastore_id)}")
+                finally:
+                    # --- 关键：无论成功失败，处理完后减去计数 ---
+                    self._inflight_counts[datastore_id] -= count
+                
+                # 给予其他协程运行机会
+                await asyncio.sleep(0)
 
-    async def sync_tasks(self, latest_datastore_configs: List[ClientDatastoreConfigResponse]):
-        """
-        Compares the latest set of datastore configurations with the currently running tasks
-        and starts/stops tasks accordingly.
-        """
+            except asyncio.CancelledError:
+                log.info(f"Processing loop for datastore {datastore_id} stopped.")
+                break
+            except Exception as e:
+                log.error(f"Critical error in processing loop: {e}", exc_info=True)
+                await asyncio.sleep(1)
+
+    async def stop_all(self):
         async with self._lock:
-            current_engine_keys = set(self._running_tasks.keys())
-            new_engine_keys = set()
+            for ds_id, task in self._tasks.items():
+                task.cancel()
+            if self._tasks:
+                await asyncio.gather(*self._tasks.values(), return_exceptions=True)
+            self._tasks.clear()
+            self._inflight_counts.clear()
 
-            for datastore_config in latest_datastore_configs:
-                new_engine_keys.add(datastore_config.datastore_id)
-
-            to_start_keys = new_engine_keys - current_engine_keys
-            to_stop_keys = current_engine_keys - new_engine_keys
-
-        for datastore_id in to_start_keys:
-            await self.start_processing_for_datastore(datastore_id)
-
-        for datastore_id in to_stop_keys:
-            await self.stop_processing_for_datastore(datastore_id)
-
-    async def shutdown(self):
-        """
-        Stops all running tasks during application shutdown.
-        """
-        logger.info("Shutting down all datastore processing tasks...")
-        async with self._lock:
-            all_tasks = list(self._running_tasks.values())
-            self._running_tasks.clear()
-
-        for task in all_tasks:
-            task.cancel()
-
-        await asyncio.gather(*all_tasks, return_exceptions=True)
-        logger.info("All datastore processing tasks have been shut down.")
+# 全局单例
+processing_manager = ProcessingManager()

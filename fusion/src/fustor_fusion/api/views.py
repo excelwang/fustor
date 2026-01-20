@@ -9,6 +9,8 @@ from typing import Dict, Any, Optional
 from ..parsers.manager import get_directory_tree, search_files, get_directory_stats, reset_directory_tree
 from ..auth.dependencies import get_datastore_id_from_api_key
 from ..datastore_state_manager import datastore_state_manager
+from ..in_memory_queue import memory_event_queue
+from ..processing_manager import processing_manager
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +18,21 @@ parser_router = APIRouter(tags=["Parsers - Data Views"])
 
 async def check_snapshot_status(datastore_id: int):
     """Checks if the initial snapshot sync is complete for the datastore."""
-    is_complete = await datastore_state_manager.is_snapshot_complete(datastore_id)
-    if not is_complete:
-        logger.warning(f"Access denied to datastore {datastore_id}: Initial snapshot sync not complete.")
+    is_signal_complete = await datastore_state_manager.is_snapshot_complete(datastore_id)
+    
+    # Check queue size AND inflight (currently processing) count
+    queue_size = memory_event_queue.get_queue_size(datastore_id)
+    inflight_count = processing_manager.get_inflight_count(datastore_id)
+    
+    if not is_signal_complete or queue_size > 0 or inflight_count > 0:
+        detail = "Initial snapshot sync in progress. Service temporarily unavailable for this datastore."
+        if is_signal_complete and (queue_size > 0 or inflight_count > 0):
+            detail = f"Sync signal received, but still processing ingested data: queue={queue_size}, inflight={inflight_count}."
+            logger.info(f"Datastore {datastore_id} {detail}")
+            
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Initial snapshot sync in progress. Service temporarily unavailable for this datastore."
+            detail=detail
         )
 
 @parser_router.get("/fs/tree", summary="Get directory tree structure")
