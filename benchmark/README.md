@@ -28,11 +28,19 @@ uv run fustor-benchmark generate fustor-benchmark-run --num-dirs 1000
 ### 2. 执行压测
 运行全链路同步并执行并发性能对比：
 ```bash
+# 全自动模式 (推荐)：数据缺失时自动生成
 uv run fustor-benchmark run fustor-benchmark-run -d 5 -c 20 -n 100
+
+# 强制重生成数据
+uv run fustor-benchmark run fustor-benchmark-run -m force
+
+# 仅使用现有数据，禁止任何生成行为
+uv run fustor-benchmark run fustor-benchmark-run -m skip
 ```
 *   `-d`: 探测深度。
 *   `-c`: 并发数。
 *   `-n`: 总请求次数。
+*   `-m`: 生成模式 (`auto`, `force`, `skip`)。
 
 ## 报告与指标
 

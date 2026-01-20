@@ -356,11 +356,23 @@ class BenchmarkRunner:
 
         with open(output_path, "w") as f: f.write(html)
 
-    def run(self, concurrency=20, reqs=200, target_depth=5, force_gen=False, custom_target=False):
-        if not custom_target:
-            if os.path.exists(self.data_dir) and not force_gen: click.echo(f"Data directory '{self.data_dir}' exists. Skipping generation.")
-            else: self.generator.generate()
-        else: click.echo(f"Benchmarking target directory: {self.data_dir}")
+    def run(self, concurrency=20, reqs=200, target_depth=5, gen_mode='auto'):
+        # Data Generation Strategy
+        data_exists = os.path.exists(self.data_dir) and len(os.listdir(self.data_dir)) > 0 if os.path.exists(self.data_dir) else False
+        
+        if gen_mode == 'force':
+            click.echo("Gen-mode: FORCE. Re-generating data...")
+            self.generator.generate()
+        elif gen_mode == 'skip':
+            click.echo(f"Gen-mode: SKIP. Using existing data in {self.data_dir}")
+            if not data_exists:
+                raise RuntimeError(f"Data directory '{self.data_dir}' is missing or empty, but gen-mode is set to 'skip'.")
+        else: # auto
+            if not data_exists:
+                click.echo(f"Gen-mode: AUTO. Data missing in {self.data_dir}. Generating...")
+                self.generator.generate()
+            else:
+                click.echo(f"Gen-mode: AUTO. Data exists in {self.data_dir}. Skipping generation.")
         
         try:
             self.services.setup_env()
