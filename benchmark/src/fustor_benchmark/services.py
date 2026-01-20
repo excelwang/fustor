@@ -20,9 +20,6 @@ class ServiceManager:
         self.fusion_port = 18102
         self.agent_port = 18100
         self.processes = []
-        
-        # Paths
-        self.venv_bin = os.path.abspath(".venv/bin") # Assuming run from repo root
 
     def setup_env(self):
         # Safety Check: Only allow operations in directories ending with 'fustor-benchmark-run'
@@ -59,7 +56,7 @@ class ServiceManager:
 
     def start_registry(self):
         cmd = [
-            f"{self.venv_bin}/fustor-registry", "start",
+            "fustor-registry", "start",
             "-p", str(self.registry_port)
         ]
         log_file = open(os.path.join(self.env_dir, "registry.log"), "w")
@@ -111,7 +108,7 @@ class ServiceManager:
 
     def start_fusion(self):
         cmd = [
-            f"{self.venv_bin}/fustor-fusion", "start",
+            "fustor-fusion", "start",
             "-p", str(self.fusion_port)
         ]
         log_file = open(os.path.join(self.env_dir, "fusion.log"), "w")
@@ -140,7 +137,7 @@ class ServiceManager:
                 "bench-fs": {
                     "driver": "fs",
                     "uri": self.data_dir,
-                    "credential": {"user": "admin"},
+                    "credential": {"key": "dummy"}, # Use valid-looking key for source
                     "disabled": False,
                     "is_transient": True,
                     "max_queue_size": 100000,
@@ -171,7 +168,7 @@ class ServiceManager:
             yaml.dump(config, f)
             
         cmd = [
-            f"{self.venv_bin}/fustor-agent", "start",
+            "fustor-agent", "start",
             "-p", str(self.agent_port)
         ]
         log_file = open(os.path.join(self.env_dir, "agent.log"), "w")
