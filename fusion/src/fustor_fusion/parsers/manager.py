@@ -98,13 +98,13 @@ async def get_cached_parser_manager(datastore_id: int) -> 'ParserManager':
     cache_key = datastore_id
     # Fast path: check if already cached without locking
     if cache_key in _parser_manager_cache:
-        logger.info(f"Returning cached parser manager for datastore {datastore_id}")
+        logger.debug(f"Returning cached parser manager for datastore {datastore_id}")
         return _parser_manager_cache[cache_key]
 
     # Slow path: lock and double-check
     async with _cache_lock:
         if cache_key in _parser_manager_cache:
-            logger.info(f"Returning cached parser manager for datastore {datastore_id} (double-checked)")
+            logger.debug(f"Returning cached parser manager for datastore {datastore_id} (double-checked)")
             return _parser_manager_cache[cache_key]
         
         logger.info(f"Creating new parser manager for datastore {datastore_id} and caching it.")
@@ -117,7 +117,7 @@ async def get_cached_parser_manager(datastore_id: int) -> 'ParserManager':
 # Interface for processing events
 async def process_event(event: EventBase, datastore_id: int) -> Dict[str, bool]:
     """Process a single event with all available parsers"""
-    logger.info(f"Processing single event in manager for datastore {datastore_id}")
+    logger.debug(f"Processing single event in manager for datastore {datastore_id}")
     # Use the cached manager for processing events to keep the in-memory view consistent
     manager = await get_cached_parser_manager(datastore_id)
     return await manager.process_event(event)
@@ -128,7 +128,7 @@ async def process_event(event: EventBase, datastore_id: int) -> Dict[str, bool]:
 
 async def get_directory_tree(path: str = "/", datastore_id: int = None, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
     """Get the directory tree from the file directory parser"""
-    logger.info(f"Getting directory tree for path '{path}' in datastore {datastore_id} (recursive={recursive}, max_depth={max_depth}, only_path={only_path})")
+    logger.debug(f"Getting directory tree for path '{path}' in datastore {datastore_id} (recursive={recursive}, max_depth={max_depth}, only_path={only_path})")
     if datastore_id:
         manager = await get_cached_parser_manager(datastore_id)
         parser = await manager.get_file_directory_parser()

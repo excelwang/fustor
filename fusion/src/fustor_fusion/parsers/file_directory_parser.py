@@ -143,13 +143,11 @@ class DirectoryStructureParser:
 
     async def process_event(self, event: EventBase) -> bool:
         """ 
-        Processes a single event by applying it directly to the in-memory cache.
+        Processes an event by applying all its data rows to the in-memory cache.
         """
-        self.logger.info(f"Processing event: {event}")
-
         # 1. Extract information from EventBase
         if event.table == "initial_trigger":
-            self.logger.info(f"Skipping initial trigger event: {event}")
+            self.logger.debug(f"Skipping initial trigger event.")
             return True
 
         if not event.rows:
@@ -157,32 +155,27 @@ class DirectoryStructureParser:
             return False
         
         # Calculate processing latency: Now - Event Timestamp (index)
-        # event.index is in milliseconds for source_fs
         now_ms = time.time() * 1000
         if event.index > 0:
             self._last_event_latency = max(0, now_ms - event.index)
         
-        # Assuming one row per event for file system changes
-        payload = event.rows[0]
-        path = payload.get('path') or payload.get('file_path')
-        if not path:
-            self.logger.warning(f"Path is missing in event payload. Event: {event}")
-            return False
-
         event_type = event.event_type
 
-        # 2. Apply change to in-memory cache directly
+        # 2. Apply changes to in-memory cache directly
         async with self._lock:
-            # Check cache invalidation before modification
-            self._check_cache_invalidation(path)
-            
-            self.logger.info(f"Applying change to in-memory cache for path: {path}, type: {event_type.value}")
-            if event_type in [EventType.INSERT, EventType.UPDATE]:
-                await self._process_create_update_in_memory(payload, path)
-            elif event_type == EventType.DELETE:
-                await self._process_delete_in_memory(path)
+            for payload in event.rows:
+                path = payload.get('path') or payload.get('file_path')
+                if not path:
+                    continue
 
-        self.logger.info(f"Successfully processed event for path: {path}")
+                # Check cache invalidation before modification
+                self._check_cache_invalidation(path)
+                
+                if event_type in [EventType.INSERT, EventType.UPDATE]:
+                    await self._process_create_update_in_memory(payload, path)
+                elif event_type == EventType.DELETE:
+                    await self._process_delete_in_memory(path)
+
         return True
 
     def _check_cache_invalidation(self, updated_path: str):

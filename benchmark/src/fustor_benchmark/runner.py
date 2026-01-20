@@ -64,8 +64,6 @@ class BenchmarkRunner:
 
     def _discover_leaf_targets_via_api(self, api_key: str, depth: int):
         """Finds directories at the specified depth relative to data_dir using Fusion API."""
-        # Calculate the depth of the data_dir itself (prefix_depth)
-        # e.g., /home/user/data -> ['home', 'user', 'data'] -> depth 3
         prefix_depth = len(self.data_dir.strip('/').split('/')) if self.data_dir != '/' else 0
         max_fetch_depth = depth + prefix_depth
         
@@ -75,45 +73,33 @@ class BenchmarkRunner:
         headers = {"X-API-Key": api_key}
         
         try:
-            # Fetch the tree with exact required depth
             res = requests.get(
                 f"{fusion_url}/views/fs/tree", 
                 params={"path": "/", "max_depth": max_fetch_depth, "only_path": "true"}, 
                 headers=headers, 
                 timeout=30
             )
-            if res.status_code != 200:
-                return ["/"]
+            if res.status_code != 200: return ["/"]
             
             tree_data = res.json()
             targets = []
 
-            # Determine the mount point node (the one matching self.data_dir)
-            # and start walking depth-counting from there.
             def find_and_walk(node, current_rel_depth, inside_mount):
                 path = node.get('path', '')
-                
-                # Check if this node is our data_dir (mount point)
                 if not inside_mount:
                     if os.path.abspath(path) == os.path.abspath(self.data_dir):
                         inside_mount = True
                         current_rel_depth = 0
                     else:
-                        # Continue searching for the mount point in children
                         children = node.get('children', {})
                         if isinstance(children, dict):
                             for child in children.values(): find_and_walk(child, 0, False)
                         elif isinstance(children, list):
                             for child in children: find_and_walk(child, 0, False)
                         return
-
-                # If we are here, we are at or inside the mount point
                 if current_rel_depth == depth:
-                    if node.get('content_type') == 'directory':
-                        targets.append(path)
+                    if node.get('content_type') == 'directory': targets.append(path)
                     return
-
-                # Recurse further down
                 children = node.get('children', {})
                 if isinstance(children, dict):
                     for child in children.values(): find_and_walk(child, current_rel_depth + 1, True)
@@ -126,7 +112,7 @@ class BenchmarkRunner:
             return ["/"]
 
         if not targets:
-            click.echo(click.style(f"No targets found at relative depth {depth}. (Check if data is synced)", fg="yellow"))
+            click.echo(click.style(f"No targets found at relative depth {depth}.", fg="yellow"))
             targets = ["/"]
         else:
             example_path = random.choice(targets)
@@ -137,8 +123,6 @@ class BenchmarkRunner:
 
     def run_concurrent_baseline(self, targets, concurrency=20, requests_count=100):
         click.echo(f"Running Concurrent OS Baseline (Recursive find -ls): {concurrency} workers, {requests_count} requests...")
-        # Since targets are now absolute paths from Fusion, we extract the relative part
-        # to join with local data_dir if needed, but here find needs absolute paths.
         tasks = [(self.data_dir, t) for t in [random.choice(targets) for _ in range(requests_count)]]
         latencies = []
         start_total = time.time()
@@ -184,10 +168,18 @@ class BenchmarkRunner:
                 if not is_ok: raise RuntimeError(f"Agent reported error during sync: {log_msg}")
                 if int(elapsed) % 30 < 5: click.echo(f"  [Agent] Status: {log_msg}")
             try:
-                res = requests.get(f"{fusion_url}/views/fs/tree", params={"path": "/"}, headers=headers, timeout=5)
+                # Optimized readiness check: only fetch root level metadata
+                res = requests.get(
+                    f"{fusion_url}/views/fs/tree", 
+                    params={"path": "/", "max_depth": 1, "only_path": "true"}, 
+                    headers=headers, 
+                    timeout=5
+                )
+                
                 if res.status_code == 200:
                     click.echo(f"  [Fusion] READY (200 OK) after {elapsed:.1f}s.")
                     break
+            
                 elif res.status_code == 503:
                     if int(elapsed) % 5 == 0:
                         click.echo(f"  [Fusion] Still syncing... (Elapsed: {int(elapsed)}s)")
@@ -225,7 +217,9 @@ class BenchmarkRunner:
         th, td { text-align: left; padding: 15px; border-bottom: 1px solid #eee; }
         th { background: #f8f9fa; color: #2c3e50; font-weight: 600; }
         .winning { color: #2ecc71; font-weight: bold; }
-        .info-bar { background: #e8f4fd; padding: 15px; border-radius: 8px; margin-bottom: 30px; display: flex; gap: 20px; font-size: 14px; }
+        .info-bar { background: #e8f4fd; padding: 15px; border-radius: 8px; margin-bottom: 30px; display: grid; grid-template-columns: 1fr 1fr; gap: 15px; font-size: 14px; }
+        .info-item { display: flex; gap: 10px; }
+        .info-label { color: #5a6c7a; font-weight: 600; min-width: 120px; }
     </style>
 </head>
 <body>
@@ -233,10 +227,13 @@ class BenchmarkRunner:
         <h1>Fustor Performance Benchmark</h1>
         
         <div class="info-bar">
-            <span>📅 Time: <strong>{{timestamp}}</strong></span>
-            <span>📂 Target Depth: <strong>{{depth}}</strong></span>
-            <span>🚀 Requests: <strong>{{reqs}}</strong></span>
-            <span>👥 Concurrency: <strong>{{concurrency}}</strong></span>
+            <div class="info-item"><span class="info-label">📅 Timestamp:</span> <strong>{{timestamp}}</strong></div>
+            <div class="info-item"><span class="info-label">⚙️ Op Type:</span> <strong>{{op_type}}</strong></div>
+            <div class="info-item"><span class="info-label">📂 Data Scale:</span> <strong>{{total_files}} files ({{total_dirs}} dirs)</strong></div>
+            <div class="info-item"><span class="info-label">📂 Target Depth:</span> <strong>{{depth}}</strong></div>
+            <div class="info-item"><span class="info-label">🚀 Requests:</span> <strong>{{reqs}}</strong></div>
+            <div class="info-item"><span class="info-label">👥 Concurrency:</span> <strong>{{concurrency}}</strong></div>
+            <div class="info-item"><span class="info-label">🏷️ Target Folders:</span> <strong>{{target_count}}</strong></div>
         </div>
         
         <div class="summary">
@@ -291,7 +288,6 @@ class BenchmarkRunner:
     </div>
 
     <script>
-        // Bar Chart
         new Chart(document.getElementById('barChart'), {
             type: 'bar',
             data: {
@@ -304,7 +300,6 @@ class BenchmarkRunner:
             options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }
         });
 
-        // Percentile Line Chart
         new Chart(document.getElementById('lineChart'), {
             type: 'line',
             data: {
@@ -319,17 +314,18 @@ class BenchmarkRunner:
     </script>
 </body>
 </html>
-"""
+""";
         # Calculate speedups
         g_avg = results['os']['avg'] / results['fusion']['avg'] if results['fusion']['avg'] > 0 else 0
-        
-        # Helper for percentiles in line chart
         def get_p(stats, p):
-            raw = stats['raw']
-            idx = int(len(raw) * p / 100)
+            raw = stats['raw']; idx = int(len(raw) * p / 100)
             return raw[min(idx, len(raw)-1)]
 
         html = template.replace("{{timestamp}}", results['timestamp']) \
+                       .replace("{{op_type}}", results['metadata']['operation_type']) \
+                       .replace("{{total_files}}", f"{results['metadata']['total_files_in_scope']:,}") \
+                       .replace("{{total_dirs}}", f"{results['metadata'].get('total_directories_in_scope', 0):,}") \
+                       .replace("{{target_count}}", str(results['target_directory_count'])) \
                        .replace("{{depth}}", str(results['depth'])) \
                        .replace("{{reqs}}", str(results['requests'])) \
                        .replace("{{concurrency}}", str(results['concurrency'])) \
@@ -376,14 +372,30 @@ class BenchmarkRunner:
             click.echo("Agent health check passed.")
             
             self.wait_for_sync(api_key)
+            
+            # Discover targets
             targets = self._discover_leaf_targets_via_api(api_key, target_depth)
             
             # Run benchmarks
             os_stats = self.run_concurrent_baseline(targets, concurrency, reqs)
             fusion_stats = self.run_concurrent_fusion(api_key, targets, concurrency, reqs)
             
-            # Prepare results object
+            # Fetch final stats AFTER benchmark to ensure total accuracy
+            fusion_url = f"http://localhost:{self.services.fusion_port}"
+            res_stats = requests.get(f"{fusion_url}/views/fs/stats", headers={"X-API-Key": api_key})
+            stats_data = res_stats.json() if res_stats.status_code == 200 else {}
+            total_files = stats_data.get("total_files", 0)
+            total_dirs = stats_data.get("total_directories", 0)
+            
+            click.echo(f"Final System Stats: {total_files:,} files, {total_dirs:,} directories.")
+            
+            # Prepare results object with rich metadata
             final_results = {
+                "metadata": {
+                    "operation_type": "RECURSIVE_METADATA_GET",
+                    "total_files_in_scope": total_files,
+                    "total_directories_in_scope": total_dirs
+                },
                 "depth": target_depth, "requests": reqs, "concurrency": concurrency,
                 "target_directory_count": len(targets),
                 "os": os_stats, "fusion": fusion_stats,
@@ -393,7 +405,6 @@ class BenchmarkRunner:
             # Save JSON and HTML to results directory
             results_dir = os.path.join(self.run_dir, "results")
             os.makedirs(results_dir, exist_ok=True)
-            
             json_path = os.path.join(results_dir, "stress-find.json")
             html_path = os.path.join(results_dir, "stress-find.html")
             
@@ -403,7 +414,7 @@ class BenchmarkRunner:
             # Output Scorecard to console
             click.echo("\n" + "="*60)
             click.echo(f"RECURSIVE METADATA RETRIEVAL PERFORMANCE (DEPTH {target_depth})")
-            click.echo(f"Target Directories Found: {len(targets)}")
+            click.echo(f"Data Scale: {total_files:,} files | Targets: {len(targets)}")
             click.echo("="*60)
             click.echo(f"{ 'Metric (ms)':<25} | {'OS (find -ls)':<18} | {'Fusion API':<18}")
             click.echo("-" * 65)

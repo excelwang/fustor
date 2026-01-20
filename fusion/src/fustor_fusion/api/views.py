@@ -47,7 +47,7 @@ async def get_directory_tree_api(
     await check_snapshot_status(datastore_id)
     # If max_depth is set, we imply recursive behavior
     effective_recursive = recursive if max_depth is None else True
-    logger.info(f"API request for directory tree: path={path}, recursive={effective_recursive}, max_depth={max_depth}, only_path={only_path}, datastore_id={datastore_id}")
+    logger.debug(f"API request for directory tree: path={path}, recursive={effective_recursive}, max_depth={max_depth}, only_path={only_path}, datastore_id={datastore_id}")
     result = await get_directory_tree(path, datastore_id=datastore_id, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
     return result
 
