@@ -38,7 +38,7 @@ class FusionDriver(PusherDriver):
         event_dicts = [event.model_dump(mode='json') for event in events]
         source_type = kwargs.get("source_type", "message")
         is_snapshot_end = kwargs.get("is_snapshot_end", False)
-
+        
         # Calculate total rows across all events for accurate logging
         total_rows = sum(len(event.rows) for event in events if event.rows)
 
@@ -50,10 +50,10 @@ class FusionDriver(PusherDriver):
         )
 
         if success:
-            self.logger.info(f"Successfully pushed {len(events)} events ({total_rows} rows).")
+            self.logger.info(f"[{source_type}] Successfully pushed {len(events)} events ({total_rows} rows).")
             return {"snapshot_needed": False}
         else:
-            self.logger.error(f"Failed to push {len(events)} events ({total_rows} rows).")
+            self.logger.error(f"[{source_type}] Failed to push {len(events)} events ({total_rows} rows).")
             return {"snapshot_needed": False}
 
     async def heartbeat(self, **kwargs) -> Dict:

@@ -8,10 +8,13 @@ import yaml
 import click
 
 class ServiceManager:
-    def __init__(self, data_dir: str):
-        self.data_dir = os.path.abspath(data_dir)
-        # Unified environment directory: {data-dir}/.fustor
-        self.env_dir = os.path.join(self.data_dir, ".fustor")
+    def __init__(self, run_dir: str):
+        self.run_dir = os.path.abspath(run_dir)
+        # 监控目标数据目录
+        self.data_dir = os.path.join(self.run_dir, "data")
+        # 系统环境主目录 (FUSTOR_HOME)
+        self.env_dir = os.path.join(self.run_dir, ".fustor")
+        
         self.registry_port = 18101
         self.fusion_port = 18102
         self.agent_port = 18100
@@ -53,7 +56,6 @@ class ServiceManager:
             f"{self.venv_bin}/fustor-registry", "start",
             "-p", str(self.registry_port)
         ]
-        # We don't use -D, we manage the process ourselves
         log_file = open(os.path.join(self.env_dir, "registry.log"), "w")
         env = os.environ.copy()
         env["FUSTOR_HOME"] = self.env_dir
@@ -66,7 +68,6 @@ class ServiceManager:
             raise RuntimeError("Registry start failed")
 
     def configure_system(self):
-        # 1. Login to get token
         reg_url = f"http://localhost:{self.registry_port}/v1"
         click.echo("Logging in to Registry...")
         try:
@@ -80,7 +81,6 @@ class ServiceManager:
             token = res.json()["access_token"]
             headers = {"Authorization": f"Bearer {token}"}
             
-            # 2. Create Datastore
             click.echo("Creating Datastore...")
             res = requests.post(f"{reg_url}/datastores/", json={
                 "name": "BenchmarkDS", "description": "Auto-generated"
@@ -89,7 +89,6 @@ class ServiceManager:
                  raise RuntimeError(f"DS creation failed: {res.text}")
             ds_id = res.json()["id"]
             
-            # 3. Create API Key
             click.echo("Creating API Key...")
             res = requests.post(f"{reg_url}/keys/", json={
                 "datastore_id": ds_id, "name": "bench-key"
@@ -118,12 +117,10 @@ class ServiceManager:
         p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
         self.processes.append(p)
         
-        # Wait for Fusion port to open
         click.echo(f"Waiting for Fusion at http://localhost:{self.fusion_port}...")
         start = time.time()
         while time.time() - start < 30:
             try:
-                # Even if 401/403, it means the server is responding
                 requests.get(f"http://localhost:{self.fusion_port}/", timeout=1)
                 click.echo("Fusion is up.")
                 return
@@ -132,8 +129,6 @@ class ServiceManager:
         raise RuntimeError("Fusion start failed")
 
     def start_agent(self, api_key: str):
-        # 1. Write Config
-        # Aligning with the user's "normal" config for maximum performance
         config = {
             "sources": {
                 "bench-fs": {
@@ -166,11 +161,9 @@ class ServiceManager:
                 }
             }
         }
-        # Config is written directly to env_dir ({data-dir}/.fustor)
         with open(os.path.join(self.env_dir, "agent-config.yaml"), "w") as f:
             yaml.dump(config, f)
             
-        # 2. Start Process
         cmd = [
             f"{self.venv_bin}/fustor-agent", "start",
             "-p", str(self.agent_port)
@@ -185,7 +178,6 @@ class ServiceManager:
         self._wait_for_service(f"http://localhost:{self.agent_port}/", "Agent")
 
     def check_agent_logs(self, lines=100):
-        """Peeks at the agent log for errors and success indicators."""
         log_path = os.path.join(self.env_dir, "agent.log")
         if not os.path.exists(log_path):
             return False, "Log file not found yet"
@@ -202,11 +194,9 @@ class ServiceManager:
             has_success = False
 
             for line in content:
-                # 检查错误
                 if any(kw in line for kw in error_keywords):
                     has_error = True
                     error_msg = line.strip()
-                # 检查成功标志
                 if any(kw in line for kw in success_keywords):
                     has_success = True
 

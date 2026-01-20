@@ -6,7 +6,7 @@ dist/
 wheels/
 *.egg-info
 .pytest_cache
-benchmark_data
+benchmark-run
 
 # Virtual environments
 .venv
@@ -24,4 +24,3 @@ config.yaml
 uv.lock
 *.pkl
 *.db
-benchmark_env
