@@ -11,30 +11,45 @@ class DataGenerator:
         self.submit_dir = os.path.join(self.base_dir, "upload/submit")
 
     def _create_batch(self, args):
-        dir_path, file_count = args
-        os.makedirs(dir_path, exist_ok=True)
-        for i in range(file_count):
-            with open(os.path.join(dir_path, f"data_{i:04d}.dat"), "w") as f:
-                pass
+        """
+        Creates subdirectories and files within a specific UUID directory.
+        args: (uuid_path, num_subdirs, files_per_subdir)
+        """
+        uuid_path, num_subdirs, files_per_subdir = args
+        try:
+            for s in range(num_subdirs):
+                sub_path = os.path.join(uuid_path, f"sub_{s}")
+                os.makedirs(sub_path, exist_ok=True)
+                for i in range(files_per_subdir):
+                    # Create empty dummy files
+                    file_path = os.path.join(sub_path, f"data_{i:04d}.dat")
+                    with open(file_path, "w") as f:
+                        pass
+        except Exception as e:
+            print(f"Error generating data in {uuid_path}: {e}")
 
-    def generate(self, num_uuids: int = 100, files_per_dir: int = 1000):
+    def generate(self, num_uuids: int = 1000, num_subdirs: int = 4, files_per_subdir: int = 250):
         if os.path.exists(self.base_dir):
             click.echo(f"Cleaning up old data in {self.base_dir}...")
             shutil.rmtree(self.base_dir)
 
-        click.echo(f"Generating {num_uuids * files_per_dir} files in {self.submit_dir}/{{c1}}/{{c2}}/{{uuid}} ...")
+        total_files = num_uuids * num_subdirs * files_per_subdir
+        click.echo(f"Generating {total_files:,} files in 1000 UUID directories...")
+        click.echo(f"Structure: {self.submit_dir}/{{c1}}/{{c2}}/{{uuid}}/sub_X/{{250 files}}")
         
         tasks = []
         for _ in range(num_uuids):
             uid = str(uuid.uuid4())
-            # Path: .../upload/submit/{c0}/{c1}/{uuid}
+            # Target path at depth 5 (relative to base_dir/data):
+            # 1:upload / 2:submit / 3:c1 / 4:c2 / 5:uuid
             path = os.path.join(self.submit_dir, uid[0], uid[1], uid)
-            tasks.append((path, files_per_dir))
+            tasks.append((path, num_subdirs, files_per_subdir))
 
         start_gen = time.time()
-        with ThreadPoolExecutor(max_workers=os.cpu_count() * 4) as executor:
+        # Using a high worker count for I/O bound file creation
+        with ThreadPoolExecutor(max_workers=os.cpu_count() * 8) as executor:
             list(executor.map(self._create_batch, tasks))
         
         duration = time.time() - start_gen
-        click.echo(f"Generation Complete: {duration:.2f}s")
+        click.echo(f"Generation Complete: {duration:.2f}s (Average: {total_files/duration:.1f} files/sec)")
         return self.base_dir

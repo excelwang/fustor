@@ -32,7 +32,6 @@ class BenchmarkRunner:
         self.data_dir = os.path.join(self.run_dir, "data")
         self.env_dir = os.path.join(self.run_dir, ".fustor")
         
-        # Pass the common root run_dir to ServiceManager
         self.services = ServiceManager(self.run_dir) 
         self.generator = DataGenerator(self.data_dir)
 
@@ -64,58 +63,87 @@ class BenchmarkRunner:
         }
 
     def _discover_leaf_targets_via_api(self, api_key: str, depth: int):
-        """Finds directories at the specified depth using a single Fusion API call with max_depth."""
-        click.echo(f"Discovering target directories at depth {depth} via Fusion API (optimized single-call)...")
+        """Finds directories at the specified depth relative to data_dir using Fusion API."""
+        # Calculate the depth of the data_dir itself (prefix_depth)
+        # e.g., /home/user/data -> ['home', 'user', 'data'] -> depth 3
+        prefix_depth = len(self.data_dir.strip('/').split('/')) if self.data_dir != '/' else 0
+        max_fetch_depth = depth + prefix_depth
+        
+        click.echo(f"Discovering target directories at depth {depth} (prefix: {prefix_depth}, total: {max_fetch_depth}) via Fusion API...")
         
         fusion_url = f"http://localhost:{self.services.fusion_port}"
         headers = {"X-API-Key": api_key}
         
         try:
+            # Fetch the tree with exact required depth
             res = requests.get(
                 f"{fusion_url}/views/fs/tree", 
-                params={"path": "/", "max_depth": depth, "only_path": "true"}, 
+                params={"path": "/", "max_depth": max_fetch_depth, "only_path": "true"}, 
                 headers=headers, 
                 timeout=30
             )
             if res.status_code != 200:
-                click.echo(click.style(f"API discovery failed with status {res.status_code}. Falling back to root.", fg="red"))
                 return ["/"]
             
             tree_data = res.json()
             targets = []
 
-            def walk(node, current_depth):
-                if current_depth == depth:
+            # Determine the mount point node (the one matching self.data_dir)
+            # and start walking depth-counting from there.
+            def find_and_walk(node, current_rel_depth, inside_mount):
+                path = node.get('path', '')
+                
+                # Check if this node is our data_dir (mount point)
+                if not inside_mount:
+                    if os.path.abspath(path) == os.path.abspath(self.data_dir):
+                        inside_mount = True
+                        current_rel_depth = 0
+                    else:
+                        # Continue searching for the mount point in children
+                        children = node.get('children', {})
+                        if isinstance(children, dict):
+                            for child in children.values(): find_and_walk(child, 0, False)
+                        elif isinstance(children, list):
+                            for child in children: find_and_walk(child, 0, False)
+                        return
+
+                # If we are here, we are at or inside the mount point
+                if current_rel_depth == depth:
                     if node.get('content_type') == 'directory':
-                        targets.append(node.get('path'))
+                        targets.append(path)
                     return
+
+                # Recurse further down
                 children = node.get('children', {})
                 if isinstance(children, dict):
-                    for child_node in children.values(): walk(child_node, current_depth + 1)
+                    for child in children.values(): find_and_walk(child, current_rel_depth + 1, True)
                 elif isinstance(children, list):
-                    for child_node in children: walk(child_node, current_depth + 1)
+                    for child in children: find_and_walk(child, current_rel_depth + 1, True)
 
-            walk(tree_data, 0)
+            find_and_walk(tree_data, 0, False)
         except Exception as e:
             click.echo(click.style(f"Discovery error: {e}. Falling back to root.", fg="yellow"))
             return ["/"]
 
         if not targets:
+            click.echo(click.style(f"No targets found at relative depth {depth}. (Check if data is synced)", fg="yellow"))
             targets = ["/"]
         else:
             example_path = random.choice(targets)
-            click.echo(f"  [Check] Example target path at depth {depth}: '{example_path}'")
+            click.echo(f"  [Check] Example target path at relative depth {depth}: '{example_path}'")
             
-        click.echo(f"Discovered {len(targets)} candidate directories via single-call API.")
+        click.echo(f"Discovered {len(targets)} candidate directories via API.")
         return targets
 
     def run_concurrent_baseline(self, targets, concurrency=20, requests_count=100):
         click.echo(f"Running Concurrent OS Baseline (Recursive find -ls): {concurrency} workers, {requests_count} requests...")
-        tasks = [(self.data_dir, random.choice(targets)) for _ in range(requests_count)]
+        # Since targets are now absolute paths from Fusion, we extract the relative part
+        # to join with local data_dir if needed, but here find needs absolute paths.
+        tasks = [(self.data_dir, t) for t in [random.choice(targets) for _ in range(requests_count)]]
         latencies = []
         start_total = time.time()
         with ProcessPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(run_find_recursive_metadata_task, t) for t in tasks] # noqa
+            futures = [executor.submit(run_find_recursive_metadata_task, t) for t in tasks]
             for f in as_completed(futures): latencies.append(f.result())
         total_time = time.time() - start_total
         return self._calculate_stats(latencies, total_time, requests_count)
@@ -206,6 +234,7 @@ class BenchmarkRunner:
         
         <div class="info-bar">
             <span>📅 Time: <strong>{{timestamp}}</strong></span>
+            <span>📂 Target Depth: <strong>{{depth}}</strong></span>
             <span>🚀 Requests: <strong>{{reqs}}</strong></span>
             <span>👥 Concurrency: <strong>{{concurrency}}</strong></span>
         </div>
@@ -356,6 +385,7 @@ class BenchmarkRunner:
             # Prepare results object
             final_results = {
                 "depth": target_depth, "requests": reqs, "concurrency": concurrency,
+                "target_directory_count": len(targets),
                 "os": os_stats, "fusion": fusion_stats,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
@@ -369,6 +399,7 @@ class BenchmarkRunner:
             # Output Scorecard to console
             click.echo("\n" + "="*60)
             click.echo(f"RECURSIVE METADATA RETRIEVAL PERFORMANCE (DEPTH {target_depth})")
+            click.echo(f"Target Directories Found: {len(targets)}")
             click.echo("="*60)
             click.echo(f"{ 'Metric (ms)':<25} | {'OS (find -ls)':<18} | {'Fusion API':<18}")
             click.echo("-" * 65)

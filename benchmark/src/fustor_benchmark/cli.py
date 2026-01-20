@@ -10,12 +10,13 @@ def cli():
 
 @cli.command()
 @click.argument("run-dir", type=click.Path(exists=False))
-@click.option("--num-dirs", default=100, help="Number of UUID directories")
-@click.option("--files-per-dir", default=1000, help="Files per directory")
-def generate(run_dir, num_dirs, files_per_dir):
+@click.option("--num-dirs", default=1000, help="Number of UUID directories")
+@click.option("--num-subdirs", default=4, help="Number of subdirectories per UUID directory")
+@click.option("--files-per-subdir", default=250, help="Files per subdirectory")
+def generate(run_dir, num_dirs, num_subdirs, files_per_subdir):
     """Generate benchmark dataset"""
     gen = DataGenerator(os.path.join(run_dir, "data"))
-    gen.generate(num_dirs, files_per_dir)
+    gen.generate(num_dirs, num_subdirs, files_per_subdir)
 
 @cli.command()
 @click.argument("run-dir", type=click.Path(exists=True))
