@@ -82,6 +82,7 @@ echo "--- Phase 4: Publishing Services & Complex Integrations ---"
 publish_package "packages/pusher_fusion" "fustor-pusher-fusion"
 publish_package "fusion" "fustor-fusion"
 publish_package "agent" "fustor-agent"
+publish_package "benchmark" "fustor-benchmark"
 
 
 echo "----------------------------------------------------"
