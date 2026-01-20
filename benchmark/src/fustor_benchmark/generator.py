@@ -29,6 +29,13 @@ class DataGenerator:
             print(f"Error generating data in {uuid_path}: {e}")
 
     def generate(self, num_uuids: int = 1000, num_subdirs: int = 4, files_per_subdir: int = 250):
+        # Safety Check: Only allow operations in directories ending with 'fustor-benchmark-run'
+        # Note: self.base_dir is typically run-dir/data, so we check the parent run-dir
+        run_dir = os.path.dirname(self.base_dir)
+        if not run_dir.endswith("fustor-benchmark-run"):
+            click.echo(click.style(f"FATAL: Operation denied. Target run-dir '{run_dir}' must end with 'fustor-benchmark-run' for safety.", fg="red", bold=True))
+            return
+
         if os.path.exists(self.base_dir):
             click.echo(f"Cleaning up old data in {self.base_dir}...")
             shutil.rmtree(self.base_dir)

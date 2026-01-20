@@ -390,9 +390,13 @@ class BenchmarkRunner:
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
 
-            # Save JSON and HTML
-            json_path = os.path.join(self.env_dir, "benchmark_results.json")
-            html_path = os.path.join(self.env_dir, "report.html")
+            # Save JSON and HTML to results directory
+            results_dir = os.path.join(self.run_dir, "results")
+            os.makedirs(results_dir, exist_ok=True)
+            
+            json_path = os.path.join(results_dir, "stress-find.json")
+            html_path = os.path.join(results_dir, "stress-find.html")
+            
             with open(json_path, "w") as f: json.dump(final_results, f, indent=2)
             self.generate_html_report(final_results, html_path)
 

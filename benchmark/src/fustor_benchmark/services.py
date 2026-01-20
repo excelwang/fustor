@@ -24,6 +24,11 @@ class ServiceManager:
         self.venv_bin = os.path.abspath(".venv/bin") # Assuming run from repo root
 
     def setup_env(self):
+        # Safety Check: Only allow operations in directories ending with 'fustor-benchmark-run'
+        if not self.run_dir.endswith("fustor-benchmark-run"):
+            click.echo(click.style(f"FATAL: Environment setup denied. Target run-dir '{self.run_dir}' must end with 'fustor-benchmark-run' for safety.", fg="red", bold=True))
+            sys.exit(1)
+
         if os.path.exists(self.env_dir):
             shutil.rmtree(self.env_dir)
         os.makedirs(self.env_dir, exist_ok=True)

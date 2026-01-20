@@ -6,7 +6,7 @@ dist/
 wheels/
 *.egg-info
 .pytest_cache
-benchmark-run
+fustor-benchmark-run
 
 # Virtual environments
 .venv
