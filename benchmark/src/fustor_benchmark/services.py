@@ -1,11 +1,12 @@
 import os
-import time
 import shutil
-import signal
-import subprocess
-import requests
-import yaml
 import click
+import sys
+import yaml
+import subprocess
+import time
+import requests
+
 
 class ServiceManager:
     def __init__(self, run_dir: str):
