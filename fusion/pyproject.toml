@@ -6,7 +6,8 @@ requires-python = ">=3.11"
 dependencies = [
     "fastapi[all]",
     "uvicorn",
-    "sqlalchemy>=2.0.0",
+    "sqlalchemy==2.0.41",
+    "greenlet==3.2.2",
     "pydantic>=2.0.0",
     "pydantic-settings",
     "aiosqlite",
