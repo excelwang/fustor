@@ -8,27 +8,27 @@
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 40px; background: #f4f7f6; color: #333; }
         .container { max-width: 1300px; margin: auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
         h1 { color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom: 15px; margin-top: 0; }
-        .summary { display: flex; justify-content: space-between; margin: 30px -10px; }
+        h2 { color: #34495e; margin-top: 40px; border-bottom: 1px solid #eee; padding-bottom: 10px; }
+        .summary-group { margin-bottom: 30px; }
+        .summary-title { font-size: 18px; font-weight: bold; color: #7f8c8d; margin-bottom: 15px; text-transform: uppercase; letter-spacing: 1px; }
+        .summary { display: flex; justify-content: space-between; margin: 0 -10px 20px -10px; }
         .stat-card { background: #fff; padding: 20px; border-radius: 10px; flex: 1; margin: 0 10px; text-align: center; border: 1px solid #eee; border-top: 5px solid #3498db; transition: transform 0.2s; }
         .stat-card:hover { transform: translateY(-5px); }
         .stat-card.fusion { border-top-color: #2ecc71; }
         .stat-card.integrity { border-top-color: #e74c3c; }
         .stat-card.gain { border-top-color: #f1c40f; }
         .stat-value { font-size: 28px; font-weight: bold; margin: 10px 0; color: #2c3e50; }
-        .stat-label { font-size: 14px; color: #7f8c8d; text-transform: uppercase; letter-spacing: 1px; }
+        .stat-label { font-size: 14px; color: #7f8c8d; text-transform: uppercase; }
         .chart-row { display: flex; gap: 20px; margin-bottom: 40px; }
         .chart-box { flex: 1; background: #fff; padding: 20px; border-radius: 10px; border: 1px solid #eee; min-width: 0; }
-        .chart-container { position: relative; height: 350px; width: 100%; }
+        .chart-container { position: relative; height: 300px; width: 100%; }
         table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 14px; table-layout: fixed; }
         th, td { text-align: left; padding: 12px; border-bottom: 1px solid #eee; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         th { background: #f8f9fa; color: #2c3e50; font-weight: 600; }
-        .info-bar { background: #e8f4fd; padding: 15px; border-radius: 8px; margin-bottom: 30px; display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 15px; font-size: 13px; }
+        .info-bar { background: #e8f4fd; padding: 15px; border-radius: 8px; margin-bottom: 30px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; font-size: 13px; }
         .info-item { display: flex; gap: 10px; }
         .info-label { color: #5a6c7a; font-weight: 600; min-width: 100px; }
         .note-box { background: #fff9db; padding: 15px; border-left: 5px solid #fcc419; margin: 20px 0; font-size: 14px; line-height: 1.6; }
-        .methodology h3 { color: #2c3e50; margin-top: 25px; border-left: 4px solid #3498db; padding-left: 10px; }
-        .methodology ul { padding-left: 20px; }
-        .methodology li { margin-bottom: 10px; }
         .task-name { font-weight: bold; color: #2980b9; }
         .param-value { color: #e67e22; font-weight: bold; }
     </style>
@@ -45,37 +45,45 @@
             <div class="info-item"><span class="info-label">⏱️ Integrity Intv:</span> <strong class="param-value">{{integrity_interval}}s</strong></div>
         </div>
 
-        <div class="summary">
-            <div class="stat-card">
-                <div class="stat-label">OS Baseline (Pure Scan)</div>
-                <div class="stat-value">{{os_avg}} ms</div>
+        <div class="summary-group">
+            <div class="summary-title">Latency Summary (响应延迟)</div>
+            <div class="summary">
+                <div class="stat-card"><div class="stat-label">OS Baseline</div><div class="stat-value">{{os_avg}} ms</div></div>
+                <div class="stat-card integrity"><div class="stat-label">OS Integrity</div><div class="stat-value">{{os_integrity_avg}} ms</div></div>
+                <div class="stat-card fusion"><div class="stat-label">Fusion API</div><div class="stat-value">{{fusion_avg}} ms</div></div>
+                <div class="stat-card gain"><div class="stat-label">Latency Speedup</div><div class="stat-value" style="color: #2ecc71">{{gain_latency}}</div></div>
             </div>
-            <div class="stat-card integrity">
-                <div class="stat-label">OS Integrity (Standard Safe)</div>
-                <div class="stat-value">{{os_integrity_avg}} ms</div>
-            </div>
-            <div class="stat-card fusion">
-                <div class="stat-label">Fusion API (Perception)</div>
-                <div class="stat-value">{{fusion_avg}} ms</div>
-            </div>
-            <div class="stat-card gain">
-                <div class="stat-label">Speedup (vs Integrity)</div>
-                <div class="stat-value" style="color: #2ecc71">{{gain}}</div>
+        </div>
+
+        <div class="summary-group">
+            <div class="summary-title">Throughput Summary (系统吞吐率)</div>
+            <div class="summary">
+                <div class="stat-card"><div class="stat-label">OS Baseline</div><div class="stat-value">{{os_qps}}</div></div>
+                <div class="stat-card integrity"><div class="stat-label">OS Integrity</div><div class="stat-value">{{os_integrity_qps}}</div></div>
+                <div class="stat-card fusion"><div class="stat-label">Fusion API</div><div class="stat-value">{{fusion_qps}}</div></div>
+                <div class="stat-card gain"><div class="stat-label">QPS Gain</div><div class="stat-value" style="color: #2ecc71">{{gain_qps}}</div></div>
             </div>
         </div>
 
         <div class="note-box">
             <strong>📢 方案合理性说明 (Scientific Justification):</strong><br>
-            本次测试中的 <strong>OS Integrity</strong> 静默期设为 <span class="param-value">{{integrity_interval}}s</span>。这并非随意设定，而是严格遵循了 <strong>Linux NFS 协议的默认标准</strong>。在 NFS 挂载参数中，<code>acregmax</code> 和 <code>acdirmax</code>（元数据最大缓存时间）的默认值通常为 <strong>60 秒</strong>。在分布式系统中，只有等待超过该时间，才能确保不同客户端看到的 ctime 和文件大小是一致且最终正确的。Fusion API 成功的关键在于其 <strong>Perception (感知)</strong> 架构，通过在写入端实时拦截系统事件，彻底消除了这 60 秒的物理同步壁垒。
+            本次测试中的 <strong>OS Integrity</strong> 静默期设为 <span class="param-value">{{integrity_interval}}s</span>。这并非随意设定，而是严格遵循了 <strong>Linux NFS 协议的默认标准</strong>。在 NFS 挂载参数中，<code>acregmax</code> 和 <code>acdirmax</code> 的默认值通常为 <strong>60 秒</strong>。在分布式系统中，只有等待超过该时间，才能确保不同客户端看到的元数据是一致且最终正确的。Fusion API 成功的关键在于其 <strong>Perception (感知)</strong> 架构，彻底消除了这 60 秒的物理同步壁垒。
         </div>
 
         <div class="chart-row">
             <div class="chart-box">
-                <h3>Core Performance Comparison (Latency)</h3>
-                <div class="chart-container"><canvas id="barChart"></canvas></div>
+                <h3>Throughput Comparison (QPS) - Higher is Better</h3>
+                <div class="chart-container"><canvas id="qpsChart"></canvas></div>
             </div>
             <div class="chart-box">
-                <h3>Latency Percentiles (Distribution)</h3>
+                <h3>Average Latency (ms) - Lower is Better</h3>
+                <div class="chart-container"><canvas id="latencyChart"></canvas></div>
+            </div>
+        </div>
+
+        <div class="chart-row">
+            <div class="chart-box" style="flex: 2">
+                <h3>Latency Percentiles (Distribution) - Lower is Better</h3>
                 <div class="chart-container"><canvas id="lineChart"></canvas></div>
             </div>
         </div>
@@ -97,21 +105,12 @@
 
         <div class="methodology">
             <h2>Test Methodology & Documentation (测试任务详解)</h2>
-            
             <section>
                 <h3>1. 任务定义 (Task Definitions)</h3>
                 <ul>
-                    <li><span class="task-name">OS Baseline (Pure find Scan)</span>: 最原始的文件扫描方案。该方案无法识别正在写入的文件，在 NFS 环境下极易产生“脏读”，数据一致性等级为“低”。</li>
-                    
-                    <li><span class="task-name">OS Integrity (Double Sampling)</span>: 模拟 NFS 环境下确保文件完整的真实方案。
-                        <ol>
-                            <li>执行采样：<code>find ... -printf "%p\t%C@\t%s\n"</code>。</li>
-                            <li><strong>执行 NFS 安全静默期等待：<span class="param-value">{{integrity_interval}}s</span>。</strong>（注：对应标准 NFS 挂载参数 <code>acregmax=60</code>）。</li>
-                            <li>二次校验：对比 ctime 和文件大小，确认文件已完全同步并停止写入。</li>
-                        </ol>
-                    </li>
-
-                    <li><span class="task-name">Fusion API (Perception Mode)</span>: 基于实时感知的元数据检索。<strong>Agent 通过 Close-on-Write 事件直接获取“完整性”信号</strong>，使 Fusion 无需任何物理静默等待即可返回可靠数据。</li>
+                    <li><span class="task-name">OS Baseline (Pure find Scan)</span>: 执行原生 <code>find</code> 扫描。该方案无法识别正在写入的文件，在 NFS 环境下极易产生“脏读”，数据一致性等级为“低”。</li>
+                    <li><span class="task-name">OS Integrity (Double Sampling)</span>: 模拟 NFS 环境下确保文件完整的真实方案。包含首次采样 -> 强制 <strong>{{integrity_interval}}s</strong> 物理等待 -> 二次校验。</li>
+                    <li><span class="task-name">Fusion API (Perception Mode)</span>: 基于 Agent 实时感知的元数据检索。无需任何物理静默等待即可返回可靠数据。</li>
                 </ul>
             </section>
         </div>
@@ -138,19 +137,39 @@
             tableBody.appendChild(row);
         });
 
-        new Chart(document.getElementById('barChart'), {
+        const commonLabels = ['OS Baseline', 'OS Integrity', 'Fusion API'];
+        const getVal = (key) => [rawData.os[key], rawData.os_integrity[key], rawData.fusion[key]];
+
+        // 1. QPS Chart
+        new Chart(document.getElementById('qpsChart'), {
             type: 'bar',
             data: {
-                labels: ['Avg Latency', 'Median (P50)', 'P95 Latency'],
-                datasets: [
-                    { label: 'OS Baseline', data: [rawData.os.avg, rawData.os.p50, rawData.os.p95], backgroundColor: '#3498db' },
-                    { label: 'OS Integrity', data: [rawData.os_integrity.avg, rawData.os_integrity.p50, rawData.os_integrity.p95], backgroundColor: '#e74c3c' },
-                    { label: 'Fusion API', data: [rawData.fusion.avg, rawData.fusion.p50, rawData.fusion.p95], backgroundColor: '#2ecc71' }
-                ]
+                labels: commonLabels,
+                datasets: [{ label: 'QPS (Higher is better)', data: getVal('qps'), backgroundColor: ['#3498db', '#e74c3c', '#2ecc71'] }]
             },
-            options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }
+            options: { responsive: true, maintainAspectRatio: false }
         });
 
+        // 2. Latency Chart
+        new Chart(document.getElementById('latencyChart'), {
+            type: 'bar',
+            data: {
+                labels: commonLabels,
+                datasets: [{ label: 'Avg Latency (Lower is better)', data: getVal('avg'), backgroundColor: ['#3498db', '#e74c3c', '#2ecc71'] }]
+            },
+            options: { 
+                responsive: true, 
+                maintainAspectRatio: false,
+                scales: { 
+                    y: { 
+                        type: 'logarithmic',
+                        title: { display: true, text: 'ms (Log Scale)' }
+                    } 
+                }
+            }
+        });
+
+        // 3. Line Chart
         const pLabels = ['Min', 'P50', 'P75', 'P90', 'P95', 'P99', 'Max'];
         const getS = (g) => [rawData[g].min, rawData[g].p50, rawData[g].p75, rawData[g].p90, rawData[g].p95, rawData[g].p99, rawData[g].max];
         new Chart(document.getElementById('lineChart'), {

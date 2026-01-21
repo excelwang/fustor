@@ -12,7 +12,6 @@ def calculate_stats(latencies, total_time, count):
     qps = count / total_time
     qs = statistics.quantiles(l_ms, n=100) if len(l_ms) >= 2 else [l_ms[0]] * 100
     
-    # Calculate more percentiles for the line chart
     return {
         "qps": qps, 
         "avg": statistics.mean(l_ms), 
@@ -37,32 +36,34 @@ def generate_html_report(results, output_path):
         print(f"Error loading HTML template: {e}")
         return
 
-    # Calculate gain against OS Integrity (the reliable baseline)
-    gain = results['os_integrity']['avg'] / results['fusion']['avg'] if results['fusion']['avg'] > 0 else 0
+    # Calculate gains against OS Integrity
+    gain_latency = results['os_integrity']['avg'] / results['fusion']['avg'] if results['fusion']['avg'] > 0 else 0
+    gain_qps = results['fusion']['qps'] / results['os_integrity']['qps'] if results['os_integrity']['qps'] > 0 else 0
     
-    # Create a clean summary for template string replacement (for non-JS parts)
     summary = {
         "timestamp": results['timestamp'],
-        "op_type": results['metadata'].get('operation_type', 'RECURSIVE_METADATA_GET'),
         "total_files": f"{results['metadata']['total_files_in_scope']:,}",
         "total_dirs": f"{results['metadata'].get('total_directories_in_scope', 0):,}",
-        "target_count": str(results['target_directory_count']),
         "depth": str(results['depth']),
         "reqs": str(results['requests']),
         "concurrency": str(results['concurrency']),
+        "integrity_interval": str(results['metadata'].get('integrity_interval', 60.0)),
+        
         "os_avg": f"{results['os']['avg']:.2f}",
         "os_integrity_avg": f"{results['os_integrity']['avg']:.2f}",
         "fusion_avg": f"{results['fusion']['avg']:.2f}",
-        "dry_avg": f"{results['fusion_dry']['avg']:.2f}",
-        "gain": f"{gain:.1f}x"
+        "gain_latency": f"{gain_latency:.1f}x",
+        
+        "os_qps": f"{results['os']['qps']:.1f}",
+        "os_integrity_qps": f"{results['os_integrity']['qps']:.1f}",
+        "fusion_qps": f"{results['fusion']['qps']:.1f}",
+        "gain_qps": f"{gain_qps:.1f}x"
     }
 
     html = template
     for key, val in summary.items():
         html = html.replace(f"{{{{{key}}}}}", val)
 
-    # Inject the entire results object as JSON for JavaScript to use
-    # This avoids manual placeholder management in the <script> section
     results_json = json.dumps(results)
     html = html.replace("/* RESULTS_JSON_DATA */", results_json)
 
