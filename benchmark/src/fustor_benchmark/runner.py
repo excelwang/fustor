@@ -100,13 +100,14 @@ class BenchmarkRunner:
         total_time = time.time() - start_total
         return calculate_stats(latencies, total_time, requests_count)
 
-    def run_concurrent_find_integrity(self, targets, concurrency=20, requests_count=100):
-        click.echo(f"Running Concurrent OS Integrity (Double-Sampling check): {concurrency} workers, {requests_count} requests...")
+    def run_concurrent_find_integrity(self, targets, concurrency=20, requests_count=100, interval=60.0):
+        click.echo(f"Running Concurrent OS Integrity (Double-Sampling @ {interval}s wait): {concurrency} workers, {requests_count} requests...")
         
         shuffled_targets = list(targets)
         random.shuffle(shuffled_targets)
         sampled_paths = [shuffled_targets[i % len(shuffled_targets)] for i in range(requests_count)]
-        tasks = [(self.data_dir, t) for t in sampled_paths]
+        # Pass interval to task
+        tasks = [(self.data_dir, t, interval) for t in sampled_paths]
         
         latencies = []
         start_total = time.time()
@@ -189,7 +190,7 @@ class BenchmarkRunner:
             except Exception as e: click.echo(f"  [Fusion] Warning: Connection glitch ({e})")
             time.sleep(5)
 
-    def run(self, concurrency=20, reqs=200, target_depth=5):
+    def run(self, concurrency=20, reqs=200, target_depth=5, integrity_interval=60.0):
         data_exists = os.path.exists(self.data_dir) and len(os.listdir(self.data_dir)) > 0
         if not data_exists:
             click.echo(click.style(f"FATAL: Data directory '{self.data_dir}' is empty or missing.", fg="red", bold=True))
@@ -212,7 +213,7 @@ class BenchmarkRunner:
             targets = self._discover_leaf_targets_via_api(api_key, target_depth)
             
             os_stats = self.run_concurrent_baseline(targets, concurrency, reqs)
-            os_integrity_stats = self.run_concurrent_find_integrity(targets, concurrency, reqs)
+            os_integrity_stats = self.run_concurrent_find_integrity(targets, concurrency, reqs, interval=integrity_interval)
             fusion_dry_net_stats = self.run_concurrent_fusion_dry_net(concurrency, reqs)
             fusion_dry_stats = self.run_concurrent_fusion_dry_run(api_key, targets, concurrency, reqs)
             fusion_stats = self.run_concurrent_fusion(api_key, targets, concurrency, reqs)
@@ -222,7 +223,13 @@ class BenchmarkRunner:
             stats_data = res_stats.json() if res_stats.status_code == 200 else {}
             
             final_results = {
-                "metadata": {"total_files_in_scope": stats_data.get("total_files", 0), "total_directories_in_scope": stats_data.get("total_directories", 0), "source_path": self.data_dir, "api_endpoint": fusion_url},
+                "metadata": {
+                    "total_files_in_scope": stats_data.get("total_files", 0), 
+                    "total_directories_in_scope": stats_data.get("total_directories", 0), 
+                    "source_path": self.data_dir, 
+                    "api_endpoint": fusion_url,
+                    "integrity_interval": integrity_interval
+                },
                 "depth": target_depth, "requests": reqs, "concurrency": concurrency, "target_directory_count": len(targets),
                 "os": os_stats, "os_integrity": os_integrity_stats, 
                 "fusion_dry_net": fusion_dry_net_stats, "fusion_dry": fusion_dry_stats, "fusion": fusion_stats, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")

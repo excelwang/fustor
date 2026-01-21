@@ -60,39 +60,48 @@ def run_single_fusion_req(url, headers, path, dry_run=False, dry_net=False):
 
 def run_find_integrity_task(args):
     """
-    Simulates the 'Double Sampling' method to ensure file integrity.
-    1. First find to get candidates.
-    2. Sleep for a silence window (1s).
-    3. Re-stat each file to confirm stability.
+    Simulates the 'Double Sampling' method for NFS environments.
+    Criteria for 'Complete':
+    1. Size and ctime remain unchanged between two scans.
+    2. ctime must be older than the 'interval' (default 60s) from now.
     """
-    data_dir, subdir = args
+    data_dir, subdir, interval = args
     target = os.path.join(data_dir, subdir.lstrip('/'))
     
     start = time.time()
     
-    # Phase 1: Initial find
-    cmd = ["find", target, "-printf", "%p|%s|%T@\n"]
+    # Phase 1: First scan (Sampling ctime and size)
+    # Using %p (path), %C@ (ctime), %s (size)
+    cmd = ["find", target, "-type", "f", "-printf", "%p\t%C@\t%s\n"]
     result = subprocess.run(cmd, capture_output=True, text=True)
     lines = result.stdout.splitlines()
     
     initial_metadata = {}
     for line in lines:
-        parts = line.split('|')
+        parts = line.split('\t')
         if len(parts) == 3:
             initial_metadata[parts[0]] = (parts[1], parts[2])
             
-    # Phase 2: Silence Window (Crucial for the 'Double Sampling' logic)
-    time.sleep(1.0)
+    # Phase 2: Silence Window / Sync Wait
+    # This is the interval required for NFS consistency and stability check
+    time.sleep(interval)
     
-    # Phase 3: Secondary Validation (The O(N) overhead point)
+    # Phase 3: Secondary Validation
+    # In real logic, we would run find again or stat each. 
+    # To simulate the O(N) cost of re-verifying N files:
     stable_count = 0
-    for path, (old_size, old_mtime) in initial_metadata.items():
+    now = time.time()
+    for path, (old_ctime, old_size) in initial_metadata.items():
         try:
+            # Check age > interval (e.g. 60s)
+            if now - float(old_ctime) < interval:
+                continue # Too young, skip
+                
             st = os.stat(path)
-            # In a real scenario, we compare: 
-            # if str(st.st_size) == old_size and str(st.st_mtime) == old_mtime:
-            stable_count += 1
-        except OSError:
+            # Compare size and ctime
+            if str(st.st_size) == old_size and f"{st.st_ctime:.6f}" == old_ctime:
+                stable_count += 1
+        except (OSError, ValueError):
             pass
             
     return time.time() - start

@@ -13,25 +13,21 @@ def cli():
 
 @cli.command()
 @click.argument("target-dir", type=click.Path(exists=True))
-@click.option("--concurrency", "-c", default=20, help="Number of concurrent workers")
-@click.option("--num-requests", "-n", default=200, help="Total requests to perform")
-@click.option("--target-depth", "-d", default=5, help="Depth of target directories to benchmark")
-@click.option("--fusion-api", help="URL of an already running Fusion API (e.g., http://localhost:18102)")
-@click.option("--api-key", help="API Key for the external Fusion API")
-def run(target_dir, concurrency, num_requests, target_depth, fusion_api, api_key):
-    """Run benchmark suite. Defaults to auto-starting services unless --fusion-api is provided."""
+@click.option("-c", "--concurrency", default=20, help="Number of concurrent workers.")
+@click.option("-n", "--num-requests", default=200, help="Total number of requests to perform.")
+@click.option("-d", "--target-depth", default=5, help="Relative depth to probe for targets.")
+@click.option("--integrity-interval", default=60.0, help="Wait interval (seconds) for OS Integrity check (simulating NFS sync).")
+@click.option("--fusion-api", help="External Fusion API URL (skips local setup).")
+@click.option("--api-key", help="API Key for external Fusion API.")
+def run(target_dir, concurrency, num_requests, target_depth, integrity_interval, fusion_api, api_key):
+    """Executes the automated performance benchmark."""
     run_dir = os.path.abspath(DEFAULT_RUN_DIR)
-    
-    runner = BenchmarkRunner(
-        run_dir, 
-        target_dir=os.path.abspath(target_dir),
-        fusion_api_url=fusion_api,
-        api_key=api_key
-    )
+    runner = BenchmarkRunner(run_dir, target_dir, fusion_api, api_key)
     runner.run(
         concurrency=concurrency, 
         reqs=num_requests, 
-        target_depth=target_depth
+        target_depth=target_depth,
+        integrity_interval=integrity_interval
     )
 
 @cli.command()
