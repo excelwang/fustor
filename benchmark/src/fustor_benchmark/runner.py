@@ -285,6 +285,33 @@ class BenchmarkRunner:
                 <tr><td>Min / Max</td><td>{{os_min}} / {{os_max}}</td><td>{{fusion_min}} / {{fusion_max}}</td><td>-</td></tr>
             </tbody>
         </table>
+
+        <div class="methodology">
+            <h2>Test Methodology & Documentation</h2>
+            
+            <section>
+                <h3>1. 测试目标 (Objectives)</h3>
+                <p>量化 Fustor Fusion 在百万级元数据规模下的检索性能。核心在于验证 <strong>“In-Memory Hash Index”</strong> 在应对高并发、深层目录树递归查询时，相比于传统操作系统文件系统调用（OS System Calls）的吞吐量与延迟优势。</p>
+            </section>
+
+            <section>
+                <h3>2. 测试原理 (Principles)</h3>
+                <ul>
+                    <li><strong>Fusion API (Structured)</strong>: 模拟业务通过 REST API 获取结构化数据。Fusion 服务预先将元数据索引至内存哈希树中，查询过程为 $O(1)$ 定位 + 子树递归序列化。本次测试使用了 <code>orjson</code> 极速引擎和浮点数时间戳以消除序列化瓶颈。</li>
+                    <li><strong>OS Baseline (find + Parsing)</strong>: 模拟业务通过原生命令获取数据。执行 <code>find -printf</code> 获取原始文本，并在 Python 侧执行 <code>split</code>、<code>basename</code> 及字典对象实例化。这代表了业务系统在没有元数据中心时必须负担的 <strong>“获取 + 结构化”</strong> 真实成本。</li>
+                    <li><strong>负载模型</strong>: 采用“饱和压测”模型，并发 Worker 背靠背发起请求，中间无间隔，旨在探测系统的吞吐量天花板（Saturation Point）。</li>
+                </ul>
+            </section>
+
+            <section>
+                <h3>3. 预期测试指标 (Expected Metrics)</h3>
+                <ul>
+                    <li><strong>延迟一致性</strong>: 无论总数据量是 10 万还是 100 万，Fusion 的平均延迟应保持平稳，不会出现 $O(N)$ 级的线性增长。</li>
+                    <li><strong>长尾延迟 (P99)</strong>: Fusion 的 P99 应保持在 Avg 的 1.5 倍以内，证明内存索引不存在严重的锁竞争或 GC 抖动。</li>
+                    <li><strong>加速比</strong>: 在 NFS 等网络文件系统或冷启动场景下，Fusion 预期将产生 10 倍以上的性能领先；在本地热缓存场景下，Fusion 应提供与 OS 数量级相仿且高度结构化的访问能力。</li>
+                </ul>
+            </section>
+        </div>
     </div>
     <script>
         new Chart(document.getElementById('barChart'), {

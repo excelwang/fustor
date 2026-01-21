@@ -212,6 +212,8 @@ class FSDriver(SourceDriver):
                         stat_info = os.stat(file_path)
                         latest_mtime_in_subtree = max(latest_mtime_in_subtree, stat_info.st_mtime)
                         if fnmatch.fnmatch(filename, file_pattern):
+                            # TODO: Exclude files that are still being written to.
+                            # Consider checking if mtime is very recent or using lsof-like check.
                             metadata = get_file_metadata(file_path, stat_info=stat_info)
                             if metadata:
                                 batch.append(metadata)
