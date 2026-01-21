@@ -7,15 +7,14 @@
 1.  **量化优势**: 对比 Fusion 内存索引与 Linux 原生 `find` 命令在递归元数据检索下的延迟与吞吐量。
 2.  **百万级规模**: 支持生成并同步超过 1,000,000 个文件的元数据。
 3.  **全自动流程**: 自动编排 Registry、Fusion 和 Agent，实现一键式从环境部署到报告生成。
+4.  **生产环境巡检**: 支持对接已有的 Fustor 集群进行性能实时量化。
 
 ## 目录结构规范与安全
 
 为了保护生产数据免受误删，Benchmark 实施了严格的路径校验：
 
-*   **路径白名单**: 压测主目录（`run-dir`）必须以 **`fustor-benchmark-run`** 结尾。
-*   **结构定义**:
-    *   `{run-dir}/data/`: 存放生成的数百万个模拟文件。
-    *   `{run-dir}/.fustor/`: 存放压测期间的独立配置文件、SQLite 数据库、日志以及最终报告。
+*   **运行沙箱**: 所有的日志、中间数据库和压测报告都固定在当前目录下的 **`fustor-benchmark-run/`**。
+*   **安全逻辑**: `generate` 命令如果发现目标目录非空，会强制停止并报错，防止覆盖已有数据。
 
 ## 快速使用
 
@@ -32,30 +31,42 @@
 uv run fustor-benchmark generate fustor-benchmark-run/data --num-dirs 1000
 ```
 
-### 2. 执行压测
-运行全链路同步并执行并发性能对比：
+### 2. 执行压测 (全自动模式)
+此模式会自动在本地启动 Registry, Fusion 和 Agent，并在压测结束后自动停止：
 ```bash
-# 执行压测 (必须指定数据路径)
 uv run fustor-benchmark run fustor-benchmark-run/data -d 5 -c 20 -n 100
-
-# 使用外部 NFS 生产数据
-uv run fustor-benchmark run /mnt/nfs_data -d 5
 ```
-*   `-d`: 探测深度。
-*   `-c`: 并发数。
-*   `-n`: 总请求次数。
-*   `-m`: 生成模式 (`auto`, `force`, `skip`)。
+
+### 3. 执行压测 (外部服务模式)
+对接已在运行的 Fustor 集群（如分布式部署环境）：
+```bash
+uv run fustor-benchmark run /mnt/nfs_data \
+    --fusion-api http://10.0.0.1:18102 \
+    --api-key YOUR_SECRET_KEY \
+    -d 5 -c 50 -n 1000
+```
+
+## 参数说明
+
+| 参数 | 缩写 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `TARGET-DIR` | - | (必填) | 目标数据路径（本地或 NFS 挂载点） |
+| `--concurrency` | `-c` | 20 | 并发工作进程/线程数 |
+| `--num-requests` | `-n` | 200 | 总压测迭代次数 |
+| `--target-depth` | `-d` | 5 | 探测并测试的目录相对深度 |
+| `--fusion-api` | - | - | 外部 Fusion API 地址（跳过本地服务启动） |
+| `--api-key` | - | - | 外部 Fusion API 的身份验证 Key |
 
 ## 报告与指标
 
-压测完成后，将在 `fustor-benchmark-run/.fustor/` 下生成以下产出：
+压测完成后，将在 `fustor-benchmark-run/results/` 下生成以下产出：
 
-1.  **`report.html`**: 交互式可视化报表。
+1.  **`stress-find.html`**: 交互式可视化报表。
     *   **Latency Distribution**: 展示 Avg, P50, P95, P99 的柱状对比。
     *   **Latency Percentiles**: 展现延迟分布曲线。
     *   **Speedup Factor**: 自动计算 Fusion 相比 OS 的加速倍数。
-2.  **`benchmark_results.json`**: 结构化的指标数据，包含所有原始延迟序列。
+2.  **`stress-find.json`**: 结构化的指标数据，包含所有原始延迟序列。
 
 ## 安全保护说明
 
-Benchmark 会在 `run-dir` 下执行 `shutil.rmtree` 操作以清理旧环境。**请务必确保指定的目录不包含任何重要业务数据**。如果尝试在非 `fustor-benchmark-run` 后缀目录下运行，程序将强制退出。
+Benchmark 及其底层驱动 `source_fs` 遵循 **100% 纯读取** 准则。压测过程仅通过 API 获取元数据或执行 `find` 命令，绝对不会修改用户的生产数据或在监控目录下创建任何临时文件。

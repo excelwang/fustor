@@ -16,11 +16,18 @@ def cli():
 @click.option("--concurrency", "-c", default=20, help="Number of concurrent workers")
 @click.option("--num-requests", "-n", default=200, help="Total requests to perform")
 @click.option("--target-depth", "-d", default=5, help="Depth of target directories to benchmark")
-def run(target_dir, concurrency, num_requests, target_depth):
-    """Run full benchmark suite in './fustor-benchmark-run' using specified TARGET-DIR"""
+@click.option("--fusion-api", help="URL of an already running Fusion API (e.g., http://localhost:18102)")
+@click.option("--api-key", help="API Key for the external Fusion API")
+def run(target_dir, concurrency, num_requests, target_depth, fusion_api, api_key):
+    """Run benchmark suite. Defaults to auto-starting services unless --fusion-api is provided."""
     run_dir = os.path.abspath(DEFAULT_RUN_DIR)
     
-    runner = BenchmarkRunner(run_dir, target_dir=os.path.abspath(target_dir))
+    runner = BenchmarkRunner(
+        run_dir, 
+        target_dir=os.path.abspath(target_dir),
+        fusion_api_url=fusion_api,
+        api_key=api_key
+    )
     runner.run(
         concurrency=concurrency, 
         reqs=num_requests, 

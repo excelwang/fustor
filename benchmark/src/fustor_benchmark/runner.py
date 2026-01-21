@@ -46,10 +46,14 @@ def run_find_recursive_metadata_task(args):
     return time.time() - start
 
 class BenchmarkRunner:
-    def __init__(self, run_dir, target_dir):
+    def __init__(self, run_dir, target_dir, fusion_api_url=None, api_key=None):
         self.run_dir = os.path.abspath(run_dir)
         self.env_dir = os.path.join(self.run_dir, ".fustor")
         self.data_dir = os.path.abspath(target_dir)
+        
+        # External API support
+        self.external_api_url = fusion_api_url.rstrip('/') if fusion_api_url else None
+        self.external_api_key = api_key
         
         self.services = ServiceManager(self.run_dir) 
         self.services.data_dir = self.data_dir
@@ -77,7 +81,7 @@ class BenchmarkRunner:
         
         click.echo(f"Discovering target directories at depth {depth} (prefix: {prefix_depth}, total: {max_fetch_depth}) via Fusion API...")
         
-        fusion_url = f"http://localhost:{self.services.fusion_port}"
+        fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
         headers = {"X-API-Key": api_key}
         
         try:
@@ -131,7 +135,12 @@ class BenchmarkRunner:
 
     def run_concurrent_baseline(self, targets, concurrency=20, requests_count=100):
         click.echo(f"Running Concurrent OS Baseline (Recursive find + parsing): {concurrency} workers, {requests_count} requests...")
-        tasks = [(self.data_dir, t) for t in [random.choice(targets) for _ in range(requests_count)]]
+        
+        shuffled_targets = list(targets)
+        random.shuffle(shuffled_targets)
+        sampled_paths = [shuffled_targets[i % len(shuffled_targets)] for i in range(requests_count)]
+        tasks = [(self.data_dir, t) for t in sampled_paths]
+        
         latencies = []
         start_total = time.time()
         with ProcessPoolExecutor(max_workers=concurrency) as executor:
@@ -150,13 +159,17 @@ class BenchmarkRunner:
 
     def run_concurrent_fusion(self, api_key, targets, concurrency=20, requests_count=100):
         click.echo(f"Running Concurrent Fusion API (Recursive Tree): {concurrency} workers, {requests_count} requests...")
-        url = f"http://localhost:{self.services.fusion_port}"
+        fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
         headers = {"X-API-Key": api_key}
-        tasks = [random.choice(targets) for _ in range(requests_count)]
+        
+        shuffled_targets = list(targets)
+        random.shuffle(shuffled_targets)
+        tasks = [shuffled_targets[i % len(shuffled_targets)] for i in range(requests_count)]
+            
         latencies = []
         start_total = time.time()
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(self._run_single_fusion_req, url, headers, t) for t in tasks]
+            futures = [executor.submit(self._run_single_fusion_req, fusion_url, headers, t) for t in tasks]
             for f in as_completed(futures):
                 res = f.result()
                 if res is not None: latencies.append(res)
@@ -165,29 +178,24 @@ class BenchmarkRunner:
 
     def wait_for_sync(self, api_key: str):
         click.echo("Waiting for Fusion readiness (Alternating between API status and Agent logs)...")
-        fusion_url = f"http://localhost:{self.services.fusion_port}"
+        fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
         headers = {"X-API-Key": api_key}
         start_wait = time.time()
         loop_count = 0
         while True:
             elapsed = time.time() - start_wait
-            if loop_count % 2 == 0:
+            if not self.external_api_url and loop_count % 2 == 0:
                 is_ok, log_msg = self.services.check_agent_logs()
                 if not is_ok: raise RuntimeError(f"Agent reported error during sync: {log_msg}")
                 if int(elapsed) % 30 < 5: click.echo(f"  [Agent] Status: {log_msg}")
+            
             try:
-                res = requests.get(
-                    f"{fusion_url}/views/fs/tree", 
-                    params={"path": "/", "max_depth": 1, "only_path": "true"}, 
-                    headers=headers, 
-                    timeout=5
-                )
+                res = requests.get(f"{fusion_url}/views/fs/tree", params={"path": "/", "max_depth": 1, "only_path": "true"}, headers=headers, timeout=5)
                 if res.status_code == 200:
                     click.echo(f"  [Fusion] READY (200 OK) after {elapsed:.1f}s.")
                     break
                 elif res.status_code == 503:
-                    if int(elapsed) % 5 == 0:
-                        click.echo(f"  [Fusion] Still syncing... (Elapsed: {int(elapsed)}s)")
+                    if int(elapsed) % 5 == 0: click.echo(f"  [Fusion] Still syncing... (Elapsed: {int(elapsed)}s)")
                 else: raise RuntimeError(f"  [Fusion] Unexpected API response: {res.status_code}")
             except requests.ConnectionError: pass
             except Exception as e: click.echo(f"  [Fusion] Warning: Connection glitch ({e})")
@@ -230,7 +238,6 @@ class BenchmarkRunner:
 <body>
     <div class="container">
         <h1>Fustor Performance Benchmark</h1>
-        
         <div class="info-bar">
             <div class="info-item"><span class="info-label">📅 Timestamp:</span> <strong>{{timestamp}}</strong></div>
             <div class="info-item"><span class="info-label">⚙️ Op Type:</span> <strong>{{op_type}}</strong></div>
@@ -240,7 +247,6 @@ class BenchmarkRunner:
             <div class="info-item"><span class="info-label">👥 Concurrency:</span> <strong>{{concurrency}}</strong></div>
             <div class="info-item"><span class="info-label">🏷️ Target Folders:</span> <strong>{{target_count}}</strong></div>
         </div>
-        
         <div class="summary">
             <div class="stat-card">
                 <div class="stat-label">OS Baseline (Avg)</div>
@@ -255,31 +261,20 @@ class BenchmarkRunner:
                 <div class="stat-value" style="color: #2ecc71">{{gain}}x</div>
             </div>
         </div>
-
         <div class="chart-row">
             <div class="chart-box">
                 <h3>Latency Distribution (Bar)</h3>
-                <div class="chart-container">
-                    <canvas id="barChart"></canvas>
-                </div>
+                <div class="chart-container"><canvas id="barChart"></canvas></div>
             </div>
             <div class="chart-box">
                 <h3>Latency Percentiles (Line)</h3>
-                <div class="chart-container">
-                    <canvas id="lineChart"></canvas>
-                </div>
+                <div class="chart-container"><canvas id="lineChart"></canvas></div>
             </div>
         </div>
-
         <h2>Detailed Metrics Comparison</h2>
         <table>
             <thead>
-                <tr>
-                    <th>Metric (ms)</th>
-                    <th>OS (find + Parsing)</th>
-                    <th>Fusion API (Structured)</th>
-                    <th>Improvement</th>
-                </tr>
+                <tr><th>Metric (ms)</th><th>OS (find + Parsing)</th><th>Fusion API (Structured)</th><th>Improvement</th></tr>
             </thead>
             <tbody>
                 <tr><td>Average Latency</td><td>{{os_avg}}</td><td>{{fusion_avg}}</td><td class="winning">{{gain_avg}}x faster</td></tr>
@@ -291,7 +286,6 @@ class BenchmarkRunner:
             </tbody>
         </table>
     </div>
-
     <script>
         new Chart(document.getElementById('barChart'), {
             type: 'bar',
@@ -304,7 +298,6 @@ class BenchmarkRunner:
             },
             options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }
         });
-
         new Chart(document.getElementById('lineChart'), {
             type: 'line',
             data: {
@@ -361,7 +354,6 @@ class BenchmarkRunner:
         with open(output_path, "w") as f: f.write(html)
 
     def run(self, concurrency=20, reqs=200, target_depth=5):
-        # Data integrity check
         data_exists = os.path.exists(self.data_dir) and len(os.listdir(self.data_dir)) > 0 if os.path.exists(self.data_dir) else False
         if not data_exists:
             click.echo(click.style(f"FATAL: Data directory '{self.data_dir}' is empty or missing.", fg="red", bold=True))
@@ -369,46 +361,44 @@ class BenchmarkRunner:
             raise RuntimeError("Benchmark data missing")
 
         click.echo(f"Using data directory: {self.data_dir}")
-        
         try:
-            self.services.setup_env()
-            self.services.start_registry(); api_key = self.services.configure_system()
-            self.services.start_fusion(); self.services.start_agent(api_key)
-            time.sleep(2)
-            is_ok, msg = self.services.check_agent_logs()
-            if not is_ok: raise RuntimeError(f"Agent failed: {msg}")
-            click.echo("Agent health check passed.")
+            if self.external_api_url:
+                if not self.external_api_key: raise RuntimeError("--api-key is required when using --fusion-api")
+                click.echo(click.style(f"Using external Fusion API: {self.external_api_url}", fg="cyan", bold=True))
+                api_key = self.external_api_key
+            else:
+                self.services.setup_env()
+                self.services.start_registry()
+                api_key = self.services.configure_system()
+                self.services.start_fusion()
+                self.services.start_agent(api_key)
+                time.sleep(2)
+                is_ok, msg = self.services.check_agent_logs()
+                if not is_ok: raise RuntimeError(f"Agent failed: {msg}")
+                click.echo("Agent health check passed.")
             
             self.wait_for_sync(api_key)
             targets = self._discover_leaf_targets_via_api(api_key, target_depth)
-            
             os_stats = self.run_concurrent_baseline(targets, concurrency, reqs)
             fusion_stats = self.run_concurrent_fusion(api_key, targets, concurrency, reqs)
             
-            fusion_url = f"http://localhost:{self.services.fusion_port}"
+            fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
             res_stats = requests.get(f"{fusion_url}/views/fs/stats", headers={"X-API-Key": api_key})
             stats_data = res_stats.json() if res_stats.status_code == 200 else {}
             total_files = stats_data.get("total_files", 0)
             total_dirs = stats_data.get("total_directories", 0)
+            click.echo(f"Final Stats: {total_files:,} files, {total_dirs:,} directories.")
             
             final_results = {
-                "metadata": {
-                    "operation_type": "RECURSIVE_METADATA_GET",
-                    "total_files_in_scope": total_files,
-                    "total_directories_in_scope": total_dirs,
-                    "source_path": self.data_dir
-                },
-                "depth": target_depth, "requests": reqs, "concurrency": concurrency,
-                "target_directory_count": len(targets),
-                "os": os_stats, "fusion": fusion_stats,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                "metadata": {"operation_type": "RECURSIVE_METADATA_GET", "total_files_in_scope": total_files, "total_directories_in_scope": total_dirs, "source_path": self.data_dir, "api_endpoint": fusion_url},
+                "depth": target_depth, "requests": reqs, "concurrency": concurrency, "target_directory_count": len(targets),
+                "os": os_stats, "fusion": fusion_stats, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
 
             results_dir = os.path.join(self.run_dir, "results")
             os.makedirs(results_dir, exist_ok=True)
             json_path = os.path.join(results_dir, "stress-find.json")
             html_path = os.path.join(results_dir, "stress-find.html")
-            
             with open(json_path, "w") as f: json.dump(final_results, f, indent=2)
             self.generate_html_report(final_results, html_path)
 
@@ -425,6 +415,5 @@ class BenchmarkRunner:
             click.echo("-" * 65)
             click.echo(click.style(f"\nJSON results saved to: {json_path}", fg="cyan"))
             click.echo(click.style(f"Visual HTML report saved to: {html_path}", fg="green", bold=True))
-            
         finally:
-            self.services.stop_all()
+            if not self.external_api_url: self.services.stop_all()
