@@ -149,13 +149,18 @@ class BenchmarkRunner:
         total_time = time.time() - start_total
         return self._calculate_stats(latencies, total_time, requests_count)
 
-    def _run_single_fusion_req(self, url, headers, path, dry_run=False):
+    def _run_single_fusion_req(self, url, headers, path, dry_run=False, dry_net=False):
         start = time.time()
-        params = {"path": path}
-        if dry_run:
-            params["dry_run"] = "true"
         try:
-            res = requests.get(f"{url}/views/fs/tree", params=params, headers=headers, timeout=10)
+            if dry_net:
+                # Call the unauthenticated root endpoint
+                res = requests.get(f"{url}/", timeout=10)
+            else:
+                params = {"path": path}
+                if dry_run:
+                    params["dry_run"] = "true"
+                res = requests.get(f"{url}/views/fs/tree", params=params, headers=headers, timeout=10)
+            
             if res.status_code != 200: return None
         except Exception: return None
         return time.time() - start
@@ -172,7 +177,7 @@ class BenchmarkRunner:
         latencies = []
         start_total = time.time()
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(self._run_single_fusion_req, fusion_url, headers, t, False) for t in tasks]
+            futures = [executor.submit(self._run_single_fusion_req, fusion_url, headers, t, False, False) for t in tasks]
             for f in as_completed(futures):
                 res = f.result()
                 if res is not None: latencies.append(res)
@@ -192,7 +197,22 @@ class BenchmarkRunner:
         latencies = []
         start_total = time.time()
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(self._run_single_fusion_req, fusion_url, headers, t, True) for t in tasks]
+            futures = [executor.submit(self._run_single_fusion_req, fusion_url, headers, t, True, False) for t in tasks]
+            for f in as_completed(futures):
+                res = f.result()
+                if res is not None: latencies.append(res)
+        total_time = time.time() - start_total
+        return self._calculate_stats(latencies, total_time, requests_count)
+
+    def run_concurrent_fusion_dry_net(self, concurrency=20, requests_count=100):
+        click.echo(f"Running Concurrent Fusion API (Dry-net): {concurrency} workers, {requests_count} requests...")
+        fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
+            
+        latencies = []
+        start_total = time.time()
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            # path and headers are not used for dry_net
+            futures = [executor.submit(self._run_single_fusion_req, fusion_url, {}, None, False, True) for _ in range(requests_count)]
             for f in as_completed(futures):
                 res = f.result()
                 if res is not None: latencies.append(res)
@@ -483,6 +503,9 @@ class BenchmarkRunner:
             
             os_stats = self.run_concurrent_baseline(targets, concurrency, reqs)
             
+            # New Step: Run Dry-Net (Pure Network)
+            fusion_dry_net_stats = self.run_concurrent_fusion_dry_net(concurrency, reqs)
+            
             # New Step: Run Dry-Run
             fusion_dry_stats = self.run_concurrent_fusion_dry_run(api_key, targets, concurrency, reqs)
             
@@ -498,7 +521,7 @@ class BenchmarkRunner:
             final_results = {
                 "metadata": {"operation_type": "RECURSIVE_METADATA_GET", "total_files_in_scope": total_files, "total_directories_in_scope": total_dirs, "source_path": self.data_dir, "api_endpoint": fusion_url},
                 "depth": target_depth, "requests": reqs, "concurrency": concurrency, "target_directory_count": len(targets),
-                "os": os_stats, "fusion_dry": fusion_dry_stats, "fusion": fusion_stats, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                "os": os_stats, "fusion_dry_net": fusion_dry_net_stats, "fusion_dry": fusion_dry_stats, "fusion": fusion_stats, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
 
             results_dir = os.path.join(self.run_dir, "results")
@@ -508,17 +531,17 @@ class BenchmarkRunner:
             with open(json_path, "w") as f: json.dump(final_results, f, indent=2)
             self.generate_html_report(final_results, html_path)
 
-            click.echo("\n" + "="*85)
+            click.echo("\n" + "="*115)
             click.echo(f"RECURSIVE METADATA RETRIEVAL PERFORMANCE (DEPTH {target_depth})")
             click.echo(f"Data Scale: {total_files:,} files | Targets: {len(targets)}")
-            click.echo("="*85)
-            click.echo(f"{'Metric (ms)':<25} | {'OS (find + Parsing)':<20} | {'Fusion Dry-Run':<20} | {'Fusion API':<20}")
-            click.echo("-" * 85)
-            click.echo(f"{ 'Avg Latency':<25} | {os_stats['avg']:10.2f} ms        | {fusion_dry_stats['avg']:10.2f} ms        | {fusion_stats['avg']:10.2f} ms")
-            click.echo(f"{ 'P50 Latency':<25} | {os_stats['p50']:10.2f} ms        | {fusion_dry_stats['p50']:10.2f} ms        | {fusion_stats['p50']:10.2f} ms")
-            click.echo(f"{ 'P99 Latency':<25} | {os_stats['p99']:10.2f} ms        | {fusion_dry_stats['p99']:10.2f} ms        | {fusion_stats['p99']:10.2f} ms")
-            click.echo(f"{ 'Throughput (QPS)':<25} | {os_stats['qps']:10.1f}           | {fusion_dry_stats['qps']:10.1f}           | {fusion_stats['qps']:10.1f}")
-            click.echo("-" * 85)
+            click.echo("="*115)
+            click.echo(f"{ 'Metric (ms)':<25} | {'OS Baseline':<18} | {'Fusion Dry-Net':<18} | {'Fusion Dry-Run':<18} | {'Fusion API':<18}")
+            click.echo("-" * 115)
+            click.echo(f"{ 'Avg Latency':<25} | {os_stats['avg']:10.2f} ms      | {fusion_dry_net_stats['avg']:10.2f} ms      | {fusion_dry_stats['avg']:10.2f} ms      | {fusion_stats['avg']:10.2f} ms")
+            click.echo(f"{ 'P50 Latency':<25} | {os_stats['p50']:10.2f} ms      | {fusion_dry_net_stats['p50']:10.2f} ms      | {fusion_dry_stats['p50']:10.2f} ms      | {fusion_stats['p50']:10.2f} ms")
+            click.echo(f"{ 'P99 Latency':<25} | {os_stats['p99']:10.2f} ms      | {fusion_dry_net_stats['p99']:10.2f} ms      | {fusion_dry_stats['p99']:10.2f} ms      | {fusion_stats['p99']:10.2f} ms")
+            click.echo(f"{ 'Throughput (QPS)':<25} | {os_stats['qps']:10.1f}         | {fusion_dry_net_stats['qps']:10.1f}         | {fusion_dry_stats['qps']:10.1f}         | {fusion_stats['qps']:10.1f}")
+            click.echo("-" * 115)
             click.echo(click.style(f"\nJSON results saved to: {json_path}", fg="cyan"))
             click.echo(click.style(f"Visual HTML report saved to: {html_path}", fg="green", bold=True))
         finally:
