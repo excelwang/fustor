@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_compl
 
 from .generator import DataGenerator
 from .services import ServiceManager
-from .tasks import run_find_recursive_metadata_task, run_single_fusion_req
+from .tasks import run_find_recursive_metadata_task, run_single_fusion_req, run_find_integrity_task
 from .reporter import calculate_stats, generate_html_report
 
 class BenchmarkRunner:
@@ -100,6 +100,22 @@ class BenchmarkRunner:
         total_time = time.time() - start_total
         return calculate_stats(latencies, total_time, requests_count)
 
+    def run_concurrent_find_integrity(self, targets, concurrency=20, requests_count=100):
+        click.echo(f"Running Concurrent OS Integrity (Double-Sampling check): {concurrency} workers, {requests_count} requests...")
+        
+        shuffled_targets = list(targets)
+        random.shuffle(shuffled_targets)
+        sampled_paths = [shuffled_targets[i % len(shuffled_targets)] for i in range(requests_count)]
+        tasks = [(self.data_dir, t) for t in sampled_paths]
+        
+        latencies = []
+        start_total = time.time()
+        with ProcessPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(run_find_integrity_task, t) for t in tasks]
+            for f in as_completed(futures): latencies.append(f.result())
+        total_time = time.time() - start_total
+        return calculate_stats(latencies, total_time, requests_count)
+
     def run_concurrent_fusion(self, api_key, targets, concurrency=20, requests_count=100):
         click.echo(f"Running Concurrent Fusion API (Recursive Tree): {concurrency} workers, {requests_count} requests...")
         fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
@@ -124,6 +140,7 @@ class BenchmarkRunner:
         fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
         headers = {"X-API-Key": api_key}
         
+        # We still send paths to simulate realistic request sizes, though server will ignore them
         shuffled_targets = list(targets)
         random.shuffle(shuffled_targets)
         tasks = [shuffled_targets[i % len(shuffled_targets)] for i in range(requests_count)]
@@ -145,6 +162,7 @@ class BenchmarkRunner:
         latencies = []
         start_total = time.time()
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            # path and headers are not used for dry_net
             futures = [executor.submit(run_single_fusion_req, fusion_url, {}, None, False, True) for _ in range(requests_count)]
             for f in as_completed(futures):
                 res = f.result()
@@ -194,6 +212,7 @@ class BenchmarkRunner:
             targets = self._discover_leaf_targets_via_api(api_key, target_depth)
             
             os_stats = self.run_concurrent_baseline(targets, concurrency, reqs)
+            os_integrity_stats = self.run_concurrent_find_integrity(targets, concurrency, reqs)
             fusion_dry_net_stats = self.run_concurrent_fusion_dry_net(concurrency, reqs)
             fusion_dry_stats = self.run_concurrent_fusion_dry_run(api_key, targets, concurrency, reqs)
             fusion_stats = self.run_concurrent_fusion(api_key, targets, concurrency, reqs)
@@ -205,23 +224,25 @@ class BenchmarkRunner:
             final_results = {
                 "metadata": {"total_files_in_scope": stats_data.get("total_files", 0), "total_directories_in_scope": stats_data.get("total_directories", 0), "source_path": self.data_dir, "api_endpoint": fusion_url},
                 "depth": target_depth, "requests": reqs, "concurrency": concurrency, "target_directory_count": len(targets),
-                "os": os_stats, "fusion_dry_net": fusion_dry_net_stats, "fusion_dry": fusion_dry_stats, "fusion": fusion_stats, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                "os": os_stats, "os_integrity": os_integrity_stats, 
+                "fusion_dry_net": fusion_dry_net_stats, "fusion_dry": fusion_dry_stats, "fusion": fusion_stats, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
 
             os.makedirs(os.path.join(self.run_dir, "results"), exist_ok=True)
             with open(os.path.join(self.run_dir, "results/stress-find.json"), "w") as f: json.dump(final_results, f, indent=2)
             generate_html_report(final_results, os.path.join(self.run_dir, "results/stress-find.html"))
 
-            click.echo("\n" + "="*115)
+            click.echo("\n" + "="*135)
             click.echo(f"RECURSIVE METADATA RETRIEVAL PERFORMANCE (DEPTH {target_depth})")
             click.echo(f"Data Scale: {stats_data.get('total_files', 0):,} files | Targets: {len(targets)}")
-            click.echo("="*115)
-            click.echo("-" * 115)
-            click.echo(f"{ 'Metric (ms)':<25} | {os_stats['avg']:10.2f} ms      | {fusion_dry_net_stats['avg']:10.2f} ms      | {fusion_dry_stats['avg']:10.2f} ms      | {fusion_stats['avg']:10.2f} ms")
-            click.echo(f"{ 'P50 Latency':<25} | {os_stats['p50']:10.2f} ms      | {fusion_dry_net_stats['p50']:10.2f} ms      | {fusion_dry_stats['p50']:10.2f} ms      | {fusion_stats['p50']:10.2f} ms")
-            click.echo(f"{ 'P99 Latency':<25} | {os_stats['p99']:10.2f} ms      | {fusion_dry_net_stats['p99']:10.2f} ms      | {fusion_dry_stats['p99']:10.2f} ms      | {fusion_stats['p99']:10.2f} ms")
-            click.echo(f"{ 'Throughput (QPS)':<25} | {os_stats['qps']:10.1f}         | {fusion_dry_net_stats['qps']:10.1f}         | {fusion_dry_stats['qps']:10.1f}         | {fusion_stats['qps']:10.1f}")
-            click.echo("-" * 115)
+            click.echo("="*135)
+            click.echo(f"{ 'Metric (ms)':<25} | {'OS Baseline':<18} | {'OS Integrity':<18} | {'Fusion Dry-Net':<18} | {'Fusion Dry-Run':<18} | {'Fusion API':<18}")
+            click.echo("-" * 135)
+            click.echo(f"{ 'Avg Latency':<25} | {os_stats['avg']:10.2f} ms      | {os_integrity_stats['avg']:10.2f} ms      | {fusion_dry_net_stats['avg']:10.2f} ms      | {fusion_dry_stats['avg']:10.2f} ms      | {fusion_stats['avg']:10.2f} ms")
+            click.echo(f"{ 'P50 Latency':<25} | {os_stats['p50']:10.2f} ms      | {os_integrity_stats['p50']:10.2f} ms      | {fusion_dry_net_stats['p50']:10.2f} ms      | {fusion_dry_stats['p50']:10.2f} ms      | {fusion_stats['p50']:10.2f} ms")
+            click.echo(f"{ 'P99 Latency':<25} | {os_stats['p99']:10.2f} ms      | {os_integrity_stats['p99']:10.2f} ms      | {fusion_dry_net_stats['p99']:10.2f} ms      | {fusion_dry_stats['p99']:10.2f} ms      | {fusion_stats['p99']:10.2f} ms")
+            click.echo(f"{ 'Throughput (QPS)':<25} | {os_stats['qps']:10.1f}         | {os_integrity_stats['qps']:10.1f}         | {fusion_dry_net_stats['qps']:10.1f}         | {fusion_dry_stats['qps']:10.1f}         | {fusion_stats['qps']:10.1f}")
+            click.echo("-" * 135)
             click.echo(click.style(f"\nJSON results saved to: {os.path.join(self.run_dir, 'results/stress-find.json')}", fg="cyan"))
             click.echo(click.style(f"Visual HTML report saved to: {os.path.join(self.run_dir, 'results/stress-find.html')}", fg="green", bold=True))
         finally:
