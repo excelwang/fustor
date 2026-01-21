@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Fustor Benchmark Report</title>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 40px; background: #f4f7f6; color: #333; }
+        .container { max-width: 1200px; margin: auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+        h1 { color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom: 15px; margin-top: 0; }
+        .summary { display: flex; justify-content: space-between; margin: 30px -10px; }
+        .stat-card { background: #fff; padding: 20px; border-radius: 10px; flex: 1; margin: 0 10px; text-align: center; border: 1px solid #eee; border-top: 5px solid #3498db; transition: transform 0.2s; }
+        .stat-card:hover { transform: translateY(-5px); }
+        .stat-card.fusion { border-top-color: #2ecc71; }
+        .stat-card.dryrun { border-top-color: #95a5a6; }
+        .stat-card.gain { border-top-color: #f1c40f; }
+        .stat-value { font-size: 28px; font-weight: bold; margin: 10px 0; color: #2c3e50; }
+        .stat-label { font-size: 14px; color: #7f8c8d; text-transform: uppercase; letter-spacing: 1px; }
+        .chart-row { display: flex; gap: 20px; margin-bottom: 40px; }
+        .chart-box { flex: 1; background: #fff; padding: 20px; border-radius: 10px; border: 1px solid #eee; }
+        .chart-container { position: relative; height: 350px; width: 100%; }
+        table { width: 100%; border-collapse: collapse; margin-top: 20px; font-size: 15px; }
+        th, td { text-align: left; padding: 15px; border-bottom: 1px solid #eee; }
+        th { background: #f8f9fa; color: #2c3e50; font-weight: 600; }
+        .winning { color: #2ecc71; font-weight: bold; }
+        .info-bar { background: #e8f4fd; padding: 15px; border-radius: 8px; margin-bottom: 30px; display: grid; grid-template-columns: 1fr 1fr; gap: 15px; font-size: 14px; }
+        .info-item { display: flex; gap: 10px; }
+        .info-label { color: #5a6c7a; font-weight: 600; min-width: 120px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Fustor Performance Benchmark</h1>
+        <div class="info-bar">
+            <div class="info-item"><span class="info-label">📅 Timestamp:</span> <strong>{{timestamp}}</strong></div>
+            <div class="info-item"><span class="info-label">⚙️ Op Type:</span> <strong>{{op_type}}</strong></div>
+            <div class="info-item"><span class="info-label">📂 Data Scale:</span> <strong>{{total_files}} files ({{total_dirs}} dirs)</strong></div>
+            <div class="info-item"><span class="info-label">📂 Target Depth:</span> <strong>{{depth}}</strong></div>
+            <div class="info-item"><span class="info-label">🚀 Requests:</span> <strong>{{reqs}}</strong></div>
+            <div class="info-item"><span class="info-label">👥 Concurrency:</span> <strong>{{concurrency}}</strong></div>
+            <div class="info-item"><span class="info-label">🏷️ Target Folders:</span> <strong>{{target_count}}</strong></div>
+        </div>
+        <div class="summary">
+            <div class="stat-card">
+                <div class="stat-label">OS Baseline (Avg)</div>
+                <div class="stat-value">{{os_avg}} ms</div>
+            </div>
+            <div class="stat-card dryrun">
+                <div class="stat-label">Fusion Dry-Run (Avg)</div>
+                <div class="stat-value">{{dry_avg}} ms</div>
+            </div>
+            <div class="stat-card fusion">
+                <div class="stat-label">Fusion API (Avg)</div>
+                <div class="stat-value">{{fusion_avg}} ms</div>
+            </div>
+            <div class="stat-card gain">
+                <div class="stat-label">Speedup (vs OS)</div>
+                <div class="stat-value" style="color: #2ecc71">{{gain}}x</div>
+            </div>
+        </div>
+        <div class="chart-row">
+            <div class="chart-box">
+                <h3>Latency Distribution (Bar)</h3>
+                <div class="chart-container"><canvas id="barChart"></canvas></div>
+            </div>
+            <div class="chart-box">
+                <h3>Latency Percentiles (Line)</h3>
+                <div class="chart-container"><canvas id="lineChart"></canvas></div>
+            </div>
+        </div>
+        <h2>Detailed Metrics Comparison</h2>
+        <table>
+            <thead>
+                <tr>
+                    <th>Metric (ms)</th>
+                    <th>OS (find + Parsing)</th>
+                    <th>Fusion Dry-Run (Net only)</th>
+                    <th>Fusion API (Structured)</th>
+                    <th>Net Overhead %</th>
+                </tr>
+            </thead>
+            <tbody>
+                <tr>
+                    <td>Average Latency</td>
+                    <td>{{os_avg}}</td>
+                    <td>{{dry_avg}}</td>
+                    <td>{{fusion_avg}}</td>
+                    <td>{{net_overhead_avg}}%</td>
+                </tr>
+                <tr>
+                    <td>Median (P50)</td>
+                    <td>{{os_p50}}</td>
+                    <td>{{dry_p50}}</td>
+                    <td>{{fusion_p50}}</td>
+                    <td>{{net_overhead_p50}}%</td>
+                </tr>
+                <tr>
+                    <td>P95 Latency</td>
+                    <td>{{os_p95}}</td>
+                    <td>{{dry_p95}}</td>
+                    <td>{{fusion_p95}}</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>P99 Latency</td>
+                    <td>{{os_p99}}</td>
+                    <td>{{dry_p99}}</td>
+                    <td>{{fusion_p99}}</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>Throughput (QPS)</td>
+                    <td>{{os_qps}}</td>
+                    <td>{{dry_qps}}</td>
+                    <td>{{fusion_qps}}</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>Min / Max</td>
+                    <td>{{os_min}} / {{os_max}}</td>
+                    <td>{{dry_min}} / {{dry_max}}</td>
+                    <td>{{fusion_min}} / {{fusion_max}}</td>
+                    <td>-</td>
+                </tr>
+            </tbody>
+        </table>
+
+        <div class="methodology">
+            <h2>Test Methodology & Documentation</h2>
+            
+            <section>
+                <h3>1. 测试目标 (Objectives)</h3>
+                <p>量化 Fustor Fusion 在百万级元数据规模下的检索性能，并诊断网络与应用层开销。通过引入 Dry-Run 对照组，精确分离网络往返延迟、框架开销与实际业务逻辑处理延迟。</p>
+            </section>
+
+            <section>
+                <h3>2. 对照组说明 (Test Groups)</h3>
+                <ul>
+                    <li><strong>OS Baseline (find + Parsing)</strong>: 执行原生 <code>find -printf</code> 获取原始文本，并在 Python 侧完成解析与对象实例化。代表了传统方案下“数据获取 + 结构化”的完整成本。</li>
+                    <li><strong>Fusion Dry-Run (Net only)</strong>: 调用 API 但在服务端跳过树遍历逻辑，仅返回极小响应。测量值包含：网络 RTT、HTTP 连接管理、FastAPI 路由与鉴权中间件耗时。此为系统的<strong>链路基准开销</strong>。</li>
+                    <li><strong>Fusion API (Structured)</strong>: 执行完整的内存树检索与递归序列化。其延迟包含：<strong>(1) 锁竞争等待 (2) 树节点遍历 (3) 递归序列化 (4) 大规模 JSON 载荷的网络传输耗时</strong>。</li>
+                </ul>
+            </section>
+        </div>
+    </div>
+    <script>
+        new Chart(document.getElementById('barChart'), {
+            type: 'bar',
+            data: {
+                labels: ['Average', 'Median', 'P95', 'P99'],
+                datasets: [
+                    { label: 'OS Baseline', data: [{{os_avg}}, {{os_p50}}, {{os_p95}}, {{os_p99}}], backgroundColor: '#3498db' },
+                    { label: 'Fusion Dry-Run', data: [{{dry_avg}}, {{dry_p50}}, {{dry_p95}}, {{dry_p99}}], backgroundColor: '#95a5a6' },
+                    { label: 'Fusion API', data: [{{fusion_avg}}, {{fusion_p50}}, {{fusion_p95}}, {{fusion_p99}}], backgroundColor: '#2ecc71' }
+                ]
+            },
+            options: { responsive: true, maintainAspectRatio: false, scales: { y: { beginAtZero: true } } }
+        });
+        new Chart(document.getElementById('lineChart'), {
+            type: 'line',
+            data: {
+                labels: ['Min', 'P50', 'P75', 'P90', 'P95', 'P99', 'Max'],
+                datasets: [
+                    { label: 'OS Baseline', data: [{{os_min}}, {{os_p50}}, {{os_p75}}, {{os_p90}}, {{os_p95}}, {{os_p99}}, {{os_max}}], borderColor: '#3498db', fill: false, tension: 0.1 },
+                    { label: 'Fusion Dry-Run', data: [{{dry_min}}, {{dry_p50}}, {{dry_p75}}, {{dry_p90}}, {{dry_p95}}, {{dry_p99}}, {{dry_max}}], borderColor: '#95a5a6', fill: false, tension: 0.1 },
+                    { label: 'Fusion API', data: [{{fusion_min}}, {{fusion_p50}}, {{fusion_p75}}, {{fusion_p90}}, {{fusion_p95}}, {{fusion_p99}}, {{fusion_max}}], borderColor: '#2ecc71', fill: false, tension: 0.1 }
+                ]
+            },
+            options: { responsive: true, maintainAspectRatio: false, scales: { y: { type: 'logarithmic', title: { display: true, text: 'Latency (ms) - Log Scale' } } } }
+        });
+    </script>
+</body>
+</html>
