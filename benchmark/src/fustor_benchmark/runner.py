@@ -361,15 +361,15 @@ class BenchmarkRunner:
             
             <section>
                 <h3>1. 测试目标 (Objectives)</h3>
-                <p>量化 Fustor Fusion 在百万级元数据规模下的检索性能，并诊断网络与应用层开销。本次测试引入了 Dry-Run 对照组，以分离网络传输延迟与实际数据处理延迟。</p>
+                <p>量化 Fustor Fusion 在百万级元数据规模下的检索性能，并诊断网络与应用层开销。通过引入 Dry-Run 对照组，精确分离网络往返延迟、框架开销与实际业务逻辑处理延迟。</p>
             </section>
 
             <section>
                 <h3>2. 对照组说明 (Test Groups)</h3>
                 <ul>
-                    <li><strong>OS Baseline</strong>: 模拟业务通过原生 <code>find</code> 命令获取数据并解析的完整成本。</li>
-                    <li><strong>Fusion Dry-Run</strong>: 调用 API 但跳过数据检索逻辑，仅返回空响应。此指标代表了网络往返 (RTT)、HTTP 握手、FastAPI 框架路由、鉴权中间件以及并发连接池排队的<strong>纯系统开销</strong>。</li>
-                    <li><strong>Fusion API</strong>: 完整的结构化元数据检索。<strong>实际数据处理耗时 = (Fusion API Latency) - (Fusion Dry-Run Latency)</strong>。</li>
+                    <li><strong>OS Baseline (find + Parsing)</strong>: 执行原生 <code>find -printf</code> 获取原始文本，并在 Python 侧完成解析与对象实例化。代表了传统方案下“数据获取 + 结构化”的完整成本。</li>
+                    <li><strong>Fusion Dry-Run (Net only)</strong>: 调用 API 但在服务端跳过树遍历逻辑，仅返回极小响应。测量值包含：网络 RTT、HTTP 连接管理、FastAPI 路由与鉴权中间件耗时。此为系统的<strong>链路基准开销</strong>。</li>
+                    <li><strong>Fusion API (Structured)</strong>: 执行完整的内存树检索与递归序列化。其延迟包含：<strong>(1) 锁竞争等待 (2) 树节点遍历 (3) 递归序列化 (4) 大规模 JSON 载荷的网络传输耗时</strong>。</li>
                 </ul>
             </section>
         </div>
