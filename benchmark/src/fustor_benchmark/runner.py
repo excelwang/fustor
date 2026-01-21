@@ -149,10 +149,13 @@ class BenchmarkRunner:
         total_time = time.time() - start_total
         return self._calculate_stats(latencies, total_time, requests_count)
 
-    def _run_single_fusion_req(self, url, headers, path):
+    def _run_single_fusion_req(self, url, headers, path, dry_run=False):
         start = time.time()
+        params = {"path": path}
+        if dry_run:
+            params["dry_run"] = "true"
         try:
-            res = requests.get(f"{url}/views/fs/tree", params={"path": path}, headers=headers, timeout=10)
+            res = requests.get(f"{url}/views/fs/tree", params=params, headers=headers, timeout=10)
             if res.status_code != 200: return None
         except Exception: return None
         return time.time() - start
@@ -169,7 +172,27 @@ class BenchmarkRunner:
         latencies = []
         start_total = time.time()
         with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [executor.submit(self._run_single_fusion_req, fusion_url, headers, t) for t in tasks]
+            futures = [executor.submit(self._run_single_fusion_req, fusion_url, headers, t, False) for t in tasks]
+            for f in as_completed(futures):
+                res = f.result()
+                if res is not None: latencies.append(res)
+        total_time = time.time() - start_total
+        return self._calculate_stats(latencies, total_time, requests_count)
+
+    def run_concurrent_fusion_dry_run(self, api_key, targets, concurrency=20, requests_count=100):
+        click.echo(f"Running Concurrent Fusion API (Dry-run): {concurrency} workers, {requests_count} requests...")
+        fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
+        headers = {"X-API-Key": api_key}
+        
+        # We still send paths to simulate realistic request sizes, though server will ignore them
+        shuffled_targets = list(targets)
+        random.shuffle(shuffled_targets)
+        tasks = [shuffled_targets[i % len(shuffled_targets)] for i in range(requests_count)]
+            
+        latencies = []
+        start_total = time.time()
+        with ThreadPoolExecutor(max_workers=concurrency) as executor:
+            futures = [executor.submit(self._run_single_fusion_req, fusion_url, headers, t, True) for t in tasks]
             for f in as_completed(futures):
                 res = f.result()
                 if res is not None: latencies.append(res)
@@ -214,12 +237,13 @@ class BenchmarkRunner:
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <style>
         body { font-family: -apple-system, BlinkMacSystemFont, \"Segoe UI\", Roboto, sans-serif; margin: 40px; background: #f4f7f6; color: #333; }
-        .container { max-width: 1100px; margin: auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
+        .container { max-width: 1200px; margin: auto; background: white; padding: 40px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.08); }
         h1 { color: #2c3e50; border-bottom: 2px solid #eee; padding-bottom: 15px; margin-top: 0; }
         .summary { display: flex; justify-content: space-between; margin: 30px -10px; }
         .stat-card { background: #fff; padding: 20px; border-radius: 10px; flex: 1; margin: 0 10px; text-align: center; border: 1px solid #eee; border-top: 5px solid #3498db; transition: transform 0.2s; }
         .stat-card:hover { transform: translateY(-5px); }
         .stat-card.fusion { border-top-color: #2ecc71; }
+        .stat-card.dryrun { border-top-color: #95a5a6; }
         .stat-card.gain { border-top-color: #f1c40f; }
         .stat-value { font-size: 28px; font-weight: bold; margin: 10px 0; color: #2c3e50; }
         .stat-label { font-size: 14px; color: #7f8c8d; text-transform: uppercase; letter-spacing: 1px; }
@@ -252,12 +276,16 @@ class BenchmarkRunner:
                 <div class="stat-label">OS Baseline (Avg)</div>
                 <div class="stat-value">{{os_avg}} ms</div>
             </div>
+            <div class="stat-card dryrun">
+                <div class="stat-label">Fusion Dry-Run (Avg)</div>
+                <div class="stat-value">{{dry_avg}} ms</div>
+            </div>
             <div class="stat-card fusion">
                 <div class="stat-label">Fusion API (Avg)</div>
                 <div class="stat-value">{{fusion_avg}} ms</div>
             </div>
             <div class="stat-card gain">
-                <div class="stat-label">Speedup Factor</div>
+                <div class="stat-label">Speedup (vs OS)</div>
                 <div class="stat-value" style="color: #2ecc71">{{gain}}x</div>
             </div>
         </div>
@@ -274,15 +302,57 @@ class BenchmarkRunner:
         <h2>Detailed Metrics Comparison</h2>
         <table>
             <thead>
-                <tr><th>Metric (ms)</th><th>OS (find + Parsing)</th><th>Fusion API (Structured)</th><th>Improvement</th></tr>
+                <tr>
+                    <th>Metric (ms)</th>
+                    <th>OS (find + Parsing)</th>
+                    <th>Fusion Dry-Run (Net only)</th>
+                    <th>Fusion API (Structured)</th>
+                    <th>Net Overhead %</th>
+                </tr>
             </thead>
             <tbody>
-                <tr><td>Average Latency</td><td>{{os_avg}}</td><td>{{fusion_avg}}</td><td class="winning">{{gain_avg}}x faster</td></tr>
-                <tr><td>Median (P50)</td><td>{{os_p50}}</td><td>{{fusion_p50}}</td><td class="winning">{{gain_p50}}x faster</td></tr>
-                <tr><td>P95 Latency</td><td>{{os_p95}}</td><td>{{fusion_p95}}</td><td class="winning">{{gain_p95}}x faster</td></tr>
-                <tr><td>P99 Latency</td><td>{{os_p99}}</td><td>{{fusion_p99}}</td><td class="winning">{{gain_p99}}x faster</td></tr>
-                <tr><td>Throughput (QPS)</td><td>{{os_qps}}</td><td>{{fusion_qps}}</td><td class="winning">{{gain_qps}}x higher</td></tr>
-                <tr><td>Min / Max</td><td>{{os_min}} / {{os_max}}</td><td>{{fusion_min}} / {{fusion_max}}</td><td>-</td></tr>
+                <tr>
+                    <td>Average Latency</td>
+                    <td>{{os_avg}}</td>
+                    <td>{{dry_avg}}</td>
+                    <td>{{fusion_avg}}</td>
+                    <td>{{net_overhead_avg}}%</td>
+                </tr>
+                <tr>
+                    <td>Median (P50)</td>
+                    <td>{{os_p50}}</td>
+                    <td>{{dry_p50}}</td>
+                    <td>{{fusion_p50}}</td>
+                    <td>{{net_overhead_p50}}%</td>
+                </tr>
+                <tr>
+                    <td>P95 Latency</td>
+                    <td>{{os_p95}}</td>
+                    <td>{{dry_p95}}</td>
+                    <td>{{fusion_p95}}</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>P99 Latency</td>
+                    <td>{{os_p99}}</td>
+                    <td>{{dry_p99}}</td>
+                    <td>{{fusion_p99}}</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>Throughput (QPS)</td>
+                    <td>{{os_qps}}</td>
+                    <td>{{dry_qps}}</td>
+                    <td>{{fusion_qps}}</td>
+                    <td>-</td>
+                </tr>
+                <tr>
+                    <td>Min / Max</td>
+                    <td>{{os_min}} / {{os_max}}</td>
+                    <td>{{dry_min}} / {{dry_max}}</td>
+                    <td>{{fusion_min}} / {{fusion_max}}</td>
+                    <td>-</td>
+                </tr>
             </tbody>
         </table>
 
@@ -291,24 +361,15 @@ class BenchmarkRunner:
             
             <section>
                 <h3>1. 测试目标 (Objectives)</h3>
-                <p>量化 Fustor Fusion 在百万级元数据规模下的检索性能。核心在于验证 <strong>“In-Memory Hash Index”</strong> 在应对高并发、深层目录树递归查询时，相比于传统操作系统文件系统调用（OS System Calls）的吞吐量与延迟优势。</p>
+                <p>量化 Fustor Fusion 在百万级元数据规模下的检索性能，并诊断网络与应用层开销。本次测试引入了 Dry-Run 对照组，以分离网络传输延迟与实际数据处理延迟。</p>
             </section>
 
             <section>
-                <h3>2. 测试原理 (Principles)</h3>
+                <h3>2. 对照组说明 (Test Groups)</h3>
                 <ul>
-                    <li><strong>Fusion API (Structured)</strong>: 模拟业务通过 REST API 获取结构化数据。Fusion 服务预先将元数据索引至内存哈希树中，查询过程为 $O(1)$ 定位 + 子树递归序列化。本次测试使用了 <code>orjson</code> 极速引擎和浮点数时间戳以消除序列化瓶颈。</li>
-                    <li><strong>OS Baseline (find + Parsing)</strong>: 模拟业务通过原生命令获取数据。执行 <code>find -printf</code> 获取原始文本，并在 Python 侧执行 <code>split</code>、<code>basename</code> 及字典对象实例化。这代表了业务系统在没有元数据中心时必须负担的 <strong>“获取 + 结构化”</strong> 真实成本。</li>
-                    <li><strong>负载模型</strong>: 采用“饱和压测”模型，并发 Worker 背靠背发起请求，中间无间隔，旨在探测系统的吞吐量天花板（Saturation Point）。</li>
-                </ul>
-            </section>
-
-            <section>
-                <h3>3. 预期测试指标 (Expected Metrics)</h3>
-                <ul>
-                    <li><strong>延迟一致性</strong>: 无论总数据量是 10 万还是 100 万，Fusion 的平均延迟应保持平稳，不会出现 $O(N)$ 级的线性增长。</li>
-                    <li><strong>长尾延迟 (P99)</strong>: Fusion 的 P99 应保持在 Avg 的 1.5 倍以内，证明内存索引不存在严重的锁竞争或 GC 抖动。</li>
-                    <li><strong>加速比</strong>: 在 NFS 等网络文件系统或冷启动场景下，Fusion 预期将产生 10 倍以上的性能领先；在本地热缓存场景下，Fusion 应提供与 OS 数量级相仿且高度结构化的访问能力。</li>
+                    <li><strong>OS Baseline</strong>: 模拟业务通过原生 <code>find</code> 命令获取数据并解析的完整成本。</li>
+                    <li><strong>Fusion Dry-Run</strong>: 调用 API 但跳过数据检索逻辑，仅返回空响应。此指标代表了网络往返 (RTT)、HTTP 握手、FastAPI 框架路由、鉴权中间件以及并发连接池排队的<strong>纯系统开销</strong>。</li>
+                    <li><strong>Fusion API</strong>: 完整的结构化元数据检索。<strong>实际数据处理耗时 = (Fusion API Latency) - (Fusion Dry-Run Latency)</strong>。</li>
                 </ul>
             </section>
         </div>
@@ -320,6 +381,7 @@ class BenchmarkRunner:
                 labels: ['Average', 'Median', 'P95', 'P99'],
                 datasets: [
                     { label: 'OS Baseline', data: [{{os_avg}}, {{os_p50}}, {{os_p95}}, {{os_p99}}], backgroundColor: '#3498db' },
+                    { label: 'Fusion Dry-Run', data: [{{dry_avg}}, {{dry_p50}}, {{dry_p95}}, {{dry_p99}}], backgroundColor: '#95a5a6' },
                     { label: 'Fusion API', data: [{{fusion_avg}}, {{fusion_p50}}, {{fusion_p95}}, {{fusion_p99}}], backgroundColor: '#2ecc71' }
                 ]
             },
@@ -331,6 +393,7 @@ class BenchmarkRunner:
                 labels: ['Min', 'P50', 'P75', 'P90', 'P95', 'P99', 'Max'],
                 datasets: [
                     { label: 'OS Baseline', data: [{{os_min}}, {{os_p50}}, {{os_p75}}, {{os_p90}}, {{os_p95}}, {{os_p99}}, {{os_max}}], borderColor: '#3498db', fill: false, tension: 0.1 },
+                    { label: 'Fusion Dry-Run', data: [{{dry_min}}, {{dry_p50}}, {{dry_p75}}, {{dry_p90}}, {{dry_p95}}, {{dry_p99}}, {{dry_max}}], borderColor: '#95a5a6', fill: false, tension: 0.1 },
                     { label: 'Fusion API', data: [{{fusion_min}}, {{fusion_p50}}, {{fusion_p75}}, {{fusion_p90}}, {{fusion_p95}}, {{fusion_p99}}, {{fusion_max}}], borderColor: '#2ecc71', fill: false, tension: 0.1 }
                 ]
             },
@@ -339,10 +402,15 @@ class BenchmarkRunner:
     </script>
 </body>
 </html>
-"""
+""";
         g_avg = results['os']['avg'] / results['fusion']['avg'] if results['fusion']['avg'] > 0 else 0
+        
+        # Calculate net overhead percentage: (dry / total) * 100
+        net_overhead_avg = (results['fusion_dry']['avg'] / results['fusion']['avg'] * 100) if results['fusion']['avg'] > 0 else 0
+        net_overhead_p50 = (results['fusion_dry']['p50'] / results['fusion']['p50'] * 100) if results['fusion']['p50'] > 0 else 0
+
         def get_p(stats, p):
-            raw = stats['raw']; idx = int(len(raw) * p / 100)
+            raw = stats['raw']; idx = int(len(raw) * p / 100) # Corrected index calculation
             return raw[min(idx, len(raw)-1)]
 
         html = template.replace("{{timestamp}}", results['timestamp']) \
@@ -354,29 +422,35 @@ class BenchmarkRunner:
             .replace("{{reqs}}", str(results['requests'])) \
             .replace("{{concurrency}}", str(results['concurrency'])) \
             .replace("{{os_avg}}", f"{results['os']['avg']:.2f}") \
+            .replace("{{dry_avg}}", f"{results['fusion_dry']['avg']:.2f}") \
             .replace("{{fusion_avg}}", f"{results['fusion']['avg']:.2f}") \
             .replace("{{os_p50}}", f"{results['os']['p50']:.2f}") \
+            .replace("{{dry_p50}}", f"{results['fusion_dry']['p50']:.2f}") \
             .replace("{{fusion_p50}}", f"{results['fusion']['p50']:.2f}") \
             .replace("{{os_p95}}", f"{results['os']['p95']:.2f}") \
+            .replace("{{dry_p95}}", f"{results['fusion_dry']['p95']:.2f}") \
             .replace("{{fusion_p95}}", f"{results['fusion']['p95']:.2f}") \
             .replace("{{os_p99}}", f"{results['os']['p99']:.2f}") \
+            .replace("{{dry_p99}}", f"{results['fusion_dry']['p99']:.2f}") \
             .replace("{{fusion_p99}}", f"{results['fusion']['p99']:.2f}") \
             .replace("{{os_qps}}", f"{results['os']['qps']:.1f}") \
+            .replace("{{dry_qps}}", f"{results['fusion_dry']['qps']:.1f}") \
             .replace("{{fusion_qps}}", f"{results['fusion']['qps']:.1f}") \
             .replace("{{os_min}}", f"{results['os']['min']:.2f}") \
             .replace("{{os_max}}", f"{results['os']['max']:.2f}") \
+            .replace("{{dry_min}}", f"{results['fusion_dry']['min']:.2f}") \
+            .replace("{{dry_max}}", f"{results['fusion_dry']['max']:.2f}") \
             .replace("{{fusion_min}}", f"{results['fusion']['min']:.2f}") \
             .replace("{{fusion_max}}", f"{results['fusion']['max']:.2f}") \
             .replace("{{os_p75}}", f"{get_p(results['os'], 75):.2f}") \
             .replace("{{os_p90}}", f"{get_p(results['os'], 90):.2f}") \
+            .replace("{{dry_p75}}", f"{get_p(results['fusion_dry'], 75):.2f}") \
+            .replace("{{dry_p90}}", f"{get_p(results['fusion_dry'], 90):.2f}") \
             .replace("{{fusion_p75}}", f"{get_p(results['fusion'], 75):.2f}") \
             .replace("{{fusion_p90}}", f"{get_p(results['fusion'], 90):.2f}") \
             .replace("{{gain}}", f"{g_avg:.1f}") \
-            .replace("{{gain_avg}}", f"{g_avg:.1f}") \
-            .replace("{{gain_p50}}", f"{results['os']['p50']/results['fusion']['p50']:.1f}" if results['fusion']['p50'] > 0 else "N/A") \
-            .replace("{{gain_p95}}", f"{results['os']['p95']/results['fusion']['p95']:.1f}" if results['fusion']['p95'] > 0 else "N/A") \
-            .replace("{{gain_p99}}", f"{results['os']['p99']/results['fusion']['p99']:.1f}" if results['fusion']['p99'] > 0 else "N/A") \
-            .replace("{{gain_qps}}", f"{results['fusion']['qps']/results['os']['qps']:.1f}" if results['os']['qps'] > 0 else "N/A")
+            .replace("{{net_overhead_avg}}", f"{net_overhead_avg:.1f}") \
+            .replace("{{net_overhead_p50}}", f"{net_overhead_p50:.1f}")
 
         with open(output_path, "w") as f: f.write(html)
 
@@ -406,7 +480,12 @@ class BenchmarkRunner:
             
             self.wait_for_sync(api_key)
             targets = self._discover_leaf_targets_via_api(api_key, target_depth)
+            
             os_stats = self.run_concurrent_baseline(targets, concurrency, reqs)
+            
+            # New Step: Run Dry-Run
+            fusion_dry_stats = self.run_concurrent_fusion_dry_run(api_key, targets, concurrency, reqs)
+            
             fusion_stats = self.run_concurrent_fusion(api_key, targets, concurrency, reqs)
             
             fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
@@ -419,7 +498,7 @@ class BenchmarkRunner:
             final_results = {
                 "metadata": {"operation_type": "RECURSIVE_METADATA_GET", "total_files_in_scope": total_files, "total_directories_in_scope": total_dirs, "source_path": self.data_dir, "api_endpoint": fusion_url},
                 "depth": target_depth, "requests": reqs, "concurrency": concurrency, "target_directory_count": len(targets),
-                "os": os_stats, "fusion": fusion_stats, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
+                "os": os_stats, "fusion_dry": fusion_dry_stats, "fusion": fusion_stats, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
 
             results_dir = os.path.join(self.run_dir, "results")
@@ -429,17 +508,17 @@ class BenchmarkRunner:
             with open(json_path, "w") as f: json.dump(final_results, f, indent=2)
             self.generate_html_report(final_results, html_path)
 
-            click.echo("\n" + "="*60)
+            click.echo("\n" + "="*85)
             click.echo(f"RECURSIVE METADATA RETRIEVAL PERFORMANCE (DEPTH {target_depth})")
             click.echo(f"Data Scale: {total_files:,} files | Targets: {len(targets)}")
-            click.echo("="*60)
-            click.echo(f"{ 'Metric (ms)':<25} | {'OS (find + Parsing)':<18} | {'Fusion API (Structured)':<18}")
-            click.echo("-" * 65)
-            click.echo(f"{ 'Avg Latency':<25} | {os_stats['avg']:10.2f} ms      | {fusion_stats['avg']:10.2f} ms")
-            click.echo(f"{ 'P50 Latency':<25} | {os_stats['p50']:10.2f} ms      | {fusion_stats['p50']:10.2f} ms")
-            click.echo(f"{ 'P99 Latency':<25} | {os_stats['p99']:10.2f} ms      | {fusion_stats['p99']:10.2f} ms")
-            click.echo(f"{ 'Throughput (QPS)':<25} | {os_stats['qps']:10.1f}         | {fusion_stats['qps']:10.1f}")
-            click.echo("-" * 65)
+            click.echo("="*85)
+            click.echo(f"{'Metric (ms)':<25} | {'OS (find + Parsing)':<20} | {'Fusion Dry-Run':<20} | {'Fusion API':<20}")
+            click.echo("-" * 85)
+            click.echo(f"{ 'Avg Latency':<25} | {os_stats['avg']:10.2f} ms        | {fusion_dry_stats['avg']:10.2f} ms        | {fusion_stats['avg']:10.2f} ms")
+            click.echo(f"{ 'P50 Latency':<25} | {os_stats['p50']:10.2f} ms        | {fusion_dry_stats['p50']:10.2f} ms        | {fusion_stats['p50']:10.2f} ms")
+            click.echo(f"{ 'P99 Latency':<25} | {os_stats['p99']:10.2f} ms        | {fusion_dry_stats['p99']:10.2f} ms        | {fusion_stats['p99']:10.2f} ms")
+            click.echo(f"{ 'Throughput (QPS)':<25} | {os_stats['qps']:10.1f}           | {fusion_dry_stats['qps']:10.1f}           | {fusion_stats['qps']:10.1f}")
+            click.echo("-" * 85)
             click.echo(click.style(f"\nJSON results saved to: {json_path}", fg="cyan"))
             click.echo(click.style(f"Visual HTML report saved to: {html_path}", fg="green", bold=True))
         finally:

@@ -127,14 +127,6 @@ def cli(ctx, base_url: str):
         ctx.obj["TOKEN"] = None
 
 @cli.command()
-@click.option("--host", default="127.0.0.1", help="Host address to bind to.")
-@click.option("--port", default=8101, type=int, help="Port to bind to.")
-@click.option("--reload", is_flag=True, help="Enable auto-reloading.")
-def start_fg(host: str, port: int, reload: bool):
-    """Starts the Fustor Registry API server in foreground mode."""
-    uvicorn.run("fustor_registry.main:app", host=host, port=port, reload=reload)
-
-@cli.command()
 @click.option("--reload", is_flag=True, help="Enable auto-reloading of the server on code changes (foreground only).")
 @click.option("-p", "--port", default=8101, help="Port to run the server on.")
 @click.option("-h", "--host", default="127.0.0.1", help="Host to bind the server to.")

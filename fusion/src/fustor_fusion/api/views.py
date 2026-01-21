@@ -42,10 +42,15 @@ async def get_directory_tree_api(
     recursive: bool = Query(True, description="Whether to recursively retrieve the entire subtree"),
     max_depth: Optional[int] = Query(None, description="Maximum depth of recursion"),
     only_path: bool = Query(False, description="Return only paths, excluding metadata like size and timestamps"),
+    dry_run: bool = Query(False, description="If true, skips processing to measure network/framework latency"),
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Optional[Dict[str, Any]]:
     """Get the directory structure tree starting from the specified path."""
     await check_snapshot_status(datastore_id)
+    
+    if dry_run:
+        return ORJSONResponse(content={"message": "dry-run", "datastore_id": datastore_id})
+
     effective_recursive = recursive if max_depth is None else True
     logger.debug(f"API request for directory tree: path={path}, recursive={effective_recursive}, max_depth={max_depth}, only_path={only_path}, datastore_id={datastore_id}")
     result = await get_directory_tree(path, datastore_id=datastore_id, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
