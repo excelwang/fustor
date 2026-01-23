@@ -66,6 +66,14 @@ syncs:
 *   **停止服务**: `fustor-agent stop`
 *   **查看状态**: 访问 `http://localhost:8100` 查看 Web 控制台。
 
+## 数据可靠性保证 (Data Reliability)
+
+Agent 作为一个高效的数据分发管道，遵循 **“先感知、后推送”** 的原则。为了确保 Fusion 获取到的数据均是完整且稳定的，Agent 依赖于 Source Driver 实现以下逻辑：
+
+1.  **静默期过滤**：Driver 必须负责识别并过滤掉处于活跃写入状态的文件元数据。
+2.  **消息补偿**：对于快照扫描期间被跳过的活跃文件，Agent 必须通过实时消息流（如 inotify）进行最终补全推送。
+3.  **状态隔离**：在初始快照完成前，Pusher 应向 Fusion 发送明确的 `source_type='snapshot'` 标识，Fusion 利用此标识通过 503 状态码保护下游查询。
+
 ## 更多文档
 
 *   **驱动开发**: 详见 `docs/driver_design.md`

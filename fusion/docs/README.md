@@ -82,7 +82,19 @@ Fusion 是 Fustor 平台的核心存储与查询引擎。它负责接收来自 A
 2.  **队列就绪**: 内部 `memory_event_queue` 已全部清空。
 3.  **解析就绪**: `ProcessingManager` 中的 Inflight 事件处理数为 0。
 
-这确保了您通过 API 获取到的数据必然是物理存储上的完整快照。
+### 1. 权威会话锁 (Authoritative Session Lock)
+Fusion 遵循 **“最后启动者权威 (Last-Agent-Wins)”** 机制：
+*   同一 Datastore 仅允许一个 **权威会话 (Authoritative Session)**。
+*   当新的 Agent 启动并建立 Session 时，原有的权威 Session 会被立即标记为 **过时 (Obsolete)**。
+*   Fusion 仅信任来自权威 Session 的快照数据，并以此构建内存索引。
+
+### 2. 心跳存续依赖 (Heartbeat Availability Dependency)
+为了防止权威 Agent 崩溃导致视图陈旧（Stale Data Risk）：
+*   **硬链接可用性**：一旦权威 Agent 的 **心跳丢失 (Heartbeat Timeout)**，Fusion 必须立即将对应的 Datastore 状态切换为 **503 Service Unavailable**。
+*   **逻辑理由**：心跳丢失意味着实时事件流（inotify）可能已中断，此时 Fusion 看到的树结构不再是对物理事实的准确感知。
+
+### 3. 数据一致性断路器
+若权威 Agent 在后台巡检中发现了热文件差异并发送了异常信号，Fusion 将立即锁定查询 API，直到新的一致性快照完成同步。
 
 ## 性能优化建议
 
