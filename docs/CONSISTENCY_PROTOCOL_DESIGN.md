@@ -1,70 +1,68 @@
-# Generic Consistency Verification Protocol Design
+# Consistency & Sentinel Protocol Design
 
 ## Problem
-The initial implementation of the Sentinel Sweep relied on `get_suspect_list` and `update_suspect_list` methods. These are specific to the File System (FS) domain (dealing with mtime latency and open files) and pollute the generic `SourceDriver` and `PusherDriver` interfaces, or rely on loose `send_command` calls.
+The initial implementation of the Sentinel Sweep relied on domain-specific verification methods and unstructured command mechanisms. This polluted the generic Driver interfaces and made the system hard to extend to non-FS sources.
 
 ## Objective
-Decouple the core Agent orchestration (`SyncInstance`) from specific consistency logic (like "Suspect Lists") while maintaining a standard lifecycle hook for "Consistency Verification".
+Establish a standardized, standard-based protocol for "Consistency Verification" (Sentinel) and "Full Reconciliation" (Audit) that is decoupled from specific data source implementations.
 
-## Proposed Architecture
+## Architecture
 
-### 1. Abstract Driver Interface (`fustor_core.drivers`)
+### 1. Sentinel Protocol (Fast Verification)
 
-We introduce a generic **Verification Protocol** consisting of three methods:
+The **Sentinel** mechanism allows the Fusion backend to request the Agent to quickly verify specific data items (e.g. "Suspect" files found during real-time processing).
 
-#### `PusherDriver`
-*   `async def get_consistency_tasks(self, **kwargs) -> Optional[Dict[str, Any]]`:
-    *   Queries the upstream/backend for any data items that require active verification by the source.
-    *   Returns a semi-opaque `task_batch` dictionary. For FS, this contains the `suspect_list`.
-    *   If `None` or empty, no checks are needed.
+#### Driver Interface (`fustor_core.drivers`)
 
-*   `async def submit_consistency_results(self, results: Dict[str, Any], **kwargs) -> bool`:
-    *   Submits the results of a verification back to the upstream.
+**PusherDriver**
+*   `async def get_sentinel_tasks(self, **kwargs) -> Optional[Dict[str, Any]]`:
+    *   Queries `GET /ingestor-api/v1/consistency/sentinel/tasks`.
+    *   Returns a task batch (e.g., `{'type': 'suspect_check', 'paths': [...]}`).
+*   `async def submit_sentinel_results(self, results: Dict[str, Any], **kwargs) -> bool`:
+    *   Submits feedback via `POST /ingestor-api/v1/consistency/sentinel/feedback`.
 
-#### `SourceDriver`
-*   `def perform_consistency_check(self, task_batch: Dict[str, Any]) -> Dict[str, Any]`:
-    *   Receives the `task_batch`.
-    *   Inspects the `type` or content of the batch to decide how to verify.
-    *   For FS: Iterates over paths in `task_batch` and performs `os.stat`.
-    *   Returns a `results` dictionary.
+**SourceDriver**
+*   `def perform_sentinel_check(self, task_batch: Dict[str, Any]) -> Dict[str, Any]`:
+    *   Receives the task batch.
+    *   Performs source-specific verification (e.g. `os.stat` for FS).
+    *   Returns results (e.g., `{'type': 'suspect_update', 'updates': [...]}`).
 
-### 2. Agent Orchestration (`SyncInstance`)
+### 2. Audit Protocol (Full Reconciliation)
 
-The `_run_sentinel_sweep` (renamed to `_run_consistency_check_loop`) becomes generic:
+The **Audit** mechanism triggers a full scan of the source data to reconcile generic differences and close "Blind Spots".
 
-```python
-async def _run_consistency_check(self):
-    # 1. Ask Pusher what needs checking
-    tasks = await self.pusher_driver_instance.get_consistency_tasks(source_id=self.config.source)
-    if not tasks:
-        return
+#### Control Flow
+1.  **Start**: Agent calls `pusher.signal_audit_start()`.
+    *   API: `POST /ingestor-api/v1/consistency/audit/start`
+    *   Action: Fusion clears transient Blind Spot lists.
+2.  **Scan**: Agent iterates through all data (Snapshot/Audit Iterator) and pushes events with `source_type='audit'`.
+3.  **End**: Agent calls `pusher.signal_audit_end()`.
+    *   API: `POST /ingestor-api/v1/consistency/audit/end`
+    *   Action: Fusion compares the Audit set against its Memory Tree to identify and mark missing files.
 
-    # 2. Ask Source to check it
-    # Run in thread as source drivers might be blocking (like FS)
-    results = await asyncio.to_thread(
-        self.source_driver_instance.perform_consistency_check, 
-        tasks
-    )
+### 3. Leader Election & Failover
 
-    if not results:
-        return
+To ensure only one Agent performs these maintenance tasks (Audit/Sentinel) per Datastore:
 
-    # 3. Report back
-    await self.pusher_driver_instance.submit_consistency_results(results)
-```
+*   **Heartbeat**: Agent sends periodic heartbeats to `/ingestor-api/v1/sessions/heartbeat`.
+*   **Role Logic**:
+    *   Fusion uses a Time-To-Live (TTL) lock for Leadership.
+    *   If Leader is missing/timeout, the next heartbeat from any Agent promotes it to Leader.
+    *   Response contains `{"role": "leader" | "follower"}`.
+*   **Agent Behavior**:
+    *   **Follower**: Only pushes Realtime events.
+    *   **Leader**: Spawns additional `_run_audit_loop` and `_run_sentinel_loop` tasks.
 
-### 3. Concrete Implementation Mapping
+### 4. API Specification
 
-#### FS Source (`fustor_source_fs`)
-*   `perform_consistency_check` logic:
-    *   Input: `{"task_type": "suspect_verification", "paths": ["/a/b.txt", ...]}`
-    *   Action: `verify_files(paths)`
-    *   Output: `{"task_type": "suspect_verification_result", "updates": [{"path":..., "mtime":...}]}`
+All consistency endpoints are standardized under `/ingestor-api/v1/consistency/`:
 
-#### Fusion Pusher (`fustor_pusher_fusion`)
-*   `get_consistency_tasks`: Calls `GET /api/view/fs/suspect-list`. Wraps response in Generic Task format.
-*   `submit_consistency_results`: Calls `PUT /api/view/fs/suspect-list` with unwrapped payload.
+*   `POST /audit/start`: Signal audit cycle start.
+*   `POST /audit/end`: Signal audit cycle end.
+*   `GET /sentinel/tasks`: Retrieve pending verification tasks (e.g. Suspect List).
+*   `POST /sentinel/feedback`: Submit verification results.
 
 ## Benefits
-*   **Decoupling**: Agent doesn't know about "suspects" or "mtimes".
-*   **Extensibility**: If we add a Database generic driver later, we can implement "Checksum Verification" using the exact same Agent loop.
+*   **Decoupling**: Agent core loop is generic and unaware of "Suspects" or "Files".
+*   **Extensibility**: Database sources can implement `perform_sentinel_check` via Row Checksums without changing Agent code.
+*   **Robustness**: Automatic failover ensures consistency tasks resume even if an Agent crashes.
