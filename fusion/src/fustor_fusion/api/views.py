@@ -106,3 +106,95 @@ async def reset_directory_tree_api(
             detail="Failed to reset directory tree"
         )
     logger.info(f"Successfully reset directory tree for datastore {datastore_id}")
+
+
+# === View-Specific Consistency APIs ===
+
+from ..parsers.manager import get_cached_parser_manager
+from pydantic import BaseModel
+from typing import List
+
+class SuspectUpdateRequest(BaseModel):
+    """Request body for updating suspect file mtimes."""
+    updates: List[Dict[str, Any]]  # List of {"path": str, "mtime": float}
+
+
+@parser_router.get("/fs/suspect-list", 
+    summary="Get Suspect List for Sentinel Sweep",
+    description="Returns files that might still be under active write"
+)
+async def get_suspect_list_api(
+    datastore_id: int = Depends(get_datastore_id_from_api_key)
+) -> Dict[str, Any]:
+    """
+    Get the current Suspect List for this datastore.
+    Used by Leader Agent for Sentinel Sweep.
+    """
+    logger.info(f"API request for suspect list: datastore_id={datastore_id}")
+    manager = await get_cached_parser_manager(datastore_id)
+    parser = await manager.get_file_directory_parser()
+    suspect_list = await parser.get_suspect_list()
+    return {
+        "datastore_id": datastore_id,
+        "suspect_count": len(suspect_list),
+        "suspects": [{"path": path, "suspect_until": ts} for path, ts in suspect_list.items()]
+    }
+
+
+@parser_router.put("/fs/suspect-list",
+    summary="Update Suspect List from Sentinel Sweep",
+    description="Agent reports current mtimes of suspect files"
+)
+async def update_suspect_list_api(
+    request: SuspectUpdateRequest,
+    datastore_id: int = Depends(get_datastore_id_from_api_key)
+) -> Dict[str, Any]:
+    """
+    Update suspect files with their current mtimes from Agent's Sentinel Sweep.
+    """
+    logger.info(f"API request to update suspect list: datastore_id={datastore_id}, count={len(request.updates)}")
+    manager = await get_cached_parser_manager(datastore_id)
+    parser = await manager.get_file_directory_parser()
+    
+    updated_count = 0
+    for item in request.updates:
+        path = item.get("path")
+        mtime = item.get("mtime")
+        if path and mtime is not None:
+            await parser.update_suspect(path, mtime)
+            updated_count += 1
+    
+    return {
+        "datastore_id": datastore_id,
+        "updated_count": updated_count
+    }
+
+
+@parser_router.post("/fs/audit-start",
+    summary="Signal Audit Start",
+    description="Called by Leader Agent when starting an Audit cycle"
+)
+async def audit_start_api(
+    datastore_id: int = Depends(get_datastore_id_from_api_key)
+) -> Dict[str, str]:
+    """Signal the start of an Audit cycle."""
+    logger.info(f"Audit start signal received for datastore {datastore_id}")
+    manager = await get_cached_parser_manager(datastore_id)
+    parser = await manager.get_file_directory_parser()
+    await parser.handle_audit_start()
+    return {"status": "ok", "message": "Audit started"}
+
+
+@parser_router.post("/fs/audit-end",
+    summary="Signal Audit End",
+    description="Called by Leader Agent when completing an Audit cycle"
+)
+async def audit_end_api(
+    datastore_id: int = Depends(get_datastore_id_from_api_key)
+) -> Dict[str, str]:
+    """Signal the end of an Audit cycle. Triggers Tombstone cleanup."""
+    logger.info(f"Audit end signal received for datastore {datastore_id}")
+    manager = await get_cached_parser_manager(datastore_id)
+    parser = await manager.get_file_directory_parser()
+    await parser.handle_audit_end()
+    return {"status": "ok", "message": "Audit ended, tombstones cleaned"}

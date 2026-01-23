@@ -6,6 +6,8 @@ from typing import Dict, List, Optional, Any, Set
 from collections import deque
 from pathlib import Path
 
+from fustor_event_model.models import MessageSource
+
 logger = logging.getLogger(__name__)
 
 class DirectoryNode:
@@ -17,6 +19,9 @@ class DirectoryNode:
         self.modified_time = modified_time
         self.created_time = created_time
         self.children: Dict[str, Any] = {} # Can contain DirectoryNode or FileNode
+        # Consistency flags
+        self.integrity_suspect: bool = False
+        self.agent_missing: bool = False
 
     def to_dict(self, recursive=True, max_depth=None, only_path=False):
         """Converts the directory node to a dictionary representation."""
@@ -30,7 +35,9 @@ class DirectoryNode:
             result.update({
                 'size': self.size,
                 'modified_time': self.modified_time,
-                'created_time': self.created_time
+                'created_time': self.created_time,
+                'integrity_suspect': self.integrity_suspect,
+                'agent_missing': self.agent_missing
             })
 
         # Base case for recursion depth
@@ -66,6 +73,9 @@ class FileNode:
         self.size = size
         self.modified_time = modified_time
         self.created_time = created_time
+        # Consistency flags
+        self.integrity_suspect: bool = False
+        self.agent_missing: bool = False
 
     def to_dict(self, recursive=True, max_depth=None, only_path=False):
         """Converts the file node to a dictionary representation."""
@@ -78,14 +88,21 @@ class FileNode:
             result.update({
                 'size': self.size,
                 'modified_time': self.modified_time,
-                'created_time': self.created_time
+                'created_time': self.created_time,
+                'integrity_suspect': self.integrity_suspect,
+                'agent_missing': self.agent_missing
             })
         return result
 
 class DirectoryStructureParser:
     """
     Parses directory structure events and maintains an in-memory tree representation.
+    Implements Smart Merge logic for consistency arbitration.
     """
+    
+    # Hot file threshold: files modified within this window are marked as suspect
+    HOT_FILE_THRESHOLD_SECONDS = 600  # 10 minutes
+    
     def __init__(self, datastore_id: int):
         self.datastore_id = datastore_id
         self.logger = logging.getLogger(f"fustor_fusion.parser.fs.{datastore_id}")
@@ -95,10 +112,29 @@ class DirectoryStructureParser:
         self._lock = asyncio.Lock()
         self._last_event_latency = 0.0
         self._cache_invalidation_needed = False
+        
+        # === Consistency State ===
+        # Tombstone List: path -> delete_timestamp
+        # Prevents deleted files from being resurrected by delayed Snapshot/Audit
+        self._tombstone_list: Dict[str, float] = {}
+        
+        # Suspect List: path -> suspect_until_timestamp
+        # Marks files that might still be written to
+        self._suspect_list: Dict[str, float] = {}
+        
+        # Audit lifecycle
+        self._last_audit_start: Optional[float] = None
 
     def _check_cache_invalidation(self, path: str):
         """Simple placeholder for more complex logic"""
         pass
+    
+    def _get_node(self, path: str) -> Optional[Any]:
+        """Get a node (file or directory) by path."""
+        if path in self._directory_path_map:
+            return self._directory_path_map[path]
+        return self._file_path_map.get(path)
+
 
     async def _process_create_update_in_memory(self, payload: Dict[str, Any], path: str):
         """Update the in-memory tree with create/update event data."""
@@ -181,7 +217,14 @@ class DirectoryStructureParser:
 
     async def process_event(self, event: Any) -> bool:
         """ 
-        Processes an event by applying all its data rows to the in-memory cache.
+        Processes an event using Smart Merge logic.
+        
+        Arbitration rules:
+        1. Realtime events have highest priority - always applied
+        2. Snapshot/Audit events are filtered:
+           - Tombstone check: skip if file was deleted by Realtime
+           - Mtime check: skip if existing data is newer
+        3. For audit events, files from blind-spot are marked with agent_missing=True
         """
         if event.table == "initial_trigger":
             return True
@@ -189,23 +232,139 @@ class DirectoryStructureParser:
         if not event.rows:
             return False
         
-        now_ms = time.time() * 1000
+        now = time.time()
+        now_ms = now * 1000
         if event.index > 0:
             self._last_event_latency = max(0, now_ms - event.index)
         
         from fustor_event_model.models import EventType
         event_type = event.event_type
+        
+        # Get message source (default to REALTIME for backward compatibility)
+        message_source = getattr(event, 'message_source', MessageSource.REALTIME)
+        if isinstance(message_source, str):
+            message_source = MessageSource(message_source)
+        
+        is_realtime = (message_source == MessageSource.REALTIME)
+        is_audit = (message_source == MessageSource.AUDIT)
 
         async with self._lock:
             for payload in event.rows:
                 path = payload.get('path') or payload.get('file_path')
-                if not path: continue
+                if not path:
+                    continue
+                    
                 self._check_cache_invalidation(path)
-                if event_type in [EventType.INSERT, EventType.UPDATE]:
-                    await self._process_create_update_in_memory(payload, path)
-                elif event_type == EventType.DELETE:
-                    await self._process_delete_in_memory(path)
+                mtime = payload.get('modified_time', 0.0)
+                
+                if event_type == EventType.DELETE:
+                    if is_realtime:
+                        # Realtime Delete: unconditionally delete + add to Tombstone
+                        await self._process_delete_in_memory(path)
+                        self._tombstone_list[path] = now
+                        self._suspect_list.pop(path, None)
+                    else:
+                        # Snapshot/Audit Delete: check Tombstone
+                        if path not in self._tombstone_list:
+                            await self._process_delete_in_memory(path)
+                            
+                elif event_type in [EventType.INSERT, EventType.UPDATE]:
+                    if is_realtime:
+                        # Realtime Update: unconditionally update + remove from Tombstone
+                        await self._process_create_update_in_memory(payload, path)
+                        self._tombstone_list.pop(path, None)
+                        self._suspect_list.pop(path, None)
+                        
+                        # Update node flags
+                        node = self._get_node(path)
+                        if node:
+                            node.integrity_suspect = False
+                            node.agent_missing = False
+                    else:
+                        # Snapshot/Audit: apply arbitration
+                        
+                        # Rule 1: Tombstone check - skip resurrecting deleted files
+                        if path in self._tombstone_list:
+                            self.logger.debug(f"Skipping {path}: in Tombstone list")
+                            continue
+                        
+                        # Rule 2: Mtime check - skip if existing data is newer
+                        existing = self._get_node(path)
+                        if existing and existing.modified_time >= mtime:
+                            self.logger.debug(f"Skipping {path}: existing mtime {existing.modified_time} >= incoming {mtime}")
+                            continue
+                        
+                        # Apply the update
+                        await self._process_create_update_in_memory(payload, path)
+                        
+                        # Update consistency flags
+                        node = self._get_node(path)
+                        if node:
+                            # Mark as suspect if hot file
+                            if (now - mtime) < self.HOT_FILE_THRESHOLD_SECONDS:
+                                node.integrity_suspect = True
+                                self._suspect_list[path] = now + self.HOT_FILE_THRESHOLD_SECONDS
+                            
+                            # Mark as blind-spot file if from audit
+                            if is_audit:
+                                node.agent_missing = True
+                            
         return True
+    
+    async def handle_audit_start(self):
+        """Called when an Audit cycle begins."""
+        async with self._lock:
+            self._last_audit_start = time.time()
+            self.logger.info(f"Audit started for datastore {self.datastore_id}")
+    
+    async def handle_audit_end(self):
+        """
+        Called when an Audit cycle ends.
+        Cleans up Tombstones created before this audit started.
+        """
+        async with self._lock:
+            if self._last_audit_start is None:
+                return
+            
+            cutoff = self._last_audit_start
+            before_count = len(self._tombstone_list)
+            self._tombstone_list = {
+                path: ts for path, ts in self._tombstone_list.items()
+                if ts > cutoff
+            }
+            after_count = len(self._tombstone_list)
+            self.logger.info(
+                f"Audit ended for datastore {self.datastore_id}. "
+                f"Cleaned {before_count - after_count} tombstones (cutoff: {cutoff})"
+            )
+            self._last_audit_start = None
+    
+    async def get_suspect_list(self) -> Dict[str, float]:
+        """Get the current Suspect List for Sentinel Sweep."""
+        async with self._lock:
+            now = time.time()
+            # Clean up expired suspects
+            self._suspect_list = {
+                path: ts for path, ts in self._suspect_list.items()
+                if ts > now
+            }
+            return dict(self._suspect_list)
+    
+    async def update_suspect(self, path: str, new_mtime: float):
+        """Update a suspect file's mtime from Sentinel Sweep."""
+        async with self._lock:
+            now = time.time()
+            node = self._get_node(path)
+            if node:
+                node.modified_time = new_mtime
+                # If file is now cold, remove from suspect list
+                if (now - new_mtime) >= self.HOT_FILE_THRESHOLD_SECONDS:
+                    node.integrity_suspect = False
+                    self._suspect_list.pop(path, None)
+                else:
+                    # Still hot, extend suspect window
+                    self._suspect_list[path] = now + self.HOT_FILE_THRESHOLD_SECONDS
+
 
     async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
         """Get the tree structure starting from path."""
@@ -249,4 +408,7 @@ class DirectoryStructureParser:
             self._root = DirectoryNode("", "/")
             self._directory_path_map = {"/": self._root}
             self._file_path_map = {}
+            self._tombstone_list = {}
+            self._suspect_list = {}
+            self._last_audit_start = None
             self.logger.info(f"Parser state reset for datastore {self.datastore_id}")
