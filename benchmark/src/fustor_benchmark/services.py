@@ -65,6 +65,7 @@ class ServiceManager:
         env["FUSTOR_REGISTRY_CLIENT_TOKEN"] = self.client_token
         
         p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        log_file.close()
         self.processes.append(p)
         
         if not self._wait_for_service(f"http://localhost:{self.registry_port}/health", "Registry"):
@@ -118,6 +119,7 @@ class ServiceManager:
         env["FUSTOR_REGISTRY_CLIENT_TOKEN"] = self.client_token
         
         p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        log_file.close()
         self.processes.append(p)
         
         click.echo(f"Waiting for Fusion at http://localhost:{self.fusion_port}...")
@@ -181,6 +183,7 @@ class ServiceManager:
             env.update(extra_env)
         
         p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
+        log_file.close()
         self.processes.append(p)
         self.agent_process = p
         

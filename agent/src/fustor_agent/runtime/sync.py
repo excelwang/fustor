@@ -57,6 +57,8 @@ class SyncInstance:
         self._snapshot_task: Optional[asyncio.Task] = None
         self._audit_task: Optional[asyncio.Task] = None
         self._sentinel_task: Optional[asyncio.Task] = None
+        self._message_sync_task: Optional[asyncio.Task] = None
+        self._monitor_heartbeat_task: Optional[asyncio.Task] = None
         self.audit_mtime_cache: Dict[str, float] = {}
         self.current_role: Optional[str] = None  # Track current role (leader/follower)
         
@@ -240,10 +242,10 @@ class SyncInstance:
             self.info = f"任务启动，进入消息同步阶段，起始点位: {start_position}"
             
             # Create tasks for monitoring heartbeat errors and message sync
-            heartbeat_error_task = asyncio.create_task(self._monitor_heartbeat_errors())
-            message_sync_task = asyncio.create_task(self._run_message_sync(start_position))
+            self._monitor_heartbeat_task = asyncio.create_task(self._monitor_heartbeat_errors())
+            self._message_sync_task = asyncio.create_task(self._run_message_sync(start_position))
 
-            tasks_to_wait = [heartbeat_error_task, message_sync_task, self._heartbeat_task]
+            tasks_to_wait = [self._monitor_heartbeat_task, self._message_sync_task, self._heartbeat_task]
             
             if self.current_role == "leader":
                  logger.info(f"Assigned LEADER role for {self.id}. Starting Audit and Sentinel tasks.")
@@ -299,6 +301,24 @@ class SyncInstance:
             logger.error(f"同步任务 '{self.id}' 崩溃: {e}", exc_info=True)
             self._set_state(SyncState.ERROR, f"主控制循环崩溃: {e}")
         finally:
+            # Cancel all background tasks when exiting the control loop
+            if self._monitor_heartbeat_task and not self._monitor_heartbeat_task.done():
+                self._monitor_heartbeat_task.cancel()
+                try:
+                    await self._monitor_heartbeat_task
+                except asyncio.CancelledError:
+                    pass
+
+            if self._message_sync_task and not self._message_sync_task.done():
+                self._message_sync_task.cancel()
+                try:
+                    await self._message_sync_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    # Log message sync cleanup errors if any
+                    logger.debug(f"Error during message sync task cancellation: {e}")
+
             # Cancel the heartbeat task when exiting the control loop
             if self._heartbeat_task and not self._heartbeat_task.done():
                 self._heartbeat_task.cancel()

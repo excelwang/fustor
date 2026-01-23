@@ -12,6 +12,7 @@ from typing import (
     Iterator,
     List,
     Tuple,
+    Optional,
 )
 
 # Forward-referencing models to avoid circular imports if drivers.py is imported by models

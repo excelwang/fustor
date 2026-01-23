@@ -56,14 +56,38 @@ class TestSyncInstanceHeartbeat:
     def mock_services(self, mocker: MockerFixture):
         """Create mock services for SyncInstance using pytest-mock."""
         mock_bus_service = MagicMock()
-        mock_bus_service.get_or_create_bus_for_subscriber = AsyncMock(return_value=(MagicMock(), False))
+        
+        mock_bus_instance = MagicMock()
+        mock_internal_bus = MagicMock()
+        mock_internal_bus.get_events_for = AsyncMock(return_value=[])
+        mock_bus_instance.internal_bus = mock_internal_bus
+        
+        mock_bus_service.get_or_create_bus_for_subscriber = AsyncMock(return_value=(mock_bus_instance, False))
 
         mock_pusher_driver_service = MagicMock()
         mock_source_driver_service = MagicMock()
 
-        # Use AsyncMock for the entire driver instance to handle all awaitable methods
-        mock_pusher_driver_instance = AsyncMock()
-        mock_source_driver_instance = AsyncMock()
+        # Pusher driver mock - explicitly define async methods as AsyncMock
+        # so they return coroutines that can be awaited.
+        mock_pusher_driver_instance = MagicMock()
+        mock_pusher_driver_instance.create_session = AsyncMock(return_value={})
+        mock_pusher_driver_instance.heartbeat = AsyncMock(return_value={})
+        mock_pusher_driver_instance.get_latest_committed_index = AsyncMock(return_value=0)
+        mock_pusher_driver_instance.get_sentinel_tasks = AsyncMock(return_value={})
+        mock_pusher_driver_instance.submit_sentinel_results = AsyncMock(return_value=True)
+        mock_pusher_driver_instance.signal_audit_start = AsyncMock(return_value=True)
+        mock_pusher_driver_instance.signal_audit_end = AsyncMock(return_value=True)
+        mock_pusher_driver_instance.push = AsyncMock(return_value={})
+        mock_pusher_driver_instance.close = AsyncMock(return_value=None)
+
+        # Source driver mock - sync methods should be MagicMock
+        mock_source_driver_instance = MagicMock()
+        mock_source_driver_instance.get_snapshot_iterator = MagicMock()
+        mock_source_driver_instance.get_message_iterator = MagicMock()
+        mock_source_driver_instance.perform_sentinel_check = MagicMock()
+        mock_source_driver_instance.close = AsyncMock(return_value=None)
+        mock_source_driver_instance.is_transient = False
+        mock_source_driver_instance.is_position_available.return_value = True
 
         # Make the service return the mock driver class
         mock_pusher_driver_class = MagicMock(return_value=mock_pusher_driver_instance)
@@ -170,7 +194,8 @@ class TestSyncInstanceHeartbeat:
         )
         instance.session_id = "test_session_123"
         
-        mock_services['mock_pusher_driver_instance'].heartbeat.side_effect = Exception("Network error")
+        # Use AsyncMock specifically with side_effect to ensure it behaves as a coro
+        mock_services['mock_pusher_driver_instance'].heartbeat = AsyncMock(side_effect=Exception("Network error"))
 
         with pytest.raises(Exception, match="Network error"):
             await instance._send_heartbeat()
@@ -291,7 +316,10 @@ class TestSyncInstanceHeartbeat:
         mock_services: dict
     ):
         """Test that heartbeat failures after max_retries sets the sync instance to ERROR state."""
-        mock_services['mock_pusher_driver_instance'].heartbeat.side_effect = DriverError("Heartbeat failed")
+        async def mock_heartbeat_error(*args, **kwargs):
+            raise DriverError("Heartbeat failed")
+            
+        mock_services['mock_pusher_driver_instance'].heartbeat.side_effect = mock_heartbeat_error
         mock_services['mock_pusher_driver_instance'].create_session.return_value = {"session_id": "new_session_id"}
         
         instance = SyncInstance(
