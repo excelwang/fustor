@@ -67,7 +67,6 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 # Generate DeleteEvent for the old path
                 row = {"file_path": del_path}
                 delete_event = DeleteEvent(
-                    schema=self.watch_manager.root_path,
                     event_schema=self.watch_manager.root_path,
                     table="files",
                     rows=[row],
@@ -80,7 +79,6 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 metadata = get_file_metadata(add_path)
                 if metadata:
                     update_event = UpdateEvent(
-                        schema=self.watch_manager.root_path,
                         event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],
@@ -96,7 +94,6 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 # Generate DeleteEvent for the old directory path
                 row = {"file_path": subdir_del_path}
                 delete_event = DeleteEvent(
-                    schema=self.watch_manager.root_path,
                     event_schema=self.watch_manager.root_path,
                     table="files",
                     rows=[row],
@@ -104,12 +101,10 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                     index=int(time.time() * 1000)
                 )
                 self.event_queue.put(delete_event)
-                # No UpdateEvent for directories, touch handles their LRU/watch status
                 # Generate UpdateEvent for the new path
                 metadata = get_file_metadata(subdir_add_path)
                 if metadata:
                     update_event = UpdateEvent(
-                        schema=self.watch_manager.root_path,
                         event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],
@@ -125,7 +120,6 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 metadata = get_file_metadata(event.src_path)
                 if metadata:
                     update_event = UpdateEvent(
-                        schema=self.watch_manager.root_path,
                         event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],
@@ -147,7 +141,6 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 self.watch_manager.unschedule_recursive(event.src_path)
             row = {"file_path": event.src_path}
             delete_event = DeleteEvent(
-                schema=self.watch_manager.root_path,
                 event_schema=self.watch_manager.root_path,
                 table="files",
                 rows=[row],
@@ -173,7 +166,6 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             # Create and queue the delete event for the old location
             delete_row = {"file_path": event.src_path}
             delete_event = DeleteEvent(
-                schema=self.watch_manager.root_path,
                 event_schema=self.watch_manager.root_path,
                 table="files",
                 rows=[delete_row],
@@ -195,7 +187,6 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 metadata = get_file_metadata(event.dest_path)
                 if metadata:
                     update_event = UpdateEvent(
-                        schema=self.watch_manager.root_path,
                         event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],
@@ -229,7 +220,6 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 metadata = get_file_metadata(event.src_path)
                 if metadata:
                     update_event = UpdateEvent(
-                        schema=self.watch_manager.root_path,
                         event_schema=self.watch_manager.root_path,
                         table="files",
                         rows=[metadata],

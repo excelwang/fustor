@@ -16,7 +16,7 @@ import threading
 from typing import Any, Dict, Iterator, List, Tuple
 from fustor_core.drivers import SourceDriver
 from fustor_core.models.config import SourceConfig
-from fustor_event_model.models import EventBase, UpdateEvent, DeleteEvent
+from fustor_event_model.models import EventBase, UpdateEvent, DeleteEvent, MessageSource
 
 from .components import _WatchManager, safe_path_handling
 from .event_handler import OptimizedWatchEventHandler, get_file_metadata
@@ -221,7 +221,7 @@ class FSDriver(SourceDriver):
                                 if len(batch) >= batch_size:
                                     # Extract fields from the first row if batch is not empty
                                     fields = list(batch[0].keys()) if batch else []
-                                    yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields)
+                                    yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields, message_source=MessageSource.SNAPSHOT)
                                     batch = []
                     except (FileNotFoundError, PermissionError, OSError) as e:
                         error_count += 1
@@ -244,12 +244,12 @@ class FSDriver(SourceDriver):
                 if len(batch) >= batch_size:
                     # Extract fields from the first row if batch is not empty
                     fields = list(batch[0].keys()) if batch else []
-                    yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields)
+                    yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields, message_source=MessageSource.SNAPSHOT)
                     batch = []
             
             if batch:
                 fields = list(batch[0].keys()) if batch else []
-                yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields)
+                yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields, message_source=MessageSource.SNAPSHOT)
 
             if error_count > 0:
                 logger.warning(f"[{stream_id}] Skipped {error_count} paths in total due to permission or other errors.")
