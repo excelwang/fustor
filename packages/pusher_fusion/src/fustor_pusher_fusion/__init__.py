@@ -2,7 +2,7 @@
 Fustor Agent Fusion Pusher Driver
 """
 import logging
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from fustor_core.drivers import PusherDriver
 from fustor_core.models.config import PusherConfig
