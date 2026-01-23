@@ -21,6 +21,9 @@ class DatastoreState:
     created_at: datetime = field(default_factory=datetime.now)
     authoritative_session_id: Optional[str] = None
     completed_snapshot_session_id: Optional[str] = None
+    # Leader/Follower: First-Come-First-Serve
+    leader_session_id: Optional[str] = None
+
 
 
 class DatastoreStateManager:
@@ -211,6 +214,69 @@ class DatastoreStateManager:
                 # If no authoritative session is set, any session is considered authoritative for now.
                 return True
             return state.authoritative_session_id == session_id
+
+    # === Leader/Follower Election (First-Come-First-Serve) ===
+    
+    async def try_become_leader(self, datastore_id: int, session_id: str) -> bool:
+        """
+        Try to become the Leader for this datastore.
+        First-Come-First-Serve: only succeeds if no current leader.
+        
+        Returns:
+            True if this session became the Leader, False if already has a Leader
+        """
+        async with self._lock:
+            state = self._states.get(datastore_id)
+            if not state:
+                state = DatastoreState(datastore_id=datastore_id)
+                self._states[datastore_id] = state
+            
+            if state.leader_session_id is None:
+                # No leader yet - this session becomes Leader
+                state.leader_session_id = session_id
+                state.updated_at = datetime.now()
+                logger.info(f"Session {session_id} became Leader for datastore {datastore_id}")
+                return True
+            elif state.leader_session_id == session_id:
+                # Already the leader
+                return True
+            else:
+                # Another session is Leader - this session becomes Follower
+                logger.info(f"Session {session_id} is Follower for datastore {datastore_id} (Leader: {state.leader_session_id})")
+                return False
+    
+    async def release_leader(self, datastore_id: int, session_id: str) -> bool:
+        """
+        Release Leader role when session ends or times out.
+        Only the current Leader can release.
+        """
+        async with self._lock:
+            state = self._states.get(datastore_id)
+            if not state:
+                return False
+            
+            if state.leader_session_id == session_id:
+                state.leader_session_id = None
+                state.updated_at = datetime.now()
+                logger.info(f"Leader {session_id} released for datastore {datastore_id}")
+                return True
+            return False
+    
+    async def is_leader(self, datastore_id: int, session_id: str) -> bool:
+        """Check if a session is the Leader for this datastore."""
+        async with self._lock:
+            state = self._states.get(datastore_id)
+            if not state:
+                return False
+            return state.leader_session_id == session_id
+    
+    async def get_leader_session_id(self, datastore_id: int) -> Optional[str]:
+        """Get the current Leader session ID for a datastore."""
+        async with self._lock:
+            state = self._states.get(datastore_id)
+            if state:
+                return state.leader_session_id
+            return None
 
 # 全局实例
 datastore_state_manager = DatastoreStateManager()

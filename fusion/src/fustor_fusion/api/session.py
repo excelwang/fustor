@@ -119,11 +119,18 @@ async def create_session(
     if not datastore_config.allow_concurrent_push:
         await datastore_state_manager.lock_for_session(datastore_id, session_id)
     
+    # Leader/Follower election (First-Come-First-Serve)
+    is_leader = await datastore_state_manager.try_become_leader(datastore_id, session_id)
+    role = "leader" if is_leader else "follower"
+    
     return {
         "session_id": session_id,
+        "role": role,
+        "is_leader": is_leader,
         "suggested_heartbeat_interval_seconds": max(1, datastore_config.session_timeout_seconds // 2),
         "session_timeout_seconds": datastore_config.session_timeout_seconds
     }
+
 
 @session_router.post("/heartbeat", tags=["Session Management"], summary="会话心跳保活")
 async def heartbeat(
@@ -163,11 +170,14 @@ async def end_session(
         )
     
     await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+    # Release leader role if this session was the leader
+    await datastore_state_manager.release_leader(datastore_id, session_id)
     
     return {
         "status": "ok",
         "message": f"Session {session_id} terminated successfully",
     }
+
 
 @session_router.get("/", tags=["Session Management"], summary="获取活动会话列表")
 async def list_sessions(

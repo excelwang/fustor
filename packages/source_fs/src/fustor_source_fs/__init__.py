@@ -297,6 +297,139 @@ class FSDriver(SourceDriver):
 
         return _iterator_func()
 
+    def get_audit_iterator(self, mtime_cache: Dict[str, float] = None, **kwargs) -> Iterator[EventBase]:
+        """
+        Audit Sync: Fast directory scanning using mtime optimization.
+        
+        Uses directory mtime to skip unchanged subtrees:
+        - If directory mtime hasn't changed since last audit, skip scanning its direct children
+        - Still recurse into subdirectories to check their mtimes
+        
+        Args:
+            mtime_cache: Previous audit's mtime cache {dir_path: mtime}
+            
+        Yields:
+            UpdateEvent with message_source=AUDIT and parent_mtime in each row
+        """
+        stream_id = f"audit-fs-{uuid.uuid4().hex[:6]}"
+        logger.info(f"[{stream_id}] Starting Audit Scan for path: {self.uri}")
+        
+        if mtime_cache is None:
+            mtime_cache = {}
+        
+        new_mtime_cache: Dict[str, float] = {}
+        batch_size = kwargs.get("batch_size", 100)
+        file_pattern = self.config.driver_params.get("file_pattern", "*")
+        audit_time = int(time.time() * 1000)
+        
+        files_scanned = 0
+        dirs_scanned = 0
+        dirs_skipped = 0
+        error_count = 0
+        
+        batch: List[Dict[str, Any]] = []
+        
+        def handle_walk_error(e: OSError):
+            nonlocal error_count
+            error_count += 1
+            logger.debug(f"[{stream_id}] Error during audit walk: {safe_path_handling(e.filename)} - {e.strerror}")
+
+        for root, dirs, files in os.walk(self.uri, topdown=True, onerror=handle_walk_error):
+            try:
+                dir_stat = os.stat(root)
+                current_dir_mtime = dir_stat.st_mtime
+            except OSError:
+                continue
+            
+            new_mtime_cache[root] = current_dir_mtime
+            dirs_scanned += 1
+            
+            # Check if directory mtime changed since last audit
+            cached_mtime = mtime_cache.get(root)
+            if cached_mtime is not None and cached_mtime == current_dir_mtime:
+                # Directory unchanged - skip scanning its direct children files
+                # But we still need to recurse into subdirectories
+                dirs_skipped += 1
+                continue
+            
+            # Directory changed or new - scan all files
+            for filename in files:
+                if not fnmatch.fnmatch(filename, file_pattern):
+                    continue
+                    
+                file_path = os.path.join(root, filename)
+                try:
+                    stat_info = os.stat(file_path)
+                    metadata = get_file_metadata(file_path, stat_info=stat_info)
+                    if metadata:
+                        # Add parent_mtime for Fusion's arbitration
+                        metadata["parent_mtime"] = current_dir_mtime
+                        batch.append(metadata)
+                        files_scanned += 1
+                        
+                        if len(batch) >= batch_size:
+                            fields = list(batch[0].keys()) if batch else []
+                            yield UpdateEvent(
+                                event_schema=self.uri,
+                                table="files",
+                                rows=batch,
+                                index=audit_time,
+                                fields=fields,
+                                message_source=MessageSource.AUDIT
+                            )
+                            batch = []
+                except (FileNotFoundError, PermissionError, OSError) as e:
+                    error_count += 1
+                    logger.debug(f"[{stream_id}] Error processing file: {safe_path_handling(file_path)} - {str(e)}")
+            
+            # Also scan directories in this dir (for metadata updates)
+            for dirname in dirs:
+                dir_path = os.path.join(root, dirname)
+                try:
+                    sub_stat = os.stat(dir_path)
+                    dir_metadata = get_file_metadata(dir_path, stat_info=sub_stat)
+                    if dir_metadata:
+                        dir_metadata["parent_mtime"] = current_dir_mtime
+                        batch.append(dir_metadata)
+                        
+                        if len(batch) >= batch_size:
+                            fields = list(batch[0].keys()) if batch else []
+                            yield UpdateEvent(
+                                event_schema=self.uri,
+                                table="files",
+                                rows=batch,
+                                index=audit_time,
+                                fields=fields,
+                                message_source=MessageSource.AUDIT
+                            )
+                            batch = []
+                except (FileNotFoundError, PermissionError, OSError):
+                    pass
+        
+        # Yield remaining batch
+        if batch:
+            fields = list(batch[0].keys()) if batch else []
+            yield UpdateEvent(
+                event_schema=self.uri,
+                table="files",
+                rows=batch,
+                index=audit_time,
+                fields=fields,
+                message_source=MessageSource.AUDIT
+            )
+        
+        logger.info(
+            f"[{stream_id}] Audit complete. "
+            f"Files scanned: {files_scanned}, Dirs scanned: {dirs_scanned}, "
+            f"Dirs skipped (unchanged): {dirs_skipped}, Errors: {error_count}"
+        )
+        
+        # Return the new cache for next audit cycle
+        # Caller should store this: kwargs['mtime_cache_out'] = new_mtime_cache
+        if 'mtime_cache_out' in kwargs:
+            kwargs['mtime_cache_out'].update(new_mtime_cache)
+
+
     @classmethod
     async def get_available_fields(cls, **kwargs) -> Dict[str, Any]:
         return {"properties": {

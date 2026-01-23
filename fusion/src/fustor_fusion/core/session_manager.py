@@ -106,6 +106,8 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         
                         # Release any associated lock in the datastore state manager
                         await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+                        # Release leader role if this session was the leader
+                        await datastore_state_manager.release_leader(datastore_id, session_id)
                         
                         logger.info(f"Session {session_id} on datastore {datastore_id} expired and removed")
         except asyncio.CancelledError:
@@ -123,6 +125,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     
                     # Release any associated lock in the datastore state manager
                     await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+                    # Release leader role if this session was the leader
+                    await datastore_state_manager.release_leader(datastore_id, session_id)
+
     
     async def get_session_info(self, datastore_id: int, session_id: str) -> Optional[SessionInfo]:
         """
@@ -211,8 +216,11 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     
                     # Release any associated lock in the datastore state manager
                     await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+                    # Release leader role if this session was the leader
+                    await datastore_state_manager.release_leader(datastore_id, session_id)
                     
                     logger.info(f"Session {session_id} on datastore {datastore_id} expired and removed by periodic cleanup")
+
 
     async def terminate_session(self, datastore_id: int, session_id: str) -> bool:
         """
