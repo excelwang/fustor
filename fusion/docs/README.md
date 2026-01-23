@@ -6,7 +6,7 @@ Fusion 是 Fustor 平台的核心存储与查询引擎。它负责接收来自 A
 
 *   **In-Memory Hash Tree**: 针对文件系统层级结构优化的内存索引，支持 $O(1)$ 级节点定位。
 *   **极速序列化**: 集成 `orjson` 引擎，支持百万级元数据的高并发 JSON 输出。
-*   **最终一致性**: 通过异步摄取队列（Ingestion Queue）实现高吞吐写入，并在数据完全入库前通过 503 状态进行保护。
+*   **一致性仲裁**: 通过 Tombstone、Suspect List、Blind-spot List 实现多源数据的智能合并。
 
 ## API 接口参考
 
@@ -57,7 +57,7 @@ Fusion 是 Fustor 平台的核心存储与查询引擎。它负责接收来自 A
 | :--- | :--- | :--- |
 | `session_id` | string | 当前活跃的会话 ID。 |
 | `events` | list | 包含 `UpdateEvent` 或 `DeleteEvent` 的数组。 |
-| `source_type` | string | `snapshot` (全量快照) 或 `message` (实时增量)。 |
+| `message_source` | string | `realtime` / `snapshot` / `audit`。 |
 | `is_snapshot_end`| boolean | 快照结束标志位。 |
 
 ---
@@ -70,7 +70,7 @@ Fusion 是 Fustor 平台的核心存储与查询引擎。它负责接收来自 A
 创建新的同步会话。
 
 *   **参数**: `task_id` (唯一任务标识)。
-*   **特性**: 默认采用互斥模式（同一 Datastore 仅允许一个活跃会话），新会话的建立会自动触发旧会话的清理。
+*   **特性**: 采用 **先到先得 (First-Come-First-Serve)** 模式，第一个建立 Session 的 Agent 成为 Leader。
 
 ---
 
@@ -82,19 +82,24 @@ Fusion 是 Fustor 平台的核心存储与查询引擎。它负责接收来自 A
 2.  **队列就绪**: 内部 `memory_event_queue` 已全部清空。
 3.  **解析就绪**: `ProcessingManager` 中的 Inflight 事件处理数为 0。
 
-### 1. 权威会话锁 (Authoritative Session Lock)
-Fusion 遵循 **“最后启动者权威 (Last-Agent-Wins)”** 机制：
-*   同一 Datastore 仅允许一个 **权威会话 (Authoritative Session)**。
-*   当新的 Agent 启动并建立 Session 时，原有的权威 Session 会被立即标记为 **过时 (Obsolete)**。
-*   Fusion 仅信任来自权威 Session 的快照数据，并以此构建内存索引。
+### 1. Leader 会话锁 (Leader Session Lock)
+Fusion 遵循 **"先到先得 (First-Come-First-Serve)"** 机制：
+*   第一个建立 Session 的 Agent 成为 Leader，拥有 Snapshot/Audit/Sentinel 权限。
+*   后续连接的 Agent 自动成为 Follower，仅执行 Realtime Sync。
+*   仅当 Leader 心跳超时或断开后，Fusion 才释放 Leader 锁。
 
-### 2. 心跳存续依赖 (Heartbeat Availability Dependency)
+### 2. 一致性仲裁 (Consistency Arbitration)
+Fusion 维护以下状态：
+*   **Tombstone List**：记录被 Realtime 删除的文件，防止 Snapshot/Audit 使其"复活"
+*   **Suspect List**：标记可能正在写入的文件 (`integrity_suspect: true`)
+*   **Blind-spot List**：标记在无 Agent 客户端发生变更的文件 (`agent_missing: true`)
+
+仲裁原则：**Realtime 优先，Mtime 仲裁**。详见 `docs/CONSISTENCY_DESIGN.md`。
+
+### 3. 心跳存续依赖 (Heartbeat Availability Dependency)
 为了防止权威 Agent 崩溃导致视图陈旧（Stale Data Risk）：
 *   **硬链接可用性**：一旦权威 Agent 的 **心跳丢失 (Heartbeat Timeout)**，Fusion 必须立即将对应的 Datastore 状态切换为 **503 Service Unavailable**。
 *   **逻辑理由**：心跳丢失意味着实时事件流（inotify）可能已中断，此时 Fusion 看到的树结构不再是对物理事实的准确感知。
-
-### 3. 数据一致性断路器
-若权威 Agent 在后台巡检中发现了热文件差异并发送了异常信号，Fusion 将立即锁定查询 API，直到新的一致性快照完成同步。
 
 ## 性能优化建议
 

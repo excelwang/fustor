@@ -68,12 +68,29 @@ syncs:
 
 ## 数据可靠性保证 (Data Reliability)
 
-Agent 作为一个高效的数据分发管道，遵循 **“先感知、后推送”** 的原则。为了确保 Fusion 获取到的数据均是完整且稳定的，Agent 依赖于 Source Driver 实现以下逻辑：
+Agent 遵循 **"瘦 Agent 感知 + 胖 Fusion 裁决"** 架构。
 
-1.  **静默期过滤**：Driver 必须负责识别并过滤掉处于活跃写入状态的文件元数据。
-2.  **消息补偿**：对于快照扫描期间被跳过的活跃文件，Agent 必须通过实时消息流（如 inotify）进行最终补全推送。
-3.  **状态隔离**：在初始快照完成前，Pusher 应向 Fusion 发送明确的 `source_type='snapshot'` 标识，Fusion 利用此标识通过 503 状态码保护下游查询。
+### Leader/Follower 模式
+
+| 角色 | Realtime Sync | Snapshot Sync | Audit Sync | Sentinel Sweep |
+|------|---------------|---------------|------------|----------------|
+| **Leader** | ✅ | ✅ | ✅ | ✅ |
+| **Follower** | ✅ | ❌ | ❌ | ❌ |
+
+- **先到先得**：第一个建立 Session 的 Agent 成为 Leader
+- **故障转移**：仅当 Leader 心跳超时后，Fusion 才释放 Leader 锁
+
+### 消息类型 (`message_source`)
+
+| 类型 | 说明 |
+|------|------|
+| `realtime` | inotify 事件，优先级最高 |
+| `snapshot` | Agent 启动时全量扫描 |
+| `audit` | 定时审计，发现盲区变更 |
+
+详见 `docs/CONSISTENCY_DESIGN.md`。
 
 ## 更多文档
 
 *   **驱动开发**: 详见 `docs/driver_design.md`
+*   **一致性设计**: 详见 `docs/CONSISTENCY_DESIGN.md`

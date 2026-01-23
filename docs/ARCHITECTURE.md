@@ -10,8 +10,6 @@
 
 ## 2. 服务模块概览
 
-![服务交互图](https://your-image-host.com/fustor-arch.png)  <!-- 占位符，可替换为实际图片 -->
-
 *   **Registry 服务**:
     *   **职责**: 平台的控制平面。负责元数据管理、存储环境、数据存储库 (Datastore)、用户、API Key 和凭据管理。
     *   **核心模块**: `API`, `Database`, `Models`, `Security`。
@@ -19,31 +17,49 @@
 *   **Fusion 服务**:
     *   **职责**: 数据的摄取与处理核心。负责从 Agent 接收数据，维护实时目录树，并提供查询接口。
     *   **核心模块**: `API` (数据摄取), `Processors` (数据处理), `Models`。
+    *   **一致性仲裁**: 通过 Tombstone、Suspect List、Blind-spot List 实现多源数据的智能合并。
 
 *   **Agent 服务**:
     *   **职责**: 轻量级、可扩展的实时数据供给工具。监听数据源变更，并根据 Fusion 的需求将数据推送到指定端点。
     *   **核心模块**: `API`, `Services` (业务逻辑), `Models`, `Drivers` (扩展核心)。
+    *   **Leader/Follower 模式**: 采用"先到先得"的 Leader 选举机制，确保同一数据源只有一个 Agent 执行 Snapshot/Audit。
 
 *   **Packages**:
     *   **职责**: 包含所有可共享的库和插件。
     *   `fustor_common`: 通用工具和模型。
     *   `fustor_core`: 驱动接口定义等核心抽象。
+    *   `fustor_event_model`: 事件模型定义，包含 `message_source` 字段。
     *   `source_*` / `pusher_*`: 具体的源和目标驱动实现。
 
 ## 3. 关键架构模式
 
-### 3.1. Agent: "消息优先，并发快照" 模型
+### 3.1. "瘦 Agent 感知 + 胖 Fusion 裁决"
+
+Agent 负责数据采集和初步过滤，Fusion 负责最终的一致性仲裁：
+
+*   **Agent 职责**: Realtime Sync, Snapshot Sync, Audit Sync, Sentinel Sweep
+*   **Fusion 职责**: 维护内存树，执行 Smart Merge，管理 Tombstone/Suspect/Blind-spot List
+
+详见 [一致性设计 (CONSISTENCY_DESIGN.md)](./CONSISTENCY_DESIGN.md)
+
+### 3.2. Agent: "消息优先，并发快照" 模型
 
 为兼顾最低的实时延迟和历史数据恢复能力，Agent 的所有同步任务均遵循此模型：
 
 1.  **消息优先 (Message-First)**: 任务启动后，总是**立即**进入消息同步阶段，以最低延迟开始处理实时数据流。
-2.  **并发补充快照 (Concurrent Snapshot Backfill)**: 历史数据的全量同步（快照）被设计成一个**补充性质的、并发的**后台任务。它由远端消费者（Fusion）按需请求，并且其执行**不会阻塞**主链路的实时数据同步。
+2.  **并发补充快照 (Concurrent Snapshot Backfill)**: 历史数据的全量同步（快照）被设计成一个**补充性质的、并发的**后台任务。
 
-### 3.2. Agent: 动态负载均衡 (总线分裂)
+### 3.3. Agent: Leader/Follower 模式
 
-当多个同步任务共享一个实时消息总线时（例如，多个任务监听同一个数据库实例），系统能自动检测出消费速度过快的“快消费者”和“慢消费者”。当两者差距过大时，会自动触发“总线分裂”机制，为快消费者创建一条独立的事件总线，避免其被慢消费者拖累，从而实现动态的自我性能优化。
+| 角色 | Realtime Sync | Snapshot Sync | Audit Sync | Sentinel Sweep |
+|------|---------------|---------------|------------|----------------|
+| **Leader** | ✅ | ✅ | ✅ | ✅ |
+| **Follower** | ✅ | ❌ | ❌ | ❌ |
 
-### 3.3. Agent: 内置背压与内存管理
+*   **先到先得**: 第一个建立 Session 的 Agent 成为 Leader
+*   **故障转移**: 仅当 Leader 心跳超时后，Fusion 才释放 Leader 锁
 
-*   **背压处理**: 当数据推送速度跟不上数据生产速度时（例如 Fusion 服务处理变慢），事件总线会自动阻塞生产者，防止因缓冲区溢出导致的数据丢失。
-*   **自动内存管理**：事件总线具备垃圾回收机制，能够自动清理已被所有订阅者消费过的事件数据，有效防止内存泄漏，确保长期稳定运行。
+### 3.4. Agent: 内置背压与内存管理
+
+*   **背压处理**: 当数据推送速度跟不上数据生产速度时，事件总线会自动阻塞生产者，防止因缓冲区溢出导致的数据丢失。
+*   **自动内存管理**：事件总线具备垃圾回收机制，能够自动清理已被所有订阅者消费过的事件数据。

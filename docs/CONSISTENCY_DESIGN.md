@@ -1,47 +1,276 @@
-# Fustor 强一致性设计方案：权威哨兵与 Fusion 双名单核验模式
+# Fustor 一致性设计方案
 
-## 1. 背景与目标
-在 NFS 等环境下，利用 **“瘦 Agent 感知 + 胖 Fusion 裁决”** 架构，实现分布式存储下的感知空洞发现，保障 **“返回即完整、视图即真相”**。
+## 1. 概述
 
-## 2. 核心架构：最后启动者权威制 (Last-Agent-Wins)
+### 1.1 目标场景
 
-### 2.1 权威 Leader 及其生命周期
-1.  **即时夺权**：新 Agent 启动并建立 Session 后，即刻成为 Leader。
-2.  **启动序列**：构建监控列表 -> 发起消息同步 -> 发起 **全量快照同步 (Full Snapshot Sync)**。
-3.  **视图可用性**：视图状态仅取决于“第一次”全量同步的完成。切换 Leader 不会回退可用状态。
-4.  **前任角色转变 (Obsolete as Follower)**：
-    *   **心跳 419**：失效状态必须通过心跳请求返回。
-    *   **Follower 模式**：收到 419 后，Agent 必须强制终止快照同步和 pre-scan，但 **必须保留消息同步任务 (inotify)** ，以确保fusion不会遗漏该agent所在服务器上的文件IO事件。
+多台计算服务器通过 NFS 挂载同一共享目录。部分服务器部署了 Agent，部分没有（盲区）。
 
-## 3. Fusion 状态控制：双名单机制
+```
+                    ┌─────────────────────────────┐
+                    │      Fusion Server          │
+                    │   (中央数据视图 + 一致性裁决)   │
+                    └──────────────┬──────────────┘
+                                   │
+          ┌────────────────────────┼────────────────────────┐
+          │                        │                        │
+    ┌─────▼─────┐            ┌─────▼─────┐            ┌─────▼─────┐
+    │ Server A  │            │ Server B  │            │ Server C  │
+    │  Agent ✅ │            │  Agent ✅ │            │  Agent ❌ │
+    └─────┬─────┘            └─────┬─────┘            └─────┬─────┘
+          │                        │                        │
+          └────────────────────────┼────────────────────────┘
+                                   │
+                    ┌──────────────▼──────────────┐
+                    │     NFS / 共享存储           │
+                    └─────────────────────────────┘
+```
 
-### 3.1 可疑名单 (Suspect List) —— 解决“正在写入”
-*   **来源**：`source_type: "snapshot"` 推送且满足 `Estimated_Storage_Now - mtime < 10min`。
-*   **淘汰**：10 分钟静默期后自动移除，或收到该路径的实时 `message` 消息后立即移除。
+### 1.2 核心挑战
 
-### 3.2 黑洞名单 (Black-hole List) —— 解决“漏掉增删”
-*   **来源**：**仅限**定时全量快照同步 (Timed Snapshot Sync) 任务发现的结构性不一致。
-*   **判定**：物理端已删除/新增，但内存树未感知。
-*   **报告存证**：黑洞记录持续作为感知失效报告。新一轮定时同步开始时清空。
+| 挑战 | 描述 |
+|------|------|
+| **inotify 本地性** | Agent 只能感知本机发起的文件操作 |
+| **NFS 缓存滞后** | 不同客户端看到的目录状态可能有秒级甚至分钟级的延迟 |
+| **感知盲区** | 没有部署 Agent 的节点产生的文件变更无法实时感知 |
+| **时序冲突** | 快照/审计扫描期间发生的实时变更可能导致数据矛盾 |
 
-## 4. 监测机制
+### 1.3 设计目标
 
-### 4.1 权威哨兵巡检 (Sentinel Sweep)
-*   **频率**：2 分钟/次。
-*   **职责**：仅更新可疑名单中文件的 $mtime$。
+| 目标 | 描述 |
+|------|------|
+| **实时性优先** | Realtime 消息具有最高优先级 |
+| **盲区可发现** | 通过定时审计发现盲区变更，并明确标记 |
+| **视图即真相** | Fusion 内存树是经过仲裁后的最终状态 |
+| **IO 可控** | 只有 Leader Agent 执行 Snapshot/Audit |
 
-### 4.2 定时全量快照同步 (Timed Snapshot Sync)
-*   **职责**：全量对齐并向黑洞名单填充结构性差异。
+---
 
-## 5. 技术细节：基于偏移量的逻辑时钟 (Time Offset)
-为了对抗分布式时钟漂移并确保判定连续性，Fusion 维护一个时间偏移量：
-*   **计算**：从实时消息流（Message Sync）中提取 $mtime$，计算 `Offset = mtime - Fusion_Server_Time`。
-*   **映射**：`Estimated_Storage_Now = Fusion_Current_Time + Offset`。
-*   **优势**：即使在消息静默期，随着 Fusion 服务器时间的流逝，逻辑时钟也会自动推进。
+## 2. 架构：Leader/Follower 模式
 
-## 6. API 反馈
-*   **全局级**：`Black-hole List` 不为空时，API 返回 `agent_missing: true`。
-*   **文件级**：`Suspect List` 中的文件标记为 `integrity_suspect: true`。
+### 2.1 角色定义
 
-## 7. 结论
-本方案通过“逻辑时钟偏移量”和“温备 Follower”的设计，不仅解决了时钟对齐和感知一致性问题，还大幅缩短了 Leader 切换时的系统恢复时间，在复杂环境下具备极高的工程可靠性。
+| 角色 | Realtime Sync | Snapshot Sync | Audit Sync | Sentinel Sweep |
+|------|---------------|---------------|------------|----------------|
+| **Leader** | ✅ | ✅ | ✅ | ✅ |
+| **Follower** | ✅ | ❌ | ❌ | ❌ |
+
+### 2.2 Leader 选举
+
+- **先到先得**：第一个建立 Session 的 Agent 成为 Leader
+- **故障转移**：仅当 Leader 心跳超时或断开后，Fusion 才释放 Leader 锁
+
+---
+
+## 3. 消息类型
+
+Agent 向 Fusion 发送的消息分为四类，通过 `message_source` 字段区分：
+
+| 类型 | 来源 | 说明 |
+|------|------|------|
+| `realtime` | inotify 事件 | 单个文件的增删改，优先级最高 |
+| `snapshot` | Agent 启动时全量扫描 | 初始化内存树 |
+| `audit` | 定时审计扫描 | 发现盲区变更 |
+
+### 3.1 Audit 快速扫描算法 (Agent 端)
+
+利用 POSIX 语义：创建/删除文件只更新**直接父目录**的 mtime。
+
+```python
+def audit_directory(dir_path, cache):
+    current_mtime = os.stat(dir_path).st_mtime
+    cached = cache.get(dir_path)
+    
+    # 目录 mtime 未变 → 直接子项无增删，但仍需递归检查子目录
+    if cached and cached.mtime == current_mtime:
+        for child in os.listdir(dir_path):
+            child_path = os.path.join(dir_path, child)
+            if os.path.isdir(child_path):
+                audit_directory(child_path, cache)  # 递归
+        return
+    
+    # 目录 mtime 变了 → 完整扫描
+    for child in os.listdir(dir_path):
+        child_path = os.path.join(dir_path, child)
+        stat = os.stat(child_path)
+        
+        if os.path.isdir(child_path):
+            audit_directory(child_path, cache)
+        else:
+            # 发送 audit 消息
+            send_audit_event(child_path, stat.st_mtime, stat.st_size)
+    
+    cache[dir_path] = CacheEntry(mtime=current_mtime)
+```
+
+### 3.2 Audit 消息格式
+
+Audit 消息复用标准 Event 结构，但必须包含以下额外信息：
+
+```json
+{
+  "message_source": "audit",
+  "event_type": "UPDATE",  // INSERT / UPDATE / DELETE
+  "rows": [
+    {
+      "path": "/data/file.txt",
+      "mtime": 1706000123.0,
+      "size": 10240,
+      "parent_path": "/data",
+      "parent_mtime": 1706000100.0  // 关键：用于 Parent Mtime Check
+    }
+  ]
+}
+```
+
+**关键字段**：
+- `parent_mtime`: 扫描时父目录的 mtime，用于 Fusion 判断消息时效性
+
+---
+
+## 4. 状态管理
+
+Fusion 维护以下状态：
+
+### 4.1 内存树 (Memory Tree)
+
+存储文件/目录的元数据，每个节点包含：
+- `path`: 文件路径
+- `mtime`: 最后修改时间（来自存储系统）
+- `size`: 文件大小
+
+### 4.2 墓碑表 (Tombstone List)
+
+- **用途**：记录被 Realtime 删除的文件，防止滞后的 Snapshot/Audit 使其复活
+- **结构**：`Map<Path, DeleteTime>`
+- **生命周期**：
+  - 创建：处理 Realtime Delete 时
+  - 销毁：收到 `Audit-End` 信号后，清理所有在此次 Audit 开始前创建的 Tombstone
+
+### 4.3 可疑名单 (Suspect List)
+
+- **用途**：标记可能正在写入的文件
+- **来源**：Snapshot/Audit 发现 `(Now - mtime) < 10min` 的文件
+- **淘汰**：静默 10 分钟后移除，或收到 Realtime Update 后移除
+- **API 标记**：`integrity_suspect: true`
+
+### 4.4 盲区名单 (Blind-spot List)
+
+- **用途**：标记在无 Agent 客户端发生变更的文件
+- **来源**：Audit 发现的新增/删除，但不在 Tombstone 中且不是实时新增
+- **清空时机**：每轮 Audit 开始时清空
+- **API 标记**：`agent_missing: true`
+
+---
+
+## 5. 仲裁算法
+
+核心原则：**Realtime 优先，Mtime 仲裁**
+
+### 5.1 Realtime 消息处理
+
+```
+收到 Realtime 消息:
+    if INSERT / UPDATE:
+        → 更新内存树 (覆盖 mtime)
+        → 从 Suspect List 移除
+        → 从 Blind-spot List 移除
+    
+    if DELETE:
+        → 从内存树删除
+        → 加入 Tombstone List
+        → 从 Blind-spot List 移除
+```
+
+### 5.2 Snapshot 消息处理
+
+```
+收到 Snapshot 消息 (文件 X):
+    if X in Tombstone:
+        → 丢弃 (防止僵尸复活)
+    else:
+        → 添加到内存树
+        → 如果 (Now - X.mtime) < 10min: 加入 Suspect List
+```
+
+### 5.3 Audit 消息处理
+
+#### 场景 1: Audit 报告"存在文件 X"
+
+```
+if X in Tombstone:
+    → 丢弃 (僵尸复活)
+
+elif X in 内存树:
+    if Audit.X.mtime > Memory.X.mtime:
+        → 更新内存树 (盲区修改)
+    else:
+        → 丢弃 (Realtime 更新)
+
+else:  # 内存中无 X
+    if Audit.Parent.mtime < Memory.Parent.mtime:
+        → 丢弃 (父目录已更新，X 是旧文件)
+    else:
+        → 添加到内存树
+        → 加入 Blind-spot List (盲区新增)
+        → 如果 (Now - X.mtime) < 10min: 加入 Suspect List
+```
+
+#### 场景 2: Audit 报告"目录 D 缺少文件 B"
+
+```
+if Audit.D.mtime < Memory.D.mtime:
+    → 忽略 (Audit 视图过旧，B 可能是后来创建的)
+
+else:
+    → 从内存树删除 B
+    → 加入 Blind-spot List (盲区删除)
+```
+
+---
+
+## 6. 审计生命周期
+
+为支持 Tombstone 的精确清理，Agent 需发送生命周期信号：
+
+| 信号 | 时机 | Fusion 动作 |
+|------|------|-------------|
+| `Audit-Start` | 审计开始 | 记录 `scan_start_time` |
+| `Audit-End` | 审计结束 | 清理 `create_time < scan_start_time` 的 Tombstone |
+
+---
+
+## 7. 哨兵巡检 (Sentinel Sweep)
+
+- **触发者**：Leader Agent
+- **频率**：2 分钟/次
+- **目的**：更新 Suspect List 中文件的 mtime
+- **消息类型**：`snapshot`
+
+### API (View-Specific)
+
+```
+GET  /api/view/fs/suspect-list?source_id={id}
+PUT  /api/view/fs/suspect-list
+     Body: [{path, current_mtime, status}, ...]
+```
+
+Fusion 收到 PUT 后仅更新 mtime，不执行移除。移除由 TTL 或 Realtime 事件触发。
+
+---
+
+## 8. API 反馈
+
+| 级别 | 条件 | 返回字段 |
+|------|------|----------|
+| 全局级 | Blind-spot List 非空 | `agent_missing: true` |
+| 文件级 | 文件在 Suspect List 中 | `integrity_suspect: true` |
+
+---
+
+## 9. 扩展性要求
+
+所有 Driver 和 Parser 必须支持 `message_source` 字段：
+
+- **Driver**: 能够生成 `realtime`, `snapshot`, `audit` 类型的事件
+- **Parser**: 在 `process_event` 中根据 `message_source` 执行不同的处理逻辑

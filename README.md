@@ -156,4 +156,10 @@ source .venv/bin/activate
 
 ## 🛠️ 开发与贡献
 
-如果您想参与 Fustor 的开发，请参考 `development/DEVELOPER_GUIDE.md`。
+如果您想参与 Fustor 的开发，请参考 `docs/DEVELOPER_GUIDE.md`。
+
+## 📖 深度文档
+
+*   **[架构设计](docs/ARCHITECTURE.md)**: 了解 Fustor 的顶层设计和服务交互。
+*   **[一致性设计](docs/CONSISTENCY_DESIGN.md)**: 了解多 Agent 环境下的数据一致性机制。
+*   **[驱动开发](docs/DRIVER_DEVELOPMENT.md)**: 学习如何为 Agent 编写新的 Source 和 Pusher 插件。
