@@ -65,6 +65,20 @@ class PusherDriver(ABC):
         """
         raise NotImplementedError
 
+    async def get_consistency_tasks(self, **kwargs) -> Optional[Dict[str, Any]]:
+        """
+        Optional: Queries the pusher/upstream for any data consistency verification tasks.
+        Returns a dictionary containing the tasks (e.g. {'type': 'suspect_check', 'payload': ...}).
+        Returns None if no tasks are pending.
+        """
+        return None
+
+    async def submit_consistency_results(self, results: Dict[str, Any], **kwargs) -> bool:
+        """
+        Optional: Submits the results of a consistency check back to the pusher/upstream.
+        """
+        return False
+
     async def signal_audit_start(self, source_id: Any) -> bool:
         """
         Optional: Signals the start of an audit cycle.
@@ -186,7 +200,19 @@ class SourceDriver(ABC):
 
         Default implementation returns an empty iterator, meaning no audit is performed.
         """
-        return iter([])
+    def perform_consistency_check(self, task_batch: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Optional: Performs a consistency check based on the provided task batch.
+        
+        Args:
+            task_batch (Dict[str, Any]): The tasks to verify, e.g., {'type': 'suspect_check', 'paths': [...]}.
+
+        Returns:
+            Dict[str, Any]: The verification results.
+        
+        Default implementation returns empty dict.
+        """
+        return {}
 
     async def close(self):
         """

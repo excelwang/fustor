@@ -431,6 +431,18 @@ class FSDriver(SourceDriver):
 
 
 
+    def perform_consistency_check(self, task_batch: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Implements generic consistency check.
+        Supported types: 'suspect_check'
+        """
+        task_type = task_batch.get('type')
+        if task_type == 'suspect_check':
+             paths = task_batch.get('paths', [])
+             results = self.verify_files(paths)
+             return {'type': 'suspect_update', 'updates': results}
+        return {}
+
     def verify_files(self, paths: List[str]) -> List[Dict[str, Any]]:
         """
         Verifies the existence and mtime of the given file paths.

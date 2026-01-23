@@ -206,7 +206,7 @@ class SyncInstance:
             if role == "leader":
                  logger.info(f"Assigned LEADER role for {self.id}. Starting Audit and Sentinel tasks.")
                  self._audit_task = asyncio.create_task(self._run_audit_loop())
-                 self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
+                 self._sentinel_task = asyncio.create_task(self._run_consistency_check_loop())
                  tasks_to_wait.append(self._audit_task)
                  tasks_to_wait.append(self._sentinel_task)
             
@@ -319,59 +319,51 @@ class SyncInstance:
                 logger.error(f"Error in audit_loop for {self.id}: {e}", exc_info=True)
                 await asyncio.sleep(60) # Backoff
 
-    async def _run_sentinel_loop(self):
-        logger.info(f"开启哨兵循环 sentinel_loop for {self.id}, interval={self.sentinel_interval}s")
+    async def _run_consistency_check_loop(self):
+        logger.info(f"开启一致性检查循环 consistency_check_loop for {self.id}, interval={self.sentinel_interval}s")
         while True:
             try:
                 await asyncio.sleep(self.sentinel_interval)
-                await self._run_sentinel_sweep()
+                await self._run_consistency_check()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in sentinel_loop for {self.id}: {e}", exc_info=True)
+                logger.error(f"Error in consistency_check_loop for {self.id}: {e}", exc_info=True)
                 await asyncio.sleep(60)
 
-    async def _run_sentinel_sweep(self):
-        if self.state & SyncState.SENTINEL_SWEEP:
-            logger.warning(f"Sentinel sweep for {self.id} already running, skipping.")
+    async def _run_consistency_check(self):
+        if self.state & SyncState.SENTINEL_SWEEP: # Keep using this state flag for now or rename? 
+            # Reusing SENTINEL_SWEEP state for generic consistency check is fine as it semantically maps.
+            logger.warning(f"Consistency check (Sentinel) for {self.id} already running, skipping.")
             return
 
         self.state |= SyncState.SENTINEL_SWEEP
         try:
-            # We assume pusher driver has get_suspect_list (added via update)
-            # and source driver has verify_files
-            if not hasattr(self.pusher_driver_instance, 'get_suspect_list'):
-                 logger.debug("Pusher driver does not support get_suspect_list, skipping sentinel.")
+             # 1. Ask Pusher for tasks (Generic)
+             tasks = await self.pusher_driver_instance.get_consistency_tasks(source_id=self.config.source)
+             
+             if not tasks:
                  return
 
-            # Note: config.source is the ID. But get_suspect_list expects source_id which is integer in API?
-            # Fusion API expects integer ID?
-            # The SyncConfig.source is a string (ID). The Fusion backend uses integers.
-            # Usually SourceDriver needs to know its Fusion ID?
-            # Actually get_datastore_id_from_api_key handles context. 
-            # `get_suspect_list` param is `source_id`. This might be the string ID from config?
-            # Let's check FusionClient.
-            # It sends `params={"source_id": source_id}`.
-            # In docs, `source_id={id}`. 
-            # If the source string ID from config matches what Fusion expects, we are good.
-            # Assuming config.source is the correct ID.
-            
-            suspects = await self.pusher_driver_instance.get_suspect_list(self.config.source)
-            if not suspects:
-                return
+             # 2. Ask Source to execute (Generic)
+             # Run in thread as source drivers might be blocking (like FS OS operations)
+             if hasattr(self.source_driver_instance, 'perform_consistency_check'):
+                 results = await asyncio.to_thread(
+                     self.source_driver_instance.perform_consistency_check, 
+                     tasks
+                 )
+             else:
+                 logger.debug("Source driver does not support perform_consistency_check.")
+                 results = {}
 
-            paths = [item['path'] for item in suspects if 'path' in item]
-            if not paths:
-                return
+             if not results:
+                 return
 
-            if hasattr(self.source_driver_instance, 'verify_files'):
-                verification_results = await asyncio.to_thread(self.source_driver_instance.verify_files, paths)
-                await self.pusher_driver_instance.update_suspect_list(verification_results)
-            else:
-                logger.debug("Source driver does not support verify_files, skipping sentinel check.")
+             # 3. Report Results (Generic)
+             await self.pusher_driver_instance.submit_consistency_results(results)
 
         except Exception as e:
-            logger.error(f"Sentinel sweep failed for {self.id}: {e}")
+            logger.error(f"Consistency check failed for {self.id}: {e}")
         finally:
              self.state &= ~SyncState.SENTINEL_SWEEP
 
@@ -382,8 +374,10 @@ class SyncInstance:
         self.state |= SyncState.AUDIT_SYNC
         logger.info(f"Audit sync started for {self.id}")
         
-        if hasattr(self.pusher_driver_instance, 'signal_audit_start'):
-            await self.pusher_driver_instance.signal_audit_start(self.config.source)
+        try:
+            await self.pusher_driver_instance.send_command('signal_audit_start', source_id=self.config.source)
+        except NotImplementedError:
+             pass
 
         # Prepare for threaded execution
         snapshot_completed_successfully = False
@@ -441,8 +435,10 @@ class SyncInstance:
                 if next_cache:
                     self.audit_mtime_cache = next_cache # Update cache only on success
                 
-                if hasattr(self.pusher_driver_instance, 'signal_audit_end'):
-                    await self.pusher_driver_instance.signal_audit_end(self.config.source)
+                try:
+                    await self.pusher_driver_instance.send_command('signal_audit_end', source_id=self.config.source)
+                except NotImplementedError:
+                    pass
                     
                 logger.info(f"Audit sync completed for {self.id}")
 
