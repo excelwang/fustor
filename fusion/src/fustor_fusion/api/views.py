@@ -36,16 +36,30 @@ async def check_snapshot_status(datastore_id: int):
             detail=detail
         )
 
-@parser_router.get("/fs/tree", summary="Get directory tree structure", response_class=ORJSONResponse)
+@parser_router.get("/fs/tree", 
+    summary="获取文件系统树结构", 
+    description="""
+    获取指定路径下的目录树结构。支持高度自定义的查询参数：
+    
+    *   **path**: 目标路径，默认为根目录 ('/')。
+    *   **recursive**: 是否递归获取子目录。
+    *   **max_depth**: 限制递归深度。若设置，将忽略 recursive 参数并执行带深度限制的递归。
+    *   **only_path**: 极简模式，仅返回路径结构，剔除 size, timestamps 等元数据，适用于大规模数据快速检索。
+    *   **dry_run**: 压力测试模式，不执行查询逻辑，直接返回 200，用于测量网络开销。
+    
+    **注意**: 在 Datastore 初始快照同步完成前，此接口返回 503。
+    """,
+    response_class=ORJSONResponse
+)
 async def get_directory_tree_api(
-    path: str = Query("/", description="Directory path to retrieve (default: '/')"),
-    recursive: bool = Query(True, description="Whether to recursively retrieve the entire subtree"),
-    max_depth: Optional[int] = Query(None, description="Maximum depth of recursion"),
-    only_path: bool = Query(False, description="Return only paths, excluding metadata like size and timestamps"),
-    dry_run: bool = Query(False, description="If true, skips processing to measure network/framework latency"),
+    path: str = Query("/", description="要检索的目录路径 (默认: '/')"),
+    recursive: bool = Query(True, description="是否递归检索子目录"),
+    max_depth: Optional[int] = Query(None, description="最大递归深度 (1 表示仅当前目录及其直接子级)"),
+    only_path: bool = Query(False, description="是否仅返回路径结构，排除元数据"),
+    dry_run: bool = Query(False, description="压测模式：跳过逻辑处理以测量框架延迟"),
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Optional[Dict[str, Any]]:
-    """Get the directory structure tree starting from the specified path."""
+    """获取指定路径起始的目录结构树。"""
     await check_snapshot_status(datastore_id)
     
     if dry_run:
@@ -56,15 +70,24 @@ async def get_directory_tree_api(
     result = await get_directory_tree(path, datastore_id=datastore_id, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
     
     if result is None:
-        return ORJSONResponse(content={"detail": "Not found"}, status_code=404)
+        return ORJSONResponse(content={"detail": "路径未找到或尚未同步"}, status_code=404)
     return ORJSONResponse(content=result)
 
-@parser_router.get("/fs/search", summary="Search for files by pattern")
+@parser_router.get("/fs/search", 
+    summary="基于模式搜索文件", 
+    description="""
+    在当前 Datastore 的内存树中搜索匹配给定模式的文件。
+    
+    *   支持包含星号 (*) 的模糊匹配。
+    *   搜索是全局性的，不局限于当前目录。
+    *   返回包含完整元数据的文件列表。
+    """
+)
 async def search_files_api(
-    pattern: str = Query(..., description="Search pattern to match in file paths"),
+    pattern: str = Query(..., description="要搜索的路径匹配模式 (例如: '*.log' 或 '/data/res*')"),
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> list:
-    """Search for files matching the specified pattern."""
+    """搜索匹配模式的文件。"""
     await check_snapshot_status(datastore_id)
     logger.info(f"API request for file search: pattern={pattern}, datastore_id={datastore_id}")
     result = await search_files(pattern, datastore_id=datastore_id)
@@ -72,11 +95,22 @@ async def search_files_api(
     return result
 
 
-@parser_router.get("/fs/stats", summary="Get statistics about the directory structure")
+@parser_router.get("/fs/stats", 
+    summary="获取文件系统统计指标", 
+    description="""
+    获取当前汇总的存储统计信息，包括：
+    
+    *   **total_files**: 总文件数。
+    *   **total_directories**: 总目录数。
+    *   **total_size**: 累计文件大小。
+    *   **last_event_latency_ms**: 最近处理的一个事件从产生到解析完成的物理延迟。
+    *   **oldest_directory**: 包含最陈旧数据的目录信息（用于评估同步延迟）。
+    """
+)
 async def get_directory_stats_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Dict[str, Any]:
-    """Get statistics about the current directory structure."""
+    """获取当前目录结构的统计信息。"""
     await check_snapshot_status(datastore_id)
     logger.info(f"API request for directory stats: datastore_id={datastore_id}")
     result = await get_directory_stats(datastore_id=datastore_id)
