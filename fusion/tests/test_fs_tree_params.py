@@ -85,7 +85,7 @@ async def setup_data():
 @pytest.mark.asyncio
 async def test_tree_default_recursive(client):
     """测试默认参数（递归返回全量树）"""
-    response = await client.get("/views/fs/tree", params={"path": "/"})
+    response = await client.get("/api/v1/views/fs/tree", params={"path": "/"})
     assert response.status_code == 200
     data = response.json()
     
@@ -105,7 +105,7 @@ async def test_tree_default_recursive(client):
 @pytest.mark.asyncio
 async def test_tree_non_recursive(client):
     """测试 recursive=false（仅返回直接子级列表）"""
-    response = await client.get("/views/fs/tree", params={"path": "/", "recursive": "false"})
+    response = await client.get("/api/v1/views/fs/tree", params={"path": "/", "recursive": "false"})
     assert response.status_code == 200
     data = response.json()
     
@@ -125,7 +125,7 @@ async def test_tree_non_recursive(client):
 @pytest.mark.asyncio
 async def test_tree_max_depth_1(client):
     """测试 max_depth=1 (只包含第一层子节点，不向下递归)"""
-    response = await client.get("/views/fs/tree", params={"path": "/", "max_depth": 1})
+    response = await client.get("/api/v1/views/fs/tree", params={"path": "/", "max_depth": 1})
     assert response.status_code == 200
     data = response.json()
     
@@ -139,7 +139,7 @@ async def test_tree_max_depth_1(client):
 @pytest.mark.asyncio
 async def test_tree_max_depth_2(client):
     """测试 max_depth=2"""
-    response = await client.get("/views/fs/tree", params={"path": "/", "max_depth": 2})
+    response = await client.get("/api/v1/views/fs/tree", params={"path": "/", "max_depth": 2})
     assert response.status_code == 200
     data = response.json()
     
@@ -156,7 +156,7 @@ async def test_tree_max_depth_2(client):
 @pytest.mark.asyncio
 async def test_tree_only_path(client):
     """测试 only_path=true (剔除元数据)"""
-    response = await client.get("/views/fs/tree", params={"path": "/", "only_path": "true"})
+    response = await client.get("/api/v1/views/fs/tree", params={"path": "/", "only_path": "true"})
     assert response.status_code == 200
     data = response.json()
     
@@ -175,7 +175,7 @@ async def test_tree_only_path(client):
 @pytest.mark.asyncio
 async def test_tree_combined_params(client):
     """测试组合参数: max_depth=1 + only_path=true"""
-    response = await client.get("/views/fs/tree", params={
+    response = await client.get("/api/v1/views/fs/tree", params={
         "path": "/", 
         "max_depth": 1,
         "only_path": "true"

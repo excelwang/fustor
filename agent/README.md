@@ -42,8 +42,8 @@ pushers:
   - id: "to-fusion"            # 唯一 ID
     type: "fusion"             # 驱动类型
     config:
-      # Fusion 服务的 Ingest API 地址
-      endpoint: "http://localhost:8102/ingestor-api/v1/events"
+      # Fusion 服务的 Ingest API 基准地址
+      endpoint: "http://localhost:8102"
       # 从 Registry 获取的 API Key，用于鉴权
       credential: "YOUR_API_KEY_HERE"
 ```

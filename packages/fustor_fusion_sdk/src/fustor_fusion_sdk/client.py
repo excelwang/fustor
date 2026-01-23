@@ -44,7 +44,7 @@ class FusionClient:
         try:
             # Sanitize task_id to handle any surrogate characters before JSON serialization
             payload = {"task_id": task_id}
-            response = await self.client.post("/ingestor-api/v1/sessions/", json=payload)
+            response = await self.client.post("/api/v1/ingest/sessions/", json=payload)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -59,7 +59,7 @@ class FusionClient:
         Retrieves generic sentinel tasks (e.g. suspect checks).
         """
         try:
-            response = await self.client.get(f"/ingestor-api/v1/consistency/sentinel/tasks")
+            response = await self.client.get(f"/api/v1/ingest/consistency/sentinel/tasks")
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -71,7 +71,7 @@ class FusionClient:
         Submits feedback for sentinel tasks.
         """
         try:
-            response = await self.client.post("/ingestor-api/v1/consistency/sentinel/feedback", json=feedback)
+            response = await self.client.post("/api/v1/ingest/consistency/sentinel/feedback", json=feedback)
             response.raise_for_status()
             return True
         except Exception as e:
@@ -94,7 +94,7 @@ class FusionClient:
                 "source_type": sanitized_source_type,
                 "is_snapshot_end": is_snapshot_end
             }
-            response = await self.client.post("/ingestor-api/v1/events/", json=payload)
+            response = await self.client.post("/api/v1/ingest/events/", json=payload)
             response.raise_for_status()
             return True
         except httpx.HTTPStatusError as e:
@@ -111,7 +111,7 @@ class FusionClient:
         """
         try:
             headers = {"session-id": session_id}
-            response = await self.client.post("/ingestor-api/v1/sessions/heartbeat", headers=headers)
+            response = await self.client.post("/api/v1/ingest/sessions/heartbeat", headers=headers)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -125,7 +125,7 @@ class FusionClient:
         """Signals the start of an audit cycle."""
         try:
              # Updated to new consistency API path
-             response = await self.client.post("/ingestor-api/v1/consistency/audit/start")
+             response = await self.client.post("/api/v1/ingest/consistency/audit/start")
              response.raise_for_status()
              return True
         except Exception as e:
@@ -136,7 +136,7 @@ class FusionClient:
         """Signals the end of an audit cycle."""
         try:
              # Updated to new consistency API path
-             response = await self.client.post("/ingestor-api/v1/consistency/audit/end")
+             response = await self.client.post("/api/v1/ingest/consistency/audit/end")
              response.raise_for_status()
              return True
         except Exception as e:

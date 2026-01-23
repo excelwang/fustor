@@ -37,7 +37,7 @@ async def test_readiness_logic_full_chain(client_override):
     await memory_event_queue.clear_datastore_data(ds_id)
     
     # 状态 1: 没有任何信号 -> 503
-    res = await client_override.get("/views/fs/tree")
+    res = await client_override.get("/api/v1/views/fs/tree")
     assert res.status_code == 503
     assert "sync in progress" in res.json()["detail"]
 
@@ -52,7 +52,7 @@ async def test_readiness_logic_full_chain(client_override):
     )
     await memory_event_queue.add_event(ds_id, fake_event)
     
-    res = await client_override.get("/views/fs/tree")
+    res = await client_override.get("/api/v1/views/fs/tree")
     assert res.status_code == 503
     # 检查日志（模拟判定逻辑）
     assert memory_event_queue.get_queue_size(ds_id) == 1
@@ -63,13 +63,13 @@ async def test_readiness_logic_full_chain(client_override):
     
     # 模拟 ProcessingManager 正在工作
     with patch.object(processing_manager, "get_inflight_count", return_value=5):
-        res = await client_override.get("/views/fs/tree")
+        res = await client_override.get("/api/v1/views/fs/tree")
         assert res.status_code == 503
         assert "still processing" in res.text.lower()
 
     # 状态 4: 全部完成 -> 200
     with patch.object(processing_manager, "get_inflight_count", return_value=0):
-        res = await client_override.get("/views/fs/tree")
+        res = await client_override.get("/api/v1/views/fs/tree")
         assert res.status_code == 200
 
 @pytest.mark.asyncio

@@ -42,7 +42,7 @@ def run_single_fusion_req(url, headers, path, dry_run=False, dry_net=False):
             params = {"path": path}
             if dry_run:
                 params["dry_run"] = "true"
-            res = requests.get(f"{url}/views/fs/tree", params=params, headers=headers, timeout=10)
+            res = requests.get(f"{url}/api/v1/views/fs/tree", params=params, headers=headers, timeout=10)
         if res.status_code != 200: return None
     except Exception: return None
     return time.time() - start

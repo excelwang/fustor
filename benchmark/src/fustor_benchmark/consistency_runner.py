@@ -31,7 +31,7 @@ class ConsistencyRunner:
                 # Simple implementation: we just list root and look for file. 
                 # Bench tests are flat usually.
                 
-                res = requests.get(f"{url}/views/fs/tree", 
+                res = requests.get(f"{url}/api/v1/views/fs/tree", 
                                    params={"path": search_api_path, "max_depth": 1}, 
                                    headers={"X-API-Key": api_key},
                                    timeout=2)

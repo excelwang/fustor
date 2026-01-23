@@ -78,17 +78,28 @@ async def lifespan(app: FastAPI):
 # 实例化
 app = FastAPI(lifespan=lifespan)
 
+# --- API Routing Version 1 ---
 from .api.ingestion import ingestion_router
 from .api.session import session_router
 from .api.consistency import consistency_router
 
-router_v1 = APIRouter()
-router_v1.include_router(session_router, prefix="/sessions")
-router_v1.include_router(ingestion_router, prefix="/events")
-router_v1.include_router(consistency_router)
+# Core versioned router
+api_v1 = APIRouter()
 
-app.include_router(router_v1, prefix="/ingestor-api/v1", tags=["v1"])
-app.include_router(parser_router, prefix="/views", tags=["Views"])
+# 1. Ingestion Domain (/api/v1/ingest)
+ingest_api = APIRouter(prefix="/ingest")
+ingest_api.include_router(session_router, prefix="/sessions")
+ingest_api.include_router(ingestion_router, prefix="/events")
+ingest_api.include_router(consistency_router) # already has /consistency prefix
+
+api_v1.include_router(ingest_api)
+
+# 2. View Domain (/api/v1/views)
+api_v1.include_router(parser_router, prefix="/views")
+
+# Register the unified v1 router
+app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
+
 
 ui_dir = os.path.dirname(__file__)
 

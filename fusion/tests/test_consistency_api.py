@@ -27,7 +27,7 @@ async def test_audit_start_endpoint(mock_parser_manager):
     mock_parser_manager.get_file_directory_parser.return_value = mock_parser
 
     # Call API
-    response = client.post("/ingestor-api/v1/consistency/audit/start")
+    response = client.post("/api/v1/ingest/consistency/audit/start")
     
     assert response.status_code == 200
     assert response.json() == {"status": "audit_started"}
@@ -48,7 +48,7 @@ async def test_audit_end_endpoint(mock_parser_manager):
     mock_parser_manager.get_file_directory_parser.return_value = mock_parser
 
     # Call API
-    response = client.post("/ingestor-api/v1/consistency/audit/end")
+    response = client.post("/api/v1/ingest/consistency/audit/end")
     
     assert response.status_code == 200
     assert response.json() == {"status": "audit_ended"}
@@ -65,7 +65,7 @@ async def test_sentinel_tasks_endpoint(mock_parser_manager):
     # Mock suspect list return
     mock_parser.get_suspect_list.return_value = {"/foo/bar": 12345.0}
 
-    response = client.get("/ingestor-api/v1/consistency/sentinel/tasks")
+    response = client.get("/api/v1/ingest/consistency/sentinel/tasks")
     
     assert response.status_code == 200
     expected = {
@@ -84,7 +84,7 @@ async def test_sentinel_feedback_endpoint(mock_parser_manager):
         "type": "suspect_update",
         "updates": [{"path": "/foo", "mtime": 123}]
     }
-    response = client.post("/ingestor-api/v1/consistency/sentinel/feedback", json=payload)
+    response = client.post("/api/v1/ingest/consistency/sentinel/feedback", json=payload)
     
     assert response.status_code == 200
     assert response.json() == {"status": "processed", "count": 1}
