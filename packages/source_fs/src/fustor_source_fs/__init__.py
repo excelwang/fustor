@@ -430,6 +430,31 @@ class FSDriver(SourceDriver):
             kwargs['mtime_cache_out'].update(new_mtime_cache)
 
 
+
+    def verify_files(self, paths: List[str]) -> List[Dict[str, Any]]:
+        """
+        Verifies the existence and mtime of the given file paths.
+        Used for Sentinel Sweep.
+        """
+        results = []
+        for path in paths:
+            try:
+                stat_info = os.stat(path)
+                results.append({
+                    "path": path,
+                    "mtime": stat_info.st_mtime,
+                    "status": "exists"
+                })
+            except FileNotFoundError:
+                results.append({
+                    "path": path,
+                    "mtime": 0.0,
+                    "status": "missing"
+                })
+            except Exception as e:
+                logger.warning(f"[fs] Error verifying file {path}: {e}")
+        return results
+
     @classmethod
     async def get_available_fields(cls, **kwargs) -> Dict[str, Any]:
         return {"properties": {

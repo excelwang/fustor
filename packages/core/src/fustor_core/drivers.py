@@ -61,9 +61,21 @@ class PusherDriver(ABC):
     async def create_session(self, task_id: str) -> str:
         """
         Creates a new session with the pusher endpoint.
-        Returns the session ID string.
+        Returns the session ID string (or dict with session details).
         """
         raise NotImplementedError
+
+    async def signal_audit_start(self, source_id: Any) -> bool:
+        """
+        Optional: Signals the start of an audit cycle.
+        """
+        return False
+
+    async def signal_audit_end(self, source_id: Any) -> bool:
+        """
+        Optional: Signals the end of an audit cycle.
+        """
+        return False
 
     async def close(self):
         """
@@ -163,6 +175,18 @@ class SourceDriver(ABC):
             Iterator[EventBase]: An iterator that yields new events.
         """
         raise NotImplementedError
+
+    def get_audit_iterator(self, **kwargs) -> Iterator[EventBase]:
+        """
+        Optional: Performs a consistency audit of the source data.
+        
+        This method returns an iterator that yields events representing the current state,
+        similar to snapshot but used for periodic consistency checks and 'blind-spot' detection.
+        Unlike snapshot, audit events typically include message_source='audit'.
+
+        Default implementation returns an empty iterator, meaning no audit is performed.
+        """
+        return iter([])
 
     async def close(self):
         """

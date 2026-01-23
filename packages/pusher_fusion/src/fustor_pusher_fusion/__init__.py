@@ -21,14 +21,26 @@ class FusionDriver(PusherDriver):
 
     async def create_session(self, task_id: str) -> Dict:
         self.logger.info(f"Creating session for task {task_id}...")
-        session_id = await self.fusion_client.create_session(task_id)
-        if session_id:
-            self.session_id = session_id
-            self.logger.info(f"Session created successfully: {session_id}")
-            return {"session_id": session_id}
+        session_data = await self.fusion_client.create_session(task_id)
+        if session_data and session_data.get("session_id"):
+            self.session_id = session_data["session_id"]
+            self.logger.info(f"Session created successfully: {self.session_id}, Role: {session_data.get('role')}")
+            return session_data
         else:
             self.logger.error("Failed to create session.")
             raise RuntimeError("Failed to create session with Fusion service.")
+
+    async def get_suspect_list(self, source_id: int) -> List[Dict]:
+        return await self.fusion_client.get_suspect_list(source_id)
+
+    async def update_suspect_list(self, updates: List[Dict]) -> bool:
+        return await self.fusion_client.update_suspect_list(updates)
+
+    async def signal_audit_start(self, source_id: int) -> bool:
+        return await self.fusion_client.signal_audit_start(source_id)
+
+    async def signal_audit_end(self, source_id: int) -> bool:
+        return await self.fusion_client.signal_audit_end(source_id)
 
     async def push(self, events: List[EventBase], **kwargs) -> Dict:
         if not self.session_id:

@@ -16,7 +16,7 @@ from ..processing_manager import processing_manager
 from ..queue_integration import queue_based_ingestor, add_events_batch_to_queue, get_position_from_queue, update_position_in_queue
 from fustor_event_model.models import EventBase, EventType # Import EventBase and EventType
 
-from ..parsers.manager import ParserManager, get_directory_stats # CORRECTED
+from ..parsers.manager import ParserManager, get_directory_stats, get_cached_parser_manager # CORRECTED
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -158,8 +158,14 @@ async def ingest_event_batch(
 
     # Handle snapshot end signal
     if payload.is_snapshot_end:
-        logger.info(f"Received snapshot end signal for datastore {datastore_id} from session {payload.session_id}")
-        await datastore_state_manager.set_snapshot_complete(datastore_id, payload.session_id)
+        logger.info(f"Received end signal for source_type={payload.source_type} for datastore {datastore_id}")
+        if payload.source_type == 'audit':
+            manager = await get_cached_parser_manager(datastore_id)
+            parser = await manager.get_file_directory_parser()
+            if parser:
+                await parser.handle_audit_end()
+        else:
+            await datastore_state_manager.set_snapshot_complete(datastore_id, payload.session_id)
 
     try:
         if payload.events:
@@ -176,13 +182,24 @@ async def ingest_event_batch(
                 fields = event_dict.get("fields", list(rows[0].keys()) if rows else [])
 
                 # Create EventBase object
+                # Extract message_source from the dict (it might be in the dict or we infer it from source_type)
+                # But typically event dict from Agent includes 'message_source'
+                msg_source = event_dict.get("message_source")
+                if not msg_source and payload.source_type == 'audit':
+                     msg_source = MessageSource.AUDIT
+                elif not msg_source and payload.source_type == 'snapshot':
+                     msg_source = MessageSource.SNAPSHOT
+                elif not msg_source:
+                     msg_source = MessageSource.REALTIME
+                
                 event_obj = EventBase(
                     event_type=event_type,
                     event_schema=event_schema, # Use event_schema
                     table=table,
                     index=index,
                     rows=rows,
-                    fields=fields
+                    fields=fields,
+                    message_source=msg_source
                 )
                 event_objects_to_add.append(event_obj)
 

@@ -247,6 +247,11 @@ class DirectoryStructureParser:
         
         is_realtime = (message_source == MessageSource.REALTIME)
         is_audit = (message_source == MessageSource.AUDIT)
+        
+        # Auto-detect audit start time from the first audit event
+        if is_audit and self._last_audit_start is None and event.index > 0:
+            self._last_audit_start = event.index / 1000.0
+            self.logger.info(f"Auto-detected Audit Start time: {self._last_audit_start} from event index {event.index}")
 
         async with self._lock:
             for payload in event.rows:

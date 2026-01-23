@@ -55,6 +55,9 @@ class SyncInstance:
         self.metrics: Dict[str, Any] = {"events_pushed_total": 0, "sync_push_latency_seconds": []}
 
         self._snapshot_task: Optional[asyncio.Task] = None
+        self._audit_task: Optional[asyncio.Task] = None
+        self._sentinel_task: Optional[asyncio.Task] = None
+        self.audit_mtime_cache: Dict[str, float] = {}
         
         # Heartbeat-related attributes
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -62,6 +65,8 @@ class SyncInstance:
         self._heartbeat_error_event = asyncio.Event()  # Event to signal heartbeat error
         self._last_active_time = datetime.now(timezone.utc)
         self.heartbeat_interval: int = 10  # Default heartbeat interval
+        self.audit_interval: int = 600 # 10 minutes default
+        self.sentinel_interval: int = 120 # 2 minutes default
 
         self._fast_mapper_fn = self._compile_mapper_function()
 
@@ -180,9 +185,10 @@ class SyncInstance:
             # First, request a session from the Ingestor via the pusher driver
             session_data = await self.pusher_driver_instance.create_session(self.task_id)
             self.session_id = session_data.get("session_id")
+            role = session_data.get("role", "follower")
             self.heartbeat_interval = session_data.get("suggested_heartbeat_interval_seconds", 10)
             
-            logger.info(f"任务 '{self.id}' 正在启动，已从Ingestor获取会话 ID: {self.session_id}")
+            logger.info(f"任务 '{self.id}' 正在启动，已从Ingestor获取会话 ID: {self.session_id}, Role: {role}")
             
             self._set_state(SyncState.STARTING, "正在向接收端查询最新同步点位...")
             start_position = await self.pusher_driver_instance.get_latest_committed_index(session_id=self.session_id)
@@ -194,10 +200,19 @@ class SyncInstance:
             # Create tasks for monitoring heartbeat errors and message sync
             heartbeat_error_task = asyncio.create_task(self._monitor_heartbeat_errors())
             message_sync_task = asyncio.create_task(self._run_message_sync(start_position))
+
+            tasks_to_wait = [heartbeat_error_task, message_sync_task, self._heartbeat_task]
+            
+            if role == "leader":
+                 logger.info(f"Assigned LEADER role for {self.id}. Starting Audit and Sentinel tasks.")
+                 self._audit_task = asyncio.create_task(self._run_audit_loop())
+                 self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
+                 tasks_to_wait.append(self._audit_task)
+                 tasks_to_wait.append(self._sentinel_task)
             
             # Wait for any of the tasks to complete
             done, pending = await asyncio.wait(
-                [heartbeat_error_task, message_sync_task, self._heartbeat_task],
+                tasks_to_wait,
                 return_when=asyncio.FIRST_COMPLETED
             )
             
@@ -259,6 +274,20 @@ class SyncInstance:
                     await self._snapshot_task
                 except asyncio.CancelledError:
                     pass
+
+            if self._audit_task and not self._audit_task.done():
+                self._audit_task.cancel()
+                try:
+                    await self._audit_task
+                except asyncio.CancelledError:
+                    pass
+
+            if self._sentinel_task and not self._sentinel_task.done():
+                self._sentinel_task.cancel()
+                try:
+                    await self._sentinel_task
+                except asyncio.CancelledError:
+                    pass
             # Ensure MESSAGE_SYNC is removed if it was set
             self.state &= ~SyncState.MESSAGE_SYNC
             logger.info(f"同步任务 '{self.id}' 结束。")
@@ -277,6 +306,153 @@ class SyncInstance:
         except asyncio.CancelledError:
             # If the task is cancelled, just return
             pass
+
+    async def _run_audit_loop(self):
+        logger.info(f"开启审计循环 audit_loop for {self.id}, interval={self.audit_interval}s")
+        while True:
+            try:
+                await asyncio.sleep(self.audit_interval)
+                await self._run_audit_sync()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in audit_loop for {self.id}: {e}", exc_info=True)
+                await asyncio.sleep(60) # Backoff
+
+    async def _run_sentinel_loop(self):
+        logger.info(f"开启哨兵循环 sentinel_loop for {self.id}, interval={self.sentinel_interval}s")
+        while True:
+            try:
+                await asyncio.sleep(self.sentinel_interval)
+                await self._run_sentinel_sweep()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in sentinel_loop for {self.id}: {e}", exc_info=True)
+                await asyncio.sleep(60)
+
+    async def _run_sentinel_sweep(self):
+        if self.state & SyncState.SENTINEL_SWEEP:
+            logger.warning(f"Sentinel sweep for {self.id} already running, skipping.")
+            return
+
+        self.state |= SyncState.SENTINEL_SWEEP
+        try:
+            # We assume pusher driver has get_suspect_list (added via update)
+            # and source driver has verify_files
+            if not hasattr(self.pusher_driver_instance, 'get_suspect_list'):
+                 logger.debug("Pusher driver does not support get_suspect_list, skipping sentinel.")
+                 return
+
+            # Note: config.source is the ID. But get_suspect_list expects source_id which is integer in API?
+            # Fusion API expects integer ID?
+            # The SyncConfig.source is a string (ID). The Fusion backend uses integers.
+            # Usually SourceDriver needs to know its Fusion ID?
+            # Actually get_datastore_id_from_api_key handles context. 
+            # `get_suspect_list` param is `source_id`. This might be the string ID from config?
+            # Let's check FusionClient.
+            # It sends `params={"source_id": source_id}`.
+            # In docs, `source_id={id}`. 
+            # If the source string ID from config matches what Fusion expects, we are good.
+            # Assuming config.source is the correct ID.
+            
+            suspects = await self.pusher_driver_instance.get_suspect_list(self.config.source)
+            if not suspects:
+                return
+
+            paths = [item['path'] for item in suspects if 'path' in item]
+            if not paths:
+                return
+
+            if hasattr(self.source_driver_instance, 'verify_files'):
+                verification_results = await asyncio.to_thread(self.source_driver_instance.verify_files, paths)
+                await self.pusher_driver_instance.update_suspect_list(verification_results)
+            else:
+                logger.debug("Source driver does not support verify_files, skipping sentinel check.")
+
+        except Exception as e:
+            logger.error(f"Sentinel sweep failed for {self.id}: {e}")
+        finally:
+             self.state &= ~SyncState.SENTINEL_SWEEP
+
+    async def _run_audit_sync(self):
+        if self.state & SyncState.AUDIT_SYNC:
+             return
+        
+        self.state |= SyncState.AUDIT_SYNC
+        logger.info(f"Audit sync started for {self.id}")
+        
+        if hasattr(self.pusher_driver_instance, 'signal_audit_start'):
+            await self.pusher_driver_instance.signal_audit_start(self.config.source)
+
+        # Prepare for threaded execution
+        snapshot_completed_successfully = False
+        queue_size = 100
+        event_queue = queue.Queue(maxsize=queue_size)
+        stop_event = threading.Event()
+        next_cache = {}
+
+        try:
+            def _threaded_audit_producer():
+                try:
+                    iterator = self.source_driver_instance.get_audit_iterator(
+                        mtime_cache=self.audit_mtime_cache,
+                        mtime_cache_out=next_cache,
+                        batch_size=self.pusher_config.batch_size
+                    )
+                    for event_batch in iterator:
+                        if stop_event.is_set():
+                            break
+                        event_queue.put(event_batch)
+                except Exception as e:
+                    logger.error(f"Audit producer thread for '{self.id}' failed: {e}", exc_info=True)
+                    event_queue.put(e)
+                finally:
+                    event_queue.put(None)
+
+            producer_thread = threading.Thread(target=_threaded_audit_producer, daemon=True)
+            producer_thread.start()
+
+            while True:
+                current_event = await asyncio.to_thread(event_queue.get)
+
+                if current_event is None:
+                    snapshot_completed_successfully = True
+                    break
+                
+                if isinstance(current_event, Exception):
+                    raise current_event
+
+                if not current_event.rows:
+                    continue
+
+                final_rows_for_push = current_event.rows
+                # Optional: apply field mapping if needed (usually audit matches snapshot schema)
+                 
+                current_event.rows = final_rows_for_push
+                await self.pusher_driver_instance.push(
+                    events=[current_event], 
+                    session_id=self.session_id, 
+                    source_type='audit' # Important for Fusion to distinguish
+                )
+                self._statistics["events_pushed"] += len(current_event.rows)
+            
+            if snapshot_completed_successfully:
+                if next_cache:
+                    self.audit_mtime_cache = next_cache # Update cache only on success
+                
+                if hasattr(self.pusher_driver_instance, 'signal_audit_end'):
+                    await self.pusher_driver_instance.signal_audit_end(self.config.source)
+                    
+                logger.info(f"Audit sync completed for {self.id}")
+
+        except Exception as e:
+            logger.error(f"Audit sync failed for {self.id}: {e}", exc_info=True)
+        finally:
+            stop_event.set()
+            if 'producer_thread' in locals() and producer_thread.is_alive():
+                producer_thread.join(timeout=5.0)
+            self.state &= ~SyncState.AUDIT_SYNC
 
     async def _run_snapshot_sync(self):
         # Add SNAPSHOT_SYNC state using bitwise OR

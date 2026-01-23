@@ -13,6 +13,8 @@ class SyncState(Flag):
     STARTING = auto()
     SNAPSHOT_SYNC = auto()
     MESSAGE_SYNC = auto()
+    AUDIT_SYNC = auto()
+    SENTINEL_SWEEP = auto()
     RUNNING_CONF_OUTDATE = auto()
     STOPPING = auto()
     ERROR = auto()
