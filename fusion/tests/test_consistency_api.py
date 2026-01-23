@@ -57,3 +57,36 @@ async def test_audit_end_endpoint(mock_parser_manager):
     mock_parser_manager.get_file_directory_parser.assert_called()
     # Verify parser method call
     mock_parser.handle_audit_end.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_sentinel_tasks_endpoint(mock_parser_manager):
+    mock_parser = AsyncMock()
+    mock_parser_manager.get_file_directory_parser.return_value = mock_parser
+    # Mock suspect list return
+    mock_parser.get_suspect_list.return_value = {"/foo/bar": 12345.0}
+
+    response = client.get("/ingestor-api/v1/consistency/sentinel/tasks")
+    
+    assert response.status_code == 200
+    expected = {
+        "type": "suspect_check",
+        "paths": ["/foo/bar"],
+        "source_id": 1 # From overridden dependency
+    }
+    assert response.json() == expected
+    
+@pytest.mark.asyncio
+async def test_sentinel_feedback_endpoint(mock_parser_manager):
+    mock_parser = AsyncMock()
+    mock_parser_manager.get_file_directory_parser.return_value = mock_parser
+    
+    payload = {
+        "type": "suspect_update",
+        "updates": [{"path": "/foo", "mtime": 123}]
+    }
+    response = client.post("/ingestor-api/v1/consistency/sentinel/feedback", json=payload)
+    
+    assert response.status_code == 200
+    assert response.json() == {"status": "processed", "count": 1}
+    
+    mock_parser.update_suspect.assert_called_with("/foo", 123.0)

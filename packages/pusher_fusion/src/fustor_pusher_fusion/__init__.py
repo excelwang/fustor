@@ -32,60 +32,40 @@ class FusionDriver(PusherDriver):
 
 
 
-    async def get_consistency_tasks(self, **kwargs) -> Optional[Dict[str, Any]]:
+    async def get_sentinel_tasks(self, **kwargs) -> Optional[Dict[str, Any]]:
         """
-        Queries Fusion for consistency tasks.
-        Initially supports 'suspect_check' for FS.
+        Queries Fusion for generic sentinel tasks.
         """
-        # We can map this to different task types if Fusion API expands.
-        # For now, we specifically check the FS suspect list.
-        # Ideally, Fusion should have a generic endpoint like /api/consistency/tasks
-        # But we are adapting to existing views for now.
         try:
-             # Check if we should even ask? Maybe based on config?
-             # For now, always ask if source_fs is involved.
-             # The Fusion endpoint is view-specific (/api/view/fs/suspect-list).
-             
-             suspects = await self.fusion_client.get_suspect_list(kwargs.get("source_id"))
-             if suspects:
-                 # Map FS suspects to generic task format
-                 paths = [item['path'] for item in suspects if 'path' in item]
-                 if paths:
-                     return {
-                         'type': 'suspect_check', 
-                         'paths': paths,
-                         'source_id': kwargs.get("source_id")
-                     }
+             # Now using generic API
+             return await self.fusion_client.get_sentinel_tasks()
         except Exception as e:
-            self.logger.debug(f"Failed to get consistency tasks: {e}")
+            self.logger.debug(f"Failed to get sentinel tasks: {e}")
         return None
 
-    async def submit_consistency_results(self, results: Dict[str, Any], **kwargs) -> bool:
+    async def submit_sentinel_results(self, results: Dict[str, Any], **kwargs) -> bool:
         """
-        Submits consistency results to Fusion.
+        Submits sentinel results to Fusion.
         """
         try:
-            res_type = results.get('type')
-            if res_type == 'suspect_update':
-                updates = results.get('updates', [])
-                if updates:
-                    return await self.fusion_client.update_suspect_list(updates)
-            return True
+            return await self.fusion_client.submit_sentinel_feedback(results)
         except Exception as e:
-             self.logger.error(f"Failed to submit consistency results: {e}")
+             self.logger.error(f"Failed to submit sentinel results: {e}")
              return False
 
-    async def send_command(self, command: str, **kwargs) -> Any:
-        if command == "get_suspect_list":
-            return await self.fusion_client.get_suspect_list(kwargs.get("source_id"))
-        elif command == "update_suspect_list":
-            return await self.fusion_client.update_suspect_list(kwargs.get("updates"))
-        elif command == "signal_audit_start":
-            return await self.fusion_client.signal_audit_start(kwargs.get("source_id"))
-        elif command == "signal_audit_end":
-            return await self.fusion_client.signal_audit_end(kwargs.get("source_id"))
-        else:
-            raise NotImplementedError(f"Command '{command}' not supported by FusionDriver.")
+    async def signal_audit_start(self, source_id: Any) -> bool:
+        """
+        Signals the start of an audit cycle.
+        """
+        return await self.fusion_client.signal_audit_start(source_id)
+
+    async def signal_audit_end(self, source_id: Any) -> bool:
+        """
+        Signals the end of an audit cycle.
+        """
+        return await self.fusion_client.signal_audit_end(source_id)
+
+
 
     async def push(self, events: List[EventBase], **kwargs) -> Dict:
         if not self.session_id:

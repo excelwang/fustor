@@ -57,7 +57,6 @@ class SyncInstance:
         self._snapshot_task: Optional[asyncio.Task] = None
         self._audit_task: Optional[asyncio.Task] = None
         self._sentinel_task: Optional[asyncio.Task] = None
-        self._sentinel_task: Optional[asyncio.Task] = None
         self.audit_mtime_cache: Dict[str, float] = {}
         self.current_role: Optional[str] = None  # Track current role (leader/follower)
         
@@ -390,7 +389,7 @@ class SyncInstance:
         self.state |= SyncState.SENTINEL_SWEEP
         try:
              # 1. Ask Pusher for tasks (Generic)
-             tasks = await self.pusher_driver_instance.get_consistency_tasks(source_id=self.config.source)
+             tasks = await self.pusher_driver_instance.get_sentinel_tasks(source_id=self.config.source)
              
              if not tasks:
                  return
@@ -412,7 +411,7 @@ class SyncInstance:
                  return
 
              # 3. Report Results (Generic)
-             await self.pusher_driver_instance.submit_consistency_results(results)
+             await self.pusher_driver_instance.submit_sentinel_results(results)
 
         except Exception as e:
             logger.error(f"Sentinel check failed for {self.id}: {e}")
@@ -427,7 +426,7 @@ class SyncInstance:
         logger.info(f"Audit sync started for {self.id}")
         
         try:
-            await self.pusher_driver_instance.send_command('signal_audit_start', source_id=self.config.source)
+            await self.pusher_driver_instance.signal_audit_start(source_id=self.config.source)
         except NotImplementedError:
              pass
 
@@ -488,7 +487,7 @@ class SyncInstance:
                     self.audit_mtime_cache = next_cache # Update cache only on success
                 
                 try:
-                    await self.pusher_driver_instance.send_command('signal_audit_end', source_id=self.config.source)
+                    await self.pusher_driver_instance.signal_audit_end(source_id=self.config.source)
                 except NotImplementedError:
                     pass
                     

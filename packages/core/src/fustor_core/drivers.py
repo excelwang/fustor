@@ -65,19 +65,7 @@ class PusherDriver(ABC):
         """
         raise NotImplementedError
 
-    async def get_consistency_tasks(self, **kwargs) -> Optional[Dict[str, Any]]:
-        """
-        Optional: Queries the pusher/upstream for any data consistency verification tasks.
-        Returns a dictionary containing the tasks (e.g. {'type': 'suspect_check', 'payload': ...}).
-        Returns None if no tasks are pending.
-        """
-        return None
 
-    async def submit_consistency_results(self, results: Dict[str, Any], **kwargs) -> bool:
-        """
-        Optional: Submits the results of a consistency check back to the pusher/upstream.
-        """
-        return False
 
     async def signal_audit_start(self, source_id: Any) -> bool:
         """
@@ -90,6 +78,18 @@ class PusherDriver(ABC):
         Optional: Signals the end of an audit cycle.
         """
         return False
+
+    async def get_sentinel_tasks(self, **kwargs) -> Optional[Dict[str, Any]]:
+        """
+        Optional: Queries for sentinel tasks.
+        """
+        return None
+
+    async def submit_sentinel_results(self, results: Dict[str, Any], **kwargs) -> bool:
+        """
+        Optional: Submits sentinel task results.
+        """
+        return True
 
     async def close(self):
         """

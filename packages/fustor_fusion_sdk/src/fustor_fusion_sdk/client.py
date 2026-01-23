@@ -54,28 +54,28 @@ class FusionClient:
             logger.error(f"An error occurred: {e}")
             return None
 
-    async def get_suspect_list(self, source_id: int) -> List[Dict[str, Any]]:
+    async def get_sentinel_tasks(self) -> Dict[str, Any]:
         """
-        Retrieves the suspect list (files that might have been changed) for sentinel sweep.
+        Retrieves generic sentinel tasks (e.g. suspect checks).
         """
         try:
-            response = await self.client.get(f"/api/view/fs/suspect-list", params={"source_id": source_id})
+            response = await self.client.get(f"/ingestor-api/v1/consistency/sentinel/tasks")
             response.raise_for_status()
             return response.json()
         except Exception as e:
-            logger.error(f"Failed to get suspect list: {e}")
-            return []
+            logger.error(f"Failed to get sentinel tasks: {e}")
+            return {}
 
-    async def update_suspect_list(self, updates: List[Dict[str, Any]]) -> bool:
+    async def submit_sentinel_feedback(self, feedback: Dict[str, Any]) -> bool:
         """
-        Updates the mtime of files in the suspect list.
+        Submits feedback for sentinel tasks.
         """
         try:
-            response = await self.client.put("/api/view/fs/suspect-list", json={"updates": updates}) # Wrap in dict
+            response = await self.client.post("/ingestor-api/v1/consistency/sentinel/feedback", json=feedback)
             response.raise_for_status()
             return True
         except Exception as e:
-            logger.error(f"Failed to update suspect list: {e}")
+            logger.error(f"Failed to submit sentinel feedback: {e}")
             return False
 
 
