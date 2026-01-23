@@ -80,10 +80,12 @@ app = FastAPI(lifespan=lifespan)
 
 from .api.ingestion import ingestion_router
 from .api.session import session_router
+from .api.consistency import consistency_router
 
 router_v1 = APIRouter()
 router_v1.include_router(session_router, prefix="/sessions")
 router_v1.include_router(ingestion_router, prefix="/events")
+router_v1.include_router(consistency_router)
 
 app.include_router(router_v1, prefix="/ingestor-api/v1", tags=["v1"])
 app.include_router(parser_router, prefix="/views", tags=["Views"])

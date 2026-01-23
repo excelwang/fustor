@@ -104,36 +104,28 @@ class FusionClient:
             logger.error(f"An error occurred during event push: {e}")
             return False
 
-    async def send_heartbeat(self, session_id: str) -> bool:
+    async def send_heartbeat(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
         Sends a heartbeat to the Fusion service to keep the session alive.
+        Returns the response dict if successful, None otherwise.
         """
         try:
             headers = {"session-id": session_id}
             response = await self.client.post("/ingestor-api/v1/sessions/heartbeat", headers=headers)
             response.raise_for_status()
-            return True
+            return response.json()
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error occurred during heartbeat: {e.response.status_code} - {e.response.text}")
-            return False
+            return None
         except Exception as e:
             logger.error(f"An error occurred during heartbeat: {e}")
-            return False
+            return None
 
     async def signal_audit_start(self, source_id: int) -> bool:
         """Signals the start of an audit cycle."""
         try:
-             # Using post to trigger action
-             response = await self.client.post("/api/view/fs/audit-start", params={"datastore_id": source_id}) 
-             # Note: endpoint usually takes datastore_id from Dependency/API Key.
-             # params mapping might be redundant if API Key provides context.
-             # But views.py line 178 depends on get_datastore_id_from_api_key.
-             # So we don't need to pass source_id if it's the datastore_id?
-             # Fusion model: Source ID map to Datastore ID?
-             # Usually Agent source ID != Datastore ID.
-             # But FusionClient uses API Key. API Key IS mapped to Datastore.
-             # So we just POST.
-             response = await self.client.post("/api/view/fs/audit-start")
+             # Updated to new consistency API path
+             response = await self.client.post("/ingestor-api/v1/consistency/audit/start")
              response.raise_for_status()
              return True
         except Exception as e:
@@ -143,7 +135,8 @@ class FusionClient:
     async def signal_audit_end(self, source_id: int) -> bool:
         """Signals the end of an audit cycle."""
         try:
-             response = await self.client.post("/api/view/fs/audit-end")
+             # Updated to new consistency API path
+             response = await self.client.post("/ingestor-api/v1/consistency/audit/end")
              response.raise_for_status()
              return True
         except Exception as e:

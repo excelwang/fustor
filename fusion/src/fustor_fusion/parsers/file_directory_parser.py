@@ -127,6 +127,9 @@ class DirectoryStructureParser:
         
         # Paths seen during current audit cycle (for missing file detection)
         self._audit_seen_paths: Set[str] = set()
+        
+        # Track blind-spot deletions for global indicator
+        self._blind_spot_deletions: Set[str] = set()
 
     def _check_cache_invalidation(self, path: str):
         """Simple placeholder for more complex logic"""
@@ -385,6 +388,9 @@ class DirectoryStructureParser:
                 current_files = set(self._file_path_map.keys())
                 missing_in_audit = current_files - self._audit_seen_paths
                 
+                # Collect paths to delete (can't modify dict while iterating)
+                paths_to_delete = []
+                
                 for missing_path in missing_in_audit:
                     # Skip files in Tombstone (already marked as deleted by realtime)
                     if missing_path in self._tombstone_list:
@@ -392,23 +398,26 @@ class DirectoryStructureParser:
                     
                     # Get parent directory to check mtime
                     parent_path = os.path.dirname(missing_path)
-                    memory_parent = self._directory_path_map.get(parent_path)
                     
                     # If parent wasn't scanned in this audit, we can't conclude anything
                     # (the audit might have been partial)
                     if parent_path not in self._audit_seen_paths and parent_path != "/":
                         continue
                     
-                    # Mark as blind-spot deletion
-                    node = self._file_path_map.get(missing_path)
-                    if node:
-                        node.agent_missing = True
-                        missing_detected += 1
-                        self.logger.debug(f"Missing file detected (blind-spot): {missing_path}")
+                    # Section 5.3 Scenario 2: Delete from memory tree + mark as blind-spot
+                    paths_to_delete.append(missing_path)
+                    missing_detected += 1
+                    self.logger.debug(f"Blind-spot deletion detected: {missing_path}")
+                
+                # Execute deletions
+                for path in paths_to_delete:
+                    await self._process_delete_in_memory(path)
+                    # Add to a special "blind-spot deletions" tracking
+                    self._blind_spot_deletions.add(path)
             
             self.logger.info(
                 f"Audit ended for datastore {self.datastore_id}. "
-                f"Tombstones cleaned: {tombstones_cleaned}, Missing files marked: {missing_detected}"
+                f"Tombstones cleaned: {tombstones_cleaned}, Blind-spot deletions: {missing_detected}"
             )
             
             # Reset audit state
@@ -479,11 +488,20 @@ class DirectoryStructureParser:
                     oldest_node = min(dirs, key=lambda x: x.modified_time)
                     oldest_dir = {"path": oldest_node.path, "timestamp": oldest_node.modified_time}
 
+            # Count files with agent_missing flag (Section 8: global level indicator)
+            blind_spot_files = sum(1 for node in self._file_path_map.values() if node.agent_missing)
+            suspect_files = sum(1 for node in self._file_path_map.values() if node.integrity_suspect)
+
             return {
                 "total_directories": len(self._directory_path_map),
                 "total_files": len(self._file_path_map),
                 "last_event_latency_ms": self._last_event_latency,
-                "oldest_directory": oldest_dir
+                "oldest_directory": oldest_dir,
+                # Section 8: Global level indicators
+                "has_blind_spot": blind_spot_files > 0 or len(self._blind_spot_deletions) > 0,
+                "blind_spot_file_count": blind_spot_files,
+                "blind_spot_deletion_count": len(self._blind_spot_deletions),
+                "suspect_file_count": suspect_files
             }
 
     async def reset(self):
@@ -495,4 +513,6 @@ class DirectoryStructureParser:
             self._tombstone_list = {}
             self._suspect_list = {}
             self._last_audit_start = None
+            self._audit_seen_paths.clear()
+            self._blind_spot_deletions.clear()
             self.logger.info(f"Parser state reset for datastore {self.datastore_id}")

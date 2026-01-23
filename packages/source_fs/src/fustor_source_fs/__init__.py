@@ -432,9 +432,9 @@ class FSDriver(SourceDriver):
 
 
 
-    def perform_consistency_check(self, task_batch: Dict[str, Any]) -> Dict[str, Any]:
+    def perform_sentinel_check(self, task_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Implements generic consistency check.
+        Implements generic sentinel check.
         Supported types: 'suspect_check'
         """
         task_type = task_batch.get('type')

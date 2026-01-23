@@ -57,7 +57,9 @@ class SyncInstance:
         self._snapshot_task: Optional[asyncio.Task] = None
         self._audit_task: Optional[asyncio.Task] = None
         self._sentinel_task: Optional[asyncio.Task] = None
+        self._sentinel_task: Optional[asyncio.Task] = None
         self.audit_mtime_cache: Dict[str, float] = {}
+        self.current_role: Optional[str] = None  # Track current role (leader/follower)
         
         # Heartbeat-related attributes
         self._heartbeat_task: Optional[asyncio.Task] = None
@@ -65,8 +67,9 @@ class SyncInstance:
         self._heartbeat_error_event = asyncio.Event()  # Event to signal heartbeat error
         self._last_active_time = datetime.now(timezone.utc)
         self.heartbeat_interval: int = 10  # Default heartbeat interval
-        self.audit_interval: int = 600 # 10 minutes default
-        self.sentinel_interval: int = 120 # 2 minutes default
+        # Use config values for consistency intervals (with fallback defaults)
+        self.audit_interval: int = getattr(config, 'audit_interval_sec', 600)
+        self.sentinel_interval: int = getattr(config, 'sentinel_interval_sec', 120)
 
         self._fast_mapper_fn = self._compile_mapper_function()
 
@@ -130,8 +133,47 @@ class SyncInstance:
             session_id=self.session_id
         )
         logger.debug(f"Heartbeat sent for sync '{self.id}', result: {result}")
+        
+        # Handle dynamic role updates (e.g. failover promotion)
+        server_role = result.get('role')
+        if server_role:
+             await self._handle_role_change(server_role)
+             
         return result
 
+    async def _handle_role_change(self, new_role: str):
+        if new_role == self.current_role:
+             return
+             
+        logger.info(f"Role change detected for {self.id}: {self.current_role} -> {new_role}")
+        self.current_role = new_role
+        
+        if new_role == 'leader':
+             # Promoted to leader
+             logger.info(f"Promoted to LEADER. Starting maintenance tasks.")
+             if not self._audit_task or self._audit_task.done():
+                 self._audit_task = asyncio.create_task(self._run_audit_loop())
+             if not self._sentinel_task or self._sentinel_task.done():
+                 self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
+                 
+        elif new_role == 'follower':
+             # Demoted to follower
+             logger.info(f"Demoted to FOLLOWER. Stopping maintenance tasks.")
+             if self._audit_task and not self._audit_task.done():
+                 self._audit_task.cancel()
+                 try:
+                     await self._audit_task
+                 except asyncio.CancelledError:
+                     pass
+             self._audit_task = None
+             
+             if self._sentinel_task and not self._sentinel_task.done():
+                 self._sentinel_task.cancel()
+                 try:
+                     await self._sentinel_task
+                 except asyncio.CancelledError:
+                     pass
+             self._sentinel_task = None
     async def stop(self):
         if self.state == SyncState.STOPPED or SyncState.STOPPING in self.state:
             return
@@ -187,8 +229,9 @@ class SyncInstance:
             self.session_id = session_data.get("session_id")
             role = session_data.get("role", "follower")
             self.heartbeat_interval = session_data.get("suggested_heartbeat_interval_seconds", 10)
+            self.current_role = role
             
-            logger.info(f"任务 '{self.id}' 正在启动，已从Ingestor获取会话 ID: {self.session_id}, Role: {role}")
+            logger.info(f"任务 '{self.id}' 正在启动，已从Ingestor获取会话 ID: {self.session_id}, Role: {self.current_role}")
             
             self._set_state(SyncState.STARTING, "正在向接收端查询最新同步点位...")
             start_position = await self.pusher_driver_instance.get_latest_committed_index(session_id=self.session_id)
@@ -203,10 +246,10 @@ class SyncInstance:
 
             tasks_to_wait = [heartbeat_error_task, message_sync_task, self._heartbeat_task]
             
-            if role == "leader":
+            if self.current_role == "leader":
                  logger.info(f"Assigned LEADER role for {self.id}. Starting Audit and Sentinel tasks.")
                  self._audit_task = asyncio.create_task(self._run_audit_loop())
-                 self._sentinel_task = asyncio.create_task(self._run_consistency_check_loop())
+                 self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
                  tasks_to_wait.append(self._audit_task)
                  tasks_to_wait.append(self._sentinel_task)
             
@@ -308,6 +351,10 @@ class SyncInstance:
             pass
 
     async def _run_audit_loop(self):
+        if self.audit_interval <= 0:
+            logger.info(f"审计循环已禁用 audit_loop disabled for {self.id} (interval={self.audit_interval}s)")
+            return
+
         logger.info(f"开启审计循环 audit_loop for {self.id}, interval={self.audit_interval}s")
         while True:
             try:
@@ -319,22 +366,25 @@ class SyncInstance:
                 logger.error(f"Error in audit_loop for {self.id}: {e}", exc_info=True)
                 await asyncio.sleep(60) # Backoff
 
-    async def _run_consistency_check_loop(self):
-        logger.info(f"开启一致性检查循环 consistency_check_loop for {self.id}, interval={self.sentinel_interval}s")
+    async def _run_sentinel_loop(self):
+        if self.sentinel_interval <= 0:
+            logger.info(f"哨兵巡检循环已禁用 sentinel_loop disabled for {self.id} (interval={self.sentinel_interval}s)")
+            return
+
+        logger.info(f"开启哨兵巡检循环 sentinel_loop for {self.id}, interval={self.sentinel_interval}s")
         while True:
             try:
                 await asyncio.sleep(self.sentinel_interval)
-                await self._run_consistency_check()
+                await self._run_sentinel_check()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in consistency_check_loop for {self.id}: {e}", exc_info=True)
+                logger.error(f"Error in sentinel_loop for {self.id}: {e}", exc_info=True)
                 await asyncio.sleep(60)
 
-    async def _run_consistency_check(self):
-        if self.state & SyncState.SENTINEL_SWEEP: # Keep using this state flag for now or rename? 
-            # Reusing SENTINEL_SWEEP state for generic consistency check is fine as it semantically maps.
-            logger.warning(f"Consistency check (Sentinel) for {self.id} already running, skipping.")
+    async def _run_sentinel_check(self):
+        if self.state & SyncState.SENTINEL_SWEEP:
+            logger.warning(f"Sentinel check for {self.id} already running, skipping.")
             return
 
         self.state |= SyncState.SENTINEL_SWEEP
@@ -347,13 +397,15 @@ class SyncInstance:
 
              # 2. Ask Source to execute (Generic)
              # Run in thread as source drivers might be blocking (like FS OS operations)
-             if hasattr(self.source_driver_instance, 'perform_consistency_check'):
+             # Note: perform_sentinel_check now has a default implementation in base driver, 
+             # so we can call it directly, but 'hasattr' check is safe if base class varies.
+             if hasattr(self.source_driver_instance, 'perform_sentinel_check'):
                  results = await asyncio.to_thread(
-                     self.source_driver_instance.perform_consistency_check, 
+                     self.source_driver_instance.perform_sentinel_check, 
                      tasks
                  )
              else:
-                 logger.debug("Source driver does not support perform_consistency_check.")
+                 logger.debug("Source driver does not support perform_sentinel_check.")
                  results = {}
 
              if not results:
@@ -363,7 +415,7 @@ class SyncInstance:
              await self.pusher_driver_instance.submit_consistency_results(results)
 
         except Exception as e:
-            logger.error(f"Consistency check failed for {self.id}: {e}")
+            logger.error(f"Sentinel check failed for {self.id}: {e}")
         finally:
              self.state &= ~SyncState.SENTINEL_SWEEP
 

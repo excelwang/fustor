@@ -151,9 +151,16 @@ async def heartbeat(
         await datastore_state_manager.lock_for_session(datastore_id, session_id)
     
     await session_manager.keep_session_alive(datastore_id, session_id, client_ip=request.client.host)
+    
+    # Check and try to maintain/acquire leader role
+    is_leader = await datastore_state_manager.try_become_leader(datastore_id, session_id)
+    role = "leader" if is_leader else "follower"
+
     return {
         "status": "ok", 
         "message": f"Session {session_id} heartbeat updated successfully",
+        "role": role,
+        "is_leader": is_leader
     }
 
 @session_router.delete("/", tags=["Session Management"], summary="结束会话")

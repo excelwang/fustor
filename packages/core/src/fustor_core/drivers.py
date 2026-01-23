@@ -200,9 +200,11 @@ class SourceDriver(ABC):
 
         Default implementation returns an empty iterator, meaning no audit is performed.
         """
-    def perform_consistency_check(self, task_batch: Dict[str, Any]) -> Dict[str, Any]:
+        return iter([])
+
+    def perform_sentinel_check(self, task_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
-        Optional: Performs a consistency check based on the provided task batch.
+        Optional: Performs a sentinel check based on the provided task batch.
         
         Args:
             task_batch (Dict[str, Any]): The tasks to verify, e.g., {'type': 'suspect_check', 'paths': [...]}.

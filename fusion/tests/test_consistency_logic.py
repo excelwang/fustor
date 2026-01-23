@@ -207,14 +207,16 @@ async def test_audit_missing_file_detection():
     # Also "scan" the parent directory in audit
     parser._audit_seen_paths.add("/project")
     
-    # 4. End Audit - should detect /project/b.txt as missing
+    # 4. End Audit - should detect /project/b.txt as missing and DELETE it
     await parser.handle_audit_end()
     
-    # 5. Verify: file B should be marked as agent_missing
+    # 5. Verify: file B should be DELETED from memory tree (Section 5.3 Scenario 2)
     file_b = parser._get_node("/project/b.txt")
-    assert file_b is not None, "File B should still exist in memory"
-    assert file_b.agent_missing == True, "File B should be marked as agent_missing (blind-spot deletion)"
+    assert file_b is None, "File B should be deleted from memory tree (blind-spot deletion)"
     
-    # File A should NOT be marked
+    # But tracked in blind-spot deletions
+    assert "/project/b.txt" in parser._blind_spot_deletions
+    
+    # File A should still exist
     file_a = parser._get_node("/project/a.txt")
-    assert file_a.agent_missing == False, "File A was seen in audit, should not be marked"
+    assert file_a is not None, "File A should still exist"

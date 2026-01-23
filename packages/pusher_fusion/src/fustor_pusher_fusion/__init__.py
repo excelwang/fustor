@@ -118,11 +118,11 @@ class FusionDriver(PusherDriver):
             self.logger.error("Cannot send heartbeat: session_id is not set.")
             return {"status": "error", "message": "Session ID not set"}
 
-        success = await self.fusion_client.send_heartbeat(self.session_id)
+        result = await self.fusion_client.send_heartbeat(self.session_id)
 
-        if success:
+        if result:
             self.logger.debug("Heartbeat sent successfully.")
-            return {"status": "ok"}
+            return result
         else:
             self.logger.error("Failed to send heartbeat.")
             return {"status": "error", "message": "Failed to send heartbeat"}
