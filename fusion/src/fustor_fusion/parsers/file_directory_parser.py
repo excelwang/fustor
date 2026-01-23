@@ -124,6 +124,9 @@ class DirectoryStructureParser:
         
         # Audit lifecycle
         self._last_audit_start: Optional[float] = None
+        
+        # Paths seen during current audit cycle (for missing file detection)
+        self._audit_seen_paths: Set[str] = set()
 
     def _check_cache_invalidation(self, path: str):
         """Simple placeholder for more complex logic"""
@@ -262,6 +265,10 @@ class DirectoryStructureParser:
                 self._check_cache_invalidation(path)
                 mtime = payload.get('modified_time', 0.0)
                 
+                # Track paths seen during audit for missing file detection
+                if is_audit:
+                    self._audit_seen_paths.add(path)
+                
                 if event_type == EventType.DELETE:
                     if is_realtime:
                         # Realtime Delete: unconditionally delete + add to Tombstone
@@ -299,6 +306,22 @@ class DirectoryStructureParser:
                             self.logger.debug(f"Skipping {path}: existing mtime {existing.modified_time} >= incoming {mtime}")
                             continue
                         
+                        # Rule 3 (Audit only): Parent Mtime Check - Section 5.3 of CONSISTENCY_DESIGN
+                        # If file is NEW (not in memory tree) and parent mtime from audit is older
+                        # than our memory's parent mtime, discard (parent was updated after audit scan)
+                        if is_audit and existing is None:
+                            parent_path = payload.get('parent_path')
+                            parent_mtime_from_audit = payload.get('parent_mtime')
+                            
+                            if parent_path and parent_mtime_from_audit is not None:
+                                memory_parent = self._directory_path_map.get(parent_path)
+                                if memory_parent and memory_parent.modified_time > parent_mtime_from_audit:
+                                    self.logger.debug(
+                                        f"Skipping {path}: parent {parent_path} mtime in memory "
+                                        f"({memory_parent.modified_time}) > audit ({parent_mtime_from_audit})"
+                                    )
+                                    continue
+                        
                         # Apply the update
                         await self._process_create_update_in_memory(payload, path)
                         
@@ -310,49 +333,105 @@ class DirectoryStructureParser:
                                 node.integrity_suspect = True
                                 self._suspect_list[path] = now + self.HOT_FILE_THRESHOLD_SECONDS
                             
-                            # Mark as blind-spot file if from audit
-                            if is_audit:
+                            # Mark as blind-spot file if from audit AND it's a new file
+                            if is_audit and existing is None:
                                 node.agent_missing = True
                             
         return True
     
     async def handle_audit_start(self):
-        """Called when an Audit cycle begins."""
+        """
+        Called when an Audit cycle begins.
+        Per Section 4.4: Clear Blind-spot List at start of each audit.
+        """
         async with self._lock:
             self._last_audit_start = time.time()
-            self.logger.info(f"Audit started for datastore {self.datastore_id}")
+            
+            # Clear all agent_missing flags - they will be re-set during this audit
+            for node in self._file_path_map.values():
+                node.agent_missing = False
+            for node in self._directory_path_map.values():
+                node.agent_missing = False
+            
+            # Clear paths seen tracker for missing file detection
+            self._audit_seen_paths.clear()
+            
+            self.logger.info(f"Audit started for datastore {self.datastore_id}, cleared blind-spot flags")
     
     async def handle_audit_end(self):
         """
         Called when an Audit cycle ends.
-        Cleans up Tombstones created before this audit started.
+        1. Cleans up Tombstones created before this audit started.
+        2. Detects missing files (Section 5.3 Scenario 2).
         """
         async with self._lock:
             if self._last_audit_start is None:
                 return
             
+            # 1. Tombstone cleanup
             cutoff = self._last_audit_start
             before_count = len(self._tombstone_list)
             self._tombstone_list = {
                 path: ts for path, ts in self._tombstone_list.items()
                 if ts > cutoff
             }
-            after_count = len(self._tombstone_list)
+            tombstones_cleaned = before_count - len(self._tombstone_list)
+            
+            # 2. Missing file detection (Section 5.3 Scenario 2)
+            # Files in memory but NOT seen during audit = potentially deleted in blind-spot
+            # Only check if we have audit seen paths (meaning audit actually ran)
+            missing_detected = 0
+            if self._audit_seen_paths:
+                current_files = set(self._file_path_map.keys())
+                missing_in_audit = current_files - self._audit_seen_paths
+                
+                for missing_path in missing_in_audit:
+                    # Skip files in Tombstone (already marked as deleted by realtime)
+                    if missing_path in self._tombstone_list:
+                        continue
+                    
+                    # Get parent directory to check mtime
+                    parent_path = os.path.dirname(missing_path)
+                    memory_parent = self._directory_path_map.get(parent_path)
+                    
+                    # If parent wasn't scanned in this audit, we can't conclude anything
+                    # (the audit might have been partial)
+                    if parent_path not in self._audit_seen_paths and parent_path != "/":
+                        continue
+                    
+                    # Mark as blind-spot deletion
+                    node = self._file_path_map.get(missing_path)
+                    if node:
+                        node.agent_missing = True
+                        missing_detected += 1
+                        self.logger.debug(f"Missing file detected (blind-spot): {missing_path}")
+            
             self.logger.info(
                 f"Audit ended for datastore {self.datastore_id}. "
-                f"Cleaned {before_count - after_count} tombstones (cutoff: {cutoff})"
+                f"Tombstones cleaned: {tombstones_cleaned}, Missing files marked: {missing_detected}"
             )
+            
+            # Reset audit state
             self._last_audit_start = None
+            self._audit_seen_paths.clear()
     
+    def _cleanup_expired_suspects_unlocked(self):
+        """Clean up expired suspects and their flags. Must be called with lock held."""
+        now = time.time()
+        expired_paths = [path for path, ts in self._suspect_list.items() if ts <= now]
+        
+        for path in expired_paths:
+            del self._suspect_list[path]
+            node = self._get_node(path)
+            if node:
+                node.integrity_suspect = False
+        
+        return len(expired_paths)
+
     async def get_suspect_list(self) -> Dict[str, float]:
         """Get the current Suspect List for Sentinel Sweep."""
         async with self._lock:
-            now = time.time()
-            # Clean up expired suspects
-            self._suspect_list = {
-                path: ts for path, ts in self._suspect_list.items()
-                if ts > now
-            }
+            self._cleanup_expired_suspects_unlocked()
             return dict(self._suspect_list)
     
     async def update_suspect(self, path: str, new_mtime: float):

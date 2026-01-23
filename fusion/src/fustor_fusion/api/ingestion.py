@@ -14,7 +14,7 @@ from ..processing_manager import processing_manager
 
 # Import the queue-based ingestion
 from ..queue_integration import queue_based_ingestor, add_events_batch_to_queue, get_position_from_queue, update_position_in_queue
-from fustor_event_model.models import EventBase, EventType # Import EventBase and EventType
+from fustor_event_model.models import EventBase, EventType, MessageSource # Import EventBase, EventType, and MessageSource
 
 from ..parsers.manager import ParserManager, get_directory_stats, get_cached_parser_manager # CORRECTED
 from datetime import datetime

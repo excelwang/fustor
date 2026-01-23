@@ -362,7 +362,8 @@ class FSDriver(SourceDriver):
                     stat_info = os.stat(file_path)
                     metadata = get_file_metadata(file_path, stat_info=stat_info)
                     if metadata:
-                        # Add parent_mtime for Fusion's arbitration
+                        # Add parent info for Fusion's arbitration (Section 3.2 of CONSISTENCY_DESIGN)
+                        metadata["parent_path"] = root
                         metadata["parent_mtime"] = current_dir_mtime
                         batch.append(metadata)
                         files_scanned += 1

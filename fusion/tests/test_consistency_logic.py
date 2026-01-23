@@ -97,3 +97,124 @@ async def test_auto_audit_start():
     
     assert parser._last_audit_start is not None
     assert abs(parser._last_audit_start - now_ms/1000.0) < 0.1
+
+@pytest.mark.asyncio
+async def test_parent_mtime_check():
+    """Test Section 5.3: Parent Mtime Check for Audit events."""
+    parser = DirectoryStructureParser(datastore_id=1)
+    
+    # 1. First, establish a parent directory in memory via Realtime
+    parent_realtime_mtime = time.time()
+    parent_rows = [{"path": "/data", "modified_time": parent_realtime_mtime, "size": 0, "is_dir": True}]
+    parent_evt = UpdateEvent(table="dirs", rows=parent_rows, index=1, fields=[], message_source=MessageSource.REALTIME, event_schema="s")
+    await parser.process_event(parent_evt)
+    
+    parent_node = parser._directory_path_map.get("/data")
+    assert parent_node is not None
+    assert parent_node.modified_time == parent_realtime_mtime
+    
+    # 2. Now send an Audit event for a NEW file, but with an OLDER parent_mtime
+    #    This simulates: Audit scanned /data before Realtime updated it
+    old_parent_mtime = parent_realtime_mtime - 100  # Audit saw older parent
+    file_mtime = time.time()
+    audit_rows = [{
+        "path": "/data/stale_file.txt",
+        "modified_time": file_mtime,
+        "size": 100,
+        "parent_path": "/data",
+        "parent_mtime": old_parent_mtime  # Key: older than memory's parent mtime
+    }]
+    audit_evt = UpdateEvent(table="files", rows=audit_rows, index=2000, fields=[], message_source=MessageSource.AUDIT, event_schema="s")
+    await parser.process_event(audit_evt)
+    
+    # File should NOT be added because parent_mtime check failed
+    file_node = parser._get_node("/data/stale_file.txt")
+    assert file_node is None, "File should be discarded due to stale parent_mtime"
+    
+    # 3. Now send an Audit event with a CURRENT parent_mtime
+    current_audit_rows = [{
+        "path": "/data/valid_file.txt",
+        "modified_time": file_mtime,
+        "size": 200,
+        "parent_path": "/data",
+        "parent_mtime": parent_realtime_mtime  # Same as memory
+    }]
+    valid_audit_evt = UpdateEvent(table="files", rows=current_audit_rows, index=3000, fields=[], message_source=MessageSource.AUDIT, event_schema="s")
+    await parser.process_event(valid_audit_evt)
+    
+    # File SHOULD be added
+    valid_file_node = parser._get_node("/data/valid_file.txt")
+    assert valid_file_node is not None, "File should be added when parent_mtime is current"
+    assert valid_file_node.agent_missing == True  # New file from Audit = blind-spot
+
+@pytest.mark.asyncio
+async def test_audit_missing_file_detection():
+    """Test Section 5.3 Scenario 2: Detecting files missing from audit."""
+    parser = DirectoryStructureParser(datastore_id=1)
+    
+    # 1. Create initial state via Realtime: parent dir + 2 files
+    now = time.time()
+    
+    # Parent directory
+    dir_evt = UpdateEvent(
+        table="dirs", 
+        rows=[{"path": "/project", "modified_time": now, "size": 0, "is_dir": True}],
+        index=1, fields=[], message_source=MessageSource.REALTIME, event_schema="s"
+    )
+    await parser.process_event(dir_evt)
+    
+    # File A (will be seen in audit)
+    file_a_evt = UpdateEvent(
+        table="files",
+        rows=[{"path": "/project/a.txt", "modified_time": now, "size": 100}],
+        index=2, fields=[], message_source=MessageSource.REALTIME, event_schema="s"
+    )
+    await parser.process_event(file_a_evt)
+    
+    # File B (will be MISSING from audit - deleted in blind-spot)
+    file_b_evt = UpdateEvent(
+        table="files",
+        rows=[{"path": "/project/b.txt", "modified_time": now, "size": 200}],
+        index=3, fields=[], message_source=MessageSource.REALTIME, event_schema="s"
+    )
+    await parser.process_event(file_b_evt)
+    
+    # Verify initial state
+    assert parser._get_node("/project/a.txt") is not None
+    assert parser._get_node("/project/b.txt") is not None
+    
+    # 2. Start Audit
+    await parser.handle_audit_start()
+    assert len(parser._audit_seen_paths) == 0
+    
+    # 3. Send Audit events - only file A is reported (B was deleted on blind-spot node)
+    audit_evt = UpdateEvent(
+        table="files",
+        rows=[{
+            "path": "/project/a.txt", 
+            "modified_time": now + 1,  # Slightly updated
+            "size": 100,
+            "parent_path": "/project",
+            "parent_mtime": now
+        }],
+        index=int(now * 1000),
+        fields=[],
+        message_source=MessageSource.AUDIT,
+        event_schema="s"
+    )
+    await parser.process_event(audit_evt)
+    
+    # Also "scan" the parent directory in audit
+    parser._audit_seen_paths.add("/project")
+    
+    # 4. End Audit - should detect /project/b.txt as missing
+    await parser.handle_audit_end()
+    
+    # 5. Verify: file B should be marked as agent_missing
+    file_b = parser._get_node("/project/b.txt")
+    assert file_b is not None, "File B should still exist in memory"
+    assert file_b.agent_missing == True, "File B should be marked as agent_missing (blind-spot deletion)"
+    
+    # File A should NOT be marked
+    file_a = parser._get_node("/project/a.txt")
+    assert file_a.agent_missing == False, "File A was seen in audit, should not be marked"
