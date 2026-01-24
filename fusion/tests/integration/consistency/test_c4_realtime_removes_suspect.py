@@ -9,7 +9,7 @@ import pytest
 import time
 
 from ..utils import docker_manager
-from ..conftest import CONTAINER_CLIENT_A, MOUNT_POINT
+from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
 
 
 class TestRealtimeRemovesSuspect:
@@ -20,34 +20,36 @@ class TestRealtimeRemovesSuspect:
         docker_env,
         fusion_client,
         setup_agents,
-        clean_shared_dir
+        clean_shared_dir,
+        wait_for_audit
     ):
         """
         场景:
-          1. 创建文件（自动加入 Suspect List，因为 mtime < 10min）
-          2. 对文件进行明确的修改（触发 Realtime Update）
+          1. 无 Agent 客户端创建文件（Audit 发现加入 Suspect List）
+          2. 对文件由 Agent 客户端进行明确的修改（触发 Realtime Update）
           3. Realtime Update 事件处理后，文件从 Suspect List 移除
         预期:
           - 收到 Realtime Update 后，integrity_suspect 标记被清除
         """
         test_file = f"{MOUNT_POINT}/realtime_clear_suspect.txt"
         
-        # Step 1: Create file
+        # Step 1: Create file from blind-spot
         docker_manager.create_file_in_container(
-            CONTAINER_CLIENT_A,
+            CONTAINER_CLIENT_C,
             test_file,
             content="initial content"
         )
         
-        # Wait for sync
-        fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        # Wait for Audit to discover and mark as suspect
+        wait_for_audit()
+        fusion_client.wait_for_file_in_tree(test_file, timeout=10)
         
         # Verify file is suspect
         flags_initial = fusion_client.check_file_flags(test_file)
         assert flags_initial["integrity_suspect"] is True, \
-            "New file should be marked as suspect"
+            "New file from Audit should be marked as suspect"
         
-        # Step 2: Wait a moment, then modify file (trigger Realtime Update)
+        # Step 2: Wait a moment, then modify file from Agent A (trigger Realtime Update)
         time.sleep(2)
         docker_manager.modify_file_in_container(
             CONTAINER_CLIENT_A,
@@ -56,7 +58,7 @@ class TestRealtimeRemovesSuspect:
         )
         
         # Step 3: Wait for Realtime event to be processed
-        time.sleep(3)
+        time.sleep(5)
         
         # Step 4: Check that suspect flag is cleared
         flags_after = fusion_client.check_file_flags(test_file)
@@ -80,8 +82,6 @@ class TestRealtimeRemovesSuspect:
         """
         场景: 盲区文件被 Agent 重新创建（INSERT），应清除 suspect 状态
         """
-        from ..conftest import CONTAINER_CLIENT_C
-        
         test_file = f"{MOUNT_POINT}/realtime_insert_clear.txt"
         
         # Create from blind-spot (will be suspect + agent_missing)
@@ -108,11 +108,11 @@ class TestRealtimeRemovesSuspect:
         )
         
         # Wait for realtime events
-        time.sleep(3)
+        time.sleep(5)
         
         # After Agent INSERT, suspect should be cleared
-        # Note: The new file might be suspect again due to fresh mtime
-        # But it should NOT have agent_missing flag
         flags_after = fusion_client.check_file_flags(test_file)
         assert flags_after["agent_missing"] is False, \
             "agent_missing should be cleared after Agent INSERT"
+        assert flags_after["integrity_suspect"] is False, \
+            "integrity_suspect should be cleared after Agent INSERT/UPDATE"

@@ -48,9 +48,12 @@ def cli():
 @click.option("-h", "--host", default="127.0.0.1", help="Host to bind the server to.")
 @click.option("-D", "--daemon", is_flag=True, help="Run the service as a background daemon.")
 @click.option("-V", "--verbose", is_flag=True, help="Enable verbose (DEBUG level) logging.")
+@click.option("-C", "--config", default=None, help="Path to configuration file.")
 @click.option("--no-console-log", is_flag=True, hidden=True, help="Internal: Disable console logging.")
-def start(reload, port, host, daemon, verbose, no_console_log):
+def start(reload, port, host, daemon, verbose, no_console_log, config):
     """Starts the FuAgent monitoring service (in the foreground by default)."""
+    if config:
+        os.environ["FUSTOR_AGENT_CONFIG"] = config
     log_level = "DEBUG" if verbose else "INFO"
     # Disable console logging if --no-console-log is passed (used by daemonized process)
     setup_logging(log_file_path=AGENT_LOG_FILE, base_logger_name="fustor_agent", level=log_level.upper(), console_output=(not no_console_log))

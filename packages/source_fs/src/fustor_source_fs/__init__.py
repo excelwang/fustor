@@ -344,11 +344,23 @@ class FSDriver(SourceDriver):
             new_mtime_cache[root] = current_dir_mtime
             dirs_scanned += 1
             
+            logger.info(f"[{stream_id}] Audit scanning directory: {root}, files in os.walk: {files}, dirs in os.walk: {dirs}")
+
+            # Report the directory itself (for session seen paths and metadata)
+            dir_metadata = get_file_metadata(root, stat_info=dir_stat)
+            if dir_metadata:
+                # Root of scan has no parent info in this context, or we can use dirname
+                dir_metadata["parent_path"] = os.path.dirname(root)
+                # Note: parent_mtime for the root of scan might be unknown, 
+                # but we usually don't need it for the root itself
+                batch.append(dir_metadata)
+
             # Check if directory mtime changed since last audit
             cached_mtime = mtime_cache.get(root)
             if cached_mtime is not None and cached_mtime == current_dir_mtime:
                 # Directory unchanged - skip scanning its direct children files
-                # But we still need to recurse into subdirectories
+                # Mark it as skipped for Fusion's missing file detection logic
+                dir_metadata["audit_skipped"] = True
                 dirs_skipped += 1
                 continue
             

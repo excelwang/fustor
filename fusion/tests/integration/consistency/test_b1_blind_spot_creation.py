@@ -89,6 +89,6 @@ class TestBlindSpotFileCreation:
         blind_spot_list = fusion_client.get_blind_spot_list()
         
         # File should be in the list
-        paths_in_list = [item.get("path") for item in blind_spot_list]
+        paths_in_list = [item.get("path") for item in blind_spot_list if item.get("type") == "file"]
         assert test_file in paths_in_list, \
             f"File {test_file} should be in blind-spot list"

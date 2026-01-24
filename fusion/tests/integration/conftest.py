@@ -162,46 +162,35 @@ def fusion_client(docker_env, test_api_key) -> FusionClient:
     return client
 
 
-@pytest.fixture(scope="session")
-def setup_agents(docker_env, test_api_key, test_datastore):
-    """
-    Configure agents in NFS client containers with API key and datastore.
-    Rewrites config file and restarts agent process.
-    Returns a dict with agent configuration info.
-    """
-    api_key = test_api_key["key"]
-    datastore_id = test_datastore["id"]
-    
+def ensure_agent_running(container_name, api_key, datastore_id):
+    """Ensure the fustor-agent is configured and running in the given container."""
+    agent_id = "agent-a" if container_name == CONTAINER_CLIENT_A else "agent-b"
+    agent_port = 8100
+    mount_point = MOUNT_POINT  # /mnt/shared
     fusion_endpoint = "http://fustor-fusion:8102"
     
-    # Update agent configs in containers A and B
-    for container_name in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B]:
-        agent_id = "agent-a" if container_name == CONTAINER_CLIENT_A else "agent-b"
-        agent_port = 8100
-        mount_point = MOUNT_POINT  # /mnt/shared
-        
-        # 0. Initialize Fustor home and agent.id
-        docker_manager.exec_in_container(container_name, ["mkdir", "-p", "/root/.fustor/schemas"])
-        docker_manager.create_file_in_container(
-            container_name,
-            "/root/.fustor/agent.id",
-            content=agent_id
-        )
-        
-        # 0.1 Bypass schema discovery: Create fake schema and validation marker
-        docker_manager.create_file_in_container(
-            container_name,
-            "/root/.fustor/schemas/source_shared-fs.schema.json",
-            content="{}"
-        )
-        docker_manager.create_file_in_container(
-            container_name,
-            "/root/.fustor/schemas/source_shared-fs.valid",
-            content=""
-        )
+    # 0. Initialize Fustor home and agent.id
+    docker_manager.exec_in_container(container_name, ["mkdir", "-p", "/root/.fustor/schemas"])
+    docker_manager.create_file_in_container(
+        container_name,
+        "/root/.fustor/agent.id",
+        content=agent_id
+    )
+    
+    # 0.1 Bypass schema discovery
+    docker_manager.create_file_in_container(
+        container_name,
+        "/root/.fustor/schemas/source_shared-fs.schema.json",
+        content="{}"
+    )
+    docker_manager.create_file_in_container(
+        container_name,
+        "/root/.fustor/schemas/source_shared-fs.valid",
+        content=""
+    )
 
-        # 1. Generate Config Content (Dictionary format as expected by AppConfig)
-        config_content = f"""
+    # 1. Generate Config Content
+    config_content = f"""
 sources:
   shared-fs:
     driver: "fs"
@@ -209,9 +198,6 @@ sources:
     credential:
       user: "unused"
     disabled: false
-    driver_params:
-      scan_interval: 60
-      audit_interval: 300
 
 pushers:
   fusion:
@@ -228,26 +214,41 @@ syncs:
     source: "shared-fs"
     pusher: "fusion"
     disabled: false
+    audit_interval_sec: {AUDIT_INTERVAL}
+    sentinel_interval_sec: {AUDIT_INTERVAL // 2 if AUDIT_INTERVAL > 10 else 5}
 """
-        # 2. Write config file
-        print(f"Configuring agent in {container_name} (ID: {agent_id})...")
-        docker_manager.create_file_in_container(
-            container_name, 
-            "/root/.fustor/agent-config.yaml", 
-            content=config_content
-        )
-        
-        # 3. Kill existing agent if running
-        docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])
-        time.sleep(1) # Wait for shutdown
-        
-        # 4. Start new agent
-        print(f"Starting agent in {container_name}...")
-        # Start in background with logging to console.log
-        docker_manager.exec_in_container(
-            container_name, 
-            ["sh", "-c", "nohup fustor-agent start > /data/agent/console.log 2>&1 &"]
-        )
+    # 2. Write config file
+    docker_manager.create_file_in_container(
+        container_name, 
+        "/root/.fustor/agent-config.yaml", 
+        content=config_content
+    )
+    
+    # 3. Kill existing agent if running and clean up pid file
+    docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])
+    docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent.pid"])
+    time.sleep(1)
+    
+    # 4. Start new agent
+    docker_manager.exec_in_container(
+        container_name, 
+        ["sh", "-c", "nohup fustor-agent start > /data/agent/console.log 2>&1 &"]
+    )
+
+
+@pytest.fixture(scope="session")
+def setup_agents(docker_env, test_api_key, test_datastore):
+    """
+    Configure agents in NFS client containers with API key and datastore.
+    Returns a dict with agent configuration info.
+    """
+    api_key = test_api_key["key"]
+    datastore_id = test_datastore["id"]
+    
+    # Update agent configs in containers A and B
+    for container_name in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B]:
+        print(f"Configuring and starting agent in {container_name}...")
+        ensure_agent_running(container_name, api_key, datastore_id)
     
     # Wait for agents to register with Fusion
     print("Waiting for agents to register...")
@@ -260,18 +261,25 @@ syncs:
             "leader": CONTAINER_CLIENT_A,
             "follower": CONTAINER_CLIENT_B,
             "blind": CONTAINER_CLIENT_C
-        }
+        },
+        "ensure_agent_running": ensure_agent_running  # Pass the helper function too
     }
 
 
 @pytest.fixture
-def clean_shared_dir(docker_env):
-    """Clean up shared directory before each test."""
+def clean_shared_dir(docker_env, fusion_client):
+    """Clean up shared directory AND reset Fusion parser before each test."""
     # Clear all files in shared directory
     docker_manager.exec_in_container(
         CONTAINER_NFS_SERVER,
         ["sh", "-c", "rm -rf /exports/* 2>/dev/null || true"]
     )
+    # Reset Fusion parser state
+    try:
+        fusion_client.reset_parser()
+    except Exception as e:
+        print(f"Warning: Failed to reset Fusion parser: {e}")
+        
     # Wait for changes to propagate
     time.sleep(2)
     yield

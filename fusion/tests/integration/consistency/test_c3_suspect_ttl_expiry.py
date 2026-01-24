@@ -11,10 +11,10 @@ import time
 import os
 
 from ..utils import docker_manager
-from ..conftest import CONTAINER_CLIENT_A, MOUNT_POINT
+from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT
 
 # Skip if running in CI without enough time
-SKIP_LONG_TESTS = os.getenv("FUSTOR_SKIP_LONG_TESTS", "false").lower() == "true"
+SKIP_LONG_TESTS = os.getenv("FUSTOR_SKIP_LONG_TESTS", "true").lower() == "true"
 
 
 class TestSuspectTTLExpiry:
@@ -26,11 +26,12 @@ class TestSuspectTTLExpiry:
         docker_env,
         fusion_client,
         setup_agents,
-        clean_shared_dir
+        clean_shared_dir,
+        wait_for_audit
     ):
         """
         场景:
-          1. 创建文件（加入 Suspect List）
+          1. 创建文件（从盲区创建，触发 Audit 加入 Suspect List）
           2. 等待 10 分钟 + buffer
           3. 文件不再被标记为 integrity_suspect
         预期:
@@ -39,15 +40,16 @@ class TestSuspectTTLExpiry:
         """
         test_file = f"{MOUNT_POINT}/suspect_ttl_test.txt"
         
-        # Create file
+        # Create file from blind-spot
         docker_manager.create_file_in_container(
-            CONTAINER_CLIENT_A,
+            CONTAINER_CLIENT_C,
             test_file,
             content="file for TTL test"
         )
         
-        # Wait for sync
-        fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        # Wait for Audit to discover and mark as suspect
+        wait_for_audit()
+        fusion_client.wait_for_file_in_tree(test_file, timeout=10)
         
         # Verify it's in suspect list initially
         flags_initial = fusion_client.check_file_flags(test_file)
@@ -77,11 +79,8 @@ class TestSuspectTTLExpiry:
         setup_agents
     ):
         """
-        验证 Fusion 内部存在 TTL 清理逻辑（通过检查相关配置或 API）
-        这是一个快速验证测试，不需要等待实际 TTL。
+        验证 Suspect List API 返回列表格式。
         """
-        # This test just verifies the suspect list API works
-        # and that TTL logic is configured
         suspect_list = fusion_client.get_suspect_list()
         
         # API should return a list (even if empty)

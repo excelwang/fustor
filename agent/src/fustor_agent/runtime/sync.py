@@ -507,7 +507,14 @@ class SyncInstance:
                     self.audit_mtime_cache = next_cache # Update cache only on success
                 
                 try:
-                    await self.pusher_driver_instance.signal_audit_end(source_id=self.config.source)
+                    # Send end signal via push to ensure proper queue ordering and timing
+                    # passing empty events list with is_snapshot_end=True
+                    await self.pusher_driver_instance.push(
+                        events=[],
+                        session_id=self.session_id,
+                        source_type='audit',
+                        is_snapshot_end=True
+                    )
                 except NotImplementedError:
                     pass
                     

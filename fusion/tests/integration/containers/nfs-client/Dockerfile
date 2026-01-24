@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir \
     python-json-logger \
     colorlog \
     /app/packages/fustor_common \
+    /app/packages/core \
     /app/packages/fustor_event_model \
     /app/packages/fustor_agent_sdk \
     /app/packages/fustor_fusion_sdk \

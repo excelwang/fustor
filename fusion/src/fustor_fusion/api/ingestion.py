@@ -2,8 +2,10 @@ from fastapi import APIRouter, Depends, status, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 import logging
+import asyncio
 from typing import List, Dict, Any
 import time
+
 
 from ..auth.dependencies import get_datastore_id_from_api_key
 from ..runtime import datastore_event_manager
@@ -14,6 +16,8 @@ from ..processing_manager import processing_manager
 
 # Import the queue-based ingestion
 from ..queue_integration import queue_based_ingestor, add_events_batch_to_queue, get_position_from_queue, update_position_in_queue
+from ..in_memory_queue import memory_event_queue
+
 from fustor_event_model.models import EventBase, EventType, MessageSource # Import EventBase, EventType, and MessageSource
 
 from ..parsers.manager import ParserManager, get_directory_stats, get_cached_parser_manager # CORRECTED
@@ -156,16 +160,10 @@ async def ingest_event_batch(
             logger.warning(f"Received snapshot push from outdated session '{payload.session_id}' for datastore {datastore_id}. Rejecting with 419.")
             raise HTTPException(status_code=419, detail="A newer sync session has been started. This snapshot task is now obsolete and should stop.")
 
-    # Handle snapshot end signal
-    if payload.is_snapshot_end:
+    # Handle snapshot end signal - for non-audit types, do it upfront
+    if payload.is_snapshot_end and payload.source_type != 'audit':
         logger.info(f"Received end signal for source_type={payload.source_type} for datastore {datastore_id}")
-        if payload.source_type == 'audit':
-            manager = await get_cached_parser_manager(datastore_id)
-            parser = await manager.get_file_directory_parser()
-            if parser:
-                await parser.handle_audit_end()
-        else:
-            await datastore_state_manager.set_snapshot_complete(datastore_id, payload.session_id)
+        await datastore_state_manager.set_snapshot_complete(datastore_id, payload.session_id)
 
     try:
         if payload.events:
@@ -222,6 +220,34 @@ async def ingest_event_batch(
             await datastore_event_manager.notify(datastore_id)
         except Exception as e:
             logger.error(f"Failed to notify event manager for datastore {datastore_id}: {e}", exc_info=True)
+
+        # Handle audit end signal AFTER events are queued
+        # We wait for the queue to drain to ensure all audit_skipped flags are processed
+        if payload.is_snapshot_end and payload.source_type == 'audit':
+            logger.info(f"Received audit end signal for datastore {datastore_id}, waiting for queue to drain")
+            
+            # Wait for queue to drain with timeout
+            max_wait = 5.0
+            wait_interval = 0.1
+            elapsed = 0.0
+            
+            while elapsed < max_wait:
+                queue_size = memory_event_queue.get_queue_size(datastore_id)
+                inflight = processing_manager.get_inflight_count(datastore_id)
+                if queue_size == 0 and inflight == 0:
+                    break
+                await asyncio.sleep(wait_interval)
+                elapsed += wait_interval
+            
+            if elapsed >= max_wait:
+                logger.warning(f"Audit end timeout waiting for queue: queue={queue_size}, inflight={inflight}")
+            else:
+                logger.info(f"Queue drained for audit end (waited {elapsed:.1f}s)")
+            
+            manager = await get_cached_parser_manager(datastore_id)
+            parser = await manager.get_file_directory_parser()
+            if parser:
+                await parser.handle_audit_end()
 
     except Exception as e:
         logger.error(f"处理批量事件失败 (task: {si.task_id}): {e}", exc_info=True)

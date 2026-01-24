@@ -22,6 +22,7 @@ class DirectoryNode:
         # Consistency flags
         self.integrity_suspect: bool = False
         self.agent_missing: bool = False
+        self.audit_skipped: bool = False  # Temporary flag for missing file detection
 
     def to_dict(self, recursive=True, max_depth=None, only_path=False):
         """Converts the directory node to a dictionary representation."""
@@ -36,6 +37,8 @@ class DirectoryNode:
                 'size': self.size,
                 'modified_time': self.modified_time,
                 'created_time': self.created_time,
+                'mtime': self.modified_time,  # Alias for compatibility
+                'ctime': self.created_time,   # Alias for compatibility
                 'integrity_suspect': self.integrity_suspect,
                 'agent_missing': self.agent_missing
             })
@@ -89,6 +92,8 @@ class FileNode:
                 'size': self.size,
                 'modified_time': self.modified_time,
                 'created_time': self.created_time,
+                'mtime': self.modified_time,  # Alias for compatibility
+                'ctime': self.created_time,   # Alias for compatibility
                 'integrity_suspect': self.integrity_suspect,
                 'agent_missing': self.agent_missing
             })
@@ -146,6 +151,12 @@ class DirectoryStructureParser:
         """Update the in-memory tree with create/update event data."""
         # Standardize path
         path = path.rstrip('/') if path != '/' else '/'
+        
+        # DEBUG LOGGING
+        skipped_val = payload.get('audit_skipped', 'NOT_SET')
+        if skipped_val != 'NOT_SET':
+             self.logger.info(f"DEBUG_UPDATE: path={path} has audit_skipped={skipped_val} value_type={type(skipped_val)} payload_keys={list(payload.keys())}")
+
         parent_path = os.path.dirname(path)
         name = os.path.basename(path)
         
@@ -176,13 +187,22 @@ class DirectoryStructureParser:
                 node.size = size
                 node.modified_time = mtime
                 node.created_time = ctime
+                audit_skipped_value = payload.get('audit_skipped', False)
+                node.audit_skipped = audit_skipped_value
+                if audit_skipped_value:
+                    logger.info(f"Set audit_skipped=True for existing directory: {path}")
             else:
                 node = DirectoryNode(name, path, size, mtime, ctime)
+                audit_skipped_value = payload.get('audit_skipped', False)
+                node.audit_skipped = audit_skipped_value
+                if audit_skipped_value:
+                    logger.info(f"Set audit_skipped=True for NEW directory: {path}")
                 self._directory_path_map[path] = node
                 if path != '/':
                     parent_node = self._directory_path_map.get(parent_path)
                     if parent_node:
                         parent_node.children[name] = node
+
         else:
             node = FileNode(name, path, size, mtime, ctime)
             self._file_path_map[path] = node
@@ -316,14 +336,13 @@ class DirectoryStructureParser:
                             parent_path = payload.get('parent_path')
                             parent_mtime_from_audit = payload.get('parent_mtime')
                             
-                            if parent_path and parent_mtime_from_audit is not None:
-                                memory_parent = self._directory_path_map.get(parent_path)
-                                if memory_parent and memory_parent.modified_time > parent_mtime_from_audit:
-                                    self.logger.debug(
-                                        f"Skipping {path}: parent {parent_path} mtime in memory "
-                                        f"({memory_parent.modified_time}) > audit ({parent_mtime_from_audit})"
-                                    )
-                                    continue
+                            memory_parent = self._directory_path_map.get(parent_path)
+                            if memory_parent and memory_parent.modified_time is not None and parent_mtime_from_audit is not None and memory_parent.modified_time > parent_mtime_from_audit:
+                                self.logger.debug(
+                                    f"Skipping {path}: parent {parent_path} mtime in memory "
+                                    f"({memory_parent.modified_time}) > audit ({parent_mtime_from_audit})"
+                                )
+                                continue
                         
                         # Apply the update
                         await self._process_create_update_in_memory(payload, path)
@@ -355,11 +374,15 @@ class DirectoryStructureParser:
                 node.agent_missing = False
             for node in self._directory_path_map.values():
                 node.agent_missing = False
+                node.audit_skipped = False
             
             # Clear paths seen tracker for missing file detection
             self._audit_seen_paths.clear()
             
-            self.logger.info(f"Audit started for datastore {self.datastore_id}, cleared blind-spot flags")
+            # Clear blind-spot deletions list for the new cycle
+            self._blind_spot_deletions.clear()
+            
+            self.logger.info(f"Audit started for datastore {self.datastore_id}, cleared blind-spot flags and deletions")
     
     async def handle_audit_end(self):
         """
@@ -398,16 +421,27 @@ class DirectoryStructureParser:
                     
                     # Get parent directory to check mtime
                     parent_path = os.path.dirname(missing_path)
+                    parent_node = self._directory_path_map.get(parent_path)
                     
-                    # If parent wasn't scanned in this audit, we can't conclude anything
-                    # (the audit might have been partial)
+                    # If parent was skipped in this audit, we can't conclude it's missing
+                    parent_skipped = getattr(parent_node, 'audit_skipped', False) if parent_node else False
+                    self.logger.info(f"Checking missing: {missing_path}, parent_node exists: {parent_node is not None}, parent_skipped: {parent_skipped}")
+                    if parent_node and not parent_skipped:
+                        self.logger.info(f"DEBUG_PARENT_DUMP: {parent_path} audit_skipped={getattr(parent_node, 'audit_skipped', 'MISSING')} node_vars={vars(parent_node)}")
+
+                    if parent_node and parent_skipped:
+                        self.logger.info(f"Missing file {missing_path} ignored: parent {parent_path} was skipped in audit")
+                        continue
+                        
+                    # If parent wasn't scanned at all in this audit, we can't conclude anything
                     if parent_path not in self._audit_seen_paths and parent_path != "/":
+                        self.logger.debug(f"Missing file {missing_path} ignored: parent {parent_path} not seen in audit")
                         continue
                     
                     # Section 5.3 Scenario 2: Delete from memory tree + mark as blind-spot
                     paths_to_delete.append(missing_path)
                     missing_detected += 1
-                    self.logger.debug(f"Blind-spot deletion detected: {missing_path}")
+                    self.logger.info(f"Blind-spot deletion detected: {missing_path} (parent={parent_path}, parent_seen={parent_path in self._audit_seen_paths}, parent_skipped={getattr(parent_node, 'audit_skipped', False) if parent_node else 'N/A'})")
                 
                 # Execute deletions
                 for path in paths_to_delete:

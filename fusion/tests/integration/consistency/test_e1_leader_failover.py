@@ -8,7 +8,7 @@ import pytest
 import time
 
 from ..utils import docker_manager
-from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_B
+from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, MOUNT_POINT
 
 
 class TestLeaderFailover:
@@ -78,8 +78,13 @@ class TestLeaderFailover:
                 "New leader should have audit permission"
             
         finally:
-            # Restart Agent A container for other tests
+            # Restart Agent A container and agent process for other tests
             docker_manager.start_container(CONTAINER_CLIENT_A)
+            setup_agents["ensure_agent_running"](
+                CONTAINER_CLIENT_A, 
+                setup_agents["api_key"], 
+                setup_agents["datastore_id"]
+            )
             time.sleep(10)  # Wait for restart
 
     def test_failover_preserves_data_integrity(
@@ -108,6 +113,10 @@ class TestLeaderFailover:
         # Stop leader
         docker_manager.stop_container(CONTAINER_CLIENT_A)
         
+        # Diagnostic: Check if B can see the file
+        output = docker_manager.exec_in_container(CONTAINER_CLIENT_B, ["ls", "-l", MOUNT_POINT])
+        print(f"File listing from B after A stop: {output}")
+        
         try:
             # Wait for failover
             time.sleep(90)
@@ -117,8 +126,13 @@ class TestLeaderFailover:
             found_after = fusion_client._find_in_tree(tree, test_file)
             
             assert found_after is not None, \
-                "Data should be preserved after leader failover"
+                f"Data should be preserved after leader failover. Tree: {tree}"
             
         finally:
             docker_manager.start_container(CONTAINER_CLIENT_A)
+            setup_agents["ensure_agent_running"](
+                CONTAINER_CLIENT_A, 
+                setup_agents["api_key"], 
+                setup_agents["datastore_id"]
+            )
             time.sleep(10)

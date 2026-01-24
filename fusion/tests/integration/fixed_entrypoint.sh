@@ -27,7 +27,7 @@ agent:
   data_dir: "/data/agent"
 
 sources:
-  - name: "shared-fs"
+  shared-fs:
     driver: "source-fs"
     config:
       watch_paths:
@@ -36,7 +36,7 @@ sources:
       audit_interval: 300
 
 pushers:
-  - name: "fusion"
+  fusion:
     driver: "fusion"
     config:
       endpoint: "${FUSION_ENDPOINT}"

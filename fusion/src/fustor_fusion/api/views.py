@@ -159,7 +159,7 @@ class SuspectUpdateRequest(BaseModel):
 )
 async def get_suspect_list_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     """
     Get the current Suspect List for this datastore.
     Used by Leader Agent for Sentinel Sweep.
@@ -168,11 +168,7 @@ async def get_suspect_list_api(
     manager = await get_cached_parser_manager(datastore_id)
     parser = await manager.get_file_directory_parser()
     suspect_list = await parser.get_suspect_list()
-    return {
-        "datastore_id": datastore_id,
-        "suspect_count": len(suspect_list),
-        "suspects": [{"path": path, "suspect_until": ts} for path, ts in suspect_list.items()]
-    }
+    return [{"path": path, "suspect_until": ts} for path, ts in suspect_list.items()]
 
 
 @parser_router.put("/fs/suspect-list",
@@ -193,14 +189,15 @@ async def update_suspect_list_api(
     updated_count = 0
     for item in request.updates:
         path = item.get("path")
-        mtime = item.get("mtime")
+        mtime = item.get("mtime") or item.get("current_mtime")
         if path and mtime is not None:
-            await parser.update_suspect(path, mtime)
+            await parser.update_suspect(path, float(mtime))
             updated_count += 1
     
     return {
         "datastore_id": datastore_id,
-        "updated_count": updated_count
+        "updated_count": updated_count,
+        "status": "ok"
     }
 
 
@@ -240,11 +237,43 @@ async def audit_end_api(
 )
 async def get_blind_spot_list_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     """
     Get the current Blind-spot List for this datastore.
     """
     logger.info(f"API request for blind-spot list: datastore_id={datastore_id}")
     manager = await get_cached_parser_manager(datastore_id)
     parser = await manager.get_file_directory_parser()
-    return await parser.get_blind_spot_list()
+    blind_spot_data = await parser.get_blind_spot_list()
+    
+    # Format a unified list for the integration tests
+    result = []
+    
+    # Add files marked as agent_missing
+    for f in blind_spot_data.get("agent_missing_files", []):
+        f["type"] = "file"
+        result.append(f)
+        
+    # Add blind-spot deletions
+    for path in blind_spot_data.get("deletions", []):
+        result.append({
+            "path": path,
+            "type": "deletion",
+            "content_type": "file"  # Assumption
+        })
+        
+    return result
+
+
+@parser_router.post("/fs/reset",
+    summary="Reset Directory Tree",
+    description="Clears all in-memory data for this datastore. (Mainly for testing)"
+)
+async def reset_parser_api(
+    datastore_id: int = Depends(get_datastore_id_from_api_key)
+) -> Dict[str, str]:
+    """Reset the directory tree for this datastore."""
+    logger.info(f"API request to reset parser: datastore_id={datastore_id}")
+    from ..parsers.manager import reset_directory_tree
+    await reset_directory_tree(datastore_id)
+    return {"status": "ok", "message": "Parser state reset"}

@@ -77,7 +77,13 @@ class TestNewLeaderResumesDuties:
             
         finally:
             docker_manager.start_container(CONTAINER_CLIENT_A)
+            setup_agents["ensure_agent_running"](
+                CONTAINER_CLIENT_A, 
+                setup_agents["api_key"], 
+                setup_agents["datastore_id"]
+            )
             time.sleep(10)
+
 
     def test_new_leader_performs_snapshot(
         self,
@@ -132,7 +138,13 @@ class TestNewLeaderResumesDuties:
             
         finally:
             docker_manager.start_container(CONTAINER_CLIENT_A)
+            setup_agents["ensure_agent_running"](
+                CONTAINER_CLIENT_A, 
+                setup_agents["api_key"], 
+                setup_agents["datastore_id"]
+            )
             time.sleep(10)
+
 
     def test_original_leader_becomes_follower_on_return(
         self,
@@ -152,6 +164,12 @@ class TestNewLeaderResumesDuties:
             
             # Restart A
             docker_manager.start_container(CONTAINER_CLIENT_A)
+            setup_agents["ensure_agent_running"](
+                CONTAINER_CLIENT_A, 
+                setup_agents["api_key"], 
+                setup_agents["datastore_id"]
+            )
+            # Wait for A to register new session
             time.sleep(15)
             
             # Check roles

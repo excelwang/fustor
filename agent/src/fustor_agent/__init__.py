@@ -40,7 +40,7 @@ logger.setLevel(logging.DEBUG)
 def get_app_config() -> AppConfig:
     global _app_config_instance
     if _app_config_instance is None:
-        config_file_path = os.path.join(CONFIG_DIR, CONFIG_FILE_NAME)
+        config_file_path = os.environ.get("FUSTOR_AGENT_CONFIG") or os.path.join(CONFIG_DIR, CONFIG_FILE_NAME)
         raw_data = {}
         
         if CONFIG_DIR and not os.path.exists(CONFIG_DIR):

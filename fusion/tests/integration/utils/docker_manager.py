@@ -131,12 +131,15 @@ class DockerManager:
         return result.returncode == 0
 
     def get_file_mtime(self, container: str, path: str) -> Optional[float]:
-        """Get file mtime in container."""
+        """Get file mtime in container with high precision."""
         result = self.exec_in_container(container, [
-            "stat", "-c", "%Y", path
+            "python3", "-c", f"import os; print(os.stat('{path}').st_mtime)"
         ])
         if result.returncode == 0:
-            return float(result.stdout.strip())
+            try:
+                return float(result.stdout.strip())
+            except ValueError:
+                return None
         return None
 
     def touch_file(self, container: str, path: str) -> None:

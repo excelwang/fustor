@@ -8,7 +8,7 @@ import pytest
 import time
 
 from ..utils import docker_manager
-from ..conftest import CONTAINER_CLIENT_A, MOUNT_POINT
+from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT
 
 
 class TestSentinelSweep:
@@ -19,17 +19,18 @@ class TestSentinelSweep:
         docker_env,
         fusion_client,
         setup_agents,
-        clean_shared_dir
+        clean_shared_dir,
+        wait_for_audit
     ):
         """
         场景:
-          1. 创建多个文件（加入 Suspect List）
+          1. 无 Agent 客户端创建多个文件（加入 Suspect List）
           2. Leader 应定期请求 GET /api/v1/views/fs/suspect-list
           3. Leader 检查这些文件的当前 mtime
           4. Leader 通过 PUT /api/v1/views/fs/suspect-list 上报
-        验证方法:
-          - 检查 Fusion 日志或 metrics 中的 suspect-list 请求记录
-          - 或验证 suspect list 中的 mtime 被更新
+        预期:
+          - 文件出现在 suspect list 中
+          - PUT API 能够正常处理更新
         """
         test_files = [
             f"{MOUNT_POINT}/suspect_sweep_1.txt",
@@ -37,17 +38,20 @@ class TestSentinelSweep:
             f"{MOUNT_POINT}/suspect_sweep_3.txt",
         ]
         
-        # Create files
+        # Create files from blind-spot
         for f in test_files:
             docker_manager.create_file_in_container(
-                CONTAINER_CLIENT_A,
+                CONTAINER_CLIENT_C,
                 f,
                 content=f"content for {f}"
             )
         
-        # Wait for initial sync
+        # Wait for Audit to discover and mark as suspect
+        wait_for_audit()
+        
+        # Wait for initial sync visibility
         for f in test_files:
-            fusion_client.wait_for_file_in_tree(f, timeout=15)
+            fusion_client.wait_for_file_in_tree(f, timeout=10)
         
         # Get suspect list
         suspect_list = fusion_client.get_suspect_list()
@@ -57,24 +61,15 @@ class TestSentinelSweep:
         for f in test_files:
             assert f in paths_in_list, f"File {f} should be in suspect list"
         
-        # Wait for sentinel sweep cycle (2 minutes according to doc, but may be shorter in test)
-        # For testing, we just verify the API works
-        time.sleep(5)
-        
         # Manually trigger a suspect list update (simulating what agent would do)
-        # This tests the PUT API
+        # Testing PUT API robustness and compatibility
         updates = [
-            {"path": f, "current_mtime": time.time()} 
+            {"path": f, "mtime": time.time()} # Use 'mtime' as expected by API
             for f in test_files
         ]
         
-        # Note: In real scenario, Agent would call this
-        # For testing, we verify the API exists and works
-        try:
-            result = fusion_client.update_suspect_list(updates)
-            assert result is not None, "Suspect list update should return a result"
-        except Exception as e:
-            pytest.skip(f"Suspect list update API not implemented: {e}")
+        result = fusion_client.update_suspect_list(updates)
+        assert result is not None, "Suspect list update should return a result"
 
     def test_only_leader_performs_sentinel_sweep(
         self,
@@ -89,21 +84,12 @@ class TestSentinelSweep:
         # Get sessions
         sessions = fusion_client.get_sessions()
         
-        # Find leader and follower
+        # Find leader
         leader = None
-        follower = None
         for s in sessions:
             if s.get("role") == "leader":
                 leader = s
-            elif s.get("role") == "follower":
-                follower = s
         
-        # Leader should have sentinel sweep capability
         assert leader is not None, "Leader should exist"
-        # In the session response, we could check for a 'can_sentinel_sweep' flag
-        # For now, we just verify leader has the required permissions
-        
-        if follower:
-            # Follower should not perform sentinel sweep
-            # This is enforced by the Fusion side, checking the session role
-            pass  # Implementation-specific check
+        # The agent logs would normally show the sweep starting.
+        # This test ensures basic session role distinction via Fusion API.

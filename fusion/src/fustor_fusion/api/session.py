@@ -95,9 +95,9 @@ async def create_session(
     # Always set the new session as authoritative to enable status tracking
     await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
 
-    if datastore_config.allow_concurrent_push:
-        logger.info(f"Datastore {datastore_id} allows concurrent push. Resetting parser.")
-        
+    active_sessions = await session_manager.get_datastore_sessions(datastore_id)
+    if not active_sessions and datastore_config.allow_concurrent_push:
+        logger.info(f"Datastore {datastore_id} allows concurrent push and this is the first session. Resetting parser.")
         # Reset the parser state (memory only)
         try:
             await reset_directory_tree(datastore_id)

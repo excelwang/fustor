@@ -58,6 +58,12 @@ class FusionClient:
         resp.raise_for_status()
         return resp.json()
 
+    def reset_parser(self) -> dict:
+        """Reset the directory tree for current datastore."""
+        resp = self.session.post(f"{self.base_url}/api/v1/views/fs/reset")
+        resp.raise_for_status()
+        return resp.json()
+
     # ============ Consistency API ============
 
     def get_suspect_list(self, source_id: Optional[str] = None) -> list[dict]:
@@ -76,7 +82,7 @@ class FusionClient:
         """Update suspect list with new mtime values."""
         resp = self.session.put(
             f"{self.base_url}/api/v1/views/fs/suspect-list",
-            json=updates
+            json={"updates": updates}
         )
         resp.raise_for_status()
         return resp.json()

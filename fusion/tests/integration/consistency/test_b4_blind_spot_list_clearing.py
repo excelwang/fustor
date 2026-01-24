@@ -45,7 +45,7 @@ class TestBlindSpotListClearing:
         
         # Step 2: Verify A is in blind-spot list
         blind_list_1 = fusion_client.get_blind_spot_list()
-        paths_1 = [item.get("path") for item in blind_list_1]
+        paths_1 = [item.get("path") for item in blind_list_1 if item.get("type") == "file"]
         assert test_file_a in paths_1, "File A should be in blind-spot list"
         
         # Step 3: Delete file A, create new file B
@@ -61,7 +61,8 @@ class TestBlindSpotListClearing:
         
         # Step 5: Get new blind-spot list
         blind_list_2 = fusion_client.get_blind_spot_list()
-        paths_2 = [item.get("path") for item in blind_list_2]
+        # Filter for file type only (ignore tracked deletions)
+        paths_2 = [item.get("path") for item in blind_list_2 if item.get("type") == "file"]
         
         # File A should NOT be in the new list (list was cleared, A no longer exists)
         assert test_file_a not in paths_2, \
