@@ -51,7 +51,7 @@ class TestNewLeaderResumesDuties:
                     break
             
             assert new_leader is not None, "New leader should exist"
-            assert new_leader.get("agent_id") == "agent-b", \
+            assert new_leader.get("agent_id", "").startswith("agent-b"), \
                 "Agent B should be the new leader"
             
             # Create file from blind-spot
@@ -128,7 +128,7 @@ class TestNewLeaderResumesDuties:
             found = fusion_client.wait_for_file_in_tree(new_file, timeout=15)
             
             assert found is not None, \
-                "New leader should sync files via realtime"
+                f"New leader should sync files via realtime, got sessions: {fusion_client.get_sessions()}"
             
         finally:
             docker_manager.start_container(CONTAINER_CLIENT_A)
@@ -159,15 +159,19 @@ class TestNewLeaderResumesDuties:
             
             roles = {}
             for s in sessions:
-                roles[s.get("agent_id")] = s.get("role")
+                aid = s.get("agent_id", "")
+                if aid.startswith("agent-a"):
+                    roles["agent-a"] = s.get("role")
+                elif aid.startswith("agent-b"):
+                    roles["agent-b"] = s.get("role")
             
             # B should remain leader
             assert roles.get("agent-b") == "leader", \
-                "Agent B should remain leader"
+                f"Agent B should remain leader, got roles: {roles}"
             
             # A should be follower
             assert roles.get("agent-a") == "follower", \
-                "Returning Agent A should become follower"
+                f"Returning Agent A should become follower, got roles: {roles}"
             
         finally:
             # Final cleanup - restart to restore original state if needed

@@ -32,12 +32,15 @@ services:
       context: ../../..
       dockerfile: fusion/tests/integration/containers/fustor-services/Dockerfile
     container_name: fustor-registry
-    command: ["fustor-registry"]
+    command: ["fustor-registry", "start", "-h", "0.0.0.0"]
     environment:
       FUSTOR_REGISTRY_HOST: "0.0.0.0"
       FUSTOR_REGISTRY_PORT: "8101"
       FUSTOR_REGISTRY_DATA_DIR: "/data/registry"
       FUSTOR_REGISTRY_ADMIN_PASSWORD: "admin123"
+      # Shared token for internal service communication
+      FUSTOR_REGISTRY_CLIENT_TOKEN: "test-integration-token-for-internal-apis-12345"
+      FUSTOR_CORE_SECRET_KEY: "test-integration-secret-key-for-jwt-signing"
     volumes:
       - registry-data:/data/registry
     ports:
@@ -45,7 +48,7 @@ services:
     networks:
       - fustor-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8101/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8101/"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -55,12 +58,17 @@ services:
       context: ../../..
       dockerfile: fusion/tests/integration/containers/fustor-services/Dockerfile
     container_name: fustor-fusion
-    command: ["fustor-fusion"]
+    command: ["fustor-fusion", "start", "-h", "0.0.0.0"]
     environment:
       FUSTOR_FUSION_HOST: "0.0.0.0"
       FUSTOR_FUSION_PORT: "8102"
       FUSTOR_FUSION_REGISTRY_URL: "http://registry:8101"
       FUSTOR_FUSION_DATA_DIR: "/data/fusion"
+      # Faster cache sync for integration tests
+      FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: "5"
+      # Shared token for internal service communication (must match Registry)
+      FUSTOR_REGISTRY_CLIENT_TOKEN: "test-integration-token-for-internal-apis-12345"
+      FUSTOR_CORE_SECRET_KEY: "test-integration-secret-key-for-jwt-signing"
     volumes:
       - fusion-data:/data/fusion
     ports:
@@ -71,7 +79,7 @@ services:
       registry:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8102/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8102/"]
       interval: 5s
       timeout: 3s
       retries: 10

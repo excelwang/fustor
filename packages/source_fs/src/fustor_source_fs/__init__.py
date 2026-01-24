@@ -390,6 +390,7 @@ class FSDriver(SourceDriver):
                     sub_stat = os.stat(dir_path)
                     dir_metadata = get_file_metadata(dir_path, stat_info=sub_stat)
                     if dir_metadata:
+                        dir_metadata["parent_path"] = root
                         dir_metadata["parent_mtime"] = current_dir_mtime
                         batch.append(dir_metadata)
                         

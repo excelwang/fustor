@@ -232,3 +232,19 @@ async def audit_end_api(
     parser = await manager.get_file_directory_parser()
     await parser.handle_audit_end()
     return {"status": "ok", "message": "Audit ended, tombstones cleaned"}
+
+
+@parser_router.get("/fs/blind-spot-list", 
+    summary="Get Blind-spot List",
+    description="Returns files that exist on disk but were not reported by any Agent (Realtime/Snapshot)"
+)
+async def get_blind_spot_list_api(
+    datastore_id: int = Depends(get_datastore_id_from_api_key)
+) -> Dict[str, Any]:
+    """
+    Get the current Blind-spot List for this datastore.
+    """
+    logger.info(f"API request for blind-spot list: datastore_id={datastore_id}")
+    manager = await get_cached_parser_manager(datastore_id)
+    parser = await manager.get_file_directory_parser()
+    return await parser.get_blind_spot_list()

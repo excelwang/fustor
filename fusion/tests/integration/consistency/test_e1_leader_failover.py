@@ -36,9 +36,10 @@ class TestLeaderFailover:
         leader_session = None
         follower_session = None
         for s in sessions:
-            if s.get("agent_id") == "agent-a":
+            aid = s.get("agent_id", "")
+            if aid.startswith("agent-a"):
                 leader_session = s
-            elif s.get("agent_id") == "agent-b":
+            elif aid.startswith("agent-b"):
                 follower_session = s
         
         assert leader_session is not None, "Agent A session should exist"
@@ -67,7 +68,7 @@ class TestLeaderFailover:
                     break
             
             assert new_leader is not None, "A new leader should be elected"
-            assert new_leader.get("agent_id") == "agent-b", \
+            assert new_leader.get("agent_id", "").startswith("agent-b"), \
                 f"Agent B should become leader, got {new_leader.get('agent_id')}"
             
             # Verify new leader has proper permissions

@@ -194,15 +194,25 @@ async def list_sessions(
     
     session_list = []
     for session_id, session_info in sessions.items():
-        session_list.append({
+        session_data = {
             "session_id": session_id,
             "task_id": session_info.task_id,
+            "agent_id": session_info.task_id,  # Map task_id to agent_id for client convenience
             "client_ip": session_info.client_ip,
             "last_activity": session_info.last_activity,
             "created_at": session_info.created_at,
             "allow_concurrent_push": session_info.allow_concurrent_push,
             "session_timeout_seconds": session_info.session_timeout_seconds
-        })
+        }
+        
+        # Check leader status
+        is_leader = await datastore_state_manager.is_locked_by_session(datastore_id, session_id)
+        session_data["role"] = "leader" if is_leader else "follower"
+        session_data["can_snapshot"] = is_leader
+        session_data["can_audit"] = is_leader
+        session_data["can_realtime"] = True
+        
+        session_list.append(session_data)
     
     return {
         "datastore_id": datastore_id,

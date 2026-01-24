@@ -41,19 +41,19 @@ class DirectoryNode:
             })
 
         # Base case for recursion depth
-        if max_depth is not None and max_depth <= 0:
+        if max_depth is not None and max_depth == 0:
             return result
 
         if recursive:
-            result['children'] = {}
-            for child_name, child in self.children.items():
+            result['children'] = []
+            for child in self.children.values():
                 child_dict = child.to_dict(
                     recursive=True, 
                     max_depth=max_depth - 1 if max_depth is not None else None,
                     only_path=only_path
                 )
                 if child_dict is not None:
-                    result['children'][child_name] = child_dict
+                    result['children'].append(child_dict)
         else:
             # Non-recursive mode: return children as a LIST of direct metadata
             result['children'] = []
@@ -305,7 +305,7 @@ class DirectoryStructureParser:
                         
                         # Rule 2: Mtime check - skip if existing data is newer
                         existing = self._get_node(path)
-                        if existing and existing.modified_time >= mtime:
+                        if existing and existing.modified_time is not None and mtime is not None and existing.modified_time >= mtime:
                             self.logger.debug(f"Skipping {path}: existing mtime {existing.modified_time} >= incoming {mtime}")
                             continue
                         
@@ -462,10 +462,34 @@ class DirectoryStructureParser:
     async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
         """Get the tree structure starting from path."""
         async with self._lock:
+            # First check if it's a directory
             node = self._directory_path_map.get(path)
             if node:
                 return node.to_dict(recursive=recursive, max_depth=max_depth, only_path=only_path)
+            
+            # Then check if it's a file
+            node = self._file_path_map.get(path)
+            if node:
+                return node.to_dict(recursive=recursive, max_depth=max_depth, only_path=only_path)
+                
             return None
+    
+    async def get_blind_spot_list(self) -> Dict[str, Any]:
+        """Get the current Blind-spot List."""
+        async with self._lock:
+            # Files with agent_missing flag
+            agent_missing_files = [
+                node.to_dict() for node in self._file_path_map.values() 
+                if node.agent_missing
+            ]
+            
+            return {
+                "datastore_id": self.datastore_id,
+                "agent_missing_count": len(agent_missing_files),
+                "agent_missing_files": agent_missing_files,
+                "deletion_count": len(self._blind_spot_deletions),
+                "deletions": list(self._blind_spot_deletions)
+            }
 
     async def search_files(self, query: str) -> List[Dict[str, Any]]:
         """Search files by name pattern (placeholder)."""

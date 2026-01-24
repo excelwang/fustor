@@ -93,7 +93,7 @@ class FusionClient:
         """Get all active sessions."""
         resp = self.session.get(f"{self.base_url}/api/v1/ingest/sessions/")
         resp.raise_for_status()
-        return resp.json()
+        return resp.json().get("active_sessions", [])
 
     def get_leader_session(self) -> Optional[dict]:
         """Get the current leader session."""
