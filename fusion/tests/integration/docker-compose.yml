@@ -1,0 +1,187 @@
+# version is obsolete in compose v2
+# Fustor NFS Multi-Mount Consistency Integration Test Environment
+
+# Fustor NFS Multi-Mount Consistency Integration Test Environment
+# This setup simulates a real NFS multi-client scenario with:
+# - NFS Server: exports shared directory
+# - NFS Client A/B: with Fustor Agents (Leader/Follower)
+# - NFS Client C: no Agent (blind-spot simulation)
+# - Registry & Fusion: central services
+
+services:
+  # ============ Infrastructure Services ============
+  
+  nfs-server:
+    image: erichough/nfs-server
+    container_name: fustor-nfs-server
+    privileged: true
+    environment:
+      NFS_EXPORT_0: "/exports *(rw,sync,no_subtree_check,no_root_squash)"
+    volumes:
+      - nfs-data:/exports
+    networks:
+      - fustor-net
+    healthcheck:
+      test: ["CMD", "showmount", "-e", "localhost"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  registry:
+    build:
+      context: ../../..
+      dockerfile: fusion/tests/integration/containers/fustor-services/Dockerfile
+    container_name: fustor-registry
+    command: ["fustor-registry"]
+    environment:
+      FUSTOR_REGISTRY_HOST: "0.0.0.0"
+      FUSTOR_REGISTRY_PORT: "8101"
+      FUSTOR_REGISTRY_DATA_DIR: "/data/registry"
+      FUSTOR_REGISTRY_ADMIN_PASSWORD: "admin123"
+    volumes:
+      - registry-data:/data/registry
+    ports:
+      - "18101:8101"
+    networks:
+      - fustor-net
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8101/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  fusion:
+    build:
+      context: ../../..
+      dockerfile: fusion/tests/integration/containers/fustor-services/Dockerfile
+    container_name: fustor-fusion
+    command: ["fustor-fusion"]
+    environment:
+      FUSTOR_FUSION_HOST: "0.0.0.0"
+      FUSTOR_FUSION_PORT: "8102"
+      FUSTOR_FUSION_REGISTRY_URL: "http://registry:8101"
+      FUSTOR_FUSION_DATA_DIR: "/data/fusion"
+    volumes:
+      - fusion-data:/data/fusion
+    ports:
+      - "18102:8102"
+    networks:
+      - fustor-net
+    depends_on:
+      registry:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8102/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ============ NFS Clients with Agents ============
+
+  nfs-client-a:
+    build:
+      context: ../../..
+      dockerfile: fusion/tests/integration/containers/nfs-client/Dockerfile
+    container_name: fustor-nfs-client-a
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      NFS_SERVER: "nfs-server"
+      NFS_PATH: "/exports"
+      MOUNT_POINT: "/mnt/shared"
+      MOUNT_OPTIONS: "actimeo=5,nolock"
+      AGENT_ENABLED: "true"
+      AGENT_ID: "agent-a"
+      AGENT_PORT: "8100"
+      FUSION_ENDPOINT: "http://fusion:8102"
+      REGISTRY_ENDPOINT: "http://registry:8101"
+    volumes:
+      - agent-a-data:/data/agent
+    ports:
+      - "18100:8100"
+    networks:
+      - fustor-net
+    depends_on:
+      nfs-server:
+        condition: service_healthy
+      fusion:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-d", "/mnt/shared"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  nfs-client-b:
+    build:
+      context: ../../..
+      dockerfile: fusion/tests/integration/containers/nfs-client/Dockerfile
+    container_name: fustor-nfs-client-b
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      NFS_SERVER: "nfs-server"
+      NFS_PATH: "/exports"
+      MOUNT_POINT: "/mnt/shared"
+      MOUNT_OPTIONS: "actimeo=5,nolock"
+      AGENT_ENABLED: "true"
+      AGENT_ID: "agent-b"
+      AGENT_PORT: "8100"
+      FUSION_ENDPOINT: "http://fusion:8102"
+      REGISTRY_ENDPOINT: "http://registry:8101"
+    volumes:
+      - agent-b-data:/data/agent
+    ports:
+      - "18103:8100"
+    networks:
+      - fustor-net
+    depends_on:
+      nfs-server:
+        condition: service_healthy
+      fusion:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-d", "/mnt/shared"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ============ NFS Client without Agent (Blind-spot Simulation) ============
+
+  nfs-client-c:
+    build:
+      context: ../../..
+      dockerfile: fusion/tests/integration/containers/nfs-client/Dockerfile
+    container_name: fustor-nfs-client-c
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+    environment:
+      NFS_SERVER: "nfs-server"
+      NFS_PATH: "/exports"
+      MOUNT_POINT: "/mnt/shared"
+      MOUNT_OPTIONS: "actimeo=5,nolock"
+      AGENT_ENABLED: "false"
+    networks:
+      - fustor-net
+    depends_on:
+      nfs-server:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "test", "-d", "/mnt/shared"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+networks:
+  fustor-net:
+    driver: bridge
+
+volumes:
+  nfs-data:
+  registry-data:
+  fusion-data:
+  agent-a-data:
+  agent-b-data:
