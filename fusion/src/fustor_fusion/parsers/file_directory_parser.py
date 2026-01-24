@@ -282,6 +282,8 @@ class DirectoryStructureParser:
             self._last_audit_start = event.index / 1000.0
             self.logger.info(f"Auto-detected Audit Start time: {self._last_audit_start} from event index {event.index}")
 
+        self.logger.debug(f"Parser processing {len(event.rows)} rows from {message_source} (datastore {self.datastore_id})")
+
         async with self._lock:
             for payload in event.rows:
                 path = payload.get('path') or payload.get('file_path')
@@ -341,8 +343,8 @@ class DirectoryStructureParser:
                             
                             memory_parent = self._directory_path_map.get(parent_path)
                             if memory_parent and memory_parent.modified_time is not None and parent_mtime_from_audit is not None and memory_parent.modified_time > parent_mtime_from_audit:
-                                self.logger.debug(
-                                    f"Skipping {path}: parent {parent_path} mtime in memory "
+                                self.logger.warning(
+                                    f"Arbitration SKIP {path}: parent {parent_path} mtime in memory "
                                     f"({memory_parent.modified_time}) > audit ({parent_mtime_from_audit})"
                                 )
                                 continue
@@ -360,6 +362,7 @@ class DirectoryStructureParser:
                             
                             # Mark as blind-spot file if from audit AND it's a new file
                             if is_audit and existing is None:
+                                self.logger.info(f"Audit ADDED NEW file {path}, marking agent_missing=True")
                                 node.agent_missing = True
                             
         return True

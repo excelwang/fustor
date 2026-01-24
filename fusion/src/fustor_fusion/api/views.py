@@ -129,7 +129,7 @@ async def reset_directory_tree_api(
     """
     Reset the directory tree structure by clearing all entries for a specific datastore.
     """
-    await check_snapshot_status(datastore_id)
+    # No check_snapshot_status here to allow resetting during/after failures
     logger.info(f"API request to reset directory tree for datastore {datastore_id}")
     success = await reset_directory_tree(datastore_id)
     
@@ -266,14 +266,27 @@ async def get_blind_spot_list_api(
 
 
 @parser_router.post("/fs/reset",
-    summary="Reset Directory Tree",
-    description="Clears all in-memory data for this datastore. (Mainly for testing)"
+    summary="Reset Directory Tree and Sessions",
+    description="Clears all in-memory data for this datastore including sessions and states. (Mainly for testing)"
 )
 async def reset_parser_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Dict[str, str]:
-    """Reset the directory tree for this datastore."""
-    logger.info(f"API request to reset parser: datastore_id={datastore_id}")
+    # No check_snapshot_status here to allow resetting during integration tests
+    logger.info(f"API request to reset all state for datastore {datastore_id}")
+    
+    # 1. Reset directory tree and parsers
     from ..parsers.manager import reset_directory_tree
     await reset_directory_tree(datastore_id)
-    return {"status": "ok", "message": "Parser state reset"}
+    
+    # 2. Clear all sessions for this datastore
+    from ..core.session_manager import session_manager
+    sessions = await session_manager.get_datastore_sessions(datastore_id)
+    for session_id in list(sessions.keys()):
+        await session_manager.terminate_session(datastore_id, session_id)
+    
+    # 3. Clear datastore state (locks, authoritative session, leadership)
+    from ..datastore_state_manager import datastore_state_manager
+    await datastore_state_manager.clear_state(datastore_id)
+    
+    return {"status": "ok", "message": "All datastore state reset"}

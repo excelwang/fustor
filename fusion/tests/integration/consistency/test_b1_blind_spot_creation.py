@@ -8,7 +8,7 @@ import pytest
 import time
 
 from ..utils import docker_manager
-from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT
+from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
 
 
 class TestBlindSpotFileCreation:
@@ -31,6 +31,12 @@ class TestBlindSpotFileCreation:
         """
         test_file = f"{MOUNT_POINT}/blind_spot_created.txt"
         
+        # Step 0: Wait for initial agent sync to be definitely complete
+        # We use a synchronization marker
+        sync_marker = f"{MOUNT_POINT}/sync_marker_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, sync_marker, content="ready")
+        assert fusion_client.wait_for_file_in_tree(sync_marker, timeout=30) is not None
+        
         # Step 1: Create file on client without agent
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,
@@ -45,21 +51,22 @@ class TestBlindSpotFileCreation:
         assert found_immediately is None, \
             "File should NOT appear immediately (no realtime event from blind-spot client)"
         
-        # Step 3: Wait for Audit cycle to complete
-        wait_for_audit()
+        # Step 3 & 4: Use a marker file to detect Audit completion
+        marker_file = f"{MOUNT_POINT}/audit_marker_b1_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS cache delay
         
-        # Step 4: After Audit, file should be discovered
-        found_after_audit = fusion_client.wait_for_file_in_tree(
-            file_path=test_file,
-            timeout=10
-        )
+        # Wait for marker to appear in Fusion (at least one audit cycle completed)
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        
+        # Now check if the original blind-spot file was discovered
+        found_after_audit = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
         assert found_after_audit is not None, \
-            "File should be discovered by Audit scan"
+            f"File {test_file} should be discovered by the Audit scan"
         
         # Step 5: Verify agent_missing flag is set
-        flags = fusion_client.check_file_flags(test_file)
-        assert flags["agent_missing"] is True, \
-            "Blind-spot file should be marked with agent_missing: true"
+        assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=10), \
+            f"Blind-spot file {test_file} should be marked with agent_missing: true. Tree node: {found_after_audit}"
 
     def test_blind_spot_file_added_to_blind_spot_list(
         self,
@@ -75,6 +82,11 @@ class TestBlindSpotFileCreation:
         """
         test_file = f"{MOUNT_POINT}/blind_list_test.txt"
         
+        # Wait for initial sync
+        sync_marker = f"{MOUNT_POINT}/sync_marker_list_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, sync_marker, content="ready")
+        assert fusion_client.wait_for_file_in_tree(sync_marker, timeout=30) is not None
+        
         # Create file from blind-spot client
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,
@@ -82,13 +94,21 @@ class TestBlindSpotFileCreation:
             content="blind list test"
         )
         
-        # Wait for Audit
-        wait_for_audit()
+        # Use marker file to detect Audit completion
+        marker_file = f"{MOUNT_POINT}/audit_marker_b1_list_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS cache delay
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
-        # Get blind-spot list
-        blind_spot_list = fusion_client.get_blind_spot_list()
-        
-        # File should be in the list
-        paths_in_list = [item.get("path") for item in blind_spot_list if item.get("type") == "file"]
-        assert test_file in paths_in_list, \
-            f"File {test_file} should be in blind-spot list"
+        # Check blind-spot list for file (poll to be safe)
+        start = time.time()
+        found = False
+        while time.time() - start < 15:
+            blind_spot_list = fusion_client.get_blind_spot_list()
+            paths_in_list = [item.get("path") for item in blind_spot_list if item.get("type") == "file"]
+            if test_file in paths_in_list:
+                found = True
+                break
+            time.sleep(1)
+            
+        assert found, f"File {test_file} should be in blind-spot list. List: {blind_spot_list}"

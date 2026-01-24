@@ -10,6 +10,7 @@ import logging
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession  # Keep import for compatibility with function signatures
 from fustor_event_model.models import EventBase # Added EventBase import
+from ..in_memory_queue import memory_event_queue
 
 logger = logging.getLogger(__name__)
 
@@ -189,6 +190,10 @@ async def reset_directory_tree(datastore_id: int) -> bool:
             if cache_key in _parser_manager_cache:
                 del _parser_manager_cache[cache_key]
                 logger.info(f"Removed parser manager for datastore {datastore_id} from cache after reset.")
+        
+        # Also clear the event queue to prevent old events from re-populating the tree
+        await memory_event_queue.clear_datastore_data(datastore_id)
+        logger.info(f"Cleared event queue for datastore {datastore_id} after reset.")
 
         logger.info(f"Reset directory tree for datastore {datastore_id}")
         return True

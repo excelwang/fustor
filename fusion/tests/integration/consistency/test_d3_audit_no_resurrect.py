@@ -59,16 +59,21 @@ class TestAuditTombstoneProtection:
             content="blind spot recreation"
         )
         
-        # Step 4: Wait for Audit to discover
-        wait_for_audit()
+        # Step 4: Use a marker file to detect Audit completion
+        marker_file = f"{MOUNT_POINT}/audit_marker_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS cache
         
-        # Step 5: File should NOT appear (protected by Tombstone)
-        time.sleep(5)
+        # Wait for marker to appear in Fusion (confirms at least one audit cycle completed)
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None, \
+            "Audit marker file should be discovered by Audit scan"
+        
+        # Step 5: File should NOT appear (protected by Tombstone during its first audit)
         tree_after = fusion_client.get_tree(path="/", max_depth=-1)
         found = fusion_client._find_in_tree(tree_after, test_file)
         
         assert found is None, \
-            "Tombstoned file should NOT be resurrected by Audit"
+            "Tombstoned file should NOT be resurrected by the Audit cycle that discovered it"
 
     def test_tombstone_protects_against_nfs_cache_resurrection(
         self,
@@ -99,10 +104,14 @@ class TestAuditTombstoneProtection:
         time.sleep(3)
         
         # Even with NFS cache (actimeo), the tombstone should protect
-        # Wait for Audit
-        wait_for_audit()
+        # Use marker file to detect Audit completion
+        marker_file = f"{MOUNT_POINT}/audit_marker_cache_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS delay
+        
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
         # Verify file stays deleted
         tree = fusion_client.get_tree(path="/", max_depth=-1)
         assert fusion_client._find_in_tree(tree, test_file) is None, \
-            "Tombstone should protect against NFS cache resurrection"
+            "Tombstone should protect against NFS cache resurrection during audit"

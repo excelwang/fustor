@@ -226,7 +226,23 @@ class SyncInstance:
     async def _run_control_loop(self):
         try:
             # First, request a session from the Ingestor via the pusher driver
-            session_data = await self.pusher_driver_instance.create_session(self.task_id)
+            # Retry with backoff to handle transient API key sync delays (e.g. 401 during startup)
+            session_data = None
+            max_retries = 5
+            for attempt in range(max_retries):
+                try:
+                    session_data = await self.pusher_driver_instance.create_session(self.task_id)
+                    break
+                except Exception as e:
+                    if attempt < max_retries - 1 and ("401" in str(e) or "Unauthorized" in str(e)):
+                        logger.warning(f"Failed to create session (attempt {attempt+1}/{max_retries}) due to unauthorized error. Retrying in 2s...")
+                        await asyncio.sleep(2)
+                    else:
+                        raise
+            
+            if not session_data:
+                raise RuntimeError("Failed to obtain session after retries")
+
             self.session_id = session_data.get("session_id")
             role = session_data.get("role", "follower")
             self.heartbeat_interval = session_data.get("suggested_heartbeat_interval_seconds", 10)

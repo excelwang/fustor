@@ -55,16 +55,26 @@ class TestBlindSpotFileDeletion:
         assert still_exists is not None, \
             "File should still exist in Fusion (no realtime delete from blind-spot)"
         
-        # Step 4: Wait for Audit cycle
-        wait_for_audit()
+        # Step 4: Use a marker file to detect Audit completion
+        marker_file = f"{MOUNT_POINT}/audit_marker_b2_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS cache
+        
+        # Wait for marker to appear in Fusion (at least one audit cycle completed)
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
         # Step 5: After Audit, file should be removed
-        time.sleep(5)
-        tree = fusion_client.get_tree(path="/", max_depth=-1)
-        found_after_audit = fusion_client._find_in_tree(tree, test_file)
-        
-        assert found_after_audit is None, \
-            "File should be removed after Audit detects blind-spot deletion"
+        # Poll for removal
+        start = time.time()
+        removed = False
+        while time.time() - start < 10:
+            tree = fusion_client.get_tree(path="/", max_depth=-1)
+            if fusion_client._find_in_tree(tree, test_file) is None:
+                removed = True
+                break
+            time.sleep(1)
+            
+        assert removed, "File should be removed after Audit detects blind-spot deletion"
 
     def test_blind_spot_deletion_added_to_blind_spot_list(
         self,
@@ -89,17 +99,25 @@ class TestBlindSpotFileDeletion:
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)
         
-        # Wait for Audit
-        wait_for_audit()
+        # Step 4: Use marker to ensure audit cycle ran
+        marker_file = f"{MOUNT_POINT}/audit_marker_b2_list_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
         # Check blind-spot list for deletion record
-        blind_spot_list = fusion_client.get_blind_spot_list()
+        # Poll since events might be processed shortly after marker appearance
+        start = time.time()
+        found = False
+        while time.time() - start < 10:
+            blind_spot_list = fusion_client.get_blind_spot_list()
+            deletion_entries = [
+                item for item in blind_spot_list
+                if item.get("path") == test_file and item.get("type") == "deletion"
+            ]
+            if deletion_entries:
+                found = True
+                break
+            time.sleep(1)
         
-        # Look for deletion entry
-        deletion_entries = [
-            item for item in blind_spot_list
-            if item.get("path") == test_file and item.get("type") == "deletion"
-        ]
-        
-        assert len(deletion_entries) > 0, \
-            "Blind-spot deletion should be recorded in blind-spot list"
+        assert found, "Blind-spot deletion should be recorded in blind-spot list"

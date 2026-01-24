@@ -60,17 +60,21 @@ class TestParentMtimeCheck:
             content="new content via agent"
         )
         
-        # Wait for realtime events to be processed
-        time.sleep(3)
+        # Verify new_file exists but stale_file does not (synced via realtime)
+        assert fusion_client.wait_for_file_in_tree(new_file, timeout=10) is not None
         
-        # Verify new_file exists but stale_file does not
-        new_found = fusion_client.wait_for_file_in_tree(new_file, timeout=10)
-        assert new_found is not None, "New file should be synced via realtime"
+        # Step 4: Use a marker file to detect Audit completion
+        # This confirms that an audit cycle has scanned the directory
+        marker_file = f"{MOUNT_POINT}/audit_marker_b5_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
+        # After Audit, stale_file should STILL be absent (discarded by parent mtime check)
         tree = fusion_client.get_tree(path=test_dir, max_depth=-1)
         stale_found = fusion_client._find_in_tree(tree, stale_file)
         assert stale_found is None, \
-            "Stale file should not appear (parent mtime check should prevent it)"
+            f"Stale file should not appear after Audit. Tree: {tree}"
 
     def test_audit_missing_file_ignored_if_parent_stale(
         self,
@@ -109,7 +113,11 @@ class TestParentMtimeCheck:
         assert found is not None, "File B should appear via realtime"
         
         # Wait for Audit (which may have stale view of parent directory)
-        wait_for_audit()
+        # Use marker file to be sure audit ran
+        marker_file = f"{MOUNT_POINT}/audit_marker_b5_2_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS delay
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
         # File B should still exist (Audit mtime check should preserve it)
         tree_after = fusion_client.get_tree(path=test_dir, max_depth=-1)

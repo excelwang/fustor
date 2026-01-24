@@ -267,7 +267,7 @@ def setup_agents(docker_env, test_api_key, test_datastore):
 
 
 @pytest.fixture
-def clean_shared_dir(docker_env, fusion_client):
+def clean_shared_dir(docker_env, fusion_client, test_api_key, test_datastore):
     """Clean up shared directory AND reset Fusion parser before each test."""
     # Clear all files in shared directory
     docker_manager.exec_in_container(
@@ -280,8 +280,14 @@ def clean_shared_dir(docker_env, fusion_client):
     except Exception as e:
         print(f"Warning: Failed to reset Fusion parser: {e}")
         
-    # Wait for changes to propagate
-    time.sleep(2)
+    # Restart agents to clear their in-memory mtime caches
+    api_key = test_api_key["key"]
+    datastore_id = test_datastore["id"]
+    for container_name in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B]:
+        ensure_agent_running(container_name, api_key, datastore_id)
+        
+    # Wait for agents to register and NFS to stabilize
+    time.sleep(5)
     yield
     # Cleanup after test
     docker_manager.exec_in_container(

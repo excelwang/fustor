@@ -51,11 +51,14 @@ class TestTombstoneCleanup:
         tree = fusion_client.get_tree(path="/", max_depth=-1)
         assert fusion_client._find_in_tree(tree, test_file) is None
         
-        # Step 2-3: Wait for Audit cycle to complete
-        wait_for_audit()
+        # Step 2-3: Use a marker file to detect Audit completion
+        marker_file = f"{MOUNT_POINT}/audit_marker_d4_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
         # Step 4: After Audit, Tombstone should be cleaned
-        # We verify by creating a new file with the same path
+        # We verify by creating a new file with the same path via Agent
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_A,
             test_file,
@@ -63,13 +66,11 @@ class TestTombstoneCleanup:
         )
         
         # Step 5: The new file should appear (Tombstone no longer blocks it)
-        time.sleep(3)
-        
         # Wait for realtime sync of new file
         found = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
         
         assert found is not None, \
-            "New file should appear after Tombstone is cleaned"
+            f"New file should appear after Tombstone is cleaned. Tree: {fusion_client.get_tree(path='/', max_depth=-1)}"
 
     def test_tombstone_blocks_during_audit_but_not_after(
         self,
@@ -102,16 +103,26 @@ class TestTombstoneCleanup:
             content="blind spot attempt during tombstone"
         )
         
-        # Wait for Audit
-        wait_for_audit()
+        # Step 4: Use marker to ensure first audit cycle ran
+        marker_file = f"{MOUNT_POINT}/audit_marker_d4_lifecycle_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
-        # First Audit may or may not show the file depending on timing
-        # Wait for another Audit cycle to ensure Tombstone is definitely cleaned
-        wait_for_audit()
+        # After first audit finishes, the tombstone (created before audit) is cleaned.
+        # However, the blind-spot file report arrived DURING the first audit and was blocked.
+        # We need a SECOND audit cycle to discover the still-existing blind-spot file.
+        marker_file_2 = f"{MOUNT_POINT}/audit_marker_d4_lifecycle_2_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file_2, content="marker")
+        time.sleep(7) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file_2, timeout=120) is not None
         
         # Now the file should appear (Tombstone cleaned, blind-spot file exists)
         tree = fusion_client.get_tree(path="/", max_depth=-1)
         found = fusion_client._find_in_tree(tree, test_file)
+        
+        assert found is not None, \
+            "Blind-spot file should be discovered after tombstone expires"
         
         # After Tombstone cleanup, the blind-spot file should be discoverable
         # Note: The exact behavior depends on implementation details
