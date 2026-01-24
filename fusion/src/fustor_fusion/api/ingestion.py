@@ -227,7 +227,7 @@ async def ingest_event_batch(
             logger.info(f"Received audit end signal for datastore {datastore_id}, waiting for queue to drain")
             
             # Wait for queue to drain with timeout
-            max_wait = 5.0
+            max_wait = 10.0
             wait_interval = 0.1
             elapsed = 0.0
             

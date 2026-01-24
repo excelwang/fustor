@@ -110,9 +110,13 @@ class DockerManager:
                 f"bs={size_bytes}", "count=1"
             ])
         else:
-            # Create file with content
+            # Create file with content using base64 to avoid shell escaping issues
+            import base64
+            b64_content = base64.b64encode(content.encode('utf-8')).decode('utf-8')
+            # Use printf to avoid trailing newline from echo if not intended, 
+            # but base64 decoding is safer.
             self.exec_in_container(container, [
-                "sh", "-c", f"echo '{content}' > {path}"
+                "sh", "-c", f"echo '{b64_content}' | base64 -d > {path}"
             ])
 
     def delete_file_in_container(self, container: str, path: str) -> None:

@@ -10,7 +10,7 @@
 
 services:
   # ============ Infrastructure Services ============
-  
+
   nfs-server:
     image: erichough/nfs-server
     container_name: fustor-nfs-server
@@ -22,7 +22,7 @@ services:
     networks:
       - fustor-net
     healthcheck:
-      test: ["CMD", "showmount", "-e", "localhost"]
+      test: [ "CMD", "showmount", "-e", "localhost" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -32,7 +32,7 @@ services:
       context: ../../..
       dockerfile: fusion/tests/integration/containers/fustor-services/Dockerfile
     container_name: fustor-registry
-    command: ["fustor-registry", "start", "-h", "0.0.0.0"]
+    command: [ "fustor-registry", "start", "-h", "0.0.0.0" ]
     environment:
       FUSTOR_REGISTRY_HOST: "0.0.0.0"
       FUSTOR_REGISTRY_PORT: "8101"
@@ -48,7 +48,7 @@ services:
     networks:
       - fustor-net
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8101/"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8101/" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -58,7 +58,7 @@ services:
       context: ../../..
       dockerfile: fusion/tests/integration/containers/fustor-services/Dockerfile
     container_name: fustor-fusion
-    command: ["fustor-fusion", "start", "-h", "0.0.0.0"]
+    command: [ "fustor-fusion", "start", "-h", "0.0.0.0" ]
     environment:
       FUSTOR_FUSION_HOST: "0.0.0.0"
       FUSTOR_FUSION_PORT: "8102"
@@ -71,6 +71,12 @@ services:
       FUSTOR_CORE_SECRET_KEY: "test-integration-secret-key-for-jwt-signing"
     volumes:
       - fusion-data:/data/fusion
+      - ../../../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
+      - ../../../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
+      - ../../../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
+      - ../../../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
+      - ../../../packages/fustor_registry_client/src/fustor_registry_client:/usr/local/lib/python3.11/site-packages/fustor_registry_client
+      - ../../../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18102:8102"
     networks:
@@ -79,7 +85,7 @@ services:
       registry:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8102/"]
+      test: [ "CMD", "curl", "-f", "http://localhost:8102/" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -106,6 +112,14 @@ services:
       REGISTRY_ENDPOINT: "http://registry:8101"
     volumes:
       - agent-a-data:/data/agent
+      - ../../../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
+      - ../../../packages/source_fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
+      - ../../../packages/pusher_fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
+      - ../../../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
+      - ../../../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
+      - ../../../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
+      - ../../../packages/fustor_agent_sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
+      - ../../../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18100:8100"
     networks:
@@ -116,7 +130,7 @@ services:
       fusion:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "test", "-d", "/mnt/shared"]
+      test: [ "CMD", "test", "-d", "/mnt/shared" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -141,6 +155,14 @@ services:
       REGISTRY_ENDPOINT: "http://registry:8101"
     volumes:
       - agent-b-data:/data/agent
+      - ../../../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
+      - ../../../packages/source_fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
+      - ../../../packages/pusher_fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
+      - ../../../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
+      - ../../../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
+      - ../../../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
+      - ../../../packages/fustor_agent_sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
+      - ../../../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18103:8100"
     networks:
@@ -151,7 +173,7 @@ services:
       fusion:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "test", "-d", "/mnt/shared"]
+      test: [ "CMD", "test", "-d", "/mnt/shared" ]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -178,7 +200,7 @@ services:
       nfs-server:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "test", "-d", "/mnt/shared"]
+      test: [ "CMD", "test", "-d", "/mnt/shared" ]
       interval: 5s
       timeout: 3s
       retries: 10

@@ -329,107 +329,87 @@ class FSDriver(SourceDriver):
         
         batch: List[Dict[str, Any]] = []
         
-        def handle_walk_error(e: OSError):
-            nonlocal error_count
-            error_count += 1
-            logger.debug(f"[{stream_id}] Error during audit walk: {safe_path_handling(e.filename)} - {e.strerror}")
-
-        for root, dirs, files in os.walk(self.uri, topdown=True, onerror=handle_walk_error):
+        # Prepare for recursion
+        stack = [(self.uri, None)] # (path, parent_path)
+        
+        while stack:
+            root, parent_path = stack.pop()
+            
             try:
+                try:
+                    entries = os.listdir(root)
+                except (FileNotFoundError, PermissionError):
+                    continue
+                
                 dir_stat = os.stat(root)
                 current_dir_mtime = dir_stat.st_mtime
-            except OSError:
+                
+            except OSError as e:
+                error_count += 1
+                logger.debug(f"[{stream_id}] Error accessing {root}: {e}")
                 continue
-            
+
             new_mtime_cache[root] = current_dir_mtime
             dirs_scanned += 1
-            
-            logger.info(f"[{stream_id}] Audit scanning directory: {root}, files in os.walk: {files}, dirs in os.walk: {dirs}")
 
-            # Report the directory itself (for session seen paths and metadata)
+            # Report directory
             dir_metadata = get_file_metadata(root, stat_info=dir_stat)
             if dir_metadata:
-                # Root of scan has no parent info in this context, or we can use dirname
-                dir_metadata["parent_path"] = os.path.dirname(root)
-                # Note: parent_mtime for the root of scan might be unknown, 
-                # but we usually don't need it for the root itself
+                dir_metadata["parent_path"] = parent_path or os.path.dirname(root)
                 batch.append(dir_metadata)
 
-            # Check if directory mtime changed since last audit
+            # Mtime check
             cached_mtime = mtime_cache.get(root)
             if cached_mtime is not None and cached_mtime == current_dir_mtime:
-                # Directory unchanged - skip scanning its direct children files
-                # Mark it as skipped for Fusion's missing file detection logic
+                logger.info(f"[{stream_id}] Skipping directory {root} (unchanged)")
                 dir_metadata["audit_skipped"] = True
                 dirs_skipped += 1
-                continue
+                # Still need to crawl subdirs because their mtimes might have changed 
+                # even if parent didn't (though usually parent changes).
+                # But for Audit optimization, we usually recursively skip if subtree mtime matches.
+                # However, FSDriver doesn't track recursive subtree mtime yet. 
+                # So we ONLY skip files in THIS directory.
+            else:
+                # Scan files and queue subdirs
+                for entry in entries:
+                    full_path = os.path.join(root, entry)
+                    try:
+                        st = os.stat(full_path)
+                        if os.path.isdir(full_path):
+                            stack.append((full_path, root))
+                        else:
+                            if fnmatch.fnmatch(entry, file_pattern):
+                                metadata = get_file_metadata(full_path, stat_info=st)
+                                if metadata:
+                                    metadata["parent_path"] = root
+                                    metadata["parent_mtime"] = current_dir_mtime
+                                    batch.append(metadata)
+                                    files_scanned += 1
+                                    
+                                    if len(batch) >= batch_size:
+                                        fields = list(batch[0].keys())
+                                        yield UpdateEvent(
+                                            event_schema=self.uri, table="files", rows=batch,
+                                            index=audit_time, fields=fields, message_source=MessageSource.AUDIT
+                                        )
+                                        batch = []
+                    except OSError:
+                        continue
             
-            # Directory changed or new - scan all files
-            for filename in files:
-                if not fnmatch.fnmatch(filename, file_pattern):
-                    continue
-                    
-                file_path = os.path.join(root, filename)
-                try:
-                    stat_info = os.stat(file_path)
-                    metadata = get_file_metadata(file_path, stat_info=stat_info)
-                    if metadata:
-                        # Add parent info for Fusion's arbitration (Section 3.2 of CONSISTENCY_DESIGN)
-                        metadata["parent_path"] = root
-                        metadata["parent_mtime"] = current_dir_mtime
-                        batch.append(metadata)
-                        files_scanned += 1
-                        
-                        if len(batch) >= batch_size:
-                            fields = list(batch[0].keys()) if batch else []
-                            yield UpdateEvent(
-                                event_schema=self.uri,
-                                table="files",
-                                rows=batch,
-                                index=audit_time,
-                                fields=fields,
-                                message_source=MessageSource.AUDIT
-                            )
-                            batch = []
-                except (FileNotFoundError, PermissionError, OSError) as e:
-                    error_count += 1
-                    logger.debug(f"[{stream_id}] Error processing file: {safe_path_handling(file_path)} - {str(e)}")
-            
-            # Also scan directories in this dir (for metadata updates)
-            for dirname in dirs:
-                dir_path = os.path.join(root, dirname)
-                try:
-                    sub_stat = os.stat(dir_path)
-                    dir_metadata = get_file_metadata(dir_path, stat_info=sub_stat)
-                    if dir_metadata:
-                        dir_metadata["parent_path"] = root
-                        dir_metadata["parent_mtime"] = current_dir_mtime
-                        batch.append(dir_metadata)
-                        
-                        if len(batch) >= batch_size:
-                            fields = list(batch[0].keys()) if batch else []
-                            yield UpdateEvent(
-                                event_schema=self.uri,
-                                table="files",
-                                rows=batch,
-                                index=audit_time,
-                                fields=fields,
-                                message_source=MessageSource.AUDIT
-                            )
-                            batch = []
-                except (FileNotFoundError, PermissionError, OSError):
-                    pass
-        
+            if len(batch) >= batch_size:
+                fields = list(batch[0].keys()) if batch else []
+                yield UpdateEvent(
+                    event_schema=self.uri, table="files", rows=batch,
+                    index=audit_time, fields=fields, message_source=MessageSource.AUDIT
+                )
+                batch = []
+
         # Yield remaining batch
         if batch:
-            fields = list(batch[0].keys()) if batch else []
+            fields = list(batch[0].keys())
             yield UpdateEvent(
-                event_schema=self.uri,
-                table="files",
-                rows=batch,
-                index=audit_time,
-                fields=fields,
-                message_source=MessageSource.AUDIT
+                event_schema=self.uri, table="files", rows=batch,
+                index=audit_time, fields=fields, message_source=MessageSource.AUDIT
             )
         
         logger.info(
@@ -438,8 +418,6 @@ class FSDriver(SourceDriver):
             f"Dirs skipped (unchanged): {dirs_skipped}, Errors: {error_count}"
         )
         
-        # Return the new cache for next audit cycle
-        # Caller should store this: kwargs['mtime_cache_out'] = new_mtime_cache
         if 'mtime_cache_out' in kwargs:
             kwargs['mtime_cache_out'].update(new_mtime_cache)
 

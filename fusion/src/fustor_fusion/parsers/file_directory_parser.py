@@ -135,6 +135,9 @@ class DirectoryStructureParser:
         
         # Track blind-spot deletions for global indicator
         self._blind_spot_deletions: Set[str] = set()
+        
+        # Mtime snapshot at audit start for arbitration
+        self._audit_start_mtimes: Dict[str, float] = {}
 
     def _check_cache_invalidation(self, path: str):
         """Simple placeholder for more complex logic"""
@@ -382,7 +385,10 @@ class DirectoryStructureParser:
             # Clear blind-spot deletions list for the new cycle
             self._blind_spot_deletions.clear()
             
-            self.logger.info(f"Audit started for datastore {self.datastore_id}, cleared blind-spot flags and deletions")
+            # Snapshot current mtimes for arbitration of missing files
+            self._audit_start_mtimes = {path: node.modified_time for path, node in self._directory_path_map.items()}
+            
+            self.logger.info(f"Audit started for datastore {self.datastore_id}, cleared blind-spot flags and deletions, snapshotted {len(self._audit_start_mtimes)} dir mtimes")
     
     async def handle_audit_end(self):
         """
@@ -432,16 +438,29 @@ class DirectoryStructureParser:
                     if parent_node and parent_skipped:
                         self.logger.info(f"Missing file {missing_path} ignored: parent {parent_path} was skipped in audit")
                         continue
+                    
+                    # Section 5.3 Scenario 2 + NFS Lag Mitigation:
+                    # Trust Audit deletion ONLY if parent mtime strictly increased 
+                    # from our baseline. If mtime is equal, it could be a transient readdir lag.
+                    mtime_at_start = self._audit_start_mtimes.get(parent_path, 0.0)
+                    if parent_node and parent_node.modified_time <= mtime_at_start:
+                         # Important: If it's the root path of the audit scan, we might trust it 
+                         # but for NFS we should be cautious everywhere.
+                         self.logger.info(
+                             f"Missing file {missing_path} protected: parent {parent_path} mtime ({parent_node.modified_time}) "
+                             f"not strictly greater than baseline ({mtime_at_start})"
+                         )
+                         continue
                         
                     # If parent wasn't scanned at all in this audit, we can't conclude anything
                     if parent_path not in self._audit_seen_paths and parent_path != "/":
                         self.logger.debug(f"Missing file {missing_path} ignored: parent {parent_path} not seen in audit")
                         continue
                     
-                    # Section 5.3 Scenario 2: Delete from memory tree + mark as blind-spot
+                    # Apply deletion
                     paths_to_delete.append(missing_path)
                     missing_detected += 1
-                    self.logger.info(f"Blind-spot deletion detected: {missing_path} (parent={parent_path}, parent_seen={parent_path in self._audit_seen_paths}, parent_skipped={getattr(parent_node, 'audit_skipped', False) if parent_node else 'N/A'})")
+                    self.logger.info(f"Blind-spot deletion confirmed: {missing_path} (mtime {parent_node.modified_time} > {mtime_at_start})")
                 
                 # Execute deletions
                 for path in paths_to_delete:
@@ -457,6 +476,7 @@ class DirectoryStructureParser:
             # Reset audit state
             self._last_audit_start = None
             self._audit_seen_paths.clear()
+            self._audit_start_mtimes.clear()
     
     def _cleanup_expired_suspects_unlocked(self):
         """Clean up expired suspects and their flags. Must be called with lock held."""

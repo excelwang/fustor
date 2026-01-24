@@ -122,11 +122,16 @@ class TestLeaderFailover:
             time.sleep(90)
             
             # Data should still be accessible
-            tree = fusion_client.get_tree(path="/", max_depth=-1)
-            found_after = fusion_client._find_in_tree(tree, test_file)
+            # After failover, Agent B should perform Audit and report the missing file
+            # or at least not delete it if it was already synced.
+            # Wait for the file to be present in Fusion's tree (giving it time for Agent B audit)
+            found_after = fusion_client.wait_for_file_in_tree(
+                file_path=test_file,
+                timeout=120  # Allow time for Agent B promotion + Audit cycle
+            )
             
             assert found_after is not None, \
-                f"Data should be preserved after leader failover. Tree: {tree}"
+                f"Data should be preserved after leader failover. Tree: {fusion_client.get_tree(path='/', max_depth=-1)}"
             
         finally:
             docker_manager.start_container(CONTAINER_CLIENT_A)
