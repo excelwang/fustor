@@ -22,20 +22,8 @@ class TestBlindSpotFileCreation:
         clean_shared_dir,
         wait_for_audit
     ):
-        """
-        场景: 无 Agent 的客户端 C 创建文件
-        预期:
-          1. 文件在初始时不会出现在 Fusion 中（无实时事件）
-          2. Audit 扫描后，文件被发现并添加到内存树
-          3. 文件被标记为 agent_missing: true
-        """
-        test_file = f"{MOUNT_POINT}/blind_spot_created.txt"
-        
-        # Step 0: Wait for initial agent sync to be definitely complete
-        # We use a synchronization marker
-        sync_marker = f"{MOUNT_POINT}/sync_marker_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, sync_marker, content="ready")
-        assert fusion_client.wait_for_file_in_tree(sync_marker, timeout=30) is not None
+        """场景: 盲区发现的新文件"""
+        test_file = f"{MOUNT_POINT}/blind_spot_created_{int(time.time()*1000)}.txt"
         
         # Step 1: Create file on client without agent
         docker_manager.create_file_in_container(
@@ -52,7 +40,7 @@ class TestBlindSpotFileCreation:
             "File should NOT appear immediately (no realtime event from blind-spot client)"
         
         # Step 3 & 4: Use a marker file to detect Audit completion
-        marker_file = f"{MOUNT_POINT}/audit_marker_b1_{int(time.time())}.txt"
+        marker_file = f"{MOUNT_POINT}/audit_marker_b1_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
         time.sleep(7) # NFS cache delay
         
@@ -76,16 +64,8 @@ class TestBlindSpotFileCreation:
         clean_shared_dir,
         wait_for_audit
     ):
-        """
-        场景: 无 Agent 客户端创建的文件
-        预期: 文件被添加到 Blind-spot List
-        """
-        test_file = f"{MOUNT_POINT}/blind_list_test.txt"
-        
-        # Wait for initial sync
-        sync_marker = f"{MOUNT_POINT}/sync_marker_list_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, sync_marker, content="ready")
-        assert fusion_client.wait_for_file_in_tree(sync_marker, timeout=30) is not None
+        """场景: 盲区发现的文件加入列表"""
+        test_file = f"{MOUNT_POINT}/blind_list_test_{int(time.time()*1000)}.txt"
         
         # Create file from blind-spot client
         docker_manager.create_file_in_container(
@@ -95,7 +75,7 @@ class TestBlindSpotFileCreation:
         )
         
         # Use marker file to detect Audit completion
-        marker_file = f"{MOUNT_POINT}/audit_marker_b1_list_{int(time.time())}.txt"
+        marker_file = f"{MOUNT_POINT}/audit_marker_b1_list_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
         time.sleep(7) # NFS cache delay
         assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None

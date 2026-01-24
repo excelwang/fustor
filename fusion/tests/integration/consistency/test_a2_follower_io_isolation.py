@@ -66,7 +66,10 @@ class TestFollowerIOIsolation:
         from ..utils import docker_manager
         from ..conftest import MOUNT_POINT
         
-        test_file = f"{MOUNT_POINT}/test_follower_realtime.txt"
+        test_file = f"{MOUNT_POINT}/test_follower_realtime_{int(time.time()*1000)}.txt"
+        
+        # Give a small buffer for agents to fully transition to stable state
+        time.sleep(2)
         
         # Create file on follower's mount
         docker_manager.create_file_in_container(
@@ -75,14 +78,19 @@ class TestFollowerIOIsolation:
             content="realtime test"
         )
         
-        # Wait for event to be processed
-        time.sleep(3)
-        
-        # File should appear in tree (via realtime event)
-        found = fusion_client.wait_for_file_in_tree(
-            file_path=test_file,
-            timeout=10
-        )
+        # Wait for event to be processed (Follower -> Fusion)
+        # We poll to observe the arrival as soon as possible
+        found = None
+        start = time.time()
+        while time.time() - start < 15:
+            # Short-circuit if found
+            found = fusion_client.wait_for_file_in_tree(
+                file_path=test_file,
+                timeout=2
+            )
+            if found:
+                break
+            time.sleep(1)
         
         assert found is not None, "File should appear via realtime event from follower"
         
