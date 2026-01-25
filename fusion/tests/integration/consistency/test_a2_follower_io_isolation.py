@@ -17,7 +17,8 @@ class TestFollowerIOIsolation:
         self,
         docker_env,
         fusion_client,
-        setup_agents
+        setup_agents,
+        clean_shared_dir
     ):
         """
         场景: Agent A 已经是 Leader，Agent B 连接到 Fusion

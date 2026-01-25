@@ -56,9 +56,9 @@ class TestBlindSpotFileDeletion:
             "File should still exist in Fusion (no realtime delete from blind-spot)"
         
         # Step 4: Use a marker file to detect Audit completion
-        marker_file = f"{MOUNT_POINT}/audit_marker_b2_{int(time.time())}.txt"
+        marker_file = f"{MOUNT_POINT}/audit_marker_b2_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache
+        time.sleep(16) # Ensure > 15s for Fusion threshold + NFS cache delay
         
         # Wait for marker to appear in Fusion (at least one audit cycle completed)
         assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
@@ -100,9 +100,9 @@ class TestBlindSpotFileDeletion:
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)
         
         # Step 4: Use marker to ensure audit cycle ran
-        marker_file = f"{MOUNT_POINT}/audit_marker_b2_list_{int(time.time())}.txt"
+        marker_file = f"{MOUNT_POINT}/audit_marker_b2_list_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache
+        time.sleep(16) # Ensure > 15s for Fusion threshold + NFS cache delay
         assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
         # Check blind-spot list for deletion record

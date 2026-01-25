@@ -207,11 +207,17 @@ class DirectoryStructureParser:
                         parent_node.children[name] = node
 
         else:
-            node = FileNode(name, path, size, mtime, ctime)
-            self._file_path_map[path] = node
-            parent_node = self._directory_path_map.get(parent_path)
-            if parent_node:
-                parent_node.children[name] = node
+            if path in self._file_path_map:
+                node = self._file_path_map[path]
+                node.size = size
+                node.modified_time = mtime
+                node.created_time = ctime
+            else:
+                node = FileNode(name, path, size, mtime, ctime)
+                self._file_path_map[path] = node
+                parent_node = self._directory_path_map.get(parent_path)
+                if parent_node:
+                    parent_node.children[name] = node
 
     async def _process_delete_in_memory(self, path: str):
         """Remove a node from the in-memory tree."""
@@ -330,9 +336,13 @@ class DirectoryStructureParser:
                         
                         # Rule 2: Mtime check - skip if existing data is newer
                         existing = self._get_node(path)
-                        if existing and existing.modified_time is not None and mtime is not None and existing.modified_time >= mtime:
-                            self.logger.debug(f"Skipping {path}: existing mtime {existing.modified_time} >= incoming {mtime}")
-                            continue
+                        old_mtime = None
+                        if existing:
+                            old_mtime = existing.modified_time
+                            self.logger.info(f"Arbitration CHECK {path}: source={message_source} incoming_mtime={mtime} existing_mtime={old_mtime}")
+                            if old_mtime is not None and mtime is not None and old_mtime >= mtime:
+                                self.logger.debug(f"Skipping {path}: existing mtime {old_mtime} >= incoming {mtime}")
+                                continue
                         
                         # Rule 3 (Audit only): Parent Mtime Check - Section 5.3 of CONSISTENCY_DESIGN
                         # If file is NEW (not in memory tree) and parent mtime from audit is older
@@ -360,10 +370,16 @@ class DirectoryStructureParser:
                                 node.integrity_suspect = True
                                 self._suspect_list[path] = now + self.HOT_FILE_THRESHOLD_SECONDS
                             
-                            # Mark as blind-spot file if from audit AND it's a new file
-                            if is_audit and existing is None:
-                                self.logger.info(f"Audit ADDED NEW file {path}, marking agent_missing=True")
-                                node.agent_missing = True
+                            # Mark as blind-spot file if from audit AND (it's new OR mtime changed)
+                            # If mtime > existing.mtime, it means a modification occurred that 
+                            # wasn't reported via Realtime.
+                            if is_audit:
+                                if existing is None:
+                                    self.logger.info(f"Audit ADDED NEW file {path}, marking agent_missing=True")
+                                    node.agent_missing = True
+                                elif old_mtime is not None and mtime > old_mtime:
+                                    self.logger.info(f"Audit UPDATED file {path} (mtime {old_mtime} -> {mtime}), marking agent_missing=True")
+                                    node.agent_missing = True
                             
         return True
     
@@ -443,15 +459,16 @@ class DirectoryStructureParser:
                         continue
                     
                     # Section 5.3 Scenario 2 + NFS Lag Mitigation:
-                    # Trust Audit deletion ONLY if parent mtime strictly increased 
-                    # from our baseline. If mtime is equal, it could be a transient readdir lag.
+                    # Trust Audit deletion if:
+                    # 1. Parent mtime strictly increased from our baseline (we observed the change)
+                    # 2. OR the parent mtime is old enough that any NFS readdir cache must have expired (e.g. > 15s)
                     mtime_at_start = self._audit_start_mtimes.get(parent_path, 0.0)
-                    if parent_node and parent_node.modified_time <= mtime_at_start:
-                         # Important: If it's the root path of the audit scan, we might trust it 
-                         # but for NFS we should be cautious everywhere.
+                    mtime_age = time.time() - (parent_node.modified_time if parent_node else 0)
+                    
+                    if parent_node and parent_node.modified_time <= mtime_at_start and mtime_age < 15.0:
                          self.logger.info(
                              f"Missing file {missing_path} protected: parent {parent_path} mtime ({parent_node.modified_time}) "
-                             f"not strictly greater than baseline ({mtime_at_start})"
+                             f"not strictly greater than baseline ({mtime_at_start}) and modified recently ({mtime_age:.1f}s ago)"
                          )
                          continue
                         

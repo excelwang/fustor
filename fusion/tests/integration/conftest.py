@@ -138,16 +138,8 @@ def fusion_client(docker_env, test_api_key) -> FusionClient:
     client = FusionClient(base_url="http://localhost:18102")
     client.set_api_key(test_api_key["key"])
     
-    # Restart Fusion to force immediate cache sync (workaround for periodic sync issue)
-    print("Restarting Fusion container to enforce API key sync...")
-    docker_manager.restart_container(CONTAINER_FUSION)
-    
-    # Wait for Fusion to be healthy again
-    if not docker_manager.wait_for_health(CONTAINER_FUSION, timeout=30):
-        raise RuntimeError("Fusion container failed to become healthy after restart")
-    
-    # Wait for Fusion to be ready to accept requests
-    print("Waiting for Fusion to become ready...")
+    # Wait for Fusion to be ready to accept requests and sync its cache
+    print("Waiting for Fusion to become ready and sync cache...")
     for i in range(20):
         try:
             # Use get_sessions which doesn't require snapshot completion (unlike get_stats/get_tree)
@@ -241,7 +233,7 @@ syncs:
 
 
 @pytest.fixture(scope="session")
-def setup_agents(docker_env, test_api_key, test_datastore):
+def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
     """
     Configure agents in NFS client containers with API key and datastore.
     Returns a dict with agent configuration info.
@@ -283,6 +275,8 @@ def clean_shared_dir(docker_env, fusion_client, test_api_key, test_datastore):
     # 1. Stop agents first
     for container_name in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B]:
         docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])
+        # Important: clear agent local state so it starts fresh
+        docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent-state.json"])
         
     # 2. Clear files on NFS server
     docker_manager.exec_in_container(
@@ -290,12 +284,13 @@ def clean_shared_dir(docker_env, fusion_client, test_api_key, test_datastore):
         ["sh", "-c", "rm -rf /exports/* 2>/dev/null || true"]
     )
     
-    # 3. CRITICAL: Restart Fusion to clear all in-memory states (Tree, Sessions, Leadership)
-    print(f"Restarting {CONTAINER_FUSION} for fresh test state...")
-    docker_manager.restart_container(CONTAINER_FUSION)
+    # 3. Reset Fusion state via API (Tree, Sessions, Leadership)
+    try:
+        fusion_client.reset_parser()
+    except Exception as e:
+        print(f"Warning: Failed to reset Fusion parser: {e}")
     
-    # Wait for Fusion and NFS attributes to settle
-    docker_manager.wait_for_health(CONTAINER_FUSION, timeout=30)
+    # Wait for NFS cache to clear and Fusion to settle
     time.sleep(5)
     
     # Force NFS refresh
@@ -312,17 +307,12 @@ def clean_shared_dir(docker_env, fusion_client, test_api_key, test_datastore):
     ensure_agent_running(CONTAINER_CLIENT_B, api_key, datastore_id)
     
     # 5. Synchronization: Wait for BOTH sessions to be active
-    # This prevents races where tests start before agents are fully ready
     start_time = time.time()
     while time.time() - start_time < 30:
         sessions = fusion_client.get_sessions()
         if len(sessions) >= 2:
             break
         time.sleep(1)
-    else:
-        current_sessions = fusion_client.get_sessions()
-        print(f"Failed to find 2 sessions. Current: {current_sessions}")
-        # Note: we continue anyway to try the marker, which is the final truth
         
     # 6. Synchronization: Wait for initial Snapshot completion via marker
     start_marker = f"{MOUNT_POINT}/test_start_marker_{int(time.time()*1000)}.txt"

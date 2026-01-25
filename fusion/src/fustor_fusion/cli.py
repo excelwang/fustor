@@ -25,7 +25,15 @@ def _is_running():
         return False
     try:
         with open(FUSION_PID_FILE, 'r') as f:
-            pid = int(f.read().strip())
+            pid_str = f.read().strip()
+            if not pid_str:
+                return False
+            pid = int(pid_str)
+            
+        # If the PID in the file is our own PID, we are not "already" running (we are just starting)
+        if pid == os.getpid():
+            return False
+            
         # Check if the process with this PID is actually running
         os.kill(pid, 0) # Signal 0 doesn't do anything, but checks if PID exists
     except (IOError, ValueError, OSError):

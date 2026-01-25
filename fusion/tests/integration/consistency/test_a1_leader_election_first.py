@@ -17,7 +17,8 @@ class TestLeaderElectionFirst:
         self,
         docker_env,
         fusion_client,
-        setup_agents
+        setup_agents,
+        clean_shared_dir
     ):
         """
         场景: 第一个 Agent A 连接到 Fusion
