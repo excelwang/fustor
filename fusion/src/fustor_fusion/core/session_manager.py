@@ -82,19 +82,31 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         from ..datastore_state_manager import datastore_state_manager
         
         try:
-            # Wait for the timeout period
-            await asyncio.sleep(timeout_seconds)
+            while True:
+                # Calculate how much longer we need to wait
+                async with self._lock:
+                    if (datastore_id not in self._sessions or 
+                        session_id not in self._sessions[datastore_id]):
+                        return # Session already gone
+                    
+                    session_info = self._sessions[datastore_id][session_id]
+                    elapsed = time.time() - session_info.last_activity
+                    remaining = timeout_seconds - elapsed
+                    
+                if remaining <= 0:
+                    break # Expired
+                
+                # Wait for the remaining period
+                await asyncio.sleep(max(0.1, remaining))
             
-            # Check if the session is expired after the sleep
+            # Execute removal
             async with self._lock:
                 if (datastore_id in self._sessions and 
                     session_id in self._sessions[datastore_id]):
                     
                     session_info = self._sessions[datastore_id][session_id]
-                    current_time = time.time()
-                    
-                    # Only remove if the session hasn't been updated since scheduling
-                    if current_time - session_info.last_activity >= timeout_seconds:
+                    # Double check last_activity
+                    if time.time() - session_info.last_activity >= timeout_seconds:
                         del self._sessions[datastore_id][session_id]
                         
                         # Clean up empty datastore entries
@@ -104,9 +116,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                             await memory_event_queue.clear_datastore_data(datastore_id)
                             logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain.")
                         
-                        # Release any associated lock in the datastore state manager
+                        # Release any associated lock and leader role
+                        from ..datastore_state_manager import datastore_state_manager
                         await datastore_state_manager.unlock_for_session(datastore_id, session_id)
-                        # Release leader role if this session was the leader
                         await datastore_state_manager.release_leader(datastore_id, session_id)
                         
                         logger.info(f"Session {session_id} on datastore {datastore_id} expired and removed")

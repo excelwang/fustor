@@ -70,8 +70,8 @@ async def lifespan(app: FastAPI):
     sync_task = asyncio.create_task(periodic_sync())
     logger.debug(f"Task created: {sync_task}")
     
-    # Start periodic session cleanup
-    await session_manager.start_periodic_cleanup()
+    # Start periodic session cleanup (Every 5 seconds for fast failover)
+    await session_manager.start_periodic_cleanup(5)
 
     yield # Ready
 
