@@ -29,6 +29,9 @@ class FSDriver(SourceDriver):
     _instances: Dict[str, 'FSDriver'] = {}
     _lock = threading.Lock()
     
+    # FS driver doesn't require discovery as fields are fixed metadata.
+    require_schema_discovery = False
+
     @property
     def is_transient(self) -> bool:
         """

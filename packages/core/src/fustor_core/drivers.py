@@ -145,6 +145,10 @@ class SourceDriver(ABC):
         self.id = id
         self.config = config
 
+    # Indicates whether this source driver requires a formal schema discovery process.
+    # If False, the agent will skip the discovery step and consider the schema valid.
+    require_schema_discovery: bool = True
+
     @property
     def is_transient(self) -> bool:
         """

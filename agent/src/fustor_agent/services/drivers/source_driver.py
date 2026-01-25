@@ -61,6 +61,15 @@ class SourceDriverService(SourceDriverServiceInterface): # Inherit from the inte
         """Returns a list of all discovered driver names."""
         return list(self._discovered_drivers.keys())
 
+    def driver_requires_schema(self, driver_type: str) -> bool:
+        """Checks if a driver type requires formal schema discovery."""
+        try:
+            driver_class = self._get_driver_by_type(driver_type)
+            # Default to True (inherited from ABC) if not explicitly set
+            return getattr(driver_class, "require_schema_discovery", True)
+        except Exception:
+            return True
+
     async def get_wizard_definition_by_type(self, driver_type: str) -> Dict[str, Any]:
         """Gets the wizard step definitions for a given driver type by calling the class method."""
         try:

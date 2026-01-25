@@ -47,12 +47,20 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
         Updates a source configuration. If enabling, checks for a valid schema cache.
         """
         # If the user is trying to enable the source, perform the validation check.
+        # If the user is trying to enable the source, perform the validation check.
         if 'disabled' in updates and not updates['disabled']:
-            if not schema_cache.is_schema_valid(id):
-                raise ValueError(
-                    f"Cannot enable source '{id}': Schema cache is not validated. "
-                    f"Please run 'discover-schema' for this source first."
-                )
+            source_config = self.get_config(id) # Get current config to check driver
+            driver_type = updates.get('driver') or (source_config.driver if source_config else None)
+            
+            if driver_type and not schema_cache.is_schema_valid(id):
+                from fustor_agent.services.drivers.source_driver import SourceDriverService
+                source_driver_service = SourceDriverService()
+                
+                if source_driver_service.driver_requires_schema(driver_type):
+                    raise ValueError(
+                        f"Cannot enable source '{id}': Schema cache is not validated. "
+                        f"Please run 'discover-schema' for this source first."
+                    )
         
         # Proceed with the generic update logic from the base class.
         return await super().update_config(id, updates)
@@ -106,13 +114,22 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
             A list of IDs of sources that were disabled.
         """
         disabled_sources = []
+        from fustor_agent.services.drivers.source_driver import SourceDriverService
+        source_driver_service = SourceDriverService()
+
+        disabled_sources = []
         for source_id, config in self.list_configs().items():
             # If the source is enabled but its schema is not valid, disable it.
+            # EXCEPTION: Skip check if the driver specifically declares it doesn't need formal discovery.
             if not config.disabled and not schema_cache.is_schema_valid(source_id):
+                if not source_driver_service.driver_requires_schema(config.driver):
+                    logger.debug(f"Source '{source_id}' (driver: {config.driver}) skipped schema check as it doesn't require discovery.")
+                    continue
+
                 logger.warning(
                     f"Source '{source_id}' is enabled but its schema is not validated. "
                     f"Disabling it to prevent runtime errors. "
-                    f"Please run 'discover-schema' to re-validate."
+                    f"Please run 'fustor_agent discover-schema' to re-validate."
                 )
                 await self.disable(source_id)
                 disabled_sources.append(source_id)

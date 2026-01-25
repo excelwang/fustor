@@ -205,16 +205,12 @@ def ensure_agent_running(container_name, api_key, datastore_id):
         content=agent_id
     )
     
-    # 0.1 Bypass schema discovery
+    # 0. Initialize Fustor home and agent.id
+    docker_manager.exec_in_container(container_name, ["mkdir", "-p", "/root/.fustor/schemas"])
     docker_manager.create_file_in_container(
         container_name,
-        "/root/.fustor/schemas/source_shared-fs.schema.json",
-        content="{}"
-    )
-    docker_manager.create_file_in_container(
-        container_name,
-        "/root/.fustor/schemas/source_shared-fs.valid",
-        content=""
+        "/root/.fustor/agent.id",
+        content=agent_id
     )
 
     # 1. Generate Config Content
