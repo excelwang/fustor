@@ -5,6 +5,7 @@ Provides REST endpoints to access parsed data views.
 from fastapi import APIRouter, Query, Header, Depends, status, HTTPException
 from fastapi.responses import ORJSONResponse
 import logging
+import asyncio
 from typing import Dict, Any, Optional
 
 from ..parsers.manager import get_directory_tree, search_files, get_directory_stats, reset_directory_tree
@@ -216,6 +217,35 @@ async def audit_start_api(
     return {"status": "ok", "message": "Audit started"}
 
 
+    return {"status": "ok", "message": "Audit started"}
+
+
+async def _process_audit_end_background(datastore_id: int):
+    """Background task to wait for queue drain and process audit end."""
+    logger.info(f"Background task: Waiting for queue drain for audit end (datastore {datastore_id})")
+    
+    # Wait for queue to drain
+    max_wait = 10.0
+    wait_interval = 0.1
+    elapsed = 0.0
+    
+    while elapsed < max_wait:
+        queue_size = memory_event_queue.get_queue_size(datastore_id)
+        inflight = processing_manager.get_inflight_count(datastore_id)
+        if queue_size == 0 and inflight == 0:
+            break
+        await asyncio.sleep(wait_interval)
+        elapsed += wait_interval
+        
+    if elapsed >= max_wait:
+        logger.warning(f"Audit end timeout waiting for queue: queue={memory_event_queue.get_queue_size(datastore_id)}, inflight={processing_manager.get_inflight_count(datastore_id)}")
+    
+    manager = await get_cached_parser_manager(datastore_id)
+    parser = await manager.get_file_directory_parser()
+    await parser.handle_audit_end()
+    logger.info(f"Background task: Audit end processing complete for datastore {datastore_id}")
+
+
 @parser_router.post("/fs/audit-end",
     summary="Signal Audit End",
     description="Called by Leader Agent when completing an Audit cycle"
@@ -223,12 +253,13 @@ async def audit_start_api(
 async def audit_end_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Dict[str, str]:
-    """Signal the end of an Audit cycle. Triggers Tombstone cleanup."""
-    logger.info(f"Audit end signal received for datastore {datastore_id}")
-    manager = await get_cached_parser_manager(datastore_id)
-    parser = await manager.get_file_directory_parser()
-    await parser.handle_audit_end()
-    return {"status": "ok", "message": "Audit ended, tombstones cleaned"}
+    """Signal the end of an Audit cycle. Schedules Tombstone cleanup."""
+    logger.info(f"Audit end signal received for datastore {datastore_id}. Scheduling background processing.")
+    
+    # Schedule background task
+    asyncio.create_task(_process_audit_end_background(datastore_id))
+    
+    return {"status": "accepted", "message": "Audit end processing scheduled"}
 
 
 @parser_router.get("/fs/blind-spot-list", 
@@ -264,29 +295,3 @@ async def get_blind_spot_list_api(
         
     return result
 
-
-@parser_router.post("/fs/reset",
-    summary="Reset Directory Tree and Sessions",
-    description="Clears all in-memory data for this datastore including sessions and states. (Mainly for testing)"
-)
-async def reset_parser_api(
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> Dict[str, str]:
-    # No check_snapshot_status here to allow resetting during integration tests
-    logger.info(f"API request to reset all state for datastore {datastore_id}")
-    
-    # 1. Reset directory tree and parsers
-    from ..parsers.manager import reset_directory_tree
-    await reset_directory_tree(datastore_id)
-    
-    # 2. Clear all sessions for this datastore
-    from ..core.session_manager import session_manager
-    sessions = await session_manager.get_datastore_sessions(datastore_id)
-    for session_id in list(sessions.keys()):
-        await session_manager.terminate_session(datastore_id, session_id)
-    
-    # 3. Clear datastore state (locks, authoritative session, leadership)
-    from ..datastore_state_manager import datastore_state_manager
-    await datastore_state_manager.clear_state(datastore_id)
-    
-    return {"status": "ok", "message": "All datastore state reset"}

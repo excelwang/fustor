@@ -32,7 +32,7 @@ class TestRealtimeDeleteTombstone:
           - 文件从内存树移除
           - 文件路径记录在 Tombstone 中
         """
-        test_file = f"{MOUNT_POINT}/tombstone_create_test.txt"
+        test_file = f"{MOUNT_POINT}/tombstone_create_test_{int(time.time()*1000)}.txt"
         
         # Step 1: Create file
         docker_manager.create_file_in_container(
@@ -71,7 +71,7 @@ class TestRealtimeDeleteTombstone:
         注意: 这需要一个 API 来查询 Tombstone List。
         如果没有公开 API，可以通过验证 Audit 不会复活来间接验证。
         """
-        test_file = f"{MOUNT_POINT}/tombstone_list_check.txt"
+        test_file = f"{MOUNT_POINT}/tombstone_list_check_{int(time.time()*1000)}.txt"
         
         # Create and delete
         docker_manager.create_file_in_container(

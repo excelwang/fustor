@@ -34,7 +34,7 @@ class TestTombstoneCleanup:
           - Audit 完成后，旧 Tombstone 被清理
           - 相同路径的新文件可以被正常同步
         """
-        test_file = f"{MOUNT_POINT}/tombstone_cleanup.txt"
+        test_file = f"{MOUNT_POINT}/tombstone_cleanup_{int(time.time()*1000)}.txt"
         
         # Step 1: Create and delete file (creates Tombstone)
         docker_manager.create_file_in_container(
@@ -83,7 +83,7 @@ class TestTombstoneCleanup:
         """
         场景: 验证 Tombstone 在 Audit 期间阻止复活，但 Audit 后允许新创建
         """
-        test_file = f"{MOUNT_POINT}/tombstone_lifecycle.txt"
+        test_file = f"{MOUNT_POINT}/tombstone_lifecycle_{int(time.time()*1000)}.txt"
         
         # Create and delete
         docker_manager.create_file_in_container(

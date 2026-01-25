@@ -31,7 +31,7 @@ class TestSnapshotTombstoneProtection:
         预期:
           - 文件不会在删除后重新出现
         """
-        test_file = f"{MOUNT_POINT}/snapshot_tombstone_test.txt"
+        test_file = f"{MOUNT_POINT}/snapshot_tombstone_test_{int(time.time()*1000)}.txt"
         
         # Step 1: Create file via Agent A
         docker_manager.create_file_in_container(
@@ -78,7 +78,7 @@ class TestSnapshotTombstoneProtection:
         场景: 快速创建删除场景，验证 Tombstone 保护生效
         """
         test_files = [
-            f"{MOUNT_POINT}/rapid_{i}.txt" for i in range(5)
+            f"{MOUNT_POINT}/rapid_{int(time.time()*1000)}_{i}.txt" for i in range(5)
         ]
         
         # Rapidly create and delete files

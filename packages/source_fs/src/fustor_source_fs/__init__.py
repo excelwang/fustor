@@ -349,11 +349,8 @@ class FSDriver(SourceDriver):
                 logger.debug(f"[{stream_id}] Error accessing {root}: {e}")
                 continue
 
-            # NFS Lag Mitigation: if the directory was modified very recently, 
-            # don't cache its mtime yet to ensure it's scanned again in next audit.
-            # This helps if mtime is updated but readdir() is still stale.
-            if (time.time() - current_dir_mtime) > 10.0:
-                new_mtime_cache[root] = current_dir_mtime
+            # Cache mtime for next audit cycle
+            new_mtime_cache[root] = current_dir_mtime
             
             dirs_scanned += 1
 

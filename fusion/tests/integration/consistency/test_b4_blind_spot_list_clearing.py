@@ -30,8 +30,8 @@ class TestBlindSpotListClearing:
           4. 新 Audit 开始时，旧的 blind-spot list 被清空
           5. 文件 A 不再在 blind-spot list 中（已删除）
         """
-        test_file_a = f"{MOUNT_POINT}/blind_clear_test_a.txt"
-        test_file_b = f"{MOUNT_POINT}/blind_clear_test_b.txt"
+        test_file_a = f"{MOUNT_POINT}/blind_clear_test_a_{int(time.time()*1000)}.txt"
+        test_file_b = f"{MOUNT_POINT}/blind_clear_test_b_{int(time.time()*1000)}.txt"
         
         # Step 1: Create file A from blind-spot client
         docker_manager.create_file_in_container(
@@ -89,7 +89,7 @@ class TestBlindSpotListClearing:
         """
         from ..conftest import CONTAINER_CLIENT_A
         
-        test_file = f"{MOUNT_POINT}/blind_flag_clear_test.txt"
+        test_file = f"{MOUNT_POINT}/blind_flag_clear_test_{int(time.time()*1000)}.txt"
         
         # Create file from blind-spot
         docker_manager.create_file_in_container(

@@ -30,7 +30,7 @@ class TestAuditTriggersSuspect:
         预期:
           - 文件同时具有 agent_missing: true 和 integrity_suspect: true
         """
-        test_file = f"{MOUNT_POINT}/audit_suspect_test.txt"
+        test_file = f"{MOUNT_POINT}/audit_suspect_test_{int(time.time()*1000)}.txt"
         
         # Create file from blind-spot client
         docker_manager.create_file_in_container(
@@ -65,7 +65,7 @@ class TestAuditTriggersSuspect:
         """
         场景: Audit 发现的可疑文件应同时出现在 Suspect List 中
         """
-        test_file = f"{MOUNT_POINT}/audit_suspect_list.txt"
+        test_file = f"{MOUNT_POINT}/audit_suspect_list_{int(time.time()*1000)}.txt"
         
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,

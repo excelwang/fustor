@@ -221,33 +221,7 @@ async def ingest_event_batch(
         except Exception as e:
             logger.error(f"Failed to notify event manager for datastore {datastore_id}: {e}", exc_info=True)
 
-        # Handle audit end signal AFTER events are queued
-        # We wait for the queue to drain to ensure all audit_skipped flags are processed
-        if payload.is_snapshot_end and payload.source_type == 'audit':
-            logger.info(f"Received audit end signal for datastore {datastore_id}, waiting for queue to drain")
-            
-            # Wait for queue to drain with timeout
-            max_wait = 10.0
-            wait_interval = 0.1
-            elapsed = 0.0
-            
-            while elapsed < max_wait:
-                queue_size = memory_event_queue.get_queue_size(datastore_id)
-                inflight = processing_manager.get_inflight_count(datastore_id)
-                if queue_size == 0 and inflight == 0:
-                    break
-                await asyncio.sleep(wait_interval)
-                elapsed += wait_interval
-            
-            if elapsed >= max_wait:
-                logger.warning(f"Audit end timeout waiting for queue: queue={queue_size}, inflight={inflight}")
-            else:
-                logger.info(f"Queue drained for audit end (waited {elapsed:.1f}s)")
-            
-            manager = await get_cached_parser_manager(datastore_id)
-            parser = await manager.get_file_directory_parser()
-            if parser:
-                await parser.handle_audit_end()
+
 
     except Exception as e:
         logger.error(f"处理批量事件失败 (task: {si.task_id}): {e}", exc_info=True)

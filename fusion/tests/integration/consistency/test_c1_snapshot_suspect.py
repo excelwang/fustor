@@ -30,7 +30,7 @@ class TestSnapshotTriggersSuspect:
         预期:
           - 文件在 Audit 后，带有 integrity_suspect 标记
         """
-        test_file = f"{MOUNT_POINT}/snapshot_suspect_test.txt"
+        test_file = f"{MOUNT_POINT}/snapshot_suspect_test_{int(time.time()*1000)}.txt"
         
         # Create file from blind-spot
         docker_manager.create_file_in_container(
@@ -62,7 +62,7 @@ class TestSnapshotTriggersSuspect:
         """
         场景: 刚创建的文件应出现在 Suspect List 中
         """
-        test_file = f"{MOUNT_POINT}/suspect_list_test.txt"
+        test_file = f"{MOUNT_POINT}/suspect_list_test_{int(time.time()*1000)}.txt"
         
         # Create file from blind-spot
         docker_manager.create_file_in_container(

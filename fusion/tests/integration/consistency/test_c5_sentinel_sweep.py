@@ -33,9 +33,9 @@ class TestSentinelSweep:
           - PUT API 能够正常处理更新
         """
         test_files = [
-            f"{MOUNT_POINT}/suspect_sweep_1.txt",
-            f"{MOUNT_POINT}/suspect_sweep_2.txt",
-            f"{MOUNT_POINT}/suspect_sweep_3.txt",
+            f"{MOUNT_POINT}/suspect_sweep_1_{int(time.time()*1000)}.txt",
+            f"{MOUNT_POINT}/suspect_sweep_2_{int(time.time()*1000)}.txt",
+            f"{MOUNT_POINT}/suspect_sweep_3_{int(time.time()*1000)}.txt",
         ]
         
         # Create files from blind-spot

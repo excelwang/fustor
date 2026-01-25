@@ -34,7 +34,7 @@ class TestAuditTombstoneProtection:
         预期:
           - 即使磁盘上存在同名文件，Fusion 中也不会出现该文件
         """
-        test_file = f"{MOUNT_POINT}/audit_tombstone_test.txt"
+        test_file = f"{MOUNT_POINT}/audit_tombstone_test_{int(time.time()*1000)}.txt"
         
         # Step 1: Create file via Agent
         docker_manager.create_file_in_container(
@@ -89,7 +89,7 @@ class TestAuditTombstoneProtection:
         背景: NFS 客户端可能因为缓存延迟，在文件已被删除后仍然"看到"该文件。
         这可能导致 Audit 错误地报告文件存在。Tombstone 机制可以防止这种情况。
         """
-        test_file = f"{MOUNT_POINT}/nfs_cache_tombstone.txt"
+        test_file = f"{MOUNT_POINT}/nfs_cache_tombstone_{int(time.time()*1000)}.txt"
         
         # Create and sync
         docker_manager.create_file_in_container(

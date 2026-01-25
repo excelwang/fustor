@@ -31,7 +31,7 @@ class TestRealtimeRemovesSuspect:
         预期:
           - 收到 Realtime Update 后，integrity_suspect 标记被清除
         """
-        test_file = f"{MOUNT_POINT}/realtime_clear_suspect.txt"
+        test_file = f"{MOUNT_POINT}/realtime_clear_suspect_{int(time.time()*1000)}.txt"
         
         # Step 1: Create file from blind-spot
         docker_manager.create_file_in_container(
@@ -82,7 +82,7 @@ class TestRealtimeRemovesSuspect:
         """
         场景: 盲区文件被 Agent 重新创建（INSERT），应清除 suspect 状态
         """
-        test_file = f"{MOUNT_POINT}/realtime_insert_clear.txt"
+        test_file = f"{MOUNT_POINT}/realtime_insert_clear_{int(time.time()*1000)}.txt"
         
         # Create from blind-spot (will be suspect + agent_missing)
         docker_manager.create_file_in_container(

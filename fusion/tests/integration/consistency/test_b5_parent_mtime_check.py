@@ -32,7 +32,7 @@ class TestParentMtimeCheck:
              - 旧文件被丢弃，不会添加到内存树
         预期: 延迟 Audit 中的旧文件不会出现在 Fusion 中
         """
-        test_dir = f"{MOUNT_POINT}/parent_mtime_test"
+        test_dir = f"{MOUNT_POINT}/parent_mtime_test_{int(time.time()*1000)}"
         stale_file = f"{test_dir}/stale_file.txt"
         new_file = f"{test_dir}/new_file.txt"
         
@@ -94,7 +94,7 @@ class TestParentMtimeCheck:
           2. 模拟一个滞后的 Audit（mtime 较旧）
           3. 即使 Audit 报告 B 不存在，文件 B 仍然保留
         """
-        test_dir = f"{MOUNT_POINT}/audit_stale_dir_test"
+        test_dir = f"{MOUNT_POINT}/audit_stale_dir_test_{int(time.time()*1000)}"
         file_b = f"{test_dir}/file_b.txt"
         
         # Create directory and file via Agent

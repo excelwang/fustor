@@ -108,7 +108,7 @@ class TestNewLeaderResumesDuties:
         场景: 验证新 Leader 执行 Snapshot 初始同步
         """
         # First, create some files for the new leader to snapshot
-        test_dir = f"{MOUNT_POINT}/snapshot_resume_test"
+        test_dir = f"{MOUNT_POINT}/snapshot_resume_test_{int(time.time()*1000)}"
         docker_manager.exec_in_container(
             CONTAINER_CLIENT_B,
             ["mkdir", "-p", test_dir]

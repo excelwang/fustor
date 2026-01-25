@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import List, Any, Optional
+from typing import List, Any, Optional, Dict
 from pydantic import BaseModel, Field
 
 
@@ -39,3 +39,18 @@ class UpdateEvent(EventBase):
 
 class DeleteEvent(EventBase):
     event_type: EventType = EventType.DELETE
+
+
+class FileSystemPayload(BaseModel):
+    """Explicit definition of file system event payload structure."""
+    file_path: str
+    size: int
+    modified_time: float
+    created_time: float = 0.0
+    is_dir: bool = False
+    parent_path: Optional[str] = None
+    parent_mtime: Optional[float] = None
+    audit_skipped: bool = False  # Explicitly defined for Audit Optimization
+    
+    class Config:
+        extra = "allow"  # Allow checking other fields if present

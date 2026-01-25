@@ -97,7 +97,7 @@ class TestLeaderFailover:
         """
         场景: Leader 故障转移后，数据完整性得到保持
         """
-        test_file = f"/mnt/shared/failover_data_test.txt"
+        test_file = f"/mnt/shared/failover_data_test_{int(time.time()*1000)}.txt"
         
         # Create file before failover
         docker_manager.create_file_in_container(
