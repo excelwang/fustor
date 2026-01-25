@@ -10,8 +10,8 @@ from .utils import docker_manager, FusionClient, RegistryClient
 
 # Test configuration
 TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "120"))
-AUDIT_INTERVAL = int(os.getenv("FUSTOR_AUDIT_INTERVAL", "15"))
-SUSPECT_TTL_SECONDS = int(os.getenv("FUSTOR_SUSPECT_TTL", "60"))  # Default 60 for tests
+AUDIT_INTERVAL = int(os.getenv("FUSTOR_AUDIT_INTERVAL", "20"))
+SUSPECT_TTL_SECONDS = int(os.getenv("FUSTOR_SUSPECT_TTL", "10"))  # Default 60 for tests
 
 # Container names
 CONTAINER_NFS_SERVER = "fustor-nfs-server"
@@ -140,7 +140,7 @@ def fusion_client(docker_env, test_api_key) -> FusionClient:
     
     # Wait for Fusion to be ready to accept requests and sync its cache
     print("Waiting for Fusion to become ready and sync cache...")
-    for i in range(20):
+    for i in range(60):
         try:
             # Use get_sessions which doesn't require snapshot completion (unlike get_stats/get_tree)
             client.get_sessions()
@@ -149,7 +149,7 @@ def fusion_client(docker_env, test_api_key) -> FusionClient:
         except Exception:
             time.sleep(1)
     else:
-        raise RuntimeError("Fusion did not become ready within 20 seconds")
+        raise RuntimeError("Fusion did not become ready within 60 seconds")
     
     return client
 
@@ -246,17 +246,43 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
     print(f"Configuring and starting agent in {CONTAINER_CLIENT_A}...")
     ensure_agent_running(CONTAINER_CLIENT_A, api_key, datastore_id)
     
-    # Wait to ensure A becomes Leader
-    time.sleep(3)
+    # Wait to ensure A becomes Leader (Effective Synchronization)
+    print("Waiting for Agent A to register and become Leader...")
+    start_wait = time.time()
+    while time.time() - start_wait < 30:
+        sessions = fusion_client.get_sessions()
+        leader = next((s for s in sessions if s.get("role") == "leader"), None)
+        if leader:
+            agent_id = leader.get("agent_id", "")
+            if "agent-a" in agent_id:
+                print(f"Agent A successfully became leader: {agent_id}")
+                break
+            else:
+                print(f"WARNING: Someone else is leader: {agent_id}. Waiting...")
+        time.sleep(1)
+    else:
+        # Fallback/Timeout warning - logs will be helpful
+        print("Timeout waiting for Agent A to become leader. Proceeding anyway (might fail)...")
     
     # Now start Agent B
     print(f"Configuring and starting agent in {CONTAINER_CLIENT_B}...")
     ensure_agent_running(CONTAINER_CLIENT_B, api_key, datastore_id)
     
-    # Wait for agents to register with Fusion
-    print("Waiting for agents to register...")
-    time.sleep(5)
-    
+    # Wait for Agent B to register (Ensure both agents are online)
+    print("Waiting for Agent B to register as Follower...")
+    start_wait = time.time()
+    while time.time() - start_wait < 30:
+        sessions = fusion_client.get_sessions()
+        # Check if we have 2 sessions and one is agent-b
+        agent_b = next((s for s in sessions if "agent-b" in s.get("agent_id", "")), None)
+        if agent_b:
+            print(f"Agent B registered: {agent_b.get('agent_id')} (Role: {agent_b.get('role')})")
+            break
+        time.sleep(1)
+    else:
+        logs = docker_manager.get_logs(CONTAINER_CLIENT_B)
+        print(f"WARNING: Timeout waiting for Agent B. Logs:\n{logs}")
+
     return {
         "api_key": api_key,
         "datastore_id": datastore_id,

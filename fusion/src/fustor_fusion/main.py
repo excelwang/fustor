@@ -54,9 +54,9 @@ async def lifespan(app: FastAPI):
     # Schedule periodic cache synchronization
     print("DEBUG: DEFINING periodic_sync", flush=True)
     async def periodic_sync():
-        print(f"DEBUG: STARTING periodic_sync task. Config Interval: {fusion_config.API_KEY_CACHE_SYNC_INTERVAL_SECONDS}", flush=True)
+        print(f"DEBUG: STARTING periodic_sync task. Config Interval: {fusion_config.FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS}", flush=True)
         while True:
-            await asyncio.sleep(fusion_config.API_KEY_CACHE_SYNC_INTERVAL_SECONDS)
+            await asyncio.sleep(fusion_config.FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS)
             print("DEBUG: Periodic Sync Loop WOKE UP", flush=True)
             logger.info("Performing periodic cache synchronization...")
             try:

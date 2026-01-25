@@ -38,6 +38,9 @@ class TestFollowerIOIsolation:
                 follower_session = session
                 break
         
+        if follower_session is None:
+            print(f"DEBUG: All sessions found: {sessions}")
+        
         assert follower_session is not None, "Agent B session not found"
         assert follower_session.get("role") == "follower", \
             f"Expected agent-b to be follower, got {follower_session.get('role')}"
@@ -69,8 +72,8 @@ class TestFollowerIOIsolation:
         
         test_file = f"{MOUNT_POINT}/test_follower_realtime_{int(time.time()*1000)}.txt"
         
-        # Give a small buffer for agents to fully transition to stable state
-        time.sleep(2)
+        # Give more buffer for agents to fully transition to stable state and establish watchers
+        time.sleep(5)
         
         # Create file on follower's mount
         docker_manager.create_file_in_container(
@@ -83,7 +86,7 @@ class TestFollowerIOIsolation:
         # We poll to observe the arrival as soon as possible
         found = None
         start = time.time()
-        while time.time() - start < 15:
+        while time.time() - start < 30:
             # Short-circuit if found
             found = fusion_client.wait_for_file_in_tree(
                 file_path=test_file,

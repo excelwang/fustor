@@ -38,9 +38,8 @@ class TestNewLeaderResumesDuties:
         docker_manager.stop_container(CONTAINER_CLIENT_A)
         
         try:
-            # Wait for failover
-            print("Waiting for leader failover...")
-            time.sleep(90)
+            # Wait for failover (Session timeout 30s + buffer)
+            time.sleep(40)
             
             # Verify B is now leader
             sessions = fusion_client.get_sessions()
@@ -66,8 +65,8 @@ class TestNewLeaderResumesDuties:
             # Use marker file approach for more reliable audit cycle detection
             marker_file = f"{MOUNT_POINT}/audit_marker_e2_{int(time.time()*1000)}.txt"
             docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-            time.sleep(7)
-            assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+            time.sleep(3)
+            assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
             
             # File should be discovered by new leader's Audit
             found = fusion_client.wait_for_file_in_tree(test_file, timeout=15)
@@ -131,8 +130,8 @@ class TestNewLeaderResumesDuties:
         docker_manager.stop_container(CONTAINER_CLIENT_A)
         
         try:
-            # Wait for failover
-            time.sleep(90)
+            # Wait for failover (Session timeout 30s + buffer)
+            time.sleep(40)
             
             # Create new file while B is leader
             new_file = f"{test_dir}/after_failover.txt"
@@ -171,8 +170,8 @@ class TestNewLeaderResumesDuties:
         docker_manager.stop_container(CONTAINER_CLIENT_A)
         
         try:
-            # Wait for failover
-            time.sleep(90)
+            # Wait for failover (Session timeout 30s + buffer)
+            time.sleep(40)
             
             # Restart A
             docker_manager.start_container(CONTAINER_CLIENT_A)

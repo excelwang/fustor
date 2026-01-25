@@ -43,8 +43,8 @@ class TestSuspectTTLExpiry:
         # Use marker to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_c3_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(3) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Verify it's in suspect list initially
         flags_initial = fusion_client.check_file_flags(test_file)

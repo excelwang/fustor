@@ -41,7 +41,11 @@ class TestRealtimeRemovesSuspect:
         )
         
         # Wait for Audit to discover and mark as suspect
-        wait_for_audit()
+        # Marker synchronization
+        marker_file = f"{MOUNT_POINT}/audit_marker_c4_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(3)
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         fusion_client.wait_for_file_in_tree(test_file, timeout=10)
         
         # Verify file is suspect
@@ -91,7 +95,11 @@ class TestRealtimeRemovesSuspect:
             content="blind spot content"
         )
         
-        wait_for_audit()
+        # Marker synchronization
+        marker_file = f"{MOUNT_POINT}/audit_marker_c4_insert_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(3)
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         fusion_client.wait_for_file_in_tree(test_file, timeout=10)
         
         # Verify flags

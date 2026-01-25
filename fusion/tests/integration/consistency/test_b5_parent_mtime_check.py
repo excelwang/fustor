@@ -67,8 +67,8 @@ class TestParentMtimeCheck:
         # This confirms that an audit cycle has scanned the directory
         marker_file = f"{MOUNT_POINT}/audit_marker_b5_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(3) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # After Audit, stale_file should STILL be absent (discarded by parent mtime check)
         tree = fusion_client.get_tree(path=test_dir, max_depth=-1)
@@ -116,8 +116,8 @@ class TestParentMtimeCheck:
         # Use marker file to be sure audit ran
         marker_file = f"{MOUNT_POINT}/audit_marker_b5_2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS delay
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(3) # NFS delay
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # File B should still exist (Audit mtime check should preserve it)
         tree_after = fusion_client.get_tree(path=test_dir, max_depth=-1)

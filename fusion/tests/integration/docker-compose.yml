@@ -67,7 +67,7 @@ services:
       # Faster cache sync for integration tests
       FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: "5"
       # Low TTL for suspect files to speed up integration tests
-      FUSTOR_FUSION_SUSPECT_TTL_SECONDS: "60"
+      FUSTOR_FUSION_SUSPECT_TTL_SECONDS: "10"
       # Shared token for internal service communication (must match Registry)
       FUSTOR_REGISTRY_CLIENT_TOKEN: "test-integration-token-for-internal-apis-12345"
       FUSTOR_CORE_SECRET_KEY: "test-integration-secret-key-for-jwt-signing"
@@ -106,7 +106,7 @@ services:
       NFS_SERVER: "nfs-server"
       NFS_PATH: "/exports"
       MOUNT_POINT: "/mnt/shared"
-      MOUNT_OPTIONS: "actimeo=5,nolock"
+      MOUNT_OPTIONS: "actimeo=2,nolock"
       AGENT_ENABLED: "false"
       AGENT_ID: "agent-a"
       AGENT_PORT: "8100"
@@ -149,7 +149,7 @@ services:
       NFS_SERVER: "nfs-server"
       NFS_PATH: "/exports"
       MOUNT_POINT: "/mnt/shared"
-      MOUNT_OPTIONS: "actimeo=5,nolock"
+      MOUNT_OPTIONS: "actimeo=2,nolock"
       AGENT_ENABLED: "false"
       AGENT_ID: "agent-b"
       AGENT_PORT: "8100"
@@ -194,7 +194,7 @@ services:
       NFS_SERVER: "nfs-server"
       NFS_PATH: "/exports"
       MOUNT_POINT: "/mnt/shared"
-      MOUNT_OPTIONS: "actimeo=5,nolock"
+      MOUNT_OPTIONS: "actimeo=2,nolock"
       AGENT_ENABLED: "false"
     networks:
       - fustor-net

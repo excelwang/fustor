@@ -54,7 +54,7 @@ class TestLeaderFailover:
         try:
             # Wait for session timeout (typically 30-60 seconds)
             # The exact time depends on the configured timeout
-            timeout_wait = 90  # Wait longer than session timeout
+            timeout_wait = 40  # Wait longer than session timeout (configured as 30s)
             print(f"Waiting {timeout_wait}s for leader session timeout...")
             time.sleep(timeout_wait)
             
@@ -118,8 +118,8 @@ class TestLeaderFailover:
         print(f"File listing from B after A stop: {output}")
         
         try:
-            # Wait for failover
-            time.sleep(90)
+            # Wait for failover (Session timeout 30s + buffer)
+            time.sleep(40)
             
             # Data should still be accessible
             # After failover, Agent B should perform Audit and report the missing file
@@ -127,7 +127,7 @@ class TestLeaderFailover:
             # Wait for the file to be present in Fusion's tree (giving it time for Agent B audit)
             found_after = fusion_client.wait_for_file_in_tree(
                 file_path=test_file,
-                timeout=120  # Allow time for Agent B promotion + Audit cycle
+                timeout=60  # Allow time for Agent B promotion + Audit cycle
             )
             
             assert found_after is not None, \

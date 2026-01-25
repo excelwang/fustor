@@ -42,10 +42,10 @@ class TestBlindSpotFileCreation:
         # Step 3 & 4: Use a marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_b1_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache delay
+        time.sleep(3) # NFS cache delay
         
         # Wait for marker to appear in Fusion (at least one audit cycle completed)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Now check if the original blind-spot file was discovered
         found_after_audit = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
@@ -77,8 +77,8 @@ class TestBlindSpotFileCreation:
         # Use marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_b1_list_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache delay
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(3) # NFS cache delay
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Check blind-spot list for file (poll to be safe)
         start = time.time()

@@ -60,8 +60,8 @@ class TestBlindSpotFileModification:
         # Step 4: Use a marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_b3_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(3) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Step 5: After Audit, Fusion mtime should be updated
         # Poll for mtime update
@@ -96,7 +96,7 @@ class TestBlindSpotFileModification:
             test_file,
             content="original"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=20)
         
         # Initial file should not have agent_missing
         flags_initial = fusion_client.check_file_flags(test_file)
@@ -113,8 +113,8 @@ class TestBlindSpotFileModification:
         # Use marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_b3_flag_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(3) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Check agent_missing flag after modification
         assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=15), \

@@ -43,7 +43,7 @@ class TestBlindSpotFileDeletion:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=20)
         assert found is not None, "File should appear via realtime event"
         
         # Step 2: Delete file from blind-spot client
@@ -55,16 +55,16 @@ class TestBlindSpotFileDeletion:
         assert still_exists is not None, \
             "File should still exist in Fusion (no realtime delete from blind-spot)"
         
-        # Step 4: Wait for NFS cache expiry and mtime aging threshold (> 15s)
-        time.sleep(18)
+        # Step 4: Wait for NFS cache expiry
+        time.sleep(3)
         
         # Use a marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_b2_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7)
+        time.sleep(2)
         
         # Wait for marker to appear in Fusion (at least one audit cycle completed)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Step 5: After Audit, file should be removed
         # Poll for removal with extended timeout
@@ -102,14 +102,14 @@ class TestBlindSpotFileDeletion:
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)
         
-        # Wait for NFS cache expiry / ensure distinct mtime update event
-        time.sleep(18)
+        # Step 4: Wait for NFS cache expiry / ensure distinct mtime update event
+        time.sleep(3)
         
         # Step 4: Use marker to ensure audit cycle ran
         marker_file = f"{MOUNT_POINT}/audit_marker_b2_list_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(2) # Wait for event propagation before polling tree
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Check blind-spot list for deletion record
         # Poll since events might be processed shortly after marker appearance

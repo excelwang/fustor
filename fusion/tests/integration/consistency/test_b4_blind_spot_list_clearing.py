@@ -44,11 +44,11 @@ class TestBlindSpotListClearing:
         marker_file = f"{MOUNT_POINT}/audit_marker_b4_1_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
         # NFS Lag: wait for kernel to refresh dir listing
-        time.sleep(7)
+        time.sleep(3)
         
         # Wait for marker to appear in Fusion (at least one audit cycle completed)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None, \
-            f"Audit marker file {marker_file} should be discovered by Audit scan within 120s"
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None, \
+            f"Audit marker file {marker_file} should be discovered by Audit scan within 30s"
         
         # Verify A is in blind-spot list
         blind_list = fusion_client.get_blind_spot_list()
@@ -66,8 +66,8 @@ class TestBlindSpotListClearing:
         # Step 4 & 5: Wait for next Audit cycle and verify list
         marker_file_2 = f"{MOUNT_POINT}/audit_marker_b4_2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file_2, content="marker")
-        time.sleep(7) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file_2, timeout=120) is not None
+        time.sleep(3) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file_2, timeout=30) is not None
         
         blind_list_2 = fusion_client.get_blind_spot_list()
         paths_2 = [item.get("path") for item in blind_list_2 if item.get("type") == "file"]
@@ -100,8 +100,8 @@ class TestBlindSpotListClearing:
         # Use marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_b4_flag_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache delay
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(3) # NFS cache delay
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Verify agent_missing is set
         assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=10), \

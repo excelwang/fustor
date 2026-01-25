@@ -54,8 +54,8 @@ class TestTombstoneCleanup:
         # Step 2-3: Use a marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_d4_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(3) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Step 4: After Audit, Tombstone should be cleaned
         # We verify by creating a new file with the same path via Agent
@@ -106,16 +106,16 @@ class TestTombstoneCleanup:
         # Step 4: Use marker to ensure first audit cycle ran
         marker_file = f"{MOUNT_POINT}/audit_marker_d4_lifecycle_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        time.sleep(3) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # After first audit finishes, the tombstone (created before audit) is cleaned.
         # However, the blind-spot file report arrived DURING the first audit and was blocked.
         # We need a SECOND audit cycle to discover the still-existing blind-spot file.
         marker_file_2 = f"{MOUNT_POINT}/audit_marker_d4_lifecycle_2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file_2, content="marker")
-        time.sleep(7) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file_2, timeout=120) is not None
+        time.sleep(3) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file_2, timeout=30) is not None
         
         # Now the file should appear (Tombstone cleaned, blind-spot file exists)
         tree = fusion_client.get_tree(path="/", max_depth=-1)

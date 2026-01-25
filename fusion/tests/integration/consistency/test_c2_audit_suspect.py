@@ -40,7 +40,13 @@ class TestAuditTriggersSuspect:
         )
         
         # Wait for Audit to discover
-        wait_for_audit()
+        # Use marker file to ensure reliable synchronization with NFS latency
+        marker_file = f"{MOUNT_POINT}/audit_marker_c2_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(3) # NFS cache delay
+        
+        # Wait for marker to appear in Fusion (at least one audit cycle completed)
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # File should appear
         found = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
@@ -73,7 +79,13 @@ class TestAuditTriggersSuspect:
             content="for audit suspect list"
         )
         
-        wait_for_audit()
+        # Marker synchronization
+        marker_file = f"{MOUNT_POINT}/audit_marker_c2_list_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(3)
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        
+        # Now wait for the file itself
         fusion_client.wait_for_file_in_tree(test_file, timeout=10)
         
         suspect_list = fusion_client.get_suspect_list()

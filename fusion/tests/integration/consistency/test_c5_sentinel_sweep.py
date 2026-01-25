@@ -47,7 +47,11 @@ class TestSentinelSweep:
             )
         
         # Wait for Audit to discover and mark as suspect
-        wait_for_audit()
+        # Marker synchronization
+        marker_file = f"{MOUNT_POINT}/audit_marker_c5_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(3)
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Wait for initial sync visibility
         for f in test_files:

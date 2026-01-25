@@ -62,10 +62,10 @@ class TestAuditTombstoneProtection:
         # Step 4: Use a marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS cache
+        time.sleep(3) # NFS cache
         
         # Wait for marker to appear in Fusion (confirms at least one audit cycle completed)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None, \
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None, \
             "Audit marker file should be discovered by Audit scan"
         
         # Step 5: File should NOT appear (protected by Tombstone during its first audit)
@@ -107,9 +107,9 @@ class TestAuditTombstoneProtection:
         # Use marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_cache_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(7) # NFS delay
+        time.sleep(3) # NFS delay
         
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Verify file stays deleted
         tree = fusion_client.get_tree(path="/", max_depth=-1)
