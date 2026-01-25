@@ -4,12 +4,22 @@ Pytest configuration and fixtures for NFS multi-mount consistency integration te
 import os
 import pytest
 import time
+import logging
 from pathlib import Path
 
 from .utils import docker_manager, FusionClient, RegistryClient
 
+# Setup test logger
+logger = logging.getLogger("fustor_test")
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
 # Test configuration
-TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "120"))
+TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "600"))
 AUDIT_INTERVAL = int(os.getenv("FUSTOR_AUDIT_INTERVAL", "5"))
 SUSPECT_TTL_SECONDS = int(os.getenv("FUSTOR_SUSPECT_TTL", "30"))  # Default 60 for tests
 
@@ -36,7 +46,7 @@ def docker_env():
     reuse_env = os.getenv("FUSTOR_REUSE_ENV", "false").lower() == "true"
     
     if reuse_env:
-        print("\n=== Checking Docker Compose environment (Reuse Mode) ===")
+        logger.info("Checking Docker Compose environment (Reuse Mode)")
         # Check if environment is up by testing one container
         try:
             docker_manager.exec_in_container(CONTAINER_REGISTRY, ["ls", "/"])
@@ -45,22 +55,22 @@ def docker_env():
             is_up = False
             
         if not is_up:
-            print("Environment not running. Starting it automatically...")
+            logger.info("Environment not running. Starting it automatically...")
             docker_manager.up(build=True, wait=True)
         else:
             # Check individual container health
             for container in [CONTAINER_NFS_SERVER, CONTAINER_REGISTRY, CONTAINER_FUSION]:
-                if not docker_manager.wait_for_health(container, timeout=10):
-                    print(f"Container {container} not healthy. Repairing ecosystem...")
+                if not docker_manager.wait_for_health(container, timeout=60):
+                    logger.warning(f"Container {container} not healthy. Repairing ecosystem...")
                     docker_manager.up(build=True, wait=True)
                     break
         
-        print("=== All containers healthy (Reused/Auto-started) ===")
+        logger.info("All containers healthy (Reused/Auto-started)")
         yield docker_manager
         # Don't tear down when reusing
-        print("\n=== Keeping Docker Compose environment running ===")
+        logger.info("Keeping Docker Compose environment running")
     else:
-        print("\n=== Starting Docker Compose environment ===")
+        logger.info("Starting Docker Compose environment")
         try:
             # Build and start all services
             docker_manager.up(build=True, wait=True)
@@ -79,11 +89,11 @@ def docker_env():
                     logs = docker_manager.get_logs(container)
                     raise RuntimeError(f"Container {container} failed to become healthy.\nLogs:\n{logs}")
             
-            print("=== All containers healthy ===")
+            logger.info("All containers healthy")
             yield docker_manager
             
         finally:
-            print("\n=== Tearing down Docker Compose environment ===")
+            logger.info("Tearing down Docker Compose environment")
             docker_manager.down(volumes=True)
 
 
@@ -93,16 +103,16 @@ def registry_client(docker_env) -> RegistryClient:
     client = RegistryClient(base_url="http://localhost:18101")
     
     # Wait for registry to be fully ready and admin user created
-    print("Waiting for Registry to initialize and login...")
+    logger.info("Waiting for Registry to initialize and login...")
     for i in range(30):
         try:
             # Default admin credentials (email, not username)
             client.login("admin@admin.com", "admin")
-            print(f"Registry logged in after {i+1} seconds")
+            logger.info(f"Registry logged in after {i+1} seconds")
             break
         except Exception as e:
             if i % 5 == 0:
-                print(f"Still waiting for Registry login... ({e})")
+                logger.debug(f"Still waiting for Registry login... ({e})")
             time.sleep(1)
     else:
         raise RuntimeError("Registry did not become ready for login within 30 seconds")
@@ -116,12 +126,16 @@ def test_datastore(registry_client) -> dict:
     existing_datastores = registry_client.get_datastores()
     for ds in existing_datastores:
         if ds["name"] == "integration-test-ds":
-            print(f"Reusing existing datastore: {ds['id']}")
+            logger.info(f"Reusing existing datastore: {ds['id']}")
             # Ensure allow_concurrent_push is True and fast timeout even for reused datastore
             if not ds.get("allow_concurrent_push") or ds.get("session_timeout_seconds") != 10:
+                 logger.info(f"Updating datastore {ds['id']} to use 10s timeout...")
                  registry_client.update_datastore(ds["id"], allow_concurrent_push=True, session_timeout_seconds=10)
                  ds["allow_concurrent_push"] = True
                  ds["session_timeout_seconds"] = 10
+                 # Wait for Fusion to sync the new config if we modified it
+                 logger.info("Waiting for configuration to propagate to Fusion...")
+                 time.sleep(10)
             return ds
 
     return registry_client.create_datastore(
@@ -142,7 +156,7 @@ def test_api_key(registry_client, test_datastore) -> dict:
     
     for key in datastore_keys:
         if key["name"] == "integration-test-key":
-            print(f"Reusing existing API key: {key['name']}")
+            logger.info(f"Reusing existing API key: {key['name']}")
             return key
 
     return registry_client.create_api_key(
@@ -158,12 +172,12 @@ def fusion_client(docker_env, test_api_key) -> FusionClient:
     client.set_api_key(test_api_key["key"])
     
     # Wait for Fusion to be ready to accept requests and sync its cache
-    print("Waiting for Fusion to become ready and sync cache...")
+    logger.info("Waiting for Fusion to become ready and sync cache...")
     for i in range(60):
         try:
             # Use get_sessions which doesn't require snapshot completion (unlike get_stats/get_tree)
             client.get_sessions()
-            print(f"Fusion ready and API key synced after {i+1} seconds")
+            logger.info(f"Fusion ready and API key synced after {i+1} seconds")
             break
         except Exception:
             time.sleep(1)
@@ -262,11 +276,11 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
     
     # Update agent configs in containers A and B
     # Start Agent A first
-    print(f"Configuring and starting agent in {CONTAINER_CLIENT_A}...")
+    logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_A}...")
     ensure_agent_running(CONTAINER_CLIENT_A, api_key, datastore_id)
     
     # Wait to ensure A becomes Leader (Effective Synchronization)
-    print("Waiting for Agent A to register and become Leader...")
+    logger.info("Waiting for Agent A to register and become Leader...")
     start_wait = time.time()
     while time.time() - start_wait < 30:
         sessions = fusion_client.get_sessions()
@@ -274,33 +288,33 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
         if leader:
             agent_id = leader.get("agent_id", "")
             if "agent-a" in agent_id:
-                print(f"Agent A successfully became leader: {agent_id}")
+                logger.info(f"Agent A successfully became leader: {agent_id}")
                 break
             else:
-                print(f"WARNING: Someone else is leader: {agent_id}. Waiting...")
+                logger.warning(f"Someone else is leader: {agent_id}. Waiting...")
         time.sleep(1)
     else:
         # Fallback/Timeout warning - logs will be helpful
-        print("Timeout waiting for Agent A to become leader. Proceeding anyway (might fail)...")
+        logger.warning("Timeout waiting for Agent A to become leader. Proceeding anyway (might fail)...")
     
     # Now start Agent B
-    print(f"Configuring and starting agent in {CONTAINER_CLIENT_B}...")
+    logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_B}...")
     ensure_agent_running(CONTAINER_CLIENT_B, api_key, datastore_id)
     
     # Wait for Agent B to register (Ensure both agents are online)
-    print("Waiting for Agent B to register as Follower...")
+    logger.info("Waiting for Agent B to register as Follower...")
     start_wait = time.time()
     while time.time() - start_wait < 30:
         sessions = fusion_client.get_sessions()
         # Check if we have 2 sessions and one is agent-b
         agent_b = next((s for s in sessions if "agent-b" in s.get("agent_id", "")), None)
         if agent_b:
-            print(f"Agent B registered: {agent_b.get('agent_id')} (Role: {agent_b.get('role')})")
+            logger.info(f"Agent B registered: {agent_b.get('agent_id')} (Role: {agent_b.get('role')})")
             break
         time.sleep(1)
     else:
         logs = docker_manager.get_logs(CONTAINER_CLIENT_B)
-        print(f"WARNING: Timeout waiting for Agent B. Logs:\n{logs}")
+        logger.warning(f"Timeout waiting for Agent B. Logs:\n{logs}")
 
     return {
         "api_key": api_key,

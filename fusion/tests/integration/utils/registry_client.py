@@ -38,7 +38,7 @@ class RegistryClient:
             }
         )
         if not resp.ok:
-            print(f"Create datastore failed: {resp.status_code} - {resp.text}")
+            pass # Error will be raised by raise_for_status() below
         resp.raise_for_status()
         return resp.json()
 
@@ -80,7 +80,7 @@ class RegistryClient:
             json={"datastore_id": datastore_id, "name": name}
         )
         if not resp.ok:
-            print(f"Create API key failed: {resp.status_code} - {resp.text}")
+            pass # Error will be raised by raise_for_status() below
         resp.raise_for_status()
         return resp.json()
 

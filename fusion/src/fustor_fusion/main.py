@@ -1,5 +1,4 @@
 from fastapi import FastAPI, APIRouter, Request, HTTPException, status
-print("DEBUG: FUSTOR_FUSION MAIN MODULE LOADED", flush=True)
 from fastapi.responses import FileResponse
 import os
 import asyncio
@@ -52,12 +51,11 @@ async def lifespan(app: FastAPI):
         await processing_manager.ensure_processor(datastore_id)
 
     # Schedule periodic cache synchronization
-    print("DEBUG: DEFINING periodic_sync", flush=True)
     async def periodic_sync():
-        print(f"DEBUG: STARTING periodic_sync task. Config Interval: {fusion_config.FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS}", flush=True)
+        logger.debug(f"Starting periodic_sync task. Config Interval: {fusion_config.FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS}")
         while True:
             await asyncio.sleep(fusion_config.FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS)
-            print("DEBUG: Periodic Sync Loop WOKE UP", flush=True)
+            logger.debug("Periodic Sync Loop woke up")
             logger.info("Performing periodic cache synchronization...")
             try:
                 await sync_caches_job()
@@ -68,9 +66,9 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.error(f"Periodic cache synchronization failed: {e}", exc_info=True)
 
-    print("DEBUG: CALLING create_task for periodic_sync", flush=True)
+    logger.debug("Creating background task for periodic_sync")
     sync_task = asyncio.create_task(periodic_sync())
-    print(f"DEBUG: Task created: {sync_task}", flush=True)
+    logger.debug(f"Task created: {sync_task}")
     
     # Start periodic session cleanup
     await session_manager.start_periodic_cleanup()
