@@ -17,7 +17,7 @@
 │         └────────────────┼─────────────────────────┤                     │
 │                          │                         │                     │
 │  ┌───────────────────────┼─────────────────────────┼──────────────────┐ │
-│  │                     NFS Mount (actimeo=5)                          │ │
+│  │                     NFS Mount (actimeo=2)                          │ │
 │  │                                                                    │ │
 │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐            │ │
 │  │  │ NFS Client A │  │ NFS Client B │  │ NFS Client C │            │ │
@@ -46,15 +46,20 @@ cd /home/huajin/fustor_monorepo
 # 安装测试依赖
 pip install pytest pytest-asyncio requests
 
-# 运行所有集成测试
-pytest fusion/tests/integration/consistency/ -v
+# 运行所有集成测试（推荐启用环境重用以加速）
+FUSTOR_REUSE_ENV=true uv run pytest fusion/tests/integration/consistency/ -v
 
 # 运行特定类别的测试
-pytest fusion/tests/integration/consistency/test_b*.py -v  # 盲区测试
-pytest fusion/tests/integration/consistency/test_c*.py -v  # 可疑文件测试
-pytest fusion/tests/integration/consistency/test_d*.py -v  # 墓碑测试
-pytest fusion/tests/integration/consistency/test_e*.py -v  # 故障转移测试
+FUSTOR_REUSE_ENV=true uv run pytest fusion/tests/integration/consistency/test_b*.py -v  # 盲区测试
+FUSTOR_REUSE_ENV=true uv run pytest fusion/tests/integration/consistency/test_c*.py -v  # 可疑文件测试
+FUSTOR_REUSE_ENV=true uv run pytest fusion/tests/integration/consistency/test_d*.py -v  # 墓碑测试
+FUSTOR_REUSE_ENV=true uv run pytest fusion/tests/integration/consistency/test_e*.py -v  # 故障转移测试
 ```
+
+### 环境重用说明 (FUSTOR_REUSE_ENV)
+
+- **`FUSTOR_REUSE_ENV=true` (推荐)**: 首次运行会创建环境，后续运行会直接使用已有容器。跳过了镜像构建和冷启动阶段，全量测试仅需约 500s。
+- **`FUSTOR_REUSE_ENV=false` (默认)**: 每次运行都会执行 `docker compose down -v` 销毁并重建所有容器。用于验证冷启动引导逻辑。
 
 ### 手动管理 Docker 环境
 
@@ -96,7 +101,7 @@ docker compose down -v
 |---------|------|------|
 | C1 | `test_c1_snapshot_suspect.py` | Snapshot 标记近期文件为 Suspect |
 | C2 | `test_c2_audit_suspect.py` | Audit 标记盲区近期文件为 Suspect |
-| C3 | `test_c3_suspect_ttl_expiry.py` | 10 分钟 TTL 后 Suspect 标记过期 |
+| C3 | `test_c3_suspect_ttl_expiry.py` | 30 秒 TTL 后 Suspect 标记过期 |
 | C4 | `test_c4_realtime_removes_suspect.py` | Realtime 事件移除 Suspect 标记 |
 | C5 | `test_c5_sentinel_sweep.py` | Leader 哨兵巡检更新 Suspect mtime |
 
@@ -122,8 +127,10 @@ docker compose down -v
 
 | 变量 | 默认值 | 描述 |
 |------|--------|------|
-| `FUSTOR_TEST_TIMEOUT` | 120 | 测试超时秒数 |
-| `FUSTOR_AUDIT_INTERVAL` | 30 | 等待 Audit 周期的秒数 |
+| `FUSTOR_REUSE_ENV` | false | 是否重用已有的 Docker 容器环境 |
+| `FUSTOR_TEST_TIMEOUT` | 120 | 全局测试超时秒数 |
+| `FUSTOR_AUDIT_INTERVAL` | 5 | 审计周期秒数 (影响盲区发现速度) |
+| `FUSTOR_SUSPECT_TTL` | 30 | 可疑文件标记过期时间 (秒) |
 | `FUSTOR_SKIP_LONG_TESTS` | false | 跳过需要长时间运行的测试 |
 
 ## 目录结构

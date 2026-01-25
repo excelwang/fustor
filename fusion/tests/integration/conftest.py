@@ -36,21 +36,26 @@ def docker_env():
     reuse_env = os.getenv("FUSTOR_REUSE_ENV", "false").lower() == "true"
     
     if reuse_env:
-        print("\n=== Using existing Docker Compose environment ===")
-        # Just verify containers are running
-        containers = [
-            CONTAINER_NFS_SERVER,
-            CONTAINER_REGISTRY,
-            CONTAINER_FUSION,
-            CONTAINER_CLIENT_A,
-            CONTAINER_CLIENT_B,
-            CONTAINER_CLIENT_C
-        ]
-        for container in containers:
-            if not docker_manager.wait_for_health(container, timeout=30):
-                raise RuntimeError(f"Container {container} is not healthy. Please start the environment first.")
+        print("\n=== Checking Docker Compose environment (Reuse Mode) ===")
+        # Check if environment is up by testing one container
+        try:
+            docker_manager.exec_in_container(CONTAINER_REGISTRY, ["ls", "/"])
+            is_up = True
+        except Exception:
+            is_up = False
+            
+        if not is_up:
+            print("Environment not running. Starting it automatically...")
+            docker_manager.up(build=True, wait=True)
+        else:
+            # Check individual container health
+            for container in [CONTAINER_NFS_SERVER, CONTAINER_REGISTRY, CONTAINER_FUSION]:
+                if not docker_manager.wait_for_health(container, timeout=10):
+                    print(f"Container {container} not healthy. Repairing ecosystem...")
+                    docker_manager.up(build=True, wait=True)
+                    break
         
-        print("=== All containers healthy ===")
+        print("=== All containers healthy (Reused/Auto-started) ===")
         yield docker_manager
         # Don't tear down when reusing
         print("\n=== Keeping Docker Compose environment running ===")
@@ -86,10 +91,22 @@ def docker_env():
 def registry_client(docker_env) -> RegistryClient:
     """Create and authenticate Registry client."""
     client = RegistryClient(base_url="http://localhost:18101")
-    # Wait for registry to be fully ready
-    time.sleep(2)
-    # Default admin credentials (email, not username)
-    client.login("admin@admin.com", "admin")
+    
+    # Wait for registry to be fully ready and admin user created
+    print("Waiting for Registry to initialize and login...")
+    for i in range(30):
+        try:
+            # Default admin credentials (email, not username)
+            client.login("admin@admin.com", "admin")
+            print(f"Registry logged in after {i+1} seconds")
+            break
+        except Exception as e:
+            if i % 5 == 0:
+                print(f"Still waiting for Registry login... ({e})")
+            time.sleep(1)
+    else:
+        raise RuntimeError("Registry did not become ready for login within 30 seconds")
+        
     return client
 
 

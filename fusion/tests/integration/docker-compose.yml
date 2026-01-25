@@ -25,7 +25,7 @@ services:
       test: [ "CMD", "showmount", "-e", "localhost" ]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 30
 
   registry:
     build:
@@ -51,7 +51,7 @@ services:
       test: [ "CMD", "curl", "-f", "http://localhost:8101/" ]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 30
 
   fusion:
     build:
@@ -92,7 +92,7 @@ services:
       test: [ "CMD", "curl", "-f", "http://localhost:8102/" ]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 30
 
   # ============ NFS Clients with Agents ============
 
@@ -137,7 +137,7 @@ services:
       test: [ "CMD", "test", "-d", "/mnt/shared" ]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 30
 
   nfs-client-b:
     build:
@@ -180,7 +180,7 @@ services:
       test: [ "CMD", "test", "-d", "/mnt/shared" ]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 30
 
   # ============ NFS Client without Agent (Blind-spot Simulation) ============
 
@@ -207,7 +207,7 @@ services:
       test: [ "CMD", "test", "-d", "/mnt/shared" ]
       interval: 5s
       timeout: 3s
-      retries: 10
+      retries: 30
 
 networks:
   fustor-net:
