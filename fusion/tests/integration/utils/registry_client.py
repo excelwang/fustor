@@ -26,14 +26,15 @@ class RegistryClient:
         self.session.headers["Authorization"] = f"Bearer {self._token}"
         return self._token
 
-    def create_datastore(self, name: str, description: str = "", allow_concurrent_push: bool = False) -> dict[str, Any]:
+    def create_datastore(self, name: str, description: str = "", allow_concurrent_push: bool = False, session_timeout_seconds: int = 30) -> dict[str, Any]:
         """Create a new datastore."""
         resp = self.session.post(
             f"{self.base_url}/v1/datastores/",
             json={
                 "name": name, 
                 "description": description, 
-                "allow_concurrent_push": allow_concurrent_push
+                "allow_concurrent_push": allow_concurrent_push,
+                "session_timeout_seconds": session_timeout_seconds
             }
         )
         if not resp.ok:
@@ -55,6 +56,7 @@ class RegistryClient:
             "name": current["name"],
             "description": current.get("description", ""),
             "allow_concurrent_push": current.get("allow_concurrent_push", False),
+            "session_timeout_seconds": current.get("session_timeout_seconds", 30),
             **updates
         }
         

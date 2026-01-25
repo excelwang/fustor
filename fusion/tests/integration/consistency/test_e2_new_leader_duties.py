@@ -38,8 +38,8 @@ class TestNewLeaderResumesDuties:
         docker_manager.stop_container(CONTAINER_CLIENT_A)
         
         try:
-            # Wait for failover (Session timeout 30s + buffer)
-            time.sleep(40)
+            # Wait for failover (Session timeout 10s + buffer)
+            time.sleep(15)
             
             # Verify B is now leader
             sessions = fusion_client.get_sessions()
@@ -130,8 +130,8 @@ class TestNewLeaderResumesDuties:
         docker_manager.stop_container(CONTAINER_CLIENT_A)
         
         try:
-            # Wait for failover (Session timeout 30s + buffer)
-            time.sleep(40)
+            # Wait for failover (Session timeout 10s + buffer)
+            time.sleep(15)
             
             # Create new file while B is leader
             new_file = f"{test_dir}/after_failover.txt"
@@ -170,8 +170,8 @@ class TestNewLeaderResumesDuties:
         docker_manager.stop_container(CONTAINER_CLIENT_A)
         
         try:
-            # Wait for failover (Session timeout 30s + buffer)
-            time.sleep(40)
+            # Wait for failover (Session timeout 10s + buffer)
+            time.sleep(15)
             
             # Restart A
             docker_manager.start_container(CONTAINER_CLIENT_A)

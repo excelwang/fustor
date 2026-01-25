@@ -54,7 +54,7 @@ class TestLeaderFailover:
         try:
             # Wait for session timeout (typically 30-60 seconds)
             # The exact time depends on the configured timeout
-            timeout_wait = 40  # Wait longer than session timeout (configured as 30s)
+            timeout_wait = 15  # Wait longer than session timeout (configured as 10s)
             print(f"Waiting {timeout_wait}s for leader session timeout...")
             time.sleep(timeout_wait)
             
@@ -118,8 +118,8 @@ class TestLeaderFailover:
         print(f"File listing from B after A stop: {output}")
         
         try:
-            # Wait for failover (Session timeout 30s + buffer)
-            time.sleep(40)
+            # Wait for failover (Session timeout 10s + buffer)
+            time.sleep(15)
             
             # Data should still be accessible
             # After failover, Agent B should perform Audit and report the missing file

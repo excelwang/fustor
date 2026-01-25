@@ -10,8 +10,8 @@ from .utils import docker_manager, FusionClient, RegistryClient
 
 # Test configuration
 TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "120"))
-AUDIT_INTERVAL = int(os.getenv("FUSTOR_AUDIT_INTERVAL", "20"))
-SUSPECT_TTL_SECONDS = int(os.getenv("FUSTOR_SUSPECT_TTL", "10"))  # Default 60 for tests
+AUDIT_INTERVAL = int(os.getenv("FUSTOR_AUDIT_INTERVAL", "5"))
+SUSPECT_TTL_SECONDS = int(os.getenv("FUSTOR_SUSPECT_TTL", "30"))  # Default 60 for tests
 
 # Container names
 CONTAINER_NFS_SERVER = "fustor-nfs-server"
@@ -100,16 +100,18 @@ def test_datastore(registry_client) -> dict:
     for ds in existing_datastores:
         if ds["name"] == "integration-test-ds":
             print(f"Reusing existing datastore: {ds['id']}")
-            # Ensure allow_concurrent_push is True even for reused datastore
-            if not ds.get("allow_concurrent_push"):
-                 registry_client.update_datastore(ds["id"], allow_concurrent_push=True)
+            # Ensure allow_concurrent_push is True and fast timeout even for reused datastore
+            if not ds.get("allow_concurrent_push") or ds.get("session_timeout_seconds") != 10:
+                 registry_client.update_datastore(ds["id"], allow_concurrent_push=True, session_timeout_seconds=10)
                  ds["allow_concurrent_push"] = True
+                 ds["session_timeout_seconds"] = 10
             return ds
 
     return registry_client.create_datastore(
         name="integration-test-ds",
         description="Datastore for NFS consistency integration tests",
-        allow_concurrent_push=True
+        allow_concurrent_push=True,
+        session_timeout_seconds=10
     )
 
 
