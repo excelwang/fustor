@@ -133,7 +133,7 @@ class ServiceManager:
                 time.sleep(0.5)
         raise RuntimeError("Fusion start failed")
 
-    def start_agent(self, api_key: str, extra_env: dict = None):
+    def start_agent(self, api_key: str):
         config = {
             "sources": {
                 "bench-fs": {
@@ -144,8 +144,7 @@ class ServiceManager:
                     "is_transient": True,
                     "max_queue_size": 100000,
                     "max_retries": 1,
-                    # Shorten heartbeat to speed up failover/restart detection
-                    "driver_params": {"min_monitoring_window_days": 1} 
+                    "driver_params": {"min_monitoring_window_days": 1}
                 }
             },
             "pushers": {
@@ -163,9 +162,7 @@ class ServiceManager:
                 "bench-sync": {
                     "source": "bench-fs",
                     "pusher": "bench-fusion",
-                    "disabled": False,
-                    # Inject intervals via config if supported, otherwise rely on ENV
-                    "audit_interval_seconds": int(extra_env.get("FUSTOR_AUDIT_INTERVAL", 3600)) if extra_env else 3600
+                    "disabled": False
                 }
             }
         }
@@ -176,33 +173,15 @@ class ServiceManager:
             "fustor-agent", "start",
             "-p", str(self.agent_port)
         ]
-        log_file = open(os.path.join(self.env_dir, "agent.log"), "a") # Append mode for restarts
+        log_file = open(os.path.join(self.env_dir, "agent.log"), "w")
         env = os.environ.copy()
         env["FUSTOR_HOME"] = self.env_dir
-        if extra_env:
-            env.update(extra_env)
         
         p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-        log_file.close()
+        log_file.close() # Close in parent
         self.processes.append(p)
-        self.agent_process = p
         
         self._wait_for_service(f"http://localhost:{self.agent_port}/", "Agent")
-
-    def stop_agent(self):
-        if hasattr(self, 'agent_process') and self.agent_process:
-             click.echo("Stopping Agent...")
-             try:
-                self.agent_process.terminate()
-                self.agent_process.wait(timeout=5)
-             except:
-                self.agent_process.kill()
-             
-             if self.agent_process in self.processes:
-                 self.processes.remove(self.agent_process)
-             self.agent_process = None
-        else:
-             click.echo("Agent not running.")
 
     def check_agent_logs(self, lines=100):
         log_path = os.path.join(self.env_dir, "agent.log")
@@ -241,9 +220,8 @@ class ServiceManager:
         click.echo("Stopping all services...")
         for p in self.processes:
             try:
-                if p.poll() is None:
-                    p.terminate()
-                    p.wait(timeout=5)
+                p.terminate()
+                p.wait(timeout=5)
             except:
                 p.kill()
         self.processes = []

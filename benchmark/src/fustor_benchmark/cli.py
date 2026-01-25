@@ -40,18 +40,5 @@ def generate(target_dir, num_dirs, num_subdirs, files_per_subdir):
     gen = DataGenerator(os.path.abspath(target_dir))
     gen.generate(num_dirs, num_subdirs, files_per_subdir)
 
-@cli.command()
-@click.argument("target-dir", type=click.Path(exists=False))
-@click.option("--fusion-api", help="External Fusion API URL (skips local setup).")
-@click.option("--api-key", help="API Key for external Fusion API.")
-def consistency_check(target_dir, fusion_api, api_key):
-    """Executes consistency integration tests (Active Write & Audit Recovery)."""
-    # Import locally to avoid circular dependencies if any
-    from .consistency_runner import ConsistencyRunner
-    
-    run_dir = os.path.abspath(DEFAULT_RUN_DIR)
-    runner = ConsistencyRunner(run_dir, target_dir, fusion_api, api_key)
-    runner.run_tests()
-
 if __name__ == "__main__":
     cli()
