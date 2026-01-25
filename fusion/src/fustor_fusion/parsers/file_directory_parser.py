@@ -49,15 +49,15 @@ class DirectoryNode:
             return result
 
         if recursive:
-            result['children'] = []
-            for child in self.children.values():
+            result['children'] = {}
+            for name, child in self.children.items():
                 child_dict = child.to_dict(
                     recursive=True, 
                     max_depth=max_depth - 1 if max_depth is not None else None,
                     only_path=only_path
                 )
                 if child_dict is not None:
-                    result['children'].append(child_dict)
+                    result['children'][name] = child_dict
         else:
             # Non-recursive mode: return children as a LIST of direct metadata
             result['children'] = []
