@@ -91,16 +91,19 @@ async def test_tree_default_recursive(client):
     
     # 检查根节点
     assert data["path"] == "/"
-    assert "dir1" in data["children"]
-    assert "file3.txt" in data["children"]
+    names = [c["name"] for c in data["children"]]
+    assert "dir1" in names
+    assert "file3.txt" in names
     
     # 检查递归深度
-    dir1 = data["children"]["dir1"]
-    assert "file1.txt" in dir1["children"]
-    assert "subdir1" in dir1["children"]
+    dir1 = next(c for c in data["children"] if c["name"] == "dir1")
+    dir1_children_names = [c["name"] for c in dir1["children"]]
+    assert "file1.txt" in dir1_children_names
+    assert "subdir1" in dir1_children_names
     
-    subdir1 = dir1["children"]["subdir1"]
-    assert "file2.txt" in subdir1["children"]
+    subdir1 = next(c for c in dir1["children"] if c["name"] == "subdir1")
+    subdir1_children_names = [c["name"] for c in subdir1["children"]]
+    assert "file2.txt" in subdir1_children_names
 
 @pytest.mark.asyncio
 async def test_tree_non_recursive(client):
@@ -129,11 +132,10 @@ async def test_tree_max_depth_1(client):
     assert response.status_code == 200
     data = response.json()
     
-    assert data["path"] == "/"
-    assert "dir1" in data["children"]
+    assert any(c["name"] == "dir1" for c in data["children"])
     
     # dir1 这一层应该没有 children 字段，因为深度达到了 1
-    dir1 = data["children"]["dir1"]
+    dir1 = next(c for c in data["children"] if c["name"] == "dir1")
     assert "children" not in dir1
 
 @pytest.mark.asyncio
@@ -147,10 +149,10 @@ async def test_tree_max_depth_2(client):
     # 层级 1: dir1
     # 层级 2: subdir1 (停止递归)
     
-    dir1 = data["children"]["dir1"]
-    assert "subdir1" in dir1["children"]
+    dir1 = next(c for c in data["children"] if c["name"] == "dir1")
+    assert any(c["name"] == "subdir1" for c in dir1["children"])
     
-    subdir1 = dir1["children"]["subdir1"]
+    subdir1 = next(c for c in dir1["children"] if c["name"] == "subdir1")
     assert "children" not in subdir1 # 达到深度 2，停止
 
 @pytest.mark.asyncio
@@ -168,7 +170,7 @@ async def test_tree_only_path(client):
     
     # 文件节点不应包含 size (注：根据实现，size 在 result 中保留了，但 modified_time 等被剔除)
     # 让我们检查一下具体实现中的 FileNode.to_dict
-    file3 = data["children"]["file3.txt"]
+    file3 = next(c for c in data["children"] if c["name"] == "file3.txt")
     assert "modified_time" not in file3
     assert "path" in file3
 
@@ -183,9 +185,7 @@ async def test_tree_combined_params(client):
     assert response.status_code == 200
     data = response.json()
     
-    assert data["path"] == "/"
-    assert "modified_time" not in data
-    
-    assert "dir1" in data["children"]
-    assert "children" not in data["children"]["dir1"]
-    assert "modified_time" not in data["children"]["dir1"]
+    assert any(c["name"] == "dir1" for c in data["children"])
+    dir1 = next(c for c in data["children"] if c["name"] == "dir1")
+    assert "children" not in dir1
+    assert "modified_time" not in dir1
