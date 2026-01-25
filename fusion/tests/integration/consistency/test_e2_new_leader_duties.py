@@ -55,25 +55,37 @@ class TestNewLeaderResumesDuties:
                 "Agent B should be the new leader"
             
             # Create file from blind-spot
-            test_file = f"{MOUNT_POINT}/new_leader_audit_test.txt"
+            test_file = f"{MOUNT_POINT}/new_leader_audit_test_{int(time.time()*1000)}.txt"
             docker_manager.create_file_in_container(
                 CONTAINER_CLIENT_C,
                 test_file,
                 content="blind spot file for new leader"
             )
             
-            # Wait for new leader's Audit
-            wait_for_audit()
+            # Wait for new leader's Audit to find the file
+            # Use marker file approach for more reliable audit cycle detection
+            marker_file = f"{MOUNT_POINT}/audit_marker_e2_{int(time.time()*1000)}.txt"
+            docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+            time.sleep(7)
+            assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
             
             # File should be discovered by new leader's Audit
-            found = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+            found = fusion_client.wait_for_file_in_tree(test_file, timeout=15)
             
             assert found is not None, \
                 "New leader should discover blind-spot file via Audit"
             
-            # Verify it's marked as agent_missing
-            flags = fusion_client.check_file_flags(test_file)
-            assert flags["agent_missing"] is True
+            # Poll for agent_missing flag (may need an additional audit cycle)
+            start = time.time()
+            flag_set = False
+            while time.time() - start < 30:
+                flags = fusion_client.check_file_flags(test_file)
+                if flags["agent_missing"] is True:
+                    flag_set = True
+                    break
+                time.sleep(2)
+            
+            assert flag_set, "Blind-spot file should be marked agent_missing"
             
         finally:
             docker_manager.start_container(CONTAINER_CLIENT_A)

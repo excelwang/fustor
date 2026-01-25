@@ -24,6 +24,7 @@ class FusionServiceConfig(BaseModel):
     FUSTOR_FUSION_REGISTRY_URL: str = os.getenv("FUSTOR_FUSION_REGISTRY_URL", "http://127.0.0.1:8101")
     FUSTOR_REGISTRY_CLIENT_TOKEN: str = os.getenv("FUSTOR_REGISTRY_CLIENT_TOKEN", "")
     FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: int = int(os.getenv("FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS", 60))
+    FUSTOR_FUSION_SUSPECT_TTL_SECONDS: int = int(os.getenv("FUSTOR_FUSION_SUSPECT_TTL_SECONDS", 600))
     # Add other ingestor specific configs here
 
 fusion_config = FusionServiceConfig()

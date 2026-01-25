@@ -66,6 +66,8 @@ services:
       FUSTOR_FUSION_DATA_DIR: "/data/fusion"
       # Faster cache sync for integration tests
       FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: "5"
+      # Low TTL for suspect files to speed up integration tests
+      FUSTOR_FUSION_SUSPECT_TTL_SECONDS: "60"
       # Shared token for internal service communication (must match Registry)
       FUSTOR_REGISTRY_CLIENT_TOKEN: "test-integration-token-for-internal-apis-12345"
       FUSTOR_CORE_SECRET_KEY: "test-integration-secret-key-for-jwt-signing"

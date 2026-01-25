@@ -11,16 +11,15 @@ import time
 import os
 
 from ..utils import docker_manager
-from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT
+from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT, SUSPECT_TTL_SECONDS
 
-# Skip if running in CI without enough time
-SKIP_LONG_TESTS = os.getenv("FUSTOR_SKIP_LONG_TESTS", "true").lower() == "true"
+# Skip if running in CI without enough time (Old logic, now we use small TTL)
+SKIP_LONG_TESTS = os.getenv("FUSTOR_SKIP_LONG_TESTS", "false").lower() == "true"
 
 
 class TestSuspectTTLExpiry:
     """Test that suspect list entries expire after TTL."""
 
-    @pytest.mark.skipif(SKIP_LONG_TESTS, reason="Long-running test skipped in CI")
     def test_suspect_removed_after_ttl(
         self,
         docker_env,
@@ -30,15 +29,9 @@ class TestSuspectTTLExpiry:
         wait_for_audit
     ):
         """
-        场景:
-          1. 创建文件（从盲区创建，触发 Audit 加入 Suspect List）
-          2. 等待 10 分钟 + buffer
-          3. 文件不再被标记为 integrity_suspect
-        预期:
-          - TTL 到期后，integrity_suspect 标记被清除
-          - 文件从 Suspect List 中移除
+        场景: Suspect 标记过期移除
         """
-        test_file = f"{MOUNT_POINT}/suspect_ttl_test.txt"
+        test_file = f"{MOUNT_POINT}/suspect_ttl_test_{int(time.time()*1000)}.txt"
         
         # Create file from blind-spot
         docker_manager.create_file_in_container(
@@ -47,24 +40,38 @@ class TestSuspectTTLExpiry:
             content="file for TTL test"
         )
         
-        # Wait for Audit to discover and mark as suspect
-        wait_for_audit()
-        fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        # Use marker to detect Audit completion
+        marker_file = f"{MOUNT_POINT}/audit_marker_c3_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        time.sleep(7) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
         # Verify it's in suspect list initially
         flags_initial = fusion_client.check_file_flags(test_file)
         assert flags_initial["integrity_suspect"] is True, \
             "File should initially be suspect"
         
-        # Wait for TTL (10 minutes + 1 minute buffer)
-        ttl_seconds = 10 * 60 + 60
-        print(f"Waiting {ttl_seconds} seconds for TTL expiry...")
-        time.sleep(ttl_seconds)
+        # Wait for TTL (using configured value + small buffer)
+        ttl_wait = SUSPECT_TTL_SECONDS + 5
+        print(f"Waiting {ttl_wait} seconds for TTL expiry (configured TTL: {SUSPECT_TTL_SECONDS}s)...")
+        time.sleep(ttl_wait)
         
-        # Check that suspect flag is cleared
-        flags_after = fusion_client.check_file_flags(test_file)
-        assert flags_after["integrity_suspect"] is False, \
-            "Suspect flag should be cleared after TTL"
+        # Check that suspect flag is cleared (Force a refresh via get_tree)
+        fusion_client.get_tree(path="/", max_depth=-1)
+        
+        # Poll for flag clearing since it happens during get_suspect_list
+        start = time.time()
+        cleared = False
+        while time.time() - start < 15:
+            # Note: get_suspect_list() triggers cleanup in the parser
+            fusion_client.get_suspect_list()
+            flags_after = fusion_client.check_file_flags(test_file)
+            if flags_after["integrity_suspect"] is False:
+                cleared = True
+                break
+            time.sleep(1)
+
+        assert cleared, "Suspect flag should be cleared after TTL"
         
         # File should be removed from suspect list
         suspect_list = fusion_client.get_suspect_list()

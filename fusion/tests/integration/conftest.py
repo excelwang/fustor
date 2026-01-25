@@ -10,8 +10,8 @@ from .utils import docker_manager, FusionClient, RegistryClient
 
 # Test configuration
 TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "120"))
-AUDIT_INTERVAL = int(os.getenv("FUSTOR_AUDIT_INTERVAL", "30"))
-SUSPECT_TTL_MINUTES = 10  # From CONSISTENCY_DESIGN.md
+AUDIT_INTERVAL = int(os.getenv("FUSTOR_AUDIT_INTERVAL", "15"))
+SUSPECT_TTL_SECONDS = int(os.getenv("FUSTOR_SUSPECT_TTL", "60"))  # Default 60 for tests
 
 # Container names
 CONTAINER_NFS_SERVER = "fustor-nfs-server"

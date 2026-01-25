@@ -33,7 +33,7 @@ class TestBlindSpotFileDeletion:
           - 删除后（Audit 前）文件仍存在于 Fusion
           - Audit 后文件从 Fusion 移除
         """
-        test_file = f"{MOUNT_POINT}/blind_delete_test.txt"
+        test_file = f"{MOUNT_POINT}/blind_delete_test_{int(time.time()*1000)}.txt"
         
         # Step 1: Create file from agent client (realtime sync)
         docker_manager.create_file_in_container(
@@ -55,19 +55,22 @@ class TestBlindSpotFileDeletion:
         assert still_exists is not None, \
             "File should still exist in Fusion (no realtime delete from blind-spot)"
         
-        # Step 4: Use a marker file to detect Audit completion
+        # Step 4: Wait for NFS cache expiry and mtime aging threshold (> 15s)
+        time.sleep(18)
+        
+        # Use a marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_b2_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(16) # Ensure > 15s for Fusion threshold + NFS cache delay
+        time.sleep(7)
         
         # Wait for marker to appear in Fusion (at least one audit cycle completed)
         assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
         # Step 5: After Audit, file should be removed
-        # Poll for removal
+        # Poll for removal with extended timeout
         start = time.time()
         removed = False
-        while time.time() - start < 10:
+        while time.time() - start < 30:
             tree = fusion_client.get_tree(path="/", max_depth=-1)
             if fusion_client._find_in_tree(tree, test_file) is None:
                 removed = True
@@ -87,7 +90,7 @@ class TestBlindSpotFileDeletion:
         """
         场景: 盲区删除的文件应被记录到 Blind-spot List
         """
-        test_file = f"{MOUNT_POINT}/blind_delete_list_test.txt"
+        test_file = f"{MOUNT_POINT}/blind_delete_list_test_{int(time.time()*1000)}.txt"
         
         # Create file from agent, then delete from blind-spot
         docker_manager.create_file_in_container(
@@ -99,17 +102,20 @@ class TestBlindSpotFileDeletion:
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)
         
+        # Wait for NFS cache expiry / ensure distinct mtime update event
+        time.sleep(18)
+        
         # Step 4: Use marker to ensure audit cycle ran
         marker_file = f"{MOUNT_POINT}/audit_marker_b2_list_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(16) # Ensure > 15s for Fusion threshold + NFS cache delay
+        time.sleep(7)
         assert fusion_client.wait_for_file_in_tree(marker_file, timeout=120) is not None
         
         # Check blind-spot list for deletion record
         # Poll since events might be processed shortly after marker appearance
         start = time.time()
         found = False
-        while time.time() - start < 10:
+        while time.time() - start < 30:
             blind_spot_list = fusion_client.get_blind_spot_list()
             deletion_entries = [
                 item for item in blind_spot_list

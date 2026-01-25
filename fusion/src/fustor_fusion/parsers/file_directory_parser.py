@@ -7,6 +7,7 @@ from collections import deque
 from pathlib import Path
 
 from fustor_event_model.models import MessageSource
+from ..config import fusion_config
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +106,9 @@ class DirectoryStructureParser:
     Implements Smart Merge logic for consistency arbitration.
     """
     
-    # Hot file threshold: files modified within this window are marked as suspect
-    HOT_FILE_THRESHOLD_SECONDS = 600  # 10 minutes
+    @property
+    def hot_file_threshold(self) -> int:
+        return fusion_config.FUSTOR_FUSION_SUSPECT_TTL_SECONDS
     
     def __init__(self, datastore_id: int):
         self.datastore_id = datastore_id
@@ -335,12 +337,16 @@ class DirectoryStructureParser:
                             continue
                         
                         # Rule 2: Mtime check - skip if existing data is newer
+                        # EXCEPTION: If it's an audit event with audit_skipped=True, we MUST process it
+                        # to record the skip state, even if mtime is the same.
                         existing = self._get_node(path)
                         old_mtime = None
+                        is_audit_skip = is_audit and payload.get('audit_skipped') is True
+                        
                         if existing:
                             old_mtime = existing.modified_time
-                            self.logger.info(f"Arbitration CHECK {path}: source={message_source} incoming_mtime={mtime} existing_mtime={old_mtime}")
-                            if old_mtime is not None and mtime is not None and old_mtime >= mtime:
+                            self.logger.info(f"Arbitration CHECK {path}: source={message_source} incoming_mtime={mtime} existing_mtime={old_mtime} is_skip={is_audit_skip}")
+                            if not is_audit_skip and old_mtime is not None and mtime is not None and old_mtime >= mtime:
                                 self.logger.debug(f"Skipping {path}: existing mtime {old_mtime} >= incoming {mtime}")
                                 continue
                         
@@ -366,13 +372,11 @@ class DirectoryStructureParser:
                         node = self._get_node(path)
                         if node:
                             # Mark as suspect if hot file
-                            if (now - mtime) < self.HOT_FILE_THRESHOLD_SECONDS:
+                            if (now - mtime) < self.hot_file_threshold:
                                 node.integrity_suspect = True
-                                self._suspect_list[path] = now + self.HOT_FILE_THRESHOLD_SECONDS
+                                self._suspect_list[path] = now + self.hot_file_threshold
                             
                             # Mark as blind-spot file if from audit AND (it's new OR mtime changed)
-                            # If mtime > existing.mtime, it means a modification occurred that 
-                            # wasn't reported via Realtime.
                             if is_audit:
                                 if existing is None:
                                     self.logger.info(f"Audit ADDED NEW file {path}, marking agent_missing=True")
@@ -380,6 +384,9 @@ class DirectoryStructureParser:
                                 elif old_mtime is not None and mtime > old_mtime:
                                     self.logger.info(f"Audit UPDATED file {path} (mtime {old_mtime} -> {mtime}), marking agent_missing=True")
                                     node.agent_missing = True
+                                else:
+                                    self.logger.info(f"Audit SEE EXISTING file {path}, keeping node")
+                                    node.agent_missing = True # Ensure it stays in blind-spot list if seen in audit
                             
         return True
     
@@ -440,6 +447,7 @@ class DirectoryStructureParser:
                 paths_to_delete = []
                 
                 for missing_path in missing_in_audit:
+                    self.logger.info(f"Checking potential missing file: {missing_path}")
                     # Skip files in Tombstone (already marked as deleted by realtime)
                     if missing_path in self._tombstone_list:
                         continue
@@ -501,9 +509,13 @@ class DirectoryStructureParser:
     def _cleanup_expired_suspects_unlocked(self):
         """Clean up expired suspects and their flags. Must be called with lock held."""
         now = time.time()
+        if self._suspect_list:
+             self.logger.info(f"Suspect cleanup check: now={now} count={len(self._suspect_list)} items={self._suspect_list}")
+        
         expired_paths = [path for path, ts in self._suspect_list.items() if ts <= now]
         
         for path in expired_paths:
+            self.logger.info(f"Suspect EXPIRED: {path} (expired at {self._suspect_list[path]})")
             del self._suspect_list[path]
             node = self._get_node(path)
             if node:
@@ -525,12 +537,12 @@ class DirectoryStructureParser:
             if node:
                 node.modified_time = new_mtime
                 # If file is now cold, remove from suspect list
-                if (now - new_mtime) >= self.HOT_FILE_THRESHOLD_SECONDS:
+                if (now - new_mtime) >= self.hot_file_threshold:
                     node.integrity_suspect = False
                     self._suspect_list.pop(path, None)
                 else:
                     # Still hot, extend suspect window
-                    self._suspect_list[path] = now + self.HOT_FILE_THRESHOLD_SECONDS
+                    self._suspect_list[path] = now + self.hot_file_threshold
 
 
     async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
