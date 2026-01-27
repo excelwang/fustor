@@ -9,6 +9,9 @@ from pathlib import Path
 from fustor_event_model.models import MessageSource
 from ..config import fusion_config
 
+# Import LogicalClock for hybrid time synchronization
+from fustor_common.logical_clock import LogicalClock
+
 logger = logging.getLogger(__name__)
 
 class DirectoryNode:
@@ -135,6 +138,9 @@ class DirectoryStructureParser:
         
         # Track blind-spot deletions for global indicator
         self._blind_spot_deletions: Set[str] = set()
+        
+        # Logical clock for hybrid time synchronization (hot file detection)
+        self._logical_clock = LogicalClock()
 
     def _check_cache_invalidation(self, path: str):
         """Simple placeholder for more complex logic"""
@@ -267,7 +273,10 @@ class DirectoryStructureParser:
         now = time.time()
         now_ms = now * 1000
         if event.index > 0:
-            self._last_event_latency = max(0, now_ms - event.index)
+            # Use logical clock for latency calculation to account for clock drift
+            # event.index is Agent's timestamp, _logical_clock reflects observed file times
+            logical_now_ms = self._logical_clock.hybrid_now() * 1000
+            self._last_event_latency = max(0, logical_now_ms - event.index)
         
         from fustor_event_model.models import EventType
         event_type = event.event_type
@@ -295,6 +304,10 @@ class DirectoryStructureParser:
                     
                 self._check_cache_invalidation(path)
                 mtime = payload.get('modified_time', 0.0)
+                
+                # Update logical clock with observed mtime for hybrid hot file detection
+                if mtime is not None:
+                    self._logical_clock.update(mtime)
                 
                 # Track paths seen during audit for missing file detection
                 if is_audit:
@@ -366,10 +379,14 @@ class DirectoryStructureParser:
                         # Update consistency flags
                         node = self._get_node(path)
                         if node:
-                            # Mark as suspect if hot file
-                            if (now - mtime) < self.hot_file_threshold:
+                            # Mark as suspect if hot file (using hybrid logical clock)
+                            # This eliminates clock drift issues between Agent and Fusion
+                            logical_now = self._logical_clock.hybrid_now()
+                            if (logical_now - mtime) < self.hot_file_threshold:
                                 node.integrity_suspect = True
-                                self._suspect_list[path] = now + self.hot_file_threshold
+                                # Suspect list expiry still uses physical clock
+                                # because we need real-world time elapsed for TTL
+                                self._suspect_list[path] = time.time() + self.hot_file_threshold
                             
                             # Mark as blind-spot file if from audit AND (it's new OR mtime changed)
                             if is_audit:
@@ -507,17 +524,20 @@ class DirectoryStructureParser:
     async def update_suspect(self, path: str, new_mtime: float):
         """Update a suspect file's mtime from Sentinel Sweep."""
         async with self._lock:
-            now = time.time()
+            # Update logical clock with observed mtime
+            self._logical_clock.update(new_mtime)
+            logical_now = self._logical_clock.hybrid_now()
+            
             node = self._get_node(path)
             if node:
                 node.modified_time = new_mtime
-                # If file is now cold, remove from suspect list
-                if (now - new_mtime) >= self.hot_file_threshold:
+                # If file is now cold (using logical clock), remove from suspect list
+                if (logical_now - new_mtime) >= self.hot_file_threshold:
                     node.integrity_suspect = False
                     self._suspect_list.pop(path, None)
                 else:
-                    # Still hot, extend suspect window
-                    self._suspect_list[path] = now + self.hot_file_threshold
+                    # Still hot, extend suspect window (expiry uses physical clock)
+                    self._suspect_list[path] = time.time() + self.hot_file_threshold
 
 
     async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
@@ -586,7 +606,9 @@ class DirectoryStructureParser:
                 "has_blind_spot": blind_spot_files > 0 or len(self._blind_spot_deletions) > 0,
                 "blind_spot_file_count": blind_spot_files,
                 "blind_spot_deletion_count": len(self._blind_spot_deletions),
-                "suspect_file_count": suspect_files
+                "suspect_file_count": suspect_files,
+                # Logical clock for consistent staleness calculation
+                "logical_now": self._logical_clock.hybrid_now()
             }
 
     async def reset(self):

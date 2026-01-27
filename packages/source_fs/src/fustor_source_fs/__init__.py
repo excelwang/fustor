@@ -21,6 +21,9 @@ from fustor_event_model.models import EventBase, UpdateEvent, DeleteEvent, Messa
 from .components import _WatchManager, safe_path_handling
 from .event_handler import OptimizedWatchEventHandler, get_file_metadata
 
+# Import LogicalClock for hybrid time synchronization
+from fustor_common.logical_clock import LogicalClock
+
 logger = logging.getLogger("fustor_agent.driver.fs")
             
 import threading
@@ -68,6 +71,9 @@ class FSDriver(SourceDriver):
         self._pre_scan_lock = threading.Lock()
         self._stop_driver_event = threading.Event() # NEW
         
+        # Logical clock for hybrid time synchronization
+        self._logical_clock = LogicalClock()
+        
         self._initialized = True
 
     def _perform_pre_scan_and_schedule(self):
@@ -105,6 +111,8 @@ class FSDriver(SourceDriver):
                     try:
                         stat_info = os.stat(file_path)
                         latest_mtime = max(latest_mtime, stat_info.st_mtime)
+                        # Update logical clock with observed mtime
+                        self._logical_clock.update(stat_info.st_mtime)
                     except (FileNotFoundError, PermissionError, OSError) as e:
                         error_count += 1
                         logger.debug(f"[fs] Error during pre-scan walk, skipping path: {e.filename} - {e.strerror}")
@@ -388,6 +396,8 @@ class FSDriver(SourceDriver):
                                 if metadata:
                                     metadata["parent_path"] = root
                                     metadata["parent_mtime"] = current_dir_mtime
+                                    # Update logical clock with observed mtime
+                                    self._logical_clock.update(metadata.get("modified_time", 0))
                                     batch.append(metadata)
                                     files_scanned += 1
                                     

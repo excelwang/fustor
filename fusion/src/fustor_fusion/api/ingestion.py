@@ -78,10 +78,12 @@ async def get_global_stats():
             if ds_latency > max_latency_ms:
                 max_latency_ms = ds_latency
 
-            # 3. Staleness (Oldest Directory)
+            # 3. Staleness (Oldest Directory) - use logical clock for accuracy
             oldest = stats.get("oldest_directory")
             if oldest and oldest.get("timestamp"):
-                age_seconds = now - oldest["timestamp"]
+                # Use logical_now from parser to eliminate clock drift
+                logical_now = stats.get("logical_now", now)
+                age_seconds = logical_now - oldest["timestamp"]
                 if age_seconds > max_staleness_seconds:
                     max_staleness_seconds = age_seconds
                     oldest_dir_info = {
