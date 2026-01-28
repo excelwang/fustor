@@ -19,13 +19,10 @@ class QueueBasedIngestor:
     
     async def initialize(self):
         """Initialize the queue-based ingestor."""
-        # Load queue state from file if it exists
-        await memory_event_queue.load_from_file()
-
-        # Start periodic file persistence (every 15 minutes)
-        await memory_event_queue.start_periodic_file_persistence(interval_seconds=900)
-
-        logger.info("Queue-based ingestor initialized")
+        # Clean initialization (state is ephemeral)
+        # No persistence loading needed as per design.
+        
+        logger.info("Queue-based ingestor initialized (Ephemeral Mode)")
 
     async def add_event(self, datastore_id: int, event: EventBase, task_id: Optional[str] = None) -> str:
         """
