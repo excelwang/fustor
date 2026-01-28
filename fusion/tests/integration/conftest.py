@@ -270,6 +270,27 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
     api_key = test_api_key["key"]
     datastore_id = test_datastore["id"]
     
+    # --- Clean Slate: Stop all agents first ---
+    logger.info("Cleaning up existing agents preventing stale leadership...")
+    for container in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]:
+        try:
+             # Just kill the process, don't worry about config yet
+             docker_manager.exec_in_container(container, ["pkill", "-f", "fustor-agent"])
+        except Exception:
+             pass # Ignore errors if not running
+
+    # Wait for Fusion sessions to expire (max 12s to safely cover 10s timeout)
+    logger.info("Waiting for stale sessions to expire (max 12s)...")
+    start_cleanup = time.time()
+    while time.time() - start_cleanup < 12:
+        sessions = fusion_client.get_sessions()
+        if not sessions:
+            logger.info("All sessions cleared.")
+            break
+        time.sleep(1)
+    else:
+        logger.warning(f"Some sessions still active after cleanup: {fusion_client.get_sessions()}")
+
     # Update agent configs in containers A and B
     # Start Agent A first
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_A}...")
@@ -346,3 +367,67 @@ def wait_for_audit():
     def _wait(seconds: int = AUDIT_INTERVAL + 5):
         time.sleep(seconds)
     return _wait
+
+@pytest.fixture
+def reset_leadership(fusion_client, setup_agents, docker_env):
+    """
+    Ensure Agent A is Leader and Agent B is Follower before test.
+    This effectively resets the cluster state if previous tests messed it up.
+    """
+    api_key = setup_agents["api_key"]
+    datastore_id = setup_agents["datastore_id"]
+    ensure_agent_running = setup_agents["ensure_agent_running"]
+    
+    # Check current state
+    sessions = fusion_client.get_sessions()
+    leader = next((s for s in sessions if s.get("role") == "leader"), None)
+    
+    is_clean = False
+    if leader and "agent-a" in leader.get("agent_id", ""):
+        # Agent A is leader. Check Agent B presence.
+        agent_b = next((s for s in sessions if "agent-b" in s.get("agent_id", "")), None)
+        if agent_b:
+            is_clean = True
+            
+    if is_clean:
+        logger.info("Cluster state is clean (A=Leader, B=Follower). Skipping reset.")
+        return
+
+    logger.warning("Cluster state dirty. Forcing leadership reset...")
+    
+    # Force reset: Stop everyone
+    for container in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B]:
+         try:
+             docker_manager.exec_in_container(container, ["pkill", "-f", "fustor-agent"])
+         except Exception:
+             pass
+
+    # Wait for sessions to vanish
+    logger.info("Waiting for stale sessions to expire...")
+    start_cleanup = time.time()
+    while time.time() - start_cleanup < 15:
+        if not fusion_client.get_sessions():
+            break
+        time.sleep(1)
+        
+    # Restart A first
+    logger.info("Restarting Agent A...")
+    ensure_agent_running(CONTAINER_CLIENT_A, api_key, datastore_id)
+    
+    # Wait for A to become Leader
+    logger.info("Waiting for Agent A to be Leader...")
+    start_wait = time.time()
+    while time.time() - start_wait < 30:
+        sessions = fusion_client.get_sessions()
+        leader = next((s for s in sessions if s.get("role") == "leader"), None)
+        if leader and "agent-a" in leader.get("agent_id", ""):
+            break
+        time.sleep(1)
+        
+    # Restart B
+    logger.info("Restarting Agent B...")
+    ensure_agent_running(CONTAINER_CLIENT_B, api_key, datastore_id)
+    
+    # Wait for B
+    time.sleep(5)
+    logger.info("Leadership reset complete.")

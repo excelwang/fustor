@@ -18,7 +18,8 @@ class TestLeaderFailover:
         self,
         docker_env,
         fusion_client,
-        setup_agents
+        setup_agents,
+        reset_leadership
     ):
         """
         场景:

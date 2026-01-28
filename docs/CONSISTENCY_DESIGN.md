@@ -229,7 +229,44 @@ else:
 
 ---
 
-## 6. 审计生命周期
+## 6. 混合时钟策略 (Hybrid Clock)
+
+为解决分布式环境中 Agent 与 Fusion 服务器之间的时钟漂移 (Clock Drift) 问题，系统引入了混合时钟机制。
+
+### 6.1 问题背景
+
+在 NFS 环境中，文件 `mtime` 由 NFS Server 生成，而 Fusion 的当前时间 `now` 由 Fusion Server 的物理时钟决定。这可能导致：
+- `now < mtime`: 新文件被误判为未来产生，导致 `staleness` 计算错误。
+- `now - mtime` 误差：导致热文件检测 (Hot File Detection) 不准确。
+
+### 6.2 逻辑时钟 (Logical Clock)
+
+Fusion 维护一个单调递增的逻辑时钟 `L`。
+- **更新规则**：每次收到文件事件（包含 `mtime`）时，更新 `L = max(L, mtime)`。
+- **持久化**：内存维护，重启重置。
+
+### 6.3 混合时间 (Hybrid Now)
+
+定义混合当前时间 `H` 为物理时钟与逻辑时钟的最大值：
+
+```python
+hybrid_now = max(time.time(), logical_clock.value)
+```
+
+### 6.4 应用场景
+
+| 场景 | 使用时间源 | 逻辑 |
+|------|------------|------|
+| **热文件检测** | `Hybrid Now` | `if (hybrid_now - mtime) < threshold: mark_suspect()` |
+| **时效性指标** | `Hybrid Now` | `staleness = hybrid_now - oldest_unprocessed_mtime` |
+| **Session 超时** | `Physical Time` | `time.time() - last_heartbeat > timeout` |
+| **Suspect TTL** | `Physical Time` | `expiry = time.time() + ttl` |
+
+> **设计原则**：涉及与 `mtime` 进行**绝对时间点比较**的逻辑使用 `Hybrid Now`；涉及**时间段 (Duration)** 测量的逻辑使用 `Physical Time`。
+
+---
+
+## 7. 审计生命周期
 
 为支持 Tombstone 的精确清理，Agent 需发送生命周期信号：
 
@@ -240,7 +277,7 @@ else:
 
 ---
 
-## 7. 哨兵巡检 (Sentinel Sweep)
+## 8. 哨兵巡检 (Sentinel Sweep)
 
 - **触发者**：Leader Agent
 - **频率**：2 分钟/次
@@ -259,7 +296,7 @@ Fusion 收到 PUT 后仅更新 mtime，不执行移除。移除由 TTL 或 Realt
 
 ---
 
-## 8. API 反馈
+## 9. API 反馈
 
 | 级别 | 条件 | 返回字段 |
 |------|------|----------|
@@ -268,7 +305,7 @@ Fusion 收到 PUT 后仅更新 mtime，不执行移除。移除由 TTL 或 Realt
 
 ---
 
-## 9. 扩展性要求
+## 10. 扩展性要求
 
 所有 Driver 和 Parser 必须支持 `message_source` 字段：
 

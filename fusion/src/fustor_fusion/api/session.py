@@ -205,8 +205,8 @@ async def list_sessions(
             "session_timeout_seconds": session_info.session_timeout_seconds
         }
         
-        # Check leader status
-        is_leader = await datastore_state_manager.is_locked_by_session(datastore_id, session_id)
+        # Check leader status - use is_leader instead of is_locked_by_session
+        is_leader = await datastore_state_manager.is_leader(datastore_id, session_id)
         session_data["role"] = "leader" if is_leader else "follower"
         session_data["can_snapshot"] = is_leader
         session_data["can_audit"] = is_leader

@@ -22,7 +22,8 @@ class TestNewLeaderResumesDuties:
         fusion_client,
         setup_agents,
         clean_shared_dir,
-        wait_for_audit
+        wait_for_audit,
+        reset_leadership
     ):
         """
         场景:
@@ -101,7 +102,8 @@ class TestNewLeaderResumesDuties:
         docker_env,
         fusion_client,
         setup_agents,
-        clean_shared_dir
+        clean_shared_dir,
+        reset_leadership
     ):
         """
         场景: 验证新 Leader 执行 Snapshot 初始同步
@@ -161,7 +163,8 @@ class TestNewLeaderResumesDuties:
         self,
         docker_env,
         fusion_client,
-        setup_agents
+        setup_agents,
+        reset_leadership
     ):
         """
         场景: 原 Leader 重新上线后，应该成为 Follower（不抢占）
