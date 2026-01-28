@@ -27,6 +27,8 @@ class EventBase(BaseModel):
         default=MessageSource.REALTIME,
         description="Source of the message: realtime, snapshot, audit"
     )
+    # Optional Session ID (injected by Ingestion API)
+    session_id: Optional[str] = Field(None, description="Session ID of the source agent")
 
 
 class InsertEvent(EventBase):

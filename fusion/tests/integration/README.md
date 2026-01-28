@@ -104,8 +104,24 @@ docker compose down -v
 | C3 | `test_c3_suspect_ttl_expiry.py` | 30 秒 TTL 后 Suspect 标记过期 |
 | C4 | `test_c4_realtime_removes_suspect.py` | Realtime 事件移除 Suspect 标记 |
 | C5 | `test_c5_sentinel_sweep.py` | Leader 哨兵巡检更新 Suspect mtime |
+| C6 | `test_c6_large_file_writing.py` | 正在写入的大文件持续标记为 Suspect |
+
+### F. API 可见性 (2 用例)
+
+| 用例 ID | 文件 | 描述 |
+|---------|------|------|
+| F1 | `test_f_api_suspect_visibility.py` | API 返回结果正确包含 `integrity_suspect` 标记 |
+| F2 | `test_f_api_suspect_visibility.py` | 文件稳定后 Suspect 标记自动清除 |
+  
+### G. 用户可见性 (盲区检测)
+
+| 用例 ID | 文件 | 描述 |
+|---------|------|------|
+| G1 | `test_g_user_blind_spot_visibility.py` | 未运行 Agent 的客户端新增文件能被 API 识别为 Blind Spot |
+| G2 | `test_g_user_blind_spot_visibility.py` | 未运行 Agent 的客户端删除文件能被识别 (Persisted List) |
 
 ### D. 墓碑防复活 (4 用例)
+
 
 | 用例 ID | 文件 | 描述 |
 |---------|------|------|

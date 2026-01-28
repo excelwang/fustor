@@ -137,7 +137,13 @@ class DirectoryStructureParser:
         self._audit_seen_paths: Set[str] = set()
         
         # Track blind-spot deletions for global indicator
+        self._suspect_list: Dict[str, float] = {}   # Path -> Expiry Timestamp
+        
+        # Blind-spot tracking
+        # Just a set of paths. Incremental maintenance (audit-seen/realtime removes).
+        # Reset ONLY when a new Agent Session connects.
         self._blind_spot_deletions: Set[str] = set()
+        self._current_session_id: Optional[str] = None
         
         # Logical clock for hybrid time synchronization (hot file detection)
         self._logical_clock = LogicalClock()
@@ -294,6 +300,19 @@ class DirectoryStructureParser:
             self._last_audit_start = event.index / 1000.0
             self.logger.info(f"Auto-detected Audit Start time: {self._last_audit_start} from event index {event.index}")
 
+        # NEW: Session Change Detection
+        # If we see a new session_id, it means a new Agent (or restarted Agent) is active.
+        # We should reset the Blind Spot List because a new Agent may eliminate the Blind Spot,
+        # so we can rebuild the list from scratch.
+        session_id = getattr(event, 'session_id', None)
+        if session_id and session_id != self._current_session_id:
+             if self._current_session_id is not None:
+                 self.logger.info(f"New Agent Session detected: {session_id} (was {self._current_session_id}). Resetting Blind Spot List.")
+                 self._blind_spot_deletions.clear()
+             else:
+                 self.logger.info(f"Initial Agent Session: {session_id}")
+             self._current_session_id = session_id
+
         self.logger.debug(f"Parser processing {len(event.rows)} rows from {message_source} (datastore {self.datastore_id})")
 
         async with self._lock:
@@ -312,6 +331,9 @@ class DirectoryStructureParser:
                 # Track paths seen during audit for missing file detection
                 if is_audit:
                     self._audit_seen_paths.add(path)
+                    # If file is seen in audit, it's definitely not deleted (or has reappeared).
+                    # Remove from blind-spot deletions list to handle "recoveries".
+                    self._blind_spot_deletions.discard(path)
                 
                 if event_type == EventType.DELETE:
                     if is_realtime:
@@ -319,10 +341,12 @@ class DirectoryStructureParser:
                         await self._process_delete_in_memory(path)
                         self._tombstone_list[path] = now
                         self._suspect_list.pop(path, None)
+                        self._blind_spot_deletions.discard(path)
                     else:
                         # Snapshot/Audit Delete: check Tombstone
                         if path not in self._tombstone_list:
                             await self._process_delete_in_memory(path)
+                            self._blind_spot_deletions.discard(path)
                             
                 elif event_type in [EventType.INSERT, EventType.UPDATE]:
                     if is_realtime:
@@ -330,6 +354,7 @@ class DirectoryStructureParser:
                         await self._process_create_update_in_memory(payload, path)
                         self._tombstone_list.pop(path, None)
                         self._suspect_list.pop(path, None)
+                        self._blind_spot_deletions.discard(path)
                         
                         # Update node flags
                         node = self._get_node(path)
@@ -420,8 +445,10 @@ class DirectoryStructureParser:
             # Clear paths seen tracker for missing file detection
             self._audit_seen_paths.clear()
             
-            # Clear blind-spot deletions list for the new cycle
-            self._blind_spot_deletions.clear()
+            # DO NOT clear blind-spot deletions list here.
+            # We want to persist deletions if subsequent audits skip the directory due to NFS caching.
+            # Deletions will be removed incrementally in process_event if the file is seen again.
+            # self._blind_spot_deletions.clear()
             
             self.logger.info(f"Audit started for datastore {self.datastore_id}, cleared blind-spot flags and deletions")
     

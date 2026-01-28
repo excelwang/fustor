@@ -77,6 +77,21 @@ async def signal_audit_end(
 
 from typing import Dict, Any, List
 
+@consistency_router.get("/blind-spots", summary="Get current blind-spot information")
+async def get_blind_spots(
+    datastore_id: int = Depends(get_datastore_id_from_api_key)
+) -> Dict[str, Any]:
+    """
+    Get list of files identified as blind-spots (agent_missing or detected deletions).
+    """
+    parser_manager = await get_cached_parser_manager(datastore_id)
+    parser = await parser_manager.get_file_directory_parser()
+    if not parser:
+        return {"error": "Parser not initialized"}
+        
+    return await parser.get_blind_spot_list()
+
+
 @consistency_router.get("/sentinel/tasks", summary="Get sentinel check tasks")
 async def get_sentinel_tasks(
     datastore_id: int = Depends(get_datastore_id_from_api_key)

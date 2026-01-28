@@ -105,6 +105,13 @@ class FusionClient:
                 return s
         return None
 
+    def get_blind_spots(self) -> dict:
+        """Get blind spot list."""
+        url = f"{self.base_url}/api/v1/ingest/consistency/blind-spots"
+        resp = self.session.get(url)
+        resp.raise_for_status()
+        return resp.json()
+
     # ============ Utility Methods ============
 
     def wait_for_file(

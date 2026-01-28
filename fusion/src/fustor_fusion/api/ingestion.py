@@ -201,6 +201,9 @@ async def ingest_event_batch(
                     fields=fields,
                     message_source=msg_source
                 )
+                # Attach session_id for downstream parsers (e.g. for blind-spot reset on new session)
+                event_obj.session_id = payload.session_id
+                
                 event_objects_to_add.append(event_obj)
 
                 if isinstance(index, int):

@@ -158,8 +158,13 @@ Fusion 维护以下状态：
 
 - **用途**：标记在无 Agent 客户端发生变更的文件
 - **来源**：Audit 发现的新增/删除，但不在 Tombstone 中且不是实时新增
-- **清空时机**：每轮 Audit 开始时清空
-- **API 标记**：`agent_missing: true`
+- **生命周期**：
+  - **持久化**：不随每次 Audit 清空，也不使用 TTL 自动过期（防止有效数据丢失）
+  - **清除**：
+    - 收到 Realtime Delete/Update 时移除相关条目
+    - Audit 再次看到文件时移除相关条目
+    - **Session 重置**：当检测到新的 Agent Session (如重启或Leader切换) 时，视为全量同步开始，清空整个列表
+- **API 标记**：`agent_missing: true` (新增), `/blind-spots` 列表 (删除)
 
 ---
 
@@ -216,15 +221,22 @@ else:  # 内存中无 X
         → 如果 (Now - X.mtime) < 10min: 加入 Suspect List
 ```
 
-#### 场景 2: Audit 报告"目录 D 缺少文件 B"
+#### 场景 2: Audit 报告"目录 D 缺少文件 B" (Blind Spot Deletion)
 
 ```
-if Audit.D.mtime < Memory.D.mtime:
-    → 忽略 (Audit 视图过旧，B 可能是后来创建的)
+if Parent D is Skipped in Audit (audit_skipped=True):
+    → 维持现状 (认为是 NFS 缓存导致的未扫描，保留之前的 Deletion 记录)
 
-else:
-    → 从内存树删除 B
-    → 加入 Blind-spot List (盲区删除)
+elif Parent D was Not Scanned:
+    → 忽略
+
+else (Full Scan on D):
+    if B in Memory Tree:
+        → 将 B 加入 Blind Spot Deletion List (记录发现时间)
+        → (注意：此时不立即从内存树删除，仅标记。直到收到明确的 Delete 事件或 Session Reset)
+
+    # 列表清理
+    # 仅在检测到文件恢复(Audit found) 或 实时事件(Realtime Delete/Update) 或 新 Session 时清理。
 ```
 
 ---
