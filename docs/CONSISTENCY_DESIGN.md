@@ -163,7 +163,7 @@ Fusion 维护以下状态：
   - **清除**：
     - 收到 Realtime Delete/Update 时移除相关条目
     - Audit 再次看到文件时移除相关条目
-    - **Session 重置**：当检测到新的 Agent Session (如重启或Leader切换) 时，视为全量同步开始，清空整个列表
+    - **Session 重置**：当检测到新的 Agent Session (如重启或Leader切换) 时，盲区可能会被重新发现，清空整个列表
 
 ---
 

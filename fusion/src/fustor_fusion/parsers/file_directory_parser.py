@@ -314,6 +314,9 @@ class DirectoryStructureParser:
                 path = payload.get('path') or payload.get('file_path')
                 if not path:
                     continue
+                
+                # Normalize path to match internal storage
+                path = path.rstrip('/') if path != '/' else '/'
                     
                 self._check_cache_invalidation(path)
                 mtime = payload.get('modified_time', 0.0)
@@ -457,7 +460,6 @@ class DirectoryStructureParser:
                  self.logger.info("Preserving audit_seen_paths due to Late Start.")
             else:
                  self._audit_seen_paths.clear()
-
             
             # DO NOT clear blind-spot deletions list here.
             # We want to persist deletions if subsequent audits skip the directory due to NFS caching.

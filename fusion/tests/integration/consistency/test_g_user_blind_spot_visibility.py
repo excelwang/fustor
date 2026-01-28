@@ -59,12 +59,12 @@ class TestBlindSpotVisibility:
         logger.info(f"Blind spots response: {blind_spots}")
         
         # Basic assertions
-        assert "agent_missing_files" in blind_spots
+        assert "additions" in blind_spots
         assert "deletion_count" in blind_spots
         
         # Find our file
         found = False
-        for f in blind_spots["agent_missing_files"]:
+        for f in blind_spots["additions"]:
             if f["path"] == file_path:
                 found = True
                 break
