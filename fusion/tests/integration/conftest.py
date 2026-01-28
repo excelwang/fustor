@@ -361,6 +361,19 @@ def clean_shared_dir(docker_env):
     yield
 
 
+@pytest.fixture(autouse=True)
+def reset_fusion_state(fusion_client):
+    """
+    Reset Fusion parser state before each test case to ensure isolation.
+    """
+    try:
+        fusion_client.reset()
+    except Exception as e:
+        # It's okay if it fails (e.g. datastore not yet created in first test)
+        logger.debug(f"Fusion reset skipped or failed: {e}")
+    yield
+
+
 @pytest.fixture
 def wait_for_audit():
     """Return a function that waits for audit cycle to complete."""

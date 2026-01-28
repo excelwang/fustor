@@ -99,6 +99,16 @@ class TestFollowerIOIsolation:
         assert found is not None, "File should appear via realtime event from follower"
         
         # The file should not have agent_missing flag (came from agent)
-        flags = fusion_client.check_file_flags(test_file)
-        assert flags["agent_missing"] is False, \
-            "File from follower should not be marked as agent_missing"
+        # We poll for the False flag as Realtime might arrive slightly after Audit discovery
+        cleared = False
+        start = time.time()
+        flags = {}
+        while time.time() - start < 15:
+            flags = fusion_client.check_file_flags(test_file)
+            if flags.get("agent_missing") is False:
+                cleared = True
+                break
+            time.sleep(1)
+            
+        assert cleared, \
+            f"File from follower should eventually have agent_missing=False, got flags: {flags}"

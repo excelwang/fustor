@@ -126,18 +126,15 @@ class DirectoryStructureParser:
         # Prevents deleted files from being resurrected by delayed Snapshot/Audit
         self._tombstone_list: Dict[str, float] = {}
         
-        # Suspect List: path -> suspect_until_timestamp
+        # Suspect List: path -> suspect_until_timestamp (physical time)
         # Marks files that might still be written to
         self._suspect_list: Dict[str, float] = {}
         
-        # Audit lifecycle
+        # Audit lifecycle (logical audit start timestamp)
         self._last_audit_start: Optional[float] = None
         
         # Paths seen during current audit cycle (for missing file detection)
         self._audit_seen_paths: Set[str] = set()
-        
-        # Track blind-spot deletions for global indicator
-        self._suspect_list: Dict[str, float] = {}   # Path -> Expiry Timestamp
         
         # Blind-spot tracking
         # Just a set of paths. Incremental maintenance (audit-seen/realtime removes).
@@ -145,7 +142,7 @@ class DirectoryStructureParser:
         self._blind_spot_deletions: Set[str] = set()
         self._current_session_id: Optional[str] = None
         
-        # Logical clock for hybrid time synchronization (hot file detection)
+        # Logical clock for hybrid time synchronization
         self._logical_clock = LogicalClock()
 
     def _check_cache_invalidation(self, path: str):
@@ -276,8 +273,6 @@ class DirectoryStructureParser:
         if not event.rows:
             return False
         
-        now = time.time()
-        now_ms = now * 1000
         if event.index > 0:
             # Use logical clock for latency calculation to account for clock drift
             # event.index is Agent's timestamp, _logical_clock reflects observed file times
@@ -297,8 +292,10 @@ class DirectoryStructureParser:
         
         # Auto-detect audit start time from the first audit event
         if is_audit and self._last_audit_start is None and event.index > 0:
-            self._last_audit_start = event.index / 1000.0
-            self.logger.info(f"Auto-detected Audit Start time: {self._last_audit_start} from event index {event.index}")
+            # Update logical clock with event index before using it
+            self._logical_clock.update(event.index / 1000.0)
+            self._last_audit_start = self._logical_clock.hybrid_now()
+            self.logger.info(f"Auto-detected Audit Start logical time: {self._last_audit_start} from event index {event.index}")
 
         # NEW: Session Change Detection
         # If we see a new session_id, it means a new Agent (or restarted Agent) is active.
@@ -324,7 +321,9 @@ class DirectoryStructureParser:
                 self._check_cache_invalidation(path)
                 mtime = payload.get('modified_time', 0.0)
                 
-                # Update logical clock with observed mtime for hybrid hot file detection
+                # Update logical clock with event index and mtime for hybrid synchronization
+                if event.index > 0:
+                    self._logical_clock.update(event.index / 1000.0)
                 if mtime is not None:
                     self._logical_clock.update(mtime)
                 
@@ -339,7 +338,10 @@ class DirectoryStructureParser:
                     if is_realtime:
                         # Realtime Delete: unconditionally delete + add to Tombstone
                         await self._process_delete_in_memory(path)
-                        self._tombstone_list[path] = now
+                        # Use logical clock for tombstone to ensure consistent arbitration
+                        ts = self._logical_clock.hybrid_now()
+                        self._tombstone_list[path] = ts
+                        self.logger.info(f"Tombstone CREATED for {path} at {ts}")
                         self._suspect_list.pop(path, None)
                         self._blind_spot_deletions.discard(path)
                     else:
@@ -366,7 +368,7 @@ class DirectoryStructureParser:
                         
                         # Rule 1: Tombstone check - skip resurrecting deleted files
                         if path in self._tombstone_list:
-                            self.logger.debug(f"Skipping {path}: in Tombstone list")
+                            self.logger.info(f"Arbitration SKIP {path}: matched Tombstone (ts={self._tombstone_list[path]}, cutoff={self._last_audit_start})")
                             continue
                         
                         # Rule 2: Mtime check - skip if existing data is newer
@@ -433,7 +435,8 @@ class DirectoryStructureParser:
         Per Section 4.4: Clear Blind-spot List at start of each audit.
         """
         async with self._lock:
-            self._last_audit_start = time.time()
+            # Use logical clock for audit start to stay synchronized with events
+            self._last_audit_start = self._logical_clock.hybrid_now()
             
             # Clear all agent_missing flags - they will be re-set during this audit
             for node in self._file_path_map.values():
@@ -465,11 +468,14 @@ class DirectoryStructureParser:
             # 1. Tombstone cleanup
             cutoff = self._last_audit_start
             before_count = len(self._tombstone_list)
+            old_tombstones = list(self._tombstone_list.keys())
             self._tombstone_list = {
                 path: ts for path, ts in self._tombstone_list.items()
-                if ts > cutoff
+                if ts >= cutoff
             }
             tombstones_cleaned = before_count - len(self._tombstone_list)
+            if tombstones_cleaned > 0:
+                self.logger.info(f"Tombstone CLEANUP: removed {tombstones_cleaned} items (cutoff={cutoff}). Kept {[p for p in old_tombstones if p in self._tombstone_list]}")
             
             # 2. Missing file detection (Section 5.3 Scenario 2)
             # Files in memory but NOT seen during audit = potentially deleted in blind-spot

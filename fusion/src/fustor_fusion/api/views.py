@@ -253,45 +253,29 @@ async def _process_audit_end_background(datastore_id: int):
 async def audit_end_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Dict[str, str]:
-    """Signal the end of an Audit cycle. Schedules Tombstone cleanup."""
-    logger.info(f"Audit end signal received for datastore {datastore_id}. Scheduling background processing.")
+    """Signal the end of an Audit cycle. Performs Tombstone cleanup and missing detection."""
+    logger.info(f"Audit end signal received for datastore {datastore_id}. Processing...")
     
-    # Schedule background task
-    asyncio.create_task(_process_audit_end_background(datastore_id))
+    await _process_audit_end_background(datastore_id)
     
-    return {"status": "accepted", "message": "Audit end processing scheduled"}
+    return {"status": "ok", "message": "Audit end processed"}
 
 
-@parser_router.get("/fs/blind-spot-list", 
-    summary="Get Blind-spot List",
+@parser_router.get("/fs/blind-spots", 
+    summary="Get Blind-spot Information",
     description="Returns files that exist on disk but were not reported by any Agent (Realtime/Snapshot)"
 )
-async def get_blind_spot_list_api(
+async def get_blind_spots_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> List[Dict[str, Any]]:
+) -> Dict[str, Any]:
     """
     Get the current Blind-spot List for this datastore.
     """
-    logger.info(f"API request for blind-spot list: datastore_id={datastore_id}")
+    logger.info(f"API request for blind-spots: datastore_id={datastore_id}")
     manager = await get_cached_parser_manager(datastore_id)
     parser = await manager.get_file_directory_parser()
-    blind_spot_data = await parser.get_blind_spot_list()
-    
-    # Format a unified list for the integration tests
-    result = []
-    
-    # Add files marked as agent_missing
-    for f in blind_spot_data.get("agent_missing_files", []):
-        f["type"] = "file"
-        result.append(f)
+    if not parser:
+        return {"error": "Parser not initialized"}
         
-    # Add blind-spot deletions
-    for path in blind_spot_data.get("deletions", []):
-        result.append({
-            "path": path,
-            "type": "deletion",
-            "content_type": "file"  # Assumption
-        })
-        
-    return result
+    return await parser.get_blind_spot_list()
 

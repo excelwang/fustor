@@ -58,6 +58,11 @@ class FusionClient:
         resp.raise_for_status()
         return resp.json()
 
+    def reset(self) -> None:
+        """Reset Fusion state for current datastore."""
+        resp = self.session.delete(f"{self.base_url}/api/v1/views/fs/reset")
+        resp.raise_for_status()
+
 
 
     # ============ Consistency API ============
@@ -83,12 +88,6 @@ class FusionClient:
         resp.raise_for_status()
         return resp.json()
 
-    def get_blind_spot_list(self) -> list[dict]:
-        """Get blind-spot list (files from clients without agents)."""
-        resp = self.session.get(f"{self.base_url}/api/v1/views/fs/blind-spot-list")
-        resp.raise_for_status()
-        return resp.json()
-
     # ============ Session API ============
 
     def get_sessions(self) -> list[dict]:
@@ -106,11 +105,35 @@ class FusionClient:
         return None
 
     def get_blind_spots(self) -> dict:
-        """Get blind spot list."""
-        url = f"{self.base_url}/api/v1/ingest/consistency/blind-spots"
-        resp = self.session.get(url)
+        """Get the full blind-spot information as a dictionary."""
+        resp = self.session.get(f"{self.base_url}/api/v1/views/fs/blind-spots")
         resp.raise_for_status()
         return resp.json()
+
+    def get_blind_spot_list(self) -> list[dict]:
+        """
+        Get blind-spot list as a list of dictionaries (for compatibility with existing tests).
+        Returns a unified list of files and deletions.
+        """
+        data = self.get_blind_spots()
+        result = []
+        
+        # Add files marked as agent_missing
+        for f in data.get("agent_missing_files", []):
+            # To match the previous list format, we can add a type field if needed
+            # but usually the tests look for 'path' in the dictionaries.
+            f["type"] = "file"
+            result.append(f)
+            
+        # Add deletions
+        for path in data.get("deletions", []):
+            result.append({
+                "path": path,
+                "type": "deletion",
+                "content_type": "file" # Assumption for FS view
+            })
+            
+        return result
 
     # ============ Utility Methods ============
 
