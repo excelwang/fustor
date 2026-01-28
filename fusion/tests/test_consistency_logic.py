@@ -63,8 +63,8 @@ async def test_audit_sentinel_logic():
     
     node = parser._get_node("/test/audit_file")
     assert node.size == 500
-    # Audit events mark files as agent_missing=True
-    assert node.agent_missing == True
+    # Audit events mark files as blind-spot additions
+    assert node.path in parser._blind_spot_additions
     
     # 3. Sentinel Suspect List
     # Check if hot file is in suspect list
@@ -145,7 +145,7 @@ async def test_parent_mtime_check():
     # File SHOULD be added
     valid_file_node = parser._get_node("/data/valid_file.txt")
     assert valid_file_node is not None, "File should be added when parent_mtime is current"
-    assert valid_file_node.agent_missing == True  # New file from Audit = blind-spot
+    assert valid_file_node.path in parser._blind_spot_additions  # New file from Audit = blind-spot
 
 @pytest.mark.asyncio
 async def test_audit_missing_file_detection():
