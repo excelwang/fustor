@@ -25,7 +25,6 @@ class DirectoryNode:
         self.children: Dict[str, Any] = {} # Can contain DirectoryNode or FileNode
         # Consistency flags
         self.integrity_suspect: bool = False
-        self.agent_missing: bool = False
         self.audit_skipped: bool = False  # Temporary flag for missing file detection
 
     def to_dict(self, recursive=True, max_depth=None, only_path=False):
@@ -43,8 +42,7 @@ class DirectoryNode:
                 'created_time': self.created_time,
                 'mtime': self.modified_time,  # Alias for compatibility
                 'ctime': self.created_time,   # Alias for compatibility
-                'integrity_suspect': self.integrity_suspect,
-                'agent_missing': self.agent_missing
+                'integrity_suspect': self.integrity_suspect
             })
 
         # Base case for recursion depth
@@ -80,7 +78,6 @@ class FileNode:
         self.created_time = created_time
         # Consistency flags
         self.integrity_suspect: bool = False
-        self.agent_missing: bool = False
 
     def to_dict(self, recursive=True, max_depth=None, only_path=False):
         """Converts the file node to a dictionary representation."""
@@ -96,8 +93,7 @@ class FileNode:
                 'created_time': self.created_time,
                 'mtime': self.modified_time,  # Alias for compatibility
                 'ctime': self.created_time,   # Alias for compatibility
-                'integrity_suspect': self.integrity_suspect,
-                'agent_missing': self.agent_missing
+                'integrity_suspect': self.integrity_suspect
             })
         return result
 
@@ -140,6 +136,7 @@ class DirectoryStructureParser:
         # Just a set of paths. Incremental maintenance (audit-seen/realtime removes).
         # Reset ONLY when a new Agent Session connects.
         self._blind_spot_deletions: Set[str] = set()
+        self._blind_spot_additions: Set[str] = set()
         self._current_session_id: Optional[str] = None
         
         # Logical clock for hybrid time synchronization
@@ -265,169 +262,172 @@ class DirectoryStructureParser:
         2. Snapshot/Audit events are filtered:
            - Tombstone check: skip if file was deleted by Realtime
            - Mtime check: skip if existing data is newer
-        3. For audit events, files from blind-spot are marked with agent_missing=True
         """
         if event.table == "initial_trigger":
             return True
 
-        if not event.rows:
-            return False
-        
-        if event.index > 0:
-            # Use logical clock for latency calculation to account for clock drift
-            # event.index is Agent's timestamp, _logical_clock reflects observed file times
-            logical_now_ms = self._logical_clock.hybrid_now() * 1000
-            self._last_event_latency = max(0, logical_now_ms - event.index)
-        
-        from fustor_event_model.models import EventType
-        event_type = event.event_type
-        
-        # Get message source (default to REALTIME for backward compatibility)
-        message_source = getattr(event, 'message_source', MessageSource.REALTIME)
-        if isinstance(message_source, str):
-            message_source = MessageSource(message_source)
-        
-        is_realtime = (message_source == MessageSource.REALTIME)
-        is_audit = (message_source == MessageSource.AUDIT)
-        
-        # Auto-detect audit start time from the first audit event
-        if is_audit and self._last_audit_start is None and event.index > 0:
-            # Update logical clock with event index before using it
-            self._logical_clock.update(event.index / 1000.0)
-            self._last_audit_start = self._logical_clock.hybrid_now()
-            self.logger.info(f"Auto-detected Audit Start logical time: {self._last_audit_start} from event index {event.index}")
-
-        # NEW: Session Change Detection
-        # If we see a new session_id, it means a new Agent (or restarted Agent) is active.
-        # We should reset the Blind Spot List because a new Agent may eliminate the Blind Spot,
-        # so we can rebuild the list from scratch.
-        session_id = getattr(event, 'session_id', None)
-        if session_id and session_id != self._current_session_id:
-             if self._current_session_id is not None:
-                 self.logger.info(f"New Agent Session detected: {session_id} (was {self._current_session_id}). Resetting Blind Spot List.")
-                 self._blind_spot_deletions.clear()
-             else:
-                 self.logger.info(f"Initial Agent Session: {session_id}")
-             self._current_session_id = session_id
-
-        self.logger.debug(f"Parser processing {len(event.rows)} rows from {message_source} (datastore {self.datastore_id})")
-
         async with self._lock:
-            for payload in event.rows:
-                path = payload.get('path') or payload.get('file_path')
-                if not path:
-                    continue
+            if not event.rows:
+                return False
+        
+            if event.index > 0:
+                # Use logical clock for latency calculation to account for clock drift
+                # event.index is Agent's timestamp, _logical_clock reflects observed file times
+                logical_now_ms = self._logical_clock.hybrid_now() * 1000
+                self._last_event_latency = max(0, logical_now_ms - event.index)
+            
+            from fustor_event_model.models import EventType
+            event_type = event.event_type
+            
+            # Get message source (default to REALTIME for backward compatibility)
+            message_source = getattr(event, 'message_source', MessageSource.REALTIME)
+            if isinstance(message_source, str):
+                message_source = MessageSource(message_source)
+            
+            is_realtime = (message_source == MessageSource.REALTIME)
+            is_audit = (message_source == MessageSource.AUDIT)
+            
+            # Auto-detect audit start time from the first audit event
+            if is_audit and self._last_audit_start is None and event.index > 0:
+                # Update logical clock with event index before using it
+                self._logical_clock.update(event.index / 1000.0)
+                self._last_audit_start = self._logical_clock.hybrid_now()
+                self.logger.info(f"Auto-detected Audit Start logical time: {self._last_audit_start} from event index {event.index}")
+    
+            # NEW: Session Change Detection
+            # If we see a new session_id, it means a new Agent (or restarted Agent) is active.
+            # We should reset the Blind Spot List because a new Agent may eliminate the Blind Spot,
+            # so we can rebuild the list from scratch.
+            session_id = getattr(event, 'session_id', None)
+            if session_id and session_id != self._current_session_id:
+                 if self._current_session_id is not None:
+                     self.logger.info(f"New Agent Session detected: {session_id} (was {self._current_session_id}). Resetting Blind Spot List.")
+                     self._blind_spot_deletions.clear()
+                     self._blind_spot_additions.clear()
+                 else:
+                     self.logger.info(f"Initial Agent Session: {session_id}")
+                 self._current_session_id = session_id
+    
+            self.logger.debug(f"Parser processing {len(event.rows)} rows from {message_source} (datastore {self.datastore_id})")
+    
+            async with self._lock:
+                for payload in event.rows:
+                    path = payload.get('path') or payload.get('file_path')
+                    if not path:
+                        continue
+                        
+                    self._check_cache_invalidation(path)
+                    mtime = payload.get('modified_time', 0.0)
                     
-                self._check_cache_invalidation(path)
-                mtime = payload.get('modified_time', 0.0)
-                
-                # Update logical clock with event index and mtime for hybrid synchronization
-                if event.index > 0:
-                    self._logical_clock.update(event.index / 1000.0)
-                if mtime is not None:
-                    self._logical_clock.update(mtime)
-                
-                # Track paths seen during audit for missing file detection
-                if is_audit:
-                    self._audit_seen_paths.add(path)
-                    # If file is seen in audit, it's definitely not deleted (or has reappeared).
-                    # Remove from blind-spot deletions list to handle "recoveries".
-                    self._blind_spot_deletions.discard(path)
-                
-                if event_type == EventType.DELETE:
-                    if is_realtime:
-                        # Realtime Delete: unconditionally delete + add to Tombstone
-                        await self._process_delete_in_memory(path)
-                        # Use logical clock for tombstone to ensure consistent arbitration
-                        ts = self._logical_clock.hybrid_now()
-                        self._tombstone_list[path] = ts
-                        self.logger.info(f"Tombstone CREATED for {path} at {ts}")
-                        self._suspect_list.pop(path, None)
+                    # Update logical clock with event index and mtime for hybrid synchronization
+                    if event.index > 0:
+                        self._logical_clock.update(event.index / 1000.0)
+                    if mtime is not None:
+                        self._logical_clock.update(mtime)
+                    
+                    # Track paths seen during audit for missing file detection
+                    if is_audit:
+                        self._audit_seen_paths.add(path)
+                        # If file is seen in audit, it's definitely not deleted (or has reappeared).
+                        # Remove from blind-spot deletions list to handle "recoveries".
                         self._blind_spot_deletions.discard(path)
-                    else:
-                        # Snapshot/Audit Delete: check Tombstone
-                        if path not in self._tombstone_list:
+                    
+                    if event_type == EventType.DELETE:
+                        if is_realtime:
+                            # Realtime Delete: unconditionally delete + add to Tombstone
                             await self._process_delete_in_memory(path)
+                            # Use logical clock for tombstone to ensure consistent arbitration
+                            ts = self._logical_clock.hybrid_now()
+                            self._tombstone_list[path] = ts
+                            self.logger.info(f"Tombstone CREATED for {path} at {ts}")
+                            self._suspect_list.pop(path, None)
                             self._blind_spot_deletions.discard(path)
+                            self._blind_spot_additions.discard(path)
+                        else:
+                            # Snapshot/Audit Delete: check Tombstone
+                            if path not in self._tombstone_list:
+                                await self._process_delete_in_memory(path)
+                                self._blind_spot_deletions.discard(path)
+                                self._blind_spot_additions.discard(path)
+                                
+                    elif event_type in [EventType.INSERT, EventType.UPDATE]:
+                        if is_realtime:
+                            # Realtime Update: unconditionally update + remove from Tombstone
+                            await self._process_create_update_in_memory(payload, path)
+                            self._tombstone_list.pop(path, None)
+                            self._suspect_list.pop(path, None)
+                            self._blind_spot_deletions.discard(path)
+                            self._blind_spot_additions.discard(path)
                             
-                elif event_type in [EventType.INSERT, EventType.UPDATE]:
-                    if is_realtime:
-                        # Realtime Update: unconditionally update + remove from Tombstone
-                        await self._process_create_update_in_memory(payload, path)
-                        self._tombstone_list.pop(path, None)
-                        self._suspect_list.pop(path, None)
-                        self._blind_spot_deletions.discard(path)
-                        
-                        # Update node flags
-                        node = self._get_node(path)
-                        if node:
-                            node.integrity_suspect = False
-                            node.agent_missing = False
-                    else:
-                        # Snapshot/Audit: apply arbitration
-                        
-                        # Rule 1: Tombstone check - skip resurrecting deleted files
-                        if path in self._tombstone_list:
-                            self.logger.info(f"Arbitration SKIP {path}: matched Tombstone (ts={self._tombstone_list[path]}, cutoff={self._last_audit_start})")
-                            continue
-                        
-                        # Rule 2: Mtime check - skip if existing data is newer
-                        # EXCEPTION: If it's an audit event with audit_skipped=True, we MUST process it
-                        # to record the skip state, even if mtime is the same.
-                        existing = self._get_node(path)
-                        old_mtime = None
-                        is_audit_skip = is_audit and payload.get('audit_skipped') is True
-                        
-                        if existing:
-                            old_mtime = existing.modified_time
-                            self.logger.info(f"Arbitration CHECK {path}: source={message_source} incoming_mtime={mtime} existing_mtime={old_mtime} is_skip={is_audit_skip}")
-                            if not is_audit_skip and old_mtime is not None and mtime is not None and old_mtime >= mtime:
-                                self.logger.debug(f"Skipping {path}: existing mtime {old_mtime} >= incoming {mtime}")
+                            # Update node flags
+                            node = self._get_node(path)
+                            if node:
+                                node.integrity_suspect = False
+                        else:
+                            # Snapshot/Audit: apply arbitration
+                            
+                            # Rule 1: Tombstone check - skip resurrecting deleted files
+                            if path in self._tombstone_list:
+                                self.logger.info(f"Arbitration SKIP {path}: matched Tombstone (ts={self._tombstone_list[path]}, cutoff={self._last_audit_start})")
                                 continue
-                        
-                        # Rule 3 (Audit only): Parent Mtime Check - Section 5.3 of CONSISTENCY_DESIGN
-                        # If file is NEW (not in memory tree) and parent mtime from audit is older
-                        # than our memory's parent mtime, discard (parent was updated after audit scan)
-                        if is_audit and existing is None:
-                            parent_path = payload.get('parent_path')
-                            parent_mtime_from_audit = payload.get('parent_mtime')
                             
-                            memory_parent = self._directory_path_map.get(parent_path)
-                            if memory_parent and memory_parent.modified_time is not None and parent_mtime_from_audit is not None and memory_parent.modified_time > parent_mtime_from_audit:
-                                self.logger.warning(
-                                    f"Arbitration SKIP {path}: parent {parent_path} mtime in memory "
-                                    f"({memory_parent.modified_time}) > audit ({parent_mtime_from_audit})"
-                                )
-                                continue
-                        
-                        # Apply the update
-                        await self._process_create_update_in_memory(payload, path)
-                        
-                        # Update consistency flags
-                        node = self._get_node(path)
-                        if node:
-                            # Mark as suspect if hot file (using hybrid logical clock)
-                            # This eliminates clock drift issues between Agent and Fusion
-                            logical_now = self._logical_clock.hybrid_now()
-                            if (logical_now - mtime) < self.hot_file_threshold:
-                                node.integrity_suspect = True
-                                # Suspect list expiry still uses physical clock
-                                # because we need real-world time elapsed for TTL
-                                self._suspect_list[path] = time.time() + self.hot_file_threshold
+                            # Rule 2: Mtime check - skip if existing data is newer
+                            # EXCEPTION: If it's an audit event with audit_skipped=True, we MUST process it
+                            # to record the skip state, even if mtime is the same.
+                            existing = self._get_node(path)
+                            old_mtime = None
+                            is_audit_skip = is_audit and payload.get('audit_skipped') is True
                             
-                            # Mark as blind-spot file if from audit AND (it's new OR mtime changed)
-                            if is_audit:
-                                if existing is None:
-                                    self.logger.info(f"Audit ADDED NEW file {path}, marking agent_missing=True")
-                                    node.agent_missing = True
-                                elif old_mtime is not None and mtime > old_mtime:
-                                    self.logger.info(f"Audit UPDATED file {path} (mtime {old_mtime} -> {mtime}), marking agent_missing=True")
-                                    node.agent_missing = True
-                                else:
-                                    self.logger.info(f"Audit SEE EXISTING file {path}, keeping node")
-                                    node.agent_missing = True # Ensure it stays in blind-spot list if seen in audit
+                            if existing:
+                                old_mtime = existing.modified_time
+                                self.logger.info(f"Arbitration CHECK {path}: source={message_source} incoming_mtime={mtime} existing_mtime={old_mtime} is_skip={is_audit_skip}")
+                                if not is_audit_skip and old_mtime is not None and mtime is not None and old_mtime >= mtime:
+                                    self.logger.debug(f"Skipping {path}: existing mtime {old_mtime} >= incoming {mtime}")
+                                    continue
                             
-        return True
+                            # Rule 3 (Audit only): Parent Mtime Check - Section 5.3 of CONSISTENCY_DESIGN
+                            # If file is NEW (not in memory tree) and parent mtime from audit is older
+                            # than our memory's parent mtime, discard (parent was updated after audit scan)
+                            if is_audit and existing is None:
+                                parent_path = payload.get('parent_path')
+                                parent_mtime_from_audit = payload.get('parent_mtime')
+                                
+                                memory_parent = self._directory_path_map.get(parent_path)
+                                if memory_parent and memory_parent.modified_time is not None and parent_mtime_from_audit is not None and memory_parent.modified_time > parent_mtime_from_audit:
+                                    self.logger.warning(
+                                        f"Arbitration SKIP {path}: parent {parent_path} mtime in memory "
+                                        f"({memory_parent.modified_time}) > audit ({parent_mtime_from_audit})"
+                                    )
+                                    continue
+                            
+                            # Apply the update
+                            await self._process_create_update_in_memory(payload, path)
+                            
+                            # Update consistency flags
+                            node = self._get_node(path)
+                            if node:
+                                # Mark as suspect if hot file (using hybrid logical clock)
+                                # This eliminates clock drift issues between Agent and Fusion
+                                logical_now = self._logical_clock.hybrid_now()
+                                if (logical_now - mtime) < self.hot_file_threshold:
+                                    node.integrity_suspect = True
+                                    # Suspect list expiry still uses physical clock
+                                    # because we need real-world time elapsed for TTL
+                                    self._suspect_list[path] = time.time() + self.hot_file_threshold
+                                
+                                # Mark as blind-spot file if from audit AND (it's new OR mtime changed)
+                                if is_audit:
+                                    if existing is None:
+                                        self.logger.info(f"Audit ADDED NEW file {path}, marking as blind spot")
+                                        self._blind_spot_additions.add(path)
+                                    elif old_mtime is not None and mtime > old_mtime:
+                                        self.logger.info(f"Audit UPDATED file {path} (mtime {old_mtime} -> {mtime}), marking as blind spot")
+                                        self._blind_spot_additions.add(path)
+                                    else:
+                                        self.logger.info(f"Audit SEE EXISTING file {path}, keeping node")
+                                        self._blind_spot_additions.add(path)
+                                
+            return True
     
     async def handle_audit_start(self):
         """
@@ -435,25 +435,37 @@ class DirectoryStructureParser:
         Per Section 4.4: Clear Blind-spot List at start of each audit.
         """
         async with self._lock:
-            # Use logical clock for audit start to stay synchronized with events
-            self._last_audit_start = self._logical_clock.hybrid_now()
+            # Check if we are already in the middle of this audit (via auto-detection from process_event)
+            # If so, do NOT clear flags for files already seen.
+            now = self._logical_clock.hybrid_now()
+            is_late_start = False
             
-            # Clear all agent_missing flags - they will be re-set during this audit
-            for node in self._file_path_map.values():
-                node.agent_missing = False
-            for node in self._directory_path_map.values():
-                node.agent_missing = False
-                node.audit_skipped = False
+            # Using a 5-second window to detect race between first event and audit-start signal
+            if self._last_audit_start is not None and (now - self._last_audit_start) < 5.0 and self._audit_seen_paths:
+                self.logger.info(f"Audit Start signal received late (last_start={self._last_audit_start}, now={now}). Preserving observed flags.")
+                is_late_start = True
+            
+            # Use logical clock for audit start to stay synchronized with events
+            self._last_audit_start = now
+            
+            # Per Design Section 4.4: Blind-spot list persists across audits.
+            # Flags are only cleared by Realtime events.
+            # Audit events will re-confirm (set to True) or add new blind spots.
             
             # Clear paths seen tracker for missing file detection
-            self._audit_seen_paths.clear()
+            if is_late_start:
+                 # If late start, we preserve audit_seen_paths to avoid false positives in missing detection
+                 self.logger.info("Preserving audit_seen_paths due to Late Start.")
+            else:
+                 self._audit_seen_paths.clear()
+
             
             # DO NOT clear blind-spot deletions list here.
             # We want to persist deletions if subsequent audits skip the directory due to NFS caching.
             # Deletions will be removed incrementally in process_event if the file is seen again.
             # self._blind_spot_deletions.clear()
             
-            self.logger.info(f"Audit started for datastore {self.datastore_id}, cleared blind-spot flags and deletions")
+            self.logger.info(f"Audit started for datastore {self.datastore_id}. Flags preserved. late_start={is_late_start}")
     
     async def handle_audit_end(self):
         """
@@ -591,16 +603,31 @@ class DirectoryStructureParser:
     async def get_blind_spot_list(self) -> Dict[str, Any]:
         """Get the current Blind-spot List."""
         async with self._lock:
-            # Files with agent_missing flag
-            agent_missing_files = [
-                node.to_dict() for node in self._file_path_map.values() 
-                if node.agent_missing
-            ]
+            # Blind spot files - optimized lookup
+            # Iterate through our additions set, but cross-check with file map
+            # to ensure we don't return stale paths (e.g. if logic drifted)
+            agent_missing_files = []
+            
+            # Clean up stale entries while we iterate (lazy cleanup)
+            # This handles cases where _blind_spot_additions might get out of sync
+            # although our logic should prevent that.
+            stale_paths = []
+            
+            for path in self._blind_spot_additions:
+                node = self._file_path_map.get(path)
+                if node:
+                    agent_missing_files.append(node.to_dict())
+                else:
+                    # Node gone? Should have been removed.
+                    stale_paths.append(path)
+            
+            # Remove stale paths
+            for path in stale_paths:
+                self._blind_spot_additions.discard(path)
             
             return {
-                "datastore_id": self.datastore_id,
-                "agent_missing_count": len(agent_missing_files),
-                "agent_missing_files": agent_missing_files,
+                "additions_count": len(agent_missing_files),
+                "additions": agent_missing_files,
                 "deletion_count": len(self._blind_spot_deletions),
                 "deletions": list(self._blind_spot_deletions)
             }
@@ -626,8 +653,8 @@ class DirectoryStructureParser:
                     oldest_node = min(dirs, key=lambda x: x.modified_time)
                     oldest_dir = {"path": oldest_node.path, "timestamp": oldest_node.modified_time}
 
-            # Count files with agent_missing flag (Section 8: global level indicator)
-            blind_spot_files = sum(1 for node in self._file_path_map.values() if node.agent_missing)
+            # Count blind spot files (Section 8: global level indicator)
+            blind_spot_files = len(self._blind_spot_additions)
             suspect_files = sum(1 for node in self._file_path_map.values() if node.integrity_suspect)
 
             return {

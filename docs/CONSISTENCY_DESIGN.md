@@ -164,7 +164,6 @@ Fusion 维护以下状态：
     - 收到 Realtime Delete/Update 时移除相关条目
     - Audit 再次看到文件时移除相关条目
     - **Session 重置**：当检测到新的 Agent Session (如重启或Leader切换) 时，视为全量同步开始，清空整个列表
-- **API 标记**：`agent_missing: true` (新增), `/blind-spots` 列表 (删除)
 
 ---
 
@@ -312,8 +311,9 @@ Fusion 收到 PUT 后仅更新 mtime，不执行移除。移除由 TTL 或 Realt
 
 | 级别 | 条件 | 返回字段 |
 |------|------|----------|
-| 全局级 | Blind-spot List 非空 | `agent_missing: true` |
+| 全局级 | Blind-spot List 非空 | `has_blind_spot: true` (通过 `/fs/stats`) |
 | 文件级 | 文件在 Suspect List 中 | `integrity_suspect: true` |
+| 盲区查询 | 需获取详细盲区文件列表 | 使用 `/fs/blind-spots` API |
 
 ---
 

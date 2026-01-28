@@ -118,8 +118,8 @@ class FusionClient:
         data = self.get_blind_spots()
         result = []
         
-        # Add files marked as agent_missing
-        for f in data.get("agent_missing_files", []):
+        # Add files marked as blind spot additions
+        for f in data.get("additions", []):
             # To match the previous list format, we can add a type field if needed
             # but usually the tests look for 'path' in the dictionaries.
             f["type"] = "file"
@@ -190,10 +190,27 @@ class FusionClient:
 
     def check_file_flags(self, file_path: str) -> dict:
         """Check flag status of a file."""
-        tree = self.get_tree(path=file_path, max_depth=0)
+        # Check integrity_suspect from tree
+        try:
+            tree = self.get_tree(path=file_path, max_depth=0)
+            suspect = tree.get("integrity_suspect", False)
+        except requests.HTTPError:
+            suspect = False
+
+        # Check agent_missing from blind-spots API
+        # Note: This is less efficient but correct per new API design
+        blind_spots = self.get_blind_spots()
+        agent_missing = False
+        
+        # Check in additions list
+        for f in blind_spots.get("additions", []):
+            if f.get("path") == file_path:
+                agent_missing = True
+                break
+                
         return {
-            "agent_missing": tree.get("agent_missing", False),
-            "integrity_suspect": tree.get("integrity_suspect", False)
+            "agent_missing": agent_missing,
+            "integrity_suspect": suspect
         }
 
     def wait_for_flag(
