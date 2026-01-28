@@ -461,10 +461,11 @@ class DirectoryStructureParser:
             else:
                  self._audit_seen_paths.clear()
             
-            # DO NOT clear blind-spot deletions list here.
-            # We want to persist deletions if subsequent audits skip the directory due to NFS caching.
-            # Deletions will be removed incrementally in process_event if the file is seen again.
+            # DO NOT clear blind-spot lists here.
+            # We want to persist additions and deletions if subsequent audits skip the directory due to NFS caching.
+            # Additions and deletions will be removed incrementally in process_event if the file is seen again.
             # self._blind_spot_deletions.clear()
+            # self._blind_spot_additions.clear()
             
             self.logger.info(f"Audit started for datastore {self.datastore_id}. Flags preserved. late_start={is_late_start}")
     
@@ -472,7 +473,7 @@ class DirectoryStructureParser:
         """
         Called when an Audit cycle ends.
         1. Cleans up Tombstones created before this audit started.
-        2. Detects missing files (Section 5.3 Scenario 2).
+        2. Detects missing files (Section 5.3 Scenario 2) using optimized Scanned-Directory check.
         """
         async with self._lock:
             if self._last_audit_start is None:
@@ -490,50 +491,43 @@ class DirectoryStructureParser:
             if tombstones_cleaned > 0:
                 self.logger.info(f"Tombstone CLEANUP: removed {tombstones_cleaned} items (cutoff={cutoff}). Kept {[p for p in old_tombstones if p in self._tombstone_list]}")
             
-            # 2. Missing file detection (Section 5.3 Scenario 2)
-            # Files in memory but NOT seen during audit = potentially deleted in blind-spot
-            # Only check if we have audit seen paths (meaning audit actually ran)
+            # 2. Optimized Missing File Detection
+            # Instead of iterating ALL files to find what's missing (O(N)),
+            # we iterate only directories that were ACTIVELY SCANNED in this audit.
+            # If a directory was scanned (not skipped), any child in memory but not in audit is deleted.
             missing_detected = 0
-            if self._audit_seen_paths:
-                current_files = set(self._file_path_map.keys())
-                missing_in_audit = current_files - self._audit_seen_paths
-                
-                # Collect paths to delete (can't modify dict while iterating)
-                paths_to_delete = []
-                
-                for missing_path in missing_in_audit:
-                    self.logger.debug(f"Checking potential missing file: {missing_path}")
-                    # Skip files in Tombstone (already marked as deleted by realtime)
-                    if missing_path in self._tombstone_list:
-                        continue
-                    
-                    # Get parent directory to check mtime
-                    parent_path = os.path.dirname(missing_path)
-                    parent_node = self._directory_path_map.get(parent_path)
-                    
-                    # If parent was skipped in this audit, we can't conclude it's missing
-                    parent_skipped = getattr(parent_node, 'audit_skipped', False) if parent_node else False
+            paths_to_delete = []
 
-                    if parent_node and parent_skipped:
-                        self.logger.debug(f"Missing file {missing_path} ignored: parent {parent_path} was skipped in audit")
-                        continue
+            if self._audit_seen_paths:
+                # Iterate over all paths seen in this audit
+                # We are looking for DIRECTORIES that were fully scanned (not skipped)
+                for path in self._audit_seen_paths:
+                    dir_node = self._directory_path_map.get(path)
                     
-                    # If parent wasn't scanned at all in this audit, we can't conclude anything
-                    # (the audit might have been partial)
-                    if parent_path not in self._audit_seen_paths and parent_path != "/":
-                        self.logger.debug(f"Missing file {missing_path} ignored: parent {parent_path} not seen in audit")
-                        continue
-                    
-                    # Section 5.3 Scenario 2: Delete from memory tree + mark as blind-spot
-                    paths_to_delete.append(missing_path)
-                    missing_detected += 1
-                    self.logger.debug(f"Blind-spot deletion detected: {missing_path}")
-                
-                # Execute deletions
+                    # Check if it is a directory and it was NOT skipped
+                    # (If it was skipped, we can't confirm deletions inside it)
+                    if dir_node and not getattr(dir_node, 'audit_skipped', False):
+                        # This directory was fully scanned. 
+                        # Check its children in memory against the audit evidence.
+                        for child_name, child_node in list(dir_node.children.items()):
+                            # If a child exists in memory...
+                            # But was NOT seen in the current audit...
+                            if child_node.path not in self._audit_seen_paths:
+                                # ...and is NOT protected by a Tombstone (Realtime Delete)
+                                if child_node.path in self._tombstone_list:
+                                    continue
+                                
+                                # Then it is a Blind Spot Deletion.
+                                self.logger.debug(f"Blind-spot deletion detected (Optimized): {child_node.path} (Parent {path} was scanned)")
+                                paths_to_delete.append(child_node.path)
+            
+                # Execute deletions in bulk
+                missing_detected = len(paths_to_delete)
                 for path in paths_to_delete:
                     await self._process_delete_in_memory(path)
-                    # Add to a special "blind-spot deletions" tracking
                     self._blind_spot_deletions.add(path)
+                    # Clean up from additions list to prevent conflicting state
+                    self._blind_spot_additions.discard(path)
             
             self.logger.info(
                 f"Audit ended for datastore {self.datastore_id}. "
