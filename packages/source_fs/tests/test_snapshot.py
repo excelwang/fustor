@@ -49,6 +49,7 @@ def test_snapshot_finds_files_and_generates_events(fs_config, tmp_path: Path, mo
         }
 
         # Act
+        driver.config.driver_params["hot_data_cooloff_seconds"] = 0
         iterator = driver.get_snapshot_iterator(batch_size=2, required_fields_tracker=mock_tracker)
         events = list(iterator)
 
