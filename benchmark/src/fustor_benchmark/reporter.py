@@ -28,7 +28,7 @@ def calculate_stats(latencies, total_time, count):
 
 def generate_html_report(results, output_path):
     """Generates a rich HTML report by injecting a JSON data object."""
-    template_path = Path(__file__).parent / "report_template.html"
+    template_path = Path(__file__).parent / "query_template.html"
     try:
         with open(template_path, "r", encoding="utf-8") as f:
             template = f.read()
@@ -66,6 +66,46 @@ def generate_html_report(results, output_path):
 
     results_json = json.dumps(results)
     html = html.replace("/* RESULTS_JSON_DATA */", results_json)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(html)
+
+def generate_lifecycle_report(results, output_path, total_entries=0):
+    """Generates a lifecycle performance report."""
+    template_path = Path(__file__).parent / "lifecycle_report.html"
+    try:
+        with open(template_path, "r", encoding="utf-8") as f:
+            template = f.read()
+    except Exception as e:
+        print(f"Error loading Lifecycle template: {e}")
+        return
+
+    prescan_data = results.get('prescan', {})
+    prescan = prescan_data.get('duration', 0) if prescan_data else 0
+    
+    snapshot_data = results.get('snapshot_sync', {})
+    snapshot = snapshot_data.get('duration', 0) if snapshot_data else 0
+    ingestion = snapshot_data.get('total_ingestion', 0) if snapshot_data else 0
+    
+    audit_data = results.get('audit', {})
+    audit = audit_data.get('duration', 0) if isinstance(audit_data, dict) and 'duration' in audit_data else 0
+    
+    total_duration = (ingestion or 0) + (audit or 0)
+    avg_speed = total_entries / total_duration if total_duration > 0 else 0
+
+    summary = {
+        "total_entries": f"{total_entries:,}",
+        "total_duration": f"{total_duration:.2f}",
+        "avg_speed": f"{avg_speed:.1f}",
+        "prescan_duration": f"{prescan:.2f}" if prescan else "0.00",
+        "snapshot_duration": f"{snapshot:.2f}" if snapshot else "0.00",
+        "ingestion_total": f"{ingestion:.2f}" if ingestion else "0.00",
+        "audit_duration": f"{audit:.2f}" if audit else "0.00",
+    }
+
+    html = template
+    for key, val in summary.items():
+        html = html.replace(f"{{{{{key}}}}}", val)
 
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)

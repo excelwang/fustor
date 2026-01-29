@@ -19,8 +19,8 @@ def cli():
 @click.option("--integrity-interval", default=60.0, help="Wait interval (seconds) for OS Integrity check (simulating NFS sync).")
 @click.option("--fusion-api", help="External Fusion API URL (skips local setup).")
 @click.option("--api-key", help="API Key for external Fusion API.")
-def run(target_dir, concurrency, num_requests, target_depth, integrity_interval, fusion_api, api_key):
-    """Executes the automated performance benchmark."""
+def query(target_dir, concurrency, num_requests, target_depth, integrity_interval, fusion_api, api_key):
+    """Executes the automated metadata query & performance benchmark."""
     run_dir = os.path.abspath(DEFAULT_RUN_DIR)
     runner = BenchmarkRunner(run_dir, target_dir, fusion_api, api_key)
     runner.run(

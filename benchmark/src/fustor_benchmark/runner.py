@@ -14,7 +14,7 @@ from .tasks import (
     run_find_sampling_phase,
     run_find_validation_phase
 )
-from .reporter import calculate_stats, generate_html_report
+from .reporter import calculate_stats, generate_html_report, generate_lifecycle_report
 
 class BenchmarkRunner:
     def __init__(self, run_dir, target_dir, fusion_api_url=None, api_key=None):
@@ -201,8 +201,8 @@ class BenchmarkRunner:
                 "os": os_stats, "os_integrity": os_integrity_stats, "fusion_dry_net": fusion_dry_net_stats, "fusion_dry": fusion_dry_stats, "fusion": fusion_stats, "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")
             }
             os.makedirs(os.path.join(self.run_dir, "results"), exist_ok=True)
-            with open(os.path.join(self.run_dir, "results/stress-find.json"), "w") as f: json.dump(final_results, f, indent=2)
-            generate_html_report(final_results, os.path.join(self.run_dir, "results/stress-find.html"))
+            with open(os.path.join(self.run_dir, "results/query-find.json"), "w") as f: json.dump(final_results, f, indent=2)
+            generate_html_report(final_results, os.path.join(self.run_dir, "results/query-find.html"))
 
             click.echo("\n" + "="*135)
             click.echo(f"RECURSIVE METADATA RETRIEVAL PERFORMANCE (DEPTH {target_depth}, INTERVAL {integrity_interval}s)")
@@ -217,8 +217,8 @@ class BenchmarkRunner:
             click.echo(f"{ 'P99 Latency':<25} | {os_stats['p99']:10.2f} ms      | {os_integrity_stats['p99']:10.2f} ms      | {fusion_dry_net_stats['p99']:10.2f} ms      | {fusion_dry_stats['p99']:10.2f} ms      | {fusion_stats['p99']:10.2f} ms")
             click.echo(f"{ 'Throughput (QPS)':<25} | {fmt_q(os_stats)}         | {fmt_q(os_integrity_stats)}         | {fmt_q(fusion_dry_net_stats)}         | {fmt_q(fusion_dry_stats)}         | {fmt_q(fusion_stats)}")
             click.echo("-" * 135)
-            click.echo(click.style(f"\nJSON results saved to: {os.path.join(self.run_dir, 'results/stress-find.json')}", fg="cyan"))
-            click.echo(click.style(f"Visual HTML report saved to: {os.path.join(self.run_dir, 'results/stress-find.html')}", fg="green", bold=True))
+            click.echo(click.style(f"\nJSON results saved to: {os.path.join(self.run_dir, 'results/query-find.json')}", fg="cyan"))
+            click.echo(click.style(f"Visual HTML report saved to: {os.path.join(self.run_dir, 'results/query-find.html')}", fg="green", bold=True))
         finally:
             if not self.external_api_url: self.services.stop_all()
 
@@ -348,10 +348,21 @@ class BenchmarkRunner:
             with open(os.path.join(self.run_dir, "results/lifecycle.json"), "w") as f:
                  json.dump(results, f, indent=2)
             
+            # Get total entries for the report
+            fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
+            res_stats = requests.get(f"{fusion_url}/api/v1/views/fs/stats", headers={"X-API-Key": api_key})
+            stats_data = res_stats.json() if res_stats.status_code == 200 else {}
+            total_entries = stats_data.get("total_files", 0) + stats_data.get("total_directories", 0)
+
+            os.makedirs(os.path.join(self.run_dir, "results"), exist_ok=True)
+            report_path = os.path.join(self.run_dir, "results/lifecycle.html")
+            generate_lifecycle_report(results, report_path, total_entries=total_entries)
+
             click.echo("\n" + "="*80)
             click.echo("LIFECYCLE BENCHMARK RESULTS")
             click.echo("="*80)
             click.echo(json.dumps(results, indent=2))
+            click.echo(click.style(f"\nVisual HTML report saved to: {report_path}", fg="green", bold=True))
             
         finally:
             self.services.stop_all()
