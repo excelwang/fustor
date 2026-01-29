@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html lang="zh">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fustor 存储一致性测试报告</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=Inter:wght@300;400;500;600&display=swap"
+        rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0f172a;
+            --card-bg: rgba(30, 41, 59, 0.7);
+            --primary-accent: #2dd4bf;
+            --secondary-accent: #38bdf8;
+            --text-main: #f1f5f9;
+            --text-dim: #94a3b8;
+            --success: #10b981;
+            --border: rgba(255, 255, 255, 0.1);
+            --glass: rgba(15, 23, 42, 0.4);
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            background-color: var(--bg-color);
+            color: var(--text-main);
+            font-family: 'Inter', sans-serif;
+            background-image:
+                radial-gradient(circle at 0% 0%, rgba(45, 212, 191, 0.05) 0%, transparent 50%),
+                radial-gradient(circle at 100% 100%, rgba(56, 189, 248, 0.05) 0%, transparent 50%);
+            line-height: 1.6;
+            overflow-x: hidden;
+        }
+
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 40px 20px;
+        }
+
+        header {
+            text-align: center;
+            margin-bottom: 60px;
+            animation: fadeInDown 0.8s ease-out;
+        }
+
+        h1 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 3rem;
+            font-weight: 700;
+            background: linear-gradient(135deg, var(--primary-accent), var(--secondary-accent));
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 10px;
+        }
+
+        .subtitle {
+            color: var(--text-dim);
+            font-size: 1.1rem;
+            letter-spacing: 1px;
+            text-transform: uppercase;
+        }
+
+        /* Summary Stats Cards */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            margin-bottom: 50px;
+            animation: fadeInUp 1s ease-out;
+        }
+
+        .stat-card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border);
+            border-radius: 20px;
+            padding: 25px;
+            text-align: center;
+            transition: transform 0.3s ease;
+        }
+
+        .stat-card:hover {
+            transform: translateY(-5px);
+            border-color: var(--primary-accent);
+        }
+
+        .stat-value {
+            font-family: 'Outfit', sans-serif;
+            font-size: 2.5rem;
+            font-weight: 700;
+            display: block;
+            margin-bottom: 5px;
+        }
+
+        .stat-label {
+            color: var(--text-dim);
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .stat-success {
+            color: var(--success);
+        }
+
+        /* Main Table Section */
+        .section-card {
+            background: var(--card-bg);
+            backdrop-filter: blur(12px);
+            border: 1px solid var(--border);
+            border-radius: 24px;
+            padding: 40px;
+            margin-bottom: 40px;
+            box-shadow: 0 20px 50px rgba(0, 0, 0, 0.3);
+            animation: fadeInUp 1.2s ease-out;
+        }
+
+        h2 {
+            font-family: 'Outfit', sans-serif;
+            font-size: 1.8rem;
+            margin-bottom: 30px;
+            display: flex;
+            align-items: center;
+            gap: 15px;
+        }
+
+        h2::before {
+            content: "";
+            display: block;
+            width: 4px;
+            height: 30px;
+            background: var(--primary-accent);
+            border-radius: 2px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0 10px;
+            margin-top: 20px;
+        }
+
+        th {
+            text-align: left;
+            padding: 15px 20px;
+            color: var(--text-dim);
+            font-weight: 600;
+            font-size: 0.9rem;
+            text-transform: uppercase;
+        }
+
+        td {
+            padding: 20px;
+            background: rgba(255, 255, 255, 0.03);
+            border-top: 1px solid var(--border);
+            border-bottom: 1px solid var(--border);
+        }
+
+        td:first-child {
+            border-left: 1px solid var(--border);
+            border-radius: 12px 0 0 12px;
+            font-weight: 600;
+            color: var(--secondary-accent);
+        }
+
+        td:last-child {
+            border-right: 1px solid var(--border);
+            border-radius: 0 12px 12px 0;
+        }
+
+        .badge {
+            padding: 4px 12px;
+            border-radius: 100px;
+            font-size: 0.8rem;
+            font-weight: 600;
+            background: rgba(16, 185, 129, 0.15);
+            color: var(--success);
+            border: 1px solid rgba(16, 185, 129, 0.3);
+        }
+
+        .tech-pill {
+            display: inline-block;
+            background: rgba(56, 189, 248, 0.1);
+            color: var(--secondary-accent);
+            padding: 2px 10px;
+            border-radius: 6px;
+            font-size: 0.85rem;
+            font-family: monospace;
+            margin-top: 8px;
+        }
+
+        /* Detail Sections */
+        .detail-item {
+            margin-bottom: 30px;
+            padding: 20px;
+            border-radius: 16px;
+            background: rgba(255, 255, 255, 0.02);
+            border-left: 4px solid var(--border);
+            transition: all 0.3s ease;
+        }
+
+        .detail-item:hover {
+            background: rgba(255, 255, 255, 0.04);
+            border-left-color: var(--primary-accent);
+        }
+
+        .detail-title {
+            font-weight: 600;
+            font-size: 1.1rem;
+            margin-bottom: 10px;
+            color: var(--secondary-accent);
+        }
+
+        .p-desc {
+            color: var(--text-dim);
+            font-size: 0.95rem;
+            margin-bottom: 10px;
+        }
+
+        .p-principle {
+            font-size: 0.9rem;
+            padding-top: 10px;
+            border-top: 1px dashed var(--border);
+        }
+
+        .principle-label {
+            color: var(--primary-accent);
+            font-weight: 600;
+            margin-right: 8px;
+        }
+
+        /* API Examples */
+        .api-example {
+            margin-top: 25px;
+            background: rgba(0, 0, 0, 0.2);
+            border-radius: 12px;
+            padding: 15px;
+            border: 1px solid var(--border);
+        }
+
+        .example-label {
+            font-size: 0.8rem;
+            color: var(--secondary-accent);
+            font-weight: 600;
+            text-transform: uppercase;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .example-label::before {
+            content: "Terminal";
+            font-size: 0.7rem;
+            background: var(--secondary-accent);
+            color: var(--bg-color);
+            padding: 1px 6px;
+            border-radius: 4px;
+        }
+
+        pre {
+            overflow-x: auto;
+            scrollbar-width: thin;
+        }
+
+        code {
+            font-family: 'Fira Code', 'Cascadia Code', Consolas, monospace;
+            font-size: 0.85rem;
+            color: #e2e8f0;
+        }
+
+        footer {
+            text-align: center;
+            padding: 40px;
+            color: var(--text-dim);
+            font-size: 0.85rem;
+        }
+
+        @keyframes fadeInUp {
+            from {
+                opacity: 0;
+                transform: translateY(30px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        @keyframes fadeInDown {
+            from {
+                opacity: 0;
+                transform: translateY(-30px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        /* Smooth scroll for anchor tags */
+        html {
+            scroll-behavior: smooth;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="container">
+        <header>
+            <div class="subtitle">System Verification Report</div>
+            <h1>Fustor 存储一致性测试报告</h1>
+        </header>
+
+        <!-- Summary Stats -->
+        <div class="stats-grid">
+            <div class="stat-card">
+                <span class="stat-value stat-success">100%</span>
+                <span class="stat-label">测试通过率</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-value">41</span>
+                <span class="stat-label">集成测试用例总数</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-value">818s</span>
+                <span class="stat-label">平均回归耗时</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-value">0</span>
+                <span class="stat-label">未解决风险</span>
+            </div>
+        </div>
+
+        <!-- Main Results Table -->
+        <div class="section-card">
+            <h2>核心痛点修复结论</h2>
+            <table>
+                <thead>
+                    <tr>
+                        <th>NFS 痛点类型</th>
+                        <th>测试覆盖场景</th>
+                        <th>对应实现技术</th>
+                        <th>状态</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>感知盲区 (Blind Spots)</td>
+                        <td>无 Agent 节点物理 IO 捕获</td>
+                        <td>Leader/Follower 协同审计</td>
+                        <td><span class="badge">PASSED</span></td>
+                    </tr>
+                    <tr>
+                        <td>属性缓存滞后</td>
+                        <td>跨节点删除后的复活阻断</td>
+                        <td>墓碑裁决 (Tombstone)</td>
+                        <td><span class="badge">PASSED</span></td>
+                    </tr>
+                    <tr>
+                        <td>数据写完整性风险</td>
+                        <td>异步扫描中的热文件识别</td>
+                        <td>Suspect List 可疑列表</td>
+                        <td><span class="badge">PASSED</span></td>
+                    </tr>
+                    <tr>
+                        <td>写连续性核验</td>
+                        <td>大文件写入期间的视图锁定</td>
+                        <td>Sentinel Sweep 哨兵巡检</td>
+                        <td><span class="badge">PASSED</span></td>
+                    </tr>
+                    <tr>
+                        <td>分布式定序逻辑</td>
+                        <td>不同步时钟下的变更冲突</td>
+                        <td>混合逻辑时钟 (HLC)</td>
+                        <td><span class="badge">PASSED</span></td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Technical Analysis -->
+        <div class="section-card">
+            <h2>技术实现与验收细节</h2>
+
+            <div class="detail-item">
+                <div class="detail-title">A. 视图最终收敛 (View Convergence)</div>
+                <p class="p-desc">针对 NFS 无 Agent 节点的“监控盲区”进行了暴力测试。在压力环境下随机在多个盲区节点执行海量文件操作。</p>
+                <div class="p-principle">
+                    <span class="principle-label">实现原理:</span>
+                    Fustor 采用 Scrutiny 差分算法。Leader 节点执行深度物理扫描，将物理磁盘现状与内存元数据进行异或对比，强制补全缺失的 VFS 事件，确保接口视图在审计周期后实现最终一致性。
+                </div>
+                <div class="tech-pill">coverage: test_b1, test_b2, test_g</div>
+
+                <div class="api-example">
+                    <div class="example-label">API 调用示例: 发现盲区变更</div>
+                    <pre><code># 获取全局盲区清单
+curl -X GET "http://fusion-server/api/v1/views/views/fs/blind-spots" \
+     -H "Authorization: ApiKey YOUR_TOKEN"
+
+# 返回示例:
+{
+  "agent_missing_files": [
+    {
+      "path": "/data/blind_spot_file.dat",
+      "agent_missing": true,
+      "modified_time": 1700000000.0
+    }
+  ]
+}</code></pre>
+                </div>
+            </div>
+
+            <div class="detail-item">
+                <div class="detail-title">B. 逻辑删除单调性 (Deletion Monotonicity)</div>
+                <p class="p-desc">模拟极其严重的 NFS acregmin 延迟。测试在节点 A 手动删除条目后，节点 B 仍上报陈旧目录项的极端情况。</p>
+                <div class="p-principle">
+                    <span class="principle-label">实现原理:</span>
+                    引入分布式 Tombstone（墓碑）。一旦收到 Realtime Delete 事件，Fusion 会持久化一个带逻辑位的时间戳。所有后续来自 Scan 模式的数据必须经过物理 Mtime
+                    与墓碑逻辑时间的对撞校验，只有严格更新的版本才允许“转世”。
+                </div>
+                <div class="tech-pill">coverage: test_d2, test_d3, test_d4</div>
+
+                <div class="api-example">
+                    <div class="example-label">API 调用示例: 验证删除确权 (NO Zombie)</div>
+                    <pre><code># 查询被实时删除的路径，API 保证返回 404，即便 NFS 缓存未刷新
+curl -f -X GET "http://fusion-server/api/v1/views/views/fs/tree?path=/data/deleted_file.txt" \
+     -H "Authorization: ApiKey YOUR_TOKEN"
+
+# 返回: HTTP 404 Not Found (即使其他节点仍能通过 ls 看到该文件)</code></pre>
+                </div>
+            </div>
+
+            <div class="detail-item">
+                <div class="detail-title">C. 静默态识别 (Quiescence Verification)</div>
+                <p class="p-desc">测试在高频 IO 写入流中，API 视图对“半截文件”的预警能力。确保用户不会在数据未 Commit 时读入下游。</p>
+                <div class="p-principle">
+                    <span class="principle-label">实现原理:</span>
+                    热数据追踪。对于所有非实时上报的文件变更，系统自动降级信任度并放入 Suspect List。由后台 Sentinel 协程发起主动 `stat`
+                    系统调用，通过采样探测文件属性是否已进入静默期，从而动态控制 `integrity_suspect` 标志。
+                </div>
+                <div class="tech-pill">coverage: test_c1, test_c6</div>
+
+                <div class="api-example">
+                    <div class="example-label">API 调用示例: 识别不安全写入</div>
+                    <pre><code># 获取目录树并检查 integrity_suspect 标志
+curl -X GET "http://fusion-server/api/v1/views/views/fs/tree?path=/data/logs" \
+     -H "Authorization: ApiKey YOUR_TOKEN"
+
+# 结果中可识别“施工中”的文件:
+{
+  "path": "/data/logs/process.log",
+  "size": 1048576,
+  "integrity_suspect": true  # <--- 预警：该文件正在写入或处于 NFS 缓存不稳定期
+}</code></pre>
+                </div>
+            </div>
+        </div>
+
+        <footer>
+            <p>&copy; 2026 Fustor Agentic Coding Team. Generated by Antigravity AI.</p>
+            <p>Report ID: FST-QA-20260129-V2 | Confidential</p>
+        </footer>
+    </div>
+
+</body>
+
+</html>

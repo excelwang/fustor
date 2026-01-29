@@ -73,10 +73,12 @@ async def test_audit_sentinel_logic():
     assert "/test/audit_file" in parser._suspect_list
     
     # 4. Audit End (Cleanup)
-    # Create a tombstone OLDER than audit start (simulating pre-audit deletion)
-    original_start_time = parser._last_audit_start
-    parser._tombstone_list["/d/old"] = original_start_time - 10
-    parser._tombstone_list["/d/new"] = original_start_time + 10
+    # Create tombstones: one very old (expired), one new (within TTL)
+    tombstone_ttl = 3600.0
+    now = parser._logical_clock.hybrid_now()
+    
+    parser._tombstone_list["/d/old"] = now - (tombstone_ttl + 10) # Expired
+    parser._tombstone_list["/d/new"] = now - 10 # Within TTL
     
     await parser.handle_audit_end()
     
