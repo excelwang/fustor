@@ -29,8 +29,8 @@ services:
 
   registry:
     build:
-      context: ../../..
-      dockerfile: fusion/tests/integration/containers/fustor-services/Dockerfile
+      context: ..
+      dockerfile: tests/containers/fustor-services/Dockerfile
     container_name: fustor-registry
     command: [ "fustor-registry", "start", "-h", "0.0.0.0" ]
     environment:
@@ -55,8 +55,8 @@ services:
 
   fusion:
     build:
-      context: ../../..
-      dockerfile: fusion/tests/integration/containers/fustor-services/Dockerfile
+      context: ..
+      dockerfile: tests/containers/fustor-services/Dockerfile
     container_name: fustor-fusion
     command: [ "fustor-fusion", "start", "-h", "0.0.0.0" ]
     environment:
@@ -75,12 +75,12 @@ services:
       FUSTOR_CORE_SECRET_KEY: "test-integration-secret-key-for-jwt-signing"
     volumes:
       - fusion-data:/data/fusion
-      - ../../../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
-      - ../../../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
-      - ../../../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
-      - ../../../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
-      - ../../../packages/fustor_registry_client/src/fustor_registry_client:/usr/local/lib/python3.11/site-packages/fustor_registry_client
-      - ../../../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
+      - ../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
+      - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
+      - ../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
+      - ../packages/fustor_registry_client/src/fustor_registry_client:/usr/local/lib/python3.11/site-packages/fustor_registry_client
+      - ../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18102:8102"
     networks:
@@ -98,8 +98,8 @@ services:
 
   nfs-client-a:
     build:
-      context: ../../..
-      dockerfile: fusion/tests/integration/containers/nfs-client/Dockerfile
+      context: ..
+      dockerfile: tests/containers/nfs-client/Dockerfile
     container_name: fustor-nfs-client-a
     privileged: true
     cap_add:
@@ -116,14 +116,14 @@ services:
       REGISTRY_ENDPOINT: "http://registry:8101"
     volumes:
       - agent-a-data:/data/agent
-      - ../../../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
-      - ../../../packages/source_fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
-      - ../../../packages/pusher_fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
-      - ../../../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
-      - ../../../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
-      - ../../../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
-      - ../../../packages/fustor_agent_sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
-      - ../../../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
+      - ../packages/source_fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
+      - ../packages/pusher_fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
+      - ../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
+      - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
+      - ../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
+      - ../packages/fustor_agent_sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
+      - ../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18100:8100"
     networks:
@@ -141,8 +141,8 @@ services:
 
   nfs-client-b:
     build:
-      context: ../../..
-      dockerfile: fusion/tests/integration/containers/nfs-client/Dockerfile
+      context: ..
+      dockerfile: tests/containers/nfs-client/Dockerfile
     container_name: fustor-nfs-client-b
     privileged: true
     cap_add:
@@ -159,14 +159,14 @@ services:
       REGISTRY_ENDPOINT: "http://registry:8101"
     volumes:
       - agent-b-data:/data/agent
-      - ../../../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
-      - ../../../packages/source_fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
-      - ../../../packages/pusher_fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
-      - ../../../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
-      - ../../../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
-      - ../../../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
-      - ../../../packages/fustor_agent_sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
-      - ../../../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
+      - ../packages/source_fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
+      - ../packages/pusher_fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
+      - ../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
+      - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
+      - ../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
+      - ../packages/fustor_agent_sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
+      - ../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18103:8100"
     networks:
@@ -186,8 +186,8 @@ services:
 
   nfs-client-c:
     build:
-      context: ../../..
-      dockerfile: fusion/tests/integration/containers/nfs-client/Dockerfile
+      context: ..
+      dockerfile: tests/containers/nfs-client/Dockerfile
     container_name: fustor-nfs-client-c
     privileged: true
     cap_add:
