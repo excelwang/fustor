@@ -31,6 +31,14 @@ def run(target_dir, concurrency, num_requests, target_depth, integrity_interval,
     )
 
 @cli.command()
+@click.argument("target-dir", type=click.Path(exists=True))
+def lifecycle(target_dir):
+    """Executes the lifecycle (Pre-scan, Snapshot, Audit, Sentinel) benchmarks."""
+    run_dir = os.path.abspath(DEFAULT_RUN_DIR)
+    runner = BenchmarkRunner(run_dir, target_dir)
+    runner.run_lifecycle()
+
+@cli.command()
 @click.argument("target-dir", type=click.Path(exists=False))
 @click.option("--num-dirs", default=1000, help="Number of UUID directories")
 @click.option("--num-subdirs", default=4, help="Number of subdirectories per UUID directory")

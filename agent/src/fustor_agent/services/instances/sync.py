@@ -184,3 +184,15 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
             await asyncio.gather(*stop_tasks)
 
         await self.bus_service.release_all_unused_buses()
+
+    async def trigger_audit(self, id: str):
+        instance = self.get_instance(id)
+        if not instance:
+            raise NotFoundError(f"Sync instance '{id}' not found.")
+        await instance.trigger_audit()
+
+    async def trigger_sentinel(self, id: str):
+        instance = self.get_instance(id)
+        if not instance:
+            raise NotFoundError(f"Sync instance '{id}' not found.")
+        await instance.trigger_sentinel()

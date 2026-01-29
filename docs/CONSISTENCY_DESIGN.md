@@ -138,6 +138,7 @@ Fusion 维护以下状态：
 - `path`: 文件路径
 - `mtime`: 最后修改时间（来自存储系统）
 - `size`: 文件大小
+- `last_updated_at`: Fusion 最后确认该文件状态点的逻辑时间戳（用于陈旧证据保护）
 
 ### 4.2 墓碑表 (Tombstone List)
 
@@ -236,9 +237,26 @@ elif Parent D was Not Scanned:
 
 else (Full Scan on D):
     if B in Memory Tree:
-        → 将 B 从内存树中删除 (保证视图即真相)
-        → 将 B 加入 Blind Spot Deletion List
+        # Rule 3: 陈旧证据保护 (Stale Evidence Protection)
+        if B.last_updated_at > current_audit_start_time:
+             → 丢弃删除指令 (该文件在审计采集中途/之后有过实时更新，扫描结果已陈旧)
+        else:
+             → 将 B 从内存树中删除 (保证视图即真相)
+             → 将 B 加入 Blind Spot Deletion List
 ```
+
+### 5.4 特殊场景：旧属性注入 (Old Mtime Injection)
+
+在使用 `cp -p`、`rsync -a` 或 `tar -x` 等操作时，新创建的文件会继承源文件的旧 `mtime`。这会导致简单的基于 `mtime` 的审计仲裁逻辑判定失效。
+
+**问题背景：**
+- **$T_1$ (Audit 开始)**：Fusion 记录审计开始水位线。
+- **$T_2$ (实时创建)**：Agent 通过 Inotify 发现一个 `cp -p` 创建的新文件，其 `mtime` 被保留为一年前。
+- **$T_2$ (Fusion 同步)**：Fusion 接受该文件，并记录其 `last_updated_at = T_2`。
+- **$T_3$ (Audit 逻辑判定)**：由于审计的实际物理扫描发生在 $T_2$ 之前，其提交的扫描列表中没有该文件。
+
+**裁决逻辑保护：**
+若只对比 `mtime`，$T_{old} < T_1$ 会导致该文件被误判为“审计前本应存在但实际缺失”，从而被删除。引入 `last_updated_at` 后，Fusion 会检测到 `File.last_updated_at (T_2) > Audit.Start (T_1)`，从而识别出审计报告是**陈旧证据**，放弃删除操作，确保实时事件的绝对权威。
 
 ---
 

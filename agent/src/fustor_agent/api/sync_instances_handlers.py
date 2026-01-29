@@ -42,3 +42,23 @@ async def stop_sync_instance(id: str, app: App = Depends(get_app)):
     except Exception as e:
         logger.error(f"Failed to stop sync instance {id}: {e}", exc_info=True)
         raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/syncs/{id}/_actions/trigger_audit", status_code=status.HTTP_202_ACCEPTED, summary="Trigger audit for a sync task")
+async def trigger_audit(id: str, app: App = Depends(get_app)):
+    """Manually trigger an audit cycle for the specified sync instance."""
+    try:
+        await app.sync_instance_service.trigger_audit(id)
+        return {"message": f"Audit triggered for sync instance {id}."}
+    except Exception as e:
+        logger.error(f"Failed to trigger audit for {id}: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))
+
+@router.post("/syncs/{id}/_actions/trigger_sentinel", status_code=status.HTTP_202_ACCEPTED, summary="Trigger sentinel for a sync task")
+async def trigger_sentinel(id: str, app: App = Depends(get_app)):
+    """Manually trigger a sentinel check for the specified sync instance."""
+    try:
+        await app.sync_instance_service.trigger_sentinel(id)
+        return {"message": f"Sentinel triggered for sync instance {id}."}
+    except Exception as e:
+        logger.error(f"Failed to trigger sentinel for {id}: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=str(e))

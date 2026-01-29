@@ -12,5 +12,5 @@
   - [ ] **通讯协议升级 (gRPC/Protobuf)**: 将 JSON Over HTTP 替换为二进制流式协议（如 gRPC），以支持流式推送、并发 Multiplexing，并降低路径名等重复字符串的序列化开销。
   - [x] **Fusion 侧细粒度并发**: 在 Fusion 的 `DirectoryStructureParser` 中用**路径分段锁**替换当前的全局大锁，提升多 Agent 同时推送时的裁决并发性能。
 
-- [ ] benchmark 增加 审计性能测试、哨兵检测性能测试，（agent、fusion分别测耗时）。
+- [ ] benchmark 增加 预扫描、快照同步、审计、哨兵的性能测试，（agent、fusion分别测耗时）。
 - [ ] 集成测试，将agent、fusion的容器的物理时间打乱，看是否能正确处理。

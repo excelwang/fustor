@@ -23,6 +23,7 @@ class DirectoryNode:
         self.size = size
         self.modified_time = modified_time
         self.created_time = created_time
+        self.last_updated_at: float = 0.0 # Logical timestamp when node was last confirmed
         self.children: Dict[str, Any] = {} # Can contain DirectoryNode or FileNode
         # Consistency flags
         self.integrity_suspect: bool = False
@@ -77,6 +78,7 @@ class FileNode:
         self.size = size
         self.modified_time = modified_time
         self.created_time = created_time
+        self.last_updated_at: float = 0.0 # Logical timestamp when node was last confirmed
         # Consistency flags
         self.integrity_suspect: bool = False
 
@@ -104,13 +106,10 @@ class DirectoryStructureParser:
     Implements Smart Merge logic for consistency arbitration.
     """
     
-    @property
-    def hot_file_threshold(self) -> int:
-        return fusion_config.FUSTOR_FUSION_SUSPECT_TTL_SECONDS
-    
     def __init__(self, datastore_id: int):
         self.datastore_id = datastore_id
         self.logger = logging.getLogger(f"fustor_fusion.parser.fs.{datastore_id}")
+        self.hot_file_threshold = fusion_config.FUSTOR_FUSION_SUSPECT_TTL_SECONDS
         self._root = DirectoryNode("", "/")
         self._directory_path_map: Dict[str, DirectoryNode] = {"/": self._root}
         self._file_path_map: Dict[str, FileNode] = {}
@@ -209,6 +208,7 @@ class DirectoryStructureParser:
                 current_path += "/" + part
                 if current_path not in self._directory_path_map:
                     new_dir = DirectoryNode(part, current_path)
+                    new_dir.last_updated_at = self._logical_clock.get_watermark()
                     parent_node.children[part] = new_dir
                     self._directory_path_map[current_path] = new_dir
                 parent_node = self._directory_path_map[current_path]
@@ -235,6 +235,8 @@ class DirectoryStructureParser:
                     parent_node = self._directory_path_map.get(parent_path)
                     if parent_node:
                         parent_node.children[name] = node
+            
+            node.last_updated_at = self._logical_clock.get_watermark()
 
         else:
             if path in self._file_path_map:
@@ -248,6 +250,8 @@ class DirectoryStructureParser:
                 parent_node = self._directory_path_map.get(parent_path)
                 if parent_node:
                     parent_node.children[name] = node
+            
+            node.last_updated_at = self._logical_clock.get_watermark()
 
     async def _process_delete_in_memory(self, path: str):
         """Remove a node from the in-memory tree."""
@@ -524,6 +528,12 @@ class DirectoryStructureParser:
                                 if child_node.path in self._tombstone_list:
                                     continue
                                 
+                                # Rule 3: Stale Evidence Protection
+                                # Only delete if the node hasn't been updated AFTER this audit started.
+                                if child_node.last_updated_at > self._last_audit_start:
+                                    self.logger.info(f"Preserving node from audit deletion (Stale Evidence): {child_node.path} (last_updated={child_node.last_updated_at} > audit_start={self._last_audit_start})")
+                                    continue
+
                                 self.logger.debug(f"Blind-spot deletion detected (Optimized): {child_node.path} (Parent {path} was scanned)")
                                 paths_to_delete.append(child_node.path)
             

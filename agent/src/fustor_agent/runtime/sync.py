@@ -267,8 +267,10 @@ class SyncInstance:
                  logger.info(f"Assigned LEADER role for {self.id}. Starting Audit and Sentinel tasks.")
                  self._audit_task = asyncio.create_task(self._run_audit_loop())
                  self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
-                 tasks_to_wait.append(self._audit_task)
-                 tasks_to_wait.append(self._sentinel_task)
+                 # Do not wait for maintenance tasks as they might exit immediately if disabled
+                 # or run indefinitely. If they crash, they log errors.
+                 # tasks_to_wait.append(self._audit_task)
+                 # tasks_to_wait.append(self._sentinel_task)
             
             # Wait for any of the tasks to complete
             done, pending = await asyncio.wait(
@@ -385,6 +387,28 @@ class SyncInstance:
             # If the task is cancelled, just return
             pass
 
+    async def trigger_audit(self):
+        """Manually trigger an audit cycle."""
+        if self.current_role != 'leader':
+            logger.warning(f"Cannot trigger audit for {self.id}: not a leader.")
+            return
+        if self.state & SyncState.AUDIT_SYNC:
+            logger.warning(f"Audit for {self.id} already running.")
+            return
+        logger.info(f"Manually triggering audit for {self.id}")
+        await self._run_audit_sync()
+
+    async def trigger_sentinel(self):
+        """Manually trigger a sentinel check."""
+        if self.current_role != 'leader':
+            logger.warning(f"Cannot trigger sentinel for {self.id}: not a leader.")
+            return
+        if self.state & SyncState.SENTINEL_SWEEP:
+            logger.warning(f"Sentinel check for {self.id} already running.")
+            return
+        logger.info(f"Manually triggering sentinel for {self.id}")
+        await self._run_sentinel_check()
+
     async def _run_audit_loop(self):
         if self.audit_interval <= 0:
             logger.info(f"审计循环已禁用 audit_loop disabled for {self.id} (interval={self.audit_interval}s)")
@@ -448,6 +472,7 @@ class SyncInstance:
 
              # 3. Report Results (Generic)
              await self.pusher_driver_instance.submit_sentinel_results(results)
+             logger.info(f"Sentinel check completed for {self.id}")
 
         except Exception as e:
             logger.error(f"Sentinel check failed for {self.id}: {e}")
@@ -455,6 +480,7 @@ class SyncInstance:
              self.state &= ~SyncState.SENTINEL_SWEEP
 
     async def _run_audit_sync(self):
+        # Existing _run_audit_sync logic...
         if self.state & SyncState.AUDIT_SYNC:
              return
         

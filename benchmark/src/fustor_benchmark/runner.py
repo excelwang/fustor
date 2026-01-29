@@ -221,3 +221,137 @@ class BenchmarkRunner:
             click.echo(click.style(f"Visual HTML report saved to: {os.path.join(self.run_dir, 'results/stress-find.html')}", fg="green", bold=True))
         finally:
             if not self.external_api_url: self.services.stop_all()
+
+    def run_lifecycle(self):
+        """Runs the lifecycle benchmarks: Pre-scan, Snapshot, Audit, Sentinel."""
+        data_exists = os.path.exists(self.data_dir) and len(os.listdir(self.data_dir)) > 0
+        if not data_exists: raise RuntimeError("Benchmark data missing")
+        click.echo(f"Using data directory: {self.data_dir}")
+        
+        results = {}
+        
+        try:
+            # --- Phase 1: Setup & Initial Sync (Pre-scan + Snapshot) ---
+            click.echo("\n" + "="*80)
+            click.echo("PHASE 1: PRE-SCAN & INITIAL SNAPSHOT SYNC")
+            click.echo("="*80)
+            
+            self.services.setup_env()
+            self.services.start_registry()
+            api_key = self.services.configure_system()
+            self.services.start_fusion()
+            
+            # Start Agent once and keep it running
+            start_time = time.time()
+            self.services.start_agent(api_key, audit_interval=0, sentinel_interval=0)
+            
+            # 1. Measure Pre-scan Time
+            prescan_match = self.services.wait_for_log(
+                self.services.get_agent_log_path(), 
+                r"Pre-scan completed: processed (\d+) entries", 
+                timeout=300
+            )
+            prescan_time = time.time()
+            prescan_duration = prescan_time - start_time
+            if prescan_match:
+                click.echo(f"  [Agent] Pre-scan completed in {prescan_duration:.2f}s (Processed {prescan_match.group(1)} entries).")
+            else:
+                click.echo("  [Agent] Pre-scan log not found (Timeout).")
+                prescan_duration = None
+
+            # 2. Measure Total Ingestion Time (Fusion Ready)
+            self.wait_for_sync(api_key)
+            ingestion_end_time = time.time()
+            total_ingestion_duration = ingestion_end_time - start_time
+            
+            sync_duration = total_ingestion_duration - prescan_duration if prescan_duration else None
+            
+            click.echo(f"  [Fusion] Setup & Ingestion completed in {total_ingestion_duration:.2f}s.")
+            if sync_duration:
+                click.echo(f"  [Calculated] Snapshot Sync Duration (Net): {sync_duration:.2f}s")
+                
+            results["prescan"] = {"duration": prescan_duration}
+            results["snapshot_sync"] = {"duration": sync_duration, "total_ingestion": total_ingestion_duration}
+            
+            # MUST ensure we are Leader before proceeding to Phase 2/3
+            if not self.services.wait_for_leader():
+                click.echo("  [Agent] Agent failed to become LEADER. Cannot proceed with Audit/Sentinel.")
+                return results
+
+            # --- Phase 2: Audit Performance ---
+            click.echo("\n" + "="*80)
+            click.echo("PHASE 2: AUDIT PERFORMANCE")
+            click.echo("="*80)
+            
+            # Capture log offset before triggering
+            log_offset = self.services.get_log_size(self.services.get_agent_log_path())
+            click.echo("Triggering Audit cycle manually...")
+            # Trigger via API (no restart)
+            self.services.trigger_agent_audit()
+            
+            # Wait for Audit Start
+            audit_start_match = self.services.wait_for_log(
+                self.services.get_agent_log_path(), 
+                r"Audit sync started", 
+                start_offset=log_offset, timeout=60
+            )
+            audit_start_time = time.time()
+            
+            if audit_start_match:
+                click.echo("  [Agent] Audit started.")
+                # Wait for Audit End
+                audit_end_match = self.services.wait_for_log(
+                    self.services.get_agent_log_path(), 
+                    r"Audit sync completed", 
+                    start_offset=log_offset, timeout=120
+                )
+                audit_end_time = time.time()
+                
+                if audit_end_match:
+                    audit_duration = audit_end_time - audit_start_time
+                    click.echo(f"  [Agent] Audit cycle completed in ~{audit_duration:.2f}s.")
+                    results["audit"] = {"duration": audit_duration}
+                else:
+                    click.echo("  [Agent] Audit completion log not found (Timeout).")
+                    results["audit"] = {"status": "completion_timeout"}
+            else:
+                 click.echo("  [Agent] Audit start log not found (Timeout).")
+                 results["audit"] = {"status": "start_timeout"}
+
+            # --- Phase 3: Sentinel Performance ---
+            click.echo("\n" + "="*80)
+            click.echo("PHASE 3: SENTINEL PERFORMANCE")
+            click.echo("="*80)
+            
+            # Capture log offset before triggering
+            log_offset = self.services.get_log_size(self.services.get_agent_log_path())
+            click.echo("Triggering Sentinel cycle manually...")
+            # Trigger via API (no restart)
+            self.services.trigger_agent_sentinel()
+            
+            # Wait for Sentinel Check Completed
+            sentinel_end_match = self.services.wait_for_log(
+                self.services.get_agent_log_path(),
+                r"Sentinel check completed",
+                start_offset=log_offset, timeout=120
+            )
+            
+            if sentinel_end_match:
+                 click.echo(f"  [Agent] Sentinel check completed.")
+                 results["sentinel"] = {"status": "completed"}
+            else:
+                 click.echo("  [Agent] Sentinel check log not found (Maybe no tasks?).")
+                 results["sentinel"] = {"status": "skipped_or_timeout"}
+
+            # Save Results
+            os.makedirs(os.path.join(self.run_dir, "results"), exist_ok=True)
+            with open(os.path.join(self.run_dir, "results/lifecycle.json"), "w") as f:
+                 json.dump(results, f, indent=2)
+            
+            click.echo("\n" + "="*80)
+            click.echo("LIFECYCLE BENCHMARK RESULTS")
+            click.echo("="*80)
+            click.echo(json.dumps(results, indent=2))
+            
+        finally:
+            self.services.stop_all()

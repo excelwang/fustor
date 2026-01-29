@@ -59,7 +59,7 @@ class ServiceManager:
             "fustor-registry", "start",
             "-p", str(self.registry_port)
         ]
-        log_file = open(os.path.join(self.env_dir, "registry.log"), "w")
+        log_file = open(os.path.join(self.env_dir, "registry.log"), "a")
         env = os.environ.copy()
         env["FUSTOR_HOME"] = self.env_dir
         env["FUSTOR_REGISTRY_CLIENT_TOKEN"] = self.client_token
@@ -93,6 +93,15 @@ class ServiceManager:
                  raise RuntimeError(f"DS creation failed: {res.text}")
             ds_id = res.json()["id"]
             
+            # Check if key exists
+            res_keys = requests.get(f"{reg_url}/keys/", params={"datastore_id": ds_id}, headers=headers)
+            if res_keys.status_code == 200:
+                for k in res_keys.json():
+                    if k["name"] == "bench-key":
+                        self.api_key = k["key"]
+                        click.echo(f"Reusing existing API Key: {self.api_key[:8]}...")
+                        return self.api_key
+
             click.echo("Creating API Key...")
             res = requests.post(f"{reg_url}/keys/", json={
                 "datastore_id": ds_id, "name": "bench-key"
@@ -112,7 +121,7 @@ class ServiceManager:
             "fustor-fusion", "start",
             "-p", str(self.fusion_port)
         ]
-        log_file = open(os.path.join(self.env_dir, "fusion.log"), "w")
+        log_file = open(os.path.join(self.env_dir, "fusion.log"), "a")
         env = os.environ.copy()
         env["FUSTOR_HOME"] = self.env_dir
         env["FUSTOR_FUSION_REGISTRY_URL"] = f"http://localhost:{self.registry_port}"
@@ -133,7 +142,12 @@ class ServiceManager:
                 time.sleep(0.5)
         raise RuntimeError("Fusion start failed")
 
-    def start_agent(self, api_key: str):
+    def start_agent(self, api_key: str, **kwargs):
+        # Clean up stale PID file to allow restart
+        agent_pid = os.path.join(self.env_dir, "agent.pid")
+        if os.path.exists(agent_pid):
+            os.remove(agent_pid)
+
         config = {
             "sources": {
                 "bench-fs": {
@@ -162,7 +176,9 @@ class ServiceManager:
                 "bench-sync": {
                     "source": "bench-fs",
                     "pusher": "bench-fusion",
-                    "disabled": False
+                    "disabled": False,
+                    "audit_interval_sec": kwargs.get("audit_interval", 0),
+                    "sentinel_interval_sec": kwargs.get("sentinel_interval", 0)
                 }
             }
         }
@@ -173,7 +189,7 @@ class ServiceManager:
             "fustor-agent", "start",
             "-p", str(self.agent_port)
         ]
-        log_file = open(os.path.join(self.env_dir, "agent.log"), "w")
+        log_file = open(os.path.join(self.env_dir, "agent.log"), "a")
         env = os.environ.copy()
         env["FUSTOR_HOME"] = self.env_dir
         
@@ -216,12 +232,83 @@ class ServiceManager:
         except Exception as e:
             return True, f"Could not read log: {e}"
 
+    def get_agent_log_path(self):
+        return os.path.join(self.env_dir, "agent.log")
+
+    def get_fusion_log_path(self):
+        return os.path.join(self.env_dir, "fusion.log")
+
+    def get_log_size(self, log_path):
+        if not os.path.exists(log_path): return 0
+        return os.path.getsize(log_path)
+
+    def grep_log(self, log_path, pattern, start_offset=0):
+        """Search for a regex pattern in log file starting from offset."""
+        if not os.path.exists(log_path): return None
+        import re
+        regex = re.compile(pattern)
+        with open(log_path, "r") as f:
+            f.seek(start_offset)
+            for line in f:
+                match = regex.search(line)
+                if match:
+                    return match
+        return None
+        
+    def wait_for_log(self, log_path, pattern, start_offset=0, timeout=30):
+        """Wait for a pattern to appear in log."""
+        start = time.time()
+        while time.time() - start < timeout:
+            match = self.grep_log(log_path, pattern, start_offset)
+            if match: return match
+            time.sleep(0.5)
+        return None
+
+    def trigger_agent_audit(self, sync_id="bench-sync"):
+        """Triggers audit for a sync instance via Agent API."""
+        url = f"http://localhost:{self.agent_port}/api/instances/syncs/{sync_id}/_actions/trigger_audit"
+        res = requests.post(url)
+        res.raise_for_status()
+        return res.json()
+
+    def trigger_agent_sentinel(self, sync_id="bench-sync"):
+        """Triggers sentinel for a sync instance via Agent API."""
+        url = f"http://localhost:{self.agent_port}/api/instances/syncs/{sync_id}/_actions/trigger_sentinel"
+        res = requests.post(url)
+        res.raise_for_status()
+        return res.json()
+
+    def wait_for_leader(self, sync_id="bench-sync", timeout=30, start_offset=0):
+        click.echo(f"Waiting for {sync_id} to become LEADER...")
+        pattern = rf"Assigned LEADER role for {sync_id}"
+        return self.wait_for_log(self.get_agent_log_path(), pattern, start_offset=start_offset, timeout=timeout)
+
+    def stop_agent(self):
+        # Find Agent process in self.processes (index 2 usually, but look for it)
+        # Since we append, it's the last one? Or we track index?
+        # Simpler: Kill all fustor-agent processes
+        subprocess.run(["pkill", "-9", "-f", "fustor-agent"])
+        
+        # Also clean up internal process list if possible, but it's hard to map Popen to 'agent'
+        # just assume stop_all will clean up objects.
+        
+        # Remove PID file
+        agent_pid = os.path.join(self.env_dir, "agent.pid")
+        if os.path.exists(agent_pid):
+            os.remove(agent_pid)
+        time.sleep(1)
+
     def stop_all(self):
         click.echo("Stopping all services...")
+        # Deep kill
+        subprocess.run(["pkill", "-f", "fustor-registry"])
+        subprocess.run(["pkill", "-f", "fustor-fusion"])
+        subprocess.run(["pkill", "-f", "fustor-agent"])
+        
         for p in self.processes:
             try:
                 p.terminate()
-                p.wait(timeout=5)
+                p.wait(timeout=2)
             except:
                 p.kill()
         self.processes = []
