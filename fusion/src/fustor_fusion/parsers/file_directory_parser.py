@@ -295,8 +295,8 @@ class DirectoryStructureParser:
 
         async with self._global_semaphore:
             if event.index > 0:
-                # Use logical clock for latency calculation to account for clock drift
-                logical_now_ms = self._logical_clock.hybrid_now() * 1000
+                # Use logical clock (observation watermark) for latency calculation
+                logical_now_ms = self._logical_clock.get_watermark() * 1000
                 self._last_event_latency = max(0, logical_now_ms - event.index)
             
             from fustor_event_model.models import EventType
@@ -313,7 +313,7 @@ class DirectoryStructureParser:
             # Auto-detect audit start time
             if is_audit and self._last_audit_start is None and event.index > 0:
                 self._logical_clock.update(event.index / 1000.0)
-                self._last_audit_start = self._logical_clock.hybrid_now()
+                self._last_audit_start = self._logical_clock.get_watermark()
                 self.logger.info(f"Auto-detected Audit Start logical time: {self._last_audit_start} from event index {event.index}")
     
             # Session Change Detection
@@ -362,7 +362,7 @@ class DirectoryStructureParser:
                     if event_type == EventType.DELETE:
                         if is_realtime:
                             await self._process_delete_in_memory(path)
-                            ts = self._logical_clock.hybrid_now()
+                            ts = self._logical_clock.get_watermark()
                             self._tombstone_list[path] = ts
                             self.logger.info(f"Tombstone CREATED for {path} at {ts}")
                             self._suspect_list.pop(path, None)
@@ -420,10 +420,11 @@ class DirectoryStructureParser:
                             # Update node flags
                             node = self._get_node(path)
                             if node:
-                                logical_now = self._logical_clock.hybrid_now()
+                                logical_now = self._logical_clock.get_watermark()
                                 if (logical_now - mtime) < self.hot_file_threshold:
                                     node.integrity_suspect = True
-                                    self._suspect_list[path] = time.time() + self.hot_file_threshold
+                                    # Use monotonic time for duration-based expiry
+                                    self._suspect_list[path] = time.monotonic() + self.hot_file_threshold
                                 
                                 # Blind-spot tracking
                                 if is_audit:
@@ -439,7 +440,7 @@ class DirectoryStructureParser:
         async with self._global_exclusive_lock():
             # Check if we are already in the middle of this audit (via auto-detection from process_event)
             # If so, do NOT clear flags for files already seen.
-            now = self._logical_clock.hybrid_now()
+            now = self._logical_clock.get_watermark()
             is_late_start = False
             
             # Using a 5-second window to detect race between first event and audit-start signal
@@ -484,8 +485,9 @@ class DirectoryStructureParser:
             # to protect against 'zombie' resurrection from blind spots in subsequent cycles.
             # Only remove if TTL expired.
             
+            
             tombstone_ttl = 3600.0 # Default 1 hour (TODO: Make configurable via fusion_config)
-            now = self._logical_clock.hybrid_now()
+            now = self._logical_clock.get_watermark()
             before_count = len(self._tombstone_list)
             old_tombstones = list(self._tombstone_list.keys())
             
@@ -544,11 +546,12 @@ class DirectoryStructureParser:
     
     def _cleanup_expired_suspects_unlocked(self):
         """Clean up expired suspects and their flags. Must be called with lock held."""
-        now = time.time()
+        # Use monotonic for strictly local duration checks
+        now_monotonic = time.monotonic()
         if self._suspect_list:
-             self.logger.info(f"Suspect cleanup check: now={now} count={len(self._suspect_list)} items={self._suspect_list}")
+             self.logger.info(f"Suspect cleanup check: now_monotonic={now_monotonic} count={len(self._suspect_list)} items={self._suspect_list}")
         
-        expired_paths = [path for path, ts in self._suspect_list.items() if ts <= now]
+        expired_paths = [path for path, expires_at in self._suspect_list.items() if expires_at <= now_monotonic]
         
         for path in expired_paths:
             self.logger.info(f"Suspect EXPIRED: {path} (expired at {self._suspect_list[path]})")
@@ -571,7 +574,7 @@ class DirectoryStructureParser:
             async with self._get_segment_lock(path):
                 # Update logical clock with observed mtime
                 self._logical_clock.update(new_mtime)
-                logical_now = self._logical_clock.hybrid_now()
+                logical_now = self._logical_clock.get_watermark()
                 
                 node = self._get_node(path)
                 if node:
@@ -581,8 +584,8 @@ class DirectoryStructureParser:
                         node.integrity_suspect = False
                         self._suspect_list.pop(path, None)
                     else:
-                        # Still hot, extend suspect window (expiry uses physical clock)
-                        self._suspect_list[path] = time.time() + self.hot_file_threshold
+                        # Still hot, extend suspect window (expiry uses monotonic clock)
+                        self._suspect_list[path] = time.monotonic() + self.hot_file_threshold
 
 
     async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
@@ -668,7 +671,7 @@ class DirectoryStructureParser:
                 "blind_spot_deletion_count": len(self._blind_spot_deletions),
                 "suspect_file_count": suspect_files,
                 # Logical clock for consistent staleness calculation
-                "logical_now": self._logical_clock.hybrid_now()
+                "logical_now": self._logical_clock.get_watermark()
             }
 
     async def reset(self):

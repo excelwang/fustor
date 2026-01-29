@@ -140,6 +140,12 @@ class _WatchManager:
         self._stop_event = threading.Event()
         self.inotify_thread = threading.Thread(target=self._event_processing_loop, daemon=True)
 
+    def _get_current_time(self) -> float:
+        """Returns the current time using logical clock if available, otherwise wall clock."""
+        if hasattr(self.event_handler, 'logical_clock') and self.event_handler.logical_clock:
+            return self.event_handler.logical_clock.get_watermark()
+        return time.time()
+
     def _event_processing_loop(self):
         """
         The core event loop that reads from inotify and dispatches events.
@@ -226,7 +232,7 @@ class _WatchManager:
 
     def schedule(self, path: str, timestamp: Optional[float] = None):
         with self._lock:
-            timestamp_to_use = timestamp if timestamp is not None else time.time()
+            timestamp_to_use = timestamp if timestamp is not None else self._get_current_time()
             if path in self.lru_cache:
                 existing_entry = self.lru_cache.get(path)
                 if existing_entry and existing_entry.timestamp < timestamp_to_use:
@@ -244,7 +250,7 @@ class _WatchManager:
                 evicted_item = self.lru_cache.evict()
                 if evicted_item:
                     evicted_path, evicted_entry = evicted_item
-                    relative_age_days = (time.time() - evicted_entry.timestamp) / 86400
+                    relative_age_days = (self._get_current_time() - evicted_entry.timestamp) / 86400
                     
                     if relative_age_days < self.min_monitoring_window_days:
                         error_msg = (
@@ -293,7 +299,7 @@ class _WatchManager:
 
                 if e.errno == 28:
                     new_limit = len(self.lru_cache)
-                    relative_age_days = (time.time() - timestamp_to_use) / 86400
+                    relative_age_days = (self._get_current_time() - timestamp_to_use) / 86400
                     if relative_age_days < self.min_monitoring_window_days:
                         error_msg = (
                             f"System inotify watch limit hit. The new watch for {path} "

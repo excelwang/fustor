@@ -35,13 +35,14 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             if datastore_id not in self._sessions:
                 self._sessions[datastore_id] = {}
             
-            now = time.time()
+            now_monotonic = time.monotonic()
+            now_epoch = time.time()
             
             session_info = SessionInfo(
                 session_id=session_id,
                 datastore_id=datastore_id,
-                last_activity=now,
-                created_at=now,
+                last_activity=now_monotonic,
+                created_at=now_epoch,
                 task_id=task_id,
                 allow_concurrent_push = allow_concurrent_push,
                 session_timeout_seconds = session_timeout_seconds,
@@ -64,7 +65,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 return None # Session not found
             
             session_info = self._sessions[datastore_id][session_id]
-            session_info.last_activity = time.time()
+            session_info.last_activity = time.monotonic()
             if client_ip:
                 session_info.client_ip = client_ip
 
@@ -93,7 +94,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         return # Session already gone
                     
                     session_info = self._sessions[datastore_id][session_id]
-                    elapsed = time.time() - session_info.last_activity
+                    elapsed = time.monotonic() - session_info.last_activity
                     remaining = timeout_seconds - elapsed
                     
                 if remaining <= 0:
@@ -109,7 +110,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     
                     session_info = self._sessions[datastore_id][session_id]
                     # Double check last_activity
-                    if time.time() - session_info.last_activity >= timeout_seconds:
+                    if time.monotonic() - session_info.last_activity >= timeout_seconds:
                         del self._sessions[datastore_id][session_id]
                         
                         # Clean up empty datastore entries
@@ -198,7 +199,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         from ..datastore_state_manager import datastore_state_manager
         
         async with self._lock:
-            current_time = time.time()
+            current_time = time.monotonic()
             expired_sessions = []
             
             for datastore_id, datastore_sessions in self._sessions.items():

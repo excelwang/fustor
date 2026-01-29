@@ -65,16 +65,14 @@ def test_snapshot_lookback_picks_up_cooled_files(tmp_path: Path, fs_config: Sour
     driver_config.driver_params["hot_data_cooloff_seconds"] = 5.0
     driver = FSDriver('test-fs-lookback', driver_config)
     
-    # Custom side effect
-    call_history = []
-    def hybrid_now_side_effect(*args, **kwargs):
-        # Call 0: Worker check (returns start_time) -> Hot
-        # Call 1: Look-back check (returns start_time + 10) -> Cool
-        val = start_time if len(call_history) < 1 else start_time + 10.0
-        call_history.append(val)
-        return val
-
-    mocker.patch.object(driver._logical_clock, 'hybrid_now', side_effect=hybrid_now_side_effect)
+    # Mock get_watermark to behave like the file was just modified (Watermark ~ mtime)
+    # This triggers the "hot" detection in the worker
+    mocker.patch.object(driver._logical_clock, 'get_watermark', return_value=start_time)
+    
+    # Mock time.monotonic to simulate time passing for the look-back phase
+    # Call 1 (worker): returns 0 -> recorded as observation time
+    # Call 2 (look-back): returns 10 -> elapsed = 10 - 0 = 10 > 5 -> Cooled off
+    mocker.patch('time.monotonic', side_effect=[0.0, 10.0, 20.0, 30.0])
 
     # Act
     iterator = driver.get_snapshot_iterator()
@@ -101,9 +99,13 @@ def test_audit_postpones_hot_files_and_marks_skipped(tmp_path: Path, fs_config: 
     driver_config.driver_params["hot_data_cooloff_seconds"] = 5.0
     driver = FSDriver('test-fs-audit', driver_config)
     
-    # Mock hybrid_now to ALWAYS return start_time (even in look-back)
-    # This simulates a file that is still hot even after look-back finishes.
-    mocker.patch.object(driver._logical_clock, 'hybrid_now', return_value=start_time)
+    # Mock get_watermark to trigger initial postponement
+    mocker.patch.object(driver._logical_clock, 'get_watermark', return_value=start_time)
+
+    # Mock time.monotonic to simulate NO time passing
+    # Call 1 (worker): 0
+    # Call 2 (look-back): 0 -> elapsed = 0 < 5 -> Still Hot
+    mocker.patch('time.monotonic', return_value=0.0)
 
     # Act
     iterator = driver.get_audit_iterator()

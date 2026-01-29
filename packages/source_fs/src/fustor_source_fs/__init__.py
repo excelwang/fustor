@@ -185,24 +185,31 @@ class FSDriver(SourceDriver):
                     latest = max(latest, dir_mtime_map.get(subdir, 0))
                 dir_mtime_map[path] = latest
             
-            # Step 2: Calculate baseline delta using the true recursive mtime of the root.
-            try:
-                root_recursive_mtime = dir_mtime_map.get(self.uri, os.path.getmtime(self.uri))
-                self.clock_offset = time.time() - root_recursive_mtime
-                logger.info(f"[fs] Calculated client-server time delta: {self.clock_offset:.2f} seconds.")
-            except OSError as e:
-                logger.warning(f"[fs] Could not stat root directory to calculate time delta: {e}. Proceeding without normalization.")
+            # Step 2: Zero offset - we trust NFS time implicitly now.
+            self.clock_offset = 0.0
+            logger.info(f"[fs] Client-server time delta normalization disabled (observation-driven mode).")
 
             # Log final statistics before sorting
+            # Log final statistics before sorting
             if dir_mtime_map:
-                newest_dir = max(dir_mtime_map.items(), key=lambda x: x[1])
-                oldest_dir = min(dir_mtime_map.items(), key=lambda x: x[1])
-                newest_age = time.time() - newest_dir[1]  # Difference in seconds
-                oldest_age = time.time() - oldest_dir[1]  # Difference in seconds
+                # CRITICAL: Initialize logical clock with the true recursive mtime of the ROOT
+                # This ensures our watermark starts at the latest moment observed anywhere in the tree.
+                root_recursive_mtime = dir_mtime_map.get(self.uri, 0.0)
+                if root_recursive_mtime > 0:
+                    self._logical_clock.update(root_recursive_mtime)
+
+                now = self._logical_clock.get_watermark()
+                
+                # Optimization: root_recursive_mtime IS the newest timestamp in the tree by definition.
+                # We skip O(N) scan for newest_dir path to save time on large datasets.
+                newest_age = now - root_recursive_mtime
+                
+                # Finding oldest is still O(N) but less critical. Let's just log summary stats.
+                # oldest_dir = min(dir_mtime_map.items(), key=lambda x: x[1]) # Skipped for performance
+                
                 logger.info(
                     f"[fs] Pre-scan completed: processed {total_entries} entries, "
-                    f"errors: {error_count}, newest_dir: {safe_path_handling(newest_dir[0])} (age: {newest_age/86400:.2f} days), "
-                    f"oldest_dir: {safe_path_handling(oldest_dir[0])} (age: {oldest_age/86400:.2f} days)"
+                    f"errors: {error_count}, newest_age: {newest_age/86400:.2f} days (timestamp: {root_recursive_mtime})"
                 )
 
             logger.info(f"[fs] Found {len(dir_mtime_map)} total directories. Building capacity-aware, hierarchy-complete watch set...")
@@ -215,7 +222,7 @@ class FSDriver(SourceDriver):
                     lru_timestamp = server_mtime + self.clock_offset
                 else:
                     # Fallback for parents that might not have been in mtime_map (though they should be)
-                    lru_timestamp = time.time()
+                    lru_timestamp = self._logical_clock.get_watermark()
                 self.watch_manager.schedule(path, lru_timestamp)
                 if self.watch_manager.watch_limit < old_limit:
                     break  # Stop if we hit the limit during scheduling
@@ -236,15 +243,22 @@ class FSDriver(SourceDriver):
             
         file_pattern = driver_params.get("file_pattern", "*")
         batch_size = kwargs.get("batch_size", 100)
-        snapshot_time = int(time.time() * 1000)
+        snapshot_time = int(self._logical_clock.get_watermark() * 1000)
 
         results_queue = queue.Queue(maxsize=batch_size * 2)
         work_queue = queue.Queue()
         work_queue.put(self.uri)
         
+        # Initialize logical clock with root mtime to tether to NFS time domain
+        try:
+            root_st = os.stat(self.uri)
+            self._logical_clock.update(root_st.st_mtime)
+        except OSError:
+            pass
+
         pending_dirs = 1
         map_lock = threading.Lock()
-        postponed_files = set()
+        postponed_files = {} # path -> observed_at_monotonic
         postponed_lock = threading.Lock()
         stop_workers = threading.Event()
 
@@ -280,12 +294,13 @@ class FSDriver(SourceDriver):
                                 elif fnmatch.fnmatch(entry.name, file_pattern):
                                     st = entry.stat()
                                     # Hot data cool-off check
-                                    now = self._logical_clock.hybrid_now()
+                                    watermark = self._logical_clock.get_watermark()
                                     cooloff = driver_params.get("hot_data_cooloff_seconds", 61.0)
-                                    if (now - st.st_mtime) < cooloff:
+                                    if (watermark - st.st_mtime) < cooloff:
                                         with postponed_lock:
-                                            postponed_files.add(entry.path)
-                                        logger.debug(f"[fs] Postponing hot file during snapshot: {entry.path} (age: {now - st.st_mtime:.2f}s < {cooloff}s)")
+                                            if entry.path not in postponed_files:
+                                                postponed_files[entry.path] = time.monotonic()
+                                        logger.debug(f"[fs] Postponing hot file: {entry.path}")
                                         continue
 
                                     meta = get_file_metadata(entry.path, stat_info=st)
@@ -353,14 +368,18 @@ class FSDriver(SourceDriver):
                         logger.info(f"[{stream_id}] Snapshot scan: Look-back for {len(postponed_files)} files...")
                         lookback_rows = []
                         cooloff = driver_params.get("hot_data_cooloff_seconds", 61.0)
-                        for path in list(postponed_files):
+                        for path, observed_at in list(postponed_files.items()):
                             try:
-                                st = os.stat(path)
-                                now = self._logical_clock.hybrid_now()
-                                if (now - st.st_mtime) >= cooloff:
+                                # Duration check using monotonic clock (internal to Agent, safe)
+                                elapsed = time.monotonic() - observed_at
+                                if elapsed >= cooloff:
+                                    st = os.stat(path)
                                     meta = get_file_metadata(path, stat_info=st)
-                                    if meta: lookback_rows.append(meta)
-                            except OSError: pass
+                                    if meta: 
+                                        lookback_rows.append(meta)
+                                        postponed_files.pop(path, None)
+                            except OSError: 
+                                postponed_files.pop(path, None)
                         if lookback_rows:
                             row_buffer.extend(lookback_rows)
                             while len(row_buffer) >= batch_size:
@@ -396,6 +415,14 @@ class FSDriver(SourceDriver):
         # Perform pre-scan to populate watches before starting the observer.
         # This is essential for the message-first architecture and must block
         # until completion to prevent race conditions downstream.
+        
+        # Initialize logical clock with root mtime to tether to NFS time domain
+        try:
+            root_st = os.stat(self.uri)
+            self._logical_clock.update(root_st.st_mtime)
+        except OSError:
+            pass
+
         self._perform_pre_scan_and_schedule()
 
         def _iterator_func() -> Iterator[EventBase]:
@@ -442,15 +469,22 @@ class FSDriver(SourceDriver):
             
         batch_size = kwargs.get("batch_size", 100)
         file_pattern = self.config.driver_params.get("file_pattern", "*")
-        audit_time = int(time.time() * 1000)
+        audit_time = int(self._logical_clock.get_watermark() * 1000)
         
         results_queue = queue.Queue(maxsize=batch_size * 2)
         work_queue = queue.Queue()
         work_queue.put((self.uri, None))
         
+        # Initialize logical clock with root mtime to tether to NFS time domain
+        try:
+            root_st = os.stat(self.uri)
+            self._logical_clock.update(root_st.st_mtime)
+        except OSError:
+            pass
+        
         pending_dirs = 1
         map_lock = threading.Lock()
-        postponed_files = set()
+        postponed_files = {} # path -> observed_at_monotonic
         postponed_lock = threading.Lock()
         stop_workers = threading.Event()
 
@@ -490,12 +524,13 @@ class FSDriver(SourceDriver):
                                 elif not is_silent and fnmatch.fnmatch(entry.name, file_pattern):
                                     st = entry.stat()
                                     # Hot data cool-off check
-                                    now = time.time()
+                                    watermark = self._logical_clock.get_watermark()
                                     cooloff = self.config.driver_params.get("hot_data_cooloff_seconds", 61.0)
-                                    if (now - st.st_mtime) < cooloff:
+                                    if (watermark - st.st_mtime) < cooloff:
                                         with postponed_lock:
-                                            postponed_files.add(entry.path)
-                                        logger.debug(f"[fs] Postponing hot file during audit: {entry.path} (age: {now - st.st_mtime:.2f}s < {cooloff}s)")
+                                            if entry.path not in postponed_files:
+                                                postponed_files[entry.path] = time.monotonic()
+                                        logger.debug(f"[fs] Postponing hot file during audit: {entry.path}")
                                         continue
 
                                     meta = get_file_metadata(entry.path, stat_info=st)
@@ -557,19 +592,21 @@ class FSDriver(SourceDriver):
                         logger.info(f"[{stream_id}] Audit scan: Look-back for {len(postponed_files)} files...")
                         cooloff = self.config.driver_params.get("hot_data_cooloff_seconds", 61.0)
                         lookback_rows = []
-                        for path in list(postponed_files):
+                        for path, observed_at in list(postponed_files.items()):
                             try:
+                                elapsed = time.monotonic() - observed_at
                                 st = os.stat(path)
-                                now = self._logical_clock.hybrid_now()
                                 meta = get_file_metadata(path, stat_info=st)
                                 if meta:
-                                    if (now - st.st_mtime) >= cooloff:
+                                    if elapsed >= cooloff:
                                         lookback_rows.append(meta)
                                     else:
                                         # Still hot! Yield with audit_skipped=True to prevent deletion in Fusion
                                         meta['audit_skipped'] = True
                                         lookback_rows.append(meta)
-                            except OSError: pass
+                                postponed_files.pop(path, None)
+                            except OSError: 
+                                postponed_files.pop(path, None)
                         if lookback_rows:
                             for i in range(0, len(lookback_rows), batch_size):
                                 batch = lookback_rows[i:i+batch_size]

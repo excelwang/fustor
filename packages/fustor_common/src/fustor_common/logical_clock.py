@@ -58,27 +58,29 @@ class LogicalClock:
     
     def now(self) -> float:
         """
-        Get the current logical clock value.
+        Get the current logical clock value (Observation Watermark).
         
         Returns:
-            The current logical clock value (Unix timestamp)
+            The current logical clock value (Unix timestamp scale)
         """
         with self._lock:
             return self._value
-    
-    def hybrid_now(self, fallback_to_physical: bool = True) -> float:
+            
+    def get_watermark(self) -> float:
         """
-        Get the hybrid clock value: max(logical, physical).
-        
-        This is useful for cold start scenarios where the logical clock
-        may not have advanced yet but we still need a reasonable "now".
+        Alias for now() to emphasize its role as a watermark.
+        """
+        return self.now()
+    
+    def hybrid_now(self, fallback_to_physical: bool = False) -> float:
+        """
+        Get the hybrid clock value. 
+        Defaults to logical clock ONLY (False) to avoid drift from physical clock.
         
         Args:
-            fallback_to_physical: If True, return max(logical, physical).
-                                  If False, return logical clock only.
-                                  
-        Returns:
-            The hybrid clock value
+            fallback_to_physical: Only set to True if this value is used 
+                                  where Agent and Fusion don't communicate 
+                                  (e.g., local logging/internal stats).
         """
         with self._lock:
             if fallback_to_physical:

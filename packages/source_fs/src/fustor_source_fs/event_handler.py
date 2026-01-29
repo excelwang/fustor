@@ -47,7 +47,11 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
         if mtime is not None:
             return int(mtime * 1000)
         if self.logical_clock:
-            return int(self.logical_clock.hybrid_now() * 1000)
+            # Use observation-driven watermark for deletions/moves
+            return int(self.logical_clock.get_watermark() * 1000)
+        
+        # This shouldn't happen in production as FSDriver always provides a clock
+        logger.error("[fs] Critical: Generating index without mtime or logical clock!")
         return int(time.time() * 1000)
 
     def _touch_recursive_bottom_up(self, path: str):
