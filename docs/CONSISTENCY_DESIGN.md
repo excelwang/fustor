@@ -145,8 +145,8 @@ Fusion 维护以下状态：
 - **结构**：`Map<Path, DeleteTime>`
 - **生命周期**：
   - 创建：处理 Realtime Delete 时
-  - 销毁：收到 `Audit-End` 信号后，清理所有在此次 Audit 开始前创建的 Tombstone
-
+  - 销毁：**基于 TTL (Time-To-Live)**。默认保留 1 小时。
+  
 ### 4.3 可疑名单 (Suspect List)
 
 - **用途**：标记可能正在写入的文件
@@ -199,11 +199,16 @@ Fusion 维护以下状态：
 
 ### 5.3 Audit 消息处理
 
-#### 场景 1: Audit 报告"存在文件 X"
+#### 场景 1: Audit 报告"存在文件 X" (Smart Merge)
 
 ```
 if X in Tombstone:
-    → 丢弃 (僵尸复活)
+    if Audit.X.mtime > Tombstone.X.ts:
+        → 接受 (新文件转世 Reincarnation)
+        → 从 Tombstone 中移除 X
+        → 执行写入/更新
+    else:
+        → 丢弃 (确认是僵尸复活 Zombie)
 
 elif X in 内存树:
     if Audit.X.mtime > Memory.X.mtime:
@@ -231,11 +236,8 @@ elif Parent D was Not Scanned:
 
 else (Full Scan on D):
     if B in Memory Tree:
-        → 将 B 加入 Blind Spot Deletion List (记录发现时间)
-        → (注意：此时不立即从内存树删除，仅标记。直到收到明确的 Delete 事件或 Session Reset)
-
-    # 列表清理
-    # 仅在检测到文件恢复(Audit found) 或 实时事件(Realtime Delete/Update) 或 新 Session 时清理。
+        → 将 B 从内存树中删除 (保证视图即真相)
+        → 将 B 加入 Blind Spot Deletion List
 ```
 
 ---

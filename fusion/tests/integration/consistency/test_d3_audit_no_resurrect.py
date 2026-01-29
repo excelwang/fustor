@@ -68,12 +68,16 @@ class TestAuditTombstoneProtection:
         assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None, \
             "Audit marker file should be discovered by Audit scan"
         
-        # Step 5: File should NOT appear (protected by Tombstone during its first audit)
+        # Step 5: File SHOULD appear (Reincarnation detected)
+        # Consistency Logic Update:
+        # If the file is recreated with a NEWER mtime than the tombstone, it is a valid Reincarnation.
+        # It should ONLY be discarded if it is a Zombie (stale mtime).
+        
         tree_after = fusion_client.get_tree(path="/", max_depth=-1)
         found = fusion_client._find_in_tree(tree_after, test_file)
         
-        assert found is None, \
-            "Tombstoned file should NOT be resurrected by the Audit cycle that discovered it"
+        assert found is not None, \
+            "Reincarnated file (fresh mtime) SHOULD be accepted by Audit, overruling the Tombstone"
 
     def test_tombstone_protects_against_nfs_cache_resurrection(
         self,

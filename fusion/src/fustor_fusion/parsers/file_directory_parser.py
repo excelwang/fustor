@@ -368,10 +368,28 @@ class DirectoryStructureParser:
                     else:
                         # Snapshot/Audit: apply arbitration
                         
-                        # Rule 1: Tombstone check - skip resurrecting deleted files
+                        # Rule 1: Tombstone check - Detect Zombies vs Reincarnations
                         if path in self._tombstone_list:
-                            self.logger.info(f"Arbitration SKIP {path}: matched Tombstone (ts={self._tombstone_list[path]}, cutoff={self._last_audit_start})")
-                            continue
+                            tombstone_ts = self._tombstone_list[path]
+                            
+                            # If event has no mtime (rare), assume Zombie and block
+                            if mtime is None:
+                                self.logger.info(f"Arbitration SKIP {path}: matched Tombstone (ts={tombstone_ts}) and no mtime")
+                                continue
+                                
+                            # Mtime Comparison
+                            # If incoming file is NEWER than the Tombstone (allowing for some clock skew/precision), it is a Reincarnation.
+                            # If OLDER or EQUAL, it is a Zombie (stale event/cache).
+                            # Note: Tombstone uses logical clock (hybrid), mtime is physical.
+                            # But since logical clock tracks max(mtime), ts >= delete_mtime.
+                            
+                            if mtime > tombstone_ts:
+                                self.logger.info(f"Arbitration ACCEPT {path}: Reincarnation detected! mtime {mtime} > tombstone {tombstone_ts}")
+                                # Remove tombstone to allow normal processing
+                                self._tombstone_list.pop(path)
+                            else:
+                                self.logger.info(f"Arbitration SKIP {path}: matched Tombstone (Zombie). mtime {mtime} <= ts {tombstone_ts}")
+                                continue
                         
                         # Rule 2: Mtime check - skip if existing data is newer
                         # EXCEPTION: If it's an audit event with audit_skipped=True, we MUST process it
@@ -479,17 +497,27 @@ class DirectoryStructureParser:
             if self._last_audit_start is None:
                 return
             
-            # 1. Tombstone cleanup
-            cutoff = self._last_audit_start
+            # 1. Tombstone cleanup (TTL-based)
+            # We must persist tombstones even if Audit confirms file is missing,
+            # to protect against 'zombie' resurrection from blind spots in subsequent cycles.
+            # Only remove if TTL expired.
+            
+            tombstone_ttl = 3600.0 # Default 1 hour (TODO: Make configurable via fusion_config)
+            now = self._logical_clock.hybrid_now()
             before_count = len(self._tombstone_list)
             old_tombstones = list(self._tombstone_list.keys())
+            
+            # Keep tombstone if it is within TTL
+            # (Note: self._tombstone_list values are logical timestamps. Comparing with 'now' is correct.)
             self._tombstone_list = {
                 path: ts for path, ts in self._tombstone_list.items()
-                if ts >= cutoff
+                if (now - ts) < tombstone_ttl
             }
+            
             tombstones_cleaned = before_count - len(self._tombstone_list)
             if tombstones_cleaned > 0:
-                self.logger.info(f"Tombstone CLEANUP: removed {tombstones_cleaned} items (cutoff={cutoff}). Kept {[p for p in old_tombstones if p in self._tombstone_list]}")
+                dropped = [p for p in old_tombstones if p not in self._tombstone_list]
+                self.logger.info(f"Tombstone CLEANUP: removed {tombstones_cleaned} items (TTL expired). Removed: {dropped}")
             
             # 2. Optimized Missing File Detection
             # Instead of iterating ALL files to find what's missing (O(N)),

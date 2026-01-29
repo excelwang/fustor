@@ -25,6 +25,7 @@ class FusionServiceConfig(BaseModel):
     FUSTOR_REGISTRY_CLIENT_TOKEN: str = os.getenv("FUSTOR_REGISTRY_CLIENT_TOKEN", "")
     FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: int = int(os.getenv("FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS", 60))
     FUSTOR_FUSION_SUSPECT_TTL_SECONDS: int = int(os.getenv("FUSTOR_FUSION_SUSPECT_TTL_SECONDS", 600))
+    FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS: int = int(os.getenv("FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS", 30))
     # Add other ingestor specific configs here
 
 fusion_config = FusionServiceConfig()
