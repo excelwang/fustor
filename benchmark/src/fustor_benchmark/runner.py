@@ -14,16 +14,16 @@ from .tasks import (
     run_find_sampling_phase,
     run_find_validation_phase
 )
-from .reporter import calculate_stats, generate_html_report, generate_lifecycle_report
+from .reporter import calculate_stats, generate_html_report, generate_fs_scan_report
 
 class BenchmarkRunner:
-    def __init__(self, run_dir, target_dir, fusion_api_url=None, api_key=None):
+    def __init__(self, run_dir, target_dir, fusion_api_url=None, api_key=None, base_port=18100):
         self.run_dir = os.path.abspath(run_dir)
         self.env_dir = os.path.join(self.run_dir, ".fustor")
         self.data_dir = os.path.abspath(target_dir)
         self.external_api_url = fusion_api_url.rstrip('/') if fusion_api_url else None
         self.external_api_key = api_key
-        self.services = ServiceManager(self.run_dir) 
+        self.services = ServiceManager(self.run_dir, base_port=base_port) 
         self.services.data_dir = self.data_dir
         self.generator = DataGenerator(self.data_dir)
 
@@ -222,8 +222,8 @@ class BenchmarkRunner:
         finally:
             if not self.external_api_url: self.services.stop_all()
 
-    def run_lifecycle(self):
-        """Runs the lifecycle benchmarks: Pre-scan, Snapshot, Audit, Sentinel."""
+    def run_fs_scan(self):
+        """Runs the file system scanning benchmarks: Pre-scan, Snapshot, Audit, Sentinel."""
         data_exists = os.path.exists(self.data_dir) and len(os.listdir(self.data_dir)) > 0
         if not data_exists: raise RuntimeError("Benchmark data missing")
         click.echo(f"Using data directory: {self.data_dir}")
@@ -345,7 +345,7 @@ class BenchmarkRunner:
 
             # Save Results
             os.makedirs(os.path.join(self.run_dir, "results"), exist_ok=True)
-            with open(os.path.join(self.run_dir, "results/lifecycle.json"), "w") as f:
+            with open(os.path.join(self.run_dir, "results/fs_scan.json"), "w") as f:
                  json.dump(results, f, indent=2)
             
             # Get total entries for the report
@@ -355,11 +355,11 @@ class BenchmarkRunner:
             total_entries = stats_data.get("total_files", 0) + stats_data.get("total_directories", 0)
 
             os.makedirs(os.path.join(self.run_dir, "results"), exist_ok=True)
-            report_path = os.path.join(self.run_dir, "results/lifecycle.html")
-            generate_lifecycle_report(results, report_path, total_entries=total_entries)
+            report_path = os.path.join(self.run_dir, "results/fs_scan.html")
+            generate_fs_scan_report(results, report_path, total_entries=total_entries)
 
             click.echo("\n" + "="*80)
-            click.echo("LIFECYCLE BENCHMARK RESULTS")
+            click.echo("FS-SCAN BENCHMARK RESULTS")
             click.echo("="*80)
             click.echo(json.dumps(results, indent=2))
             click.echo(click.style(f"\nVisual HTML report saved to: {report_path}", fg="green", bold=True))

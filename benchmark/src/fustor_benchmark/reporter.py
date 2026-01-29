@@ -70,9 +70,9 @@ def generate_html_report(results, output_path):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
 
-def generate_lifecycle_report(results, output_path, total_entries=0):
-    """Generates a lifecycle performance report."""
-    template_path = Path(__file__).parent / "lifecycle_report.html"
+def generate_fs_scan_report(results, output_path, total_entries=0):
+    """Generates a file system scanning performance report."""
+    template_path = Path(__file__).parent / "fs_scan_report.html"
     try:
         with open(template_path, "r", encoding="utf-8") as f:
             template = f.read()

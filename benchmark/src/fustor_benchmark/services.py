@@ -9,17 +9,21 @@ import requests
 
 
 class ServiceManager:
-    def __init__(self, run_dir: str):
+    def __init__(self, run_dir: str, base_port: int = 18100):
         self.run_dir = os.path.abspath(run_dir)
         # 监控目标数据目录
         self.data_dir = os.path.join(self.run_dir, "data")
         # 系统环境主目录 (FUSTOR_HOME)
         self.env_dir = os.path.join(self.run_dir, ".fustor")
         
-        self.registry_port = 18101
-        self.fusion_port = 18102
-        self.agent_port = 18100
-        self.processes = []
+        self.registry_port = base_port + 1
+        self.fusion_port = base_port + 2
+        self.agent_port = base_port
+        
+        self.registry_process = None
+        self.fusion_process = None
+        self.agent_process = None
+        self.processes = [] # Backwards compatibility for stop_all fallback
 
     def setup_env(self):
         # Safety Check: Only allow operations in directories ending with 'fustor-benchmark-run'
@@ -66,6 +70,7 @@ class ServiceManager:
         
         p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
         log_file.close()
+        self.registry_process = p
         self.processes.append(p)
         
         if not self._wait_for_service(f"http://localhost:{self.registry_port}/health", "Registry"):
@@ -129,6 +134,7 @@ class ServiceManager:
         
         p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
         log_file.close()
+        self.fusion_process = p
         self.processes.append(p)
         
         click.echo(f"Waiting for Fusion at http://localhost:{self.fusion_port}...")
@@ -195,6 +201,7 @@ class ServiceManager:
         
         p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
         log_file.close() # Close in parent
+        self.agent_process = p
         self.processes.append(p)
         
         self._wait_for_service(f"http://localhost:{self.agent_port}/", "Agent")
@@ -284,13 +291,15 @@ class ServiceManager:
         return self.wait_for_log(self.get_agent_log_path(), pattern, start_offset=start_offset, timeout=timeout)
 
     def stop_agent(self):
-        # Find Agent process in self.processes (index 2 usually, but look for it)
-        # Since we append, it's the last one? Or we track index?
-        # Simpler: Kill all fustor-agent processes
-        subprocess.run(["pkill", "-9", "-f", "fustor-agent"])
-        
-        # Also clean up internal process list if possible, but it's hard to map Popen to 'agent'
-        # just assume stop_all will clean up objects.
+        """Safely stop only the benchmark agent process."""
+        if self.agent_process:
+            click.echo("Stopping benchmark agent...")
+            try:
+                self.agent_process.terminate()
+                self.agent_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.agent_process.kill()
+            self.agent_process = None
         
         # Remove PID file
         agent_pid = os.path.join(self.env_dir, "agent.pid")
@@ -299,11 +308,8 @@ class ServiceManager:
         time.sleep(1)
 
     def stop_all(self):
-        click.echo("Stopping all services...")
-        # Deep kill
-        subprocess.run(["pkill", "-f", "fustor-registry"])
-        subprocess.run(["pkill", "-f", "fustor-fusion"])
-        subprocess.run(["pkill", "-f", "fustor-agent"])
+        click.echo("Stopping all benchmark services...")
+        # No more global pkill!
         
         for p in self.processes:
             try:
