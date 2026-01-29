@@ -52,13 +52,12 @@ class TestLogicalClockBasic:
 class TestLogicalClockHybrid:
     """Tests for hybrid_now functionality."""
     
-    def test_hybrid_now_uses_max_with_physical(self):
-        """hybrid_now should return max(logical, physical)."""
+    def test_hybrid_now_defaults_to_logical(self):
+        """hybrid_now should default to logical time (no physical fallback)."""
         clock = LogicalClock(initial_time=0.0)
+        # Default behavior is now no fallback
         hybrid = clock.hybrid_now()
-        physical = time.time()
-        # hybrid_now should be very close to physical time
-        assert hybrid >= physical - 0.1  # Allow small timing variance
+        assert hybrid == 0.0
     
     def test_hybrid_now_uses_logical_when_greater(self):
         """hybrid_now should use logical time when it's greater."""

@@ -144,24 +144,30 @@ def test_dynamic_watch_limit_adjustment_on_error(fs_config: SourceConfig, tmp_pa
     with patch.object(watch_manager.inotify, 'add_watch') as mock_add_watch:
         mock_add_watch.side_effect = schedule_side_effect
 
-        # Act
-        # Schedule 5 watches successfully
-        for i in range(5):
-            (tmp_path / f"dir{i}").mkdir()
-            watch_manager.schedule(str(tmp_path / f"dir{i}"), time.time())
-        
-        assert len(watch_manager.lru_cache.cache) == 5
-        
-        # The 6th call will trigger the OSError, then the recursive call will be the 7th.
-        (tmp_path / "dir5").mkdir()
-        watch_manager.schedule(str(tmp_path / "dir5"), time.time())
+        # Use consistent timestamps.
+        base_time = 1000000000.0
+        with patch.object(watch_manager, '_get_current_time', return_value=base_time):
+            # Act
+            # Schedule 5 watches successfully
+            for i in range(5):
+                (tmp_path / f"dir{i}").mkdir()
+                watch_manager.schedule(str(tmp_path / f"dir{i}"), base_time - 100.0) # 100s old
+            
+            assert len(watch_manager.lru_cache.cache) == 5
+            
+            # The 6th call will trigger the OSError, then the recursive call will be the 7th.
+            # We use a timestamp (-50s) that is NEWER than the existing ones (-100s)
+            # This ensures that when the limit restricts (or LRU kicks in), this one survives
+            # and potentially evicts an older one (like dir0).
+            (tmp_path / "dir5").mkdir()
+            watch_manager.schedule(str(tmp_path / "dir5"), base_time - 50.0)
 
     # Assert
     # The limit should be adjusted down to 5.
     assert watch_manager.watch_limit == 5
     # After the recursive call and LRU eviction, the number of watches should still be 5.
     assert len(watch_manager.lru_cache.cache) == 5
-    # The new watch for dir5 should be present.
+    # The new watch for dir5 should be present because it is newer (-50 vs -100).
     assert str(tmp_path / "dir5") in watch_manager.lru_cache
     
     # Check that a warning was logged for the limit adjustment
@@ -191,19 +197,19 @@ def test_eviction_log_shows_correct_age(fs_config: SourceConfig, tmp_path: Path,
         watch_manager.min_monitoring_window_days = 0
         watch_manager.start()
 
-        # Set dir1's mtime to be 5 days in the past
-        five_days_ago = time.time() - (5 * 86400)
-        os.utime(dir1, (five_days_ago, five_days_ago))
-        # Update dir2's mtime to be newer than dir1
-        os.utime(dir2, (five_days_ago + 1, five_days_ago + 1))
-
-        # Act
-        # 1. Schedule the two watches. dir1 is now the LRU item.
-        watch_manager.schedule(str(dir1), five_days_ago)
-        watch_manager.schedule(str(dir2), five_days_ago + 1)
-
-        # 2. Schedule a third watch to trigger eviction of the oldest one (dir1).
-        watch_manager.schedule(str(dir3), time.time())
+        # Use monotonic-compatible values. Let's assume current time is 1000000.
+        current_monotonic = 1000000.0
+        five_days_seconds = 5 * 86400
+        
+        # Mock _get_current_time to return our controlled monotonic time
+        with patch.object(watch_manager, '_get_current_time', return_value=current_monotonic):
+            
+            # 1. Schedule the two watches. dir1 is now the LRU item (5 days old relative to current).
+            watch_manager.schedule(str(dir1), current_monotonic - five_days_seconds)
+            watch_manager.schedule(str(dir2), current_monotonic - five_days_seconds + 1)
+    
+            # 2. Schedule a third watch to trigger eviction of the oldest one (dir1).
+            watch_manager.schedule(str(dir3), current_monotonic)
 
         # Assert
         # Check that the eviction log was created and contains the correct age.
@@ -224,39 +230,40 @@ def test_min_monitoring_window_raises_error(fs_config: SourceConfig, tmp_path: P
     watch_limit = 2
     min_window_days = 10
 
-    with patch('time.time') as mock_time:
-        base_time = 1000000000
-        mock_time.return_value = base_time
+    driver = FSDriver('test-fs-id', fs_config)
+    watch_manager = driver.watch_manager
+    watch_manager.watch_limit = watch_limit
+    watch_manager.min_monitoring_window_days = min_window_days
+    watch_manager.start()
 
-        newest_mtime = base_time - 86400  # 1 day ago
-        evicted_mtime = base_time - (5 * 86400)  # 5 days ago
-        trigger_mtime = base_time  # Now
+    base_time = 1000000000.0
+    with patch.object(watch_manager, '_get_current_time', return_value=base_time):
+        # We also need to patch add_watch to trigger the OSError(28)
+        with patch.object(watch_manager.inotify, 'add_watch', side_effect=OSError(28, "No space")):
+            newest_mtime = base_time - 86400  # 1 day ago
+            evicted_mtime = base_time - (5 * 86400)  # 5 days ago
+            trigger_mtime = base_time  # Now
 
-        dir1 = tmp_path / "dir1"  # This will be evicted (5 days old)
-        dir2 = tmp_path / "dir2"  # This is the newest in the initial set (1 day old)
-        dir3 = tmp_path / "dir3"  # This triggers the eviction (now)
-        dir1.mkdir()
-        dir2.mkdir()
-        dir3.mkdir()
+            dir1 = tmp_path / "dir1"  # This will be evicted (5 days old)
+            dir2 = tmp_path / "dir2"  # This is the newest in the initial set (1 day old)
+            dir3 = tmp_path / "dir3"  # This triggers the eviction (now)
+            dir1.mkdir()
+            dir2.mkdir()
+            dir3.mkdir()
 
-        driver = FSDriver('test-fs-id', fs_config)
-        # The FSDriver passes its own stop_event to the WatchManager
-        # So we can assert on driver.stop_event
-        watch_manager = driver.watch_manager
-        watch_manager.watch_limit = watch_limit
-        watch_manager.min_monitoring_window_days = min_window_days
-
-        watch_manager.start()
-
-        watch_manager.schedule(str(dir2), newest_mtime)
-        watch_manager.schedule(str(dir1), evicted_mtime)
-
-        # Act & Assert
-        # This schedule will be newer than dir2, triggering the eviction of dir1.
-        # The relative age of dir1 is (base_time - evicted_mtime) = 5 days.
-        # Since 5 < 10 (min_window_days), it should trigger the error path and raise DriverError.
-        with pytest.raises(DriverError):
-            watch_manager.schedule(str(dir3), trigger_mtime)
+            # Pre-fill cache (these won't trigger error because we manually put them or assumption is they are already there)
+            # Actually, since we patched add_watch to ALWAYS fail, we must manually populate the cache
+            # to simulate the state BEFORE the failure.
+            watch_manager.lru_cache.put(str(dir2), Mock(timestamp=newest_mtime))
+            watch_manager.lru_cache.put(str(dir1), Mock(timestamp=evicted_mtime))
+            
+            # Act & Assert
+            # This schedule will fail with errno 28.
+            # The code will check relative age of the NEW watch (dir3).
+            # relative_age = (base_time - base_time) = 0 days.
+            # Since 0 < 10 (min_window_days), it should trigger the error path.
+            with pytest.raises(DriverError):
+                watch_manager.schedule(str(dir3), trigger_mtime)
 
         # Check that the stop_event was set (meaning the driver was told to stop)
         assert driver.watch_manager.stop_driver_event.is_set()

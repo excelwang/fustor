@@ -16,7 +16,8 @@ def integration_configs(tmp_path: Path):
     source_config = SourceConfig(
         driver="fs", 
         uri=str(tmp_path),
-        credential=PasswdCredential(user="test")
+        credential=PasswdCredential(user="test"),
+        driver_params={"hot_data_cooloff_seconds": 0}
     )
     # Configure the echo driver
     pusher_config = PusherConfig(
@@ -73,6 +74,7 @@ async def test_snapshot_flow_with_real_drivers(integration_configs, tmp_path: Pa
     )
 
     # --- Act & Assert ---
+    sync_instance.pusher_driver_instance.logger.setLevel(logging.INFO)
     with caplog.at_level(logging.INFO):
         await sync_instance._run_snapshot_sync()
         
