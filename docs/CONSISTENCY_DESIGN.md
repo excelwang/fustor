@@ -151,8 +151,10 @@ Fusion 维护以下状态：
 ### 4.3 可疑名单 (Suspect List)
 
 - **用途**：标记可能正在写入的文件
-- **来源**：Snapshot/Audit 发现 `(Now - mtime) < 10min` 的文件
-- **淘汰**：静默 10 分钟后移除，或收到 Realtime Update 后移除
+- **来源**：Snapshot/Audit 发现 `(HybridNow - mtime) < 10min` 的文件
+- **淘汰与清理**：
+  - **实时移除**：收到该文件的 Realtime Update/Delete 时立即从名单移除并清除标记。
+  - **定时到期**：由 **后台定期任务 (Periodic Task)** 负责清理。基于单调时钟计算的 TTL 到期后自动移除（防止审计扫描导致的“续命”效应，TTL 锚定在文件最后一次变动的 mtime 上）。
 - **API 标记**：`integrity_suspect: true`
 
 ### 4.4 盲区名单 (Blind-spot List)
@@ -195,7 +197,7 @@ Fusion 维护以下状态：
         → 丢弃 (防止僵尸复活)
     else:
         → 添加到内存树
-        → 如果 (Now - X.mtime) < 10min: 加入 Suspect List
+        → 如果 (HybridNow - X.mtime) < 10min: 加入 Suspect List
 ```
 
 ### 5.3 Audit 消息处理
@@ -223,7 +225,7 @@ else:  # 内存中无 X
     else:
         → 添加到内存树
         → 加入 Blind-spot List (盲区新增)
-        → 如果 (Now - X.mtime) < 10min: 加入 Suspect List
+        → 如果 (HybridNow - X.mtime) < 10min: 加入 Suspect List
 ```
 
 #### 场景 2: Audit 报告"目录 D 缺少文件 B" (Blind Spot Deletion)
@@ -260,40 +262,45 @@ else (Full Scan on D):
 
 ---
 
-## 6. 混合时钟策略 (Hybrid Clock)
+## 6. 混合时钟与逻辑时间 (Logical Time & Hybrid Clock)
 
-为解决分布式环境中 Agent 与 Fusion 服务器之间的时钟漂移 (Clock Drift) 问题，系统引入了混合时钟机制。
+为解决分布式环境中 Agent 与 Fusion 服务器之间的时钟漂移 (Clock Drift) 问题，系统引入了基于观测水位线 (Watermark) 的逻辑时钟机制。
 
-### 6.1 问题背景
+### 6.1 逻辑时钟 (Logical Clock / Observation Watermark)
 
-在 NFS 环境中，文件 `mtime` 由 NFS Server 生成，而 Fusion 的当前时间 `now` 由 Fusion Server 的物理时钟决定。这可能导致：
-- `now < mtime`: 新文件被误判为未来产生，导致 `staleness` 计算错误。
-- `now - mtime` 误差：导致热文件检测 (Hot File Detection) 不准确。
+Fusion 为每个数据源维护一个单调递增的逻辑时钟 `L`。
+- **驱动源**：
+  1. **消息序列号 (Message Index)**：Agent 发送事件时携带的物理发送时间戳。`L = max(L, event.index)`
+  2. **观测到的 mtime**：处理插入/更新事件时携带的文件修改时间。`L = max(L, event.mtime)`
+- **意义**：表示 Fusion 系统目前“观测到”的最新的时间点。即使物理服务器时钟滞后，逻辑时钟也能保证不回退。
 
-### 6.2 逻辑时钟 (Logical Clock)
+### 6.2 时间类型定义
 
-Fusion 维护一个单调递增的逻辑时钟 `L`。
-- **更新规则**：每次收到文件事件（包含 `mtime`）时，更新 `L = max(L, mtime)`。
-- **持久化**：内存维护，重启重置。
+| 类型 | 时间源 | 特性 | 核心用途 |
+|------|------------|------|------|
+| **Logical Time (L)** | `LogicalClock` | 随数据流演进，无视漂移 | 时效性判定、陈旧证据保护 (`last_updated_at`) |
+| **Physical Time (P)** | `time.time()` | 挂钟时间，受 NTP 影响可能回退 | 外部 API 展示、Session 租约检查 |
+| **Monotonic Time (M)**| `time.monotonic()`| 纳秒级单调递增，不受挂钟调整影响 | 本地倒计时 (TTL Expiry)、频率限制 (Rate Limiting) |
 
-### 6.3 混合时间 (Hybrid Now)
+### 6.3 混合当前时间 (Hybrid Now)
 
-定义混合当前时间 `H` 为物理时钟与逻辑时钟的最大值：
-
+用于判定文件“新鲜度”的关键指标：
 ```python
-hybrid_now = max(time.time(), logical_clock.value)
+hybrid_now = max(time.time(), logical_clock.get_watermark())
 ```
+这确保了即使 Fusion 服务器物理时间极度滞后（如系统启动初期），也能通过 Agent 上报的时间戳将视角拉回到全球数据流的当前状态。
 
-### 6.4 应用场景
+### 6.4 应用场景裁决表
 
-| 场景 | 使用时间源 | 逻辑 |
+| 场景 | 使用时间源 | 判定逻辑 |
 |------|------------|------|
-| **热文件检测** | `Hybrid Now` | `if (hybrid_now - mtime) < threshold: mark_suspect()` |
-| **时效性指标** | `Hybrid Now` | `staleness = hybrid_now - oldest_unprocessed_mtime` |
-| **Session 超时** | `Physical Time` | `time.time() - last_heartbeat > timeout` |
-| **Suspect TTL** | `Physical Time` | `expiry = time.time() + ttl` |
+| **热文件判定 (Suspect)** | `Hybrid Now` | `age = hybrid_now - file.mtime` |
+| **陈旧证据保护 (Handle Audit)** | `Logical Time` | `if node.last_updated_at > audit_start_logical_time: skip_deletion` |
+| **Suspect 过期移除 (TTL)** | `Monotonic Time`| `remaining_life = hot_threshold - age`; `expiry = monotonic_now + remaining_life` |
+| **Session 超时 (Heartbeat)** | `Physical Time` | `physical_now - last_heartbeat > timeout_seconds` |
+| **清理频率限制 (Rate Limit)**| `Monotonic Time`| `if monotonic_now - last_cleanup < 5s: skip` |
 
-> **设计原则**：涉及与 `mtime` 进行**绝对时间点比较**的逻辑使用 `Hybrid Now`；涉及**时间段 (Duration)** 测量的逻辑使用 `Physical Time`。
+---
 
 ---
 

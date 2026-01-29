@@ -129,9 +129,9 @@ class DirectoryStructureParser:
         # Prevents deleted files from being resurrected by delayed Snapshot/Audit
         self._tombstone_list: Dict[str, float] = {}
         
-        # Suspect List: path -> suspect_until_timestamp (physical time)
+        # Suspect List: path -> (expires_at_monotonic, recorded_mtime)
         # Marks files that might still be written to
-        self._suspect_list: Dict[str, float] = {}
+        self._suspect_list: Dict[str, Tuple[float, float]] = {}
         
         # Audit lifecycle (logical audit start timestamp)
         self._last_audit_start: Optional[float] = None
@@ -227,13 +227,13 @@ class DirectoryStructureParser:
                 audit_skipped_value = payload.get('audit_skipped', False)
                 node.audit_skipped = audit_skipped_value
                 if audit_skipped_value:
-                    logger.info(f"Set audit_skipped=True for existing directory: {path}")
+                    self.logger.debug(f"Set audit_skipped=True for existing directory: {path}")
             else:
                 node = DirectoryNode(name, path, size, mtime, ctime)
                 audit_skipped_value = payload.get('audit_skipped', False)
                 node.audit_skipped = audit_skipped_value
                 if audit_skipped_value:
-                    logger.info(f"Set audit_skipped=True for NEW directory: {path}")
+                    self.logger.debug(f"Set audit_skipped=True for NEW directory: {path}")
                 self._directory_path_map[path] = node
                 if path != '/':
                     parent_node = self._directory_path_map.get(parent_path)
@@ -429,11 +429,30 @@ class DirectoryStructureParser:
                             # Update node flags
                             node = self._get_node(path)
                             if node:
-                                logical_now = self._logical_clock.get_watermark()
-                                if (logical_now - mtime) < self.hot_file_threshold:
-                                    node.integrity_suspect = True
-                                    # Use monotonic time for duration-based expiry
-                                    self._suspect_list[path] = time.monotonic() + self.hot_file_threshold
+                                # Use Logical Clock watermark for age calculation as requested.
+                                # This ensures cross-cluster clock skew doesn't affect "hotness" detection.
+                                age = self._logical_clock.get_watermark() - mtime
+                                
+                                # CRITICAL FIX: To prevent the "sliding window" and "re-marking" loops,
+                                # we only set/reset the physical TTL timer if the mtime has actually changed.
+                                # If mtime is the same, we let the existing timer (if any) finish its countdown.
+                                mtime_changed = (old_mtime is None) or (abs(old_mtime - mtime) > 1e-6)
+                                
+                                if mtime_changed:
+                                    if age < self.hot_file_threshold:
+                                        node.integrity_suspect = True
+                                        # Only set TTL if file is not already being tracked.
+                                        # If already tracked, let the cleanup task's stability check handle renewal.
+                                        if path not in self._suspect_list:
+                                            remaining_life = self.hot_file_threshold - age
+                                            self._suspect_list[path] = (time.monotonic() + max(0.0, remaining_life), mtime)
+                                    else:
+                                        # File became cold based on mtime change
+                                        node.integrity_suspect = False
+                                        self._suspect_list.pop(path, None)
+                                else:
+                                    # mtime unchanged. Maintain integrity_suspect flag if track exists.
+                                    node.integrity_suspect = (path in self._suspect_list)
                                 
                                 # Blind-spot tracking
                                 if is_audit:
@@ -577,14 +596,29 @@ class DirectoryStructureParser:
             
         self._last_suspect_cleanup_time = now_monotonic
         
-        expired_paths = [path for path, expires_at in self._suspect_list.items() if expires_at <= now_monotonic]
+        expired_paths = [path for path, (expires_at, _) in self._suspect_list.items() if expires_at <= now_monotonic]
         
         if expired_paths:
             for path in expired_paths:
-                self.logger.info(f"Suspect EXPIRED: {path} (expired at {self._suspect_list[path]})")
-                del self._suspect_list[path]
+                expires_at, recorded_mtime = self._suspect_list[path]
                 node = self._get_node(path)
-                if node:
+                
+                if not node:
+                    del self._suspect_list[path]
+                    continue
+                
+                # STABILITY CHECK:
+                # If mtime has changed since we last checked/recorded, it's still active.
+                # Renew for another round without age recalculation.
+                current_mtime = node.modified_time
+                if abs(current_mtime - recorded_mtime) > 1e-6:
+                    new_expiry = now_monotonic + self.hot_file_threshold
+                    self._suspect_list[path] = (new_expiry, current_mtime)
+                    self.logger.info(f"Suspect RENEWED (Active): {path} (new mtime: {current_mtime})")
+                else:
+                    # Stable! Confirmed cold.
+                    self.logger.info(f"Suspect EXPIRED (Stable): {path} (expired at {expires_at})")
+                    del self._suspect_list[path]
                     node.integrity_suspect = False
         
         return len(expired_paths)
@@ -592,7 +626,8 @@ class DirectoryStructureParser:
     async def get_suspect_list(self) -> Dict[str, float]:
         """Get the current Suspect List for Sentinel Sweep."""
         async with self._global_semaphore:
-            return dict(self._suspect_list)
+            # Return path -> expiry mapping for API compatibility
+            return {path: expires_at for path, (expires_at, _) in self._suspect_list.items()}
     
     async def update_suspect(self, path: str, new_mtime: float):
         """Update a suspect file's mtime from Sentinel Sweep."""
@@ -600,18 +635,23 @@ class DirectoryStructureParser:
             async with self._get_segment_lock(path):
                 # Update logical clock with observed mtime
                 self._logical_clock.update(new_mtime)
-                logical_now = self._logical_clock.get_watermark()
+                old_mtime = node.modified_time
+                node.modified_time = new_mtime
                 
-                node = self._get_node(path)
-                if node:
-                    node.modified_time = new_mtime
-                    # If file is now cold (using logical clock), remove from suspect list
-                    if (logical_now - new_mtime) >= self.hot_file_threshold:
+                # Use Logical Clock watermark for age calculation
+                watermark = self._logical_clock.get_watermark()
+                
+                # Only reset/add to timer if mtime actually changed
+                if old_mtime is None or abs(new_mtime - old_mtime) > 1e-6:
+                    if (watermark - new_mtime) < self.hot_file_threshold:
+                        # Stability model: if already tracked, don't reset, let cleanup handle it.
+                        if path not in self._suspect_list:
+                            self._suspect_list[path] = (time.monotonic() + self.hot_file_threshold, new_mtime)
+                        node.integrity_suspect = True
+                    else:
                         node.integrity_suspect = False
                         self._suspect_list.pop(path, None)
-                    else:
-                        # Still hot, extend suspect window (expiry uses monotonic clock)
-                        self._suspect_list[path] = time.monotonic() + self.hot_file_threshold
+                # If mtime is same, let the background timer run its course.
 
 
     async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
@@ -621,12 +661,12 @@ class DirectoryStructureParser:
             node = self._directory_path_map.get(path)
             if node:
                 return node.to_dict(recursive=recursive, max_depth=max_depth, only_path=only_path)
-            
+
             # Then check if it's a file
             node = self._file_path_map.get(path)
             if node:
                 return node.to_dict(recursive=recursive, max_depth=max_depth, only_path=only_path)
-                
+
             return None
     
     async def get_blind_spot_list(self) -> Dict[str, Any]:

@@ -299,7 +299,8 @@ class FSDriver(SourceDriver):
                                     if (watermark - st.st_mtime) < cooloff:
                                         with postponed_lock:
                                             if entry.path not in postponed_files:
-                                                postponed_files[entry.path] = time.monotonic()
+                                                # Record the mtime at discovery to check for stability later
+                                                postponed_files[entry.path] = st.st_mtime
                                         logger.debug(f"[fs] Postponing hot file: {entry.path}")
                                         continue
 
@@ -367,17 +368,21 @@ class FSDriver(SourceDriver):
                     if postponed_files:
                         logger.info(f"[{stream_id}] Snapshot scan: Look-back for {len(postponed_files)} files...")
                         lookback_rows = []
-                        cooloff = driver_params.get("hot_data_cooloff_seconds", 61.0)
-                        for path, observed_at in list(postponed_files.items()):
+                        for path, observed_mtime in list(postponed_files.items()):
                             try:
-                                # Duration check using monotonic clock (internal to Agent, safe)
-                                elapsed = time.monotonic() - observed_at
-                                if elapsed >= cooloff:
-                                    st = os.stat(path)
+                                st = os.stat(path)
+                                # Stability check: If mtime hasn't changed since we first skipped it, 
+                                # it's safe to report now regardless of its absolute age.
+                                if st.st_mtime == observed_mtime:
                                     meta = get_file_metadata(path, stat_info=st)
-                                    if meta: 
+                                    if meta:
                                         lookback_rows.append(meta)
-                                        postponed_files.pop(path, None)
+                                    postponed_files.pop(path, None)
+                                else:
+                                    # Still being written to. Discard from snapshot, 
+                                    # let future audit or realtime update capture it.
+                                    logger.debug(f"[fs] Snapshot discarding still-active file: {path}")
+                                    postponed_files.pop(path, None)
                             except OSError: 
                                 postponed_files.pop(path, None)
                         if lookback_rows:
@@ -513,6 +518,20 @@ class FSDriver(SourceDriver):
                             message_source=MessageSource.AUDIT,
                             index=audit_time
                         ), {}))
+                    else:
+                        # Optimization & Protection: Directory is silent (mtime unchanged). 
+                        # Report it as skipped to ensure children are protected from deletion in Fusion.
+                        dir_metadata = get_file_metadata(root, stat_info=dir_stat)
+                        if dir_metadata:
+                            dir_metadata['audit_skipped'] = True
+                            results_queue.put((UpdateEvent(
+                                event_schema=self.uri,
+                                table="files",
+                                rows=[dir_metadata],
+                                fields=list(dir_metadata.keys()),
+                                message_source=MessageSource.AUDIT,
+                                index=audit_time
+                            ), {}))
 
                     local_batch = []
                     local_subdirs = []
@@ -520,16 +539,21 @@ class FSDriver(SourceDriver):
                         for entry in it:
                             try:
                                 if entry.is_dir(follow_symlinks=False):
+                                    # Always collect subdirs to ensure deep detection since dir mtime 
+                                    # only reflects direct entry changes (create/delete/rename).
                                     local_subdirs.append(entry.path)
+                                
+                                # OPTIMIZATION: ONLY scan/stat files if the directory is NOT silent.
                                 elif not is_silent and fnmatch.fnmatch(entry.name, file_pattern):
                                     st = entry.stat()
-                                    # Hot data cool-off check
+                                    # Hot data stability check (Agent-side look-back)
                                     watermark = self._logical_clock.get_watermark()
                                     cooloff = self.config.driver_params.get("hot_data_cooloff_seconds", 61.0)
                                     if (watermark - st.st_mtime) < cooloff:
                                         with postponed_lock:
                                             if entry.path not in postponed_files:
-                                                postponed_files[entry.path] = time.monotonic()
+                                                # Record initial mtime to verify stability at scan end
+                                                postponed_files[entry.path] = st.st_mtime
                                         logger.debug(f"[fs] Postponing hot file during audit: {entry.path}")
                                         continue
 
@@ -561,8 +585,13 @@ class FSDriver(SourceDriver):
                             message_source=MessageSource.AUDIT,
                             index=audit_time
                         ), {}))
-                    else:
+                    elif not is_silent:
+                        # Only report empty result if directory was actually scanned
                         results_queue.put((None, {root: current_dir_mtime}))
+                    else:
+                        # For silent directory, we've already sent the audit_skipped event.
+                        # Do not send None event which would update mtime_cache incorrectly without full scan.
+                        pass
 
                     with map_lock:
                         for sd in local_subdirs:
@@ -590,20 +619,19 @@ class FSDriver(SourceDriver):
                 if pending_dirs == 0 and work_queue.empty():
                     if postponed_files:
                         logger.info(f"[{stream_id}] Audit scan: Look-back for {len(postponed_files)} files...")
-                        cooloff = self.config.driver_params.get("hot_data_cooloff_seconds", 61.0)
                         lookback_rows = []
-                        for path, observed_at in list(postponed_files.items()):
+                        for path, observed_mtime in list(postponed_files.items()):
                             try:
-                                elapsed = time.monotonic() - observed_at
                                 st = os.stat(path)
-                                meta = get_file_metadata(path, stat_info=st)
-                                if meta:
-                                    if elapsed >= cooloff:
+                                # Stability check: If mtime hasn't changed since we first skipped it, 
+                                # it's safe to report now regardless of its absolute age.
+                                if st.st_mtime == observed_mtime:
+                                    meta = get_file_metadata(path, stat_info=st)
+                                    if meta:
                                         lookback_rows.append(meta)
-                                    else:
-                                        # Still hot! Yield with audit_skipped=True to prevent deletion in Fusion
-                                        meta['audit_skipped'] = True
-                                        lookback_rows.append(meta)
+                                else:
+                                    # Still being written to. Skip for now, let future audit/events handle it.
+                                    logger.debug(f"[fs] Audit discarding still-active file: {path}")
                                 postponed_files.pop(path, None)
                             except OSError: 
                                 postponed_files.pop(path, None)
