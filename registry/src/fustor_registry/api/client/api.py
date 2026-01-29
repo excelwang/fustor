@@ -52,15 +52,17 @@ async def get_all_datastores_config(
         select(
             DatastoreModel.id,
             DatastoreModel.allow_concurrent_push,
-            DatastoreModel.session_timeout_seconds
+            DatastoreModel.session_timeout_seconds,
+            DatastoreModel.meta
         )
     )
 
     datastores_map = {}
-    for d_id, acp, sts in result.all():
+    for d_id, acp, sts, meta in result.all():
         datastores_map[d_id] = ClientDatastoreConfigResponse(
             datastore_id=d_id,
             allow_concurrent_push=acp,
-            session_timeout_seconds=sts
+            session_timeout_seconds=sts,
+            meta=meta
         )
     return list(datastores_map.values())

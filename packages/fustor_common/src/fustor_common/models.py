@@ -73,3 +73,4 @@ class DatastoreConfig(BaseModel):
     datastore_id: int
     allow_concurrent_push: bool
     session_timeout_seconds: int
+    meta: Optional[Dict] = None

@@ -89,6 +89,12 @@ class ParserManager:
         """Get the file directory structure parser"""
         return self.parsers["file_directory"]  # type: ignore
 
+    async def cleanup_expired_suspects(self):
+        """Cleanup expired suspects in all supporting parsers."""
+        parser = self.parsers.get("file_directory")
+        if parser and hasattr(parser, "cleanup_expired_suspects"):
+            await parser.cleanup_expired_suspects()
+
 
 
 async def get_cached_parser_manager(datastore_id: int) -> 'ParserManager':
@@ -113,6 +119,18 @@ async def get_cached_parser_manager(datastore_id: int) -> 'ParserManager':
         await new_manager.initialize_parsers()
         _parser_manager_cache[cache_key] = new_manager
         return new_manager
+
+
+async def cleanup_all_expired_suspects():
+    """Iterate through all cached managers and cleanup suspects."""
+    logger.debug("Triggering periodic suspect cleanup for all managers")
+    # Create a copy of values to avoid concurrent modification issues if cache changes
+    managers = list(_parser_manager_cache.values())
+    for manager in managers:
+        try:
+            await manager.cleanup_expired_suspects()
+        except Exception as e:
+            logger.error(f"Error during periodic suspect cleanup for datastore {manager.datastore_id}: {e}")
 
 
 # Interface for processing events

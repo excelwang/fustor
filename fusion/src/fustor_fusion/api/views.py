@@ -20,6 +20,20 @@ parser_router = APIRouter(tags=["Parsers - Data Views"])
 
 async def check_snapshot_status(datastore_id: int):
     """Checks if the initial snapshot sync is complete for the datastore."""
+    # 1. Check for active sessions if datastore is 'live'
+    from ..core.session_manager import session_manager
+    from ..auth.datastore_cache import datastore_config_cache
+    
+    config = datastore_config_cache.get_datastore_config(datastore_id)
+    if config and config.meta and config.meta.get('type') == 'live':
+        sessions = await session_manager.get_datastore_sessions(datastore_id)
+        if not sessions:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="No active sessions for this live datastore. Service temporarily unavailable."
+            )
+
+    # 2. Check snapshot completion and queue status
     is_signal_complete = await datastore_state_manager.is_snapshot_complete(datastore_id)
     
     # Check queue size AND inflight (currently processing) count
@@ -202,63 +216,6 @@ async def update_suspect_list_api(
     }
 
 
-@parser_router.post("/fs/audit-start",
-    summary="Signal Audit Start",
-    description="Called by Leader Agent when starting an Audit cycle"
-)
-async def audit_start_api(
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> Dict[str, str]:
-    """Signal the start of an Audit cycle."""
-    logger.info(f"Audit start signal received for datastore {datastore_id}")
-    manager = await get_cached_parser_manager(datastore_id)
-    parser = await manager.get_file_directory_parser()
-    await parser.handle_audit_start()
-    return {"status": "ok", "message": "Audit started"}
-
-
-    return {"status": "ok", "message": "Audit started"}
-
-
-async def _process_audit_end_background(datastore_id: int):
-    """Background task to wait for queue drain and process audit end."""
-    logger.info(f"Background task: Waiting for queue drain for audit end (datastore {datastore_id})")
-    
-    # Wait for queue to drain
-    max_wait = 10.0
-    wait_interval = 0.1
-    elapsed = 0.0
-    
-    while elapsed < max_wait:
-        queue_size = memory_event_queue.get_queue_size(datastore_id)
-        inflight = processing_manager.get_inflight_count(datastore_id)
-        if queue_size == 0 and inflight == 0:
-            break
-        await asyncio.sleep(wait_interval)
-        elapsed += wait_interval
-        
-    if elapsed >= max_wait:
-        logger.warning(f"Audit end timeout waiting for queue: queue={memory_event_queue.get_queue_size(datastore_id)}, inflight={processing_manager.get_inflight_count(datastore_id)}")
-    
-    manager = await get_cached_parser_manager(datastore_id)
-    parser = await manager.get_file_directory_parser()
-    await parser.handle_audit_end()
-    logger.info(f"Background task: Audit end processing complete for datastore {datastore_id}")
-
-
-@parser_router.post("/fs/audit-end",
-    summary="Signal Audit End",
-    description="Called by Leader Agent when completing an Audit cycle"
-)
-async def audit_end_api(
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> Dict[str, str]:
-    """Signal the end of an Audit cycle. Performs Tombstone cleanup and missing detection."""
-    logger.info(f"Audit end signal received for datastore {datastore_id}. Processing...")
-    
-    await _process_audit_end_background(datastore_id)
-    
-    return {"status": "ok", "message": "Audit end processed"}
 
 
 @parser_router.get("/fs/blind-spots", 

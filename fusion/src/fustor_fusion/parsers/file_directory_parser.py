@@ -139,6 +139,10 @@ class DirectoryStructureParser:
         # Paths seen during current audit cycle (for missing file detection)
         self._audit_seen_paths: Set[str] = set()
         
+        # Rate-limiting for suspect cleanup
+        self._last_suspect_cleanup_time = 0.0
+        self._suspect_cleanup_interval = 0.5 # seconds
+        
         # Blind-spot tracking
         # Just a set of paths. Incremental maintenance (audit-seen/realtime removes).
         # Reset ONLY when a new Agent Session connects.
@@ -321,15 +325,14 @@ class DirectoryStructureParser:
                 self.logger.info(f"Auto-detected Audit Start logical time: {self._last_audit_start} from event index {event.index}")
     
             # Session Change Detection
-            session_id = getattr(event, 'session_id', None)
+            session_id = getattr(event, "session_id", None)
             if session_id and session_id != self._current_session_id:
-                  if self._current_session_id is not None:
-                      self.logger.info(f"New Agent Session detected: {session_id} (was {self._current_session_id}). Resetting Blind Spot List.")
-                      self._blind_spot_deletions.clear()
-                      self._blind_spot_additions.clear()
-                  else:
-                      self.logger.info(f"Initial Agent Session: {session_id}")
-                  self._current_session_id = session_id
+                if self._current_session_id is not None:
+                    self.logger.info(f"New Agent Session detected: {session_id} (was {self._current_session_id}). Resetting Blind Spot List.")
+                    self._blind_spot_deletions.clear()
+                    self._blind_spot_additions.clear()
+                self._current_session_id = session_id
+
     
             self.logger.debug(f"Parser processing {len(event.rows)} rows from {message_source} (datastore {self.datastore_id})")
     
@@ -339,16 +342,18 @@ class DirectoryStructureParser:
                 if not path:
                     continue
                 
-                # Yield occasionally to allow other events (e.g. Realtime) to squeeze in
+                # Yield occasionally
                 rows_processed += 1
                 if rows_processed % 100 == 0:
                     await asyncio.sleep(0)
 
-                # Use segmented lock for row-level concurrency
+                # Use segmented lock
                 async with self._get_segment_lock(path):
-                    # Normalize path to match internal storage
+                    # Normalize path
                     path = path.rstrip('/') if path != '/' else '/'
-                        
+                    
+                    self.logger.debug(f"Processing {event_type} for {path} from {message_source}")
+
                     self._check_cache_invalidation(path)
                     mtime = payload.get('modified_time', 0.0)
                     
@@ -368,7 +373,7 @@ class DirectoryStructureParser:
                             await self._process_delete_in_memory(path)
                             ts = self._logical_clock.get_watermark()
                             self._tombstone_list[path] = ts
-                            self.logger.info(f"Tombstone CREATED for {path} at {ts}")
+                            self.logger.info(f"Tombstone CREATED for {path} at {ts} via Realtime DELETE")
                             self._suspect_list.pop(path, None)
                             self._blind_spot_deletions.discard(path)
                             self._blind_spot_additions.discard(path)
@@ -435,6 +440,11 @@ class DirectoryStructureParser:
                                     self._blind_spot_additions.add(path)
                                     
             return True
+    
+    async def cleanup_expired_suspects(self):
+        """Public method to trigger periodic cleanup."""
+        async with self._global_semaphore:
+            self._cleanup_expired_suspects_unlocked()
     
     async def handle_audit_start(self):
         """
@@ -556,26 +566,32 @@ class DirectoryStructureParser:
     
     def _cleanup_expired_suspects_unlocked(self):
         """Clean up expired suspects and their flags. Must be called with lock held."""
-        # Use monotonic for strictly local duration checks
+        if not self._suspect_list:
+            return 0
+            
         now_monotonic = time.monotonic()
-        if self._suspect_list:
-             self.logger.info(f"Suspect cleanup check: now_monotonic={now_monotonic} count={len(self._suspect_list)} items={self._suspect_list}")
+        
+        # Rate limit the cleanup logic to avoid excessive CPU usage
+        if now_monotonic - self._last_suspect_cleanup_time < self._suspect_cleanup_interval:
+            return 0
+            
+        self._last_suspect_cleanup_time = now_monotonic
         
         expired_paths = [path for path, expires_at in self._suspect_list.items() if expires_at <= now_monotonic]
         
-        for path in expired_paths:
-            self.logger.info(f"Suspect EXPIRED: {path} (expired at {self._suspect_list[path]})")
-            del self._suspect_list[path]
-            node = self._get_node(path)
-            if node:
-                node.integrity_suspect = False
+        if expired_paths:
+            for path in expired_paths:
+                self.logger.info(f"Suspect EXPIRED: {path} (expired at {self._suspect_list[path]})")
+                del self._suspect_list[path]
+                node = self._get_node(path)
+                if node:
+                    node.integrity_suspect = False
         
         return len(expired_paths)
 
     async def get_suspect_list(self) -> Dict[str, float]:
         """Get the current Suspect List for Sentinel Sweep."""
         async with self._global_semaphore:
-            self._cleanup_expired_suspects_unlocked()
             return dict(self._suspect_list)
     
     async def update_suspect(self, path: str, new_mtime: float):
@@ -621,22 +637,10 @@ class DirectoryStructureParser:
             # to ensure we don't return stale paths (e.g. if logic drifted)
             agent_missing_files = []
             
-            # Clean up stale entries while we iterate (lazy cleanup)
-            # This handles cases where _blind_spot_additions might get out of sync
-            # although our logic should prevent that.
-            stale_paths = []
-            
             for path in self._blind_spot_additions:
                 node = self._file_path_map.get(path)
                 if node:
                     agent_missing_files.append(node.to_dict())
-                else:
-                    # Node gone? Should have been removed.
-                    stale_paths.append(path)
-            
-            # Remove stale paths
-            for path in stale_paths:
-                self._blind_spot_additions.discard(path)
             
             return {
                 "additions_count": len(agent_missing_files),
@@ -696,3 +700,8 @@ class DirectoryStructureParser:
             self._audit_seen_paths.clear()
             self._blind_spot_deletions.clear()
             self.logger.info(f"Parser state reset for datastore {self.datastore_id}")
+
+    async def cleanup_expired_suspects(self):
+        """Public method to trigger periodic cleanup."""
+        async with self._global_semaphore:
+            self._cleanup_expired_suspects_unlocked()

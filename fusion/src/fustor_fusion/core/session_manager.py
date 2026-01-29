@@ -116,9 +116,25 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         # Clean up empty datastore entries
                         if not self._sessions[datastore_id]:
                             del self._sessions[datastore_id]
-                            from ..in_memory_queue import memory_event_queue
-                            await memory_event_queue.clear_datastore_data(datastore_id)
-                            logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain.")
+                            
+                            # NEW: Check if this is a 'live' datastore and clear data
+                            from ..auth.datastore_cache import datastore_config_cache
+                            from ..parsers.manager import reset_directory_tree
+                            
+                            datastore_config = datastore_config_cache.get_datastore_config(datastore_id)
+                            is_live = False
+                            if datastore_config and datastore_config.meta:
+                                if datastore_config.meta.get('type') == 'live':
+                                    is_live = True
+                            
+                            if is_live:
+                                logger.info(f"Datastore {datastore_id} is 'live' type. Resetting directory tree as no sessions remain.")
+                                await reset_directory_tree(datastore_id)
+                            else:
+                                from ..in_memory_queue import memory_event_queue
+                                await memory_event_queue.clear_datastore_data(datastore_id)
+                            
+                            logger.info(f"Cleared all session-associated data for datastore {datastore_id}.")
                         
                         # Release any associated lock and leader role
                         from ..datastore_state_manager import datastore_state_manager
@@ -187,7 +203,19 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             # 如果datastore没有更多session了，删除该datastore的条目
             if not self._sessions[datastore_id]:
                 del self._sessions[datastore_id]
-                await memory_event_queue.clear_datastore_data(datastore_id)
+                
+                # Check for 'live' type and reset
+                from ..auth.datastore_cache import datastore_config_cache
+                from ..parsers.manager import reset_directory_tree
+                
+                config = datastore_config_cache.get_datastore_config(datastore_id)
+                is_live = config.meta.get('type') == 'live' if config and config.meta else False
+                
+                if is_live:
+                    await reset_directory_tree(datastore_id)
+                else:
+                    await memory_event_queue.clear_datastore_data(datastore_id)
+                    
                 logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain after removal.")
             
             return True
@@ -227,7 +255,17 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     # If datastore has no more sessions, remove the datastore entry
                     if not self._sessions[datastore_id]:
                         del self._sessions[datastore_id]
-                        await memory_event_queue.clear_datastore_data(datastore_id)
+                        
+                        from ..auth.datastore_cache import datastore_config_cache
+                        from ..parsers.manager import reset_directory_tree
+                        config = datastore_config_cache.get_datastore_config(datastore_id)
+                        is_live = config.meta.get('type') == 'live' if config and config.meta else False
+                        
+                        if is_live:
+                            await reset_directory_tree(datastore_id)
+                        else:
+                            await memory_event_queue.clear_datastore_data(datastore_id)
+                        
                         logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain after cleanup.")
                     
                     # Release any associated lock in the datastore state manager

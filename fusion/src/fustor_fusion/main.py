@@ -23,7 +23,7 @@ from . import runtime_objects
 from fustor_event_model.models import EventBase
 
 # --- Parser Module Imports ---
-from .parsers.manager import process_event as process_single_event
+from .parsers.manager import process_event as process_single_event, cleanup_all_expired_suspects
 from .api.views import parser_router
 
 
@@ -70,6 +70,22 @@ async def lifespan(app: FastAPI):
     sync_task = asyncio.create_task(periodic_sync())
     logger.debug(f"Task created: {sync_task}")
     
+    # Start periodic suspect cleanup (Every 5 seconds)
+    async def periodic_suspect_cleanup():
+        logger.info("Starting periodic suspect cleanup task")
+        while True:
+            try:
+                await asyncio.sleep(5)
+                await cleanup_all_expired_suspects()
+            except asyncio.CancelledError:
+                logger.info("Periodic suspect cleanup task cancelled")
+                break
+            except Exception as e:
+                logger.error(f"Error in periodic_suspect_cleanup task: {e}", exc_info=True)
+                await asyncio.sleep(5) # Avoid tight error loop
+            
+    suspect_cleanup_task = asyncio.create_task(periodic_suspect_cleanup())
+    
     # Start periodic session cleanup (Every 5 seconds for fast failover)
     await session_manager.start_periodic_cleanup(5)
 
@@ -77,6 +93,7 @@ async def lifespan(app: FastAPI):
 
     logger.info("Application shutdown initiated.")
     sync_task.cancel()
+    suspect_cleanup_task.cancel()
     await processing_manager.stop_all()
     await session_manager.stop_periodic_cleanup()
     logger.info("Application shutdown complete.")
