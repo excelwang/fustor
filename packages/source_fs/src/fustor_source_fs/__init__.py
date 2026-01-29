@@ -13,7 +13,7 @@ import uuid
 import getpass
 import fnmatch
 import threading
-from typing import Any, Dict, Iterator, List, Tuple
+from typing import Any, Dict, Iterator, List, Tuple, Optional
 from fustor_core.drivers import SourceDriver
 from fustor_core.models.config import SourceConfig
 from fustor_event_model.models import EventBase, UpdateEvent, DeleteEvent, MessageSource
@@ -308,19 +308,20 @@ class FSDriver(SourceDriver):
 
         return _iterator_func()
 
-    def get_audit_iterator(self, mtime_cache: Dict[str, float] = None, **kwargs) -> Iterator[EventBase]:
+    def get_audit_iterator(self, mtime_cache: Dict[str, float] = None, **kwargs) -> Iterator[Tuple[Optional[EventBase], Dict[str, float]]]:
         """
         Audit Sync: Fast directory scanning using mtime optimization.
         
         Uses directory mtime to skip unchanged subtrees:
         - If directory mtime hasn't changed since last audit, skip scanning its direct children
         - Still recurse into subdirectories to check their mtimes
+        - Implement "True Silence": Stop sending directory nodes themselves if mtime matches.
         
         Args:
             mtime_cache: Previous audit's mtime cache {dir_path: mtime}
             
         Yields:
-            UpdateEvent with message_source=AUDIT and parent_mtime in each row
+            Tuple of (UpdateEvent, mtimes_to_commit)
         """
         stream_id = f"audit-fs-{uuid.uuid4().hex[:6]}"
         logger.info(f"[{stream_id}] Starting Audit Scan for path: {self.uri}")
@@ -328,7 +329,6 @@ class FSDriver(SourceDriver):
         if mtime_cache is None:
             mtime_cache = {}
         
-        new_mtime_cache: Dict[str, float] = {}
         batch_size = kwargs.get("batch_size", 100)
         file_pattern = self.config.driver_params.get("file_pattern", "*")
         audit_time = int(time.time() * 1000)
@@ -339,6 +339,7 @@ class FSDriver(SourceDriver):
         error_count = 0
         
         batch: List[Dict[str, Any]] = []
+        pending_mtimes: Dict[str, float] = {}
         
         # Prepare for recursion
         stack = [(self.uri, None)] # (path, parent_path)
@@ -360,29 +361,33 @@ class FSDriver(SourceDriver):
                 logger.debug(f"[{stream_id}] Error accessing {root}: {e}")
                 continue
 
-            # Cache mtime for next audit cycle
-            new_mtime_cache[root] = current_dir_mtime
-            
             dirs_scanned += 1
-
-            # Report directory
-            dir_metadata = get_file_metadata(root, stat_info=dir_stat)
-            if dir_metadata:
-                dir_metadata["parent_path"] = parent_path or os.path.dirname(root)
-                batch.append(dir_metadata)
 
             # Mtime check
             cached_mtime = mtime_cache.get(root)
             if cached_mtime is not None and cached_mtime == current_dir_mtime:
-                logger.info(f"[{stream_id}] Skipping directory {root} because current mtime {current_dir_mtime} matches cached.")
-                dir_metadata["audit_skipped"] = True
+                logger.debug(f"[{stream_id}] True Silence: Skipping directory node and children for {root}")
                 dirs_skipped += 1
                 # Still need to crawl subdirs because their mtimes might have changed 
                 # even if parent didn't (though usually parent changes).
-                # But for Audit optimization, we usually recursively skip if subtree mtime matches.
-                # However, FSDriver doesn't track recursive subtree mtime yet. 
-                # So we ONLY skip files in THIS directory.
+                for entry in entries:
+                    full_path = os.path.join(root, entry)
+                    if os.path.isdir(full_path):
+                        stack.append((full_path, root))
+                
+                # Directory is "finished" (no changes here), update cache immediately
+                pending_mtimes[root] = current_dir_mtime
+                # If we have collected enough mtimes or have a pending batch, yield them
+                if len(pending_mtimes) >= batch_size:
+                    yield (None, pending_mtimes)
+                    pending_mtimes = {}
             else:
+                # Report directory node (it changed or is new)
+                dir_metadata = get_file_metadata(root, stat_info=dir_stat)
+                if dir_metadata:
+                    dir_metadata["parent_path"] = parent_path or os.path.dirname(root)
+                    batch.append(dir_metadata)
+
                 # Scan files and queue subdirs
                 for entry in entries:
                     full_path = os.path.join(root, entry)
@@ -403,38 +408,44 @@ class FSDriver(SourceDriver):
                                     
                                     if len(batch) >= batch_size:
                                         fields = list(batch[0].keys())
-                                        yield UpdateEvent(
+                                        event = UpdateEvent(
                                             event_schema=self.uri, table="files", rows=batch,
                                             index=audit_time, fields=fields, message_source=MessageSource.AUDIT
                                         )
+                                        yield (event, {})
                                         batch = []
                     except OSError:
                         continue
-            
+                
+                # After scanning all children of 'root', it is safe to commit its mtime
+                pending_mtimes[root] = current_dir_mtime
+
             if len(batch) >= batch_size:
                 fields = list(batch[0].keys()) if batch else []
-                yield UpdateEvent(
+                event = UpdateEvent(
                     event_schema=self.uri, table="files", rows=batch,
                     index=audit_time, fields=fields, message_source=MessageSource.AUDIT
                 )
+                yield (event, pending_mtimes)
                 batch = []
+                pending_mtimes = {}
 
-        # Yield remaining batch
-        if batch:
-            fields = list(batch[0].keys())
-            yield UpdateEvent(
-                event_schema=self.uri, table="files", rows=batch,
-                index=audit_time, fields=fields, message_source=MessageSource.AUDIT
-            )
+        # Yield remaining batch and pending mtimes
+        if batch or pending_mtimes:
+            event = None
+            if batch:
+                fields = list(batch[0].keys())
+                event = UpdateEvent(
+                    event_schema=self.uri, table="files", rows=batch,
+                    index=audit_time, fields=fields, message_source=MessageSource.AUDIT
+                )
+            yield (event, pending_mtimes)
         
         logger.info(
             f"[{stream_id}] Audit complete. "
             f"Files scanned: {files_scanned}, Dirs scanned: {dirs_scanned}, "
             f"Dirs skipped (unchanged): {dirs_skipped}, Errors: {error_count}"
         )
-        
-        if 'mtime_cache_out' in kwargs:
-            kwargs['mtime_cache_out'].update(new_mtime_cache)
 
 
 

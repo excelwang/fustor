@@ -471,20 +471,18 @@ class SyncInstance:
         queue_size = 100
         event_queue = queue.Queue(maxsize=queue_size)
         stop_event = threading.Event()
-        next_cache = {}
 
         try:
             def _threaded_audit_producer():
                 try:
                     iterator = self.source_driver_instance.get_audit_iterator(
                         mtime_cache=self.audit_mtime_cache,
-                        mtime_cache_out=next_cache,
                         batch_size=self.pusher_config.batch_size
                     )
-                    for event_batch in iterator:
+                    for item in iterator:
                         if stop_event.is_set():
                             break
-                        event_queue.put(event_batch)
+                        event_queue.put(item)
                 except Exception as e:
                     logger.error(f"Audit producer thread for '{self.id}' failed: {e}", exc_info=True)
                     event_queue.put(e)
@@ -495,33 +493,30 @@ class SyncInstance:
             producer_thread.start()
 
             while True:
-                current_event = await asyncio.to_thread(event_queue.get)
+                item = await asyncio.to_thread(event_queue.get)
 
-                if current_event is None:
+                if item is None:
                     snapshot_completed_successfully = True
                     break
                 
-                if isinstance(current_event, Exception):
-                    raise current_event
+                if isinstance(item, Exception):
+                    raise item
 
-                if not current_event.rows:
-                    continue
+                current_event, finalized_mtimes = item
 
-                final_rows_for_push = current_event.rows
-                # Optional: apply field mapping if needed (usually audit matches snapshot schema)
-                 
-                current_event.rows = final_rows_for_push
-                await self.pusher_driver_instance.push(
-                    events=[current_event], 
-                    session_id=self.session_id, 
-                    source_type='audit' # Important for Fusion to distinguish
-                )
-                self._statistics["events_pushed"] += len(current_event.rows)
+                if current_event and current_event.rows:
+                    await self.pusher_driver_instance.push(
+                        events=[current_event], 
+                        session_id=self.session_id, 
+                        source_type='audit' # Important for Fusion to distinguish
+                    )
+                    self._statistics["events_pushed"] += len(current_event.rows)
+                
+                # Incremental Update: commit mtimes to local cache after successful push
+                if finalized_mtimes:
+                    self.audit_mtime_cache.update(finalized_mtimes)
             
             if snapshot_completed_successfully:
-                if next_cache:
-                    self.audit_mtime_cache = next_cache # Update cache only on success
-                
                 try:
                     await self.pusher_driver_instance.signal_audit_end(source_id=self.config.source)
                 except NotImplementedError:
