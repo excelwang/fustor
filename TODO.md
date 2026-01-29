@@ -4,7 +4,7 @@
 - [ ] Snapshot sync phase: postpone files that are currently being written to (active writes) from being pushed to Fusion.
 
 ## source fs
-- [ ] Pre-scan、快照同步、审计、哨兵都进行并行扫描优化：多线程并行扫描不同子目录。
+- [X] Pre-scan、快照同步、审计、哨兵都进行并行扫描优化：多线程并行扫描不同子目录。
 - [ ] 核对各模块的逻辑时钟。
 - [x] **审计通讯性能优化 (Performance & Efficiency)**:
   - [x] **实现“真正的静默” (True Silence)**: 在 Agent 的 Audit 模式下，如果目录的 `mtime` 与本地 `mtime_cache` 匹配，则不仅跳过其子文件扫描，还应**停止发送该目录节点本身**。假设只要在 `mtime_cache` 中存在，Fusion 就已经拥有该目录的元数据。这将极大地减少空闲期间的长尾流量。
@@ -13,3 +13,4 @@
   - [x] **Fusion 侧细粒度并发**: 在 Fusion 的 `DirectoryStructureParser` 中用**路径分段锁**替换当前的全局大锁，提升多 Agent 同时推送时的裁决并发性能。
 
 - [ ] benchmark 增加 审计性能测试、哨兵检测性能测试，（agent、fusion分别测耗时）。
+- [ ] 集成测试，将agent、fusion的容器的物理时间打乱，看是否能正确处理。

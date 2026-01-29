@@ -126,12 +126,13 @@ def test_iterator_ignores_old_events(tmp_path: Path, message_iterator_runner):
     events.clear()
 
     # Run the iterator, starting from NOW.
-    runner(start_pos_offset=0.1)
+    runner(start_pos_offset=0.0)
+    time.sleep(0.1) # Extra buffer to ensure start_position is in the past
 
     # Create a new file, which should be after the start_position
     new_file = tmp_path / "new.txt"
     new_file.write_text("fresh")
-    time.sleep(0.1)
+    time.sleep(0.5)
 
     # Assert
     assert len(events) == 1

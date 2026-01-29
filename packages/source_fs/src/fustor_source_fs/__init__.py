@@ -13,7 +13,9 @@ import uuid
 import getpass
 import fnmatch
 import threading
-from typing import Any, Dict, Iterator, List, Tuple, Optional
+import multiprocessing
+from typing import Any, Dict, Iterator, List, Tuple, Optional, Set
+from concurrent.futures import ThreadPoolExecutor
 from fustor_core.drivers import SourceDriver
 from fustor_core.models.config import SourceConfig
 from fustor_event_model.models import EventBase, UpdateEvent, DeleteEvent, MessageSource
@@ -61,18 +63,23 @@ class FSDriver(SourceDriver):
         super().__init__(id, config)
         self.uri = self.config.uri
         self.event_queue: queue.Queue[EventBase] = queue.Queue()
-        self.clock_offset = 0.0  # Placeholder for potential future use
-        self._stop_driver_event = threading.Event() # NEW
-        min_monitoring_window_days = self.config.driver_params.get("min_monitoring_window_days", 30.0)
-        self.watch_manager = _WatchManager(self.uri, event_handler=None, min_monitoring_window_days=min_monitoring_window_days, stop_driver_event=self._stop_driver_event)
-        self.event_handler = OptimizedWatchEventHandler(self.event_queue, self.watch_manager)
-        self.watch_manager.event_handler = self.event_handler
-        self._pre_scan_completed = False
-        self._pre_scan_lock = threading.Lock()
-        self._stop_driver_event = threading.Event() # NEW
+        self.clock_offset = 0.0
+        self._stop_driver_event = threading.Event()
         
         # Logical clock for hybrid time synchronization
         self._logical_clock = LogicalClock()
+        
+        min_monitoring_window_days = self.config.driver_params.get("min_monitoring_window_days", 30.0)
+        self.watch_manager = _WatchManager(self.uri, event_handler=None, min_monitoring_window_days=min_monitoring_window_days, stop_driver_event=self._stop_driver_event)
+        self.event_handler = OptimizedWatchEventHandler(self.event_queue, self.watch_manager, logical_clock=self._logical_clock)
+        self.watch_manager.event_handler = self.event_handler
+        self._pre_scan_completed = False
+        self._pre_scan_lock = threading.Lock()
+        
+        # Thread pool for parallel scanning
+        max_workers = self.config.driver_params.get("max_scan_workers", multiprocessing.cpu_count())
+        self._executor = ThreadPoolExecutor(max_workers=max_workers)
+        logger.info(f"[fs] Driver initialized with {max_workers} scan workers.")
         
         self._initialized = True
 
@@ -80,82 +87,116 @@ class FSDriver(SourceDriver):
         """
         Performs a one-time scan of the directory to populate the watch manager
         with a capacity-aware, hierarchy-complete set of the most active directories.
-        It uses a delta to normalize server mtimes to the client's time domain.
         """
         with self._pre_scan_lock:
             if self._pre_scan_completed:
                 return
 
-            logger.info(f"[fs] Performing initial directory scan to build hot-directory map for: {self.uri}")
+            logger.info(f"[fs] Performing initial parallel directory scan for: {self.uri}")
             
-            mtime_map: Dict[str, float] = {}
+            # 1. Parallel Scan (Top-down) to collect direct mtimes
+            # dir_mtime_map[path] = max(mtime of dir itself, mtime of its direct files)
+            dir_mtime_map: Dict[str, float] = {}
+            # dir_children_map[path] = [direct_child_dir_paths]
+            dir_children_map: Dict[str, List[str]] = {}
+            map_lock = threading.Lock()
             
-            # Track statistics
             error_count = 0
-            total_entries = 0  # Total number of entries (directories and files) processed
+            total_entries = 0
             
-            def handle_walk_error(e: OSError):
-                nonlocal error_count
-                error_count += 1
-                logger.debug(f"[fs] Error during pre-scan walk, skipping path: {e.filename} - {e.strerror}")
+            work_queue = queue.Queue()
+            work_queue.put(self.uri)
+            
+            active_tasks = threading.Event() # Set when tasks are in queue or being processed
+            pending_count = 1 # Number of directories currently in queue or processing
 
-            # Step 1: Walk the entire tree to build the mtime_map with server times
-            for root, dirs, files in os.walk(self.uri, topdown=False, onerror=handle_walk_error):
-                try:
-                    latest_mtime = os.path.getmtime(root)
-                except OSError:
-                    continue
-
-                for filename in files:
-                    file_path = os.path.join(root, filename)
+            def scan_worker():
+                nonlocal pending_count, error_count, total_entries
+                while True:
                     try:
-                        stat_info = os.stat(file_path)
-                        latest_mtime = max(latest_mtime, stat_info.st_mtime)
-                        # Update logical clock with observed mtime
-                        self._logical_clock.update(stat_info.st_mtime)
-                    except (FileNotFoundError, PermissionError, OSError) as e:
+                        root = work_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        if pending_count == 0:
+                            break
+                        continue
+
+                    try:
+                        latest_mtime = os.path.getmtime(root)
+                        local_subdirs = []
+                        local_total = 1
+                        
+                        with os.scandir(root) as it:
+                            for entry in it:
+                                local_total += 1
+                                try:
+                                    if entry.is_dir(follow_symlinks=False):
+                                        local_subdirs.append(entry.path)
+                                    else:
+                                        st = entry.stat(follow_symlinks=False)
+                                        latest_mtime = max(latest_mtime, st.st_mtime)
+                                        self._logical_clock.update(st.st_mtime)
+                                except OSError:
+                                    error_count += 1
+
+                        with map_lock:
+                            dir_mtime_map[root] = latest_mtime
+                            dir_children_map[root] = local_subdirs
+                            total_entries += local_total
+                            
+                            # Add subdirs to queue
+                            for sd in local_subdirs:
+                                pending_count += 1
+                                work_queue.put(sd)
+                        
+                        # Progress logging
+                        if total_entries > 0 and total_entries % 10000 < local_total:
+                            logger.info(f"[fs] Pre-scan progress: processed {total_entries} entries, pending dirs: {pending_count}")
+
+                    except OSError:
                         error_count += 1
-                        logger.debug(f"[fs] Error during pre-scan walk, skipping path: {e.filename} - {e.strerror}")
+                    finally:
+                        with map_lock:
+                            pending_count -= 1
+                        work_queue.task_done()
 
-                    # Count each file as an entry
-                    total_entries += 1
+            # Start workers
+            workers = []
+            for _ in range(self._executor._max_workers):
+                t = threading.Thread(target=scan_worker, daemon=True)
+                t.start()
+                workers.append(t)
+            
+            # Wait for completion
+            work_queue.join()
+            for t in workers:
+                t.join()
 
-                for dirname in dirs:
-                    dirpath = os.path.join(root, dirname)
-                    latest_mtime = max(latest_mtime, mtime_map.get(dirpath, 0))
-                    # Count each dir as an entry
-                    total_entries += 1
-                
-                # Count the current directory
-                mtime_map[root] = latest_mtime
-                total_entries += 1  # Increment for each directory processed
-                
-                # Log statistics every 1000 entries (using a reasonable batch size)
-                if total_entries % 10000 == 0:
-                    # Find the newest and oldest directories so far
-                    if mtime_map:
-                        newest_dir = max(mtime_map.items(), key=lambda x: x[1])
-                        oldest_dir = min(mtime_map.items(), key=lambda x: x[1])
-                        newest_age = time.time() - newest_dir[1]  # Difference in seconds
-                        oldest_age = time.time() - oldest_dir[1]  # Difference in seconds
-                        logger.info(
-                            f"[fs] Pre-scan progress: processed {total_entries} entries, "
-                            f"errors: {error_count}, newest_dir: {newest_dir[0]} (age: {newest_age/86400:.2f} days), "
-                            f"oldest_dir: {oldest_dir[0]} (age: {oldest_age/86400:.2f} days)"
-                        )
+            # 2. Bottom-up pass to calculate recursive subtree mtimes
+            logger.info(f"[fs] Parallel scan finished. Calculating recursive mtimes for {len(dir_mtime_map)} directories...")
+            
+            # Sort directories by depth (deepest first) to bubble up mtimes
+            all_dirs = sorted(dir_mtime_map.keys(), key=lambda x: x.count(os.sep), reverse=True)
+            
+            for path in all_dirs:
+                # current_mtime is max(self, direct_files)
+                # We need to add max(recursive_mtimes_of_subdirs)
+                latest = dir_mtime_map[path]
+                for subdir in dir_children_map.get(path, []):
+                    latest = max(latest, dir_mtime_map.get(subdir, 0))
+                dir_mtime_map[path] = latest
             
             # Step 2: Calculate baseline delta using the true recursive mtime of the root.
             try:
-                root_recursive_mtime = mtime_map.get(self.uri, os.path.getmtime(self.uri))
+                root_recursive_mtime = dir_mtime_map.get(self.uri, os.path.getmtime(self.uri))
                 self.clock_offset = time.time() - root_recursive_mtime
                 logger.info(f"[fs] Calculated client-server time delta: {self.clock_offset:.2f} seconds.")
             except OSError as e:
                 logger.warning(f"[fs] Could not stat root directory to calculate time delta: {e}. Proceeding without normalization.")
 
             # Log final statistics before sorting
-            if mtime_map:
-                newest_dir = max(mtime_map.items(), key=lambda x: x[1])
-                oldest_dir = min(mtime_map.items(), key=lambda x: x[1])
+            if dir_mtime_map:
+                newest_dir = max(dir_mtime_map.items(), key=lambda x: x[1])
+                oldest_dir = min(dir_mtime_map.items(), key=lambda x: x[1])
                 newest_age = time.time() - newest_dir[1]  # Difference in seconds
                 oldest_age = time.time() - oldest_dir[1]  # Difference in seconds
                 logger.info(
@@ -164,11 +205,11 @@ class FSDriver(SourceDriver):
                     f"oldest_dir: {safe_path_handling(oldest_dir[0])} (age: {oldest_age/86400:.2f} days)"
                 )
 
-            logger.info(f"[fs] Found {len(mtime_map)} total directories. Building capacity-aware, hierarchy-complete watch set...")
-            sorted_dirs = sorted(mtime_map.items(), key=lambda item: item[1], reverse=True)[:self.watch_manager.watch_limit]
+            logger.info(f"[fs] Found {len(dir_mtime_map)} total directories. Building capacity-aware, hierarchy-complete watch set...")
+            sorted_dirs = sorted(dir_mtime_map.items(), key=lambda item: item[1], reverse=True)[:self.watch_manager.watch_limit]
             old_limit = self.watch_manager.watch_limit
             for path, _ in sorted_dirs:
-                server_mtime = mtime_map.get(path)
+                server_mtime = dir_mtime_map.get(path)
                 if server_mtime:
                     # Normalize to client time domain while preserving relative differences
                     lru_timestamp = server_mtime + self.clock_offset
@@ -183,92 +224,136 @@ class FSDriver(SourceDriver):
 
 
     def get_snapshot_iterator(self, **kwargs) -> Iterator[EventBase]:
+        """
+        Parallel Snapshot Scan Phase.
+        """
         stream_id = f"snapshot-fs-{uuid.uuid4().hex[:6]}"
-        logger.info(f"[{stream_id}] Starting Snapshot Scan Phase: for path: {self.uri}")
+        logger.info(f"[{stream_id}] Starting Parallel Snapshot Scan: {self.uri}")
 
         driver_params = self.config.driver_params
         if driver_params.get("startup_mode") == "message-only":
-            logger.info(f"[{stream_id}] Skipping snapshot due to 'message-only' mode.")
             return
-
+            
         file_pattern = driver_params.get("file_pattern", "*")
         batch_size = kwargs.get("batch_size", 100)
+        snapshot_time = int(time.time() * 1000)
+
+        results_queue = queue.Queue(maxsize=batch_size * 2)
+        work_queue = queue.Queue()
+        work_queue.put(self.uri)
         
-        logger.info(f"[{stream_id}] Scan parameters: file_pattern='{file_pattern}'")
+        pending_dirs = 1
+        map_lock = threading.Lock()
+        stop_workers = threading.Event()
 
-        try:
-            batch: List[Dict[str, Any]] = []
-            files_processed_count = 0
-            error_count = 0
-            snapshot_time = int(time.time() * 1000)
-
-            def handle_walk_error(e: OSError):
-                nonlocal error_count
-                error_count += 1
-                logger.debug(f"[{stream_id}] Error during snapshot walk, skipping path: {safe_path_handling(e.filename)} - {e.strerror}")
-
-            temp_mtime_map: Dict[str, float] = {}
-
-            for root, dirs, files in os.walk(self.uri, topdown=False, onerror=handle_walk_error):
+        def scan_worker():
+            nonlocal pending_dirs
+            while not stop_workers.is_set():
                 try:
-                    dir_stat_info = os.stat(root)
-                    latest_mtime_in_subtree = dir_stat_info.st_mtime
+                    root = work_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+                try:
+                    dir_stat = os.stat(root)
+                    latest_mtime_in_subtree = dir_stat.st_mtime
+                    dir_metadata = get_file_metadata(root, stat_info=dir_stat)
+                    results_queue.put(UpdateEvent(
+                        event_schema=self.uri,
+                        table="files",
+                        rows=[dir_metadata],
+                        fields=list(dir_metadata.keys()),
+                        message_source=MessageSource.SNAPSHOT,
+                        index=snapshot_time
+                    ))
+
+                    local_batch = []
+                    with os.scandir(root) as it:
+                        for entry in it:
+                            try:
+                                if entry.is_dir(follow_symlinks=False):
+                                    with map_lock:
+                                        pending_dirs += 1
+                                        work_queue.put(entry.path)
+                                elif fnmatch.fnmatch(entry.name, file_pattern):
+                                    st = entry.stat()
+                                    meta = get_file_metadata(entry.path, stat_info=st)
+                                    self._logical_clock.update(meta['modified_time'])
+                                    latest_mtime_in_subtree = max(latest_mtime_in_subtree, meta['modified_time'])
+                                    local_batch.append(meta)
+                                    if len(local_batch) >= batch_size:
+                                        results_queue.put(UpdateEvent(
+                                            event_schema=self.uri,
+                                            table="files",
+                                            rows=local_batch,
+                                            fields=list(local_batch[0].keys()),
+                                            message_source=MessageSource.SNAPSHOT,
+                                            index=snapshot_time
+                                        ))
+                                        local_batch = []
+                            except OSError:
+                                pass
+                    
+                    if local_batch:
+                        results_queue.put(UpdateEvent(
+                            event_schema=self.uri,
+                            table="files",
+                            rows=local_batch,
+                            fields=list(local_batch[0].keys()),
+                            message_source=MessageSource.SNAPSHOT,
+                            index=snapshot_time
+                        ))
+                    
+                    self.watch_manager.touch(root, latest_mtime_in_subtree + self.clock_offset, is_recursive_upward=False)
+
                 except OSError:
-                    dir_stat_info = None
-                    latest_mtime_in_subtree = 0.0
+                    pass
+                finally:
+                    with map_lock:
+                        pending_dirs -= 1
+                    work_queue.task_done()
 
-                for filename in files:
-                    file_path = os.path.join(root, filename)
-                    try:
-                        stat_info = os.stat(file_path)
-                        latest_mtime_in_subtree = max(latest_mtime_in_subtree, stat_info.st_mtime)
-                        if fnmatch.fnmatch(filename, file_pattern):
-                            # TODO: Exclude files that are still being written to.
-                            # Consider checking if mtime is very recent or using lsof-like check.
-                            metadata = get_file_metadata(file_path, stat_info=stat_info)
-                            if metadata:
-                                batch.append(metadata)
-                                files_processed_count += 1
-                                if len(batch) >= batch_size:
-                                    # Extract fields from the first row if batch is not empty
-                                    fields = list(batch[0].keys()) if batch else []
-                                    yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields, message_source=MessageSource.SNAPSHOT)
-                                    batch = []
-                    except (FileNotFoundError, PermissionError, OSError) as e:
-                        error_count += 1
-                        logger.debug(f"[fs] Error processing file during snapshot: {safe_path_handling(file_path)} - {str(e)}")
+        # Start workers
+        workers = []
+        for _ in range(self._executor._max_workers):
+            t = threading.Thread(target=scan_worker, daemon=True)
+            t.start()
+            workers.append(t)
 
-                for dirname in dirs:
-                    dirpath = os.path.join(root, dirname)
-                    latest_mtime_in_subtree = max(latest_mtime_in_subtree, temp_mtime_map.get(dirpath, 0.0))
-                
-                temp_mtime_map[root] = latest_mtime_in_subtree
-                aligned_lru_timestamp = latest_mtime_in_subtree + self.clock_offset
-                self.watch_manager.touch(root, aligned_lru_timestamp, is_recursive_upward=False)
-
-                if dir_stat_info:
-                    dir_metadata = get_file_metadata(root, stat_info=dir_stat_info)
-                    if dir_metadata:
-                        batch.append(dir_metadata)
-                        files_processed_count += 1
-                
-                if len(batch) >= batch_size:
-                    # Extract fields from the first row if batch is not empty
-                    fields = list(batch[0].keys()) if batch else []
-                    yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields, message_source=MessageSource.SNAPSHOT)
-                    batch = []
-            
-            if batch:
-                fields = list(batch[0].keys()) if batch else []
-                yield UpdateEvent(event_schema=self.uri, table="files", rows=batch, index=snapshot_time, fields=fields, message_source=MessageSource.SNAPSHOT)
-
-            if error_count > 0:
-                logger.warning(f"[{stream_id}] Skipped {error_count} paths in total due to permission or other errors.")
-
-            logger.info(f"[{stream_id}] Full scan complete. Processed {files_processed_count} files and directories.")
-
-        except Exception as e:
-            logger.error(f"[{stream_id}] Snapshot phase for fs failed: {e}", exc_info=True)
+        # Consumer loop with global re-batching
+        row_buffer = []
+        while True:
+            try:
+                event = results_queue.get(timeout=0.2)
+                row_buffer.extend(event.rows)
+                while len(row_buffer) >= batch_size:
+                    yield UpdateEvent(
+                        event_schema=self.uri,
+                        table="files",
+                        rows=row_buffer[:batch_size],
+                        fields=list(row_buffer[0].keys()),
+                        message_source=MessageSource.SNAPSHOT,
+                        index=snapshot_time
+                    )
+                    row_buffer = row_buffer[batch_size:]
+            except queue.Empty:
+                if pending_dirs == 0 and work_queue.empty():
+                    break
+        
+        if row_buffer:
+            yield UpdateEvent(
+                event_schema=self.uri,
+                table="files",
+                rows=row_buffer,
+                fields=list(row_buffer[0].keys()),
+                message_source=MessageSource.SNAPSHOT,
+                index=snapshot_time
+            )
+        
+        stop_workers.set()
+        for t in workers:
+            t.join()
+        logger.info(f"[{stream_id}] Snapshot scan completed.")
 
     def get_message_iterator(self, start_position: int=-1, **kwargs) -> Iterator[EventBase]:
         
@@ -310,142 +395,123 @@ class FSDriver(SourceDriver):
 
     def get_audit_iterator(self, mtime_cache: Dict[str, float] = None, **kwargs) -> Iterator[Tuple[Optional[EventBase], Dict[str, float]]]:
         """
-        Audit Sync: Fast directory scanning using mtime optimization.
-        
-        Uses directory mtime to skip unchanged subtrees:
-        - If directory mtime hasn't changed since last audit, skip scanning its direct children
-        - Still recurse into subdirectories to check their mtimes
-        - Implement "True Silence": Stop sending directory nodes themselves if mtime matches.
-        
-        Args:
-            mtime_cache: Previous audit's mtime cache {dir_path: mtime}
-            
-        Yields:
-            Tuple of (UpdateEvent, mtimes_to_commit)
+        Parallel Audit Sync: Uses a task queue to scan subtrees in parallel.
+        Correctly implements mtime-based 'True Silence'.
         """
         stream_id = f"audit-fs-{uuid.uuid4().hex[:6]}"
-        logger.info(f"[{stream_id}] Starting Audit Scan for path: {self.uri}")
+        logger.info(f"[{stream_id}] Starting Parallel Audit Scan: {self.uri}")
         
         if mtime_cache is None:
             mtime_cache = {}
-        
+            
         batch_size = kwargs.get("batch_size", 100)
         file_pattern = self.config.driver_params.get("file_pattern", "*")
         audit_time = int(time.time() * 1000)
         
-        files_scanned = 0
-        dirs_scanned = 0
-        dirs_skipped = 0
-        error_count = 0
+        results_queue = queue.Queue(maxsize=batch_size * 2)
+        work_queue = queue.Queue()
+        work_queue.put((self.uri, None))
         
-        batch: List[Dict[str, Any]] = []
-        pending_mtimes: Dict[str, float] = {}
-        
-        # Prepare for recursion
-        stack = [(self.uri, None)] # (path, parent_path)
-        
-        while stack:
-            root, parent_path = stack.pop()
-            
-            try:
+        pending_dirs = 1
+        map_lock = threading.Lock()
+        stop_workers = threading.Event()
+
+        def audit_worker():
+            nonlocal pending_dirs
+            while not stop_workers.is_set():
                 try:
-                    entries = os.listdir(root)
-                except (FileNotFoundError, PermissionError):
+                    root, parent_path = work_queue.get(timeout=0.1)
+                except queue.Empty:
                     continue
-                
-                dir_stat = os.stat(root)
-                current_dir_mtime = dir_stat.st_mtime
-                
-            except OSError as e:
-                error_count += 1
-                logger.debug(f"[{stream_id}] Error accessing {root}: {e}")
-                continue
 
-            dirs_scanned += 1
+                try:
+                    dir_stat = os.stat(root)
+                    current_dir_mtime = dir_stat.st_mtime
+                    cached_mtime = mtime_cache.get(root)
+                    
+                    is_silent = cached_mtime is not None and cached_mtime == current_dir_mtime
+                    
+                    if not is_silent:
+                        dir_metadata = get_file_metadata(root, stat_info=dir_stat)
+                        results_queue.put((UpdateEvent(
+                            event_schema=self.uri,
+                            table="files",
+                            rows=[dir_metadata],
+                            fields=list(dir_metadata.keys()),
+                            message_source=MessageSource.AUDIT,
+                            index=audit_time
+                        ), {}))
 
-            # Mtime check
-            cached_mtime = mtime_cache.get(root)
-            if cached_mtime is not None and cached_mtime == current_dir_mtime:
-                logger.debug(f"[{stream_id}] True Silence: Skipping directory node and children for {root}")
-                dirs_skipped += 1
-                # Still need to crawl subdirs because their mtimes might have changed 
-                # even if parent didn't (though usually parent changes).
-                for entry in entries:
-                    full_path = os.path.join(root, entry)
-                    if os.path.isdir(full_path):
-                        stack.append((full_path, root))
-                
-                # Directory is "finished" (no changes here), update cache immediately
-                pending_mtimes[root] = current_dir_mtime
-                # If we have collected enough mtimes or have a pending batch, yield them
-                if len(pending_mtimes) >= batch_size:
-                    yield (None, pending_mtimes)
-                    pending_mtimes = {}
-            else:
-                # Report directory node (it changed or is new)
-                dir_metadata = get_file_metadata(root, stat_info=dir_stat)
-                if dir_metadata:
-                    dir_metadata["parent_path"] = parent_path or os.path.dirname(root)
-                    batch.append(dir_metadata)
+                    local_batch = []
+                    local_subdirs = []
+                    with os.scandir(root) as it:
+                        for entry in it:
+                            try:
+                                if entry.is_dir(follow_symlinks=False):
+                                    local_subdirs.append(entry.path)
+                                elif not is_silent and fnmatch.fnmatch(entry.name, file_pattern):
+                                    st = entry.stat()
+                                    meta = get_file_metadata(entry.path, stat_info=st)
+                                    self._logical_clock.update(meta['modified_time'])
+                                    # Add parent info for Rule 3 arbitration
+                                    meta['parent_path'] = root
+                                    meta['parent_mtime'] = current_dir_mtime
+                                    local_batch.append(meta)
+                                    if len(local_batch) >= batch_size:
+                                        results_queue.put((UpdateEvent(
+                                            event_schema=self.uri,
+                                            table="files",
+                                            rows=local_batch,
+                                            fields=list(local_batch[0].keys()),
+                                            message_source=MessageSource.AUDIT,
+                                            index=audit_time
+                                        ), {}))
+                                        local_batch = []
+                            except OSError:
+                                pass
 
-                # Scan files and queue subdirs
-                for entry in entries:
-                    full_path = os.path.join(root, entry)
-                    try:
-                        st = os.stat(full_path)
-                        if os.path.isdir(full_path):
-                            stack.append((full_path, root))
-                        else:
-                            if fnmatch.fnmatch(entry, file_pattern):
-                                metadata = get_file_metadata(full_path, stat_info=st)
-                                if metadata:
-                                    metadata["parent_path"] = root
-                                    metadata["parent_mtime"] = current_dir_mtime
-                                    # Update logical clock with observed mtime
-                                    self._logical_clock.update(metadata.get("modified_time", 0))
-                                    batch.append(metadata)
-                                    files_scanned += 1
-                                    
-                                    if len(batch) >= batch_size:
-                                        fields = list(batch[0].keys())
-                                        event = UpdateEvent(
-                                            event_schema=self.uri, table="files", rows=batch,
-                                            index=audit_time, fields=fields, message_source=MessageSource.AUDIT
-                                        )
-                                        yield (event, {})
-                                        batch = []
-                    except OSError:
-                        continue
-                
-                # After scanning all children of 'root', it is safe to commit its mtime
-                pending_mtimes[root] = current_dir_mtime
+                    if local_batch:
+                        results_queue.put((UpdateEvent(
+                            event_schema=self.uri,
+                            table="files",
+                            rows=local_batch,
+                            fields=list(local_batch[0].keys()),
+                            message_source=MessageSource.AUDIT,
+                            index=audit_time
+                        ), {}))
+                    else:
+                        results_queue.put((None, {root: current_dir_mtime}))
 
-            if len(batch) >= batch_size:
-                fields = list(batch[0].keys()) if batch else []
-                event = UpdateEvent(
-                    event_schema=self.uri, table="files", rows=batch,
-                    index=audit_time, fields=fields, message_source=MessageSource.AUDIT
-                )
-                yield (event, pending_mtimes)
-                batch = []
-                pending_mtimes = {}
+                    with map_lock:
+                        for sd in local_subdirs:
+                            pending_dirs += 1
+                            work_queue.put((sd, root))
 
-        # Yield remaining batch and pending mtimes
-        if batch or pending_mtimes:
-            event = None
-            if batch:
-                fields = list(batch[0].keys())
-                event = UpdateEvent(
-                    event_schema=self.uri, table="files", rows=batch,
-                    index=audit_time, fields=fields, message_source=MessageSource.AUDIT
-                )
-            yield (event, pending_mtimes)
+                except OSError:
+                    pass
+                finally:
+                    with map_lock:
+                        pending_dirs -= 1
+                    work_queue.task_done()
+
+        workers = []
+        for _ in range(self._executor._max_workers):
+            t = threading.Thread(target=audit_worker, daemon=True)
+            t.start()
+            workers.append(t)
+
+        while True:
+            try:
+                event_tuple = results_queue.get(timeout=0.1)
+                yield event_tuple
+            except queue.Empty:
+                if pending_dirs == 0 and work_queue.empty():
+                    break
         
-        logger.info(
-            f"[{stream_id}] Audit complete. "
-            f"Files scanned: {files_scanned}, Dirs scanned: {dirs_scanned}, "
-            f"Dirs skipped (unchanged): {dirs_skipped}, Errors: {error_count}"
-        )
+        stop_workers.set()
+        for t in workers:
+            t.join()
+        logger.info(f"[{stream_id}] Audit scan completed.")
 
 
 
@@ -466,24 +532,28 @@ class FSDriver(SourceDriver):
         Verifies the existence and mtime of the given file paths.
         Used for Sentinel Sweep.
         """
-        results = []
-        for path in paths:
+        def verify_single(path):
             try:
                 stat_info = os.stat(path)
-                results.append({
+                return {
                     "path": path,
                     "mtime": stat_info.st_mtime,
                     "status": "exists"
-                })
+                }
             except FileNotFoundError:
-                results.append({
+                return {
                     "path": path,
                     "mtime": 0.0,
                     "status": "missing"
-                })
+                }
             except Exception as e:
                 logger.warning(f"[fs] Error verifying file {path}: {e}")
-        return results
+                return None
+
+        # Process in parallel using the driver's executor
+        results = list(self._executor.map(verify_single, paths))
+        # Filter out failed ones
+        return [r for r in results if r is not None]
 
     @classmethod
     async def get_available_fields(cls, **kwargs) -> Dict[str, Any]:

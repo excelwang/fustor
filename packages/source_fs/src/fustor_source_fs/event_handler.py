@@ -37,10 +37,18 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
     Event handler that processes watchdog events immediately using dedicated
     on_* methods, which is the idiomatic way to use watchdog.
     """
-    def __init__(self, event_queue: queue.Queue, watch_manager: _WatchManager):
+    def __init__(self, event_queue: queue.Queue, watch_manager: _WatchManager, logical_clock=None):
         super().__init__()
         self.event_queue = event_queue
         self.watch_manager = watch_manager
+        self.logical_clock = logical_clock
+
+    def _get_index(self, mtime=None):
+        if mtime is not None:
+            return int(mtime * 1000)
+        if self.logical_clock:
+            return int(self.logical_clock.hybrid_now() * 1000)
+        return int(time.time() * 1000)
 
     def _touch_recursive_bottom_up(self, path: str):
         """Recursively touches a directory and its contents from bottom-up."""
@@ -71,7 +79,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                     table="files",
                     rows=[row],
                     fields=list(row.keys()),
-                    index=int(time.time() * 1000)
+                    index=self._get_index()
                 )
                 self.event_queue.put(delete_event)
                 
@@ -83,7 +91,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
-                        index=int(time.time() * 1000)
+                        index=self._get_index(mtime=metadata['modified_time'])
                     )
                     self.event_queue.put(update_event)
             
@@ -98,7 +106,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                     table="files",
                     rows=[row],
                     fields=list(row.keys()),
-                    index=int(time.time() * 1000)
+                    index=self._get_index()
                 )
                 self.event_queue.put(delete_event)
                 # Generate UpdateEvent for the new path
@@ -109,7 +117,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
-                        index=int(time.time() * 1000)
+                        index=self._get_index(mtime=metadata['modified_time'])
                     )
                     self.event_queue.put(update_event)
 
@@ -124,7 +132,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
-                        index=int(time.time() * 1000)
+                        index=self._get_index(mtime=metadata['modified_time'])
                     )
                     self.event_queue.put(update_event)
                 self.watch_manager.touch(event.src_path)
@@ -145,7 +153,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 table="files",
                 rows=[row],
                 fields=list(row.keys()),
-                index=int(time.time() * 1000)
+                index=self._get_index()
             )
             self.event_queue.put(delete_event)
             
@@ -170,7 +178,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 table="files",
                 rows=[delete_row],
                 fields=list(delete_row.keys()),
-                index=int(time.time() * 1000)
+                index=self._get_index()
             )
             self.event_queue.put(delete_event)
             
@@ -191,7 +199,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
-                        index=int(time.time() * 1000)
+                        index=self._get_index(mtime=metadata['modified_time'])
                     )
                     self.event_queue.put(update_event)
                 # Touch the file itself at its new destination
@@ -224,7 +232,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
-                        index=int(time.time() * 1000)
+                        index=self._get_index(mtime=metadata['modified_time'])
                     )
                     self.event_queue.put(update_event)
         except Exception as e:
