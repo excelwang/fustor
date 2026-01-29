@@ -18,6 +18,7 @@ class TestBlindSpotListPersistence:
         self,
         docker_env,
         fusion_client,
+        setup_agents,
         clean_shared_dir,
         wait_for_audit
     ):
@@ -60,13 +61,25 @@ class TestBlindSpotListPersistence:
         assert fusion_client.wait_for_file_in_tree(marker_2, timeout=45)
         
         # Step 4: Verify List State
-        # - A should be GONE (Deleted)
+        # - A should be GONE (Deleted) - Wait for async blind-spot deletion
         # - B should be PRESENT (New)
         # - C should be PRESENT (Persisted)
-        blind_list_2 = fusion_client.get_blind_spot_list()
-        paths_2 = [item.get("path") for item in blind_list_2 if item.get("type") == "file"]
         
-        assert test_file_a not in paths_2, f"Deleted file A should be removed from additions list. Got: {paths_2}"
+        start_wait = time.time()
+        blind_list_2 = []
+        paths_2 = []
+        a_removed = False
+        
+        while time.time() - start_wait < 30:
+            blind_list_2 = fusion_client.get_blind_spot_list()
+            paths_2 = [item.get("path") for item in blind_list_2 if item.get("type") == "file"]
+            
+            if test_file_a not in paths_2:
+                a_removed = True
+                break
+            time.sleep(1)
+            
+        assert a_removed, f"Deleted file A should be removed from additions list. Final paths: {paths_2}"
         assert test_file_b in paths_2, "New file B should be in blind-spot list"
         assert test_file_c in paths_2, "Untouched file C should PERSIST in blind-spot list (Persistence Check)"
 

@@ -504,20 +504,14 @@ class DirectoryStructureParser:
                 for path in self._audit_seen_paths:
                     dir_node = self._directory_path_map.get(path)
                     
-                    # Check if it is a directory and it was NOT skipped
-                    # (If it was skipped, we can't confirm deletions inside it)
                     if dir_node and not getattr(dir_node, 'audit_skipped', False):
-                        # This directory was fully scanned. 
+                        # This directory was fully scanned.
                         # Check its children in memory against the audit evidence.
                         for child_name, child_node in list(dir_node.children.items()):
-                            # If a child exists in memory...
-                            # But was NOT seen in the current audit...
                             if child_node.path not in self._audit_seen_paths:
-                                # ...and is NOT protected by a Tombstone (Realtime Delete)
                                 if child_node.path in self._tombstone_list:
                                     continue
                                 
-                                # Then it is a Blind Spot Deletion.
                                 self.logger.debug(f"Blind-spot deletion detected (Optimized): {child_node.path} (Parent {path} was scanned)")
                                 paths_to_delete.append(child_node.path)
             
