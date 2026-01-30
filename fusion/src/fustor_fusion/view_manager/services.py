@@ -11,17 +11,20 @@ async def get_view_status(datastore_id: int) -> Dict[str, Any]:
     """
     Get the current status of all views for a specific datastore.
     """
-    from .manager import get_directory_stats
+    from .manager import get_cached_view_manager
 
     try:
-        # Get stats from the consistent view provider
-        stats = await get_directory_stats(datastore_id=datastore_id)
+        # Get stats from the consistent view manager
+        manager = await get_cached_view_manager(datastore_id)
+        stats = await manager.get_aggregated_stats()
+        
         return {
             "datastore_id": datastore_id,
             "status": "active",
-            "total_directory_entries": stats.get("total_files", 0) + stats.get("total_directories", 0) if stats else 0,
+            "total_items": stats.get("total_volume", 0),
             "memory_stats": stats
         }
+
     except Exception as e:
         logger.error(f"Error getting view status for datastore {datastore_id}: {e}", exc_info=True)
         return {

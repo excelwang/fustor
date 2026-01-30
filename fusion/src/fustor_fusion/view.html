@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -39,7 +40,7 @@
             display: flex;
             align-items: center;
             justify-content: space-between;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
         }
 
         .app-header .brand h1 {
@@ -51,7 +52,7 @@
             align-items: center;
             gap: 10px;
         }
-        
+
         .app-header .brand .logo-icon {
             font-size: 1.5rem;
         }
@@ -68,8 +69,8 @@
         }
 
         input#api-key-input {
-            background: rgba(255,255,255,0.1);
-            border: 1px solid rgba(255,255,255,0.2);
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
             color: white;
             padding: 6px 12px;
             border-radius: 4px;
@@ -79,7 +80,7 @@
         }
 
         input#api-key-input:focus {
-            background: rgba(255,255,255,0.2);
+            background: rgba(255, 255, 255, 0.2);
             border-color: var(--color-primary);
         }
 
@@ -100,7 +101,7 @@
 
         .refresh-status {
             font-size: 0.85rem;
-            color: rgba(255,255,255,0.8);
+            color: rgba(255, 255, 255, 0.8);
             display: flex;
             align-items: center;
             gap: 8px;
@@ -120,9 +121,17 @@
         }
 
         @keyframes pulse {
-            0% { opacity: 1; }
-            50% { opacity: 0.4; }
-            100% { opacity: 1; }
+            0% {
+                opacity: 1;
+            }
+
+            50% {
+                opacity: 0.4;
+            }
+
+            100% {
+                opacity: 1;
+            }
         }
 
         /* 主体布局 */
@@ -171,7 +180,7 @@
             transition: all 0.3s;
             position: relative;
         }
-        
+
         .source-node.active {
             border-color: var(--color-primary);
             background: #e6f7ff;
@@ -205,26 +214,49 @@
         .fusion-core::after {
             content: '';
             position: absolute;
-            top: -10px; bottom: -10px; left: -10px; right: -10px;
+            top: -10px;
+            bottom: -10px;
+            left: -10px;
+            right: -10px;
             border: 2px dashed rgba(24, 144, 255, 0.3);
             border-radius: 50%;
             animation: spin 10s linear infinite;
         }
 
-        @keyframes spin { 100% { transform: rotate(360deg); } }
+        @keyframes spin {
+            100% {
+                transform: rotate(360deg);
+            }
+        }
 
-        .core-icon { font-size: 2.5rem; margin-bottom: 5px; }
-        .core-label { font-weight: bold; font-size: 1rem; }
-        .core-status { font-size: 0.75rem; opacity: 0.8; text-transform: uppercase; margin-top: 4px;}
+        .core-icon {
+            font-size: 2.5rem;
+            margin-bottom: 5px;
+        }
+
+        .core-label {
+            font-weight: bold;
+            font-size: 1rem;
+        }
+
+        .core-status {
+            font-size: 0.75rem;
+            opacity: 0.8;
+            text-transform: uppercase;
+            margin-top: 4px;
+        }
 
         /* 连接线动画 */
         .flow-lines {
             position: absolute;
-            top: 0; left: 0; width: 100%; height: 100%;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
             z-index: 1;
             pointer-events: none;
         }
-        
+
         .flow-line {
             position: absolute;
             height: 2px;
@@ -241,15 +273,29 @@
             border-radius: 50%;
             background-color: var(--color-primary);
             box-shadow: 0 0 6px var(--color-primary);
-            offset-path: path('M0,0 L100,0'); /* Placeholder, set via JS */
+            offset-path: path('M0,0 L100,0');
+            /* Placeholder, set via JS */
             animation: flow 1.5s linear infinite;
         }
-        
+
         @keyframes flow {
-            0% { offset-distance: 0%; opacity: 0; }
-            10% { opacity: 1; }
-            90% { opacity: 1; }
-            100% { offset-distance: 100%; opacity: 0; }
+            0% {
+                offset-distance: 0%;
+                opacity: 0;
+            }
+
+            10% {
+                opacity: 1;
+            }
+
+            90% {
+                opacity: 1;
+            }
+
+            100% {
+                offset-distance: 100%;
+                opacity: 0;
+            }
         }
 
         /* 3. 核心指标区域 */
@@ -269,10 +315,21 @@
             justify-content: space-between;
             border-left: 4px solid transparent;
         }
-        
-        .metric-card:nth-child(1) { border-left-color: #1890ff; }
-        .metric-card:nth-child(2) { border-left-color: #52c41a; }
-        .metric-card:nth-child(3) { border-left-color: #faad14; grid-column: span 1; } /* Adjusted for 3 cols */
+
+        .metric-card:nth-child(1) {
+            border-left-color: #1890ff;
+        }
+
+        .metric-card:nth-child(2) {
+            border-left-color: #52c41a;
+        }
+
+        .metric-card:nth-child(3) {
+            border-left-color: #faad14;
+            grid-column: span 1;
+        }
+
+        /* Adjusted for 3 cols */
 
         .metric-header {
             display: flex;
@@ -284,8 +341,13 @@
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
-        
-        .metric-header svg { margin-right: 8px; width: 16px; height: 16px; fill: currentColor; }
+
+        .metric-header svg {
+            margin-right: 8px;
+            width: 16px;
+            height: 16px;
+            fill: currentColor;
+        }
 
         .metric-body {
             display: flex;
@@ -319,7 +381,7 @@
             flex-direction: column;
             gap: 4px;
         }
-        
+
         .staleness-path {
             font-family: 'Menlo', monospace;
             background: #f5f5f5;
@@ -338,34 +400,53 @@
             font-weight: 600;
             margin-right: 8px;
         }
-        
-        .badge.good { background: #f6ffed; color: #52c41a; border: 1px solid #b7eb8f; }
-        .badge.warn { background: #fffbe6; color: #faad14; border: 1px solid #ffe58f; }
-        .badge.bad { background: #fff1f0; color: #f5222d; border: 1px solid #ffa39e; }
+
+        .badge.good {
+            background: #f6ffed;
+            color: #52c41a;
+            border: 1px solid #b7eb8f;
+        }
+
+        .badge.warn {
+            background: #fffbe6;
+            color: #faad14;
+            border: 1px solid #ffe58f;
+        }
+
+        .badge.bad {
+            background: #fff1f0;
+            color: #f5222d;
+            border: 1px solid #ffa39e;
+        }
 
         /* 状态遮罩 */
         .overlay {
             position: fixed;
-            top: 0; left: 0; right: 0; bottom: 0;
-            background: rgba(0,0,0,0.5);
+            top: 0;
+            left: 0;
+            right: 0;
+            bottom: 0;
+            background: rgba(0, 0, 0, 0.5);
             z-index: 1000;
             display: none;
             align-items: center;
             justify-content: center;
         }
-        
-        .overlay.active { display: flex; }
-        
+
+        .overlay.active {
+            display: flex;
+        }
+
         .modal {
             background: white;
             padding: 30px;
             border-radius: 8px;
             text-align: center;
-            box-shadow: 0 4px 12px rgba(0,0,0,0.2);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
         }
-
     </style>
 </head>
+
 <body>
 
     <header class="app-header">
@@ -410,11 +491,14 @@
 
         <!-- 核心指标 -->
         <section class="metrics-section">
-            
+
             <!-- 1. 数据量 -->
             <div class="metric-card">
                 <div class="metric-header">
-                    <svg viewBox="0 0 24 24"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+                    <svg viewBox="0 0 24 24">
+                        <path
+                            d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z" />
+                    </svg>
                     总处理文件量
                 </div>
                 <div class="metric-body">
@@ -429,7 +513,10 @@
             <!-- 2. 延迟 -->
             <div class="metric-card">
                 <div class="metric-header">
-                    <svg viewBox="0 0 24 24"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z"/></svg>
+                    <svg viewBox="0 0 24 24">
+                        <path
+                            d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm.5-13H11v6l5.25 3.15.75-1.23-4.5-2.67z" />
+                    </svg>
                     最新同步延迟
                 </div>
                 <div class="metric-body">
@@ -444,7 +531,10 @@
             <!-- 3. 陈旧度 -->
             <div class="metric-card">
                 <div class="metric-header">
-                    <svg viewBox="0 0 24 24"><path d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z"/></svg>
+                    <svg viewBox="0 0 24 24">
+                        <path
+                            d="M10 4H4c-1.1 0-1.99.9-1.99 2L2 18c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V8c0-1.1-.9-2-2-2h-8l-2-2z" />
+                    </svg>
                     最旧目录滞后
                 </div>
                 <div class="metric-body">
@@ -469,12 +559,12 @@
     </div>
 
     <script>
-        (function() {
+        (function () {
             // --- 配置与状态 ---
             const API_BASE = '/api/v1/ingest/events';
             // 注意：这里使用 MOCK 开关。如果后端准备好了，设为 false。
-            const MOCK_MODE = false; 
-            
+            const MOCK_MODE = false;
+
             const state = {
                 apiKey: localStorage.getItem('fustor_api_key') || '',
                 isConnected: false,
@@ -523,10 +613,10 @@
             function connect() {
                 updateStatus(true, '连接中...');
                 if (state.pollingInterval) clearInterval(state.pollingInterval);
-                
+
                 // 立即执行一次
                 fetchStats();
-                
+
                 // 启动轮询
                 state.pollingInterval = setInterval(fetchStats, 3000);
                 state.isConnected = true;
@@ -548,11 +638,11 @@
                     let data;
                     if (MOCK_MODE) {
                         // 模拟 API 延迟
-                        await new Promise(r => setTimeout(r, 300)); 
+                        await new Promise(r => setTimeout(r, 300));
                         data = getMockData();
                     } else {
                         const res = await fetch(`${API_BASE}/stats`, {
-                            headers: { 
+                            headers: {
                                 'accept': 'application/json',
                                 'x-api-key': state.apiKey
                             }
@@ -560,7 +650,7 @@
                         if (!res.ok) throw new Error('API Error');
                         data = await res.json();
                     }
-                    
+
                     render(data);
                     updateStatus(true, '实时监控中');
                 } catch (e) {
@@ -576,7 +666,7 @@
                 const randomInc = Math.floor(Math.random() * 10);
                 const latencyBase = 120;
                 const latencyNoise = Math.floor(Math.random() * 200) - 50; // -50 to 150
-                
+
                 return {
                     // 模拟返回的活跃源列表
                     sources: [
@@ -587,7 +677,7 @@
                     metrics: {
                         total_volume: baseVolume + randomInc + Date.now() % 1000, // Fake increment
                         latency_ms: Math.max(10, latencyBase + latencyNoise),
-                        oldest_directory: {
+                        oldest_item: {
                             path: '/data/archive/logs/2024/01',
                             age_days: 42
                         }
@@ -608,21 +698,21 @@
                 // 2. Latency
                 const lat = metrics.latency_ms;
                 els.valLatency.textContent = lat;
-                
+
                 let badgeClass = 'good';
                 let badgeText = '健康';
                 if (lat > 1000) { badgeClass = 'warn'; badgeText = '缓慢'; }
                 if (lat > 5000) { badgeClass = 'bad'; badgeText = '阻塞'; }
-                
+
                 els.badgeLatency.className = `badge ${badgeClass}`;
                 els.badgeLatency.textContent = badgeText;
                 els.valLatency.style.color = badgeClass === 'good' ? 'var(--color-text-main)' : (badgeClass === 'warn' ? 'var(--color-warning)' : 'var(--color-error)');
 
                 // 3. Staleness
-                const stale = metrics.oldest_directory;
+                const stale = metrics.oldest_item || { age_days: 0, path: '等待数据...' };
                 els.valStalenessDays.textContent = stale.age_days;
                 els.valStalenessPath.textContent = stale.path;
-                
+
                 const staleColor = stale.age_days > 30 ? 'var(--color-warning)' : 'var(--color-text-main)';
                 els.valStalenessDays.style.color = staleColor;
             }
@@ -635,7 +725,7 @@
 
                 els.sourcesLeft.innerHTML = '';
                 els.sourcesRight.innerHTML = '';
-                
+
                 // 清空连线
                 while (els.flowCanvas.firstChild) {
                     els.flowCanvas.removeChild(els.flowCanvas.firstChild);
@@ -676,12 +766,12 @@
                     const nodeRect = node.getBoundingClientRect();
                     // 找最近的边缘点
                     const isLeft = nodeRect.left < centerRect.left;
-                    
+
                     const startPoint = {
                         x: isLeft ? (nodeRect.right) : (nodeRect.left),
                         y: nodeRect.top + nodeRect.height / 2
                     };
-                    
+
                     // 转换为相对于 container 的坐标
                     const x1 = startPoint.x - containerRect.left;
                     const y1 = startPoint.y - containerRect.top;
@@ -698,7 +788,7 @@
                 // 计算角度和距离
                 const dx = x2 - x1;
                 const dy = y2 - y1;
-                const dist = Math.sqrt(dx*dx + dy*dy);
+                const dist = Math.sqrt(dx * dx + dy * dy);
                 const angle = Math.atan2(dy, dx) * 180 / Math.PI;
 
                 // 容器
@@ -711,7 +801,7 @@
                 lineContainer.style.height = '2px'; // 厚度
                 lineContainer.style.transform = `rotate(${angle}deg)`;
                 lineContainer.style.transformOrigin = '0 0';
-                
+
                 // 背景线
                 const bgLine = document.createElement('div');
                 bgLine.style.width = '100%';
@@ -728,7 +818,7 @@
                 particle.style.left = '0';
                 particle.style.top = '-2px'; // 居中
                 particle.style.animation = `flowParticle 1.5s linear infinite`;
-                
+
                 // 动态注入 keyframes 也可以，或者直接利用 left 0->100%
                 // 这里复用 CSS 中的 flow 定义，但需要 offset-path 支持较差，改用 left
                 particle.style.offsetPath = 'none'; // 覆盖默认
@@ -751,7 +841,7 @@
             // 窗口大小改变时重绘连线
             window.addEventListener('resize', () => {
                 // 清空旧线
-                 while (els.flowCanvas.firstChild) {
+                while (els.flowCanvas.firstChild) {
                     els.flowCanvas.removeChild(els.flowCanvas.firstChild);
                 }
                 drawFlowLines();
@@ -763,4 +853,5 @@
         })();
     </script>
 </body>
+
 </html>

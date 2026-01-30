@@ -1,20 +1,15 @@
 """
-API endpoints for the data views.
-Provides REST endpoints to access consistent data views.
-"""
-from fastapi import APIRouter, Query, Depends, status, HTTPException
-from fastapi.responses import ORJSONResponse
-import logging
-from typing import Dict, Any, Optional, List
-from pydantic import BaseModel
+API endpoints for data views.
 
-from ..view_manager.manager import (
-    get_directory_tree, 
-    search_files, 
-    get_directory_stats, 
-    reset_directory_tree,
-    get_cached_view_manager
-)
+View-specific endpoints are provided by view driver packages
+and dynamically registered via entry points.
+Each view driver can export a 'create_router' function to provide its API routes.
+"""
+from fastapi import APIRouter, Depends, HTTPException, status
+from importlib.metadata import entry_points
+import logging
+
+from ..view_manager.manager import get_cached_view_manager
 from ..auth.dependencies import get_datastore_id_from_api_key
 from ..datastore_state_manager import datastore_state_manager
 from ..in_memory_queue import memory_event_queue
@@ -23,6 +18,7 @@ from ..processing_manager import processing_manager
 logger = logging.getLogger(__name__)
 
 view_router = APIRouter(tags=["Data Views"])
+
 
 async def check_snapshot_status(datastore_id: int):
     """Checks if the initial snapshot sync is complete for the datastore."""
@@ -53,115 +49,75 @@ async def check_snapshot_status(datastore_id: int):
             detail=detail
         )
 
-@view_router.get("/fs/tree", 
-    summary="获取文件系统树结构", 
-    response_class=ORJSONResponse
-)
-async def get_directory_tree_api(
-    path: str = Query("/", description="要检索的目录路径 (默认: '/')"),
-    recursive: bool = Query(True, description="是否递归检索子目录"),
-    max_depth: Optional[int] = Query(None, description="最大递归深度 (1 表示仅当前目录及其直接子级)"),
-    only_path: bool = Query(False, description="是否仅返回路径结构，排除元数据"),
-    dry_run: bool = Query(False, description="压测模式：跳过逻辑处理以测量框架延迟"),
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> Optional[Dict[str, Any]]:
-    """获取指定路径起始的目录结构树。"""
-    await check_snapshot_status(datastore_id)
+
+async def get_view_provider(datastore_id: int, driver_name: str):
+    """
+    Helper to get a view provider for a specific driver.
     
-    if dry_run:
-        return ORJSONResponse(content={"message": "dry-run", "datastore_id": datastore_id})
-
-    effective_recursive = recursive if max_depth is None else True
-    result = await get_directory_tree(path, datastore_id=datastore_id, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
-    
-    if result is None:
-        return ORJSONResponse(content={"detail": "路径未找到或尚未同步"}, status_code=404)
-    return ORJSONResponse(content=result)
-
-@view_router.get("/fs/search", 
-    summary="基于模式搜索文件"
-)
-async def search_files_api(
-    pattern: str = Query(..., description="要搜索的路径匹配模式 (例如: '*.log' 或 '/data/res*')"),
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> list:
-    """搜索匹配模式的文件。"""
-    await check_snapshot_status(datastore_id)
-    return await search_files(pattern, datastore_id=datastore_id)
-
-@view_router.get("/fs/stats", 
-    summary="获取文件系统统计指标"
-)
-async def get_directory_stats_api(
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> Dict[str, Any]:
-    """获取当前目录结构的统计信息。"""
-    await check_snapshot_status(datastore_id)
-    return await get_directory_stats(datastore_id=datastore_id)
-
-@view_router.delete("/fs/reset", 
-    summary="Reset directory tree structure",
-    status_code=status.HTTP_204_NO_CONTENT
-)
-async def reset_directory_tree_api(
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> None:
-    """Reset the directory tree structure by clearing all entries for a specific datastore."""
-    success = await reset_directory_tree(datastore_id)
-    if not success:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to reset directory tree"
-        )
-
-# === Consistency APIs ===
-
-class SuspectUpdateRequest(BaseModel):
-    """Request body for updating suspect file mtimes."""
-    updates: List[Dict[str, Any]]  # List of {"path": str, "mtime": float}
-
-@view_router.get("/fs/suspect-list", 
-    summary="Get Suspect List for Sentinel Sweep"
-)
-async def get_suspect_list_api(
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> List[Dict[str, Any]]:
-    """Get the current Suspect List for this datastore."""
+    Args:
+        datastore_id: The datastore ID
+        driver_name: The driver name (e.g., 'fs')
+    """
     manager = await get_cached_view_manager(datastore_id)
-    provider = await manager.get_file_directory_provider()
-    suspect_list = await provider.get_suspect_list()
-    return [{"path": path, "suspect_until": ts} for path, ts in suspect_list.items()]
+    return manager.providers.get(driver_name)
 
-@view_router.put("/fs/suspect-list",
-    summary="Update Suspect List from Sentinel Sweep"
-)
-async def update_suspect_list_api(
-    request: SuspectUpdateRequest,
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> Dict[str, Any]:
-    """Update suspect files with their current mtimes from Agent's Sentinel Sweep."""
-    manager = await get_cached_view_manager(datastore_id)
-    provider = await manager.get_file_directory_provider()
-    
-    updated_count = 0
-    for item in request.updates:
-        path = item.get("path")
-        mtime = item.get("mtime") or item.get("current_mtime")
-        if path and mtime is not None:
-            await provider.update_suspect(path, float(mtime))
-            updated_count += 1
-    
-    return {"datastore_id": datastore_id, "updated_count": updated_count, "status": "ok"}
 
-@view_router.get("/fs/blind-spots", 
-    summary="Get Blind-spot Information"
-)
-async def get_blind_spots_api(
-    datastore_id: int = Depends(get_datastore_id_from_api_key)
-) -> Dict[str, Any]:
-    """Get the current Blind-spot List for this datastore."""
-    manager = await get_cached_view_manager(datastore_id)
-    provider = await manager.get_file_directory_provider()
-    if not provider:
-        return {"error": "Provider not initialized"}
-    return await provider.get_blind_spot_list()
+def _discover_view_api_routers():
+    """
+    Discover and load API routers from view driver packages.
+    
+    View driver packages can register API routers via the 'fustor.view_api' entry point group.
+    Each entry point should be a function that accepts:
+        - get_provider_func: async function(datastore_id, driver_name) -> provider
+        - check_snapshot_func: async function(datastore_id) -> None (raises HTTPException)
+        - get_datastore_id_dep: FastAPI dependency for authentication
+    
+    Returns:
+        List of (name, router) tuples
+    """
+    routers = []
+    try:
+        eps = entry_points(group="fustor.view_api")
+        for ep in eps:
+            try:
+                create_router_func = ep.load()
+                driver_name = ep.name
+                
+                # Create a provider getter bound to this driver name
+                async def get_provider_for_driver(datastore_id: int, _driver=driver_name):
+                    return await get_view_provider(datastore_id, _driver)
+                
+                router = create_router_func(
+                    get_provider_func=get_provider_for_driver,
+                    check_snapshot_func=check_snapshot_status,
+                    get_datastore_id_dep=get_datastore_id_from_api_key
+                )
+                routers.append((ep.name, router))
+                logger.info(f"Discovered view API router: {ep.name}")
+            except Exception as e:
+                logger.error(f"Failed to load view API entry point '{ep.name}': {e}", exc_info=True)
+    except Exception as e:
+        logger.error(f"Error discovering view API entry points: {e}", exc_info=True)
+    
+    return routers
+
+
+def register_view_driver_routes():
+    """
+    Dynamically register API routes from view driver packages.
+    Routes are discovered via the 'fustor.view_api' entry point group.
+    """
+    routers = _discover_view_api_routers()
+    for name, router in routers:
+        try:
+            view_router.include_router(router)
+            logger.info(f"Registered view API routes: {name}")
+        except Exception as e:
+            logger.error(f"Error registering view API routes '{name}': {e}", exc_info=True)
+    
+    if not routers:
+        logger.warning("No view API routers discovered. Check if view driver packages are installed.")
+
+
+# Register routes when module is loaded
+register_view_driver_routes()

@@ -22,7 +22,6 @@ class LogicalClock:
         clock = LogicalClock()
         clock.update(file_mtime)  # Advances clock if mtime is newer
         current = clock.now()     # Get logical time
-        hybrid = clock.hybrid_now()  # Get max(logical, physical)
     """
     
     def __init__(self, initial_time: float = 0.0):
@@ -71,21 +70,6 @@ class LogicalClock:
         Alias for now() to emphasize its role as a watermark.
         """
         return self.now()
-    
-    def hybrid_now(self, fallback_to_physical: bool = False) -> float:
-        """
-        Get the hybrid clock value. 
-        Defaults to logical clock ONLY (False) to avoid drift from physical clock.
-        
-        Args:
-            fallback_to_physical: Only set to True if this value is used 
-                                  where Agent and Fusion don't communicate 
-                                  (e.g., local logging/internal stats).
-        """
-        with self._lock:
-            if fallback_to_physical:
-                return max(self._value, time.time())
-            return self._value
     
     def reset(self, value: float = 0.0) -> None:
         """

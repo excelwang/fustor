@@ -66,21 +66,23 @@ services:
       FUSTOR_FUSION_DATA_DIR: "/data/fusion"
       # Faster cache sync for integration tests
       FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: "5"
-      # Low TTL for suspect files to speed up integration tests
-      FUSTOR_FUSION_SUSPECT_TTL_SECONDS: "30"
       # Accelerate failover tests
       FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS: "10"
       # Shared token for internal service communication (must match Registry)
       FUSTOR_REGISTRY_CLIENT_TOKEN: "test-integration-token-for-internal-apis-12345"
       FUSTOR_CORE_SECRET_KEY: "test-integration-secret-key-for-jwt-signing"
+      FUSTOR_FUSION_CONFIG_PATH: "/data/config/fusion-config.yaml"
     volumes:
       - fusion-data:/data/fusion
+      - ./config/fusion/config.yaml:/data/config/fusion-config.yaml
       - ../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
       - ../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
       - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
       - ../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
       - ../packages/fustor_registry_client/src/fustor_registry_client:/usr/local/lib/python3.11/site-packages/fustor_registry_client
       - ../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../packages/view_fs/src/fustor_view_fs:/usr/local/lib/python3.11/site-packages/fustor_view_fs
+
     ports:
       - "18102:8102"
     networks:

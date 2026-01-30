@@ -23,8 +23,10 @@ RUN pip install --no-cache-dir \
     /app/packages/fustor_event_model \
     /app/packages/fustor_registry_client \
     /app/packages/fustor_fusion_sdk \
+    /app/packages/view_fs \
     /app/registry \
     /app/fusion
+
 
 # Create data directories
 RUN mkdir -p /data/registry /data/fusion

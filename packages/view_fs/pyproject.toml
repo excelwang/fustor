@@ -7,7 +7,10 @@ dependencies = [
     "fustor-common",
     "fustor-event-model",
     "fustor-core",
+    "fastapi",
+    "pydantic",
 ]
+
 
 [project.optional-dependencies]
 test = [
@@ -31,3 +34,6 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/packages/view_fs"
 
 [project.entry-points."fustor.view_drivers"]
 fs = "fustor_view_fs:FSViewProvider"
+
+[project.entry-points."fustor.view_api"]
+fs = "fustor_view_fs:create_fs_router"

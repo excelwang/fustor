@@ -70,3 +70,34 @@ class ViewMixin(FSViewBase):
                 "suspect_file_count": suspect_files,
                 "logical_now": self._logical_clock.get_watermark()
             }
+
+    async def get_stats(self) -> Dict[str, Any]:
+        """
+        Return standardized statistics for Fusion Core to avoid logic leakage.
+        Returns:
+            item_count: Total number of tracked items (files + dirs)
+            latency_ms: Processing latency
+            staleness_seconds: Max staleness of data
+            oldest_item_path: Path of the oldest item
+            details: Driver specific detailed stats
+        """
+        raw_stats = await self.get_directory_stats()
+        
+        logical_now = raw_stats["logical_now"]
+        oldest_dict = raw_stats.get("oldest_directory")
+        staleness = 0.0
+        oldest_path = None
+        
+        if oldest_dict and oldest_dict.get("timestamp"):
+             staleness = max(0.0, float(logical_now - oldest_dict["timestamp"]))
+             oldest_path = oldest_dict.get("path")
+             
+        return {
+             "item_count": raw_stats["total_files"] + raw_stats["total_directories"],
+             "total_items": raw_stats["total_files"], # Backward compat or specific file count
+             "latency_ms": raw_stats["last_event_latency_ms"],
+             "staleness_seconds": staleness,
+             "oldest_item_path": oldest_path,
+             "logical_now": logical_now,
+             "details": raw_stats
+        }

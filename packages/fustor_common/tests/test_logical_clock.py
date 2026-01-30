@@ -48,31 +48,6 @@ class TestLogicalClockBasic:
         result = clock.update(None)
         assert result == 100.0
 
-
-class TestLogicalClockHybrid:
-    """Tests for hybrid_now functionality."""
-    
-    def test_hybrid_now_defaults_to_logical(self):
-        """hybrid_now should default to logical time (no physical fallback)."""
-        clock = LogicalClock(initial_time=0.0)
-        # Default behavior is now no fallback
-        hybrid = clock.hybrid_now()
-        assert hybrid == 0.0
-    
-    def test_hybrid_now_uses_logical_when_greater(self):
-        """hybrid_now should use logical time when it's greater."""
-        future_time = time.time() + 3600  # 1 hour in future
-        clock = LogicalClock(initial_time=future_time)
-        hybrid = clock.hybrid_now()
-        assert hybrid == future_time
-    
-    def test_hybrid_now_fallback_disabled(self):
-        """hybrid_now with fallback=False should only return logical."""
-        clock = LogicalClock(initial_time=100.0)
-        result = clock.hybrid_now(fallback_to_physical=False)
-        assert result == 100.0
-
-
 class TestLogicalClockReset:
     """Tests for reset functionality."""
     

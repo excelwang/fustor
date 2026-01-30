@@ -72,18 +72,57 @@ class ViewManager:
             
         self.logger.info(f"Initializing view providers for datastore {self.datastore_id}")
         
-        drivers = _load_view_drivers()
-        config = {"hot_file_threshold": fusion_config.FUSTOR_FUSION_SUSPECT_TTL_SECONDS}
+        available_drivers = _load_view_drivers()
         
-        for schema, driver_cls in drivers.items():
-            try:
-                self.providers[schema] = driver_cls(
-                    datastore_id=self.datastore_id,
-                    config=config
-                )
-                self.logger.info(f"Initialized ViewDriver '{schema}' for datastore {self.datastore_id}")
-            except Exception as e:
-                self.logger.error(f"Failed to initialize ViewDriver '{schema}': {e}", exc_info=True)
+        # Try loading from local config first
+        from ..local_config import local_config
+        view_configs = local_config.get_datastore_views(self.datastore_id)
+        
+        if view_configs:
+            self.logger.info(f"Using local configuration for datastore {self.datastore_id} views: {list(view_configs.keys())}")
+            for view_name, cfg in view_configs.items():
+                driver_type = cfg.get("driver")
+                if not driver_type:
+                    self.logger.warning(f"View '{view_name}' config missing 'driver' field, skipping")
+                    continue
+                    
+                driver_cls = available_drivers.get(driver_type)
+                if not driver_cls:
+                    self.logger.error(f"Driver type '{driver_type}' not found for view '{view_name}'. Available: {list(available_drivers.keys())}")
+                    continue
+                
+                # Use driver_params directly
+                driver_params = cfg.get("driver_params", {})
+                
+                try:
+                    self.providers[view_name] = driver_cls(
+                        datastore_id=self.datastore_id,
+                        config=driver_params
+                    )
+                    self.logger.info(f"Initialized ViewDriver '{view_name}' (type={driver_type})")
+                except Exception as e:
+                    self.logger.error(f"Failed to initialize ViewDriver '{view_name}': {e}", exc_info=True)
+                    
+        else:
+            # Fallback: Auto-load all found drivers IF config file is missing
+            if not local_config.is_configured():
+                 self.logger.info(f"No fusion config file found, auto-loading all installed view drivers")
+                 
+                 for schema, driver_cls in available_drivers.items():
+                     try:
+                         # For auto-discovery, we use the schema name as the view instance name
+                         # No default config provided
+                         self.providers[schema] = driver_cls(
+                             datastore_id=self.datastore_id,
+                             config={}
+                         )
+                         self.logger.info(f"Initialized ViewDriver '{schema}' for datastore {self.datastore_id}")
+                     except Exception as e:
+                         self.logger.error(f"Failed to initialize ViewDriver '{schema}': {e}", exc_info=True)
+            else:
+                 self.logger.info(f"Fusion config active but no views configured for datastore {self.datastore_id}")
+
+
     
     async def process_event(self, event: EventBase) -> Dict[str, bool]:
         """Process an event with all applicable providers and return results"""
@@ -99,10 +138,10 @@ class ViewManager:
         
         return results
     
-    async def get_file_directory_provider(self) -> ViewDriver:
-        """Get the file directory structure provider"""
-        return self.providers["file_directory"]
-    
+    def get_provider(self, name: str) -> Optional[ViewDriver]:
+        """Get a provider by name."""
+        return self.providers.get(name)
+
     async def get_data_view(self, provider_name: str, **kwargs) -> Optional[Any]:
         """Get the data view from a specific provider"""
         provider = self.providers.get(provider_name)
@@ -115,10 +154,14 @@ class ViewManager:
         return list(self.providers.keys())
 
     async def cleanup_expired_suspects(self):
-        """Cleanup expired suspects in all supporting providers."""
-        provider = self.providers.get("file_directory")
-        if provider:
-            await provider.cleanup_expired_suspects()
+        """Cleanup expired suspects in all providers that support it."""
+        for name, provider in self.providers.items():
+            if hasattr(provider, 'cleanup_expired_suspects'):
+                try:
+                    await provider.cleanup_expired_suspects()
+                except Exception as e:
+                    self.logger.error(f"Error cleaning up suspects for provider {name}: {e}")
+
 
     async def on_session_start(self, session_id: str):
         """Dispatch session start event to all providers."""
@@ -129,6 +172,74 @@ class ViewManager:
         """Dispatch session close event to all providers for cleanup."""
         for name, provider in self.providers.items():
             await provider.on_session_close(session_id)
+
+    async def get_aggregated_stats(self) -> Dict[str, Any]:
+        """
+        Collect and aggregate stats from all providers using standardized interface.
+        """
+        aggregated = {
+            "total_volume": 0,
+            "max_latency_ms": 0,
+            "max_staleness_seconds": 0,
+            "oldest_item_info": None,
+            "logical_now": 0,
+            "providers": {}
+        }
+        
+        for name, provider in self.providers.items():
+            try:
+                # Enforce generic stats interface
+                if not hasattr(provider, 'get_stats'):
+                    self.logger.warning(f"Provider {name} does not implement get_stats(), skipping metrics.")
+                    continue
+
+                provider_stats = await provider.get_stats()
+                aggregated["providers"][name] = provider_stats
+                
+                # Aggregate standardized metrics
+                # 1. Volume
+                aggregated["total_volume"] += provider_stats.get("item_count", 0)
+                
+                # 2. Latency
+                lat = provider_stats.get("latency_ms", 0)
+                if lat > aggregated["max_latency_ms"]:
+                     aggregated["max_latency_ms"] = lat
+                     
+                # 3. Logical Clock
+                aggregated["logical_now"] = max(aggregated["logical_now"], provider_stats.get("logical_now", 0))
+
+                # 4. Oldest Item / Staleness
+                stale = provider_stats.get("staleness_seconds", 0)
+                if stale > aggregated["max_staleness_seconds"]:
+                    aggregated["max_staleness_seconds"] = stale
+                    # We might need provider-specific formatting for path, but generally we just preface with provider name
+                    path = provider_stats.get('oldest_item_path', 'unknown')
+                    aggregated["oldest_item_info"] = {
+                        "path": f"[{name}] {path}",
+                        "age_seconds": stale
+                    }
+            except Exception as e:
+                self.logger.error(f"Failed to get stats from provider {name}: {e}", exc_info=True)
+                         
+        return aggregated
+
+async def reset_views(datastore_id: int) -> bool:
+    """
+    Reset all views by clearing cached manager and data for a specific datastore.
+    """
+    logger.info(f"Resetting views for datastore {datastore_id}")
+    try:
+        async with _cache_lock:
+            if datastore_id in _view_manager_cache:
+                del _view_manager_cache[datastore_id]
+        
+        await memory_event_queue.clear_datastore_data(datastore_id)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to reset views for datastore {datastore_id}: {e}", exc_info=True)
+        return False
+
+
 
 
 async def get_cached_view_manager(datastore_id: int) -> 'ViewManager':
@@ -167,58 +278,14 @@ async def process_event(event: EventBase, datastore_id: int) -> Dict[str, bool]:
     return await manager.process_event(event)
 
 
-# --- Public Interface for Data Access ---
-
-async def get_directory_tree(path: str = "/", datastore_id: int = None, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
-    """Get the directory tree from the file directory provider"""
-    if datastore_id:
-        manager = await get_cached_view_manager(datastore_id)
-        provider = await manager.get_file_directory_provider()
-        if provider:
-            return await provider.get_directory_tree(path, recursive=recursive, max_depth=max_depth, only_path=only_path)
-    return None
-
-async def search_files(pattern: str, datastore_id: int = None) -> list:
-    """Search for files using the file directory provider"""
-    if datastore_id:
-        manager = await get_cached_view_manager(datastore_id)
-        provider = await manager.get_file_directory_provider()
-        if provider:
-            return await provider.search_files(pattern)
-    return []
-
-async def get_directory_stats(datastore_id: int = None) -> Dict[str, Any]:
-    """Get directory statistics using the file directory provider"""
-    if datastore_id:
-        manager = await get_cached_view_manager(datastore_id)
-        provider = await manager.get_file_directory_provider()
-        if provider:
-            return await provider.get_directory_stats()
-    return {}
-
-async def reset_directory_tree(datastore_id: int) -> bool:
-    """
-    Reset the directory tree by clearing all entries for a specific datastore.
-    """
-    logger.info(f"Resetting directory tree for datastore {datastore_id}")
-    try:
-        async with _cache_lock:
-            if datastore_id in _view_manager_cache:
-                del _view_manager_cache[datastore_id]
-        
-        await memory_event_queue.clear_datastore_data(datastore_id)
-        return True
-    except Exception as e:
-        logger.error(f"Failed to reset directory tree for datastore {datastore_id}: {e}", exc_info=True)
-        return False
-
 async def on_session_start(datastore_id: int, session_id: str):
     """Notify view providers that a new session has started."""
     manager = await get_cached_view_manager(datastore_id)
     await manager.on_session_start(session_id)
+
+
 async def on_session_close(datastore_id: int, session_id: str):
     """Notify view providers that a session has closed for cleanup."""
     if datastore_id in _view_manager_cache:
         manager = _view_manager_cache[datastore_id]
         await manager.on_session_close(session_id)
-

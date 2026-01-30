@@ -17,6 +17,7 @@ dependencies = [
     "fustor-registry-client",
     "fustor-event-model",
     "fustor-core",
+    "PyYAML",
 ]
 [[project.authors]]
 name = "Huajin Wang"

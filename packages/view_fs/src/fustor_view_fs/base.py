@@ -20,10 +20,18 @@ class FSViewBase(ViewDriver):
     target_schema: str = "file_directory"
     
     def __init__(self, datastore_id: int, config: Optional[Dict[str, Any]] = None, hot_file_threshold: float = 30.0):
-        super().__init__(datastore_id, config or {"hot_file_threshold": hot_file_threshold})
+        # Allow config to override argument
+        final_config = config or {}
+        # Support both keys, prefer item
+        threshold = final_config.get("hot_item_threshold") or final_config.get("hot_file_threshold") or hot_file_threshold
+        
+        # Ensure config has at least one valid key for upstream
+        final_config.setdefault("hot_item_threshold", threshold)
+        
+        super().__init__(datastore_id, final_config)
         
         self.logger = logging.getLogger(f"fustor_view.fs.{datastore_id}")
-        self.hot_file_threshold = self.config.get("hot_file_threshold", hot_file_threshold)
+        self.hot_file_threshold = float(threshold)
         
         self._root = DirectoryNode("", "/")
         self._directory_path_map: Dict[str, DirectoryNode] = {"/": self._root}

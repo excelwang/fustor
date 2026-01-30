@@ -20,7 +20,7 @@ from ..in_memory_queue import memory_event_queue
 
 from fustor_event_model.models import EventBase, EventType, MessageSource # Import EventBase, EventType, and MessageSource
 
-from ..view_manager.manager import get_directory_stats, get_cached_view_manager
+from ..view_manager.manager import get_cached_view_manager
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -36,7 +36,7 @@ async def get_global_stats():
     sources_map = {} # deduplicate by task_id
     total_volume = 0
     max_latency_ms = 0
-    oldest_dir_info = {"path": "N/A", "age_days": 0}
+    oldest_item_info = {"path": "N/A", "age_days": 0}
     max_staleness_seconds = -1
 
     now = datetime.now().timestamp()
@@ -67,30 +67,27 @@ async def get_global_stats():
                 }
 
         try:
-            stats = await get_directory_stats(datastore_id=ds_id)
+            view_manager = await get_cached_view_manager(ds_id)
+            stats = await view_manager.get_aggregated_stats()
             
             # 1. Volume
-            total_volume += stats.get("total_files", 0)
+            total_volume += stats.get("total_volume", 0)
 
-            # 2. Latency (Processing Lag)
-            # Use the fixed latency from parser (Now - Event_Timestamp at time of parsing)
-            ds_latency = stats.get("last_event_latency_ms", 0)
+            # 2. Latency
+            ds_latency = stats.get("max_latency_ms", 0)
             if ds_latency > max_latency_ms:
                 max_latency_ms = ds_latency
 
-            # 3. Staleness (Oldest Directory) - use logical clock for accuracy
-            oldest = stats.get("oldest_directory")
-            if oldest and oldest.get("timestamp"):
-                # Use logical_now from parser to eliminate clock drift
-                logical_now = stats.get("logical_now", now)
-                age_seconds = logical_now - oldest["timestamp"]
-                if age_seconds > max_staleness_seconds:
-                    max_staleness_seconds = age_seconds
-                    oldest_dir_info = {
-                        "path": f"[{ds_id}] {oldest['path']}",
-                        "age_days": int(age_seconds / 86400)
-                    }
-
+            # 3. Staleness
+            stale = stats.get("max_staleness_seconds", 0)
+            if stale > max_staleness_seconds:
+                max_staleness_seconds = stale
+                info = stats.get("oldest_item_info")
+                if info:
+                     oldest_item_info = {
+                         "path": f"[{ds_id}] {info.get('path', 'unknown')}",
+                         "age_days": int(stale / 86400)
+                     }
         except Exception as e:
             logger.error(f"Failed to get stats for datastore {ds_id}: {e}")
 
@@ -99,7 +96,7 @@ async def get_global_stats():
         "metrics": {
             "total_volume": total_volume,
             "latency_ms": int(max_latency_ms),
-            "oldest_directory": oldest_dir_info
+            "oldest_item": oldest_item_info
         }
     }
 

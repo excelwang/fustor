@@ -74,18 +74,21 @@ async def test_audit_sentinel_logic():
     assert "/test/audit_file" in parser._suspect_list
     
     # 4. Audit End (Cleanup)
-    # Create tombstones: one very old (expired), one new (within TTL)
-    tombstone_ttl = 3600.0
-    now = parser._logical_clock.hybrid_now()
+    # Tombstone cleanup logic: Remove tombstones created BEFORE audit start
+    # (i.e., keep only ts >= self._last_audit_start)
+    audit_start_time = parser._last_audit_start
     
-    parser._tombstone_list["/d/old"] = now - (tombstone_ttl + 10) # Expired
-    parser._tombstone_list["/d/new"] = now - 10 # Within TTL
+    parser._tombstone_list["/d/before"] = audit_start_time - 10  # Before audit start → should be removed
+    parser._tombstone_list["/d/after"] = audit_start_time + 10   # After audit start → should be kept
     
     await parser.handle_audit_end()
     
-    assert "/d/old" not in parser._tombstone_list
-    assert "/d/new" in parser._tombstone_list
+    # Tomb stones created before audit should be cleaned up
+    assert "/d/before" not in parser._tombstone_list
+    # Tombstones created during/after audit should remain
+    assert "/d/after" in parser._tombstone_list
     assert parser._last_audit_start is None
+
 
 @pytest.mark.asyncio
 async def test_auto_audit_start():
