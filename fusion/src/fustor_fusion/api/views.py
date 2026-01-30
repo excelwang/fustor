@@ -141,19 +141,53 @@ def register_view_driver_routes():
     """
     Dynamically register API routes from view driver packages.
     Routes are discovered via the 'fustor.view_api' entry point group.
-    """
-    routers = _discover_view_api_routers()
-    for name, router in routers:
-        try:
-            # Register with prefix matching the view_id (driver name)
-            # This allows multiple drivers or custom driver IDs to coexist
-            view_router.include_router(router, prefix=f"/{name}")
-            logger.info(f"Registered view API routes: {name} at prefix /{name}")
-        except Exception as e:
-            logger.error(f"Error registering view API routes '{name}': {e}", exc_info=True)
     
-    if not routers:
+    Registration Priority:
+    1. If views are defined in local_config, register each view_name as a prefix.
+    2. Fallback: Register the driver names themselves as prefixes.
+    """
+    from ..local_config import local_config
+    
+    available_routers = {name: router for name, router in _discover_view_api_routers()}
+    
+    if not available_routers:
         logger.warning("No view API routers discovered. Check if view driver packages are installed.")
+        return
+
+    # 1. Try to register based on specific view instances in config
+    view_configs = local_config.config.get("views", {})
+    registered_count = 0
+    
+    if view_configs:
+        for view_name, cfg in view_configs.items():
+            # Skip disabled views
+            if cfg.get("disabled", False):
+                continue
+                
+            driver_name = cfg.get("driver")
+            router = available_routers.get(driver_name)
+            
+            if router:
+                try:
+                    # Register with prefix matching the view_name (e.g., test-fs)
+                    view_router.include_router(router, prefix=f"/{view_name}")
+                    logger.info(f"Registered view API routes: {view_name} (driver: {driver_name}) at prefix /{view_name}")
+                    registered_count += 1
+                except Exception as e:
+                    logger.error(f"Error registering view API routes '{view_name}': {e}", exc_info=True)
+            else:
+                logger.warning(f"View '{view_name}' configures driver '{driver_name}', but no API router for that driver was found.")
+
+    # 2. If no config or no views registered via config, fall back to driver names
+    # OR: Should we always register driver names as aliases?
+    # For now, let's fall back if no views were created via config, or if is_configured is False.
+    if registered_count == 0:
+        for name, router in available_routers.items():
+            try:
+                view_router.include_router(router, prefix=f"/{name}")
+                logger.info(f"Registered fallback view API routes: {name} at prefix /{name}")
+            except Exception as e:
+                logger.error(f"Error registering fallback view API routes '{name}': {e}", exc_info=True)
 
 
 # Register routes when module is loaded

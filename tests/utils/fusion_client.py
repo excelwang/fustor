@@ -9,9 +9,10 @@ import requests
 class FusionClient:
     """HTTP client for Fusion API."""
 
-    def __init__(self, base_url: str = "http://localhost:18102", api_key: Optional[str] = None):
+    def __init__(self, base_url: str = "http://localhost:18102", api_key: Optional[str] = None, view_id: str = "fs"):
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.view_id = view_id
         self.session = requests.Session()
         if api_key:
             self.session.headers["X-API-Key"] = api_key
@@ -32,7 +33,7 @@ class FusionClient:
     ) -> dict[str, Any]:
         """Get file tree from Fusion."""
         resp = self.session.get(
-            f"{self.base_url}/api/v1/views/fs/tree",
+            f"{self.base_url}/api/v1/views/{self.view_id}/tree",
             params={
                 "path": path,
                 "max_depth": max_depth,
@@ -46,7 +47,7 @@ class FusionClient:
     def search(self, pattern: str, path: str = "/") -> dict[str, Any]:
         """Search files by pattern."""
         resp = self.session.get(
-            f"{self.base_url}/api/v1/views/fs/search",
+            f"{self.base_url}/api/v1/views/{self.view_id}/search",
             params={"pattern": pattern, "path": path}
         )
         resp.raise_for_status()
@@ -54,13 +55,13 @@ class FusionClient:
 
     def get_stats(self) -> dict[str, Any]:
         """Get file system statistics."""
-        resp = self.session.get(f"{self.base_url}/api/v1/views/fs/stats")
+        resp = self.session.get(f"{self.base_url}/api/v1/views/{self.view_id}/stats")
         resp.raise_for_status()
         return resp.json()
 
     def reset(self) -> None:
         """Reset Fusion state for current datastore."""
-        resp = self.session.delete(f"{self.base_url}/api/v1/views/fs/reset")
+        resp = self.session.delete(f"{self.base_url}/api/v1/views/{self.view_id}/reset")
         resp.raise_for_status()
 
 
@@ -73,7 +74,7 @@ class FusionClient:
         if source_id:
             params["source_id"] = source_id
         resp = self.session.get(
-            f"{self.base_url}/api/v1/views/fs/suspect-list",
+            f"{self.base_url}/api/v1/views/{self.view_id}/suspect-list",
             params=params
         )
         resp.raise_for_status()
@@ -82,7 +83,7 @@ class FusionClient:
     def update_suspect_list(self, updates: list[dict]) -> dict:
         """Update suspect list with new mtime values."""
         resp = self.session.put(
-            f"{self.base_url}/api/v1/views/fs/suspect-list",
+            f"{self.base_url}/api/v1/views/{self.view_id}/suspect-list",
             json={"updates": updates}
         )
         resp.raise_for_status()
@@ -106,7 +107,7 @@ class FusionClient:
 
     def get_blind_spots(self) -> dict:
         """Get the full blind-spot information as a dictionary."""
-        resp = self.session.get(f"{self.base_url}/api/v1/views/fs/blind-spots")
+        resp = self.session.get(f"{self.base_url}/api/v1/views/{self.view_id}/blind-spots")
         resp.raise_for_status()
         return resp.json()
 

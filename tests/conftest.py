@@ -168,7 +168,7 @@ def test_api_key(registry_client, test_datastore) -> dict:
 @pytest.fixture(scope="session")
 def fusion_client(docker_env, test_api_key) -> FusionClient:
     """Create Fusion client with API key."""
-    client = FusionClient(base_url="http://localhost:18102")
+    client = FusionClient(base_url="http://localhost:18102", view_id="test-fs")
     client.set_api_key(test_api_key["key"])
     
     # Wait for Fusion to be ready to accept requests and sync its cache

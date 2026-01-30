@@ -14,17 +14,20 @@ Fusion 是 Fustor 平台的核心存储与查询引擎。它负责接收来自 A
 
 ### 1. 视图 API (Views)
 
-用于检索已索引的文件系统元数据。
+用于检索已索引的数据视图（如文件系统、数据库镜像等）。视图 API 的路径采用动态前缀：
+`/api/v1/views/{view_id}/...`
 
-#### **GET `/views/fs/tree`**
-递归获取目录树结构。
+其中 `{view_id}` 是在 `fusion-config.yaml` 中配置的视图实例名称（见下文 "配置参考"）。
+
+#### **GET `/views/{view_id}/tree`**
+获取目录树结构（仅限 `fs` 驱动）。
 
 | 参数 | 类型 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `path` | string | `/` | 目标起始路径。 |
 | `recursive` | boolean | `true` | 是否递归返回子孙节点。 |
 | `max_depth` | integer | `null` | 递归的最大深度（相对于 `path`）。 |
-| `only_path` | boolean | `false` | 若为 `true`，则只返回路径，剔除 size/mtime/ctime 等元数据以减少带宽。 |
+| `only_path` | boolean | `false` | 若为 `true`，则只返回路径，剔除 size/mtime/ctime 等元数据。 |
 
 **响应结构 (JSON):**
 ```json
@@ -32,17 +35,31 @@ Fusion 是 Fustor 平台的核心存储与查询引擎。它负责接收来自 A
   "name": "dir1",
   "path": "/dir1",
   "content_type": "directory",
-  "size": 0,
-  "modified_time": 1705832400.0,
-  "created_time": 1705832400.0,
   "children": { ... }
 }
 ```
 
-#### **GET `/views/fs/stats`**
-获取当前存储库的全局统计信息。
+#### **GET `/views/{view_id}/stats`**
+获取当前视图的指标和统计信息。
 
-*   **返回**: `total_files`, `total_directories`, `last_event_latency_ms`（系统同步延迟）。
+*   **返回**: `item_count`, `latency_ms`, `logical_now` 等。
+
+---
+
+## 配置参考 (Configuration)
+
+Fusion 的行为可以通过 `fusion-config.yaml` 进行深度定制。
+
+```yaml
+views:
+  test-fs:            # view_id，对应 API 路径 /views/test-fs/
+    driver: "fs"      # 使用的驱动程序名称
+    disabled: false
+    datastore_id: 1   # 该视图实例服务的数据仓库 ID
+    driver_params:
+      hot_item_threshold: 30
+```
+
 
 ---
 
@@ -76,11 +93,18 @@ Fusion 是 Fustor 平台的核心存储与查询引擎。它负责接收来自 A
 
 ## 就绪状态判定 (READY Logic)
 
-当存储库处于初始快照同步阶段时，视图 API 可能会返回 **503 Service Unavailable**。
-只有同时满足以下三个条件时，API 才会转为 **200 OK**:
+当存储库处于初始快照同步阶段或 Live 模式下无活跃会话时，视图 API 会返回 **503 Service Unavailable**。
+
+### 1. 核心就绪 (Core Readiness)
+所有视图驱动必须满足以下条件方可访问：
 1.  **信号就绪**: 已接收到 `is_snapshot_end=true`。
 2.  **队列就绪**: 内部 `memory_event_queue` 已全部清空。
 3.  **解析就绪**: `ProcessingManager` 中的 Inflight 事件处理数为 0。
+
+### 2. Live 模式强制检查 (Live Session Enforcement)
+若视图配置为 **Live 模式** (配置中 `mode: live` 或驱动属性 `requires_full_reset_on_session_close=True`)，则额外要求：
+*   **活跃会话**: 必须至少有一个活跃的 Ingest Session。若所有 Session 关闭，视图会自动重置并返回 503 直到新 Session 建立。
+
 
 ### 1. Leader 会话锁 (Leader Session Lock)
 Fusion 遵循 **"先到先得 (First-Come-First-Serve)"** 机制：
