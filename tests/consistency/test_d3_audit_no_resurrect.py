@@ -46,11 +46,10 @@ class TestAuditTombstoneProtection:
         
         # Step 2: Delete via Agent (creates Tombstone)
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
-        time.sleep(3)
         
-        # Verify deleted
-        tree = fusion_client.get_tree(path="/", max_depth=-1)
-        assert fusion_client._find_in_tree(tree, test_file) is None
+        # Wait for DELETE event and Verify deleted
+        removed = fusion_client.wait_for_file(test_file, timeout=20, should_exist=False)
+        assert removed, "File should be removed"
         
         # Step 3: Recreate same file from blind-spot (simulating a problematic scenario)
         docker_manager.create_file_in_container(
@@ -105,7 +104,10 @@ class TestAuditTombstoneProtection:
         
         # Delete
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
-        time.sleep(3)
+        
+        # Verify deleted
+        removed = fusion_client.wait_for_file(test_file, timeout=20, should_exist=False)
+        assert removed, "File should be removed"
         
         # Even with NFS cache (actimeo), the tombstone should protect
         # Use marker file to detect Audit completion

@@ -178,6 +178,8 @@ class DirectoryStructureParser:
 
     def _get_node(self, path: str) -> Optional[Any]:
         """Get a node (file or directory) by path."""
+        # Normalize
+        path = os.path.normpath(path).rstrip('/') if path != '/' else '/'
         if path in self._directory_path_map:
             return self._directory_path_map[path]
         return self._file_path_map.get(path)
@@ -193,7 +195,9 @@ class DirectoryStructureParser:
         if skipped_val != 'NOT_SET':
              self.logger.info(f"DEBUG_UPDATE: path={path} has audit_skipped={skipped_val} value_type={type(skipped_val)} payload_keys={list(payload.keys())}")
 
-        parent_path = os.path.dirname(path)
+        # 0. Aggressive path normalization
+        path = os.path.normpath(path).rstrip('/') if path != '/' else '/'
+        parent_path = os.path.normpath(os.path.dirname(path))
         name = os.path.basename(path)
         
         size = payload.get('size', 0)
@@ -205,11 +209,11 @@ class DirectoryStructureParser:
         if parent_path not in self._directory_path_map and path != '/':
             # Auto-create parent nodes if they don't exist
             current_path = ""
-            parts = parent_path.strip('/').split('/')
+            # Strictly normalize parts
+            parts = [p for p in parent_path.split('/') if p]
             parent_node = self._root
             for part in parts:
-                if not part: continue
-                current_path += "/" + part
+                current_path = os.path.normpath(current_path + "/" + part)
                 if current_path not in self._directory_path_map:
                     new_dir = DirectoryNode(part, current_path)
                     new_dir.last_updated_at = self._logical_clock.get_watermark()
@@ -219,6 +223,10 @@ class DirectoryStructureParser:
         
         # 2. Update current node
         if is_dir:
+            # Type change protection: if it was a file, remove it first
+            if path in self._file_path_map:
+                await self._process_delete_in_memory(path)
+
             if path in self._directory_path_map:
                 node = self._directory_path_map[path]
                 node.size = size
@@ -226,14 +234,10 @@ class DirectoryStructureParser:
                 node.created_time = ctime
                 audit_skipped_value = payload.get('audit_skipped', False)
                 node.audit_skipped = audit_skipped_value
-                if audit_skipped_value:
-                    self.logger.debug(f"Set audit_skipped=True for existing directory: {path}")
             else:
                 node = DirectoryNode(name, path, size, mtime, ctime)
                 audit_skipped_value = payload.get('audit_skipped', False)
                 node.audit_skipped = audit_skipped_value
-                if audit_skipped_value:
-                    self.logger.debug(f"Set audit_skipped=True for NEW directory: {path}")
                 self._directory_path_map[path] = node
                 if path != '/':
                     parent_node = self._directory_path_map.get(parent_path)
@@ -243,6 +247,10 @@ class DirectoryStructureParser:
             node.last_updated_at = self._logical_clock.get_watermark()
 
         else:
+            # Type change protection: if it was a directory, remove it first
+            if path in self._directory_path_map:
+                await self._process_delete_in_memory(path)
+
             if path in self._file_path_map:
                 node = self._file_path_map[path]
                 node.size = size
@@ -259,13 +267,20 @@ class DirectoryStructureParser:
 
     async def _process_delete_in_memory(self, path: str):
         """Remove a node from the in-memory tree."""
-        path = path.rstrip('/') if path != '/' else '/'
-        parent_path = os.path.dirname(path)
+        # Standardize path
+        path = os.path.normpath(path).rstrip('/') if path != '/' else '/'
+        parent_path = os.path.normpath(os.path.dirname(path))
         name = os.path.basename(path)
 
-        if path in self._directory_path_map:
+        self.logger.info(f"Memory DELETE: {path} (parent={parent_path}, name={name})")
+
+        # Capture nodes from BOTH maps to ensure complete removal
+        dir_node = self._directory_path_map.get(path)
+        file_node = self._file_path_map.get(path)
+
+        if dir_node:
             # Recursive deletion from maps
-            stack = [self._directory_path_map[path]]
+            stack = [dir_node]
             while stack:
                 curr = stack.pop()
                 if curr.path in self._directory_path_map:
@@ -279,14 +294,17 @@ class DirectoryStructureParser:
             
             # Remove from parent's children
             parent = self._directory_path_map.get(parent_path)
-            if parent and name in parent.children:
-                del parent.children[name]
+            if parent:
+                parent.children.pop(name, None)
 
-        elif path in self._file_path_map:
+        if file_node:
             del self._file_path_map[path]
             parent = self._directory_path_map.get(parent_path)
-            if parent and name in parent.children:
-                del parent.children[name]
+            if parent:
+                parent.children.pop(name, None)
+        
+        if not dir_node and not file_node:
+            self.logger.debug(f"DELETE ignored: {path} not found in maps")
 
     async def process_event(self, event: Any) -> bool:
         """ 
@@ -338,10 +356,13 @@ class DirectoryStructureParser:
     
             rows_processed = 0
             for payload in event.rows:
-                path = payload.get('path') or payload.get('file_path')
-                if not path:
+                raw_path = payload.get('path') or payload.get('file_path')
+                if not raw_path:
                     continue
                 
+                # Normalize BEFORE taking segmented lock to ensure lock consistency
+                path = os.path.normpath(raw_path).rstrip('/') if raw_path != '/' else '/'
+
                 # Yield occasionally
                 rows_processed += 1
                 if rows_processed % 100 == 0:
@@ -349,13 +370,11 @@ class DirectoryStructureParser:
 
                 # Use segmented lock
                 async with self._get_segment_lock(path):
-                    # Normalize path
-                    path = path.rstrip('/') if path != '/' else '/'
-                    
-                    self.logger.debug(f"Processing {event_type} for {path} from {message_source}")
+                    self.logger.info(f"PROCESS_ROW_START: type={event_type} source={message_source} path={path} index={event.index}")
 
                     self._check_cache_invalidation(path)
                     mtime = payload.get('modified_time', 0.0)
+                    if mtime is None: mtime = 0.0
                     
                     # Update logical clock
                     if event.index > 0:
@@ -370,23 +389,57 @@ class DirectoryStructureParser:
                     
                     if event_type == EventType.DELETE:
                         if is_realtime:
+                            # CRITICAL: Capture mtime before deletion to ensure Tombstone watermark covers it
+                            existing = self._get_node(path)
+                            existing_mtime = existing.modified_time if existing else 0.0
+                            
                             await self._process_delete_in_memory(path)
+                            
+                            # Update clock with both index and the file's last known mtime
+                            if event.index > 0:
+                                self._logical_clock.update(event.index / 1000.0)
+                            self._logical_clock.update(existing_mtime)
+                            
+                            # Record logical watermark as墓碑生命起点
                             ts = self._logical_clock.get_watermark()
                             self._tombstone_list[path] = ts
-                            self.logger.info(f"Tombstone CREATED for {path} at {ts} via Realtime DELETE")
+                            self.logger.info(f"Tombstone CREATED for {path} at {ts} via Realtime DELETE (mtime was {existing_mtime})")
+                            
                             self._suspect_list.pop(path, None)
                             self._blind_spot_deletions.discard(path)
                             self._blind_spot_additions.discard(path)
                         else:
+                            # Audit/Snapshot DELETE handling (if applicable)
                             if path not in self._tombstone_list:
                                 await self._process_delete_in_memory(path)
                                 self._blind_spot_deletions.discard(path)
                                 self._blind_spot_additions.discard(path)
                                 
                     elif event_type in [EventType.INSERT, EventType.UPDATE]:
+                        # Rule 1: Tombstone protection (Applies to ALL sources)
+                        if path in self._tombstone_list:
+                            tombstone_ts = self._tombstone_list[path]
+                            
+                            is_new_activity = False
+                            if is_realtime:
+                                # For Realtime, any event after delete (higher index) clears tombstone
+                                event_ref_ts = (event.index / 1000.0) if event.index > 0 else mtime
+                                is_new_activity = (event_ref_ts > (tombstone_ts + 1e-5)) or (mtime > (tombstone_ts + 1e-5))
+                            else:
+                                # For Snapshot/Audit, only mtime is meaningful for resurrection
+                                # Use epsilon to guard against floating-point precision loss during serializing/marshaling/NFS truncation
+                                is_new_activity = (mtime > (tombstone_ts + 1e-5))
+                            
+                            if not is_new_activity:
+                                self.logger.info(f"TOMBSTONE_BLOCK: {path} blocked by ts={tombstone_ts} (mtime={mtime}, source={message_source}, is_realtime={is_realtime})")
+                                continue
+                            else:
+                                self.logger.info(f"TOMBSTONE_CLEARED: {path} fresh activity detected (mtime={mtime} > ts={tombstone_ts})")
+                                self._tombstone_list.pop(path, None)
+
                         if is_realtime:
                             await self._process_create_update_in_memory(payload, path)
-                            self._tombstone_list.pop(path, None)
+                            self._tombstone_list.pop(path, None) 
                             self._suspect_list.pop(path, None)
                             self._blind_spot_deletions.discard(path)
                             self._blind_spot_additions.discard(path)
@@ -395,16 +448,6 @@ class DirectoryStructureParser:
                             if node:
                                 node.integrity_suspect = False
                         else:
-                            # Rule 1: Tombstone check
-                            if path in self._tombstone_list:
-                                tombstone_ts = self._tombstone_list[path]
-                                if mtime is None:
-                                    continue
-                                if mtime > tombstone_ts:
-                                    self._tombstone_list.pop(path)
-                                else:
-                                    continue
-                            
                             # Rule 2: Mtime check
                             existing = self._get_node(path)
                             old_mtime = None
@@ -631,10 +674,18 @@ class DirectoryStructureParser:
     
     async def update_suspect(self, path: str, new_mtime: float):
         """Update a suspect file's mtime from Sentinel Sweep."""
+        # Normalize
+        path = os.path.normpath(path).rstrip('/') if path != '/' else '/'
         async with self._global_semaphore:
             async with self._get_segment_lock(path):
                 # Update logical clock with observed mtime
                 self._logical_clock.update(new_mtime)
+                
+                node = self._get_node(path)
+                if not node:
+                    self.logger.warning(f"Suspect update ignored: {path} not found in tree")
+                    return
+
                 old_mtime = node.modified_time
                 node.modified_time = new_mtime
                 
@@ -656,6 +707,9 @@ class DirectoryStructureParser:
 
     async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
         """Get the tree structure starting from path."""
+        # Normalize incoming path
+        path = os.path.normpath(path).rstrip('/') if path != '/' else '/'
+        
         async with self._global_semaphore:
             # First check if it's a directory
             node = self._directory_path_map.get(path)

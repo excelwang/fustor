@@ -150,11 +150,13 @@ Fusion 维护以下状态：
   
 ### 4.3 可疑名单 (Suspect List)
 
-- **用途**：标记可能正在写入的文件
-- **来源**：Snapshot/Audit 发现 `(HybridNow - mtime) < 10min` 的文件
-- **淘汰与清理**：
-  - **实时移除**：收到该文件的 Realtime Update/Delete 时立即从名单移除并清除标记。
-  - **定时到期**：由 **后台定期任务 (Periodic Task)** 负责清理。基于单调时钟计算的 TTL 到期后自动移除（防止审计扫描导致的“续命”效应，TTL 锚定在文件最后一次变动的 mtime 上）。
+- **用途**：标记可能正处于 NFS 客户端缓存中、尚未完全刷新到存储中心的文件、未结束写入的不完整文件。
+- **来源**：任何 Snapshot/Audit 发现 `(LogicalWatermark - mtime) < threshold` 的文件。
+- **稳定性判定模型 (Stability-based Model)**：
+  - **实时移除**：收到文件 Realtime Update/Delete 时立即从名单移除并清除标记。
+  - **物理过期检查**：后台任务定期检查物理 TTL (基于 `monotonic_now`) 已到期的条目。
+    - **稳定 (Stable/Cold)**：比较当前 `node.mtime` 与加入名单时记录的 `recorded_mtime`。若一致，判定为“已冷却”，正式移除条目并清除 `integrity_suspect` 标记。
+    - **活跃 (Active/Hot)**：若 `node.mtime` 发生了变化，说明文件仍处于活跃变动中。此时为条目**续期**一个完整的物理 TTL 周期，并更新 `recorded_mtime`（无需重新计算逻辑 Age）。
 - **API 标记**：`integrity_suspect: true`
 
 ### 4.4 盲区名单 (Blind-spot List)
@@ -205,6 +207,7 @@ Fusion 维护以下状态：
 #### 场景 1: Audit 报告"存在文件 X" (Smart Merge)
 
 ```
+# Rule 1: Tombstone Protection
 if X in Tombstone:
     if Audit.X.mtime > Tombstone.X.ts:
         → 接受 (新文件转世 Reincarnation)
@@ -212,12 +215,14 @@ if X in Tombstone:
         → 执行写入/更新
     else:
         → 丢弃 (确认是僵尸复活 Zombie)
+        return
 
+# Rule 2: Mtime Arbitration
 elif X in 内存树:
     if Audit.X.mtime > Memory.X.mtime:
         → 更新内存树 (盲区修改)
     else:
-        → 丢弃 (Realtime 更新)
+        → 维持现状 (Snapshot/Audit 不覆盖较新的状态)
 
 else:  # 内存中无 X
     if Audit.Parent.mtime < Memory.Parent.mtime:
@@ -225,23 +230,25 @@ else:  # 内存中无 X
     else:
         → 添加到内存树
         → 加入 Blind-spot List (盲区新增)
-        → 如果 (HybridNow - X.mtime) < 10min: 加入 Suspect List
+        → 如果 (LogicalWatermark - X.mtime) < threshold: 加入 Suspect List
 ```
 
 #### 场景 2: Audit 报告"目录 D 缺少文件 B" (Blind Spot Deletion)
 
 ```
-if Parent D is Skipped in Audit (audit_skipped=True):
-    → 维持现状 (认为是 NFS 缓存导致的未扫描，保留之前的 Deletion 记录)
+if Parent D reported as "Skipped" (audit_skipped=True):
+    → 维持现状 (认为是 NFS 缓存导致的静默目录，保护子项不被误删)
 
-elif Parent D was Not Scanned:
-    → 忽略
+elif Parent D was Not Scanned in this cycle:
+    → 忽略 (不触发 Missing 判定)
 
-else (Full Scan on D):
+else (Full Scan on D confirmed):
     if B in Memory Tree:
         # Rule 3: 陈旧证据保护 (Stale Evidence Protection)
-        if B.last_updated_at > current_audit_start_time:
-             → 丢弃删除指令 (该文件在审计采集中途/之后有过实时更新，扫描结果已陈旧)
+        if B.last_updated_at > current_audit_start_logical_time:
+             → 丢弃删除指令 (该文件在审计开始后有过实时更新，审计视图已落后)
+        elif B in Tombstone:
+             → 忽略 (已处理)
         else:
              → 将 B 从内存树中删除 (保证视图即真相)
              → 将 B 加入 Blind Spot Deletion List
@@ -294,11 +301,12 @@ hybrid_now = max(time.time(), logical_clock.get_watermark())
 
 | 场景 | 使用时间源 | 判定逻辑 |
 |------|------------|------|
-| **热文件判定 (Suspect)** | `Hybrid Now` | `age = hybrid_now - file.mtime` |
-| **陈旧证据保护 (Handle Audit)** | `Logical Time` | `if node.last_updated_at > audit_start_logical_time: skip_deletion` |
-| **Suspect 过期移除 (TTL)** | `Monotonic Time`| `remaining_life = hot_threshold - age`; `expiry = monotonic_now + remaining_life` |
-| **Session 超时 (Heartbeat)** | `Physical Time` | `physical_now - last_heartbeat > timeout_seconds` |
-| **清理频率限制 (Rate Limit)**| `Monotonic Time`| `if monotonic_now - last_cleanup < 5s: skip` |
+| **热文件判定 (Suspect Age)** | `Logical Time` | `age = watermark - file.mtime` |
+| **墓碑时效清理 (Tombstone TTL)**| `Logical Time` | `if watermark - ts > 1hr: purge` |
+| **陈旧证据保护 (Audit End)** | `Logical Time` | `if node.last_updated_at > audit_start: skip` |
+| **Suspect 稳定性续期 (Physical TTL)** | `Monotonic Time`| `if monotonic_now > expires_at: perform_mtime_stability_check()` |
+| **Session 超时 (Heartbeat)** | `Physical Time` | `physical_now - last_heartbeat > timeout` |
+| **清理频率限制 (Rate Limit)**| `Monotonic Time`| `if monotonic_now - last_cleanup < 0.5s: skip` |
 
 ---
 

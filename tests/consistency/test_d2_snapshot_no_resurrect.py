@@ -47,13 +47,9 @@ class TestSnapshotTombstoneProtection:
         # Step 2: Delete via Agent A (creates Tombstone)
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
-        # Wait for DELETE event
-        time.sleep(3)
-        
-        # Verify file is gone
-        tree = fusion_client.get_tree(path="/", max_depth=-1)
-        assert fusion_client._find_in_tree(tree, test_file) is None, \
-            "File should be deleted"
+        # Wait for DELETE event and Verify file is gone
+        removed = fusion_client.wait_for_file(test_file, timeout=20, should_exist=False)
+        assert removed, "File should be deleted"
         
         # Step 3: Now, if Agent B's snapshot sees the file (due to NFS cache)
         # and sends a snapshot event, it should be discarded.
