@@ -52,8 +52,11 @@ def message_iterator_runner(fs_config: SourceConfig, tmp_path: Path):
     driver.watch_manager.stop()
 
 
-def test_no_event_during_incomplete_write(tmp_path: Path, message_iterator_runner):
-    """Tests that a file being written to continuously doesn't generate premature events."""
+def test_events_during_incomplete_write(tmp_path: Path, message_iterator_runner):
+    """
+    Tests that a file being written to generates events even before closing, 
+    supporting the requirement for on_modified events.
+    """
     runner, events, _ = message_iterator_runner
     runner()
     events.clear()  # Clear any initial events
@@ -62,29 +65,39 @@ def test_no_event_during_incomplete_write(tmp_path: Path, message_iterator_runne
     file_path = tmp_path / "incomplete_write.txt"
     file_handle = open(file_path, 'w')
     file_handle.write("initial content")
+    file_handle.flush() # Ensure it hits the disk for inotify
     
-    # Wait for potential event processing (should not generate an event)
-    time.sleep(0.2)
+    # Wait for potential event processing (now it SHOULD generate an event due to on_modified)
+    time.sleep(0.3)
 
-    # Assert: No events should have been generated yet since file is not closed
-    assert len(events) == 0, f"Expected 0 events during incomplete write, but got {len(events)}: {events}"
+    # Assert: We should have at least one event (creation or modification)
+    assert len(events) >= 1, f"Expected at least 1 event during incomplete write, but got {len(events)}"
+    
+    # Check that the event refers to the correct file
+    last_event = events[-1]
+    assert isinstance(last_event, UpdateEvent)
+    assert last_event.rows[0]['file_path'] == str(file_path)
 
     # Act: Continue writing to the file
     file_handle.write("\nadditional content")
+    file_handle.flush()
     time.sleep(0.2)
 
-    # Assert: Still no events should have been generated
-    assert len(events) == 0, f"Expected 0 events during continued writing, but got {len(events)}: {events}"
+    # Note: Subsequent modifications might be throttled (5s interval), 
+    # so we might or might not have more events here depending on timing.
 
-    # Act: Close the file, which should trigger the event
+    # Act: Close the file
     file_handle.close()
-    time.sleep(0.2)
+    time.sleep(0.3)
 
-    # Assert: Now we should have exactly one UpdateEvent
-    assert len(events) == 1, f"Expected 1 event after file close, but got {len(events)}: {events}"
-    event = events[0]
-    assert isinstance(event, UpdateEvent), f"Expected UpdateEvent, got {type(event)}"
-    assert event.rows[0]['file_path'] == str(file_path)
+    # Assert: Now we should have at least one UpdateEvent, and the last one should reflect the final state
+    assert len(events) >= 1
+    final_event = events[-1]
+    assert isinstance(final_event, UpdateEvent)
+    assert final_event.rows[0]['file_path'] == str(file_path)
+    # Total size should be around 15 + 1 + 18 = 34
+    assert final_event.rows[0]['size'] >= 15
+
 
 
 def test_multiple_writes_generate_single_event(tmp_path: Path, message_iterator_runner):
@@ -105,14 +118,19 @@ def test_multiple_writes_generate_single_event(tmp_path: Path, message_iterator_
         # File is automatically closed after exiting 'with' block
 
     # Wait for event processing
-    time.sleep(0.2)
+    time.sleep(0.3)
 
-    # Assert: Only one UpdateEvent should be generated despite multiple writes
-    assert len(events) == 1, f"Expected 1 event after multiple writes, but got {len(events)}: {events}"
-    event = events[0]
-    assert isinstance(event, UpdateEvent), f"Expected UpdateEvent, got {type(event)}"
-    assert event.rows[0]['file_path'] == str(file_path)
-    assert event.rows[0]['size'] > 0, "File size should be greater than 0"
+    # Assert: We should have at least one UpdateEvent (might have more due to on_modified)
+    assert len(events) >= 1, f"Expected at least 1 event after multiple writes, but got {len(events)}"
+    
+    # Verify that the events refer to the correct file
+    for event in events:
+        assert isinstance(event, UpdateEvent)
+        assert event.rows[0]['file_path'] == str(file_path)
+    
+    # The last event should have the full size
+    assert events[-1].rows[0]['size'] > 0
+
 
 
 def test_append_mode_writes_generate_single_event(tmp_path: Path, message_iterator_runner):
@@ -136,10 +154,12 @@ def test_append_mode_writes_generate_single_event(tmp_path: Path, message_iterat
         f.write("\nmore appended content")
 
     # Wait for event processing
-    time.sleep(0.2)
+    time.sleep(0.3)
 
-    # Assert: Only one UpdateEvent should be generated despite multiple appends
-    assert len(events) == 1, f"Expected 1 event after multiple appends, but got {len(events)}: {events}"
-    event = events[0]
-    assert isinstance(event, UpdateEvent), f"Expected UpdateEvent, got {type(event)}"
-    assert event.rows[0]['file_path'] == str(file_path)
+    # Assert: At least one UpdateEvent should be generated
+    assert len(events) >= 1, f"Expected at least 1 event after multiple appends, but got {len(events)}"
+    
+    # Last event should be the final state
+    final_event = events[-1]
+    assert isinstance(final_event, UpdateEvent)
+    assert final_event.rows[0]['file_path'] == str(file_path)

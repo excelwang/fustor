@@ -143,10 +143,10 @@ Fusion 维护以下状态：
 ### 4.2 墓碑表 (Tombstone List)
 
 - **用途**：记录被 Realtime 删除的文件，防止滞后的 Snapshot/Audit 使其复活
-- **结构**：`Map<Path, DeleteTime>`
+- **结构**：`Map<Path, DeleteLogicalTime>`
 - **生命周期**：
-  - 创建：处理 Realtime Delete 时
-  - 销毁：**基于 TTL (Time-To-Live)**。默认保留 1 小时。
+  - **创建**：处理 Realtime Delete 时，记录删除时刻的逻辑时间戳
+  
   
 ### 4.3 可疑名单 (Suspect List)
 
@@ -326,19 +326,23 @@ hybrid_now = max(time.time(), logical_clock.get_watermark())
 ## 8. 哨兵巡检 (Sentinel Sweep)
 
 - **触发者**：Leader Agent
-- **频率**：2 分钟/次
-- **目的**：更新 Suspect List 中文件的 mtime
-- **消息类型**：`snapshot`
+- **频率**：2 分钟/次 (可配置 `sentinel_interval_sec`)
+- **目的**：验证 Suspect List 中文件的 mtime 稳定性
+- **消息类型**：`snapshot` 或直接 API 反馈
 
-### API (View-Specific)
+### API
 
 ```
-GET  /api/view/fs/suspect-list?source_id={id}
-PUT  /api/view/fs/suspect-list
-     Body: [{path, current_mtime, status}, ...]
+# 获取待巡检任务
+GET  /api/v1/ingest/consistency/sentinel/tasks
+     Response: {"type": "suspect_check", "paths": ["/file1.txt", ...]}
+
+# 提交巡检结果
+POST /api/v1/ingest/consistency/sentinel/feedback
+     Body: {"type": "suspect_update", "updates": [{"path": "...", "mtime": 123.0}, ...]}
 ```
 
-Fusion 收到 PUT 后仅更新 mtime，不执行移除。移除由 TTL 或 Realtime 事件触发。
+Fusion 收到反馈后执行稳定性判定：若 mtime 与记录值一致，则确认文件已冷却，移除 Suspect 标记；若 mtime 变化，则续期 TTL。
 
 ---
 
@@ -354,7 +358,39 @@ Fusion 收到 PUT 后仅更新 mtime，不执行移除。移除由 TTL 或 Realt
 
 ## 10. 扩展性要求
 
-所有 Driver 和 Parser 必须支持 `message_source` 字段：
+所有 SourceDriver 和 ViewDriver 必须支持 `message_source` 字段：
 
-- **Driver**: 能够生成 `realtime`, `snapshot`, `audit` 类型的事件
-- **Parser**: 在 `process_event` 中根据 `message_source` 执行不同的处理逻辑
+- **SourceDriver**: 能够生成 `message_source` 为 `realtime`, `snapshot`, `audit` 类型的事件
+- **ViewDriver**: 在 `process_event` 中根据 `message_source` 执行不同的处理逻辑
+
+---
+
+## 11. 实现细节 (Implementation Notes)
+
+### 11.1 陈旧证据保护 (Stale Evidence Protection)
+
+每个节点维护 `last_updated_at` 逻辑时间戳，记录最后一次被 Realtime 事件更新的时刻。在 `Audit-End` 执行 Missing 判定时：
+
+```python
+if node.last_updated_at > audit_start_logical_time:
+    # 该节点在审计期间有过实时更新，审计视图已落后
+    # 跳过删除
+```
+
+### 11.2 审计跳过保护 (Audit Skipped Protection)
+
+当父目录被标记为 `audit_skipped=True` 时（因 mtime 未变而跳过扫描），其子项不会被 Missing 判定误删。
+
+### 11.3 Suspect 堆优化 (Heap-based TTL)
+
+使用 `heapq` 管理 Suspect 条目的 TTL 到期时间，实现 O(log n) 的高效过期检查。
+
+### 11.4 ViewDriver 生命周期钩子
+
+| 钩子 | 时机 | 用途 |
+|------|------|------|
+| `on_session_start` | 新 Session 加入 | 重置盲区列表 |
+| `on_session_close` | Session 结束 | 清理 Session 相关状态 |
+| `handle_audit_start` | 审计开始 | 记录逻辑时间戳 |
+| `handle_audit_end` | 审计结束 | 执行 Missing 判定和 Tombstone 清理 |
+| `cleanup_expired_suspects` | 后台定时任务 | 执行 mtime 稳定性检查 |
