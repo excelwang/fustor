@@ -28,6 +28,10 @@ class EventParser(Protocol):
         """Process a single event and update the data view"""
         ...
     
+    async def on_session_start(self, session_id: str):
+        """Called when a new session is created for the datastore"""
+        ...
+
     async def get_data_view(self, **kwargs) -> Any:
         """Get the current data view"""
         ...
@@ -94,6 +98,12 @@ class ParserManager:
         parser = self.parsers.get("file_directory")
         if parser and hasattr(parser, "cleanup_expired_suspects"):
             await parser.cleanup_expired_suspects()
+
+    async def on_session_start(self, session_id: str):
+        """Dispatch session start event to all parsers."""
+        for name, parser in self.parsers.items():
+            if hasattr(parser, "on_session_start"):
+                await parser.on_session_start(session_id)
 
 
 
@@ -219,3 +229,8 @@ async def reset_directory_tree(datastore_id: int) -> bool:
     except Exception as e:
         logger.error(f"Failed to reset directory tree for datastore {datastore_id}: {e}", exc_info=True)
         return False
+
+async def on_session_start(datastore_id: int, session_id: str):
+    """Notify parsers that a new session has started."""
+    manager = await get_cached_parser_manager(datastore_id)
+    await manager.on_session_start(session_id)

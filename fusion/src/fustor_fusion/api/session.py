@@ -9,7 +9,7 @@ from ..auth.dependencies import get_datastore_id_from_api_key
 from ..auth.datastore_cache import datastore_config_cache, DatastoreConfig
 from ..core.session_manager import session_manager
 from ..datastore_state_manager import datastore_state_manager
-from ..parsers.manager import reset_directory_tree
+from ..parsers.manager import reset_directory_tree, on_session_start
 
 logger = logging.getLogger(__name__)
 session_router = APIRouter(tags=["Session Management"])
@@ -107,6 +107,13 @@ async def create_session(
 
     client_ip = request.client.host
     
+    # Notify parsers about the new session for lifecycle management (e.g. blind-spot reset)
+    try:
+        await on_session_start(datastore_id, session_id)
+        logger.info(f"Triggered on_session_start for {session_id} on datastore {datastore_id}")
+    except Exception as e:
+        logger.error(f"Failed to trigger on_session_start during session creation: {e}")
+
     await session_manager.create_session_entry(
         datastore_id, 
         session_id, 

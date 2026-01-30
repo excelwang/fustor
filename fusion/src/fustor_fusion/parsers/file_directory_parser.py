@@ -152,6 +152,16 @@ class DirectoryStructureParser:
         
         # Logical clock for hybrid time synchronization
         self._logical_clock = LogicalClock()
+        
+        # Priority queue for efficient suspect expiration: (expires_at, path)
+        self._suspect_heap: List[Tuple[float, str]] = []
+
+    async def on_session_start(self, session_id: str):
+        """Called when a new session joins. Resets blind-spot lists for fresh calibration."""
+        async with self._global_exclusive_lock():
+            self._blind_spot_deletions.clear()
+            self._blind_spot_additions.clear()
+            self.logger.info(f"Blind spot lists reset for datastore {self.datastore_id} due to new session {session_id}")
 
     def _check_cache_invalidation(self, path: str):
         """Simple placeholder for more complex logic"""
@@ -342,13 +352,10 @@ class DirectoryStructureParser:
                 self._last_audit_start = self._logical_clock.get_watermark()
                 self.logger.info(f"Auto-detected Audit Start logical time: {self._last_audit_start} from event index {event.index}")
     
-            # Session Change Detection
+            # Session tracking (informative only)
             session_id = getattr(event, "session_id", None)
             if session_id and session_id != self._current_session_id:
-                if self._current_session_id is not None:
-                    self.logger.info(f"New Agent Session detected: {session_id} (was {self._current_session_id}). Resetting Blind Spot List.")
-                    self._blind_spot_deletions.clear()
-                    self._blind_spot_additions.clear()
+                self.logger.info(f"Processing events from session: {session_id}")
                 self._current_session_id = session_id
 
     
@@ -488,7 +495,10 @@ class DirectoryStructureParser:
                                         # If already tracked, let the cleanup task's stability check handle renewal.
                                         if path not in self._suspect_list:
                                             remaining_life = self.hot_file_threshold - age
-                                            self._suspect_list[path] = (time.monotonic() + max(0.0, remaining_life), mtime)
+                                            expiry = time.monotonic() + max(0.0, remaining_life)
+                                            self._suspect_list[path] = (expiry, mtime)
+                                            import heapq
+                                            heapq.heappush(self._suspect_heap, (expiry, path))
                                     else:
                                         # File became cold based on mtime change
                                         node.integrity_suspect = False
@@ -639,32 +649,43 @@ class DirectoryStructureParser:
             
         self._last_suspect_cleanup_time = now_monotonic
         
-        expired_paths = [path for path, (expires_at, _) in self._suspect_list.items() if expires_at <= now_monotonic]
+        import heapq
+        processed_count = 0
+        while self._suspect_heap and self._suspect_heap[0][0] <= now_monotonic:
+            expires_at, path = heapq.heappop(self._suspect_heap)
+            processed_count += 1
+            
+            # Check if this item is still in the list and matches the expiry
+            # (it might have been removed or updated with a newer expiry)
+            if path not in self._suspect_list:
+                continue
+            
+            current_expiry, recorded_mtime = self._suspect_list[path]
+            # Since we use a heap, we might have multiple entries for the same path.
+            # Only process the one that matches current state.
+            if abs(current_expiry - expires_at) > 1e-6:
+                continue
+            
+            node = self._get_node(path)
+            if not node:
+                del self._suspect_list[path]
+                continue
+            
+            # STABILITY CHECK
+            current_mtime = node.modified_time
+            if abs(current_mtime - recorded_mtime) > 1e-6:
+                # Still active, renew
+                new_expiry = now_monotonic + self.hot_file_threshold
+                self._suspect_list[path] = (new_expiry, current_mtime)
+                heapq.heappush(self._suspect_heap, (new_expiry, path))
+                self.logger.info(f"Suspect RENEWED (Active): {path} (new mtime: {current_mtime})")
+            else:
+                # Stable!
+                self.logger.info(f"Suspect EXPIRED (Stable): {path}")
+                del self._suspect_list[path]
+                node.integrity_suspect = False
         
-        if expired_paths:
-            for path in expired_paths:
-                expires_at, recorded_mtime = self._suspect_list[path]
-                node = self._get_node(path)
-                
-                if not node:
-                    del self._suspect_list[path]
-                    continue
-                
-                # STABILITY CHECK:
-                # If mtime has changed since we last checked/recorded, it's still active.
-                # Renew for another round without age recalculation.
-                current_mtime = node.modified_time
-                if abs(current_mtime - recorded_mtime) > 1e-6:
-                    new_expiry = now_monotonic + self.hot_file_threshold
-                    self._suspect_list[path] = (new_expiry, current_mtime)
-                    self.logger.info(f"Suspect RENEWED (Active): {path} (new mtime: {current_mtime})")
-                else:
-                    # Stable! Confirmed cold.
-                    self.logger.info(f"Suspect EXPIRED (Stable): {path} (expired at {expires_at})")
-                    del self._suspect_list[path]
-                    node.integrity_suspect = False
-        
-        return len(expired_paths)
+        return processed_count
 
     async def get_suspect_list(self) -> Dict[str, float]:
         """Get the current Suspect List for Sentinel Sweep."""
@@ -697,7 +718,10 @@ class DirectoryStructureParser:
                     if (watermark - new_mtime) < self.hot_file_threshold:
                         # Stability model: if already tracked, don't reset, let cleanup handle it.
                         if path not in self._suspect_list:
-                            self._suspect_list[path] = (time.monotonic() + self.hot_file_threshold, new_mtime)
+                            expiry = time.monotonic() + self.hot_file_threshold
+                            self._suspect_list[path] = (expiry, new_mtime)
+                            import heapq
+                            heapq.heappush(self._suspect_heap, (expiry, path))
                         node.integrity_suspect = True
                     else:
                         node.integrity_suspect = False
@@ -790,6 +814,7 @@ class DirectoryStructureParser:
             self._file_path_map = {}
             self._tombstone_list = {}
             self._suspect_list = {}
+            self._suspect_heap = []
             self._last_audit_start = None
             self._audit_seen_paths.clear()
             self._blind_spot_deletions.clear()
