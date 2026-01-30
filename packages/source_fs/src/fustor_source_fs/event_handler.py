@@ -47,14 +47,17 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
         self.throttle_interval = 5.0  # seconds
 
     def _get_index(self, mtime=None):
-        if mtime is not None:
-            return int(mtime * 1000)
         if self.logical_clock:
-            # Use observation-driven watermark for deletions/moves
+            if mtime is not None:
+                 # Problem 2 Fix: Strictly advance local logical clock with observed mtime
+                 self.logical_clock.update(float(mtime))
+            
+            # Index is ALWAYS the logic watermark * 1000 (ms)
             return int(self.logical_clock.get_watermark() * 1000)
         
-        # This shouldn't happen in production as FSDriver always provides a clock
-        logger.error("[fs] Critical: Generating index without mtime or logical clock!")
+        # Fallback if no logical clock provided (should not happen in production)
+        if mtime is not None:
+            return int(mtime * 1000)
         return int(time.time() * 1000)
 
     def _touch_recursive_bottom_up(self, path: str):
