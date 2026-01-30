@@ -44,12 +44,12 @@ class TestTombstoneCleanup:
         )
         fusion_client.wait_for_file_in_tree(test_file, timeout=15)
         
+        # Delete via Agent (creates Tombstone)
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
-        time.sleep(3)
         
-        # Verify deleted
-        tree = fusion_client.get_tree(path="/", max_depth=-1)
-        assert fusion_client._find_in_tree(tree, test_file) is None
+        # Wait for DELETE event and Verify deleted
+        assert fusion_client.wait_for_file(test_file, timeout=20, should_exist=False), \
+            f"File {test_file} should be removed from tree after Realtime DELETE"
         
         # Step 2-3: Use a marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_d4_{int(time.time())}.txt"
@@ -94,7 +94,11 @@ class TestTombstoneCleanup:
         fusion_client.wait_for_file_in_tree(test_file, timeout=15)
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
-        time.sleep(3)
+        assert fusion_client.wait_for_file(test_file, timeout=20, should_exist=False), \
+            f"File {test_file} should be removed after delete"
+        
+        # Give a small buffer for potential racing snapshots to be processed and blocked
+        time.sleep(5)
         
         # Immediately try to create from blind-spot (should be blocked by Tombstone)
         docker_manager.create_file_in_container(

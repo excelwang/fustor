@@ -1,8 +1,8 @@
 """
-Test D3: Audit does not resurrect tombstoned files.
+Test D3: Audit allows Reincarnation but blocks Zombie resurrection.
 
-验证在 Tombstone 中的文件不会被 Audit 事件复活。
-参考文档: CONSISTENCY_DESIGN.md - Section 5.3 场景 1 (if X in Tombstone → 丢弃 (僵尸复活))
+验证 Audit 能够区分“投胎”（删除后新创建，mtime 更新）和“僵尸复活”（NFS 缓存导致的过时消息）。
+参考文档: CONSISTENCY_DESIGN.md - Section 5.3 场景 1
 """
 import pytest
 import time
@@ -16,7 +16,7 @@ from ..conftest import (
 class TestAuditTombstoneProtection:
     """Test that audit does not resurrect tombstoned files."""
 
-    def test_audit_discards_tombstoned_file(
+    def test_audit_allows_reincarnation_after_delete(
         self,
         docker_env,
         fusion_client,
@@ -28,11 +28,11 @@ class TestAuditTombstoneProtection:
         场景:
           1. Agent A 创建文件
           2. Agent A 删除文件（创建 Tombstone）
-          3. 无 Agent 客户端 C 重新创建同名文件（盲区操作）
+          3. 无 Agent 客户端 C 重新创建同名文件（mtime 更晚）
           4. Audit 发现该文件
-          5. 但因为文件在 Tombstone 中，Audit 事件被丢弃
         预期:
-          - 即使磁盘上存在同名文件，Fusion 中也不会出现该文件
+          - 因为 mtime > Tombstone TS，这被视为合法的“重构/投胎”。
+          - Fusion 应该接受该文件，Overrule Tombstone。
         """
         test_file = f"{MOUNT_POINT}/audit_tombstone_test_{int(time.time()*1000)}.txt"
         

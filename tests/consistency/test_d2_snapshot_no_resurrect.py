@@ -92,8 +92,13 @@ class TestSnapshotTombstoneProtection:
         for f in test_files:
             docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, f)
         
-        # Wait for delete events and potential snapshot
-        time.sleep(15)
+        # Wait for delete events to be processed
+        for f in test_files:
+            assert fusion_client.wait_for_file(f, timeout=20, should_exist=False), \
+                f"File {f} should be removed after rapid delete"
+        
+        # Give a small buffer for potential racing snapshots to be blocked by Tombstone
+        time.sleep(5)
         
         # All files should remain deleted
         tree = fusion_client.get_tree(path="/", max_depth=-1)

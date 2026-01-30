@@ -2,7 +2,8 @@ import pytest
 import time
 import asyncio
 from unittest.mock import MagicMock
-from fustor_fusion.parsers.file_directory_parser import DirectoryStructureParser
+import heapq
+from fustor_fusion.parsers.fs import DirectoryStructureParser
 from fustor_event_model.models import UpdateEvent, MessageSource, EventType
 
 @pytest.fixture
@@ -43,7 +44,9 @@ async def test_suspect_stability_cleanup_stable(parser):
     # 2. Simulate TTL expiry (physical time)
     now_monotonic = time.monotonic()
     # Force expired
-    parser._suspect_list[path] = (now_monotonic - 10.0, mtime) 
+    expiry = now_monotonic - 10.0
+    parser._suspect_list[path] = (expiry, mtime) 
+    heapq.heappush(parser._suspect_heap, (expiry, path))
     parser._last_suspect_cleanup_time = 0.0 # Ensure cleanup runs
     
     # Act: trigger cleanup
@@ -83,7 +86,9 @@ async def test_suspect_stability_cleanup_renewal(parser):
     # 3. Simulate TTL expiry
     now_monotonic = time.monotonic()
     # Force expiry, recorded was 1000
-    parser._suspect_list[path] = (now_monotonic - 10.0, mtime) 
+    expiry = now_monotonic - 10.0
+    parser._suspect_list[path] = (expiry, mtime) 
+    heapq.heappush(parser._suspect_heap, (expiry, path))
     parser._last_suspect_cleanup_time = 0.0 # Ensure cleanup runs
     
     # Act: trigger cleanup

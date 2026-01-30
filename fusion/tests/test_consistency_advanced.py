@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 import time
-from fustor_fusion.parsers.file_directory_parser import DirectoryStructureParser
+from fustor_fusion.parsers.fs import DirectoryStructureParser
 from fustor_event_model.models import UpdateEvent, MessageSource, DeleteEvent
 
 @pytest.fixture

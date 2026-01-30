@@ -5,7 +5,7 @@ and building corresponding data views.
 All data is stored in memory only.
 """
 from typing import Dict, Any, Optional, Protocol
-from .file_directory_parser import DirectoryStructureParser
+from .fs import DirectoryStructureParser
 import logging
 import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession  # Keep import for compatibility with function signatures
