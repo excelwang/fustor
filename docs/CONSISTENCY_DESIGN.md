@@ -289,14 +289,6 @@ Fusion 为每个数据源维护一个单调递增的逻辑时钟 `L`。
 | **Physical Time (P)** | `time.time()` | 挂钟时间，受 NTP 影响可能回退 | 外部 API 展示、Session 租约检查 |
 | **Monotonic Time (M)**| `time.monotonic()`| 纳秒级单调递增，不受挂钟调整影响 | 本地倒计时 (TTL Expiry)、频率限制 (Rate Limiting) |
 
-### 6.3 混合当前时间 (Hybrid Now)
-
-用于判定文件“新鲜度”的关键指标：
-```python
-hybrid_now = max(time.time(), logical_clock.get_watermark())
-```
-这确保了即使 Fusion 服务器物理时间极度滞后（如系统启动初期），也能通过 Agent 上报的时间戳将视角拉回到全球数据流的当前状态。
-
 ### 6.4 应用场景裁决表
 
 | 场景 | 使用时间源 | 判定逻辑 |

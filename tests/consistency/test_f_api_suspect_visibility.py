@@ -35,7 +35,7 @@ class TestApiSuspectVisibility:
         # 1. create file in blind spot (Client C)
         # Use a future timestamp to guarantee it's considered "hot" and thus suspect
         # But we can't easily set future mtime via docker exec touch without root/time shift complications.
-        # Instead, relying on Hybrid Clock: hybrid_now - mtime < threshold (10min).
+        # Instead, relying on Logical Clock.
         # Any newly created file IS hot by definition.
         
         docker_manager.create_file_in_container(
