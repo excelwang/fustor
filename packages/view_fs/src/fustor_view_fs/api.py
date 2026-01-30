@@ -25,9 +25,9 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_datastore_id_de
     
     Args:
         get_provider_func: Async function to get the FSViewProvider for a datastore
-        check_snapshot_func: Async function to check snapshot status
+        check_snapshot_func: Async function to check snapshot status (includes Core + Live logic)
         get_datastore_id_dep: FastAPI dependency to get datastore_id from API key
-    
+
     Returns:
         Configured FastAPI APIRouter
     """

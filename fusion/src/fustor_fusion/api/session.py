@@ -11,12 +11,6 @@ from ..core.session_manager import session_manager
 from ..datastore_state_manager import datastore_state_manager
 from ..view_manager.manager import reset_views, on_session_start, on_session_close
 
-# ... (omitted lines)
-
-        # If it's a live datastore and no sessions are left, reset the views
-        # (This logic might be in session_manager, but api/session.py might duplicate or invoke it)
-        # Checking context... likely just imports and usages.
-
 
 logger = logging.getLogger(__name__)
 session_router = APIRouter(tags=["Session Management"])

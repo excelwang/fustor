@@ -20,20 +20,8 @@ logger = logging.getLogger(__name__)
 view_router = APIRouter(tags=["Data Views"])
 
 
-async def check_snapshot_status(datastore_id: int):
-    """Checks if the initial snapshot sync is complete for the datastore."""
-    from ..core.session_manager import session_manager
-    from ..auth.datastore_cache import datastore_config_cache
-    
-    config = datastore_config_cache.get_datastore_config(datastore_id)
-    if config and config.meta and config.meta.get('type') == 'live':
-        sessions = await session_manager.get_datastore_sessions(datastore_id)
-        if not sessions:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="No active sessions for this live datastore. Service temporarily unavailable."
-            )
-
+async def _check_core_readiness(datastore_id: int):
+    """Internal helper to check core system readiness (snapshot signal, queue, inflight)."""
     is_signal_complete = await datastore_state_manager.is_snapshot_complete(datastore_id)
     queue_size = memory_event_queue.get_queue_size(datastore_id)
     inflight_count = processing_manager.get_inflight_count(datastore_id)
@@ -48,6 +36,50 @@ async def check_snapshot_status(datastore_id: int):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=detail
         )
+
+def make_readiness_checker(driver_name: str):
+    """
+    Factory to create a complete readiness checker for a specific driver.
+    Checks:
+    1. Core System Readiness (Snapshot, Queue, Inflight)
+    2. Live Session Requirement (if Provider is configured as Live)
+    """
+    async def _check(datastore_id: int):
+        # 1. Check core readiness
+        await _check_core_readiness(datastore_id)
+        
+        # 2. Check "live" mode
+        from ..core.session_manager import session_manager
+        
+        manager = await get_cached_view_manager(datastore_id)
+        provider = manager.providers.get(driver_name)
+        
+        # Determine if we need to enforce live session check
+        is_live = False
+        if provider:
+            # Prefer property check if available (standard interface)
+            if getattr(provider, "requires_full_reset_on_session_close", False):
+                is_live = True
+            elif provider.config:
+                # Fallback to config inspection
+                is_live = provider.config.get("mode") == "live" or provider.config.get("is_live") is True
+        
+        if is_live:
+            sessions = await session_manager.get_datastore_sessions(datastore_id)
+            if not sessions:
+                raise HTTPException(
+                    status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                    detail="No active sessions for this live datastore. Service temporarily unavailable."
+                )
+    return _check
+
+
+async def check_snapshot_status(datastore_id: int):
+    """
+    Generic core readiness check (Snapshot + Queue + Inflight).
+    Usage: For generic endpoints that don't target a specific view driver.
+    """
+    await _check_core_readiness(datastore_id)
 
 
 async def get_view_provider(datastore_id: int, driver_name: str):
@@ -87,9 +119,12 @@ def _discover_view_api_routers():
                 async def get_provider_for_driver(datastore_id: int, _driver=driver_name):
                     return await get_view_provider(datastore_id, _driver)
                 
+                # Create specialized checker that covers all readiness logic
+                checker = make_readiness_checker(driver_name)
+                
                 router = create_router_func(
                     get_provider_func=get_provider_for_driver,
-                    check_snapshot_func=check_snapshot_status,
+                    check_snapshot_func=checker,
                     get_datastore_id_dep=get_datastore_id_from_api_key
                 )
                 routers.append((ep.name, router))
@@ -110,8 +145,10 @@ def register_view_driver_routes():
     routers = _discover_view_api_routers()
     for name, router in routers:
         try:
-            view_router.include_router(router)
-            logger.info(f"Registered view API routes: {name}")
+            # Register with prefix matching the view_id (driver name)
+            # This allows multiple drivers or custom driver IDs to coexist
+            view_router.include_router(router, prefix=f"/{name}")
+            logger.info(f"Registered view API routes: {name} at prefix /{name}")
         except Exception as e:
             logger.error(f"Error registering view API routes '{name}': {e}", exc_info=True)
     

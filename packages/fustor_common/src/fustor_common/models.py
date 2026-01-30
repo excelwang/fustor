@@ -20,7 +20,7 @@ class DatastoreBase(BaseModel):
     id: Optional[int] = None
     name: str = Field(..., description="存储库名称")
     visible: bool = Field(False, description="是否对公众可见")
-    meta: Optional[Dict] = Field(None, description="存储库描述")
+    # meta field removed as per refactoring requirement
     allow_concurrent_push: bool = Field(False, description="是否允许并发推送")
     session_timeout_seconds: int = Field(30, description="会话超时秒数")
 
@@ -73,4 +73,3 @@ class DatastoreConfig(BaseModel):
     datastore_id: int
     allow_concurrent_push: bool
     session_timeout_seconds: int
-    meta: Optional[Dict] = None

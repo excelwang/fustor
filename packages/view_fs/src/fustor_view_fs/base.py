@@ -17,8 +17,6 @@ class FSViewBase(ViewDriver):
     Provides shared state and concurrency primitives.
     """
     
-    target_schema: str = "file_directory"
-    
     def __init__(self, datastore_id: int, config: Optional[Dict[str, Any]] = None, hot_file_threshold: float = 30.0):
         # Allow config to override argument
         final_config = config or {}

@@ -44,6 +44,17 @@ class ViewDriver(ABC):
         """
         self.datastore_id = datastore_id
         self.config = config
+    
+    @property
+    def requires_full_reset_on_session_close(self) -> bool:
+        """
+        Indicates if the view should be fully reset when the last session closes.
+        This often corresponds to 'Live' mode drivers where state is ephemeral to the session.
+        """
+        if self.config:
+            # Check for standard 'live' config patterns
+            return self.config.get("mode") == "live" or self.config.get("is_live") is True
+        return False
 
     @abstractmethod
     async def process_event(self, event: EventBase) -> bool:

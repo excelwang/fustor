@@ -79,6 +79,24 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 self._schedule_session_cleanup(datastore_id, session_id, timeout)
             )
             return session_info
+    async def _check_if_datastore_live(self, datastore_id: int) -> bool:
+        """
+        Check if any view provider for the datastore requires full reset (Live mode).
+        """
+        from ..view_manager.manager import get_cached_view_manager
+        try:
+            manager = await get_cached_view_manager(datastore_id)
+            if not manager or not manager.providers:
+                return False
+                
+            for provider in manager.providers.values():
+                # Use property defined in ViewDriver base class
+                if getattr(provider, "requires_full_reset_on_session_close", False):
+                    return True
+        except Exception as e:
+            logger.warning(f"Failed to check live status for datastore {datastore_id}: {e}")
+        return False
+
     async def _schedule_session_cleanup(self, datastore_id: int, session_id: str, timeout_seconds: int):
         """
         Schedule cleanup for a single session after timeout.
@@ -118,14 +136,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                             del self._sessions[datastore_id]
                             
                             # NEW: Check if this is a 'live' datastore and clear data
-                            from ..auth.datastore_cache import datastore_config_cache
                             from ..view_manager.manager import reset_views
                             
-                            datastore_config = datastore_config_cache.get_datastore_config(datastore_id)
-                            is_live = False
-                            if datastore_config and datastore_config.meta:
-                                if datastore_config.meta.get('type') == 'live':
-                                    is_live = True
+                            is_live = await self._check_if_datastore_live(datastore_id)
                             
                             if is_live:
                                 logger.info(f"Datastore {datastore_id} is 'live' type. Resetting views as no sessions remain.")
@@ -205,11 +218,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 del self._sessions[datastore_id]
                 
                 # Check for 'live' type and reset
-                from ..auth.datastore_cache import datastore_config_cache
                 from ..view_manager.manager import reset_views
                 
-                config = datastore_config_cache.get_datastore_config(datastore_id)
-                is_live = config.meta.get('type') == 'live' if config and config.meta else False
+                is_live = await self._check_if_datastore_live(datastore_id)
                 
                 if is_live:
                     await reset_views(datastore_id)
@@ -256,10 +267,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     if not self._sessions[datastore_id]:
                         del self._sessions[datastore_id]
                         
-                        from ..auth.datastore_cache import datastore_config_cache
                         from ..view_manager.manager import reset_views
-                        config = datastore_config_cache.get_datastore_config(datastore_id)
-                        is_live = config.meta.get('type') == 'live' if config and config.meta else False
+                        
+                        is_live = await self._check_if_datastore_live(datastore_id)
                         
                         if is_live:
                             await reset_views(datastore_id)

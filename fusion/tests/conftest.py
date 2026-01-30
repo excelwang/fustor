@@ -28,15 +28,17 @@ def register_dummy_route_for_middleware_test():
     # Define a simple router that explicitly uses the middleware we want to test
     dummy_router = APIRouter()
     
+    # Create a specialized checker logic for 'test_driver' using the real factory
+    from fustor_fusion.api.views import make_readiness_checker
+    
+    # Usage of factory ensures we test the same logic as production
+    test_checker = make_readiness_checker("test_driver")
+
     @dummy_router.get("/status_check")
     async def status_check(
         datastore_id: int = Depends(get_datastore_id_from_api_key)
     ):
-        # Explicitly call the dependency function if it's not automatically run by Depends in this context?
-        # Standard usage: Depends(check_snapshot_status) in signature.
-        # But create_fs_router calls it manually inside the handler usually?
-        # Let's match create_fs_router pattern: explicit await
-        await check_snapshot_status(datastore_id)
+        await test_checker(datastore_id)
         return {"status": "ok"}
         
     # Register on app to ensure visibility
