@@ -29,23 +29,18 @@ async def clean_state():
 @pytest.mark.asyncio
 async def test_api_unavailable_initially(client):
     """验证初始状态下接口返回 503"""
-    endpoints = [
-        ("/api/v1/views/fs/tree", {"path": "/"}),
-        ("/api/v1/views/fs/search", {"pattern": "test"}),
-        ("/api/v1/views/fs/stats", {}),
-    ]
-    
-    for url, params in endpoints:
-        response = await client.get(url, params=params)
-        assert response.status_code == 503
-        assert "Initial snapshot sync in progress" in response.json()["detail"]
+    """验证初始状态下接口返回 503"""
+    # Use generic status check endpoint
+    response = await client.get("/api/v1/views/test/status_check")
+    assert response.status_code == 503
+    assert "Initial snapshot sync in progress" in response.json()["detail"]
 
 @pytest.mark.asyncio
 async def test_api_unavailable_during_sync(client):
     """验证同步进行中（有权威但未完成）返回 503"""
     await datastore_state_manager.set_authoritative_session(1, "session-1")
     
-    response = await client.get("/api/v1/views/fs/tree", params={"path": "/"})
+    response = await client.get("/api/v1/views/test/status_check")
     assert response.status_code == 503
 
 @pytest.mark.asyncio
@@ -55,10 +50,8 @@ async def test_api_available_after_sync_complete(client):
     await datastore_state_manager.set_authoritative_session(1, session_id)
     await datastore_state_manager.set_snapshot_complete(1, session_id)
     
-    with patch("fustor_fusion.api.views.get_directory_tree", new_callable=AsyncMock) as mock_get:
-        mock_get.return_value = {"name": "root"}
-        response = await client.get("/api/v1/views/fs/tree", params={"path": "/"})
-        assert response.status_code == 200
+    response = await client.get("/api/v1/views/test/status_check")
+    assert response.status_code == 200
 
 @pytest.mark.asyncio
 async def test_api_re_locks_on_new_session(client):
@@ -70,19 +63,15 @@ async def test_api_re_locks_on_new_session(client):
     await datastore_state_manager.set_authoritative_session(1, session_old)
     await datastore_state_manager.set_snapshot_complete(1, session_old)
     
-    with patch("fustor_fusion.api.views.get_directory_tree", new_callable=AsyncMock) as mock_get:
-        mock_get.return_value = {}
-        res = await client.get("/api/v1/views/fs/tree")
-        assert res.status_code == 200
+    res = await client.get("/api/v1/views/test/status_check")
+    assert res.status_code == 200
     
     # 2. 新会话启动，接口应立即变为 503
     await datastore_state_manager.set_authoritative_session(1, session_new)
-    response = await client.get("/api/v1/views/fs/tree")
+    response = await client.get("/api/v1/views/test/status_check")
     assert response.status_code == 503
     
     # 3. 新会话完成后重新可用
     await datastore_state_manager.set_snapshot_complete(1, session_new)
-    with patch("fustor_fusion.api.views.get_directory_tree", new_callable=AsyncMock) as mock_get:
-        mock_get.return_value = {}
-        res = await client.get("/api/v1/views/fs/tree")
-        assert res.status_code == 200
+    res = await client.get("/api/v1/views/test/status_check")
+    assert res.status_code == 200

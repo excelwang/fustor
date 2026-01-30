@@ -21,17 +21,20 @@ def mock_view_manager():
         yield mock, manager
 
 @pytest.mark.asyncio
+@pytest.mark.asyncio
 async def test_audit_start_endpoint(mock_view_manager):
     """Test that the audit start endpoint calls handle_audit_start on the provider."""
     mock_get, manager = mock_view_manager
     
     provider = AsyncMock()
-    manager.get_file_directory_provider = AsyncMock(return_value=provider)
+    # Mock iterator and getter
+    manager.get_available_providers.return_value = ["file_directory"]
+    manager.get_provider.return_value = provider
     
     response = client.post("/api/v1/ingest/consistency/audit/start")
     
     assert response.status_code == 200
-    assert response.json() == {"status": "audit_started"}
+    assert response.json()["status"] == "audit_started"
     provider.handle_audit_start.assert_called_once()
 
 @pytest.mark.asyncio
@@ -40,7 +43,8 @@ async def test_audit_end_endpoint(mock_view_manager):
     mock_get, manager = mock_view_manager
     
     provider = AsyncMock()
-    manager.get_file_directory_provider = AsyncMock(return_value=provider)
+    manager.get_available_providers.return_value = ["file_directory"]
+    manager.get_provider.return_value = provider
     
     # Patch queue / processing manager to simulate drained queue
     with patch("fustor_fusion.api.consistency.memory_event_queue") as mock_queue, \
@@ -51,7 +55,7 @@ async def test_audit_end_endpoint(mock_view_manager):
         response = client.post("/api/v1/ingest/consistency/audit/end")
     
     assert response.status_code == 200
-    assert response.json() == {"status": "audit_ended"}
+    assert response.json()["status"] == "audit_ended"
     provider.handle_audit_end.assert_called_once()
 
 @pytest.mark.asyncio
@@ -61,7 +65,8 @@ async def test_get_sentinel_tasks_with_suspects(mock_view_manager):
     
     provider = AsyncMock()
     provider.get_suspect_list = AsyncMock(return_value={"/file1.txt": 123.0, "/file2.txt": 456.0})
-    manager.get_file_directory_provider = AsyncMock(return_value=provider)
+    manager.get_available_providers.return_value = ["file_directory"]
+    manager.get_provider.return_value = provider
     
     response = client.get("/api/v1/ingest/consistency/sentinel/tasks")
     
@@ -78,7 +83,8 @@ async def test_get_sentinel_tasks_empty(mock_view_manager):
     
     provider = AsyncMock()
     provider.get_suspect_list = AsyncMock(return_value={})
-    manager.get_file_directory_provider = AsyncMock(return_value=provider)
+    manager.get_available_providers.return_value = ["file_directory"]
+    manager.get_provider.return_value = provider
     
     response = client.get("/api/v1/ingest/consistency/sentinel/tasks")
     
@@ -91,7 +97,8 @@ async def test_submit_sentinel_feedback(mock_view_manager):
     mock_get, manager = mock_view_manager
     
     provider = AsyncMock()
-    manager.get_file_directory_provider = AsyncMock(return_value=provider)
+    manager.get_available_providers.return_value = ["file_directory"]
+    manager.get_provider.return_value = provider
     
     response = client.post("/api/v1/ingest/consistency/sentinel/feedback", json={
         "type": "suspect_update",

@@ -1,5 +1,6 @@
 import pytest
 import asyncio
+import pytest_asyncio
 from httpx import AsyncClient, ASGITransport
 from unittest.mock import patch, MagicMock, AsyncMock
 from fustor_fusion.main import app
@@ -12,13 +13,14 @@ from fustor_event_model.models import EventBase, EventType
 async def mock_get_datastore_id():
     return 1
 
-@pytest.fixture
-def client_override():
+@pytest_asyncio.fixture
+async def client_override():
     from fustor_fusion.auth.dependencies import get_datastore_id_from_api_key
     app.dependency_overrides[get_datastore_id_from_api_key] = mock_get_datastore_id
-    with patch("fustor_fusion.api.views.get_directory_tree", new_callable=AsyncMock) as m:
-        m.return_value = {"name": "root"}
-        yield AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+    
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        yield c
+    
     app.dependency_overrides.clear()
 
 @pytest.mark.asyncio
@@ -37,7 +39,7 @@ async def test_readiness_logic_full_chain(client_override):
     await memory_event_queue.clear_datastore_data(ds_id)
     
     # 状态 1: 没有任何信号 -> 503
-    res = await client_override.get("/api/v1/views/fs/tree")
+    res = await client_override.get("/api/v1/views/test/status_check")
     assert res.status_code == 503
     assert "sync in progress" in res.json()["detail"]
 
@@ -52,7 +54,7 @@ async def test_readiness_logic_full_chain(client_override):
     )
     await memory_event_queue.add_event(ds_id, fake_event)
     
-    res = await client_override.get("/api/v1/views/fs/tree")
+    res = await client_override.get("/api/v1/views/test/status_check")
     assert res.status_code == 503
     # 检查日志（模拟判定逻辑）
     assert memory_event_queue.get_queue_size(ds_id) == 1
@@ -63,13 +65,13 @@ async def test_readiness_logic_full_chain(client_override):
     
     # 模拟 ProcessingManager 正在工作
     with patch.object(processing_manager, "get_inflight_count", return_value=5):
-        res = await client_override.get("/api/v1/views/fs/tree")
+        res = await client_override.get("/api/v1/views/test/status_check")
         assert res.status_code == 503
         assert "still processing" in res.text.lower()
 
     # 状态 4: 全部完成 -> 200
     with patch.object(processing_manager, "get_inflight_count", return_value=0):
-        res = await client_override.get("/api/v1/views/fs/tree")
+        res = await client_override.get("/api/v1/views/test/status_check")
         assert res.status_code == 200
 
 @pytest.mark.asyncio

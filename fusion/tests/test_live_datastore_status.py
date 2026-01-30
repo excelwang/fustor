@@ -47,7 +47,7 @@ async def test_live_datastore_503_without_sessions(mock_live_config):
             del session_manager._sessions[1]
             
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-            response = await client.get("/api/v1/views/fs/tree", params={"path": "/"})
+            response = await client.get("/api/v1/views/test/status_check")
             assert response.status_code == 503
             assert "No active sessions for this live datastore" in response.json()["detail"]
 
@@ -67,11 +67,9 @@ async def test_live_datastore_200_with_sessions(mock_live_config):
         # 创建一个 session
         await session_manager.create_session_entry(1, "s1")
         
-        with patch("fustor_fusion.api.views.get_directory_tree", new_callable=AsyncMock) as mock_get:
-            mock_get.return_value = {"name": "root"}
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-                response = await client.get("/api/v1/views/fs/tree", params={"path": "/"})
-                assert response.status_code == 200
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/api/v1/views/test/status_check")
+            assert response.status_code == 200
         
         # 清理 session
         await session_manager.terminate_session(1, "s1")
@@ -92,11 +90,9 @@ async def test_normal_datastore_200_without_sessions(mock_normal_config):
         if 1 in session_manager._sessions:
             del session_manager._sessions[1]
             
-        with patch("fustor_fusion.api.views.get_directory_tree", new_callable=AsyncMock) as mock_get:
-            mock_get.return_value = {"name": "root"}
-            async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
-                response = await client.get("/api/v1/views/fs/tree", params={"path": "/"})
-                assert response.status_code == 200
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.get("/api/v1/views/test/status_check")
+            assert response.status_code == 200
 
     app.dependency_overrides.clear()
     await datastore_state_manager.clear_state(1)
@@ -119,7 +115,7 @@ async def test_live_session_cleanup_resets_tree(mocker):
     
     # 模拟依赖
     mocker.patch('fustor_fusion.auth.datastore_cache.datastore_config_cache.get_datastore_config', return_value=mock_config)
-    mock_reset = mocker.patch('fustor_fusion.view_manager.manager.reset_directory_tree', new_callable=AsyncMock)
+    mock_reset = mocker.patch('fustor_fusion.view_manager.manager.reset_views', new_callable=AsyncMock)
     mocker.patch('fustor_fusion.in_memory_queue.memory_event_queue.clear_datastore_data', new_callable=AsyncMock)
 
     # 1. 创建 Session
@@ -129,7 +125,7 @@ async def test_live_session_cleanup_resets_tree(mocker):
     # 2. 终止 Session
     await sm.terminate_session(datastore_id, session_id)
     
-    # 3. 验证 reset_directory_tree 被调用
+    # 3. 验证 reset_views 被调用
     mock_reset.assert_called_once_with(datastore_id)
     assert datastore_id not in sm._sessions
     
