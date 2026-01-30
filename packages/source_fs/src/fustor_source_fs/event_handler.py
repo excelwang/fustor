@@ -42,6 +42,9 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
         self.event_queue = event_queue
         self.watch_manager = watch_manager
         self.logical_clock = logical_clock
+        # Path -> last_sent_time mapping to throttle on_modified for files
+        self.last_modified_sent: Dict[str, float] = {}
+        self.throttle_interval = 5.0  # seconds
 
     def _get_index(self, mtime=None):
         if mtime is not None:
@@ -164,6 +167,9 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             # A deletion is an activity, touch the parent path to update its timestamp.
             # We assume the parent is always a directory.
             self.watch_manager.touch(os.path.dirname(event.src_path))
+            
+            # Clean up throttle cache
+            self.last_modified_sent.pop(event.src_path, None)
         except Exception as e:
             logger.warning(f"[fs] Error processing file deletion event for {event.src_path}: {str(e)}")
 
@@ -208,6 +214,9 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                     self.event_queue.put(update_event)
                 # Touch the file itself at its new destination
                 self.watch_manager.touch(event.dest_path)
+                
+                # Clean up throttle cache for old path
+                self.last_modified_sent.pop(event.src_path, None)
         except Exception as e:
             logger.warning(f"[fs] Error processing file move event for {event.src_path} -> {event.dest_path}: {str(e)}")
             # Note: If we get here, the delete_event may already be in the queue
@@ -217,10 +226,29 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
     def on_modified(self, event: FileSystemEvent):
         """
         Called when a file or directory is modified.
-        This is intentionally ignored to wait for the 'closed' event,
-        ensuring the file is fully written.
         """
-        pass
+        try:
+            self.watch_manager.touch(event.src_path)
+            if not event.is_directory:
+                now = time.time()
+                last_sent = self.last_modified_sent.get(event.src_path, 0)
+                
+                if now - last_sent < self.throttle_interval:
+                    return # Throttled
+                
+                metadata = get_file_metadata(event.src_path)
+                if metadata:
+                    update_event = UpdateEvent(
+                        event_schema=self.watch_manager.root_path,
+                        table="files",
+                        rows=[metadata],
+                        fields=list(metadata.keys()),
+                        index=self._get_index(mtime=metadata['modified_time'])
+                    )
+                    self.event_queue.put(update_event)
+                    self.last_modified_sent[event.src_path] = now
+        except Exception as e:
+            logger.warning(f"[fs] Error processing file modification event for {event.src_path}: {str(e)}")
 
     def on_closed(self, event: FileSystemEvent):
         """
@@ -239,5 +267,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                         index=self._get_index(mtime=metadata['modified_time'])
                     )
                     self.event_queue.put(update_event)
+                    # Clear throttle cache on close to ensure final state is sent
+                    self.last_modified_sent.pop(event.src_path, None)
         except Exception as e:
             logger.warning(f"[fs] Error processing file closed event for {event.src_path}: {str(e)}")
