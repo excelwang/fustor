@@ -22,9 +22,9 @@ from .processing_manager import processing_manager
 from . import runtime_objects
 from fustor_event_model.models import EventBase
 
-# --- Parser Module Imports ---
-from .parsers.manager import process_event as process_single_event, cleanup_all_expired_suspects
-from .api.views import parser_router
+# --- View Manager Module Imports ---
+from .view_manager.manager import process_event as process_single_event, cleanup_all_expired_suspects
+from .api.views import view_router
 
 
 logger = logging.getLogger(__name__) # Re-initialize logger after setting levels
@@ -119,7 +119,7 @@ ingest_api.include_router(consistency_router) # already has /consistency prefix
 api_v1.include_router(ingest_api)
 
 # 2. View Domain (/api/v1/views)
-api_v1.include_router(parser_router, prefix="/views")
+api_v1.include_router(view_router, prefix="/views")
 
 # Register the unified v1 router
 app.include_router(api_v1, prefix="/api/v1", tags=["v1"])

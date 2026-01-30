@@ -5,18 +5,26 @@ from collections import defaultdict
 import os
 from contextlib import asynccontextmanager
 
+from fustor_core.drivers import ViewDriver
 from fustor_common.logical_clock import LogicalClock
-from ...config import fusion_config
 from .nodes import DirectoryNode, FileNode
 
 logger = logging.getLogger(__name__)
 
-class ParserBase:
-    """Base class providing shared state and concurrency primitives for the FS parser."""
-    def __init__(self, datastore_id: int):
-        self.datastore_id = datastore_id
-        self.logger = logging.getLogger(f"fustor_fusion.parser.fs.{datastore_id}")
-        self.hot_file_threshold = fusion_config.FUSTOR_FUSION_SUSPECT_TTL_SECONDS
+class FSViewBase(ViewDriver):
+    """
+    Base class for FS View Providers, inheriting from the core ViewDriver ABC.
+    Provides shared state and concurrency primitives.
+    """
+    
+    target_schema: str = "file_directory"
+    
+    def __init__(self, datastore_id: int, config: Optional[Dict[str, Any]] = None, hot_file_threshold: float = 30.0):
+        super().__init__(datastore_id, config or {"hot_file_threshold": hot_file_threshold})
+        
+        self.logger = logging.getLogger(f"fustor_view.fs.{datastore_id}")
+        self.hot_file_threshold = self.config.get("hot_file_threshold", hot_file_threshold)
+        
         self._root = DirectoryNode("", "/")
         self._directory_path_map: Dict[str, DirectoryNode] = {"/": self._root}
         self._file_path_map: Dict[str, FileNode] = {}

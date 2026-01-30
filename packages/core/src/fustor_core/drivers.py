@@ -20,6 +20,76 @@ from fustor_event_model.models import EventBase # Import EventBase from fustor_e
 from fustor_core.models.config import SourceConfig, PusherConfig
 
 
+class ViewDriver(ABC):
+    """
+    Abstract Base Class for View Drivers.
+    
+    A ViewDriver consumes events and maintains a consistent, queryable view of data.
+    This is the Fusion-side counterpart to SourceDriver (Agent-side).
+    
+    View drivers are discovered via the 'fustor.view_drivers' entry point group.
+    """
+    
+    # The schema/table pattern this driver handles (e.g., "file_directory")
+    # Used by ViewManager to route events to the appropriate driver.
+    target_schema: str = ""
+    
+    def __init__(self, datastore_id: int, config: Dict[str, Any]):
+        """
+        Initialize the view driver.
+        
+        Args:
+            datastore_id: The ID of the datastore this driver manages.
+            config: Driver-specific configuration dictionary.
+        """
+        self.datastore_id = datastore_id
+        self.config = config
+
+    @abstractmethod
+    async def process_event(self, event: EventBase) -> bool:
+        """
+        Process a single event and update internal state.
+        
+        Returns:
+            True if the event was successfully processed, False otherwise.
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    async def get_data_view(self, **kwargs) -> Any:
+        """
+        Return the current consistent data view.
+        
+        The format of the returned data is driver-specific.
+        """
+        raise NotImplementedError
+
+    async def on_session_start(self, session_id: str):
+        """Called when a new Agent session starts. Optional hook for state reset."""
+        pass
+
+    async def on_session_close(self, session_id: str):
+        """Called when an Agent session terminates. Optional hook for cleanup."""
+        pass
+
+    async def handle_audit_start(self):
+        """Called at the start of an audit cycle. Optional hook."""
+        pass
+    
+    async def handle_audit_end(self):
+        """Called at the end of an audit cycle. Optional hook for cleanup/reconciliation."""
+        pass
+
+    async def reset(self):
+        """Clears all in-memory state for this driver. Optional hook."""
+        pass
+    
+    async def cleanup_expired_suspects(self):
+        """Periodic cleanup hook for time-sensitive data. Optional."""
+        pass
+
+
+
 class PusherDriver(ABC):
     """
     Abstract Base Class for all Pusher drivers.

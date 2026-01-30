@@ -9,7 +9,7 @@ from ..auth.dependencies import get_datastore_id_from_api_key
 from ..auth.datastore_cache import datastore_config_cache, DatastoreConfig
 from ..core.session_manager import session_manager
 from ..datastore_state_manager import datastore_state_manager
-from ..parsers.manager import reset_directory_tree, on_session_start
+from ..view_manager.manager import reset_directory_tree, on_session_start, on_session_close
 
 logger = logging.getLogger(__name__)
 session_router = APIRouter(tags=["Session Management"])
@@ -186,6 +186,12 @@ async def end_session(
     await datastore_state_manager.unlock_for_session(datastore_id, session_id)
     # Release leader role if this session was the leader
     await datastore_state_manager.release_leader(datastore_id, session_id)
+    
+    # Notify view providers of session closure for cleanup
+    try:
+        await on_session_close(datastore_id, session_id)
+    except Exception as e:
+        logger.warning(f"Failed to notify view providers of session close: {e}")
     
     return {
         "status": "ok",

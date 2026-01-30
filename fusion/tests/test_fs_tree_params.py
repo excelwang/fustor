@@ -4,7 +4,7 @@ from httpx import AsyncClient, ASGITransport
 from unittest.mock import patch, AsyncMock
 from fustor_fusion.main import app
 from fustor_fusion.datastore_state_manager import datastore_state_manager
-from fustor_fusion.parsers.manager import process_event, reset_directory_tree
+from fustor_fusion.view_manager.manager import process_event, reset_directory_tree
 from fustor_event_model.models import EventBase, EventType
 import time
 

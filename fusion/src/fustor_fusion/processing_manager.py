@@ -3,7 +3,7 @@ import logging
 from typing import Dict, List, Optional, Any
 from collections import defaultdict
 from .queue_integration import get_events_from_queue
-from .parsers.manager import process_event as process_single_event
+from .view_manager.manager import process_event as process_single_event
 from .runtime import datastore_event_manager
 from .in_memory_queue import memory_event_queue
 

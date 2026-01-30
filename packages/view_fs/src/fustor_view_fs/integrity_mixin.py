@@ -2,9 +2,9 @@ import time
 import heapq
 import os
 from typing import Dict
-from .base import ParserBase
+from .base import FSViewBase
 
-class IntegrityMixin(ParserBase):
+class IntegrityMixin(FSViewBase):
     async def cleanup_expired_suspects(self):
         """Public method called by background task to trigger periodic cleanup."""
         async with self._global_semaphore:

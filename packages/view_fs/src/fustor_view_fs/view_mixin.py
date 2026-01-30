@@ -1,8 +1,8 @@
 from typing import Dict, List, Optional, Any
 import os
-from .base import ParserBase
+from .base import FSViewBase
 
-class ViewMixin(ParserBase):
+class ViewMixin(FSViewBase):
     async def get_suspect_list(self) -> Dict[str, float]:
         """Get the current Suspect List for Sentinel Sweep."""
         async with self._global_semaphore:

@@ -3,12 +3,12 @@ import time
 import asyncio
 from unittest.mock import MagicMock
 import heapq
-from fustor_fusion.parsers.fs import DirectoryStructureParser
+from fustor_view_fs import FSViewProvider
 from fustor_event_model.models import UpdateEvent, MessageSource, EventType
 
 @pytest.fixture
 def parser():
-    p = DirectoryStructureParser(datastore_id=1)
+    p = FSViewProvider(datastore_id=1)
     p.hot_file_threshold = 30.0
     return p
 

@@ -1,12 +1,12 @@
 import pytest
 import asyncio
 import time
-from fustor_fusion.parsers.fs import DirectoryStructureParser
+from fustor_view_fs import FSViewProvider
 from fustor_event_model.models import UpdateEvent, MessageSource, DeleteEvent
 
 @pytest.fixture
 def parser():
-    return DirectoryStructureParser(datastore_id=1)
+    return FSViewProvider(datastore_id=1)
 
 @pytest.mark.asyncio
 async def test_audit_late_start_signal(parser):

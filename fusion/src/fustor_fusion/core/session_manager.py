@@ -119,7 +119,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                             
                             # NEW: Check if this is a 'live' datastore and clear data
                             from ..auth.datastore_cache import datastore_config_cache
-                            from ..parsers.manager import reset_directory_tree
+                            from ..view_manager.manager import reset_directory_tree
                             
                             datastore_config = datastore_config_cache.get_datastore_config(datastore_id)
                             is_live = False
@@ -206,7 +206,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 
                 # Check for 'live' type and reset
                 from ..auth.datastore_cache import datastore_config_cache
-                from ..parsers.manager import reset_directory_tree
+                from ..view_manager.manager import reset_directory_tree
                 
                 config = datastore_config_cache.get_datastore_config(datastore_id)
                 is_live = config.meta.get('type') == 'live' if config and config.meta else False
@@ -257,7 +257,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         del self._sessions[datastore_id]
                         
                         from ..auth.datastore_cache import datastore_config_cache
-                        from ..parsers.manager import reset_directory_tree
+                        from ..view_manager.manager import reset_directory_tree
                         config = datastore_config_cache.get_datastore_config(datastore_id)
                         is_live = config.meta.get('type') == 'live' if config and config.meta else False
                         

@@ -1,6 +1,6 @@
-from .base import ParserBase
+from .base import FSViewBase
 
-class AuditMixin(ParserBase):
+class AuditMixin(FSViewBase):
     async def handle_audit_start(self):
         """Called when an Audit cycle begins."""
         async with self._global_exclusive_lock():

@@ -15,7 +15,8 @@ dependencies = [
     "orjson",
     "fustor-common",
     "fustor-registry-client",
-    "fustor-event-model"
+    "fustor-event-model",
+    "fustor-core",
 ]
 [[project.authors]]
 name = "Huajin Wang"

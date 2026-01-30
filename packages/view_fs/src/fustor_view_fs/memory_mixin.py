@@ -1,9 +1,9 @@
 from typing import Dict, Any
 import os
 from .nodes import DirectoryNode, FileNode
-from .base import ParserBase
+from .base import FSViewBase
 
-class MemoryMixin(ParserBase):
+class MemoryMixin(FSViewBase):
     async def _process_create_update_in_memory(self, payload: Dict[str, Any], path: str):
         """Update the in-memory tree with create/update event data."""
         path = path.rstrip('/') if path != '/' else '/'

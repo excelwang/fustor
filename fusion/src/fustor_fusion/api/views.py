@@ -1,14 +1,20 @@
 """
-API endpoints for the parsers module.
-Provides REST endpoints to access parsed data views.
+API endpoints for the data views.
+Provides REST endpoints to access consistent data views.
 """
-from fastapi import APIRouter, Query, Header, Depends, status, HTTPException
+from fastapi import APIRouter, Query, Depends, status, HTTPException
 from fastapi.responses import ORJSONResponse
 import logging
-import asyncio
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
+from pydantic import BaseModel
 
-from ..parsers.manager import get_directory_tree, search_files, get_directory_stats, reset_directory_tree
+from ..view_manager.manager import (
+    get_directory_tree, 
+    search_files, 
+    get_directory_stats, 
+    reset_directory_tree,
+    get_cached_view_manager
+)
 from ..auth.dependencies import get_datastore_id_from_api_key
 from ..datastore_state_manager import datastore_state_manager
 from ..in_memory_queue import memory_event_queue
@@ -16,11 +22,10 @@ from ..processing_manager import processing_manager
 
 logger = logging.getLogger(__name__)
 
-parser_router = APIRouter(tags=["Parsers - Data Views"])
+view_router = APIRouter(tags=["Data Views"])
 
 async def check_snapshot_status(datastore_id: int):
     """Checks if the initial snapshot sync is complete for the datastore."""
-    # 1. Check for active sessions if datastore is 'live'
     from ..core.session_manager import session_manager
     from ..auth.datastore_cache import datastore_config_cache
     
@@ -33,10 +38,7 @@ async def check_snapshot_status(datastore_id: int):
                 detail="No active sessions for this live datastore. Service temporarily unavailable."
             )
 
-    # 2. Check snapshot completion and queue status
     is_signal_complete = await datastore_state_manager.is_snapshot_complete(datastore_id)
-    
-    # Check queue size AND inflight (currently processing) count
     queue_size = memory_event_queue.get_queue_size(datastore_id)
     inflight_count = processing_manager.get_inflight_count(datastore_id)
     
@@ -51,19 +53,8 @@ async def check_snapshot_status(datastore_id: int):
             detail=detail
         )
 
-@parser_router.get("/fs/tree", 
+@view_router.get("/fs/tree", 
     summary="获取文件系统树结构", 
-    description="""
-    获取指定路径下的目录树结构。支持高度自定义的查询参数：
-    
-    *   **path**: 目标路径，默认为根目录 ('/')。
-    *   **recursive**: 是否递归获取子目录。
-    *   **max_depth**: 限制递归深度。若设置，将忽略 recursive 参数并执行带深度限制的递归。
-    *   **only_path**: 极简模式，仅返回路径结构，剔除 size, timestamps 等元数据，适用于大规模数据快速检索。
-    *   **dry_run**: 压力测试模式，不执行查询逻辑，直接返回 200，用于测量网络开销。
-    
-    **注意**: 在 Datastore 初始快照同步完成前，此接口返回 503。
-    """,
     response_class=ORJSONResponse
 )
 async def get_directory_tree_api(
@@ -81,22 +72,14 @@ async def get_directory_tree_api(
         return ORJSONResponse(content={"message": "dry-run", "datastore_id": datastore_id})
 
     effective_recursive = recursive if max_depth is None else True
-    logger.debug(f"API request for directory tree: path={path}, recursive={effective_recursive}, max_depth={max_depth}, only_path={only_path}, datastore_id={datastore_id}")
     result = await get_directory_tree(path, datastore_id=datastore_id, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
     
     if result is None:
         return ORJSONResponse(content={"detail": "路径未找到或尚未同步"}, status_code=404)
     return ORJSONResponse(content=result)
 
-@parser_router.get("/fs/search", 
-    summary="基于模式搜索文件", 
-    description="""
-    在当前 Datastore 的内存树中搜索匹配给定模式的文件。
-    
-    *   支持包含星号 (*) 的模糊匹配。
-    *   搜索是全局性的，不局限于当前目录。
-    *   返回包含完整元数据的文件列表。
-    """
+@view_router.get("/fs/search", 
+    summary="基于模式搜索文件"
 )
 async def search_files_api(
     pattern: str = Query(..., description="要搜索的路径匹配模式 (例如: '*.log' 或 '/data/res*')"),
@@ -104,135 +87,81 @@ async def search_files_api(
 ) -> list:
     """搜索匹配模式的文件。"""
     await check_snapshot_status(datastore_id)
-    logger.info(f"API request for file search: pattern={pattern}, datastore_id={datastore_id}")
-    result = await search_files(pattern, datastore_id=datastore_id)
-    logger.info(f"File search result for pattern '{pattern}': found {len(result)} files")
-    return result
+    return await search_files(pattern, datastore_id=datastore_id)
 
-
-@parser_router.get("/fs/stats", 
-    summary="获取文件系统统计指标", 
-    description="""
-    获取当前汇总的存储统计信息，包括：
-    
-    *   **total_files**: 总文件数。
-    *   **total_directories**: 总目录数。
-    *   **total_size**: 累计文件大小。
-    *   **last_event_latency_ms**: 最近处理的一个事件从产生到解析完成的物理延迟。
-    *   **oldest_directory**: 包含最陈旧数据的目录信息（用于评估同步延迟）。
-    """
+@view_router.get("/fs/stats", 
+    summary="获取文件系统统计指标"
 )
 async def get_directory_stats_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Dict[str, Any]:
     """获取当前目录结构的统计信息。"""
     await check_snapshot_status(datastore_id)
-    logger.info(f"API request for directory stats: datastore_id={datastore_id}")
-    result = await get_directory_stats(datastore_id=datastore_id)
-    logger.info(f"Directory stats result: {result}")
-    return result
+    return await get_directory_stats(datastore_id=datastore_id)
 
-
-@parser_router.delete("/fs/reset", 
+@view_router.delete("/fs/reset", 
     summary="Reset directory tree structure",
-    description="Clear all directory entries for a specific datastore",
     status_code=status.HTTP_204_NO_CONTENT
 )
 async def reset_directory_tree_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> None:
-    """
-    Reset the directory tree structure by clearing all entries for a specific datastore.
-    """
-    # No check_snapshot_status here to allow resetting during/after failures
-    logger.info(f"API request to reset directory tree for datastore {datastore_id}")
+    """Reset the directory tree structure by clearing all entries for a specific datastore."""
     success = await reset_directory_tree(datastore_id)
-    
     if not success:
-        logger.error(f"Failed to reset directory tree for datastore {datastore_id}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to reset directory tree"
         )
-    logger.info(f"Successfully reset directory tree for datastore {datastore_id}")
 
-
-# === View-Specific Consistency APIs ===
-
-from ..parsers.manager import get_cached_parser_manager
-from pydantic import BaseModel
-from typing import List
+# === Consistency APIs ===
 
 class SuspectUpdateRequest(BaseModel):
     """Request body for updating suspect file mtimes."""
     updates: List[Dict[str, Any]]  # List of {"path": str, "mtime": float}
 
-
-@parser_router.get("/fs/suspect-list", 
-    summary="Get Suspect List for Sentinel Sweep",
-    description="Returns files that might still be under active write"
+@view_router.get("/fs/suspect-list", 
+    summary="Get Suspect List for Sentinel Sweep"
 )
 async def get_suspect_list_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> List[Dict[str, Any]]:
-    """
-    Get the current Suspect List for this datastore.
-    Used by Leader Agent for Sentinel Sweep.
-    """
-    logger.info(f"API request for suspect list: datastore_id={datastore_id}")
-    manager = await get_cached_parser_manager(datastore_id)
-    parser = await manager.get_file_directory_parser()
-    suspect_list = await parser.get_suspect_list()
+    """Get the current Suspect List for this datastore."""
+    manager = await get_cached_view_manager(datastore_id)
+    provider = await manager.get_file_directory_provider()
+    suspect_list = await provider.get_suspect_list()
     return [{"path": path, "suspect_until": ts} for path, ts in suspect_list.items()]
 
-
-@parser_router.put("/fs/suspect-list",
-    summary="Update Suspect List from Sentinel Sweep",
-    description="Agent reports current mtimes of suspect files"
+@view_router.put("/fs/suspect-list",
+    summary="Update Suspect List from Sentinel Sweep"
 )
 async def update_suspect_list_api(
     request: SuspectUpdateRequest,
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Dict[str, Any]:
-    """
-    Update suspect files with their current mtimes from Agent's Sentinel Sweep.
-    """
-    logger.info(f"API request to update suspect list: datastore_id={datastore_id}, count={len(request.updates)}")
-    manager = await get_cached_parser_manager(datastore_id)
-    parser = await manager.get_file_directory_parser()
+    """Update suspect files with their current mtimes from Agent's Sentinel Sweep."""
+    manager = await get_cached_view_manager(datastore_id)
+    provider = await manager.get_file_directory_provider()
     
     updated_count = 0
     for item in request.updates:
         path = item.get("path")
         mtime = item.get("mtime") or item.get("current_mtime")
         if path and mtime is not None:
-            await parser.update_suspect(path, float(mtime))
+            await provider.update_suspect(path, float(mtime))
             updated_count += 1
     
-    return {
-        "datastore_id": datastore_id,
-        "updated_count": updated_count,
-        "status": "ok"
-    }
+    return {"datastore_id": datastore_id, "updated_count": updated_count, "status": "ok"}
 
-
-
-
-@parser_router.get("/fs/blind-spots", 
-    summary="Get Blind-spot Information",
-    description="Returns files that exist on disk but were not reported by any Agent (Realtime/Snapshot)"
+@view_router.get("/fs/blind-spots", 
+    summary="Get Blind-spot Information"
 )
 async def get_blind_spots_api(
     datastore_id: int = Depends(get_datastore_id_from_api_key)
 ) -> Dict[str, Any]:
-    """
-    Get the current Blind-spot List for this datastore.
-    """
-    logger.info(f"API request for blind-spots: datastore_id={datastore_id}")
-    manager = await get_cached_parser_manager(datastore_id)
-    parser = await manager.get_file_directory_parser()
-    if not parser:
-        return {"error": "Parser not initialized"}
-        
-    return await parser.get_blind_spot_list()
-
+    """Get the current Blind-spot List for this datastore."""
+    manager = await get_cached_view_manager(datastore_id)
+    provider = await manager.get_file_directory_provider()
+    if not provider:
+        return {"error": "Provider not initialized"}
+    return await provider.get_blind_spot_list()

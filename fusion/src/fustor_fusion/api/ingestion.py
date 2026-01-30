@@ -20,7 +20,7 @@ from ..in_memory_queue import memory_event_queue
 
 from fustor_event_model.models import EventBase, EventType, MessageSource # Import EventBase, EventType, and MessageSource
 
-from ..parsers.manager import ParserManager, get_directory_stats, get_cached_parser_manager # CORRECTED
+from ..view_manager.manager import get_directory_stats, get_cached_view_manager
 from datetime import datetime
 
 logger = logging.getLogger(__name__)

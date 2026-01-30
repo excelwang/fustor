@@ -5,9 +5,9 @@ import heapq
 from typing import Any
 
 from fustor_event_model.models import MessageSource, EventType
-from .base import ParserBase
+from .base import FSViewBase
 
-class EventMixin(ParserBase):
+class EventMixin(FSViewBase):
     async def process_event(self, event: Any) -> bool:
         """Processes an event using Smart Merge logic."""
         if not event.rows:

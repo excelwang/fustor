@@ -119,7 +119,7 @@ async def test_live_session_cleanup_resets_tree(mocker):
     
     # 模拟依赖
     mocker.patch('fustor_fusion.auth.datastore_cache.datastore_config_cache.get_datastore_config', return_value=mock_config)
-    mock_reset = mocker.patch('fustor_fusion.parsers.manager.reset_directory_tree', new_callable=AsyncMock)
+    mock_reset = mocker.patch('fustor_fusion.view_manager.manager.reset_directory_tree', new_callable=AsyncMock)
     mocker.patch('fustor_fusion.in_memory_queue.memory_event_queue.clear_datastore_data', new_callable=AsyncMock)
 
     # 1. 创建 Session
