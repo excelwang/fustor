@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, ConfigDict, field_validator
-from typing import Optional, Dict, List
+from typing import Optional, Dict, List, Any
 
 class ResponseBase(BaseModel):
     # Base model for API responses, can include common fields like status, message
@@ -20,7 +20,7 @@ class DatastoreBase(BaseModel):
     id: Optional[int] = None
     name: str = Field(..., description="存储库名称")
     visible: bool = Field(False, description="是否对公众可见")
-    # meta field removed as per refactoring requirement
+    meta: Optional[Dict[str, Any]] = Field(default=None, description="存储库元数据")
     allow_concurrent_push: bool = Field(False, description="是否允许并发推送")
     session_timeout_seconds: int = Field(30, description="会话超时秒数")
 

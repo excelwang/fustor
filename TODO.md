@@ -14,3 +14,8 @@
 
 - [x] benchmark 增加 预扫描、快照同步、审计、哨兵的性能测试，（agent、fusion分别测耗时）。
 - [ ] 集成测试，将agent、fusion的容器的物理时间打乱，看是否能正确处理。
+- [x] 重构 `fustor-view-fs` 逻辑：使用组合而非继承（`FSState`, `TreeManager`, `FSArbitrator`, `AuditManager`, `FSViewQuery`）。
+
+## View & Consistency
+- [ ] **完善 Tombstone 清理机制**: 目前 `Tombstone` 列表仅在审计结束时清理（针对旧记录）。考虑到 Agent 崩溃或审计中断的风险，应为 `Tombstone` 增加基于时间的 TTL（如 2 小时）自动过期清理机制，防止内存泄漏。
+- [ ] **解耦 NFS 特定逻辑**: 将 `audit_skipped`（基于 NFS 的 `mtime` 传播特性）等 NFS 特有状态从通用 `fustor-view-fs` 逻辑中解耦，通过驱动扩展或配置项实现，提升 View 驱动的通用性。

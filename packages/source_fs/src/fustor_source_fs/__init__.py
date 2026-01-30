@@ -70,16 +70,18 @@ class FSDriver(SourceDriver):
         self._logical_clock = LogicalClock()
         
         min_monitoring_window_days = self.config.driver_params.get("min_monitoring_window_days", 30.0)
-        self.watch_manager = _WatchManager(self.uri, event_handler=None, min_monitoring_window_days=min_monitoring_window_days, stop_driver_event=self._stop_driver_event)
+        self.watch_manager = _WatchManager(self.uri, event_handler=None, min_monitoring_window_days=min_monitoring_window_days, stop_driver_event=self._stop_driver_event, logical_clock=self._logical_clock)
         self.event_handler = OptimizedWatchEventHandler(self.event_queue, self.watch_manager, logical_clock=self._logical_clock)
         self.watch_manager.event_handler = self.event_handler
         self._pre_scan_completed = False
         self._pre_scan_lock = threading.Lock()
         
         # Thread pool for parallel scanning
-        max_workers = self.config.driver_params.get("max_scan_workers", multiprocessing.cpu_count())
+        # Issue 7 Fix: Use a more conservative default (min(4, cpu_count)) to prevent NFS IOPS spikes.
+        default_workers = min(4, multiprocessing.cpu_count())
+        max_workers = self.config.driver_params.get("max_scan_workers", default_workers)
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        logger.info(f"[fs] Driver initialized with {max_workers} scan workers.")
+        logger.info(f"[fs] Driver initialized with {max_workers} scan workers (default was {default_workers}).")
         
         self._initialized = True
 
@@ -258,8 +260,6 @@ class FSDriver(SourceDriver):
 
         pending_dirs = 1
         map_lock = threading.Lock()
-        postponed_files = {} # path -> observed_at_monotonic
-        postponed_lock = threading.Lock()
         stop_workers = threading.Event()
 
         def scan_worker():
@@ -293,17 +293,6 @@ class FSDriver(SourceDriver):
                                         work_queue.put(entry.path)
                                 elif fnmatch.fnmatch(entry.name, file_pattern):
                                     st = entry.stat()
-                                    # Hot data cool-off check
-                                    watermark = self._logical_clock.get_watermark()
-                                    cooloff = driver_params.get("hot_data_cooloff_seconds", 61.0)
-                                    if (watermark - st.st_mtime) < cooloff:
-                                        with postponed_lock:
-                                            if entry.path not in postponed_files:
-                                                # Record the mtime at discovery to check for stability later
-                                                postponed_files[entry.path] = st.st_mtime
-                                        logger.debug(f"[fs] Postponing hot file: {entry.path}")
-                                        continue
-
                                     meta = get_file_metadata(entry.path, stat_info=st)
                                     self._logical_clock.update(meta['modified_time'])
                                     latest_mtime_in_subtree = max(latest_mtime_in_subtree, meta['modified_time'])
@@ -365,39 +354,6 @@ class FSDriver(SourceDriver):
                     row_buffer = row_buffer[batch_size:]
             except queue.Empty:
                 if pending_dirs == 0 and work_queue.empty():
-                    if postponed_files:
-                        logger.info(f"[{stream_id}] Snapshot scan: Look-back for {len(postponed_files)} files...")
-                        lookback_rows = []
-                        for path, observed_mtime in list(postponed_files.items()):
-                            try:
-                                st = os.stat(path)
-                                # Stability check: If mtime hasn't changed since we first skipped it, 
-                                # it's safe to report now regardless of its absolute age.
-                                if st.st_mtime == observed_mtime:
-                                    meta = get_file_metadata(path, stat_info=st)
-                                    if meta:
-                                        lookback_rows.append(meta)
-                                    postponed_files.pop(path, None)
-                                else:
-                                    # Still being written to. Discard from snapshot, 
-                                    # let future audit or realtime update capture it.
-                                    logger.debug(f"[fs] Snapshot discarding still-active file: {path}")
-                                    postponed_files.pop(path, None)
-                            except OSError: 
-                                postponed_files.pop(path, None)
-                        if lookback_rows:
-                            row_buffer.extend(lookback_rows)
-                            while len(row_buffer) >= batch_size:
-                                yield UpdateEvent(
-                                    event_schema=self.uri,
-                                    table="files",
-                                    rows=row_buffer[:batch_size],
-                                    fields=list(row_buffer[0].keys()),
-                                    message_source=MessageSource.SNAPSHOT,
-                                    index=snapshot_time
-                                )
-                                row_buffer = row_buffer[batch_size:]
-                        logger.info(f"[{stream_id}] Look-back complete.")
                     break
         
         if row_buffer:
@@ -489,8 +445,6 @@ class FSDriver(SourceDriver):
         
         pending_dirs = 1
         map_lock = threading.Lock()
-        postponed_files = {} # path -> observed_at_monotonic
-        postponed_lock = threading.Lock()
         stop_workers = threading.Event()
 
         def audit_worker():
@@ -546,17 +500,6 @@ class FSDriver(SourceDriver):
                                 # OPTIMIZATION: ONLY scan/stat files if the directory is NOT silent.
                                 elif not is_silent and fnmatch.fnmatch(entry.name, file_pattern):
                                     st = entry.stat()
-                                    # Hot data stability check (Agent-side look-back)
-                                    watermark = self._logical_clock.get_watermark()
-                                    cooloff = self.config.driver_params.get("hot_data_cooloff_seconds", 61.0)
-                                    if (watermark - st.st_mtime) < cooloff:
-                                        with postponed_lock:
-                                            if entry.path not in postponed_files:
-                                                # Record initial mtime to verify stability at scan end
-                                                postponed_files[entry.path] = st.st_mtime
-                                        logger.debug(f"[fs] Postponing hot file during audit: {entry.path}")
-                                        continue
-
                                     meta = get_file_metadata(entry.path, stat_info=st)
                                     self._logical_clock.update(meta['modified_time'])
                                     # Add parent info for Rule 3 arbitration
@@ -617,36 +560,6 @@ class FSDriver(SourceDriver):
                 yield event_tuple
             except queue.Empty:
                 if pending_dirs == 0 and work_queue.empty():
-                    if postponed_files:
-                        logger.info(f"[{stream_id}] Audit scan: Look-back for {len(postponed_files)} files...")
-                        lookback_rows = []
-                        for path, observed_mtime in list(postponed_files.items()):
-                            try:
-                                st = os.stat(path)
-                                # Stability check: If mtime hasn't changed since we first skipped it, 
-                                # it's safe to report now regardless of its absolute age.
-                                if st.st_mtime == observed_mtime:
-                                    meta = get_file_metadata(path, stat_info=st)
-                                    if meta:
-                                        lookback_rows.append(meta)
-                                else:
-                                    # Still being written to. Skip for now, let future audit/events handle it.
-                                    logger.debug(f"[fs] Audit discarding still-active file: {path}")
-                                postponed_files.pop(path, None)
-                            except OSError: 
-                                postponed_files.pop(path, None)
-                        if lookback_rows:
-                            for i in range(0, len(lookback_rows), batch_size):
-                                batch = lookback_rows[i:i+batch_size]
-                                yield UpdateEvent(
-                                    event_schema=self.uri,
-                                    table="files",
-                                    rows=batch,
-                                    fields=list(batch[0].keys()),
-                                    message_source=MessageSource.AUDIT,
-                                    index=audit_time
-                                ), {}
-                        logger.info(f"[{stream_id}] Audit look-back complete.")
                     break
         
         stop_workers.set()
@@ -801,12 +714,6 @@ class FSDriver(SourceDriver):
                                         "title": "最小监控窗口 (天)",
                                         "description": "当需要淘汰监控目录时，确保被淘汰的目录比整个监控范围内最新的文件至少旧N天。这可以防止淘汰近期仍在活跃范围内的目录。例如，设置为30，则表示只有比最新文件早30天以上的目录才允许被淘汰。",
                                         "default": 30.0
-                                    },
-                                    "hot_data_cooloff_seconds": {
-                                        "type": "number",
-                                        "title": "热数据冷却时间 (秒)",
-                                        "description": "快照和审计阶段将跳过修改时间在此时间窗口内的文件，以避免同步正在写入的热数据。NFS 缓存默认为 60s，建议设为 61s 以上。",
-                                        "default": 61.0
                                     }
                                 }
                             }

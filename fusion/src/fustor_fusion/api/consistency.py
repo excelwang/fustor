@@ -55,27 +55,30 @@ async def signal_audit_end(
     Broadcasts to all view providers that support audit handling.
     """
     # Wait for queue to drain (with timeout)
-    max_wait = 5.0  # seconds
-    wait_interval = 0.2
+    # Problem 5 Fix: Removed hardcoded 1s sleep. 
+    # Since Agents await the HTTP response of the last batch before signaling end,
+    # the data is guaranteed to be in Fusion's memory when this is called.
+    max_wait = 10.0  # seconds
+    wait_interval = 0.1
     elapsed = 0.0
-    
-    # Wait at least 1 second upfront to give HTTP pipeline time to complete
-    await asyncio.sleep(1.0)
     
     while elapsed < max_wait:
         queue_size = memory_event_queue.get_queue_size(datastore_id)
         inflight = processing_manager.get_inflight_count(datastore_id)
         if queue_size == 0 and inflight == 0:
-            break
+            # Settle period: wait one more interval to ensure no micro-bursts are in-flight
+            await asyncio.sleep(wait_interval)
+            # Re-check
+            if memory_event_queue.get_queue_size(datastore_id) == 0 and processing_manager.get_inflight_count(datastore_id) == 0:
+                break
+        
         await asyncio.sleep(wait_interval)
         elapsed += wait_interval
     
     if elapsed >= max_wait:
         logger.warning(f"Audit end signal timeout waiting for queue drain: queue={queue_size}, inflight={inflight}")
     else:
-        logger.info(f"Queue drained for audit end (waited {1.0 + elapsed:.1f}s), proceeding with missing item detection")
-        # Additional delay to ensure any in-progress operations complete
-        await asyncio.sleep(0.2)
+        logger.info(f"Queue drained for audit end (waited {elapsed:.2f}s), proceeding with missing item detection")
 
     view_manager = await get_cached_view_manager(datastore_id)
     provider_names = view_manager.get_available_providers()

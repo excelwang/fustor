@@ -37,21 +37,32 @@ def test_lru_pruning_and_cascading_unschedule(fs_config: SourceConfig, tmp_path:
         for d in dirs:
             d.mkdir()
             (d / "nested").mkdir()  # Add nested dirs for cascading test
-
+        # Give some time for background mkdir events to settle
+        time.sleep(1.0)
+        
         # Use a real observer but mock the queue to check what's being put
         with patch.object(driver.watch_manager.inotify, 'remove_watch') as mock_remove_watch:
+            # Clear any background-triggered entries to start clean
+            driver.watch_manager.lru_cache.cache.clear()
+            driver.watch_manager.lru_cache.min_heap = []
+            driver.watch_manager.lru_cache.removed_from_heap.clear()
+            
             # Act
             # 1. Fill the watch manager up to its limit
+            base_ts = driver._logical_clock.get_watermark() + 1000
             for i in range(watch_limit):
-                driver.watch_manager.schedule(str(dirs[i]), time.time())
-                time.sleep(0.1)
+                timestamp = base_ts + i # Logical time
+                driver._logical_clock.update(timestamp)
+                driver.watch_manager.schedule(str(dirs[i]), timestamp)
 
             # 2. Access some to change LRU order. 0 is now the most recent.
             driver.watch_manager.touch(str(dirs[0]))
 
             # 3. Add one more directory, which should trigger pruning of dir[1]
             lru_path_to_be_evicted = str(dirs[1])
-            driver.watch_manager.schedule(str(dirs[watch_limit]), time.time())
+            trigger_ts = base_ts + 4000 # Much larger to ensure scheduled
+            driver._logical_clock.update(trigger_ts)
+            driver.watch_manager.schedule(str(dirs[watch_limit]), trigger_ts)
 
             # Give event processing thread time to process the event
             time.sleep(0.5)
