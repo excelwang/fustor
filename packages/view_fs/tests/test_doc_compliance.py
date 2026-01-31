@@ -37,7 +37,7 @@ class TestTombstoneTTLCleanup:
         """
         # Setup: 创建一个 2 小时前的 Tombstone
         old_ts = time.time() - 7200  # 2 hours ago
-        state.tombstone_list["/old_file.txt"] = old_ts
+        state.tombstone_list["/old_file.txt"] = (old_ts, old_ts)
         
         # 设置逻辑时钟水位线为当前时间
         state.logical_clock.update(time.time())
@@ -59,7 +59,7 @@ class TestTombstoneTTLCleanup:
         """
         # Setup: 创建一个 30 分钟前的 Tombstone
         recent_ts = time.time() - 1800  # 30 minutes ago
-        state.tombstone_list["/recent_file.txt"] = recent_ts
+        state.tombstone_list["/recent_file.txt"] = (recent_ts, recent_ts)
         
         # 设置逻辑时钟水位线为当前时间
         state.logical_clock.update(time.time())

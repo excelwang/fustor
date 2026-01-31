@@ -1,12 +1,75 @@
 import pytest
 import asyncio
 import time
+import unittest
 from fustor_view_fs import FSViewProvider
 from fustor_event_model.models import UpdateEvent, MessageSource, DeleteEvent
 
 @pytest.fixture
 def parser():
     return FSViewProvider(datastore_id="1", view_id="test_view")
+
+# ... (Previous tests unchanged) ...
+
+@pytest.mark.asyncio
+async def test_rule3_protection_old_mtime_injection(parser):
+    """
+    Test Rule 3: Stale Evidence Protection.
+    Ensures that a file created/updated via Realtime AFTER an audit started
+    is NOT deleted by that audit, even if the file has an old mtime (e.g., cp -p).
+    """
+    # Setup: Parent directory exists
+    await parser.process_event(UpdateEvent(
+        table="dirs",
+        rows=[{"path": "/data", "modified_time": 900, "is_dir": True}],
+        index=900000,
+        fields=[],
+        message_source=MessageSource.REALTIME,
+        event_schema="s"
+    ))
+    
+    # 1. Audit Start at T=1000
+    parser._logical_clock.update(1000)
+    
+    # Mock time.time() so _last_audit_start is recorded as 1000
+    with unittest.mock.patch('time.time', return_value=1000):
+        await parser.handle_audit_start()
+    
+    assert parser._last_audit_start == 1000
+    
+    # 2. Realtime Event at T=1100 (Logical Watermark)
+    # This represents a 'cp -p' where mtime is old (500)
+    parser._logical_clock.update(1100)
+    
+    # Mock time.time() so node.last_updated_at is recorded as 1100
+    with unittest.mock.patch('time.time', return_value=1100):
+        await parser.process_event(UpdateEvent(
+            table="files",
+            rows=[{"path": "/data/copied_file.txt", "modified_time": 500, "size": 100}],
+            index=1100000,
+            fields=[],
+            message_source=MessageSource.REALTIME,
+            event_schema="s"
+        ))
+    
+    node = parser._get_node("/data/copied_file.txt")
+    assert node is not None
+    assert node.last_updated_at == 1100
+    assert node.modified_time == 500
+    
+    # 3. Audit End
+    # The audit didn't see the file (because it scanned /data before the copy happened)
+    # But it DID scan /data
+    parser._audit_seen_paths.add("/data")
+    
+    await parser.handle_audit_end()
+    
+    # 4. Verification
+    # Even though mtime (500) < audit_start (1000), 
+    # Rule 3 should preserve it because last_updated_at (1100) > audit_start (1000)
+    node_after = parser._get_node("/data/copied_file.txt")
+    assert node_after is not None, "File should be preserved by Rule 3 protection"
+    assert "/data/copied_file.txt" not in parser._blind_spot_deletions
 
 @pytest.mark.asyncio
 async def test_audit_late_start_signal(parser):
@@ -123,55 +186,3 @@ async def test_audit_vs_tombstone_precedence(parser):
     assert "/del/zombie.txt" not in parser._blind_spot_deletions
     assert "/del/zombie.txt" in parser._tombstone_list
 
-@pytest.mark.asyncio
-async def test_rule3_protection_old_mtime_injection(parser):
-    """
-    Test Rule 3: Stale Evidence Protection.
-    Ensures that a file created/updated via Realtime AFTER an audit started
-    is NOT deleted by that audit, even if the file has an old mtime (e.g., cp -p).
-    """
-    # Setup: Parent directory exists
-    await parser.process_event(UpdateEvent(
-        table="dirs",
-        rows=[{"path": "/data", "modified_time": 900, "is_dir": True}],
-        index=900000,
-        fields=[],
-        message_source=MessageSource.REALTIME,
-        event_schema="s"
-    ))
-    
-    # 1. Audit Start at T=1000
-    parser._logical_clock.update(1000)
-    await parser.handle_audit_start()
-    assert parser._last_audit_start == 1000
-    
-    # 2. Realtime Event at T=1100 (Logical Watermark)
-    # This represents a 'cp -p' where mtime is old (500)
-    parser._logical_clock.update(1100)
-    await parser.process_event(UpdateEvent(
-        table="files",
-        rows=[{"path": "/data/copied_file.txt", "modified_time": 500, "size": 100}],
-        index=1100000,
-        fields=[],
-        message_source=MessageSource.REALTIME,
-        event_schema="s"
-    ))
-    
-    node = parser._get_node("/data/copied_file.txt")
-    assert node is not None
-    assert node.last_updated_at == 1100
-    assert node.modified_time == 500
-    
-    # 3. Audit End
-    # The audit didn't see the file (because it scanned /data before the copy happened)
-    # But it DID scan /data
-    parser._audit_seen_paths.add("/data")
-    
-    await parser.handle_audit_end()
-    
-    # 4. Verification
-    # Even though mtime (500) < audit_start (1000), 
-    # Rule 3 should preserve it because last_updated_at (1100) > audit_start (1000)
-    node_after = parser._get_node("/data/copied_file.txt")
-    assert node_after is not None, "File should be preserved by Rule 3 protection"
-    assert "/data/copied_file.txt" not in parser._blind_spot_deletions
