@@ -82,6 +82,8 @@ services:
       AGENT_ID: "agent-a"
       AGENT_PORT: "8100"
       FUSION_ENDPOINT: "http://fusion:8102"
+      LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
+      FAKETIME: "+2 hours"
     volumes:
       - agent-a-data:/data/agent
       - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
@@ -124,6 +126,8 @@ services:
       AGENT_ID: "agent-b"
       AGENT_PORT: "8100"
       FUSION_ENDPOINT: "http://fusion:8102"
+      LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
+      FAKETIME: "-1h"
     volumes:
       - agent-b-data:/data/agent
       - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent

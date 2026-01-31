@@ -8,6 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nfs-common \
     curl \
     procps \
+    faketime \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the entire monorepo (context is project root)

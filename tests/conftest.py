@@ -92,8 +92,22 @@ driver_params:
     # 4. Reload Fusion (Restarting is safer to ensure all services pickup the new YAML)
     docker_manager.restart_container(CONTAINER_FUSION)
     docker_manager.wait_for_health(CONTAINER_FUSION)
+    
+    # 5. Simulate Clock Skew (Testing Logical Clock synchronization)
+    # NFS Server: 2 hours AHEAD (files will have future mtime)
+    # Client B: 1 hour BEHIND
+    # Fusion & Client A: Normal time (reference)
+    logger.info("Simulating clock skew between containers...")
+    # 5. Log Environment Skew (configured via libfaketime in docker-compose.yml)
+    logger.info("Clock skew environment active: A:+2h, B:-1h, Fusion/NFS/Host:0")
+    try:
+        for container in [CONTAINER_FUSION, CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_NFS_SERVER]:
+            t = docker_manager.exec_in_container(container, ["date", "-u"])
+            logger.info(f"Container {container} UTC time: {t.stdout.strip()}")
+    except Exception as e:
+        logger.warning(f"Could not log container times: {e}")
 
-    logger.info("All containers healthy and Fusion configured.")
+    logger.info("All containers healthy and Fusion configured with clock skew.")
     yield docker_manager
     logger.info("Keeping Docker Compose environment running")
 
