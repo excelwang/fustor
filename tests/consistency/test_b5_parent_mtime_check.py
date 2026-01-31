@@ -120,7 +120,20 @@ class TestParentMtimeCheck:
         assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # File B should still exist (Audit mtime check should preserve it)
-        tree_after = fusion_client.get_tree(path=test_dir, max_depth=-1)
+        # Use retry to handle transient 503 errors (Fusion processing queue)
+        import requests
+        tree_after = None
+        for _ in range(10):
+            try:
+                tree_after = fusion_client.get_tree(path=test_dir, max_depth=-1)
+                break
+            except requests.HTTPError as e:
+                if e.response.status_code == 503:
+                    time.sleep(1)
+                    continue
+                raise
+        
+        assert tree_after is not None, "Failed to get tree after retries"
         b_after = fusion_client._find_in_tree(tree_after, file_b)
         
         assert b_after is not None, \

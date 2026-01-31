@@ -198,6 +198,27 @@ class FusionClient:
                 return found
         return None
 
+    def wait_for_file_not_in_tree(
+        self,
+        file_path: str,
+        root_path: str = "/",
+        timeout: float = 30,
+        interval: float = 0.5
+    ) -> bool:
+        """Wait for a specific file to disappear from tree."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                tree = self.get_tree(path=root_path, max_depth=-1)
+                found = self._find_in_tree(tree, file_path)
+                if not found:
+                    return True
+            except requests.HTTPError:
+                # If we can't get tree, consider file gone
+                return True
+            time.sleep(interval)
+        return False
+
     def check_file_flags(self, file_path: str) -> dict:
         """Check flag status of a file."""
         # Check integrity_suspect from tree

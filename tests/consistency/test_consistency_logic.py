@@ -63,7 +63,7 @@ async def test_audit_sentinel_logic():
     
     # 3. Audit Event (Update)
     rows = [{"path": "/test/audit_file", "modified_time": now + 1, "size": 500}] # +1 to advance
-    evt = UpdateEvent(table="files", rows=rows, index=None, fields=[], message_source=MessageSource.AUDIT, event_schema="s")
+    evt = UpdateEvent(table="files", rows=rows, index=2000, fields=[], message_source=MessageSource.AUDIT, event_schema="s")
     await parser.process_event(evt)
     
     node = parser.state.get_node("/test/audit_file")
