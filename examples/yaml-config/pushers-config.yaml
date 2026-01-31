@@ -1,0 +1,23 @@
+# Example: pushers-config.yaml
+# Location: $FUSTOR_HOME/pushers-config.yaml
+# Defines push destinations where Agent sends data
+
+fusion-main:
+  driver: fusion
+  endpoint: http://localhost:8102
+  disabled: false
+  credential:
+    key: fk_example_api_key_replace_me
+  driver_params:
+    datastore_id: 1
+    batch_size: 100
+    timeout_sec: 30
+
+fusion-backup:
+  driver: fusion
+  endpoint: http://backup-fusion:8102
+  disabled: true
+  credential:
+    key: fk_backup_api_key_replace_me
+  driver_params:
+    datastore_id: 2
