@@ -3,7 +3,7 @@ name = "fustor-agent-sdk"
 dynamic = ["version"]
 description = "SDK for Fustor Agent service"
 license = "MIT"
-dependencies = [ "fustor-core", "fustor-registry-client",]
+dependencies = [ "fustor-core"]
 
 [build-system]
 requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]

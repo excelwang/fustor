@@ -77,7 +77,7 @@ async def test_readiness_logic_full_chain(client_override):
 @pytest.mark.asyncio
 async def test_dynamic_processor_activation():
     """验证 ProcessingManager 能够动态激活新的 Datastore 处理器"""
-    ds_id = 999
+    ds_id = "999"
     # 初始无任务
     await processing_manager.stop_all()
     assert ds_id not in processing_manager._tasks

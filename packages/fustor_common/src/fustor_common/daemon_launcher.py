@@ -15,10 +15,10 @@ from fustor_common.logging_config import setup_logging
 
 def main():
     parser = argparse.ArgumentParser(description='Generic Fustor Service Daemon Launcher')
-    parser.add_argument('module_path', help='Module path to import (e.g., fustor_registry.main)')
+    parser.add_argument('module_path', help='Module path to import (e.g., fustor_fusion.main)')
     parser.add_argument('app_var', help='Application variable name (e.g., app)')
-    parser.add_argument('pid_file', help='PID file name (e.g., registry.pid)')
-    parser.add_argument('log_file', help='Log file name (e.g., registry.log)')
+    parser.add_argument('pid_file', help='PID file name (e.g., fusion.pid)')
+    parser.add_argument('log_file', help='Log file name (e.g., fusion.log)')
     parser.add_argument('display_name', help='Display name for the service')
     parser.add_argument('port', type=int, help='Port to run the service on')
     parser.add_argument('host', nargs='?', default='127.0.0.1', help='Host to bind the service to (default: 127.0.0.1)')

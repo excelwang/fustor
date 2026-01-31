@@ -5,7 +5,7 @@ Datastore configuration loader from YAML files.
 import yaml
 import logging
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from pydantic import BaseModel, field_validator
 
 from fustor_common.paths import get_fustor_home_dir
@@ -16,10 +16,19 @@ logger = logging.getLogger(__name__)
 
 class DatastoreConfig(BaseModel):
     """Configuration for a single datastore."""
-    name: str
+    id: str  # Added ID for easier access, though it comes from the map key
     session_timeout_seconds: int = 30
     allow_concurrent_push: bool = False
     api_key: str
+
+    @field_validator('id')
+    @classmethod
+    def validate_id(cls, v: str) -> str:
+        """Validate that ID is URL-safe."""
+        errors = validate_url_safe_id(v, "datastore id")
+        if errors:
+            raise ValueError("; ".join(errors))
+        return v
 
 
 class DatastoresConfigLoader:
@@ -28,11 +37,9 @@ class DatastoresConfigLoader:
     
     Config file format:
     ```yaml
-    datastores:
-      1:
-        name: research-data
-        session_timeout_seconds: 30
-        api_key: fk_abc123xyz
+    research-data:
+      session_timeout_seconds: 30
+      api_key: fk_abc123xyz
     ```
     """
     
@@ -40,8 +47,8 @@ class DatastoresConfigLoader:
         if config_path is None:
             config_path = get_fustor_home_dir() / "datastores-config.yaml"
         self.path = Path(config_path)
-        self._datastores: Dict[int, DatastoreConfig] = {}
-        self._api_key_map: Dict[str, int] = {}  # api_key -> datastore_id
+        self._datastores: Dict[str, DatastoreConfig] = {}
+        self._api_key_map: Dict[str, str] = {}  # api_key -> datastore_id
         self._loaded = False
     
     def load(self) -> None:
@@ -57,12 +64,24 @@ class DatastoresConfigLoader:
             self._datastores.clear()
             self._api_key_map.clear()
             
-            for ds_id, ds_data in data.get("datastores", {}).items():
+            # If the file has a top-level 'datastores' key, use it for backward compatibility
+            # Otherwise, use the top-level objects as datastores
+            datastores_data = data.get("datastores", data) if isinstance(data, dict) else {}
+            
+            for ds_id, ds_data in datastores_data.items():
+                # Skip if not a dict (might be a top-level 'datastores' key itself)
+                if ds_id == "datastores" and isinstance(ds_data, dict):
+                    continue
+                if not isinstance(ds_data, dict):
+                    continue
+                    
                 try:
+                    ds_id_str = str(ds_id)
+                    # Merge ID into data for Pydantic validation
+                    ds_data["id"] = ds_id_str
                     config = DatastoreConfig(**ds_data)
-                    int_id = int(ds_id)
-                    self._datastores[int_id] = config
-                    self._api_key_map[config.api_key] = int_id
+                    self._datastores[ds_id_str] = config
+                    self._api_key_map[config.api_key] = ds_id_str
                 except Exception as e:
                     logger.error(f"Failed to parse datastore {ds_id}: {e}")
             
@@ -77,17 +96,26 @@ class DatastoresConfigLoader:
         if not self._loaded:
             self.load()
     
-    def get_datastore(self, datastore_id: int) -> Optional[DatastoreConfig]:
+    def get_datastore(self, datastore_id: str) -> Optional[DatastoreConfig]:
         """Get datastore configuration by ID."""
         self.ensure_loaded()
-        return self._datastores.get(datastore_id)
+        return self._datastores.get(str(datastore_id))
+
+    def reload(self) -> None:
+        """Force reload configuration from YAML file."""
+        self.load()
+
+    def get_all_ids(self) -> List[str]:
+        """Get all registered datastore IDs."""
+        self.ensure_loaded()
+        return list(self._datastores.keys())
     
-    def get_all_datastores(self) -> Dict[int, DatastoreConfig]:
+    def get_all_datastores(self) -> Dict[str, DatastoreConfig]:
         """Get all datastore configurations."""
         self.ensure_loaded()
         return self._datastores.copy()
     
-    def validate_api_key(self, api_key: str) -> Optional[int]:
+    def validate_api_key(self, api_key: str) -> Optional[str]:
         """
         Validate API key and return associated datastore_id.
         
@@ -100,7 +128,7 @@ class DatastoresConfigLoader:
         self.ensure_loaded()
         return self._api_key_map.get(api_key)
     
-    def save_api_key(self, datastore_id: int, api_key: str) -> None:
+    def save_api_key(self, datastore_id: str, api_key: str) -> None:
         """
         Save a new API key to the YAML file.
         
@@ -108,31 +136,32 @@ class DatastoresConfigLoader:
             datastore_id: The datastore ID
             api_key: The new API key
         """
+        ds_id_str = str(datastore_id)
         if not self.path.exists():
-            data = {"datastores": {}}
+            data = {}
         else:
             with open(self.path) as f:
-                data = yaml.safe_load(f) or {"datastores": {}}
+                data = yaml.safe_load(f) or {}
         
-        if "datastores" not in data:
-            data["datastores"] = {}
-        
-        # Handle both int and str keys (YAML may use either)
-        existing_key = None
-        for k in [datastore_id, str(datastore_id)]:
-            if k in data["datastores"]:
-                existing_key = k
-                break
-        
-        if existing_key is not None:
-            data["datastores"][existing_key]["api_key"] = api_key
+        # Determine if we are using the new flat format or old nested format
+        if "datastores" in data and isinstance(data["datastores"], dict):
+            # Nested format
+            if ds_id_str in data["datastores"]:
+                data["datastores"][ds_id_str]["api_key"] = api_key
+            else:
+                data["datastores"][ds_id_str] = {
+                    "session_timeout_seconds": 30,
+                    "api_key": api_key
+                }
         else:
-            # Use int key for new entries
-            data["datastores"][datastore_id] = {
-                "name": f"datastore-{datastore_id}",
-                "session_timeout_seconds": 30,
-                "api_key": api_key
-            }
+            # Flat format
+            if ds_id_str in data:
+                data[ds_id_str]["api_key"] = api_key
+            else:
+                data[ds_id_str] = {
+                    "session_timeout_seconds": 30,
+                    "api_key": api_key
+                }
         
         with open(self.path, "w") as f:
             yaml.dump(data, f, default_flow_style=False, sort_keys=False)

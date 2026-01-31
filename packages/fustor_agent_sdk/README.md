@@ -39,4 +39,3 @@ print(response)
 ## Dependencies
 
 *   `fustor-core`: Provides foundational elements and shared components.
-*   `fustor-registry-client`: (If applicable) Used for interacting with the Fustor Registry service, which might be a dependency for Agent configuration.

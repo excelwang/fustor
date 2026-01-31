@@ -80,7 +80,7 @@ class TestBlindSpotSessionReset:
 
     @pytest.fixture
     def provider(self):
-        return FSViewProvider(datastore_id=1)
+        return FSViewProvider(datastore_id="1", view_id="test_view")
 
     @pytest.mark.asyncio
     async def test_blind_spot_additions_cleared_on_session_start(self, provider):

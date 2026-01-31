@@ -1,4 +1,4 @@
-# Dockerfile for Fustor Registry and Fusion services
+# Dockerfile for Fustor Fusion service
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -8,28 +8,25 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the entire monorepo (context is project root)
-COPY registry /app/registry
+# Copy monorepo components (context is project root)
 COPY fusion /app/fusion
 COPY packages /app/packages
 
 # Set fake version for setuptools-scm (since .git is not copied)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 
-# Install Fustor packages (using correct package names)
+# Install Fustor packages
 RUN pip install --no-cache-dir \
+    fastapi uvicorn pydantic pyyaml \
     /app/packages/fustor_common \
     /app/packages/core \
     /app/packages/fustor_event_model \
-    /app/packages/fustor_registry_client \
     /app/packages/fustor_fusion_sdk \
     /app/packages/view_fs \
-    /app/registry \
     /app/fusion
 
+# Create data directory
+RUN mkdir -p /data/fusion
 
-# Create data directories
-RUN mkdir -p /data/registry /data/fusion
-
-# Default command (override in docker-compose)
-CMD ["fustor-registry"]
+# Default command 
+CMD ["fustor-fusion", "start"]

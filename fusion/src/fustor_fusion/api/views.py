@@ -14,6 +14,7 @@ from ..auth.dependencies import get_datastore_id_from_api_key
 from ..datastore_state_manager import datastore_state_manager
 from ..in_memory_queue import memory_event_queue
 from ..processing_manager import processing_manager
+from ..config.views import views_config
 
 logger = logging.getLogger(__name__)
 
@@ -127,8 +128,6 @@ def register_view_driver_routes():
     1. If views are defined in local_config, register each view_name as a prefix.
     2. Fallback: Register the driver names themselves as prefixes.
     """
-    from ..local_config import local_config
-    
     available_factories = {name: func for name, func in _discover_view_api_factories()}
     
     if not available_factories:
@@ -136,16 +135,16 @@ def register_view_driver_routes():
         return
 
     # 1. Try to register based on specific view instances in config
-    view_configs = local_config.config.get("views", {})
+    view_configs = views_config.get_all()
     registered_count = 0
     
     if view_configs:
         for view_name, cfg in view_configs.items():
             # Skip disabled views
-            if cfg.get("disabled", False):
+            if cfg.disabled:
                 continue
                 
-            driver_name = cfg.get("driver")
+            driver_name = cfg.driver
             create_func = available_factories.get(driver_name)
             
             if create_func:

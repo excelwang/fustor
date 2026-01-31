@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class QueuedEvent:
     """Represents an event in the queue."""
     id: str
-    datastore_id: int
+    datastore_id: str
     event: EventBase # Changed content to event, type is EventBase
     timestamp: float = field(default_factory=time.time)
     processing_attempts: int = 0
@@ -34,7 +34,7 @@ class InMemoryEventQueue:
 
     def __init__(self):
         # Dictionary of asyncio queues, one per datastore_id
-        self._queues: Dict[int, asyncio.Queue] = defaultdict(asyncio.Queue)
+        self._queues: Dict[str, asyncio.Queue] = defaultdict(asyncio.Queue)
         # Lock for thread-safe operations
         self._lock = asyncio.Lock()
         # Statistics
@@ -43,9 +43,9 @@ class InMemoryEventQueue:
             "total_events_received": 0,
         }
         # Positions to track the highest processed index for each (datastore_id, task_id) combination
-        self._positions: Dict[Tuple[int, str], int] = {} # task_id can be a unique string
+        self._positions: Dict[Tuple[str, str], int] = {} # task_id can be a unique string
 
-    async def add_event(self, datastore_id: int, event: EventBase, task_id: Optional[str] = None) -> str:
+    async def add_event(self, datastore_id: str, event: EventBase, task_id: Optional[str] = None) -> str:
         """
         Add an event to the queue for a specific datastore.
 
@@ -57,15 +57,15 @@ class InMemoryEventQueue:
         Returns:
             Event ID if successful
         """
+        ds_id_str = str(datastore_id)
         event_id = str(uuid4())
         queued_event = QueuedEvent(
             id=event_id,
-            datastore_id=datastore_id,
+            datastore_id=ds_id_str,
             event=event
         )
 
-        queue_key = datastore_id
-        queue = self._queues[queue_key]
+        queue = self._queues[ds_id_str]
         await queue.put(queued_event)
 
         async with self._lock:
@@ -73,15 +73,15 @@ class InMemoryEventQueue:
 
             # Update position if task_id is provided and event has index
             if task_id and event.index != -1:
-                current_position = self._positions.get((datastore_id, task_id), 0)
+                current_position = self._positions.get((ds_id_str, task_id), 0)
                 new_index = event.index
                 if new_index > current_position:
-                    self._positions[(datastore_id, task_id)] = new_index
+                    self._positions[(ds_id_str, task_id)] = new_index
 
-        logger.debug(f"Added event {event_id} to datastore {datastore_id} queue")
+        logger.debug(f"Added event {event_id} to datastore {ds_id_str} queue")
         return event_id
 
-    async def add_events_batch(self, datastore_id: int, events: List[EventBase], task_id: Optional[str] = None) -> int:
+    async def add_events_batch(self, datastore_id: str, events: List[EventBase], task_id: Optional[str] = None) -> int:
         """
         Add a batch of events for a specific datastore.
 
@@ -93,12 +93,13 @@ class InMemoryEventQueue:
         Returns:
             Number of events successfully added
         """
+        ds_id_str = str(datastore_id)
         added_count = 0
         max_index = 0
 
         for event in events:
             try:
-                await self.add_event(datastore_id, event, task_id)
+                await self.add_event(ds_id_str, event, task_id)
                 added_count += 1
 
                 # Track the maximum index for position update
@@ -107,18 +108,18 @@ class InMemoryEventQueue:
                     if index_value > max_index:
                         max_index = index_value
             except Exception as e:
-                logger.error(f"Failed to add event to datastore {datastore_id}: {e}")
+                logger.error(f"Failed to add event to datastore {ds_id_str}: {e}")
 
         # Update position with the maximum index from the batch
         if task_id and max_index > 0:
             async with self._lock:
-                current_position = self._positions.get((datastore_id, task_id), 0)
+                current_position = self._positions.get((ds_id_str, task_id), 0)
                 if max_index > current_position:
-                    self._positions[(datastore_id, task_id)] = max_index
+                    self._positions[(ds_id_str, task_id)] = max_index
 
         return added_count
 
-    async def get_event(self, datastore_id: int, timeout: Optional[float] = None) -> Optional[QueuedEvent]:
+    async def get_event(self, datastore_id: str, timeout: Optional[float] = None) -> Optional[QueuedEvent]:
         """
         Get a single event from the queue for a specific datastore.
 
@@ -129,8 +130,8 @@ class InMemoryEventQueue:
         Returns:
             QueuedEvent if available, None if timeout or exception
         """
-        queue_key = datastore_id
-        queue = self._queues.get(queue_key)
+        ds_id_str = str(datastore_id)
+        queue = self._queues.get(ds_id_str)
         if queue is None or queue.empty():
             return None
 
@@ -147,7 +148,7 @@ class InMemoryEventQueue:
             async with self._lock:
                 self._stats["total_events_received"] += 1
 
-            logger.debug(f"Retrieved event {queued_event.id} from datastore {datastore_id} queue")
+            logger.debug(f"Retrieved event {queued_event.id} from datastore {ds_id_str} queue")
             return queued_event
         except Exception as e:
             logger.error(f"Error getting event from queue: {e}")
@@ -155,7 +156,7 @@ class InMemoryEventQueue:
 
     async def get_events_batch(
         self,
-        datastore_id: int,
+        datastore_id: str,
         batch_size: int = 100,
         timeout: Optional[float] = 1.0
     ) -> List[QueuedEvent]:
@@ -170,18 +171,18 @@ class InMemoryEventQueue:
         Returns:
             List of QueuedEvents
         """
+        ds_id_str = str(datastore_id)
         events = []
 
         # Get the first event with timeout
-        first_event = await self.get_event(datastore_id, timeout)
+        first_event = await self.get_event(ds_id_str, timeout)
         if first_event:
             events.append(first_event)
         else:
             return events  # Return empty if no initial event
 
         # Try to get more events without blocking
-        queue_key = datastore_id
-        queue = self._queues.get(queue_key)
+        queue = self._queues.get(ds_id_str)
         if queue:
             for _ in range(batch_size - 1):
                 if queue.empty():
@@ -194,10 +195,10 @@ class InMemoryEventQueue:
                 except asyncio.QueueEmpty:
                     break  # No more events available
 
-        logger.debug(f"Retrieved batch of {len(events)} events for datastore {datastore_id}")
+        logger.debug(f"Retrieved batch of {len(events)} events for datastore {ds_id_str}")
         return events
 
-    async def get_position(self, datastore_id: int, task_id: str) -> Optional[int]:
+    async def get_position(self, datastore_id: str, task_id: str) -> Optional[int]:
         """
         Get the current position (highest processed index) for a specific datastore and task.
 
@@ -208,10 +209,11 @@ class InMemoryEventQueue:
         Returns:
             The highest processed index, or None if no position exists
         """
+        ds_id_str = str(datastore_id)
         async with self._lock:
-            return self._positions.get((datastore_id, task_id))
+            return self._positions.get((ds_id_str, task_id))
 
-    async def update_position(self, datastore_id: int, task_id: str, index: int) -> None:
+    async def update_position(self, datastore_id: str, task_id: str, index: int) -> None:
         """
         Update the position for a specific datastore and task.
 
@@ -220,10 +222,11 @@ class InMemoryEventQueue:
             task_id: The task ID
             index: The index to set as the position
         """
+        ds_id_str = str(datastore_id)
         async with self._lock:
-            current_position = self._positions.get((datastore_id, task_id), 0)
+            current_position = self._positions.get((ds_id_str, task_id), 0)
             if index > current_position:
-                self._positions[(datastore_id, task_id)] = index
+                self._positions[(ds_id_str, task_id)] = index
 
     async def get_stats(self) -> Dict[str, Any]:
         """
@@ -238,33 +241,34 @@ class InMemoryEventQueue:
 
         return stats
 
-    def get_queue_size(self, datastore_id: int) -> int:
+    def get_queue_size(self, datastore_id: str) -> int:
         """
         Get the current size of a specific datastore queue.
         """
-        queue_key = datastore_id
-        queue = self._queues.get(queue_key)
+        ds_id_str = str(datastore_id)
+        queue = self._queues.get(ds_id_str)
         return queue.qsize() if queue else 0
 
-    async def clear_datastore_data(self, datastore_id: int):
+    async def clear_datastore_data(self, datastore_id: str):
         """
         Clears the event queue and all position tracking for a given datastore.
         """
+        ds_id_str = str(datastore_id)
         async with self._lock:
             # Clear the queue for the datastore
-            if datastore_id in self._queues:
+            if ds_id_str in self._queues:
                 # Draining the queue to prevent dangling references (though not strictly necessary for deletion)
-                while not self._queues[datastore_id].empty():
-                    self._queues[datastore_id].get_nowait()
-                del self._queues[datastore_id]
-                logger.info(f"Cleared event queue for datastore {datastore_id}.")
+                while not self._queues[ds_id_str].empty():
+                    self._queues[ds_id_str].get_nowait()
+                del self._queues[ds_id_str]
+                logger.info(f"Cleared event queue for datastore {ds_id_str}.")
             
             # Clear all positions associated with this datastore
-            keys_to_delete = [key for key in self._positions if key[0] == datastore_id]
+            keys_to_delete = [key for key in self._positions if key[0] == ds_id_str]
             for key in keys_to_delete:
                 del self._positions[key]
             if keys_to_delete:
-                logger.info(f"Cleared {len(keys_to_delete)} position entries for datastore {datastore_id}.")
+                logger.info(f"Cleared {len(keys_to_delete)} position entries for datastore {ds_id_str}.")
 
 
 # Global instance

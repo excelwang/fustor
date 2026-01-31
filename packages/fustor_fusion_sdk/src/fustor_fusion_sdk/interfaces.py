@@ -14,47 +14,6 @@ class SessionInfo:
     client_ip: Optional[str] = None
     cleanup_task: Optional[asyncio.Task] = None
 
-class ApiKeyCacheInterface(Protocol):
-    """
-    Interface for managing API key cache.
-    """
-    def set_cache(self, api_keys_data: List[Dict[str, Any]]):
-        ...
-
-    def get_datastore_id(self, api_key: str) -> Optional[int]:
-        ...
-
-from fustor_common.models import DatastoreConfig
-from fustor_registry_client.models import ClientDatastoreConfigResponse
-
-class DatastoreConfigCacheInterface(Protocol):
-    """
-    Interface for managing datastore config cache.
-    """
-    def set_cache(self, datastore_configs_data: List[ClientDatastoreConfigResponse]):
-        ...
-
-    def get_datastore_config(self, datastore_id: int) -> Optional[DatastoreConfig]:
-        ...
-
-from fustor_registry_client.models import ClientDatastoreConfigResponse
-
-class ParserProcessingTaskManagerInterface(Protocol):
-    """
-    Interface for managing datastore processing tasks.
-    """
-    async def start_processing_for_datastore(self, datastore_id: int):
-        ...
-
-    async def stop_processing_for_datastore(self, datastore_id: int):
-        ...
-
-    async def sync_tasks(self, latest_datastore_configs: List[ClientDatastoreConfigResponse]):
-        ...
-
-    async def shutdown(self):
-        ...
-
 class SessionManagerInterface(Protocol):
     """
     Interface for managing user sessions.
@@ -89,4 +48,27 @@ class SessionManagerInterface(Protocol):
         ...
 
     async def stop_periodic_cleanup(self):
+        ...
+
+class ViewProvider(Protocol):
+    """
+    Interface for a View Provider driver.
+    Views expose datastore content via specific protocols (e.g. FUSE/NFS).
+    """
+    def __init__(self, datastore_id: int, view_id: str, **kwargs):
+        ...
+
+    async def initialize(self) -> None:
+        """Initialize resources (mount points, network listeners)."""
+        ...
+
+    async def cleanup(self) -> None:
+        """Release resources (unmount, stop listeners)."""
+        ...
+        
+    async def on_session_start(self, session_id: str) -> None:
+        """
+        Called when a new write session starts.
+        Used to clear caches or prepare for incoming data.
+        """
         ...

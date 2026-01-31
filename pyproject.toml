@@ -2,14 +2,12 @@
 members = [
     "agent",
     "fusion",
-    "registry",
     "benchmark",
     "packages/core",
     "packages/fustor_agent_sdk",
     "packages/fustor_common",
     "packages/fustor_event_model",
     "packages/fustor_fusion_sdk",
-    "packages/fustor_registry_client",
     "packages/pusher_echo",
     "packages/pusher_openapi",
     "packages/pusher_fusion",
@@ -25,13 +23,11 @@ members = [
 [tool.uv.sources]
 fustor-agent = { workspace = true }
 fustor-fusion = { workspace = true }
-fustor-registry = { workspace = true }
 fustor-core = { workspace = true }
 fustor-agent-sdk = { workspace = true }
 fustor-common = { workspace = true }
 fustor-event-model = { workspace = true }
 fustor-fusion-sdk = { workspace = true }
-fustor-registry-client = { workspace = true }
 fustor-pusher-echo = { workspace = true }
 fustor-pusher-openapi = { workspace = true }
 fustor-pusher-fusion = { workspace = true }
@@ -47,7 +43,6 @@ fustor-view-fs = { workspace = true }
 pythonpath = [
     "agent/src",
     "fusion/src",
-    "registry/src",
     "packages/core/src",
     "packages/pusher_echo/src",
     "packages/pusher_openapi/src",
@@ -63,7 +58,6 @@ pythonpath = [
 testpaths = [
     "agent/tests",
     "fusion/tests",
-    "registry/tests",
     "packages/*/tests",
     "packages/source_oss/tests"
 ]

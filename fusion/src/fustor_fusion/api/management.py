@@ -57,7 +57,6 @@ async def start_view(view_id: str):
     if datastore_id not in view_managers:
         from ..view_manager.manager import ViewManager
         view_managers[datastore_id] = ViewManager(datastore_id=datastore_id)
-        await view_managers[datastore_id].initialize()
     
     vm = view_managers[datastore_id]
     
@@ -71,9 +70,9 @@ async def start_view(view_id: str):
         from fustor_fusion_sdk.loaders import load_view
         provider_class = load_view(config.driver)
         provider = provider_class(
-            datastore_id=datastore_id,
             view_id=view_id,
-            **config.driver_params
+            datastore_id=datastore_id,
+            config=config.driver_params
         )
         await provider.initialize()
         vm.providers[view_id] = provider

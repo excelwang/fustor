@@ -8,7 +8,7 @@ from fustor_event_model.models import UpdateEvent, MessageSource, EventType
 
 @pytest.fixture
 def parser():
-    p = FSViewProvider(datastore_id=1)
+    p = FSViewProvider(datastore_id="1", view_id="test_view")
     p.hot_file_threshold = 30.0
     return p
 

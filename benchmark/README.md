@@ -6,7 +6,7 @@
 
 1.  **量化优势**: 对比 Fusion 内存索引与 Linux 原生 `find` 命令在递归元数据检索下的延迟与吞吐量。
 2.  **百万级规模**: 支持生成并同步超过 1,000,000 个文件的元数据。
-3.  **全自动流程**: 自动编排 Registry、Fusion 和 Agent，实现一键式从环境部署到报告生成。
+3.  **全自动流程**: 自动编排 Fusion 和 Agent，实现一键式从环境部署到报告生成。
 4.  **生产环境巡检**: 支持对接已有的 Fustor 集群进行性能实时量化。
 
 ## 目录结构规范与安全
@@ -32,7 +32,7 @@ uv run fustor-benchmark generate fustor-benchmark-run/data --num-dirs 1000
 ```
 
 ### 2. 执行压测 (全自动模式)
-此模式会自动在本地启动 Registry, Fusion 和 Agent，并在压测结束后自动停止：
+此模式会自动在本地启动 Fusion 和 Agent，并在压测结束后自动停止：
 ```bash
 uv run fustor-benchmark run fustor-benchmark-run/data -d 5 -c 20 -n 100
 ```

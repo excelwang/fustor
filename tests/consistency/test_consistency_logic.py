@@ -5,7 +5,7 @@ from fustor_event_model.models import EventBase, EventType, MessageSource, Updat
 
 @pytest.mark.asyncio
 async def test_arbitration_logic():
-    parser = FSViewProvider(datastore_id=1)
+    parser = FSViewProvider(datastore_id="1", view_id="test_view")
 
     
     # 1. Snapshot event (old data)
@@ -50,16 +50,20 @@ async def test_arbitration_logic():
 
 @pytest.mark.asyncio
 async def test_audit_sentinel_logic():
-    parser = FSViewProvider(datastore_id=1)
+    parser = FSViewProvider(datastore_id="1", view_id="test_view")
     
-    # 1. Audit Start
-    await parser.handle_audit_start()
-    assert parser.state.last_audit_start is not None
-    
-    # 2. Audit Event (Update)
+    # 1. Init clock to now so last_audit_start is meaningful
     now = time.time()
-    rows = [{"path": "/test/audit_file", "modified_time": now, "size": 500}]
-    evt = UpdateEvent(table="files", rows=rows, index=1000, fields=[], message_source=MessageSource.AUDIT, event_schema="s")
+    parser.state.logical_clock.update(now)
+
+    # 2. Audit Start
+    await parser.handle_audit_start()
+    audit_start_time = parser.state.last_audit_start
+    assert audit_start_time is not None
+    
+    # 3. Audit Event (Update)
+    rows = [{"path": "/test/audit_file", "modified_time": now + 1, "size": 500}] # +1 to advance
+    evt = UpdateEvent(table="files", rows=rows, index=None, fields=[], message_source=MessageSource.AUDIT, event_schema="s")
     await parser.process_event(evt)
     
     node = parser.state.get_node("/test/audit_file")
@@ -67,32 +71,33 @@ async def test_audit_sentinel_logic():
     # Audit events mark files as blind-spot additions
     assert node.path in parser.state.blind_spot_additions
     
-    # 3. Sentinel Suspect List
-    # Check if hot file is in suspect list
-    # logic: if (now - mtime) < HOT_FILE_THRESHOLD_SECONDS (600): suspect=True
+    # Sentinel check logic relies on hot_file_threshold (default 30s)
+    # (clock - mtime) < 30 ? 
+    # clock is now at now+1 (from row mtime update). row mtime is now+1. diff is 0. So Suspect.
     assert node.integrity_suspect == True
     assert "/test/audit_file" in parser.state.suspect_list
     
     # 4. Audit End (Cleanup)
-    # Tombstone cleanup logic: Remove tombstones created BEFORE audit start
-    # (i.e., keep only ts >= self._last_audit_start)
-    audit_start_time = parser.state.last_audit_start
+    # Tombstone cleanup logic: Purge tombstones older than 1 HOUR
+    # Current watermark is ~ now+1
     
-    parser.state.tombstone_list["/d/before"] = audit_start_time - 10  # Before audit start → should be removed
-    parser.state.tombstone_list["/d/after"] = audit_start_time + 10   # After audit start → should be kept
+    # Case A: Ancient tombstone (2 hours ago) -> Should be removed
+    parser.state.tombstone_list["/d/ancient"] = now - 7300 
+    
+    # Case B: Recent tombstone (1 minute ago) -> Should be kept
+    parser.state.tombstone_list["/d/recent"] = now - 60 
     
     await parser.handle_audit_end()
     
-    # Tomb stones created before audit should be cleaned up
-    assert "/d/before" not in parser.state.tombstone_list
-    # Tombstones created during/after audit should remain
-    assert "/d/after" in parser.state.tombstone_list
+    # Assertions
+    assert "/d/ancient" not in parser.state.tombstone_list, "Ancient tombstone should be cleaned"
+    assert "/d/recent" in parser.state.tombstone_list, "Recent tombstone should be preserved"
     assert parser.state.last_audit_start is None
 
 
 @pytest.mark.asyncio
 async def test_auto_audit_start():
-    parser = FSViewProvider(datastore_id=1)
+    parser = FSViewProvider(datastore_id="1", view_id="test_view")
     assert parser.state.last_audit_start is None
     
     now_ms = int(time.time() * 1000)
@@ -107,7 +112,7 @@ async def test_auto_audit_start():
 @pytest.mark.asyncio
 async def test_parent_mtime_check():
     """Test Section 5.3: Parent Mtime Check for Audit events."""
-    parser = FSViewProvider(datastore_id=1)
+    parser = FSViewProvider(datastore_id="1", view_id="test_view")
     
     # 1. First, establish a parent directory in memory via Realtime
     parent_realtime_mtime = time.time()
@@ -156,7 +161,7 @@ async def test_parent_mtime_check():
 @pytest.mark.asyncio
 async def test_audit_missing_file_detection():
     """Test Section 5.3 Scenario 2: Detecting files missing from audit."""
-    parser = FSViewProvider(datastore_id=1)
+    parser = FSViewProvider(datastore_id="1", view_id="test_view")
     
     # 1. Create initial state via Realtime: parent dir + 2 files
     now = time.time()

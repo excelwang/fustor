@@ -10,7 +10,7 @@ import time
 from ..auth.dependencies import get_datastore_id_from_api_key
 from ..runtime import datastore_event_manager
 from ..core.session_manager import session_manager
-from ..auth.datastore_cache import datastore_config_cache
+from ..config.datastores import datastores_config # Use datastores_config
 from ..datastore_state_manager import datastore_state_manager
 from ..processing_manager import processing_manager
 
@@ -31,7 +31,23 @@ async def get_global_stats():
     """
     Get aggregated statistics across all active datastores and sessions for the monitoring dashboard.
     """
-    active_datastores = datastore_config_cache.get_all_active_datastores()
+    # Get all configs directly from the new config module
+    # get_all_configs() returns dict {id: config} values() gives config objects
+    # But wait, datastores_config doesn't have get_all_active_datastores.
+    # It has get_all_ids() and get_datastore(id).
+    # We need all active datastores.
+    # Assuming all loaded datastores are active.
+    
+    # We can iterate over all IDs.
+    active_datastores = []
+    for ds_id in datastores_config.get_all_ids():
+         cfg = datastores_config.get_datastore(ds_id)
+         if cfg:
+             # Add a datastore_id attribute dynamically if missing, or use ds_id
+             # DatastoreConfig model might not have datastore_id field if it keys by ID in yaml.
+             # Let's attach it.
+             cfg.datastore_id = ds_id 
+             active_datastores.append(cfg)
     
     sources_map = {} # deduplicate by task_id
     total_volume = 0
@@ -152,7 +168,7 @@ async def ingest_event_batch(
     )
 
     # NEW: Check for outdated snapshot pushes
-    datastore_config = datastore_config_cache.get_datastore_config(datastore_id)
+    datastore_config = datastores_config.get_datastore(datastore_id)
     if datastore_config and datastore_config.allow_concurrent_push and payload.source_type == 'snapshot':
         is_authoritative = await datastore_state_manager.is_authoritative_session(datastore_id, payload.session_id)
         if not is_authoritative:

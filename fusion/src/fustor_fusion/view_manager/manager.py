@@ -9,7 +9,7 @@ View Drivers are discovered dynamically via the 'fustor.view_drivers' entry poin
 from typing import Dict, Any, Optional, Type
 from importlib.metadata import entry_points
 from fustor_core.drivers import ViewDriver
-from ..config import fusion_config
+from ..config import fusion_config, views_config
 import logging
 import asyncio
 from fustor_event_model.models import EventBase
@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 
 # --- Global Cache for View Managers ---
-_view_manager_cache: Dict[int, 'ViewManager'] = {}
+_view_manager_cache: Dict[str, 'ViewManager'] = {}
 _cache_lock = asyncio.Lock()
 
 # --- Cached loaded drivers ---
@@ -60,7 +60,7 @@ class ViewManager:
     based on event type or content.
     """
     
-    def __init__(self, datastore_id: int = None):
+    def __init__(self, datastore_id: str = None):
         self.providers: Dict[str, ViewDriver] = {}
         self.logger = logging.getLogger(__name__)
         self.datastore_id = datastore_id
@@ -74,14 +74,14 @@ class ViewManager:
         
         available_drivers = _load_view_drivers()
         
-        # Try loading from local config first
-        from ..local_config import local_config
-        view_configs = local_config.get_datastore_views(self.datastore_id)
+        # Try loading from views_config loader
+        view_configs = views_config.get_by_datastore(self.datastore_id)
         
         if view_configs:
-            self.logger.info(f"Using local configuration for datastore {self.datastore_id} views: {list(view_configs.keys())}")
-            for view_name, cfg in view_configs.items():
-                driver_type = cfg.get("driver")
+            self.logger.info(f"Using view configuration for datastore {self.datastore_id}: {[v.id for v in view_configs]}")
+            for config in view_configs:
+                view_name = config.id
+                driver_type = config.driver
                 if not driver_type:
                     self.logger.warning(f"View '{view_name}' config missing 'driver' field, skipping")
                     continue
@@ -92,30 +92,36 @@ class ViewManager:
                     continue
                 
                 # Use driver_params directly
-                driver_params = cfg.get("driver_params", {})
+                driver_params = config.driver_params
                 
                 try:
-                    self.providers[view_name] = driver_cls(
+                    provider = driver_cls(
+                        view_id=view_name,
                         datastore_id=self.datastore_id,
                         config=driver_params
                     )
+                    await provider.initialize()
+                    self.providers[view_name] = provider
                     self.logger.info(f"Initialized ViewDriver '{view_name}' (type={driver_type})")
                 except Exception as e:
                     self.logger.error(f"Failed to initialize ViewDriver '{view_name}': {e}", exc_info=True)
                     
         else:
-            # Fallback: Auto-load all found drivers IF config file is missing
-            if not local_config.is_configured():
+            # Fallback: Auto-load all found drivers IF config is empty
+            if not views_config.get_all():
                  self.logger.info(f"No fusion config file found, auto-loading all installed view drivers")
                  
                  for schema, driver_cls in available_drivers.items():
                      try:
                          # For auto-discovery, we use the schema name as the view instance name
                          # No default config provided
-                         self.providers[schema] = driver_cls(
+                         provider = driver_cls(
+                             view_id=schema,
                              datastore_id=self.datastore_id,
                              config={}
                          )
+                         await provider.initialize()
+                         self.providers[schema] = provider
                          self.logger.info(f"Initialized ViewDriver '{schema}' for datastore {self.datastore_id}")
                      except Exception as e:
                          self.logger.error(f"Failed to initialize ViewDriver '{schema}': {e}", exc_info=True)
@@ -223,41 +229,43 @@ class ViewManager:
                          
         return aggregated
 
-async def reset_views(datastore_id: int) -> bool:
+async def reset_views(datastore_id: str) -> bool:
     """
     Reset all views by clearing cached manager and data for a specific datastore.
     """
-    logger.info(f"Resetting views for datastore {datastore_id}")
+    ds_id_str = str(datastore_id)
+    logger.info(f"Resetting views for datastore {ds_id_str}")
     try:
         async with _cache_lock:
-            if datastore_id in _view_manager_cache:
-                del _view_manager_cache[datastore_id]
+            if ds_id_str in _view_manager_cache:
+                del _view_manager_cache[ds_id_str]
         
-        await memory_event_queue.clear_datastore_data(datastore_id)
+        await memory_event_queue.clear_datastore_data(ds_id_str)
         return True
     except Exception as e:
-        logger.error(f"Failed to reset views for datastore {datastore_id}: {e}", exc_info=True)
+        logger.error(f"Failed to reset views for datastore {ds_id_str}: {e}", exc_info=True)
         return False
 
 
 
 
-async def get_cached_view_manager(datastore_id: int) -> 'ViewManager':
+async def get_cached_view_manager(datastore_id: str) -> 'ViewManager':
     """
     Gets a cached ViewManager for a given datastore_id.
     If not in cache, it creates, initializes, and caches one.
     """
-    if datastore_id in _view_manager_cache:
-        return _view_manager_cache[datastore_id]
+    ds_id_str = str(datastore_id)
+    if ds_id_str in _view_manager_cache:
+        return _view_manager_cache[ds_id_str]
 
     async with _cache_lock:
-        if datastore_id in _view_manager_cache:
-            return _view_manager_cache[datastore_id]
+        if ds_id_str in _view_manager_cache:
+            return _view_manager_cache[ds_id_str]
         
-        logger.info(f"Creating new view manager for datastore {datastore_id}")
-        new_manager = ViewManager(datastore_id=datastore_id)
+        logger.info(f"Creating new view manager for datastore {ds_id_str}")
+        new_manager = ViewManager(datastore_id=ds_id_str)
         await new_manager.initialize_providers()
-        _view_manager_cache[datastore_id] = new_manager
+        _view_manager_cache[ds_id_str] = new_manager
         return new_manager
 
 
@@ -272,20 +280,21 @@ async def cleanup_all_expired_suspects():
 
 # --- Public Interface for Processing events ---
 
-async def process_event(event: EventBase, datastore_id: int) -> Dict[str, bool]:
+async def process_event(event: EventBase, datastore_id: str) -> Dict[str, bool]:
     """Process a single event with all available view providers"""
     manager = await get_cached_view_manager(datastore_id)
     return await manager.process_event(event)
 
 
-async def on_session_start(datastore_id: int, session_id: str):
+async def on_session_start(datastore_id: str, session_id: str):
     """Notify view providers that a new session has started."""
     manager = await get_cached_view_manager(datastore_id)
     await manager.on_session_start(session_id)
 
 
-async def on_session_close(datastore_id: int, session_id: str):
+async def on_session_close(datastore_id: str, session_id: str):
     """Notify view providers that a session has closed for cleanup."""
-    if datastore_id in _view_manager_cache:
-        manager = _view_manager_cache[datastore_id]
+    ds_id_str = str(datastore_id)
+    if ds_id_str in _view_manager_cache:
+        manager = _view_manager_cache[ds_id_str]
         await manager.on_session_close(session_id)

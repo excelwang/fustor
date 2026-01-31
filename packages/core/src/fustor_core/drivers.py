@@ -34,16 +34,24 @@ class ViewDriver(ABC):
     # Used by ViewManager to route events to the appropriate driver.
     target_schema: str = ""
     
-    def __init__(self, datastore_id: int, config: Dict[str, Any]):
+    def __init__(self, view_id: str, datastore_id: str, config: Dict[str, Any]):
         """
         Initialize the view driver.
         
         Args:
+            view_id: The unique ID assigned to this view instance.
             datastore_id: The ID of the datastore this driver manages.
             config: Driver-specific configuration dictionary.
         """
+        self.view_id = view_id
         self.datastore_id = datastore_id
         self.config = config
+
+    async def initialize(self):
+        """
+        Optional: Perform asynchronous initialization.
+        """
+        pass
     
     @property
     def requires_full_reset_on_session_close(self) -> bool:

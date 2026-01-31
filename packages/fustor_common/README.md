@@ -22,7 +22,7 @@ This package is part of the Fustor monorepo and is typically installed in editab
 
 ## Usage
 
-Components from `fustor-common` are imported and utilized by other Fustor services (e.g., `agent`, `registry`, `fusion`) and plugin packages to leverage shared functionalities and maintain consistency.
+Components from `fustor-common` are imported and utilized by other Fustor services (e.g., `agent`, `fusion`) and plugin packages to leverage shared functionalities and maintain consistency.
 
 Example:
 

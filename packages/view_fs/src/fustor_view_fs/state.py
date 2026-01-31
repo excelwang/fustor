@@ -13,7 +13,7 @@ class FSState:
     Holds the in-memory state for a File System View.
     This replaces the implicit state shared via Mixins.
     """
-    def __init__(self, datastore_id: int):
+    def __init__(self, datastore_id: str):
         self.datastore_id = datastore_id
         self._root = DirectoryNode("", "/")
         self.directory_path_map: Dict[str, DirectoryNode] = {"/": self._root}

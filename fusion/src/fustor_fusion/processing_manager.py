@@ -11,35 +11,37 @@ logger = logging.getLogger(__name__)
 
 class ProcessingManager:
     def __init__(self):
-        self._tasks: Dict[int, asyncio.Task] = {}
+        self._tasks: Dict[str, asyncio.Task] = {}
         self._lock = asyncio.Lock()
         # 追踪每个数据存储正在处理中（已出队但未完成解析）的事件数量
-        self._inflight_counts: Dict[int, int] = defaultdict(int)
+        self._inflight_counts: Dict[str, int] = defaultdict(int)
 
-    def get_inflight_count(self, datastore_id: int) -> int:
+    def get_inflight_count(self, datastore_id: str) -> int:
         """获取当前正在内存解析中的事件数"""
-        return self._inflight_counts.get(datastore_id, 0)
+        return self._inflight_counts.get(str(datastore_id), 0)
 
-    async def ensure_processor(self, datastore_id: int):
+    async def ensure_processor(self, datastore_id: str):
         """确保指定数据存储的处理循环正在运行"""
+        ds_id_str = str(datastore_id)
         async with self._lock:
-            if datastore_id not in self._tasks or self._tasks[datastore_id].done():
-                task = asyncio.create_task(self._per_datastore_processing_loop(datastore_id))
-                self._tasks[datastore_id] = task
-                logger.info(f"Started dynamic background processing task for datastore {datastore_id}.")
+            if ds_id_str not in self._tasks or self._tasks[ds_id_str].done():
+                task = asyncio.create_task(self._per_datastore_processing_loop(ds_id_str))
+                self._tasks[ds_id_str] = task
+                logger.info(f"Started dynamic background processing task for datastore {ds_id_str}.")
 
     async def sync_tasks(self, datastore_configs: List[Any]):
-        """根据配置同步处理任务 (由 sync_cache 调用)"""
+        """根据配置同步处理任务 (由 reload_configs_job 调用)"""
         for config in datastore_configs:
-            # DatastoreConfig object usually has datastore_id
-            ds_id = getattr(config, 'datastore_id', None)
+            # DatastoreConfig object has 'id' field
+            ds_id = getattr(config, 'id', None)
             if ds_id is not None:
                 await self.ensure_processor(ds_id)
 
-    async def _per_datastore_processing_loop(self, datastore_id: int):
+    async def _per_datastore_processing_loop(self, datastore_id: str):
         """优化的后台处理循环：事件驱动 + 状态追踪"""
-        log = logging.getLogger(f"fustor.processor.{datastore_id}")
-        log.info(f"Processing loop started for datastore {datastore_id}")
+        ds_id_str = str(datastore_id)
+        log = logging.getLogger(f"fustor.processor.{ds_id_str}")
+        log.info(f"Processing loop started for datastore {ds_id_str}")
         
         while True:
             try:
@@ -53,22 +55,22 @@ class ProcessingManager:
 
                 # --- 关键：增加处理中计数 ---
                 count = len(events)
-                self._inflight_counts[datastore_id] += count
+                self._inflight_counts[ds_id_str] += count
                 
                 try:
                     processed_count = 0
                     for event_obj in events:
                         try:
-                            await process_single_event(event_obj, datastore_id)
+                            await process_single_event(event_obj, ds_id_str)
                             processed_count += 1
                         except Exception as e:
                             log.error(f"Error processing event: {e}", exc_info=True)
                     
                     if processed_count > 0:
-                        log.info(f"Processed {processed_count} events. Queue: {memory_event_queue.get_queue_size(datastore_id)}")
+                        log.info(f"Processed {processed_count} events. Queue: {memory_event_queue.get_queue_size(ds_id_str)}")
                 finally:
                     # --- 关键：无论成功失败，处理完后减去计数 ---
-                    self._inflight_counts[datastore_id] -= count
+                    self._inflight_counts[ds_id_str] -= count
                 
                 # 给予其他协程运行机会
                 await asyncio.sleep(0)

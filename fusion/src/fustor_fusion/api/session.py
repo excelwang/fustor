@@ -6,7 +6,7 @@ import time
 import uuid
 
 from ..auth.dependencies import get_datastore_id_from_api_key
-from ..auth.datastore_cache import datastore_config_cache, DatastoreConfig
+from ..config.datastores import datastores_config, DatastoreConfig
 from ..core.session_manager import session_manager
 from ..datastore_state_manager import datastore_state_manager
 from ..view_manager.manager import reset_views, on_session_start, on_session_close
@@ -73,7 +73,7 @@ async def create_session(
     datastore_id: int = Depends(get_datastore_id_from_api_key),
 ):
     # Get datastore configuration from cache
-    datastore_config = datastore_config_cache.get_datastore_config(datastore_id)
+    datastore_config = datastores_config.get_datastore(datastore_id)
     
     if not datastore_config:
         raise HTTPException(

@@ -44,7 +44,7 @@ pushers:
     config:
       # Fusion 服务的 Ingest API 基准地址
       endpoint: "http://localhost:8102"
-      # 从 Registry 获取的 API Key，用于鉴权
+      # 从 Fusion 管理员处获取的 API Key，用于鉴权
       credential: "YOUR_API_KEY_HERE"
 ```
 

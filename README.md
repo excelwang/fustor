@@ -21,145 +21,91 @@ uv venv .venv
 source .venv/bin/activate
 ```
 
-### 2. 角色操作手册
+### 2. 初始化配置
 
-请根据您的角色选择相应的操作指南：
+Fustor 使用一个主目录来存放配置、日志和数据库。
+*   **默认路径**: `~/.fustor`
+*   **自定义路径**: 设置 `FUSTOR_HOME` 环境变量。
 
-#### 🧑‍💼 Registry Admin (平台管理员)
-**职责**: 部署 Registry 服务，创建 Datastore，生成 API Key。
-
-1.  **安装 Registry**:
-    ```bash
-    pip install fustor-registry
-    # 或者在源码目录下: uv sync --extra registry
-    ```
-
-2.  **初始化配置**:
-    Fustor 使用一个主目录来存放配置、日志和数据库。
-    *   **默认路径**: `~/.fustor`
-    *   **自定义路径**: 设置 `FUSTOR_HOME` 环境变量。
-
-    ```bash
-    # 创建主目录（以默认路径为例）
-    mkdir -p ~/.fustor
-    # 复制 .env.example 到主目录下的 .env 并配置数据库连接等
-    ```
-
-3.  **启动 Registry 服务**:
-    ```bash
-    # 启动服务 (默认端口 8101)
-    fustor-registry start -D
-    ```
-
-4.  **管理操作**:
-    *   访问 Swagger UI: `http://localhost:8101/docs`
-    *   **创建 Datastore**: 调用 `POST /api/v1/admin/datastores` 创建一个新的数据存储库 (例如 "My Research Data")。
-    *   **生成 API Key**: 调用 `POST /api/v1/admin/apikeys` 为该 Datastore 生成一个 API Key。**请妥善保存此 Key，后续 Fusion 和 Agent 都需要用到。**
+```bash
+# 创建基础目录结构
+mkdir -p ~/.fustor/views-config
+mkdir -p ~/.fustor/syncs-config
+```
 
 ---
 
+### 3. 角色操作手册
+
 #### 👨‍🔧 Fusion Admin (融合服务管理员)
-**职责**: 部署 Fusion 服务，连接 Registry，管理服务启停。
+**职责**: 配置数据存储库 (Datastore) 和视图 (View)，启动 Fusion 服务。
 
 1.  **安装 Fusion**:
     ```bash
     pip install fustor-fusion
-    # 或者在源码目录下: uv sync --extra fusion
     ```
 
-2.  **配置连接**:
-    在 Fustor 主目录下的 `.env` 中配置 Registry 的地址：
-    ```bash
-    FUSTOR_REGISTRY_URL=http://localhost:8101
+2.  **配置 Datastore**:
+    在 `~/.fustor/datastores-config.yaml` 中定义存储库和 API Key：
+    ```yaml
+    1:
+      name: research-data
+      api_key: fk_your_secure_api_key_123
+      session_timeout_seconds: 30
+      allow_concurrent_push: true
     ```
 
-3.  **启动 Fusion 服务**:
+3.  **配置 View**:
+    在 `~/.fustor/views-config/my-view.yaml` 中定义数据展示方式：
+    ```yaml
+    datastore_id: 1
+    driver: fs
+    disabled: false
+    driver_params:
+      uri: "/mnt/fusion-view"
+    ```
+
+4.  **启动 Fusion 服务**:
     ```bash
-    # 启动服务 (默认端口 8102)
     fustor-fusion start -D
-    
-    # 停止服务
-    fustor-fusion stop
     ```
 
 ---
 
 #### 👷 Source Admin (数据源管理员)
-**职责**: 部署 Agent 服务，配置数据源，将数据推送给 Fusion。
+**职责**: 配置数据源，将数据推送给 Fusion。
 
 1.  **安装 Agent**:
     ```bash
-    pip install fustor-agent
-    # 以及你需要的数据源插件，例如:
-    pip install fustor-source-fs
+    pip install fustor-agent fustor-source-fs
     ```
 
-2.  **配置 Agent (`agent-config.yaml`)**:
-    在 Fustor 主目录下的 `agent-config.yaml` 中配置 Source 和 Pusher。
-    
-    ```yaml
-    # 示例配置：监控本地目录并推送到 Fusion
-    
-    sources:
-      - id: "local-fs-source"
-        type: "fs"
-        config:
-          uri: "/path/to/your/data"  # 监控的目录
-          driver_params:
-            min_monitoring_window_days: 30
+2.  **配置同步任务**:
+    在 `~/.fustor/syncs-config/sync-job.yaml` 中定义采集与推送逻辑。
 
-    pushers:
-      - id: "fusion-pusher"
-        type: "fusion"
-        config:
-          # Fusion 的接收地址
-          endpoint: "http://localhost:8102/ingestor-api/v1/events" 
-          # 从 Registry Admin 处获取的 API Key
-          credential: "YOUR_API_KEY_HERE" 
-
-    syncs:
-      - id: "sync-job-1"
-        source_id: "local-fs-source"
-        pusher_id: "fusion-pusher"
-        # 自动启动
-        enabled: true 
-    ```
-
-3.  **启动 Agent 服务**:
+3.  **启动 Agent**:
     ```bash
-    # 启动服务 (默认端口 8100)
     fustor-agent start -D
     ```
-    Agent 启动后会自动读取配置并开始同步数据。
 
 ---
 
 #### 🕵️ Fusion User (数据用户)
-**职责**: 查看数据，监控系统状态。
+**职责**: 访问和检索数据。
 
-1.  **访问监控仪表盘 (Dashboard)**:
-    *   打开浏览器访问: `http://localhost:8102/view`
-    *   输入 **API Key** 进行连接。
-    *   您将看到实时的网络拓扑图、数据吞吐量、同步延迟和陈旧度指标。
-
-2.  **浏览文件目录**:
+1.  **浏览文件目录**:
     *   Fusion 提供了文件系统风格的 API。
-    *   **获取根目录**: `GET /views/fs/tree?path=/`
-    *   **搜索文件**: `GET /views/fs/search?pattern=*.txt`
+    *   **获取根目录**: `GET /api/v1/views/my-view/tree?path=/`
     *   *(注：需在请求 Header 中带上 `X-API-Key`)*
 
 ## 📦 模块详情
 
-*   **Registry**: 核心元数据管理。详见 `registry/docs/README.md`。
-*   **Fusion**: 数据摄取与处理。详见 `fusion/docs/README.md`。
+*   **Fusion**: 数据摄取、处理与视图提供。详见 `fusion/README.md`。
 *   **Agent**: 数据采集与推送。详见 `agent/README.md`。
+*   **Common**: 通用工具与基础库。
 
-## 🛠️ 开发与贡献
+## 📖 核心文档
 
-如果您想参与 Fustor 的开发，请参考 `docs/DEVELOPER_GUIDE.md`。
-
-## 📖 深度文档
-
+*   **[配置指南](docs/CONFIGURATION.md)**: 详细的 YAML 配置说明。
 *   **[架构设计](docs/ARCHITECTURE.md)**: 了解 Fustor 的顶层设计和服务交互。
 *   **[一致性设计](docs/CONSISTENCY_DESIGN.md)**: 了解多 Agent 环境下的数据一致性机制。
-*   **[驱动开发](docs/DRIVER_DEVELOPMENT.md)**: 学习如何为 Agent 编写新的 Source 和 Pusher 插件。

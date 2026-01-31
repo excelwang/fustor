@@ -11,9 +11,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # --- Ingestor Service Specific Imports ---
-from .config import fusion_config
-from .auth.cache import api_key_cache
-from .jobs.sync_cache import sync_caches_job
+from .config import fusion_config, datastores_config
 from .core.session_manager import session_manager
 from .datastore_state_manager import datastore_state_manager
 from .queue_integration import queue_based_ingestor, get_events_from_queue
@@ -37,39 +35,15 @@ async def lifespan(app: FastAPI):
     # NEW: Initialize the global task manager reference
     runtime_objects.task_manager = processing_manager
 
-    # Perform initial cache sync
+    # Perform initial configuration load and start processors
     try:
-        await sync_caches_job()
-    except RuntimeError as e:
-        logger.error(f"Initial cache synchronization failed: {e}. Aborting startup.")
+        datastores_config.reload()
+        await processing_manager.sync_tasks(list(datastores_config.get_all_datastores().values()))
+    except Exception as e:
+        logger.error(f"Initial configuration load failed: {e}. Aborting startup.")
         raise
-    logger.info("Initial cache synchronization successful.")
+    logger.info("Initial configuration load successful.")
 
-    # Start processors for initial datastores
-    active_datastores = list(api_key_cache._cache.values())
-    for datastore_id in active_datastores:
-        await processing_manager.ensure_processor(datastore_id)
-
-    # Schedule periodic cache synchronization
-    async def periodic_sync():
-        logger.debug(f"Starting periodic_sync task. Config Interval: {fusion_config.FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS}")
-        while True:
-            await asyncio.sleep(fusion_config.FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS)
-            logger.debug("Periodic Sync Loop woke up")
-            logger.info("Performing periodic cache synchronization...")
-            try:
-                await sync_caches_job()
-                # Dynamic check: ensure new datastores have processors
-                active_ds = list(api_key_cache._cache.values())
-                for ds_id in active_ds:
-                    await processing_manager.ensure_processor(ds_id)
-            except Exception as e:
-                logger.error(f"Periodic cache synchronization failed: {e}", exc_info=True)
-
-    logger.debug("Creating background task for periodic_sync")
-    sync_task = asyncio.create_task(periodic_sync())
-    logger.debug(f"Task created: {sync_task}")
-    
     # Start periodic suspect cleanup (Every 5 seconds)
     async def periodic_suspect_cleanup():
         logger.info("Starting periodic suspect cleanup task")
@@ -89,10 +63,51 @@ async def lifespan(app: FastAPI):
     # Start periodic session cleanup (Every 5 seconds for fast failover)
     await session_manager.start_periodic_cleanup(5)
 
+    # NEW: Auto-start enabled views from YAML
+    try:
+        from .config import views_config
+        from .view_manager.manager import ViewManager
+        from fustor_fusion_sdk.loaders import load_view
+        
+        # Reload to ensure fresh config
+        views_config.reload()
+        enabled_views = views_config.get_enabled()
+        logger.info(f"Auto-starting {len(enabled_views)} enabled views...")
+        
+        for view_id, config in enabled_views.items():
+            try:
+                datastore_id = config.datastore_id
+                
+                # Ensure ViewManager exists
+                if datastore_id not in runtime_objects.view_managers:
+                     runtime_objects.view_managers[datastore_id] = ViewManager(datastore_id=datastore_id)
+                
+                vm = runtime_objects.view_managers[datastore_id]
+                
+                # Check if already running (unlikely on fresh start, but good safety)
+                if view_id in vm.providers:
+                    continue
+
+                # Start Provider
+                provider_class = load_view(config.driver)
+                provider = provider_class(
+                    view_id=view_id,
+                    datastore_id=datastore_id,
+                    config=config.driver_params
+                )
+                await provider.initialize()
+                vm.providers[view_id] = provider
+                logger.info(f"Auto-started view: {view_id}")
+                
+            except Exception as e:
+                logger.error(f"Failed to auto-start view {view_id}: {e}", exc_info=True)
+                
+    except Exception as e:
+        logger.error(f"Error during view auto-start: {e}", exc_info=True)
+
     yield # Ready
 
     logger.info("Application shutdown initiated.")
-    sync_task.cancel()
     suspect_cleanup_task.cancel()
     await processing_manager.stop_all()
     await session_manager.stop_periodic_cleanup()

@@ -7,7 +7,7 @@ import time
 import logging
 from pathlib import Path
 
-from .utils import docker_manager, FusionClient, RegistryClient
+from .utils import docker_manager, FusionClient
 
 # Setup test logger
 logger = logging.getLogger("fustor_test")
@@ -24,12 +24,11 @@ TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "600"))
 # Timing Hierarchy
 # NFS actimeo=1 (set in docker-compose.yml)
 ACTIMEO = 1 
-SUSPECT_TTL_SECONDS = 2 * ACTIMEO     # 2s
-AUDIT_INTERVAL = 2 * SUSPECT_TTL_SECONDS # 4s
+SUSPECT_TTL_SECONDS = ACTIMEO * 2
+AUDIT_INTERVAL = 2 * SUSPECT_TTL_SECONDS
 
 # Container names
 CONTAINER_NFS_SERVER = "fustor-nfs-server"
-CONTAINER_REGISTRY = "fustor-registry"
 CONTAINER_FUSION = "fustor-fusion"
 CONTAINER_CLIENT_A = "fustor-nfs-client-a"
 CONTAINER_CLIENT_B = "fustor-nfs-client-b"
@@ -38,17 +37,16 @@ CONTAINER_CLIENT_C = "fustor-nfs-client-c"
 # Shared mount point inside containers
 MOUNT_POINT = "/mnt/shared"
 
-
 @pytest.fixture(scope="session")
 def docker_env():
     """
     Session-scoped fixture that manages the Docker Compose environment.
-    Always attempts to reuse an existing environment if healthy.
+    Initializes Fusion with static configuration.
     """
     logger.info("Checking Docker Compose environment (Auto-Reuse Mode)")
-    # Check if environment is up by testing one container
+    # Check if environment is up
     try:
-        docker_manager.exec_in_container(CONTAINER_REGISTRY, ["ls", "/"])
+        docker_manager.exec_in_container(CONTAINER_NFS_SERVER, ["ls", "/"])
         is_up = True
     except Exception:
         is_up = False
@@ -58,85 +56,70 @@ def docker_env():
         docker_manager.up(build=True, wait=True)
     else:
         # Check individual container health
-        for container in [CONTAINER_NFS_SERVER, CONTAINER_REGISTRY, CONTAINER_FUSION]:
+        for container in [CONTAINER_NFS_SERVER, CONTAINER_FUSION]:
             if not docker_manager.wait_for_health(container, timeout=30):
                 logger.warning(f"Container {container} not healthy. Repairing ecosystem...")
                 docker_manager.up(build=True, wait=True)
                 break
     
-    logger.info("All containers healthy (Reused/Auto-started)")
+    # --- NEW: Inject Fusion Configuration ---
+    logger.info("Injecting static configuration into Fusion...")
+    
+    # 1. Create .fustor directory
+    docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/views-config"])
+    
+    # 2. Inject Datastores Config
+    ds_config = """
+datastores:
+  1:
+    name: "integration-test-ds"
+    api_key: "test-api-key-123"
+    session_timeout_seconds: 3
+    allow_concurrent_push: true
+"""
+    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/datastores-config.yaml", ds_config)
+    
+    # 3. Inject View Config
+    view_config = """
+id: "test-fs"
+datastore_id: 1
+driver: "fs"
+disabled: false
+driver_params:
+  uri: "/mnt/shared-view"
+  hot_file_threshold: 2.0
+"""
+    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/test-fs.yaml", view_config)
+    
+    # 4. Reload Fusion (Restarting is safer to ensure all services pickup the new YAML)
+    docker_manager.restart_container(CONTAINER_FUSION)
+    docker_manager.wait_for_health(CONTAINER_FUSION)
+
+    logger.info("All containers healthy and Fusion configured.")
     yield docker_manager
-    logger.info("Keeping Docker Compose environment running (Use cleanup.sh for total reset)")
+    logger.info("Keeping Docker Compose environment running")
 
 
 @pytest.fixture(scope="session")
-def registry_client(docker_env) -> RegistryClient:
-    """Create and authenticate Registry client."""
-    client = RegistryClient(base_url="http://localhost:18101")
-    
-    # Wait for registry to be fully ready and admin user created
-    logger.info("Waiting for Registry to initialize and login...")
-    for i in range(12):  # 12 * 0.5 = 6s
-        try:
-            # Default admin credentials (email, not username)
-            client.login("admin@admin.com", "admin")
-            logger.info(f"Registry logged in after {i+1} seconds")
-            break
-        except Exception as e:
-            if i % 5 == 0:
-                logger.debug(f"Still waiting for Registry login... ({e})")
-            time.sleep(1)
-    else:
-        raise RuntimeError("Registry did not become ready for login within 30 seconds")
-        
-    return client
+def test_datastore() -> dict:
+    """Return static test datastore info."""
+    return {
+        "id": 1,
+        "name": "integration-test-ds",
+        "allow_concurrent_push": True,
+        "session_timeout_seconds": 3
+    }
 
 
 @pytest.fixture(scope="session")
-def test_datastore(registry_client) -> dict:
-    """Create a test datastore or reuse existing one."""
-    existing_datastores = registry_client.get_datastores()
-    for ds in existing_datastores:
-        if ds["name"] == "integration-test-ds":
-            logger.info(f"Reusing existing datastore: {ds['id']}")
-            # Ensure allow_concurrent_push is True and fast timeout even for reused datastore
-            if not ds.get("allow_concurrent_push") or ds.get("session_timeout_seconds") != 3:
-                 logger.info(f"Updating datastore {ds['id']} to use 3s timeout...")
-                 registry_client.update_datastore(ds["id"], allow_concurrent_push=True, session_timeout_seconds=3)
-                 ds["allow_concurrent_push"] = True
-                 ds["session_timeout_seconds"] = 3
-                 # Wait for Fusion to sync the new config if we modified it
-                 logger.info("Waiting for configuration to propagate to Fusion...")
-                 time.sleep(2)
-            return ds
+def test_api_key(test_datastore) -> dict:
+    """Return static API key info."""
+    return {
+        "key": "test-api-key-123",
+        "datastore_id": 1,
+        "name": "integration-test-key"
+    }
 
-    ds = registry_client.create_datastore(
-        name="integration-test-ds",
-        description="Datastore for NFS consistency integration tests",
-        allow_concurrent_push=True,
-        session_timeout_seconds=3
-    )
-    logger.info(f"Created new datastore: {ds['name']} (ID: {ds['id']})")
-    return ds
-
-
-@pytest.fixture(scope="session")
-def test_api_key(registry_client, test_datastore) -> dict:
-    """Create an API key for the test datastore or reuse existing one."""
-    existing_keys = registry_client.get_api_keys()
-    
-    # Filter keys for this datastore
-    datastore_keys = [k for k in existing_keys if k.get("datastore_id") == test_datastore["id"]]
-    
-    for key in datastore_keys:
-        if key["name"] == "integration-test-key":
-            logger.info(f"Reusing existing API key: {key['name']}")
-            return key
-
-    return registry_client.create_api_key(
-        datastore_id=test_datastore["id"],
-        name="integration-test-key"
-    )
 
 
 @pytest.fixture(scope="session")

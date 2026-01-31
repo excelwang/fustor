@@ -7,7 +7,7 @@ from datetime import datetime
 from contextlib import asynccontextmanager
 
 
-from fustor_fusion.auth.datastore_cache import DatastoreConfig
+from fustor_fusion.config import DatastoreConfig
 
 faulthandler.enable()
 
@@ -23,18 +23,20 @@ async def test_new_session_terminates_old_snapshot_and_clears_parser(
 
 async def _test_body(async_client: AsyncClient):
     print("\n--- Test Started ---")
-    datastore_id = 1
+    datastore_id = "1"
 
     # 1. Arrange: Mock datastore config
     mock_config = DatastoreConfig(
+        id="test-concurrent",
         datastore_id=datastore_id,
+        api_key="key3",
         allow_concurrent_push=True,
         session_timeout_seconds=60,
     )
 
     # 2. Act: Create sessions within the patched context
-    with patch('fustor_fusion.api.session.datastore_config_cache.get_datastore_config', return_value=mock_config), \
-         patch('fustor_fusion.api.ingestion.datastore_config_cache', return_value=mock_config):
+    with patch('fustor_fusion.api.session.datastores_config.get_datastore', return_value=mock_config), \
+         patch('fustor_fusion.api.ingestion.datastores_config', return_value=mock_config):
 
         print("--- Creating first session ---")
         create_session_payload_1 = {"task_id": "agent:sync-1"}

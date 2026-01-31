@@ -14,7 +14,6 @@ dependencies = [
     "httpx",
     "orjson",
     "fustor-common",
-    "fustor-registry-client",
     "fustor-event-model",
     "fustor-core",
     "PyYAML",

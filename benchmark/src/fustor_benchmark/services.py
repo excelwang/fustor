@@ -16,11 +16,9 @@ class ServiceManager:
         # 系统环境主目录 (FUSTOR_HOME)
         self.env_dir = os.path.join(self.run_dir, ".fustor")
         
-        self.registry_port = base_port + 1
         self.fusion_port = base_port + 2
         self.agent_port = base_port
         
-        self.registry_process = None
         self.fusion_process = None
         self.agent_process = None
         self.processes = [] # Backwards compatibility for stop_all fallback
@@ -39,11 +37,37 @@ class ServiceManager:
         import secrets
         self.client_token = secrets.token_urlsafe(32)
         
-        # Registry DB config
+        # Environment config
         with open(os.path.join(self.env_dir, ".env"), "w") as f:
-            f.write(f"FUSTOR_REGISTRY_DB_URL=sqlite+aiosqlite:///{self.env_dir}/registry.db\n")
-            f.write(f"FUSTOR_FUSION_REGISTRY_URL=http://localhost:{self.registry_port}\n")
-            f.write(f"FUSTOR_REGISTRY_CLIENT_TOKEN={self.client_token}\n")
+            f.write(f"FUSTOR_HOME={self.env_dir}\n")
+            f.write(f"FUSTOR_LOG_LEVEL=DEBUG\n")
+        
+        # Inject Datastores Config for Fusion
+        os.makedirs(os.path.join(self.env_dir, "datastores-config"), exist_ok=True)
+        self.api_key = "bench-api-key-123456"
+        ds_config = {
+            1: {
+                "name": "BenchmarkDS",
+                "api_key": self.api_key,
+                "session_timeout_seconds": 30,
+                "allow_concurrent_push": True
+            }
+        }
+        with open(os.path.join(self.env_dir, "datastores-config.yaml"), "w") as f:
+            yaml.dump(ds_config, f)
+        
+        # Inject View Config for Fusion
+        os.makedirs(os.path.join(self.env_dir, "views-config"), exist_ok=True)
+        view_config = {
+            "bench-view": {
+                "datastore_id": 1,
+                "driver": "fs",
+                "disabled": False,
+                "driver_params": {"uri": "/tmp/bench-view"}
+            }
+        }
+        with open(os.path.join(self.env_dir, "views-config/bench-view.yaml"), "w") as f:
+            yaml.dump(view_config, f)
 
     def _wait_for_service(self, url: str, name: str, timeout: int = 30):
         click.echo(f"Waiting for {name} at {url}...")
@@ -58,68 +82,10 @@ class ServiceManager:
         click.echo(f"Error: {name} failed to start.")
         return False
 
-    def start_registry(self):
-        cmd = [
-            "fustor-registry", "start",
-            "-p", str(self.registry_port)
-        ]
-        log_file = open(os.path.join(self.env_dir, "registry.log"), "a")
-        env = os.environ.copy()
-        env["FUSTOR_HOME"] = self.env_dir
-        env["FUSTOR_REGISTRY_CLIENT_TOKEN"] = self.client_token
-        
-        p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
-        log_file.close()
-        self.registry_process = p
-        self.processes.append(p)
-        
-        if not self._wait_for_service(f"http://localhost:{self.registry_port}/health", "Registry"):
-            raise RuntimeError("Registry start failed")
 
     def configure_system(self):
-        reg_url = f"http://localhost:{self.registry_port}/v1"
-        click.echo("Logging in to Registry...")
-        try:
-            res = requests.post(f"{reg_url}/auth/login", data={
-                "username": "admin@admin.com",
-                "password": "admin"
-            })
-            if res.status_code != 200:
-                raise RuntimeError(f"Login failed: {res.text}")
-            
-            token = res.json()["access_token"]
-            headers = {"Authorization": f"Bearer {token}"}
-            
-            click.echo("Creating Datastore...")
-            res = requests.post(f"{reg_url}/datastores/", json={
-                "name": "BenchmarkDS", "description": "Auto-generated"
-            }, headers=headers)
-            if res.status_code not in (200, 201):
-                 raise RuntimeError(f"DS creation failed: {res.text}")
-            ds_id = res.json()["id"]
-            
-            # Check if key exists
-            res_keys = requests.get(f"{reg_url}/keys/", params={"datastore_id": ds_id}, headers=headers)
-            if res_keys.status_code == 200:
-                for k in res_keys.json():
-                    if k["name"] == "bench-key":
-                        self.api_key = k["key"]
-                        click.echo(f"Reusing existing API Key: {self.api_key[:8]}...")
-                        return self.api_key
-
-            click.echo("Creating API Key...")
-            res = requests.post(f"{reg_url}/keys/", json={
-                "datastore_id": ds_id, "name": "bench-key"
-            }, headers=headers)
-            if res.status_code not in (200, 201):
-                 raise RuntimeError(f"API Key creation failed: {res.text}")
-            
-            self.api_key = res.json()["key"]
-            click.echo(f"API Key generated: {self.api_key[:8]}...")
-            
-            return self.api_key
-        except Exception as e:
-            raise RuntimeError(f"Failed to configure system: {e}")
+        click.echo("System configured via static YAML.")
+        return self.api_key
 
     def start_fusion(self):
         cmd = [
@@ -129,8 +95,6 @@ class ServiceManager:
         log_file = open(os.path.join(self.env_dir, "fusion.log"), "a")
         env = os.environ.copy()
         env["FUSTOR_HOME"] = self.env_dir
-        env["FUSTOR_FUSION_REGISTRY_URL"] = f"http://localhost:{self.registry_port}"
-        env["FUSTOR_REGISTRY_CLIENT_TOKEN"] = self.client_token
         
         p = subprocess.Popen(cmd, env=env, stdout=log_file, stderr=subprocess.STDOUT)
         log_file.close()

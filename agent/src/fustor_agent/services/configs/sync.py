@@ -1,18 +1,19 @@
 import logging
 from typing import Optional, Dict, Any, List
 
-from fustor_core.models.config import AppConfig, SyncConfig
+from fustor_core.models.config import AppConfig, SyncConfig, FieldMapping
 from fustor_agent.services.instances.sync import SyncInstanceService
 from .base import BaseConfigService
 from .source import SourceConfigService
 from .pusher import PusherConfigService
 from fustor_agent_sdk.interfaces import SyncConfigServiceInterface # Import the interface
+from fustor_agent.config.syncs import syncs_config, SyncConfigYaml # New YAML loader
 
 logger = logging.getLogger("fustor_agent")
 
 class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterface): # Inherit from the interface
     """
-    Manages SyncConfig objects.
+    Manages SyncConfig objects, supporting both legacy AppConfig and new YAML config files.
     """
     def __init__(
         self,
@@ -24,10 +25,51 @@ class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterfac
         self.sync_instance_service: Optional[SyncInstanceService] = None
         self.source_config_service = source_config_service
         self.pusher_config_service = pusher_config_service
+        
+        # Ensure YAML configs are loaded
+        syncs_config.ensure_loaded()
 
     def set_dependencies(self, sync_instance_service: SyncInstanceService):
         """Injects the SyncInstanceService for dependency management."""
         self.sync_instance_service = sync_instance_service
+
+    def _convert_yaml_to_model(self, y_cfg: SyncConfigYaml) -> SyncConfig:
+        """Convert YAML configuration to internal model."""
+        fields_mapping = [
+            FieldMapping(to=m.to, source=m.source, required=m.required)
+            for m in y_cfg.fields_mapping
+        ]
+        return SyncConfig(
+            source=y_cfg.source,
+            pusher=y_cfg.pusher,
+            disabled=y_cfg.disabled,
+            fields_mapping=fields_mapping,
+            audit_interval_sec=y_cfg.audit_interval_sec,
+            sentinel_interval_sec=y_cfg.sentinel_interval_sec,
+            heartbeat_interval_sec=y_cfg.heartbeat_interval_sec
+        )
+
+    def get_config(self, id: str) -> Optional[SyncConfig]:
+        """Get config by ID, checking YAML first then legacy config."""
+        # 1. Try YAML first
+        yaml_config = syncs_config.get(id)
+        if yaml_config:
+            return self._convert_yaml_to_model(yaml_config)
+            
+        # 2. Fallback to AppConfig
+        return super().get_config(id)
+
+    def list_configs(self) -> Dict[str, SyncConfig]:
+        """List all configs, merging YAML and legacy configurations."""
+        # Start with legacy configs
+        configs = super().list_configs().copy()
+        
+        # Merge YAML configs (YAML takes precedence if ID conflicts)
+        yaml_configs = syncs_config.get_all()
+        for id, y_cfg in yaml_configs.items():
+            configs[id] = self._convert_yaml_to_model(y_cfg)
+            
+        return configs
 
     async def enable(self, id: str):
         """Enables a Sync configuration, ensuring its source and pusher are also enabled."""

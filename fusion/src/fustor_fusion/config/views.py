@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 class ViewConfig(BaseModel):
     """Configuration for a single view."""
     id: str
-    datastore_id: int
+    datastore_id: str
     driver: str
     disabled: bool = False
     driver_params: dict = {}
@@ -30,6 +30,15 @@ class ViewConfig(BaseModel):
         if errors:
             raise ValueError("; ".join(errors))
         return v
+
+    @field_validator('datastore_id')
+    @classmethod
+    def validate_datastore_id(cls, v: str) -> str:
+        """Validate that ID is URL-safe."""
+        errors = validate_url_safe_id(str(v), "datastore id")
+        if errors:
+            raise ValueError("; ".join(errors))
+        return str(v)
 
 
 class ViewsConfigLoader:
@@ -84,6 +93,10 @@ class ViewsConfigLoader:
                     logger.warning(f"Empty config file: {yaml_file}")
                     continue
                 
+                # Ensure datastore_id is treated as string for validation
+                if "datastore_id" in data:
+                    data["datastore_id"] = str(data["datastore_id"])
+
                 config = ViewConfig(**data)
                 self._views[config.id] = config
                 logger.debug(f"Loaded view config: {config.id}")
@@ -115,10 +128,11 @@ class ViewsConfigLoader:
         self.ensure_loaded()
         return {k: v for k, v in self._views.items() if not v.disabled}
     
-    def get_by_datastore(self, datastore_id: int) -> List[ViewConfig]:
+    def get_by_datastore(self, datastore_id: str) -> List[ViewConfig]:
         """Get all view configurations for a specific datastore."""
         self.ensure_loaded()
-        return [v for v in self._views.values() if v.datastore_id == datastore_id]
+        ds_id_str = str(datastore_id)
+        return [v for v in self._views.values() if v.datastore_id == ds_id_str]
     
     def reload(self) -> Dict[str, ViewConfig]:
         """Force reload all configurations."""

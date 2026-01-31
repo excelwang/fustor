@@ -2,7 +2,7 @@ from __future__ import annotations
 import os
 import yaml
 import logging
-from typing import Optional
+from typing import Optional, Dict
 from dotenv import load_dotenv, find_dotenv
 from pydantic import ValidationError
 import tempfile
@@ -40,72 +40,62 @@ logger.setLevel(logging.DEBUG)
 def get_app_config() -> AppConfig:
     global _app_config_instance
     if _app_config_instance is None:
-        config_file_path = os.environ.get("FUSTOR_AGENT_CONFIG") or os.path.join(CONFIG_DIR, CONFIG_FILE_NAME)
-        raw_data = {}
+        from .config import sources_config, pushers_config, syncs_config
+
+        # 1. Load Sources
+        sources_config.reload()
+        valid_sources = sources_config.get_all()
+
+        # 2. Load Pushers
+        pushers_config.reload()
+        valid_pushers = pushers_config.get_all()
+
+        # 3. Load Syncs from directory
+        syncs_config.reload()
+        valid_syncs_yaml = syncs_config.get_all()
+        valid_syncs: Dict[str, SyncConfig] = {}
         
-        if CONFIG_DIR and not os.path.exists(CONFIG_DIR):
-            try:
-                os.makedirs(CONFIG_DIR)
-                logger.info(f"Created configuration directory: {CONFIG_DIR}")
-            except OSError as e:
-                raise ConfigurationError(f"无法创建配置目录 '{CONFIG_DIR}': {e}")
+        # Convert SyncConfigYaml to SyncConfig
+        for s_id, s_yaml in valid_syncs_yaml.items():
+            # SyncConfig doesn't have 'id' field, it's the key in the dict
+            s_dict = s_yaml.model_dump(exclude={'id'})
+            valid_syncs[s_id] = SyncConfig(**s_dict)
 
-        if os.path.exists(config_file_path):
-            try:
-                with open(config_file_path, 'r', encoding='utf-8') as f:
-                    loaded_data = yaml.safe_load(f)
-                raw_data = loaded_data if loaded_data is not None else {}
-            except (yaml.YAMLError, Exception) as e:
-                raise ConfigurationError(f"加载或解析配置文件 '{config_file_path}' 时发生错误: {e}")
-        else:
-            logger.warning(f"配置文件 '{config_file_path}' 不存在。将使用默认配置启动。")
-
-        # Resiliently load configurations
-        valid_sources = {}
-        for id, config_data in raw_data.get('sources', {}).items():
-            if not config_data:
-                logger.error(f"Source '{id}' has an empty configuration and will be skipped.")
-                continue
-            try:
-                for key, value in config_data.items():
-                    if isinstance(value, str):
-                        config_data[key] = value.strip()
-                valid_sources[id] = SourceConfig(**config_data)
-            except ValidationError as e:
-                logger.error(f"Source '{id}' 配置无效，已作为错误条目加载: {e}")
-                valid_sources[id] = SourceConfig(
-                    driver='invalid-config',
-                    uri=config_data.get('uri', 'N/A'),
-                    credential={'user': 'invalid', 'passwd': ''},
-                    disabled=True,
-                    validation_error=str(e)
-                )
-
-        valid_pushers = {}
-        for id, config_data in raw_data.get('pushers', {}).items():
-            if not config_data:
-                logger.error(f"Pusher '{id}' has an empty configuration and will be skipped.")
-                continue
-            try:
-                for key, value in config_data.items():
-                    if isinstance(value, str):
-                        config_data[key] = value.strip()
-                valid_pushers[id] = PusherConfig(**config_data)
-            except ValidationError as e:
-                logger.error(f"Pusher '{id}' 配置无效，已跳过: {e}")
-
-        valid_syncs = {}
-        for id, config_data in raw_data.get('syncs', {}).items():
-            if not config_data:
-                logger.error(f"Sync '{id}' has an empty configuration and will be skipped.")
-                continue
-            try:
-                for key, value in config_data.items():
-                    if isinstance(value, str):
-                        config_data[key] = value.strip()
-                valid_syncs[id] = SyncConfig(**config_data)
-            except ValidationError as e:
-                logger.error(f"Sync '{id}' 配置无效，已跳过: {e}")
+        # 4. Backward Compatibility Check: Legacy agent-config.yaml
+        # If we have no sources and no pushers from the new files, try the old file.
+        if not valid_sources and not valid_pushers:
+            config_file_path = os.environ.get("FUSTOR_AGENT_CONFIG") or os.path.join(CONFIG_DIR, CONFIG_FILE_NAME)
+            if os.path.exists(config_file_path):
+                logger.info(f"Attempting to load legacy config from {config_file_path}")
+                try:
+                    with open(config_file_path, 'r', encoding='utf-8') as f:
+                        raw_data = yaml.safe_load(f) or {}
+                    
+                    # Merge sources if not already loaded from separate file
+                    if not valid_sources:
+                        for s_id, config_data in raw_data.get('sources', {}).items():
+                            try:
+                                valid_sources[s_id] = SourceConfig(**config_data)
+                            except Exception as e:
+                                logger.error(f"Legacy source '{s_id}' invalid: {e}")
+                    
+                    # Merge pushers if not already loaded from separate file
+                    if not valid_pushers:
+                        for p_id, config_data in raw_data.get('pushers', {}).items():
+                            try:
+                                valid_pushers[p_id] = PusherConfig(**config_data)
+                            except Exception as e:
+                                logger.error(f"Legacy pusher '{p_id}' invalid: {e}")
+                                
+                    # Merge syncs if not already loaded from directory
+                    if not valid_syncs:
+                        for sy_id, config_data in raw_data.get('syncs', {}).items():
+                            try:
+                                valid_syncs[sy_id] = SyncConfig(**config_data)
+                            except Exception as e:
+                                logger.error(f"Legacy sync '{sy_id}' invalid: {e}")
+                except Exception as e:
+                    logger.warning(f"Failed to load legacy config: {e}")
 
         _app_config_instance = AppConfig(
             sources=SourceConfigDict(root=valid_sources),

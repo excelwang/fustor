@@ -24,7 +24,7 @@ class QueueBasedIngestor:
         
         logger.info("Queue-based ingestor initialized (Ephemeral Mode)")
 
-    async def add_event(self, datastore_id: int, event: EventBase, task_id: Optional[str] = None) -> str:
+    async def add_event(self, datastore_id: str, event: EventBase, task_id: Optional[str] = None) -> str:
         """
         Add an event to the in-memory queue.
         
@@ -38,7 +38,7 @@ class QueueBasedIngestor:
         """
         return await memory_event_queue.add_event(datastore_id, event, task_id)
 
-    async def add_events_batch(self, datastore_id: int, events: List[EventBase], task_id: Optional[str] = None) -> int:
+    async def add_events_batch(self, datastore_id: str, events: List[EventBase], task_id: Optional[str] = None) -> int:
         """
         Add a batch of events to the in-memory queue.
         
@@ -52,7 +52,7 @@ class QueueBasedIngestor:
         """
         return await memory_event_queue.add_events_batch(datastore_id, events, task_id)
 
-    async def process_next_batch(self, datastore_id: int, batch_size: int = 100) -> List[EventBase]:
+    async def process_next_batch(self, datastore_id: str, batch_size: int = 100) -> List[EventBase]:
         """
         Process the next batch of events from the queue.
         
@@ -66,7 +66,7 @@ class QueueBasedIngestor:
         queued_events = await memory_event_queue.get_events_batch(datastore_id, batch_size)
         return [qe.event for qe in queued_events]
 
-    async def get_position(self, datastore_id: int, task_id: str) -> Optional[int]:
+    async def get_position(self, datastore_id: str, task_id: str) -> Optional[int]:
         """
         Get the current position for a specific datastore and task.
         
@@ -79,7 +79,7 @@ class QueueBasedIngestor:
         """
         return await memory_event_queue.get_position(datastore_id, task_id)
 
-    async def update_position(self, datastore_id: int, task_id: str, index: int) -> None:
+    async def update_position(self, datastore_id: str, task_id: str, index: int) -> None:
         """
         Update the position for a specific datastore and task.
         
@@ -105,35 +105,35 @@ queue_based_ingestor = QueueBasedIngestor()
 
 
 # Functions for direct usage
-async def add_event_to_queue(datastore_id: int, event: EventBase, task_id: Optional[str] = None) -> str:
+async def add_event_to_queue(datastore_id: str, event: EventBase, task_id: Optional[str] = None) -> str:
     """
     Add an event to the in-memory queue.
     """
     return await queue_based_ingestor.add_event(datastore_id, event, task_id)
 
 
-async def add_events_batch_to_queue(datastore_id: int, events: List[EventBase], task_id: Optional[str] = None) -> int:
+async def add_events_batch_to_queue(datastore_id: str, events: List[EventBase], task_id: Optional[str] = None) -> int:
     """
     Add a batch of events to the in-memory queue.
     """
     return await queue_based_ingestor.add_events_batch(datastore_id, events, task_id)
 
 
-async def get_events_from_queue(datastore_id: int, batch_size: int = 100) -> List[EventBase]:
+async def get_events_from_queue(datastore_id: str, batch_size: int = 100) -> List[EventBase]:
     """
     Get a batch of events from the in-memory queue.
     """
     return await queue_based_ingestor.process_next_batch(datastore_id, batch_size)
 
 
-async def get_position_from_queue(datastore_id: int, task_id: str) -> Optional[int]:
+async def get_position_from_queue(datastore_id: str, task_id: str) -> Optional[int]:
     """
     Get the current position for a specific datastore and task.
     """
     return await queue_based_ingestor.get_position(datastore_id, task_id)
 
 
-async def update_position_in_queue(datastore_id: int, task_id: str, index: int) -> None:
+async def update_position_in_queue(datastore_id: str, task_id: str, index: int) -> None:
     """
     Update the position for a specific datastore and task.
     """

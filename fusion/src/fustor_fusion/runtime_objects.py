@@ -10,3 +10,7 @@ if TYPE_CHECKING:
 
 # Using generic type here or TYPE_CHECKING to avoid import cycle
 task_manager: Optional['ProcessingManager'] = None
+
+# Global storage for active ViewManagers (keyed by datastore_id)
+# This is populated at runtime as views are started.
+view_managers: dict = {}

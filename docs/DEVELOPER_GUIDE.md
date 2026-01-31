@@ -30,7 +30,7 @@
     ```bash
     uvicorn agent.src.fustor_agent.app:app --reload --port 8100
     ```
-    *   要启动其他服务（如 Registry 或 Fusion），请替换 `agent.src.fustor_agent.app:app` 为对应服务的入口点。
+    *   要启动其他服务（如 Fusion），请替换 `agent.src.fustor_agent.app:app` 为对应服务的入口点。
 
 ## 2. 技术栈
 - **核心框架**: FastAPI, SQLAlchemy 2.0 (Async), Pydantic v2

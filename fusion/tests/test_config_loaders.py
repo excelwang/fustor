@@ -59,8 +59,7 @@ class TestDatastoresConfigLoader:
         config_file = tmp_path / "datastores-config.yaml"
         config_file.write_text(yaml.dump({
             "datastores": {
-                1: {
-                    "name": "test-data",
+                "test-ds": {
                     "session_timeout_seconds": 60,
                     "api_key": "fk_test123"
                 }
@@ -70,9 +69,28 @@ class TestDatastoresConfigLoader:
         loader = DatastoresConfigLoader(config_file)
         loader.load()
         
-        ds = loader.get_datastore(1)
+        ds = loader.get_datastore("test-ds")
         assert ds is not None
-        assert ds.name == "test-data"
+        assert ds.id == "test-ds"
+        assert ds.session_timeout_seconds == 60
+        assert ds.api_key == "fk_test123"
+
+    def test_load_flat_config(self, tmp_path):
+        """Should load flat datastore config (no top-level 'datastores' key)."""
+        config_file = tmp_path / "datastores-config.yaml"
+        config_file.write_text(yaml.dump({
+            "test-ds": {
+                "session_timeout_seconds": 60,
+                "api_key": "fk_test123"
+            }
+        }))
+        
+        loader = DatastoresConfigLoader(config_file)
+        loader.load()
+        
+        ds = loader.get_datastore("test-ds")
+        assert ds is not None
+        assert ds.id == "test-ds"
         assert ds.session_timeout_seconds == 60
         assert ds.api_key == "fk_test123"
     
@@ -81,16 +99,16 @@ class TestDatastoresConfigLoader:
         config_file = tmp_path / "datastores-config.yaml"
         config_file.write_text(yaml.dump({
             "datastores": {
-                1: {"name": "ds1", "api_key": "key1"},
-                2: {"name": "ds2", "api_key": "key2"}
+                "ds1": {"api_key": "key1"},
+                "ds2": {"api_key": "key2"}
             }
         }))
         
         loader = DatastoresConfigLoader(config_file)
         loader.load()
         
-        assert loader.validate_api_key("key1") == 1
-        assert loader.validate_api_key("key2") == 2
+        assert loader.validate_api_key("key1") == "ds1"
+        assert loader.validate_api_key("key2") == "ds2"
         assert loader.validate_api_key("invalid") is None
     
     def test_save_api_key(self, tmp_path):
@@ -98,25 +116,75 @@ class TestDatastoresConfigLoader:
         config_file = tmp_path / "datastores-config.yaml"
         config_file.write_text(yaml.dump({
             "datastores": {
-                1: {"name": "ds1", "api_key": "old_key"}
+                "ds1": {"api_key": "old_key"}
             }
         }))
         
         loader = DatastoresConfigLoader(config_file)
         loader.load()
         
-        loader.save_api_key(1, "new_key")
+        loader.save_api_key("ds1", "new_key")
         
-        # Verify file was updated (key may be int or str)
+        # Verify file was updated
         with open(config_file) as f:
             data = yaml.safe_load(f)
-        # YAML may save as int key or str key depending on how it was written
-        ds_data = data["datastores"].get(1) or data["datastores"].get("1")
-        assert ds_data["api_key"] == "new_key"
+        
+        # Should respect the existing 'datastores' key if it was present
+        assert "datastores" in data
+        assert data["datastores"]["ds1"]["api_key"] == "new_key"
         
         # Verify internal state was updated
-        assert loader.validate_api_key("new_key") == 1
+        assert loader.validate_api_key("new_key") == "ds1"
         assert loader.validate_api_key("old_key") is None
+
+    def test_get_all_ids(self, tmp_path):
+        """Should return all registered datastore IDs."""
+        config_file = tmp_path / "datastores-config.yaml"
+        config_file.write_text(yaml.dump({
+            "datastores": {
+                "ds1": {"api_key": "key1"},
+                "ds2": {"api_key": "key2"}
+            }
+        }))
+        loader = DatastoresConfigLoader(config_file)
+        loader.load()
+        assert set(loader.get_all_ids()) == {"ds1", "ds2"}
+
+    def test_reload_config(self, tmp_path):
+        """Should reload configuration from file."""
+        config_file = tmp_path / "datastores-config.yaml"
+        config_file.write_text(yaml.dump({
+            "datastores": {
+                "ds1": {"api_key": "key1"}
+            }
+        }))
+        loader = DatastoresConfigLoader(config_file)
+        loader.load()
+        assert loader.get_datastore("ds1").api_key == "key1"
+
+        # Modify file and reload
+        config_file.write_text(yaml.dump({
+            "datastores": {
+                "ds1": {"api_key": "key1-updated"}
+            }
+        }))
+        loader.reload()
+        assert loader.get_datastore("ds1").api_key == "key1-updated"
+
+    def test_url_unsafe_id_rejected(self, tmp_path):
+        """Should reject datastore config with URL-unsafe ID."""
+        config_file = tmp_path / "datastores-config.yaml"
+        config_file.write_text(yaml.dump({
+            "datastores": {
+                "Invalid ID": {"api_key": "key1"}
+            }
+        }))
+        
+        loader = DatastoresConfigLoader(config_file)
+        loader.load()
+        
+        # Should not load invalid config
+        assert len(loader.get_all_ids()) == 0
 
 
 class TestViewsConfigLoader:
@@ -129,13 +197,13 @@ class TestViewsConfigLoader:
         
         (views_dir / "view-a.yaml").write_text(yaml.dump({
             "id": "view-a",
-            "datastore_id": 1,
+            "datastore_id": "ds1",
             "driver": "fs"
         }))
         
         (views_dir / "view-b.yaml").write_text(yaml.dump({
             "id": "view-b",
-            "datastore_id": 2,
+            "datastore_id": "ds2",
             "driver": "fs",
             "disabled": True
         }))
@@ -154,13 +222,13 @@ class TestViewsConfigLoader:
         
         (views_dir / "enabled.yaml").write_text(yaml.dump({
             "id": "enabled",
-            "datastore_id": 1,
+            "datastore_id": "ds1",
             "driver": "fs"
         }))
         
         (views_dir / "disabled.yaml").write_text(yaml.dump({
             "id": "disabled",
-            "datastore_id": 1,
+            "datastore_id": "ds1",
             "driver": "fs",
             "disabled": True
         }))
@@ -179,20 +247,20 @@ class TestViewsConfigLoader:
         
         (views_dir / "ds1-view.yaml").write_text(yaml.dump({
             "id": "ds1-view",
-            "datastore_id": 1,
+            "datastore_id": "ds1",
             "driver": "fs"
         }))
         
         (views_dir / "ds2-view.yaml").write_text(yaml.dump({
             "id": "ds2-view",
-            "datastore_id": 2,
+            "datastore_id": "ds2",
             "driver": "fs"
         }))
         
         loader = ViewsConfigLoader(views_dir)
         loader.scan()
         
-        ds1_views = loader.get_by_datastore(1)
+        ds1_views = loader.get_by_datastore("ds1")
         assert len(ds1_views) == 1
         assert ds1_views[0].id == "ds1-view"
     
@@ -203,7 +271,7 @@ class TestViewsConfigLoader:
         
         (views_dir / "invalid.yaml").write_text(yaml.dump({
             "id": "Invalid ID",  # uppercase and space
-            "datastore_id": 1,
+            "datastore_id": "ds1",
             "driver": "fs"
         }))
         

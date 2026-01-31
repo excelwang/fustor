@@ -49,7 +49,7 @@ async def test_session_creation_multiple_servers():
         session_timeout_seconds=1  # Short timeout for testing
     )
     
-    with patch('fustor_fusion.api.session.datastore_config_cache.get_datastore_config', return_value=datastore):
+    with patch('fustor_fusion.api.session.datastores_config.get_datastore', return_value=datastore):
         # Server 1 creates a session
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "task_server1"
@@ -106,7 +106,7 @@ async def test_session_creation_same_task_id():
         session_timeout_seconds=30  # Longer timeout
     )
     
-    with patch('fustor_fusion.api.session.datastore_config_cache.get_datastore_config', return_value=datastore):
+    with patch('fustor_fusion.api.session.datastores_config.get_datastore', return_value=datastore):
         # Server 1 creates a session
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "same_task"
@@ -152,7 +152,7 @@ async def test_session_creation_different_task_id():
         session_timeout_seconds=30
     )
     
-    with patch('fustor_fusion.api.session.datastore_config_cache.get_datastore_config', return_value=datastore):
+    with patch('fustor_fusion.api.session.datastores_config.get_datastore', return_value=datastore):
         # Server 1 creates a session
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "different_task_1"
@@ -200,7 +200,7 @@ async def test_concurrent_push_allowed():
         session_timeout_seconds=30
     )
     
-    with patch('fustor_fusion.api.session.datastore_config_cache.get_datastore_config', return_value=datastore):
+    with patch('fustor_fusion.api.session.datastores_config.get_datastore', return_value=datastore):
         # Server 1 creates a session
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "concurrent_task_1"
@@ -245,7 +245,7 @@ async def test_same_task_id_with_concurrent_push():
         session_timeout_seconds=30
     )
     
-    with patch('fustor_fusion.api.session.datastore_config_cache.get_datastore_config', return_value=datastore):
+    with patch('fustor_fusion.api.session.datastores_config.get_datastore', return_value=datastore):
         # Server 1 creates a session
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "repeated_task"
@@ -291,7 +291,7 @@ async def test_stale_lock_handling():
         session_timeout_seconds=30
     )
     
-    with patch('fustor_fusion.api.session.datastore_config_cache.get_datastore_config', return_value=datastore):
+    with patch('fustor_fusion.api.session.datastores_config.get_datastore', return_value=datastore):
         # Manually create a lock in the datastore state manager for a session that doesn't exist in session manager
         stale_session_id = str(uuid.uuid4())
         await datastore_state_manager.lock_for_session(datastore_id, stale_session_id)

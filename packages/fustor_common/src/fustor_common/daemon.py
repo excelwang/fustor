@@ -14,11 +14,11 @@ def start_daemon(service_module_path, app_var_name, pid_file_name, log_file_name
     Start a Fustor service as a daemon process.
 
     Args:
-        service_module_path (str): The Python module path to import (e.g., 'fustor_registry.main')
+        service_module_path (str): The Python module path to import (e.g., 'fustor_fusion.main')
         app_var_name (str): The name of the application variable in the module (e.g., 'app')
-        pid_file_name (str): The name of the PID file (e.g., 'registry.pid')
-        log_file_name (str): The name of the log file (e.g., 'registry.log')
-        display_name (str): The display name for the service (e.g., 'Fustor Registry')
+        pid_file_name (str): The name of the PID file (e.g., 'fusion.pid')
+        log_file_name (str): The name of the log file (e.g., 'fusion.log')
+        display_name (str): The display name for the service (e.g., 'Fustor Fusion')
         port (int): The port to run the service on
         verbose (bool): Whether to enable verbose logging
     """

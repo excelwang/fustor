@@ -41,7 +41,7 @@ async def test_clear_all_sessions():
         session_timeout_seconds=30
     )
     
-    with patch('fustor_fusion.api.session.datastore_config_cache.get_datastore_config', return_value=datastore):
+    with patch('fustor_fusion.api.session.datastores_config.get_datastore', return_value=datastore):
         # Create a session
         payload = type('CreateSessionPayload', (), {})()
         payload.task_id = "task_to_clear"

@@ -15,7 +15,7 @@ This package is part of the Fustor monorepo and is typically installed in editab
 
 ## Usage
 
-Components from `fustor-core` are imported and utilized by other Fustor services (e.g., `agent`, `registry`, `fusion`) and plugin packages (e.g., `source_mysql`, `pusher_fusion`) to ensure consistency and reusability.
+Components from `fustor-core` are imported and utilized by other Fustor services (e.g., `agent`, `fusion`) and plugin packages (e.g., `source_mysql`, `pusher_fusion`) to ensure consistency and reusability.
 
 ## Note on Package Structure
 

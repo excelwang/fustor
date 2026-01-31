@@ -6,7 +6,7 @@ from fustor_event_model.models import UpdateEvent, MessageSource, DeleteEvent
 
 @pytest.fixture
 def parser():
-    return FSViewProvider(datastore_id=1)
+    return FSViewProvider(datastore_id="1", view_id="test_view")
 
 @pytest.mark.asyncio
 async def test_audit_late_start_signal(parser):

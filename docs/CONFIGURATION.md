@@ -26,8 +26,7 @@ Located at `$FUSTOR_HOME/datastores-config.yaml`. Defines data repositories and 
 
 ```yaml
 datastores:
-  1:
-    name: research-data
+  research-data:
     session_timeout_seconds: 30
     allow_concurrent_push: false
     api_key: fk_your_secure_api_key_here

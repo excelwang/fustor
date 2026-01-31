@@ -178,7 +178,6 @@ class BenchmarkRunner:
                 api_key = self.external_api_key
             else:
                 self.services.setup_env()
-                self.services.start_registry()
                 api_key = self.services.configure_system()
                 self.services.start_fusion()
                 self.services.start_agent(api_key)
@@ -237,7 +236,6 @@ class BenchmarkRunner:
             click.echo("="*80)
             
             self.services.setup_env()
-            self.services.start_registry()
             api_key = self.services.configure_system()
             self.services.start_fusion()
             

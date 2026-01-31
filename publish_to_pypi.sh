@@ -58,17 +58,16 @@ echo "--- Phase 1: Publishing Foundation Packages ---"
 publish_package "packages/core" "fustor-core"
 publish_package "packages/fustor_common" "fustor-common"
 publish_package "packages/fustor_event_model" "fustor-event-model"
-publish_package "registry" "fustor-registry"
 
 # --- Phase 2: Clients & Basic Connectors ---
 echo "--- Phase 2: Publishing Clients & Basic Connectors ---"
-publish_package "packages/fustor_registry_client" "fustor-registry-client"
 publish_package "packages/web_ui" "fustor-web-ui"
 publish_package "packages/pusher_echo" "fustor-pusher-echo"
 publish_package "packages/pusher_openapi" "fustor-pusher-openapi"
 publish_package "packages/source_elasticsearch" "fustor-source-elasticsearch"
 publish_package "packages/source_mysql" "fustor-source-mysql"
 publish_package "packages/source_oss" "fustor-source-oss"
+publish_package "packages/view_fs" "fustor-view-fs"
 
 # --- Phase 3: SDKs & Advanced Connectors ---
 echo "--- Phase 3: Publishing SDKs & Advanced Connectors ---"
