@@ -268,29 +268,29 @@ else (Full Scan on D confirmed):
 
 ---
 
-## 6. 混合时钟与逻辑时间 (Logical Time & Hybrid Clock)
+## 6. 双轨时间系统 (Dual-Track Time System)
 
-为解决分布式环境中 Agent 与 Fusion 服务器之间的时钟漂移 (Clock Drift) 问题，系统引入了基于观测水位线 (Watermark) 的逻辑时钟机制。
+为解决分布式环境下的时钟偏移（Clock Skew）和跳变文件（Future Timestamp）问题，Fustor 采用 **"统计学校准的主动时钟"** 方案。
 
-### 6.1 逻辑时钟 (Logical Clock / Observation Watermark)
+详细设计请参考独立文档：[LOGICAL_CLOCK_DESIGN.md](./LOGICAL_CLOCK_DESIGN.md)。
 
-Fusion 为每个数据源维护一个单调递增的逻辑时钟 `L`。
-- **驱动源**：观测到的文件 **mtime**。处理插入/更新事件时携带的文件修改时间。`L = max(L, event.mtime)`
-- **意义**：表示 Fusion 系统目前“观测到”的最新的数据时间点（数据面水位线）。即使物理服务器时钟滞后，逻辑时钟也能保证不回退。
-- **改动**：不再使用 `event.index` 更新逻辑时钟，以防止 Agent 的系统时钟偏置污染 NFS 水位线。
+### 6.1 时间轨道概览
 
-### 6.2 时间类型定义
+| 轨道 | 定义 | 来源 | 核心用途 |
+| :--- | :--- | :--- | :--- |
+| **Physical Time** | Fusion Server 的系统时间 (`time.time()`) | Fusion 本地时钟 | 1. `last_updated_at` (新鲜度保护)<br>2. `last_audit_start` (审计周期)<br>3. `suspect_ttl` (状态过期)<br>4. **保底水位线** (Watchdog) |
+| **Logical Clock (Watermark)** | **NFS Server 的估算物理时间** | 算法合成 | **数据一致性核心基准**。<br>用于计算 Data Age，判定 Suspect 状态。 |
 
-| 类型 | 时间源 | 特性 | 核心用途 |
-|------|------------|------|------|
-| **Logical Time (L)** | `LogicalClock` | 随数据 mtime 演进 | 数据 Age 计算、`integrity_suspect` 判定 |
-| **Physical Time (P)** | `time.time()` | Fusion 本地挂钟时间 | **处理顺序判定**、`last_updated_at`、审计时效保护、Session 租约 |
-| **Monotonic Time (M)**| `time.monotonic()`| 绝对单调递增 | 后台任务过期检查 (Suspect TTL) |
+### 6.2 核心差异点
 
-### 6.3 应用场景裁决表 (双轨制)
+1.  **主动时钟**: 不再单纯被动依赖 `Max(mtime)`，而是基于 `AgentTime - Skew` 主动推进，免疫单点时钟跳变。
+2.  **信任窗口**: 在 `BaseLine + 1s` 范围内允许 FastPath 推进，兼顾实时性与稳定性。
+3.  **兜底机制**: 仅在冷启动无法计算 Skew 时使用 Fusion 本地时间兜底。
+
+### 6.3 应用场景裁决表
 
 | 判定需求 | 时间源 | 判定逻辑 |
-|------|------------|------|
+| :--- | :--- | :--- |
 | **热文件判定 (Suspect Age)** | `Logical Time` | `age = watermark - file.mtime` |
 | **墓碑时效清理 (Tombstone TTL)**| `Physical Time` | `if now - ts > 1hr: purge` |
 | **陈旧证据保护 (Audit End)** | `Physical Time` | `if node.last_updated_at > audit_start_local_time: skip` |

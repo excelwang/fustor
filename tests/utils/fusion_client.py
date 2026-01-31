@@ -145,6 +145,21 @@ class FusionClient:
             
         return result
 
+
+    def get_node(self, path: str) -> Optional[dict[str, Any]]:
+        """Get metadata for a single node (file/dir) via tree API."""
+        try:
+            # max_depth=0 returns the node itself if it's a file, or the dir with children if it's a dir
+            # But the tree API returns the subtree rooted at 'path'.
+            tree = self.get_tree(path=path, max_depth=0)
+            if not tree:
+                return None
+            # If path doesn't exist, get_tree might throw 404 or return empty?
+            # Impl of get_tree usually throws on 404.
+            return tree
+        except (requests.HTTPError, Exception):
+            return None
+
     # ============ Utility Methods ============
 
     def wait_for_file(

@@ -48,7 +48,20 @@ class FSArbitrator:
 
             # Update clock with row mtime
             mtime = payload.get('modified_time', 0.0) or 0.0
-            self.state.logical_clock.update(mtime)
+            
+            # Extract Agent Time and Session ID for Robust Clock
+            agent_time = None
+            session_id = self.state.current_session_id
+            
+            if hasattr(event, 'index'):
+                 agent_time = float(event.index)
+            elif hasattr(event, 'timestamp'):
+                 agent_time = float(event.timestamp)
+                 
+            if hasattr(event, 'session_id'):
+                session_id = event.session_id
+
+            self.state.logical_clock.update(mtime, agent_time=agent_time, session_id=session_id)
             
             # Update latency (Lag) based on current watermark
             watermark = self.state.logical_clock.get_watermark()

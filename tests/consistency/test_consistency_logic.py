@@ -82,10 +82,10 @@ async def test_audit_sentinel_logic():
     # Current watermark is ~ now+1
     
     # Case A: Ancient tombstone (2 hours ago) -> Should be removed
-    parser.state.tombstone_list["/d/ancient"] = now - 7300 
+    parser.state.tombstone_list["/d/ancient"] = (now - 7300, now - 7300)
     
     # Case B: Recent tombstone (1 minute ago) -> Should be kept
-    parser.state.tombstone_list["/d/recent"] = now - 60 
+    parser.state.tombstone_list["/d/recent"] = (now - 60, now - 60) 
     
     await parser.handle_audit_end()
     

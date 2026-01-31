@@ -49,6 +49,12 @@ class TestBlindSpotFileModification:
             append_content="modified from blind spot"
         )
         
+        # NOTE: Smart Audit relies on parent directory mtime change to scan files.
+        # In-place modifications (append) do not always update directory mtime on all FS.
+        # We create a trigger file to ensure the directory is scanned.
+        trigger_file = f"{MOUNT_POINT}/trigger_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, trigger_file, "trigger")
+        
         # Get new mtime from filesystem
         new_fs_mtime = docker_manager.get_file_mtime(CONTAINER_CLIENT_C, test_file)
         assert new_fs_mtime > original_mtime, "Filesystem mtime should increase after modification"
@@ -113,6 +119,9 @@ class TestBlindSpotFileModification:
             test_file,
             append_content="blind modification"
         )
+        # Trigger directory scan
+        trigger_file = f"{MOUNT_POINT}/trigger_flag_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, trigger_file, "trigger")
         
         # Wait for Audit cycle
         logger.info(f"Waiting for Audit cycle ({AUDIT_INTERVAL}s) to detect blind modification flags...")

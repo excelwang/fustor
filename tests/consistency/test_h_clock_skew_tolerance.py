@@ -64,7 +64,7 @@ class TestClockSkewTolerance:
         assert 7100 < a_skew < 7300, f"Agent A should be ~2h ahead, got {a_skew}s"
         assert -3700 < b_skew < -3500, f"Agent B should be ~1h behind, got {b_skew}s"
 
-    def test_file_from_future_nfs_handled_correctly(
+    def test_audit_discovery_of_new_file_is_flagged_suspect(
         self,
         docker_env,
         fusion_client,
@@ -73,50 +73,37 @@ class TestClockSkewTolerance:
         wait_for_audit
     ):
         """
-        从 Agent B (落后) 的视角看，NFS 上的文件可能来自"未来"。
+        验证跨节点新创建的文件（未被本节点实时捕获，而是通过审计发现）应被标记为 suspect。
         
-        场景：
-          1. 通过 Client C (正常时间) 创建文件。 (mtime = T)
-          2. Agent B (时间 = T - 1h) 尝试发现该文件。
         预期：
-          - Agent B 虽然处于"过去"，但仍应能正确扫描到 mtime 为 T 的文件。
-          - Fusion 接收到 mtime T，逻辑时钟正确演进。
+          - 由 Client C (无监控 Agent) 创建一个文件。mtime 为 T。
+          - Fusion 的水位线此时可能由 Agent A (+2h) 的心跳或之前活动保持。
+          - Agent A 通过审计发现该文件。
+          - 由于该文件是新出现的且 mtime 与当前水位线接近（Age < threshold），应标记为 suspect。
         """
-        # 1. Create file from Client C (Host time)
-        filename = f"future_for_b_{int(time.time())}.txt"
+        filename = f"audit_discovery_{int(time.time())}.txt"
         file_path = f"{MOUNT_POINT}/{filename}"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path, content="test")
         
-        # Ensure Fusion's logical clock is initialized by waiting for a report
-        # Agent A should be sending index = Host + 2h
-        logger.info("Waiting for Fusion Logical Clock to initialize...")
-        start_init = time.time()
-        logical_now = 0
-        while time.time() - start_init < 30:
-            stats = fusion_client.get_stats()
-            logical_now = stats.get("logical_now", 0)
-            if logical_now > 1700000000: # Recent human time
-                break
-            time.sleep(1)
+        # 1. Create file from Client C (No Agent)
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path, "from_c")
         
-        # Set mtime to significantly LATER than logical_now (e.g. +24 hours)
-        hot_mtime = logical_now + 86400  # +24h
-        touch_date = time.strftime('%Y%m%d%H%M.%S', time.gmtime(hot_mtime))
-        docker_manager.exec_in_container(CONTAINER_NFS_SERVER, ["touch", "-t", touch_date, f"/exports/{filename}"])
-        logger.info(f"Targeting HOT mtime: {hot_mtime} (date: {touch_date}), Current Logical: {logical_now}")
+        # NOTE: Smart Audit relies on parent directory mtime change.
+        # Ensure directory mtime is definitely updated to T (host time)
+        trigger_path = f"{MOUNT_POINT}/trigger_h_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, trigger_path, "trigger")
         
-        # 2. Sync for audit
-        audit_marker = f"audit_marker_future_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, f"{MOUNT_POINT}/{audit_marker}", "marker")
-        assert fusion_client.wait_for_file_in_tree(f"{MOUNT_POINT}/{audit_marker}", timeout=60) is not None
+        logger.info(f"Client C created file: {filename} and trigger.")
         
-        # 3. Verify file is discovered and IS suspect (age < threshold)
-        found = fusion_client.wait_for_file_in_tree(file_path, timeout=10)
-        assert found is not None
+        # 2. Wait for Audit cycle to complete
+        wait_for_audit()
         
+        # 3. Wait for discovery via Audit/Scan from Agent A (Leader)
+        assert fusion_client.wait_for_file_in_tree(file_path, timeout=60) is not None
+        
+        # 3. Verify suspect flag
         flags = fusion_client.check_file_flags(file_path)
-        logger.info(f"Future file flags: {flags}")
-        assert flags["integrity_suspect"] is True, "File with future mtime relative to system should be suspect"
+        logger.info(f"Audit discovered file flags: {flags}")
+        assert flags["integrity_suspect"] is True, "New file discovered via Audit should be suspect"
 
     def test_realtime_sync_from_past_agent(
         self,
@@ -126,38 +113,29 @@ class TestClockSkewTolerance:
         clean_shared_dir
     ):
         """
-        验证时间落后的 Agent (Follower) 发送的实时事件能被正确处理。
-        
-        场景：
-          1. Leaderc A (正常时间) 创建文件。
-          2. Follower B (落后 1h) 修改文件。
-        预期：
-          - 即使 Agent B 自己的系统时间落后，它观察到的文件 mtime (来自 NFS) 仍是正常的。
-          - Fusion 应该能正确处理这个更新。
+        验证落后 Agent 的实时修改能正常同步并由于时间较旧而清除 suspect。
         """
-        filename = f"stale_agent_realtime_{int(time.time())}.txt"
+        filename = f"past_rt_{int(time.time())}.txt"
         file_path = f"{MOUNT_POINT}/{filename}"
         
-        # 1. Agent A creates file
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, file_path, "original")
+        # 1. Create file via Client C (Host time)
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path, "orig")
+        
+        # 2. Wait for it to be suspect (if discovered via audit by A) or just wait for it to appear
         assert fusion_client.wait_for_file_in_tree(file_path) is not None
         
-        # 2. Agent B modifies file
-        # Note: B's system time is T-1h, but NFS is T.
-        # When B appends, NFS sets mtime to ~T.
-        docker_manager.exec_in_container(CONTAINER_CLIENT_B, ["sh", "-c", f"echo 'modified' >> {file_path}"])
+        # 3. Agent B (落后 1h) 修改文件。实时事件会清除 suspect。
+        docker_manager.exec_in_container(CONTAINER_CLIENT_B, ["sh", "-c", f"echo 'mod' >> {file_path}"])
         
-        # 3. Verify update
+        # 4. Verify suspect is cleared
         time.sleep(2)
-        # Wait for tree to show change (we can't easily check content via tree API yet, but we check suspect cleared)
         flags = fusion_client.check_file_flags(file_path)
-        assert flags["integrity_suspect"] is False, "Realtime from follower should clear suspect"
+        assert flags["integrity_suspect"] is False, "Realtime update should clear suspect status"
 
     def test_logical_clock_jumps_forward_and_remains_stable(
         self,
         docker_env,
         fusion_client,
-        setup_agents,
         clean_shared_dir,
         wait_for_audit
     ):
@@ -165,66 +143,41 @@ class TestClockSkewTolerance:
         验证逻辑时钟处理跳跃式的未来更新。
         
         场景：
-          1. 制造一个"领先" Agent A (+2h) 的发现。
-          2. 然后制造一个常规的发现。
+          1. Agent A (+2h) 创建一个文件，推动逻辑时钟跳变。
+          2. 然后在 Client C (正常时间) 创建一个文件。
         预期：
-          - 逻辑时钟水位线推进到物理时间 + 2h。
-          - 后续物理时间创建的文件由于 mtime 小于水位线，被视为"旧"的，不会再标记为 suspect。
+          - 逻辑时钟水位线由于 Agent A 的文件而推进。
+          - 后续正常文件被视为"旧"的（Age ~ 2h），不会标记为 suspect。
         """
         # 1. Agent A (+2h) creates a file
-        # mtime will be ~Host Time (unless faketime affects NFS writes, which it usually doesn't on shared volumes)
-        # Wait, if Agent A uses faketime and does 'touch' without arguments, it might send a fake timestamp to NFS.
-        filename_a = f"future_jump_{int(time.time())}.txt"
+        filename_a = f"jump_trigger_{int(time.time())}.txt"
         file_path_a = f"{MOUNT_POINT}/{filename_a}"
+        docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["touch", file_path_a])
         
-        # Use A to create file. 
-        docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["sh", "-c", f"echo 'jump' > {file_path_a}"])
+        # Wait for discovery to ensure clock jumped
+        assert fusion_client.wait_for_file_in_tree(file_path_a, timeout=30) is not None
         
-        # Wait for discovery
-        assert fusion_client.wait_for_file_in_tree(file_path_a) is not None
-        
-        # 2. Check logical clock state indirectly by verifying a jump
-        jump_file = f"manual_jump_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, f"{MOUNT_POINT}/{jump_file}", "jump")
-        # Set mtime to +24 hours manually on NFS server (very far future)
-        future_ts = time.time() + 86400  # +24h
-        touch_date = time.strftime('%Y%m%d%H%M.%S', time.gmtime(future_ts))
-        docker_manager.exec_in_container(CONTAINER_NFS_SERVER, ["touch", "-t", touch_date, f"/exports/{jump_file}"])
-        
-        # Use marker to wait for audit
-        audit_marker = f"audit_marker_h_1_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, f"{MOUNT_POINT}/{audit_marker}", "marker")
-        
-        # Wait for both to appear
-        assert fusion_client.wait_for_file_in_tree(f"{MOUNT_POINT}/{audit_marker}", timeout=60) is not None
-        assert fusion_client.wait_for_file_in_tree(f"{MOUNT_POINT}/{jump_file}", timeout=10) is not None
-        
-        # Verify Logical Clock jumped
         stats = fusion_client.get_stats()
         logical_now = stats.get("logical_now", 0)
         host_now = time.time()
-        logger.info(f"Fusion Logical Clock: {logical_now}, Host Physical: {host_now}")
+        logger.info(f"Watermark after A: {logical_now}, Host Physical: {host_now}")
+        assert logical_now > host_now + 7100, "Logical Clock should have jumped forward via Agent A's mtime"
         
-        # Logical clock should be roughly Host + 24h
-        assert logical_now > host_now + 36000, "Logical Clock should have jumped forward significantly"
+        # 2. Now create a NORMAL file (Host time) from Client C
+        normal_file = f"cold_file_{int(time.time())}.txt"
+        file_path_normal = f"{MOUNT_POINT}/{normal_file}"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path_normal, "normal")
         
-        # 3. Now create a NORMAL file (Host time)
-        # Logical Clock is at least +24h. New file is at 0h.
-        # Age = Watermark - mtime = (Host+24h) - (Host) = 24 hours.
-        # 24 hours > 5s.
+        # 3. Wait for Audit to discover it
+        # (We use a marker to be sure audit finished after the file was created)
+        audit_marker = f"marker_jump_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, f"{MOUNT_POINT}/{audit_marker}", "marker")
+        assert fusion_client.wait_for_file_in_tree(f"{MOUNT_POINT}/{audit_marker}", timeout=60) is not None
         
-        normal_file = f"post_jump_normal_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, f"{MOUNT_POINT}/{normal_file}", "normal")
-        
-        # Marker again
-        audit_marker_2 = f"audit_marker_h_2_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, f"{MOUNT_POINT}/{audit_marker_2}", "marker")
-        
-        assert fusion_client.wait_for_file_in_tree(f"{MOUNT_POINT}/{audit_marker_2}", timeout=60) is not None
-        assert fusion_client.wait_for_file_in_tree(f"{MOUNT_POINT}/{normal_file}", timeout=10) is not None
-        
-        flags = fusion_client.check_file_flags(f"{MOUNT_POINT}/{normal_file}")
+        # 4. Verify the normal file is NOT suspect
+        assert fusion_client.wait_for_file_in_tree(file_path_normal) is not None
+        flags = fusion_client.check_file_flags(file_path_normal)
         logger.info(f"Post-jump normal file flags: {flags}")
         
         assert flags["integrity_suspect"] is False, \
-            f"Files significantly older than Logical Clock ({logical_now}) should not be suspect upon audit discovery"
+            f"File from past relative to Watermark ({logical_now}) should not be suspect"
