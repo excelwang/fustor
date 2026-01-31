@@ -175,11 +175,101 @@ def stop():
         click.echo("Fustor Fusion stopped successfully.")
     except OSError as e:
         click.echo(click.style(f"Error stopping process: {e}", fg="red"))
-        logger.error(f"Error stopping process with PID {pid}: {e}")
     finally:
         if os.path.exists(FUSION_PID_FILE):
             os.remove(FUSION_PID_FILE)
-            logger.info("Removed PID file.")
+
+
+@cli.command("start-view")
+@click.argument("view_id")
+def start_view(view_id: str):
+    """Start a single view by ID. Starts daemon if not running."""
+    import requests
+    
+    # Check if daemon is running
+    pid = _is_running()
+    if not pid:
+        click.echo("Fusion daemon not running. Starting it first...")
+        # Start daemon
+        ctx = click.get_current_context()
+        ctx.invoke(start, daemon=True, port=8102)
+        time.sleep(3)  # Wait for daemon to start
+        
+        pid = _is_running()
+        if not pid:
+            click.echo(click.style("Failed to start Fusion daemon.", fg="red"))
+            return
+    
+    # Call management API to start view
+    try:
+        response = requests.post(
+            f"http://localhost:8102/api/v1/management/views/{view_id}/start",
+            timeout=10
+        )
+        if response.ok:
+            click.echo(click.style(f"View '{view_id}' started successfully.", fg="green"))
+        else:
+            detail = response.json().get("detail", "Unknown error")
+            click.echo(click.style(f"Failed to start view '{view_id}': {detail}", fg="red"))
+    except requests.exceptions.ConnectionError:
+        click.echo(click.style("Cannot connect to Fusion daemon.", fg="red"))
+    except Exception as e:
+        click.echo(click.style(f"Error: {e}", fg="red"))
+
+
+@cli.command("stop-view")
+@click.argument("view_id")
+def stop_view(view_id: str):
+    """Stop a single view by ID. Stops daemon if no views left."""
+    import requests
+    
+    pid = _is_running()
+    if not pid:
+        click.echo("Fusion daemon is not running.")
+        return
+    
+    try:
+        response = requests.post(
+            f"http://localhost:8102/api/v1/management/views/{view_id}/stop",
+            timeout=10
+        )
+        if response.ok:
+            data = response.json()
+            click.echo(click.style(f"View '{view_id}' stopped.", fg="green"))
+            
+            if data.get("should_shutdown"):
+                click.echo("No active views remaining. Stopping Fusion daemon...")
+                ctx = click.get_current_context()
+                ctx.invoke(stop)
+        else:
+            detail = response.json().get("detail", "Unknown error")
+            click.echo(click.style(f"Failed to stop view '{view_id}': {detail}", fg="red"))
+    except requests.exceptions.ConnectionError:
+        click.echo(click.style("Cannot connect to Fusion daemon.", fg="red"))
+    except Exception as e:
+        click.echo(click.style(f"Error: {e}", fg="red"))
+
+
+@cli.command("create-api-key")
+@click.option("--datastore", "-d", required=True, type=int, help="Datastore ID")
+def create_api_key(datastore: int):
+    """Generate a new API key for a datastore and save to config."""
+    import secrets
+    from fustor_fusion.config import datastores_config
+    
+    # Generate API key
+    api_key = f"fk_{secrets.token_urlsafe(24)}"
+    
+    # Save to config
+    try:
+        datastores_config.save_api_key(datastore, api_key)
+        click.echo(click.style("API Key created successfully!", fg="green"))
+        click.echo(f"Datastore: {datastore}")
+        click.echo(f"API Key: {api_key}")
+        click.echo(click.style("Saved to datastores-config.yaml", fg="cyan"))
+    except Exception as e:
+        click.echo(click.style(f"Failed to save API key: {e}", fg="red"))
+
 
 # Define FUSION_LOG_FILE_NAME here as it's used in setup_logging
 FUSION_LOG_FILE_NAME = "fustor_fusion.log"

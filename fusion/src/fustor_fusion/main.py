@@ -106,6 +106,7 @@ app = FastAPI(lifespan=lifespan)
 from .api.ingestion import ingestion_router
 from .api.session import session_router
 from .api.consistency import consistency_router
+from .api.management import router as management_router
 
 # Core versioned router
 api_v1 = APIRouter()
@@ -120,6 +121,9 @@ api_v1.include_router(ingest_api)
 
 # 2. View Domain (/api/v1/views)
 api_v1.include_router(view_router, prefix="/views")
+
+# 3. Management Domain (/api/v1/management)
+api_v1.include_router(management_router)
 
 # Register the unified v1 router
 app.include_router(api_v1, prefix="/api/v1", tags=["v1"])

@@ -1,0 +1,10 @@
+# Example: syncs-config/sync-research.yaml
+# Location: $FUSTOR_HOME/syncs-config/sync-research.yaml
+
+id: sync-research
+source: fs-research
+pusher: fusion-main
+disabled: false
+audit_interval_sec: 600
+sentinel_interval_sec: 120
+heartbeat_interval_sec: 10

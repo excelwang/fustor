@@ -188,3 +188,72 @@ def discover_schema(ctx, source_id, admin_user, admin_password):
         click.echo(f"An unexpected error occurred: {e}", err=True)
         logger.error(f"An unexpected error occurred while discovering schema for '{source_id}': {e}", exc_info=True)
         ctx.exit(1)
+
+
+@cli.command("start-sync")
+@click.argument("sync_id")
+def start_sync(sync_id: str):
+    """Start a single sync task by ID. Starts daemon if not running."""
+    import requests
+    
+    # Check if daemon is running
+    pid = _is_running()
+    if not pid:
+        click.echo("Agent daemon not running. Starting it first...")
+        ctx = click.get_current_context()
+        ctx.invoke(start, daemon=True, port=8103)
+        time.sleep(3)
+        
+        pid = _is_running()
+        if not pid:
+            click.echo(click.style("Failed to start Agent daemon.", fg="red"))
+            return
+    
+    # Call management API to start sync
+    try:
+        response = requests.post(
+            f"http://localhost:8103/api/v1/management/syncs/{sync_id}/start",
+            timeout=10
+        )
+        if response.ok:
+            click.echo(click.style(f"Sync '{sync_id}' started successfully.", fg="green"))
+        else:
+            detail = response.json().get("detail", "Unknown error")
+            click.echo(click.style(f"Failed to start sync '{sync_id}': {detail}", fg="red"))
+    except requests.exceptions.ConnectionError:
+        click.echo(click.style("Cannot connect to Agent daemon.", fg="red"))
+    except Exception as e:
+        click.echo(click.style(f"Error: {e}", fg="red"))
+
+
+@cli.command("stop-sync")
+@click.argument("sync_id")
+def stop_sync(sync_id: str):
+    """Stop a single sync task by ID. Stops daemon if no syncs left."""
+    import requests
+    
+    pid = _is_running()
+    if not pid:
+        click.echo("Agent daemon is not running.")
+        return
+    
+    try:
+        response = requests.post(
+            f"http://localhost:8103/api/v1/management/syncs/{sync_id}/stop",
+            timeout=10
+        )
+        if response.ok:
+            data = response.json()
+            click.echo(click.style(f"Sync '{sync_id}' stopped.", fg="green"))
+            
+            if data.get("should_shutdown"):
+                click.echo("No active syncs remaining. Stopping Agent daemon...")
+                ctx = click.get_current_context()
+                ctx.invoke(stop)
+        else:
+            detail = response.json().get("detail", "Unknown error")
+            click.echo(click.style(f"Failed to stop sync '{sync_id}': {detail}", fg="red"))
+    except requests.exceptions.ConnectionError:
+        click.echo(click.style("Cannot connect to Agent daemon.", fg="red"))
+    except Exception as e:
+        click.echo(click.style(f"Error: {e}", fg="red"))

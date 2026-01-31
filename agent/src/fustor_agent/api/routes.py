@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from ..app import App # Import App
 from .. import CONFIG_DIR # Import CONFIG_DIR
 
-from . import sources_api, pushers_api, syncs_api, system_handlers, sync_instances_handlers, logs_handlers, metrics_api, configs_api, drivers_api
+from . import sources_api, pushers_api, syncs_api, system_handlers, sync_instances_handlers, logs_handlers, metrics_api, configs_api, drivers_api, management_api
 
 api_router = APIRouter()
 
@@ -19,6 +19,10 @@ api_router.include_router(system_handlers.router, prefix="/instances", tags=["Sy
 api_router.include_router(sync_instances_handlers.router, prefix="/instances", tags=["Instances"])
 api_router.include_router(metrics_api.router, prefix="", tags=["Metrics"])
 api_router.include_router(drivers_api.router, prefix="/drivers", tags=["Drivers"])
+
+# Versioned API router for v1
+api_v1_router = APIRouter()
+api_v1_router.include_router(management_api.router)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -39,6 +43,9 @@ web_app = FastAPI(title="FuAgent API", lifespan=lifespan)
 
 # Include the API router with a prefix
 web_app.include_router(api_router, prefix="/api")
+
+# Include the v1 API router
+web_app.include_router(api_v1_router, prefix="/api/v1", tags=["v1"])
 
 # Conditionally serve static files for the UI if the package is installed
 try:
