@@ -72,9 +72,9 @@ class FSViewProvider(FSViewBase):
 
     # --- Query Delegation ---
 
-    async def get_directory_tree(self, **kwargs) -> Optional[Dict[str, Any]]:
+    async def get_directory_tree(self, path: str = "/", **kwargs) -> Optional[Dict[str, Any]]:
         async with self._global_semaphore:
-            return self.query.get_directory_tree(**kwargs)
+            return self.query.get_directory_tree(path=path, **kwargs)
 
     async def get_blind_spot_list(self) -> Dict[str, Any]:
         async with self._global_semaphore:

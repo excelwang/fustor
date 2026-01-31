@@ -203,8 +203,9 @@ class DatastoreStateManager:
                 # If state doesn't exist, create it.
                 state = DatastoreState(datastore_id=datastore_id)
                 self._states[datastore_id] = state
-            state.authoritative_session_id = session_id
-            logger.info(f"Set authoritative session for datastore {datastore_id} to {session_id}.")
+            if state.authoritative_session_id != session_id:
+                state.authoritative_session_id = session_id
+                logger.info(f"Set authoritative session for datastore {datastore_id} to {session_id}.")
 
     async def is_authoritative_session(self, datastore_id: int, session_id: str) -> bool:
         """Checks if a session is the authoritative one for a datastore."""

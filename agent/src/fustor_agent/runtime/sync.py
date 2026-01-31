@@ -480,7 +480,10 @@ class SyncInstance:
              self.state &= ~SyncState.SENTINEL_SWEEP
 
     async def _run_audit_sync(self):
-        # Existing _run_audit_sync logic...
+        # Rule: Only the Leader performs Audit scans to prevent concurrent interference and redundant IO.
+        if self.current_role != 'leader':
+            return
+            
         if self.state & SyncState.AUDIT_SYNC:
              return
         
@@ -562,6 +565,7 @@ class SyncInstance:
         # Add SNAPSHOT_SYNC state using bitwise OR
         self.state |= SyncState.SNAPSHOT_SYNC
         self.info = "补充性质的快照同步任务开始运行。"
+        logger.info(f"Sync instance '{self.id}' starting supplemental snapshot sync.")
         snapshot_completed_successfully = False
         try:
             from fustor_agent.services.instances.bus import RequiredFieldsTracker
@@ -594,7 +598,7 @@ class SyncInstance:
 
             while True:
                 current_event = await asyncio.to_thread(event_queue.get)
-
+                
                 if current_event is None:
                     snapshot_completed_successfully = True # Set flag on natural exit
                     break

@@ -93,8 +93,12 @@ async def create_session(
             detail="New session cannot be created due to current active sessions"
         )
     
-    # Always set the new session as authoritative to enable status tracking
-    await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
+    # Leader/Follower election (First-Come-First-Serve)
+    is_leader = await datastore_state_manager.try_become_leader(datastore_id, session_id)
+    
+    # Only the leader session is considered authoritative for snapshot completion
+    if is_leader:
+        await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
 
     active_sessions = await session_manager.get_datastore_sessions(datastore_id)
     if not active_sessions and datastore_config.allow_concurrent_push:
@@ -127,8 +131,6 @@ async def create_session(
     if not datastore_config.allow_concurrent_push:
         await datastore_state_manager.lock_for_session(datastore_id, session_id)
     
-    # Leader/Follower election (First-Come-First-Serve)
-    is_leader = await datastore_state_manager.try_become_leader(datastore_id, session_id)
     role = "leader" if is_leader else "follower"
     
     return {
@@ -162,6 +164,12 @@ async def heartbeat(
     
     # Check and try to maintain/acquire leader role
     is_leader = await datastore_state_manager.try_become_leader(datastore_id, session_id)
+    
+    # Critical: If this session became or maintained leader, ensure it is the authoritative session
+    # for snapshot completion tracking.
+    if is_leader:
+        await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
+        
     role = "leader" if is_leader else "follower"
 
     return {

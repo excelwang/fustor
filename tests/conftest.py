@@ -138,12 +138,14 @@ def test_datastore(registry_client) -> dict:
                  time.sleep(10)
             return ds
 
-    return registry_client.create_datastore(
+    ds = registry_client.create_datastore(
         name="integration-test-ds",
         description="Datastore for NFS consistency integration tests",
         allow_concurrent_push=True,
         session_timeout_seconds=10
     )
+    logger.info(f"Created new datastore: {ds['name']} (ID: {ds['id']})")
+    return ds
 
 
 @pytest.fixture(scope="session")
@@ -257,7 +259,7 @@ syncs:
     # 4. Start new agent
     docker_manager.exec_in_container(
         container_name, 
-        ["sh", "-c", "nohup fustor-agent start > /data/agent/console.log 2>&1 &"]
+        ["sh", "-c", "export FUSTOR_LOG_LEVEL=DEBUG && nohup fustor-agent start > /data/agent/console.log 2>&1 &"]
     )
 
 

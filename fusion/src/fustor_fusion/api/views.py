@@ -27,19 +27,20 @@ async def _check_core_readiness(datastore_id: int):
     inflight_count = processing_manager.get_inflight_count(datastore_id)
     
     if not is_signal_complete or queue_size > 0 or inflight_count > 0:
-        detail = "Initial snapshot sync in progress. Service temporarily unavailable for this datastore."
-        if is_signal_complete and (queue_size > 0 or inflight_count > 0):
-            detail = f"Sync signal received, but still processing ingested data: queue={queue_size}, inflight={inflight_count}."
-            logger.info(f"Datastore {datastore_id} {detail}")
+        detail = f"Datastore {datastore_id} not ready: snapshot_complete={is_signal_complete}, queue={queue_size}, inflight={inflight_count}. "
+        if not is_signal_complete:
+            detail += "Initial snapshot sync in progress. Waiting for end signal from authoritative agent."
+        else:
+            detail += "Events still processing in queue/inflight."
             
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail=detail
         )
 
-def make_readiness_checker(driver_name: str):
+def make_readiness_checker(lookup_key: str):
     """
-    Factory to create a complete readiness checker for a specific driver.
+    Factory to create a complete readiness checker for a specific provider instance.
     Checks:
     1. Core System Readiness (Snapshot, Queue, Inflight)
     2. Live Session Requirement (if Provider is configured as Live)
@@ -52,7 +53,7 @@ def make_readiness_checker(driver_name: str):
         from ..core.session_manager import session_manager
         
         manager = await get_cached_view_manager(datastore_id)
-        provider = manager.providers.get(driver_name)
+        provider = manager.providers.get(lookup_key)
         
         # Determine if we need to enforce live session check
         is_live = False
@@ -82,59 +83,39 @@ async def check_snapshot_status(datastore_id: int):
     await _check_core_readiness(datastore_id)
 
 
-async def get_view_provider(datastore_id: int, driver_name: str):
+async def get_view_provider(datastore_id: int, lookup_key: str):
     """
-    Helper to get a view provider for a specific driver.
+    Helper to get a view provider for a specific key (instance name or driver name).
     
     Args:
         datastore_id: The datastore ID
-        driver_name: The driver name (e.g., 'fs')
+        lookup_key: The key used to look up the provider in ViewManager
     """
     manager = await get_cached_view_manager(datastore_id)
-    return manager.providers.get(driver_name)
+    return manager.providers.get(lookup_key)
 
 
-def _discover_view_api_routers():
+def _discover_view_api_factories():
     """
-    Discover and load API routers from view driver packages.
-    
-    View driver packages can register API routers via the 'fustor.view_api' entry point group.
-    Each entry point should be a function that accepts:
-        - get_provider_func: async function(datastore_id, driver_name) -> provider
-        - check_snapshot_func: async function(datastore_id) -> None (raises HTTPException)
-        - get_datastore_id_dep: FastAPI dependency for authentication
+    Discover view API router factories from view driver packages.
     
     Returns:
-        List of (name, router) tuples
+        List of (driver_name, create_router_func) tuples
     """
-    routers = []
+    factories = []
     try:
         eps = entry_points(group="fustor.view_api")
         for ep in eps:
             try:
                 create_router_func = ep.load()
-                driver_name = ep.name
-                
-                # Create a provider getter bound to this driver name
-                async def get_provider_for_driver(datastore_id: int, _driver=driver_name):
-                    return await get_view_provider(datastore_id, _driver)
-                
-                # Create specialized checker that covers all readiness logic
-                checker = make_readiness_checker(driver_name)
-                
-                router = create_router_func(
-                    get_provider_func=get_provider_for_driver,
-                    check_snapshot_func=checker,
-                    get_datastore_id_dep=get_datastore_id_from_api_key
-                )
-                routers.append((ep.name, router))
-                logger.info(f"Discovered view API router: {ep.name}")
+                factories.append((ep.name, create_router_func))
+                logger.info(f"Discovered view API factory: {ep.name}")
             except Exception as e:
                 logger.error(f"Failed to load view API entry point '{ep.name}': {e}", exc_info=True)
     except Exception as e:
         logger.error(f"Error discovering view API entry points: {e}", exc_info=True)
     
-    return routers
+    return factories
 
 
 def register_view_driver_routes():
@@ -148,10 +129,10 @@ def register_view_driver_routes():
     """
     from ..local_config import local_config
     
-    available_routers = {name: router for name, router in _discover_view_api_routers()}
+    available_factories = {name: func for name, func in _discover_view_api_factories()}
     
-    if not available_routers:
-        logger.warning("No view API routers discovered. Check if view driver packages are installed.")
+    if not available_factories:
+        logger.warning("No view API factories discovered. Check if view driver packages are installed.")
         return
 
     # 1. Try to register based on specific view instances in config
@@ -165,10 +146,22 @@ def register_view_driver_routes():
                 continue
                 
             driver_name = cfg.get("driver")
-            router = available_routers.get(driver_name)
+            create_func = available_factories.get(driver_name)
             
-            if router:
+            if create_func:
                 try:
+                    # Create context-bound provider getter and readiness checker
+                    async def get_provider_for_instance(datastore_id: int, _key=view_name):
+                        return await get_view_provider(datastore_id, _key)
+                    
+                    checker = make_readiness_checker(view_name)
+                    
+                    router = create_func(
+                        get_provider_func=get_provider_for_instance,
+                        check_snapshot_func=checker,
+                        get_datastore_id_dep=get_datastore_id_from_api_key
+                    )
+                    
                     # Register with prefix matching the view_name (e.g., test-fs)
                     view_router.include_router(router, prefix=f"/{view_name}")
                     logger.info(f"Registered view API routes: {view_name} (driver: {driver_name}) at prefix /{view_name}")
@@ -176,14 +169,24 @@ def register_view_driver_routes():
                 except Exception as e:
                     logger.error(f"Error registering view API routes '{view_name}': {e}", exc_info=True)
             else:
-                logger.warning(f"View '{view_name}' configures driver '{driver_name}', but no API router for that driver was found.")
+                logger.warning(f"View '{view_name}' configures driver '{driver_name}', but no API factory for that driver was found.")
 
     # 2. If no config or no views registered via config, fall back to driver names
-    # OR: Should we always register driver names as aliases?
-    # For now, let's fall back if no views were created via config, or if is_configured is False.
     if registered_count == 0:
-        for name, router in available_routers.items():
+        for name, create_func in available_factories.items():
             try:
+                # Fallback uses driver name as the lookup key
+                async def get_provider_fallback(datastore_id: int, _key=name):
+                    return await get_view_provider(datastore_id, _key)
+                
+                checker = make_readiness_checker(name)
+                
+                router = create_func(
+                    get_provider_func=get_provider_fallback,
+                    check_snapshot_func=checker,
+                    get_datastore_id_dep=get_datastore_id_from_api_key
+                )
+                
                 view_router.include_router(router, prefix=f"/{name}")
                 logger.info(f"Registered fallback view API routes: {name} at prefix /{name}")
             except Exception as e:

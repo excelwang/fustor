@@ -41,7 +41,16 @@ class FusionClient:
                 "dry_run": dry_run
             }
         )
-        resp.raise_for_status()
+        try:
+            resp.raise_for_status()
+        except requests.HTTPError as e:
+            if resp.status_code == 503:
+                try:
+                    detail = resp.json().get('detail', 'No detail provided')
+                    print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {detail}")
+                except Exception:
+                    print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {resp.text}")
+            raise e
         return resp.json()
 
     def search(self, pattern: str, path: str = "/") -> dict[str, Any]:
