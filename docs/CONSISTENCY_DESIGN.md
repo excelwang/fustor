@@ -275,29 +275,26 @@ else (Full Scan on D confirmed):
 ### 6.1 逻辑时钟 (Logical Clock / Observation Watermark)
 
 Fusion 为每个数据源维护一个单调递增的逻辑时钟 `L`。
-- **驱动源**：
-  1. **消息序列号 (Message Index)**：Agent 发送事件时携带的物理发送时间戳。`L = max(L, event.index)`
-  2. **观测到的 mtime**：处理插入/更新事件时携带的文件修改时间。`L = max(L, event.mtime)`
-- **意义**：表示 Fusion 系统目前“观测到”的最新的时间点。即使物理服务器时钟滞后，逻辑时钟也能保证不回退。
+- **驱动源**：观测到的文件 **mtime**。处理插入/更新事件时携带的文件修改时间。`L = max(L, event.mtime)`
+- **意义**：表示 Fusion 系统目前“观测到”的最新的数据时间点（数据面水位线）。即使物理服务器时钟滞后，逻辑时钟也能保证不回退。
+- **改动**：不再使用 `event.index` 更新逻辑时钟，以防止 Agent 的系统时钟偏置污染 NFS 水位线。
 
 ### 6.2 时间类型定义
 
 | 类型 | 时间源 | 特性 | 核心用途 |
 |------|------------|------|------|
-| **Logical Time (L)** | `LogicalClock` | 随数据流演进，无视漂移 | 时效性判定、陈旧证据保护 (`last_updated_at`) |
-| **Physical Time (P)** | `time.time()` | 挂钟时间，受 NTP 影响可能回退 | 外部 API 展示、Session 租约检查 |
-| **Monotonic Time (M)**| `time.monotonic()`| 纳秒级单调递增，不受挂钟调整影响 | 本地倒计时 (TTL Expiry)、频率限制 (Rate Limiting) |
+| **Logical Time (L)** | `LogicalClock` | 随数据 mtime 演进 | 数据 Age 计算、`integrity_suspect` 判定 |
+| **Physical Time (P)** | `time.time()` | Fusion 本地挂钟时间 | **处理顺序判定**、`last_updated_at`、审计时效保护、Session 租约 |
+| **Monotonic Time (M)**| `time.monotonic()`| 绝对单调递增 | 后台任务过期检查 (Suspect TTL) |
 
-### 6.4 应用场景裁决表
+### 6.3 应用场景裁决表 (双轨制)
 
-| 场景 | 使用时间源 | 判定逻辑 |
+| 判定需求 | 时间源 | 判定逻辑 |
 |------|------------|------|
 | **热文件判定 (Suspect Age)** | `Logical Time` | `age = watermark - file.mtime` |
-| **墓碑时效清理 (Tombstone TTL)**| `Logical Time` | `if watermark - ts > 1hr: purge` |
-| **陈旧证据保护 (Audit End)** | `Logical Time` | `if node.last_updated_at > audit_start: skip` |
-| **Suspect 稳定性续期 (Physical TTL)** | `Monotonic Time`| `if monotonic_now > expires_at: perform_mtime_stability_check()` |
-| **Session 超时 (Heartbeat)** | `Physical Time` | `physical_now - last_heartbeat > timeout` |
-| **清理频率限制 (Rate Limit)**| `Monotonic Time`| `if monotonic_now - last_cleanup < 0.5s: skip` |
+| **墓碑时效清理 (Tombstone TTL)**| `Physical Time` | `if now - ts > 1hr: purge` |
+| **陈旧证据保护 (Audit End)** | `Physical Time` | `if node.last_updated_at > audit_start_local_time: skip` |
+| **处理流时延 (Latency)** | `Logical Time` | `delay = watermark - file.mtime` |
 
 ---
 
@@ -360,12 +357,15 @@ Fusion 收到反馈后执行稳定性判定：若 mtime 与记录值一致，则
 
 ### 11.1 陈旧证据保护 (Stale Evidence Protection)
 
-每个节点维护 `last_updated_at` 逻辑时间戳，记录最后一次被 Realtime 事件更新的时刻。在 `Audit-End` 执行 Missing 判定时：
+每个节点维护 `last_updated_at` 物理时间戳，记录最后一次被 Fusion 接收并更新的**本地时刻**（基于 `time.time()`）。
 
+在 `Audit-End` 执行 Missing 判定时：
 ```python
-if node.last_updated_at > audit_start_logical_time:
-    # 该节点在审计期间有过实时更新，审计视图已落后
-    # 跳过删除
+# 核心逻辑：基于 Fusion 本地物理时间的序列判定
+if node.last_updated_at > audit_start_local_time:
+    # 判定：该节点在审计扫描开始后，有过更及时的实时更新进入 Fusion。
+    # 结论：当前审计报告相对于该节点是“陈旧”的。
+    # 动作：跳过删除，保护实时权威。
 ```
 
 ### 11.2 审计跳过保护 (Audit Skipped Protection)

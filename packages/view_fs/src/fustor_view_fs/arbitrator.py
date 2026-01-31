@@ -3,6 +3,7 @@ import os
 import time
 import heapq
 import logging
+import time
 from typing import Any, Dict, Tuple
 from fustor_event_model.models import MessageSource, EventType
 from .state import FSState
@@ -31,23 +32,12 @@ class FSArbitrator:
         is_realtime = (message_source == MessageSource.REALTIME)
         is_audit = (message_source == MessageSource.AUDIT)
         
-        # Problem 2 Fix: Strictly update clock using event.index if available
-        # event.index is expected to be milliseconds
-        if event.index > 0:
-            agent_watermark = event.index / 1000.0
-            self.state.logical_clock.update(agent_watermark)
-            
-            # Latency tracking
-            logical_now_ms = self.state.logical_clock.get_watermark() * 1000
-            self.state.last_event_latency = max(0.0, logical_now_ms - event.index)
-        
-        # Audit Start Auto-detection
-        if is_audit and self.state.last_audit_start is None and event.index > 0:
-            self.state.last_audit_start = self.state.logical_clock.get_watermark()
-            self.logger.info(f"Auto-detected Audit Start logical time: {self.state.last_audit_start}")
+        if is_audit and self.state.last_audit_start is None:
+            self.state.last_audit_start = time.time()
+            self.logger.info(f"Auto-detected Audit Start at local time: {self.state.last_audit_start}")
 
         self.state.current_session_id = getattr(event, "session_id", self.state.current_session_id)
-
+        
         rows_processed = 0
         for payload in event.rows:
             path = self._normalize_path(payload.get('path') or payload.get('file_path'))
@@ -59,6 +49,10 @@ class FSArbitrator:
             # Update clock with row mtime
             mtime = payload.get('modified_time', 0.0) or 0.0
             self.state.logical_clock.update(mtime)
+            
+            # Update latency (Lag) based on current watermark
+            watermark = self.state.logical_clock.get_watermark()
+            self.state.last_event_latency = max(0.0, (watermark - mtime) * 1000.0)
             
             if is_audit:
                 self.state.audit_seen_paths.add(path)
@@ -81,10 +75,11 @@ class FSArbitrator:
             # Update clock with the time of deletion (either index or existing mtime)
             self.state.logical_clock.update(existing_mtime)
             
-            # Create Tombstone
-            ts = self.state.logical_clock.get_watermark()
-            self.state.tombstone_list[path] = ts
-            self.logger.info(f"Tombstone CREATED for {path} at {ts}")
+            # Create Tombstone with Dual-Track timestamps
+            logical_ts = self.state.logical_clock.get_watermark()
+            physical_ts = time.time()
+            self.state.tombstone_list[path] = (logical_ts, physical_ts)
+            self.logger.info(f"Tombstone CREATED for {path} (Logical: {logical_ts}, Physical: {physical_ts})")
             
             self.state.suspect_list.pop(path, None)
             self.state.blind_spot_deletions.discard(path)
@@ -99,7 +94,7 @@ class FSArbitrator:
     async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float):
         # 1. Tombstone Protection
         if path in self.state.tombstone_list:
-            tombstone_ts = self.state.tombstone_list[path]
+            tombstone_ts, _ = self.state.tombstone_list[path] # Use logical timestamp for arbitration
             is_realtime = (source == MessageSource.REALTIME)
             
             # Check if this is "New activity" after deletion

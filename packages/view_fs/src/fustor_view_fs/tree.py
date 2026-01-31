@@ -1,5 +1,6 @@
 import os
 import logging
+import time
 from typing import Dict, Any
 from .nodes import DirectoryNode, FileNode
 from .state import FSState
@@ -52,7 +53,7 @@ class TreeManager:
                     if parent_node:
                         parent_node.children[name] = node
             
-            node.last_updated_at = watermark
+            node.last_updated_at = time.time()
 
         else:
             # Type change protection
@@ -71,7 +72,7 @@ class TreeManager:
                 if parent_node:
                     parent_node.children[name] = node
             
-            node.last_updated_at = watermark
+            node.last_updated_at = time.time()
 
     def _ensure_parent_chain(self, parent_path: str):
         parts = [p for p in parent_path.split('/') if p]
@@ -83,7 +84,7 @@ class TreeManager:
             current_path = os.path.normpath(current_path + "/" + part)
             if current_path not in self.state.directory_path_map:
                 new_dir = DirectoryNode(part, current_path)
-                new_dir.last_updated_at = watermark
+                new_dir.last_updated_at = time.time()
                 parent_node.children[part] = new_dir
                 self.state.directory_path_map[current_path] = new_dir
             parent_node = self.state.directory_path_map[current_path]

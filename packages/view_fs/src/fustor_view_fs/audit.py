@@ -1,4 +1,5 @@
 import logging
+import time
 from .state import FSState
 from .tree import TreeManager
 
@@ -15,7 +16,7 @@ class AuditManager:
 
     async def handle_start(self):
         """Prepares state for a new audit cycle."""
-        now = self.state.logical_clock.get_watermark()
+        now = time.time()
         is_late_start = False
         
         # If we received another start signal very recently, don't clear flags
@@ -27,21 +28,22 @@ class AuditManager:
         if not is_late_start:
              self.state.audit_seen_paths.clear()
         
-        self.logger.info(f"Audit started at logical time {now}. late_start={is_late_start}")
+        self.logger.info(f"Audit started at local time {now}. late_start={is_late_start}")
 
     async def handle_end(self):
         """Finalizes audit cycle, performs Tombstone cleanup and Missing Item Detection."""
         if self.state.last_audit_start is None:
             return
 
-        # 1. Tombstone Cleanup (Rule: Purge tombstones older than 1 hour per §6.4)
-        # Use logical time watermark for TTL calculation
+        # 1. Tombstone Cleanup (Rule: Purge tombstones older than 1 hour per §6.3)
+        # Use physical local time for TTL calculation to be stable against logical clock jumps
         tombstone_ttl_seconds = 3600.0  # 1 hour
-        watermark = self.state.logical_clock.get_watermark()
+        now_physical = time.time()
         before = len(self.state.tombstone_list)
+        
         self.state.tombstone_list = {
-            path: ts for path, ts in self.state.tombstone_list.items()
-            if (watermark - ts) < tombstone_ttl_seconds
+            path: (l_ts, p_ts) for path, (l_ts, p_ts) in self.state.tombstone_list.items()
+            if (now_physical - p_ts) < tombstone_ttl_seconds
         }
         cleaned = before - len(self.state.tombstone_list)
         if cleaned > 0:
