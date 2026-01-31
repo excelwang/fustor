@@ -34,15 +34,18 @@ class AuditManager:
         if self.state.last_audit_start is None:
             return
 
-        # 1. Tombstone Cleanup (Rule: Purge tombstones older than audit start)
+        # 1. Tombstone Cleanup (Rule: Purge tombstones older than 1 hour per §6.4)
+        # Use logical time watermark for TTL calculation
+        tombstone_ttl_seconds = 3600.0  # 1 hour
+        watermark = self.state.logical_clock.get_watermark()
         before = len(self.state.tombstone_list)
         self.state.tombstone_list = {
             path: ts for path, ts in self.state.tombstone_list.items()
-            if ts >= self.state.last_audit_start
+            if (watermark - ts) < tombstone_ttl_seconds
         }
         cleaned = before - len(self.state.tombstone_list)
         if cleaned > 0:
-            self.logger.info(f"Tombstone CLEANUP: removed {cleaned} items.")
+            self.logger.info(f"Tombstone CLEANUP: removed {cleaned} items (TTL > 1hr).")
 
         # 2. Optimized Missing File Detection
         missing_count = 0

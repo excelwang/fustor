@@ -134,11 +134,17 @@ class FSArbitrator:
 
         # Capture state before update for arbitration
         old_mtime = existing.modified_time if existing else 0.0
+        old_last_updated_at = existing.last_updated_at if existing else 0.0
         
         # Perform the actual update
         await self.tree_manager.update_node(payload, path)
         node = self.state.get_node(path)
         if not node: return
+
+        # Fix: Only Realtime events should update last_updated_at (Stale Evidence Protection)
+        # Snapshot/Audit events should NOT update this timestamp
+        if not is_realtime and old_last_updated_at > 0:
+            node.last_updated_at = old_last_updated_at
 
         # 3. Blind Spot and Suspect Management
         if is_realtime:

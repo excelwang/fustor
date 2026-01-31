@@ -146,8 +146,7 @@ Fusion 维护以下状态：
 - **结构**：`Map<Path, DeleteLogicalTime>`
 - **生命周期**：
   - **创建**：处理 Realtime Delete 时，记录删除时刻的逻辑时间戳
-  
-  
+  - **即时清除**：当更新的事件（mtime > tombstone_ts）到达时，Tombstone 被清除（文件转世 Reincarnation）
 ### 4.3 可疑名单 (Suspect List)
 
 - **用途**：标记可能正处于 NFS 客户端缓存中、尚未完全刷新到存储中心的文件、未结束写入的不完整文件。
@@ -164,7 +163,7 @@ Fusion 维护以下状态：
 - **用途**：标记在无 Agent 客户端发生变更的文件
 - **来源**：Audit 发现的新增/删除，但不在 Tombstone 中且不是实时新增
 - **生命周期**：
-  - **持久化**：不随每次 Audit 清空，也不使用 TTL 自动过期（防止有效数据丢失）
+  - **持久化**：跨 Audit 周期和 Session 持久保留，不使用 TTL 自动过期（防止有效数据丢失）
   - **清除**：
     - 收到 Realtime Delete/Update 时移除相关条目
     - Audit 再次看到文件时移除相关条目

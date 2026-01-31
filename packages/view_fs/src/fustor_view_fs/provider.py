@@ -56,7 +56,13 @@ class FSViewProvider(FSViewBase):
             self.state.last_audit_start = None
             self.state.audit_seen_paths.clear()
             self.state.current_session_id = session_id
-            self.logger.info(f"Session {session_id} started. Cleared audit buffer.")
+            
+            # Per CONSISTENCY_DESIGN.md §4.4: Clear blind-spot lists on new session
+            # Blind spots may be rediscovered by the new session
+            self.state.blind_spot_additions.clear()
+            self.state.blind_spot_deletions.clear()
+            
+            self.logger.info(f"Session {session_id} started. Cleared audit buffer and blind-spot lists.")
 
     async def on_session_close(self, session_id: str):
         """Handles session closure."""
