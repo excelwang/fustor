@@ -71,7 +71,20 @@ class TestParentMtimeCheck:
         assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # After Audit, stale_file should STILL be absent (discarded by parent mtime check)
-        tree = fusion_client.get_tree(path=test_dir, max_depth=-1)
+        # Use retry to handle transient 503 errors (Fusion processing queue)
+        import requests
+        tree = None
+        for _ in range(10):
+            try:
+                tree = fusion_client.get_tree(path=test_dir, max_depth=-1)
+                break
+            except requests.HTTPError as e:
+                if e.response.status_code == 503:
+                    time.sleep(1)
+                    continue
+                raise
+        
+        assert tree is not None, "Failed to get tree after retries"
         stale_found = fusion_client._find_in_tree(tree, stale_file)
         assert stale_found is None, \
             f"Stale file should not appear after Audit. Tree: {tree}"

@@ -21,4 +21,4 @@
 
 
 ## YAML 格式
-- [ ] 各种id需要能直接用于url而无需encode。例如：`fustor-agent-01`、`fustor-view-01`。
+- [x] 各种id需要能直接用于url而无需encode。例如：`fustor-agent-01`、`fustor-view-01`。
