@@ -70,8 +70,7 @@ def docker_env():
     # 2. Inject Datastores Config
     ds_config = """
 datastores:
-  1:
-    name: "integration-test-ds"
+  integration-test-ds:
     api_key: "test-api-key-123"
     session_timeout_seconds: 3
     allow_concurrent_push: true
@@ -81,7 +80,7 @@ datastores:
     # 3. Inject View Config
     view_config = """
 id: "test-fs"
-datastore_id: 1
+datastore_id: "integration-test-ds"
 driver: "fs"
 disabled: false
 driver_params:
@@ -103,7 +102,7 @@ driver_params:
 def test_datastore() -> dict:
     """Return static test datastore info."""
     return {
-        "id": 1,
+        "id": "integration-test-ds",
         "name": "integration-test-ds",
         "allow_concurrent_push": True,
         "session_timeout_seconds": 3
@@ -115,7 +114,7 @@ def test_api_key(test_datastore) -> dict:
     """Return static API key info."""
     return {
         "key": "test-api-key-123",
-        "datastore_id": 1,
+        "datastore_id": "integration-test-ds",
         "name": "integration-test-key"
     }
 
