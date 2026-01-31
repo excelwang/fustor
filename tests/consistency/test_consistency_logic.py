@@ -14,7 +14,7 @@ async def test_arbitration_logic():
     evt1 = UpdateEvent(table="files", rows=rows, index=1, fields=[], message_source=MessageSource.SNAPSHOT, event_schema="s")
     await parser.process_event(evt1)
     
-    node = parser._get_node("/test/file1")
+    node = parser.state.get_node("/test/file1")
     assert node.size == 100
     
     # 2. Realtime event (newer data)
@@ -23,7 +23,7 @@ async def test_arbitration_logic():
     evt2 = UpdateEvent(table="files", rows=rows2, index=2, fields=[], message_source=MessageSource.REALTIME, event_schema="s")
     await parser.process_event(evt2)
     
-    node = parser._get_node("/test/file1")
+    node = parser.state.get_node("/test/file1")
     assert node.size == 200
     assert node.modified_time == new_time
     
@@ -32,20 +32,20 @@ async def test_arbitration_logic():
     evt3 = UpdateEvent(table="files", rows=rows3, index=3, fields=[], message_source=MessageSource.SNAPSHOT, event_schema="s")
     await parser.process_event(evt3)
     
-    node = parser._get_node("/test/file1")
+    node = parser.state.get_node("/test/file1")
     assert node.size == 200 # Should NOT change to 300
     
     # 4. Realtime Delete
     del_evt = DeleteEvent(table="files", rows=[{"path": "/test/file1"}], index=4, fields=[], message_source=MessageSource.REALTIME, event_schema="s")
     await parser.process_event(del_evt)
     
-    node = parser._get_node("/test/file1")
+    node = parser.state.get_node("/test/file1")
     assert node is None
-    assert "/test/file1" in parser._tombstone_list
+    assert "/test/file1" in parser.state.tombstone_list
     
     # 5. Snapshot resurrect check - Should be ignored due to Tombstone
     await parser.process_event(evt1) # Resend old snapshot
-    node = parser._get_node("/test/file1")
+    node = parser.state.get_node("/test/file1")
     assert node is None # Still dead
 
 @pytest.mark.asyncio
@@ -54,7 +54,7 @@ async def test_audit_sentinel_logic():
     
     # 1. Audit Start
     await parser.handle_audit_start()
-    assert parser._last_audit_start is not None
+    assert parser.state.last_audit_start is not None
     
     # 2. Audit Event (Update)
     now = time.time()
@@ -62,38 +62,38 @@ async def test_audit_sentinel_logic():
     evt = UpdateEvent(table="files", rows=rows, index=1000, fields=[], message_source=MessageSource.AUDIT, event_schema="s")
     await parser.process_event(evt)
     
-    node = parser._get_node("/test/audit_file")
+    node = parser.state.get_node("/test/audit_file")
     assert node.size == 500
     # Audit events mark files as blind-spot additions
-    assert node.path in parser._blind_spot_additions
+    assert node.path in parser.state.blind_spot_additions
     
     # 3. Sentinel Suspect List
     # Check if hot file is in suspect list
     # logic: if (now - mtime) < HOT_FILE_THRESHOLD_SECONDS (600): suspect=True
     assert node.integrity_suspect == True
-    assert "/test/audit_file" in parser._suspect_list
+    assert "/test/audit_file" in parser.state.suspect_list
     
     # 4. Audit End (Cleanup)
     # Tombstone cleanup logic: Remove tombstones created BEFORE audit start
     # (i.e., keep only ts >= self._last_audit_start)
-    audit_start_time = parser._last_audit_start
+    audit_start_time = parser.state.last_audit_start
     
-    parser._tombstone_list["/d/before"] = audit_start_time - 10  # Before audit start → should be removed
-    parser._tombstone_list["/d/after"] = audit_start_time + 10   # After audit start → should be kept
+    parser.state.tombstone_list["/d/before"] = audit_start_time - 10  # Before audit start → should be removed
+    parser.state.tombstone_list["/d/after"] = audit_start_time + 10   # After audit start → should be kept
     
     await parser.handle_audit_end()
     
     # Tomb stones created before audit should be cleaned up
-    assert "/d/before" not in parser._tombstone_list
+    assert "/d/before" not in parser.state.tombstone_list
     # Tombstones created during/after audit should remain
-    assert "/d/after" in parser._tombstone_list
-    assert parser._last_audit_start is None
+    assert "/d/after" in parser.state.tombstone_list
+    assert parser.state.last_audit_start is None
 
 
 @pytest.mark.asyncio
 async def test_auto_audit_start():
     parser = FSViewProvider(datastore_id=1)
-    assert parser._last_audit_start is None
+    assert parser.state.last_audit_start is None
     
     now_ms = int(time.time() * 1000)
     rows = [{"path": "/test/auto", "modified_time": 0, "size": 0}]
@@ -101,8 +101,8 @@ async def test_auto_audit_start():
     
     await parser.process_event(evt)
     
-    assert parser._last_audit_start is not None
-    assert abs(parser._last_audit_start - now_ms/1000.0) < 0.1
+    assert parser.state.last_audit_start is not None
+    assert abs(parser.state.last_audit_start - now_ms/1000.0) < 0.1
 
 @pytest.mark.asyncio
 async def test_parent_mtime_check():
@@ -115,7 +115,7 @@ async def test_parent_mtime_check():
     parent_evt = UpdateEvent(table="dirs", rows=parent_rows, index=1, fields=[], message_source=MessageSource.REALTIME, event_schema="s")
     await parser.process_event(parent_evt)
     
-    parent_node = parser._directory_path_map.get("/data")
+    parent_node = parser.state.directory_path_map.get("/data")
     assert parent_node is not None
     assert parent_node.modified_time == parent_realtime_mtime
     
@@ -134,7 +134,7 @@ async def test_parent_mtime_check():
     await parser.process_event(audit_evt)
     
     # File should NOT be added because parent_mtime check failed
-    file_node = parser._get_node("/data/stale_file.txt")
+    file_node = parser.state.get_node("/data/stale_file.txt")
     assert file_node is None, "File should be discarded due to stale parent_mtime"
     
     # 3. Now send an Audit event with a CURRENT parent_mtime
@@ -149,9 +149,9 @@ async def test_parent_mtime_check():
     await parser.process_event(valid_audit_evt)
     
     # File SHOULD be added
-    valid_file_node = parser._get_node("/data/valid_file.txt")
+    valid_file_node = parser.state.get_node("/data/valid_file.txt")
     assert valid_file_node is not None, "File should be added when parent_mtime is current"
-    assert valid_file_node.path in parser._blind_spot_additions  # New file from Audit = blind-spot
+    assert valid_file_node.path in parser.state.blind_spot_additions  # New file from Audit = blind-spot
 
 @pytest.mark.asyncio
 async def test_audit_missing_file_detection():
@@ -186,12 +186,12 @@ async def test_audit_missing_file_detection():
     await parser.process_event(file_b_evt)
     
     # Verify initial state
-    assert parser._get_node("/project/a.txt") is not None
-    assert parser._get_node("/project/b.txt") is not None
+    assert parser.state.get_node("/project/a.txt") is not None
+    assert parser.state.get_node("/project/b.txt") is not None
     
     # 2. Start Audit
     await parser.handle_audit_start()
-    assert len(parser._audit_seen_paths) == 0
+    assert len(parser.state.audit_seen_paths) == 0
     
     # 3. Send Audit events - only file A is reported (B was deleted on blind-spot node)
     audit_evt = UpdateEvent(
@@ -211,18 +211,18 @@ async def test_audit_missing_file_detection():
     await parser.process_event(audit_evt)
     
     # Also "scan" the parent directory in audit
-    parser._audit_seen_paths.add("/project")
+    parser.state.audit_seen_paths.add("/project")
     
     # 4. End Audit - should detect /project/b.txt as missing and DELETE it
     await parser.handle_audit_end()
     
     # 5. Verify: file B should be DELETED from memory tree (Section 5.3 Scenario 2)
-    file_b = parser._get_node("/project/b.txt")
+    file_b = parser.state.get_node("/project/b.txt")
     assert file_b is None, "File B should be deleted from memory tree (blind-spot deletion)"
     
     # But tracked in blind-spot deletions
-    assert "/project/b.txt" in parser._blind_spot_deletions
+    assert "/project/b.txt" in parser.state.blind_spot_deletions
     
     # File A should still exist
-    file_a = parser._get_node("/project/a.txt")
+    file_a = parser.state.get_node("/project/a.txt")
     assert file_a is not None, "File A should still exist"

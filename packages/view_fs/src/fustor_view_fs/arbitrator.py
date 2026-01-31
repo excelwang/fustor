@@ -132,6 +132,9 @@ class FSArbitrator:
                     # Memory parent is newer than what audit saw -> audit result is stale
                     return
 
+        # Capture state before update for arbitration
+        old_mtime = existing.modified_time if existing else 0.0
+        
         # Perform the actual update
         await self.tree_manager.update_node(payload, path)
         node = self.state.get_node(path)
@@ -147,7 +150,7 @@ class FSArbitrator:
         else:
             # Manage Suspect List (Hot Data)
             age = self.state.logical_clock.get_watermark() - mtime
-            mtime_changed = (existing is None) or (abs(existing.modified_time - mtime) > 1e-6)
+            mtime_changed = (existing is None) or (abs(old_mtime - mtime) > 1e-6)
             
             if mtime_changed:
                 if is_audit:

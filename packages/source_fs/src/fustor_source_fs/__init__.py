@@ -70,8 +70,20 @@ class FSDriver(SourceDriver):
         self._logical_clock = LogicalClock()
         
         min_monitoring_window_days = self.config.driver_params.get("min_monitoring_window_days", 30.0)
-        self.watch_manager = _WatchManager(self.uri, event_handler=None, min_monitoring_window_days=min_monitoring_window_days, stop_driver_event=self._stop_driver_event, logical_clock=self._logical_clock)
-        self.event_handler = OptimizedWatchEventHandler(self.event_queue, self.watch_manager, logical_clock=self._logical_clock)
+        throttle_interval = self.config.driver_params.get("throttle_interval_sec", 5.0)
+        self.watch_manager = _WatchManager(
+            self.uri, 
+            event_handler=None, 
+            min_monitoring_window_days=min_monitoring_window_days, 
+            stop_driver_event=self._stop_driver_event, 
+            logical_clock=self._logical_clock,
+            throttle_interval=throttle_interval
+        )
+        self.event_handler = OptimizedWatchEventHandler(
+            self.event_queue, 
+            self.watch_manager, 
+            logical_clock=self._logical_clock
+        )
         self.watch_manager.event_handler = self.event_handler
         self._pre_scan_completed = False
         self._pre_scan_lock = threading.Lock()

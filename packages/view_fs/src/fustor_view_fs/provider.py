@@ -67,8 +67,17 @@ class FSViewProvider(FSViewBase):
     async def reset(self):
         """Full reset of the in-memory view."""
         async with self._global_exclusive_lock():
+            # 1. Clear view-specific in-memory state
             self.state.reset()
-            self.logger.info("FS View state has been fully reset.")
+            
+            # 2. Clear global Fusion states for this datastore
+            from fustor_fusion.in_memory_queue import memory_event_queue
+            from fustor_fusion.datastore_state_manager import datastore_state_manager
+            
+            await memory_event_queue.clear_datastore_data(self.datastore_id)
+            await datastore_state_manager.clear_state(self.datastore_id)
+            
+            self.logger.info(f"FS View and Core state for datastore {self.datastore_id} has been fully reset.")
 
     # --- Query Delegation ---
 

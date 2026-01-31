@@ -121,7 +121,7 @@ class _WatchManager:
     Manages a single inotify instance and its watches, including LRU pruning.
     This is a more resource-efficient implementation.
     """
-    def __init__(self, root_path: str, event_handler, min_monitoring_window_days: float = 30.0, stop_driver_event: threading.Event = None, logical_clock=None):
+    def __init__(self, root_path: str, event_handler, min_monitoring_window_days: float = 30.0, stop_driver_event: threading.Event = None, logical_clock=None, throttle_interval: float = 5.0):
         logger.info(f"Creating a new Inotify instance for root path {root_path}.")
         self.watch_limit = 10000000  # This now only limits watches, not instances.
         self.lru_cache = _LRUCache(self.watch_limit)
@@ -131,6 +131,7 @@ class _WatchManager:
         self.min_monitoring_window_days = min_monitoring_window_days
         self.stop_driver_event = stop_driver_event 
         self.logical_clock = logical_clock
+        self.throttle_interval = throttle_interval
 
         # Directly use the low-level Inotify class
         # We watch the root path non-recursively just to initialize the instance.

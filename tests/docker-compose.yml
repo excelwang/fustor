@@ -65,9 +65,9 @@ services:
       FUSTOR_FUSION_REGISTRY_URL: "http://registry:8101"
       FUSTOR_FUSION_DATA_DIR: "/data/fusion"
       # Faster cache sync for integration tests
-      FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: "5"
+      FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: "1"
       # Accelerate failover tests
-      FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS: "10"
+      FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS: "3"
       # Shared token for internal service communication (must match Registry)
       FUSTOR_REGISTRY_CLIENT_TOKEN: "test-integration-token-for-internal-apis-12345"
       FUSTOR_CORE_SECRET_KEY: "test-integration-secret-key-for-jwt-signing"
@@ -111,7 +111,7 @@ services:
       NFS_SERVER: "nfs-server"
       NFS_PATH: "/exports"
       MOUNT_POINT: "/mnt/shared"
-      MOUNT_OPTIONS: "actimeo=2,nolock"
+      MOUNT_OPTIONS: "actimeo=1,nolock"
       AGENT_ENABLED: "false"
       AGENT_ID: "agent-a"
       AGENT_PORT: "8100"
@@ -154,7 +154,7 @@ services:
       NFS_SERVER: "nfs-server"
       NFS_PATH: "/exports"
       MOUNT_POINT: "/mnt/shared"
-      MOUNT_OPTIONS: "actimeo=2,nolock"
+      MOUNT_OPTIONS: "actimeo=1,nolock"
       AGENT_ENABLED: "false"
       AGENT_ID: "agent-b"
       AGENT_PORT: "8100"
@@ -199,7 +199,7 @@ services:
       NFS_SERVER: "nfs-server"
       NFS_PATH: "/exports"
       MOUNT_POINT: "/mnt/shared"
-      MOUNT_OPTIONS: "actimeo=2,nolock"
+      MOUNT_OPTIONS: "actimeo=1,nolock"
       AGENT_ENABLED: "false"
     networks:
       - fustor-net

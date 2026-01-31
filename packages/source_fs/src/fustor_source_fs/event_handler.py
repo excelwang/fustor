@@ -44,7 +44,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
         self.logical_clock = logical_clock
         # Path -> last_sent_time mapping to throttle on_modified for files
         self.last_modified_sent: Dict[str, float] = {}
-        self.throttle_interval = 5.0  # seconds
+        self.throttle_interval = float(getattr(watch_manager, 'throttle_interval', 5.0))
 
     def _get_index(self, mtime=None):
         if self.logical_clock:

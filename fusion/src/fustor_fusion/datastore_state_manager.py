@@ -279,5 +279,15 @@ class DatastoreStateManager:
                 return state.leader_session_id
             return None
 
+    async def clear_state(self, datastore_id: int):
+        """
+        Purge the runtime state for a given datastore.
+        Used for full reset during tests.
+        """
+        async with self._lock:
+            if datastore_id in self._states:
+                del self._states[datastore_id]
+                logger.info(f"Purged runtime state for datastore {datastore_id}")
+
 # 全局实例
 datastore_state_manager = DatastoreStateManager()

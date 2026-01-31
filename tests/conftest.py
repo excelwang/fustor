@@ -20,8 +20,12 @@ if not logger.handlers:
 
 # Test configuration
 TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "600"))
-AUDIT_INTERVAL = int(os.getenv("FUSTOR_AUDIT_INTERVAL", "5"))
-SUSPECT_TTL_SECONDS = int(os.getenv("FUSTOR_SUSPECT_TTL", "30"))  # Default 60 for tests
+
+# Timing Hierarchy
+# NFS actimeo=1 (set in docker-compose.yml)
+ACTIMEO = 1 
+SUSPECT_TTL_SECONDS = 2 * ACTIMEO     # 2s
+AUDIT_INTERVAL = 2 * SUSPECT_TTL_SECONDS # 4s
 
 # Container names
 CONTAINER_NFS_SERVER = "fustor-nfs-server"
@@ -39,62 +43,30 @@ MOUNT_POINT = "/mnt/shared"
 def docker_env():
     """
     Session-scoped fixture that manages the Docker Compose environment.
-    
-    Set FUSTOR_REUSE_ENV=true to use an already running environment.
-    Otherwise, the environment will be built and torn down for each session.
+    Always attempts to reuse an existing environment if healthy.
     """
-    reuse_env = os.getenv("FUSTOR_REUSE_ENV", "false").lower() == "true"
-    
-    if reuse_env:
-        logger.info("Checking Docker Compose environment (Reuse Mode)")
-        # Check if environment is up by testing one container
-        try:
-            docker_manager.exec_in_container(CONTAINER_REGISTRY, ["ls", "/"])
-            is_up = True
-        except Exception:
-            is_up = False
-            
-        if not is_up:
-            logger.info("Environment not running. Starting it automatically...")
-            docker_manager.up(build=True, wait=True)
-        else:
-            # Check individual container health
-            for container in [CONTAINER_NFS_SERVER, CONTAINER_REGISTRY, CONTAINER_FUSION]:
-                if not docker_manager.wait_for_health(container, timeout=60):
-                    logger.warning(f"Container {container} not healthy. Repairing ecosystem...")
-                    docker_manager.up(build=True, wait=True)
-                    break
+    logger.info("Checking Docker Compose environment (Auto-Reuse Mode)")
+    # Check if environment is up by testing one container
+    try:
+        docker_manager.exec_in_container(CONTAINER_REGISTRY, ["ls", "/"])
+        is_up = True
+    except Exception:
+        is_up = False
         
-        logger.info("All containers healthy (Reused/Auto-started)")
-        yield docker_manager
-        # Don't tear down when reusing
-        logger.info("Keeping Docker Compose environment running")
+    if not is_up:
+        logger.info("Environment not running. Starting it automatically...")
+        docker_manager.up(build=True, wait=True)
     else:
-        logger.info("Starting Docker Compose environment")
-        try:
-            # Build and start all services
-            docker_manager.up(build=True, wait=True)
-            
-            # Wait for all containers to be healthy
-            containers = [
-                CONTAINER_NFS_SERVER,
-                CONTAINER_REGISTRY,
-                CONTAINER_FUSION,
-                CONTAINER_CLIENT_A,
-                CONTAINER_CLIENT_B,
-                CONTAINER_CLIENT_C
-            ]
-            for container in containers:
-                if not docker_manager.wait_for_health(container, timeout=120):
-                    logs = docker_manager.get_logs(container)
-                    raise RuntimeError(f"Container {container} failed to become healthy.\nLogs:\n{logs}")
-            
-            logger.info("All containers healthy")
-            yield docker_manager
-            
-        finally:
-            logger.info("Tearing down Docker Compose environment")
-            docker_manager.down(volumes=True)
+        # Check individual container health
+        for container in [CONTAINER_NFS_SERVER, CONTAINER_REGISTRY, CONTAINER_FUSION]:
+            if not docker_manager.wait_for_health(container, timeout=30):
+                logger.warning(f"Container {container} not healthy. Repairing ecosystem...")
+                docker_manager.up(build=True, wait=True)
+                break
+    
+    logger.info("All containers healthy (Reused/Auto-started)")
+    yield docker_manager
+    logger.info("Keeping Docker Compose environment running (Use cleanup.sh for total reset)")
 
 
 @pytest.fixture(scope="session")
@@ -128,21 +100,21 @@ def test_datastore(registry_client) -> dict:
         if ds["name"] == "integration-test-ds":
             logger.info(f"Reusing existing datastore: {ds['id']}")
             # Ensure allow_concurrent_push is True and fast timeout even for reused datastore
-            if not ds.get("allow_concurrent_push") or ds.get("session_timeout_seconds") != 10:
-                 logger.info(f"Updating datastore {ds['id']} to use 10s timeout...")
-                 registry_client.update_datastore(ds["id"], allow_concurrent_push=True, session_timeout_seconds=10)
+            if not ds.get("allow_concurrent_push") or ds.get("session_timeout_seconds") != 3:
+                 logger.info(f"Updating datastore {ds['id']} to use 3s timeout...")
+                 registry_client.update_datastore(ds["id"], allow_concurrent_push=True, session_timeout_seconds=3)
                  ds["allow_concurrent_push"] = True
-                 ds["session_timeout_seconds"] = 10
+                 ds["session_timeout_seconds"] = 3
                  # Wait for Fusion to sync the new config if we modified it
                  logger.info("Waiting for configuration to propagate to Fusion...")
-                 time.sleep(10)
+                 time.sleep(2)
             return ds
 
     ds = registry_client.create_datastore(
         name="integration-test-ds",
         description="Datastore for NFS consistency integration tests",
         allow_concurrent_push=True,
-        session_timeout_seconds=10
+        session_timeout_seconds=3
     )
     logger.info(f"Created new datastore: {ds['name']} (ID: {ds['id']})")
     return ds
@@ -224,6 +196,8 @@ sources:
     credential:
       user: "unused"
     disabled: false
+    driver_params:
+      throttle_interval_sec: 0.5
 
 pushers:
   fusion:
@@ -241,7 +215,8 @@ syncs:
     pusher: "fusion"
     disabled: false
     audit_interval_sec: {AUDIT_INTERVAL}
-    sentinel_interval_sec: {AUDIT_INTERVAL // 2 if AUDIT_INTERVAL > 10 else 5}
+    sentinel_interval_sec: 1
+    heartbeat_interval_sec: 1
 """
     # 2. Write config file
     docker_manager.create_file_in_container(
@@ -254,7 +229,7 @@ syncs:
     docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])
     docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent.pid"])
     docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent-state.json"])
-    time.sleep(1)
+    time.sleep(0.2)
     
     # 4. Start new agent
     docker_manager.exec_in_container(
@@ -281,15 +256,15 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
         except Exception:
              pass # Ignore errors if not running
 
-    # Wait for Fusion sessions to expire (max 12s to safely cover 10s timeout)
-    logger.info("Waiting for stale sessions to expire (max 12s)...")
+    # Wait for Fusion sessions to expire (max 5s to safely cover 3s timeout)
+    logger.info("Waiting for stale sessions to expire (max 5s)...")
     start_cleanup = time.time()
-    while time.time() - start_cleanup < 12:
+    while time.time() - start_cleanup < 5:
         sessions = fusion_client.get_sessions()
         if not sessions:
             logger.info("All sessions cleared.")
             break
-        time.sleep(1)
+        time.sleep(0.5)
     else:
         logger.warning(f"Some sessions still active after cleanup: {fusion_client.get_sessions()}")
 
@@ -311,7 +286,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
                 break
             else:
                 logger.warning(f"Someone else is leader: {agent_id}. Waiting...")
-        time.sleep(1)
+        time.sleep(0.5)
     else:
         # Fallback/Timeout warning - logs will be helpful
         logger.warning("Timeout waiting for Agent A to become leader. Proceeding anyway (might fail)...")
@@ -330,7 +305,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
         if agent_b:
             logger.info(f"Agent B registered: {agent_b.get('agent_id')} (Role: {agent_b.get('role')})")
             break
-        time.sleep(1)
+        time.sleep(0.5)
     else:
         logs = docker_manager.get_logs(CONTAINER_CLIENT_B)
         logger.warning(f"Timeout waiting for Agent B. Logs:\n{logs}")
@@ -359,7 +334,7 @@ def clean_shared_dir(docker_env):
         ["sh", "-c", "rm -rf /exports/* 2>/dev/null || true"]
     )
     # Wait for NFS cache partially
-    time.sleep(2)
+    time.sleep(1.1)
     yield
 
 
@@ -379,7 +354,7 @@ def reset_fusion_state(fusion_client):
 @pytest.fixture
 def wait_for_audit():
     """Return a function that waits for audit cycle to complete."""
-    def _wait(seconds: int = AUDIT_INTERVAL + 5):
+    def _wait(seconds: int = AUDIT_INTERVAL + 1):
         time.sleep(seconds)
     return _wait
 
@@ -420,10 +395,10 @@ def reset_leadership(fusion_client, setup_agents, docker_env):
     # Wait for sessions to vanish
     logger.info("Waiting for stale sessions to expire...")
     start_cleanup = time.time()
-    while time.time() - start_cleanup < 15:
+    while time.time() - start_cleanup < 6:
         if not fusion_client.get_sessions():
             break
-        time.sleep(1)
+        time.sleep(0.5)
         
     # Restart A first
     logger.info("Restarting Agent A...")
@@ -437,12 +412,12 @@ def reset_leadership(fusion_client, setup_agents, docker_env):
         leader = next((s for s in sessions if s.get("role") == "leader"), None)
         if leader and "agent-a" in leader.get("agent_id", ""):
             break
-        time.sleep(1)
+        time.sleep(0.5)
         
     # Restart B
     logger.info("Restarting Agent B...")
     ensure_agent_running(CONTAINER_CLIENT_B, api_key, datastore_id)
     
     # Wait for B
-    time.sleep(5)
+    time.sleep(1)
     logger.info("Leadership reset complete.")

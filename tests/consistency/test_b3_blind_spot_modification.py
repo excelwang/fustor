@@ -57,24 +57,23 @@ class TestBlindSpotFileModification:
         assert mtime_before_audit == original_mtime, \
             "Fusion mtime should be unchanged before Audit"
         
-        # Step 4: Use a marker file to detect Audit completion
-        marker_file = f"{MOUNT_POINT}/audit_marker_b3_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Step 4: Wait for Audit cycle to detect the modification
+        # We wait for ACTIMEO + AUDIT_INTERVAL to ensure NFS cache is clear and audit runs
+        logger.info(f"Waiting for Audit cycle ({AUDIT_INTERVAL}s) to detect blind modification...")
+        wait_for_audit()
         
         # Step 5: After Audit, Fusion mtime should be updated
-        # Poll for mtime update
+        # Poll briefly for the change to be reflected in the tree
         start = time.time()
         success = False
         mtime_after_audit = 0
-        while time.time() - start < 15:
+        while time.time() - start < 10:
             tree_after = fusion_client.get_tree(path=test_file, max_depth=0)
             mtime_after_audit = tree_after.get("mtime")
             if abs(mtime_after_audit - new_fs_mtime) < 0.001:
                 success = True
                 break
-            time.sleep(1)
+            time.sleep(0.5)
         
         assert success, \
             f"Fusion mtime should match filesystem mtime {new_fs_mtime} after Audit. Got {mtime_after_audit}"
@@ -88,6 +87,9 @@ class TestBlindSpotFileModification:
         wait_for_audit
     ):
         """场景: 盲区修改的文件标记为 agent_missing"""
+        import logging
+        logger = logging.getLogger("fustor_test")
+
         test_file = f"{MOUNT_POINT}/blind_modify_flag_test_{int(time.time()*1000)}.txt"
         
         # Create from agent, modify from blind-spot
@@ -103,19 +105,17 @@ class TestBlindSpotFileModification:
         assert flags_initial["agent_missing"] is False
         
         # Modify from blind-spot
-        time.sleep(2)
+        time.sleep(1.5) # Ensure mtime distinct
         docker_manager.modify_file_in_container(
             CONTAINER_CLIENT_C,
             test_file,
             append_content="blind modification"
         )
         
-        # Use marker file to detect Audit completion
-        marker_file = f"{MOUNT_POINT}/audit_marker_b3_flag_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Wait for Audit cycle
+        logger.info(f"Waiting for Audit cycle ({AUDIT_INTERVAL}s) to detect blind modification flags...")
+        wait_for_audit()
         
         # Check agent_missing flag after modification
-        assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=15), \
+        assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=10), \
             "agent_missing flag should be set after blind modification"

@@ -80,7 +80,7 @@ class DockerManager:
             status = result.stdout.strip()
             if status == "healthy":
                 return True
-            time.sleep(2)
+            time.sleep(0.5)
         return False
 
     def stop_container(self, container: str) -> None:

@@ -151,7 +151,7 @@ class FusionClient:
         self,
         path: str,
         timeout: float = 30,
-        interval: float = 1,
+        interval: float = 0.1,
         should_exist: bool = True
     ) -> bool:
         """Wait for file to appear/disappear in Fusion tree."""
@@ -173,7 +173,7 @@ class FusionClient:
         file_path: str,
         root_path: str = "/",
         timeout: float = 30,
-        interval: float = 1
+        interval: float = 0.1
     ) -> Optional[dict]:
         """Wait for a specific file to appear in tree."""
         start = time.time()
@@ -229,7 +229,7 @@ class FusionClient:
         flag_name: str,
         expected_value: bool,
         timeout: float = 30,
-        interval: float = 1
+        interval: float = 0.1
     ) -> bool:
         """Wait for a specific flag to reach expected value."""
         start = time.time()

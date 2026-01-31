@@ -67,7 +67,7 @@ class SyncInstance:
         self._stop_heartbeat_event = asyncio.Event()
         self._heartbeat_error_event = asyncio.Event()  # Event to signal heartbeat error
         self._last_active_time = datetime.now(timezone.utc)
-        self.heartbeat_interval: int = 10  # Default heartbeat interval
+        self.heartbeat_interval: int = getattr(config, 'heartbeat_interval_sec', 10)
         # Use config values for consistency intervals (with fallback defaults)
         self.audit_interval: int = getattr(config, 'audit_interval_sec', 600)
         self.sentinel_interval: int = getattr(config, 'sentinel_interval_sec', 120)

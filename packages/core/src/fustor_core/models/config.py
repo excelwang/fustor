@@ -96,6 +96,7 @@ class SyncConfig(BaseModel):
     # Consistency-related intervals (Section 7 of CONSISTENCY_DESIGN)
     audit_interval_sec: int = Field(default=600, ge=0, description="审计扫描间隔(秒)，0表示禁用，默认10分钟")
     sentinel_interval_sec: int = Field(default=120, ge=0, description="哨兵巡检间隔(秒)，0表示禁用，默认2分钟")
+    heartbeat_interval_sec: int = Field(default=10, ge=1, description="心跳间隔(秒)，默认10秒")
 
 class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):
     root: Dict[str, SourceConfig] = Field(default_factory=dict)
