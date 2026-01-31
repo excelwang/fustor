@@ -59,7 +59,7 @@ class ViewsConfigLoader:
     driver: fs
     disabled: false
     driver_params:
-      hot_item_threshold: 600
+      hot_file_threshold: 600
     ```
     """
     

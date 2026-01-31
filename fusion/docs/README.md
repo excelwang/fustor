@@ -57,7 +57,7 @@ views:
     disabled: false
     datastore_id: 1   # 该视图实例服务的数据仓库 ID
     driver_params:
-      hot_item_threshold: 30
+      hot_file_threshold: 30
 ```
 
 

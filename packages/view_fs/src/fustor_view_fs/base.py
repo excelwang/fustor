@@ -21,10 +21,10 @@ class FSViewBase(ViewDriver):
         # Allow config to override argument
         final_config = config or {}
         # Support both keys, prefer item
-        threshold = final_config.get("hot_item_threshold") or final_config.get("hot_file_threshold") or hot_file_threshold
+        threshold = final_config.get("hot_file_threshold") or final_config.get("hot_file_threshold") or hot_file_threshold
         
         # Ensure config has at least one valid key for upstream
-        final_config.setdefault("hot_item_threshold", threshold)
+        final_config.setdefault("hot_file_threshold", threshold)
         
         super().__init__(view_id, datastore_id, final_config)
         

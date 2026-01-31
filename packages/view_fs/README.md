@@ -25,5 +25,5 @@ views:
   my-fs:
     driver: "fs"
     driver_params:
-      hot_item_threshold: 30  # 文件被视为“热”的时间阈值（秒）
+      hot_file_threshold: 30  # 文件被视为“热”的时间阈值（秒）
 ```

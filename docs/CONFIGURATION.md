@@ -53,7 +53,7 @@ datastore_id: 1
 driver: fs
 disabled: false
 driver_params:
-  hot_item_threshold: 30
+  hot_file_threshold: 30
 ```
 
 - **id**: Unique identifier (URL-safe string).
