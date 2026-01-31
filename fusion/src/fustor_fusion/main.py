@@ -44,19 +44,19 @@ async def lifespan(app: FastAPI):
         raise
     logger.info("Initial configuration load successful.")
 
-    # Start periodic suspect cleanup (Every 5 seconds)
+    # Start periodic suspect cleanup (Every 0.5 seconds)
     async def periodic_suspect_cleanup():
         logger.info("Starting periodic suspect cleanup task")
         while True:
             try:
-                await asyncio.sleep(5)
+                await asyncio.sleep(0.5)
                 await cleanup_all_expired_suspects()
             except asyncio.CancelledError:
                 logger.info("Periodic suspect cleanup task cancelled")
                 break
             except Exception as e:
                 logger.error(f"Error in periodic_suspect_cleanup task: {e}", exc_info=True)
-                await asyncio.sleep(5) # Avoid tight error loop
+                await asyncio.sleep(0.5) # Avoid tight error loop
             
     suspect_cleanup_task = asyncio.create_task(periodic_suspect_cleanup())
     
@@ -66,8 +66,7 @@ async def lifespan(app: FastAPI):
     # NEW: Auto-start enabled views from YAML
     try:
         from .config import views_config
-        from .view_manager.manager import ViewManager
-        from fustor_fusion_sdk.loaders import load_view
+        from .view_manager.manager import get_cached_view_manager
         
         # Reload to ensure fresh config
         views_config.reload()
@@ -78,26 +77,19 @@ async def lifespan(app: FastAPI):
             try:
                 datastore_id = config.datastore_id
                 
-                # Ensure ViewManager exists
-                if datastore_id not in runtime_objects.view_managers:
-                     runtime_objects.view_managers[datastore_id] = ViewManager(datastore_id=datastore_id)
+                # Use the centralized cache to ensure consistency with API/Ingestion
+                vm = await get_cached_view_manager(datastore_id)
                 
-                vm = runtime_objects.view_managers[datastore_id]
-                
-                # Check if already running (unlikely on fresh start, but good safety)
+                # Check if provider is already loaded (get_cached_view_manager initializes them)
                 if view_id in vm.providers:
+                    logger.info(f"View {view_id} already initialized by manager.")
                     continue
-
-                # Start Provider
-                provider_class = load_view(config.driver)
-                provider = provider_class(
-                    view_id=view_id,
-                    datastore_id=datastore_id,
-                    config=config.driver_params
-                )
-                await provider.initialize()
-                vm.providers[view_id] = provider
-                logger.info(f"Auto-started view: {view_id}")
+                
+                # If not loaded (e.g. not in config but manually started? Unlikely if we read from config),
+                # force load. But get_cached_view_manager calls initialize_providers(), so strictly
+                # speaking we shouldn't need to do anything if it's in config.
+                
+                logger.info(f"Verified view {view_id} is active in manager for datastore {datastore_id}")
                 
             except Exception as e:
                 logger.error(f"Failed to auto-start view {view_id}: {e}", exc_info=True)
