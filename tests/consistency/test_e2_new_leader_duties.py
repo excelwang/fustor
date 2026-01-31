@@ -42,6 +42,19 @@ class TestNewLeaderResumesDuties:
             # Wait for failover (Session timeout 10s + buffer)
             time.sleep(15)
             
+            # Wait for Snapshot (Readiness) restoration
+            start_wait = time.time()
+            ready = False
+            while time.time() - start_wait < 60:
+                try:
+                    fusion_client.get_stats()
+                    ready = True 
+                    break
+                except Exception:
+                    time.sleep(1)
+            if not ready:
+                pytest.fail("Datastore failed to become ready after failover in test_new_leader_performs_audit")
+            
             # Verify B is now leader
             sessions = fusion_client.get_sessions()
             new_leader = None
@@ -134,6 +147,19 @@ class TestNewLeaderResumesDuties:
         try:
             # Wait for failover (Session timeout 10s + buffer)
             time.sleep(15)
+
+            # Wait for Snapshot (Readiness) restoration
+            start_wait = time.time()
+            ready = False
+            while time.time() - start_wait < 60:
+                try:
+                    fusion_client.get_stats()
+                    ready = True 
+                    break
+                except Exception:
+                    time.sleep(1)
+            if not ready:
+                pytest.fail("Datastore failed to become ready after failover in test_new_leader_performs_snapshot")
             
             # Create new file while B is leader
             new_file = f"{test_dir}/after_failover.txt"

@@ -67,7 +67,10 @@ class SyncInstance:
         self._stop_heartbeat_event = asyncio.Event()
         self._heartbeat_error_event = asyncio.Event()  # Event to signal heartbeat error
         self._last_active_time = datetime.now(timezone.utc)
-        self.heartbeat_interval: int = getattr(config, 'heartbeat_interval_sec', 10)
+        self._last_active_time = datetime.now(timezone.utc)
+        # Heartbeat interval is now dynamically set by the session response from Fusion
+        # Default to 10s until session is established
+        self.heartbeat_interval: int = 10 
         # Use config values for consistency intervals (with fallback defaults)
         self.audit_interval: int = getattr(config, 'audit_interval_sec', 600)
         self.sentinel_interval: int = getattr(config, 'sentinel_interval_sec', 120)
@@ -151,11 +154,15 @@ class SyncInstance:
         
         if new_role == 'leader':
              # Promoted to leader
-             logger.info(f"Promoted to LEADER. Starting maintenance tasks.")
-             if not self._audit_task or self._audit_task.done():
-                 self._audit_task = asyncio.create_task(self._run_audit_loop())
-             if not self._sentinel_task or self._sentinel_task.done():
-                 self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
+             logger.info(f"Promoted to LEADER. Starting maintenance tasks and triggering supplemental snapshot to claim authority.")
+             
+             # IMPORTANT: When becoming leader (especially after failover), we must ensure Fusion 
+             # recognizes us as the authoritative source for the full state.
+             # Fusion resets 'snapshot_complete' when authoritative session changes.
+             # So we must perform a snapshot to re-establish readiness.
+             # Sequence: Snapshot -> (if success) -> Audit & Sentinel
+             if not self._snapshot_task or self._snapshot_task.done():
+                 self._snapshot_task = asyncio.create_task(self._run_leader_sequence())
                  
         elif new_role == 'follower':
              # Demoted to follower
@@ -264,13 +271,9 @@ class SyncInstance:
             tasks_to_wait = [self._monitor_heartbeat_task, self._message_sync_task, self._heartbeat_task]
             
             if self.current_role == "leader":
-                 logger.info(f"Assigned LEADER role for {self.id}. Starting Audit and Sentinel tasks.")
-                 self._audit_task = asyncio.create_task(self._run_audit_loop())
-                 self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
-                 # Do not wait for maintenance tasks as they might exit immediately if disabled
-                 # or run indefinitely. If they crash, they log errors.
-                 # tasks_to_wait.append(self._audit_task)
-                 # tasks_to_wait.append(self._sentinel_task)
+                 logger.info(f"Assigned LEADER role for {self.id}. Starting Leader duties sequence.")
+                 # We use the snapshot_task variable to track the sequence task, as it starts with snapshot
+                 self._snapshot_task = asyncio.create_task(self._run_leader_sequence())
             
             # Wait for any of the tasks to complete
             done, pending = await asyncio.wait(
@@ -561,7 +564,34 @@ class SyncInstance:
                 producer_thread.join(timeout=5.0)
             self.state &= ~SyncState.AUDIT_SYNC
 
-    async def _run_snapshot_sync(self):
+    async def _run_leader_sequence(self):
+        """
+        Orchestrates the sequence of Leader duties:
+        1. Snapshot Sync (Blocking, Required for Readiness)
+        2. Audit Loop (Starts only if Snapshot succeeds)
+        3. Sentinel Loop (Starts with Audit)
+        """
+        logger.info(f"[{self.id}] Starting Leader Sequence: Snapshot -> Audit")
+        
+        # 1. Run Snapshot Sync and wait for it
+        success = await self._run_snapshot_sync()
+        
+        if success and self.current_role == 'leader' and self.state != SyncState.STOPPED:
+            logger.info(f"[{self.id}] Snapshot complete. Starting Audit and Sentinel loops.")
+            
+            # 2. Start Audit Loop
+            if not self._audit_task or self._audit_task.done():
+                self._audit_task = asyncio.create_task(self._run_audit_loop())
+                # Trigger immediate audit for faster test convergence
+                asyncio.create_task(self.trigger_audit())
+                
+            # 3. Start Sentinel Loop
+            if not self._sentinel_task or self._sentinel_task.done():
+                self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
+        else:
+            logger.warning(f"[{self.id}] Snapshot failed or role changed. Skipping Audit/Sentinel start.")
+
+    async def _run_snapshot_sync(self) -> bool:
         # Add SNAPSHOT_SYNC state using bitwise OR
         self.state |= SyncState.SNAPSHOT_SYNC
         self.info = "补充性质的快照同步任务开始运行。"
@@ -637,9 +667,11 @@ class SyncInstance:
             if snapshot_completed_successfully: # Only call if the loop finished naturally
                 await self.pusher_driver_instance.push(events=[], task_id=self.id, session_id=self.session_id, is_snapshot_end=True, source_type='snapshot')
                 logger.info(f"补充快照同步任务 '{self.id}' 完成。")
+                return True
 
         except Exception as e:
             logger.error(f"补充快照同步任务 '{self.id}' 失败: {e}", exc_info=True)
+            return False
         finally:
             stop_event.set()
             if producer_thread.is_alive():
@@ -648,6 +680,8 @@ class SyncInstance:
             self.state &= ~SyncState.SNAPSHOT_SYNC
             self.info = "快照同步任务已清理。"
             self._snapshot_task = None
+        
+        return False
 
     async def _run_message_sync(self, start_position: int):
         # Flag to track if we've sent the initial trigger event

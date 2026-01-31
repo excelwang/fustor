@@ -74,6 +74,13 @@ class TestFollowerIOIsolation:
         
         # Give more buffer for agents to fully transition to stable state and establish watchers
         time.sleep(5)
+
+        # WARMUP: Ensure Follower's FS Driver is actively watching
+        # Create a warmup file and wait for it to be seen. This confirms inotify is ready.
+        warmup_file = f"{MOUNT_POINT}/warmup_follower_{int(time.time())}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_B, warmup_file, "warmup")
+        if not fusion_client.wait_for_file_in_tree(warmup_file, timeout=10):
+            pytest.fail("Follower Agent B failed to detect warmup file. FS Driver might not be ready.")
         
         # Create file on follower's mount
         docker_manager.create_file_in_container(

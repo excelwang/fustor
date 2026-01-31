@@ -307,6 +307,27 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         
         return success
 
+    async def clear_all_sessions(self, datastore_id: int):
+        """
+        Terminate all sessions for a specific datastore.
+        Used for full reset.
+        """
+        async with self._lock:
+            if datastore_id not in self._sessions:
+                return
+            
+            # Copy keys to avoid modification during iteration
+            session_ids = list(self._sessions[datastore_id].keys())
+        
+        # Terminate each session (outside the lock to avoid deadlock if terminate_session locking)
+        for sid in session_ids:
+            try:
+                await self.terminate_session(datastore_id, sid)
+            except Exception as e:
+                logger.error(f"Failed to terminate session {sid} during clear_all: {e}")
+        
+        logger.info(f"Terminated all {len(session_ids)} sessions for datastore {datastore_id} during reset.")
+
     async def start_periodic_cleanup(self, interval_seconds: int = 60):
         """
         Start a background task that periodically cleans up expired sessions.

@@ -8,7 +8,9 @@ import pytest
 import time
 
 from ..utils import docker_manager
-from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
+from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT, AUDIT_INTERVAL
+import logging
+logger = logging.getLogger("fustor_test")
 
 
 class TestBlindSpotFileModification:

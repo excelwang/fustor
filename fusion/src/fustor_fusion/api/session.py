@@ -137,7 +137,7 @@ async def create_session(
         "session_id": session_id,
         "role": role,
         "is_leader": is_leader,
-        "suggested_heartbeat_interval_seconds": max(1, datastore_config.session_timeout_seconds // 2),
+        "suggested_heartbeat_interval_seconds": datastore_config.session_timeout_seconds // 2,
         "session_timeout_seconds": datastore_config.session_timeout_seconds
     }
 

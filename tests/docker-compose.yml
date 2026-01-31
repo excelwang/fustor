@@ -66,8 +66,8 @@ services:
       FUSTOR_FUSION_DATA_DIR: "/data/fusion"
       # Faster cache sync for integration tests
       FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: "1"
-      # Accelerate failover tests
-      FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS: "3"
+      # Accelerate failover tests (Slightly relaxed for stability)
+      FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS: "4"
       # Shared token for internal service communication (must match Registry)
       FUSTOR_REGISTRY_CLIENT_TOKEN: "test-integration-token-for-internal-apis-12345"
       FUSTOR_CORE_SECRET_KEY: "test-integration-secret-key-for-jwt-signing"

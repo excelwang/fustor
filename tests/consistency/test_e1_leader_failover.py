@@ -121,6 +121,21 @@ class TestLeaderFailover:
         try:
             # Wait for failover (Session timeout 10s + buffer)
             time.sleep(15)
+
+            # Wait for Snapshot (Readiness) restoration
+            # New leader must complete initial snapshot sync
+            start_wait = time.time()
+            ready = False
+            while time.time() - start_wait < 60:
+                try:
+                    stats = fusion_client.get_stats()
+                    ready = True # If get_stats succeeds, readiness check passed
+                    break
+                except Exception:
+                    time.sleep(1)
+            
+            if not ready:
+                pytest.fail("Datastore failed to become ready after failover (New Leader Snapshot timed out)")
             
             # Data should still be accessible
             # After failover, Agent B should perform Audit and report the missing file

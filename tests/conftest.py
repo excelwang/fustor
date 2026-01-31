@@ -76,7 +76,7 @@ def registry_client(docker_env) -> RegistryClient:
     
     # Wait for registry to be fully ready and admin user created
     logger.info("Waiting for Registry to initialize and login...")
-    for i in range(30):
+    for i in range(12):  # 12 * 0.5 = 6s
         try:
             # Default admin credentials (email, not username)
             client.login("admin@admin.com", "admin")
@@ -216,7 +216,6 @@ syncs:
     disabled: false
     audit_interval_sec: {AUDIT_INTERVAL}
     sentinel_interval_sec: 1
-    heartbeat_interval_sec: 1
 """
     # 2. Write config file
     docker_manager.create_file_in_container(
@@ -286,12 +285,26 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
                 break
             else:
                 logger.warning(f"Someone else is leader: {agent_id}. Waiting...")
-        time.sleep(0.5)
+        time.sleep(1)
     else:
-        # Fallback/Timeout warning - logs will be helpful
-        logger.warning("Timeout waiting for Agent A to become leader. Proceeding anyway (might fail)...")
-    
-    # Now start Agent B
+        raise RuntimeError("Agent A did not become leader within 30 seconds")
+
+    # 4. Wait for Datastore to be READY (Snapshot complete)
+    logger.info("Waiting for Datastore to be ready (initial snapshot completion)...")
+    start_ready = time.time()
+    while time.time() - start_ready < 30:
+        try:
+            # Stats endpoint checks readiness
+            fusion_client.get_stats()
+            logger.info("Datastore is READY.")
+            break
+        except Exception as e:
+            # logger.debug(f"Datastore not ready yet: {e}")
+            time.sleep(0.5)
+    else:
+        logger.warning("Datastore readiness check timed out. Proceeding anyway.")
+
+    # 5. Start Agent B as Follower
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_B}...")
     ensure_agent_running(CONTAINER_CLIENT_B, api_key, datastore_id)
     

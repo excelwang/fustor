@@ -70,14 +70,7 @@ class FSViewProvider(FSViewBase):
             # 1. Clear view-specific in-memory state
             self.state.reset()
             
-            # 2. Clear global Fusion states for this datastore
-            from fustor_fusion.in_memory_queue import memory_event_queue
-            from fustor_fusion.datastore_state_manager import datastore_state_manager
-            
-            await memory_event_queue.clear_datastore_data(self.datastore_id)
-            await datastore_state_manager.clear_state(self.datastore_id)
-            
-            self.logger.info(f"FS View and Core state for datastore {self.datastore_id} has been fully reset.")
+            self.logger.info(f"FS View state for datastore {self.datastore_id} has been reset. Global sessions and ingestion state remain unaffected.")
 
     # --- Query Delegation ---
 
@@ -98,7 +91,7 @@ class FSViewProvider(FSViewBase):
         async with self._global_semaphore:
             return self.query.search_files(query)
 
-    async def get_stats(self) -> Dict[str, Any]:
+    async def get_directory_stats(self) -> Dict[str, Any]:
         async with self._global_semaphore:
             return self.query.get_stats()
 
