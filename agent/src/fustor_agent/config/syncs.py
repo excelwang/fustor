@@ -5,8 +5,8 @@ Sync configuration loader from YAML files in a directory.
 import yaml
 import logging
 from pathlib import Path
-from typing import Dict, Optional, List
-from pydantic import BaseModel, field_validator
+from typing import Dict, Optional, List, Any
+from pydantic import BaseModel, field_validator, model_validator
 
 from fustor_core.common import get_fustor_home_dir
 from .validators import validate_url_safe_id
@@ -25,12 +25,29 @@ class SyncConfigYaml(BaseModel):
     """Configuration for a single sync task loaded from YAML."""
     id: str
     source: str
-    sender: Optional[str] = None  # New field name (v2), optional for migration
+    sender: Optional[str] = None
     disabled: bool = False
     fields_mapping: List[FieldMappingYaml] = []
     audit_interval_sec: int = 600
     sentinel_interval_sec: int = 120
     heartbeat_interval_sec: int = 10
+    
+
+    @model_validator(mode='before')
+    @classmethod
+    def handle_pusher_alias(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            # Map legacy 'pusher' to new 'sender'
+            if 'pusher' in data and not data.get('sender'):
+                data['sender'] = data.pop('pusher')
+        return data
+
+    @field_validator('sender')
+    @classmethod
+    def validate_sender(cls, v: Optional[str]) -> str:
+        if v is None:
+            raise ValueError("Field 'sender' (formerly 'pusher') is required")
+        return v
     
     @field_validator('id')
     @classmethod

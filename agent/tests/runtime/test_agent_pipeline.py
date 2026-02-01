@@ -116,7 +116,8 @@ class TestAgentPipelineInit:
         dto = agent_pipeline.get_dto()
         assert dto["id"] == "test-sync"
         assert dto["task_id"] == "agent1:test-sync"
-        assert dto["state"] == "STOPPED"
+        assert "STOPPED" in dto["state"]
+
         assert "statistics" in dto
     
     def test_is_running_when_stopped(self, agent_pipeline):

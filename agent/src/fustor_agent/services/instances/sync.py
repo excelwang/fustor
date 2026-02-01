@@ -137,19 +137,24 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
         self.logger.info(f"Sync task '{sync_id}' remapped to bus '{new_bus.id}' successfully.")
 
     async def mark_dependent_syncs_outdated(self, dependency_type: str, dependency_id: str, reason_info: str, updates: Optional[Dict[str, Any]] = None):
-        affected_syncs = [
-            inst for inst in self.list_instances() 
-            if (dependency_type == "source" and inst.config.source == dependency_id) or
-               (dependency_type == "sender" and inst.config.sender == dependency_id)
-        ]
+        from fustor_core.pipeline import PipelineState
+        affected_syncs = []
+        for inst in self.list_instances():
+            sync_config = self.sync_config_service.get_config(inst.id)
+            if not sync_config:
+                continue
+            
+            if (dependency_type == "source" and sync_config.source == dependency_id) or \
+               (dependency_type == "sender" and sync_config.sender == dependency_id):
+                affected_syncs.append(inst)
 
         logger.info(f"Marking syncs dependent on {dependency_type} '{dependency_id}' as outdated.")
         for sync_instance in affected_syncs:
-            # Add RUNNING_CONF_OUTDATE flag using bitwise OR
-            # This allows it to stack with existing states like SNAPSHOT_SYNC or MESSAGE_SYNC
-            sync_instance.state |= SyncState.RUNNING_CONF_OUTDATE
+            # Use PipelineState which is what AgentPipeline uses internally
+            sync_instance.state |= PipelineState.CONF_OUTDATED
             sync_instance.info = reason_info # Update info directly
         self.logger.info(f"Marked {len(affected_syncs)} syncs as outdated.")
+
 
     async def start_all_enabled(self):
         all_sync_configs = self.sync_config_service.list_configs()
@@ -167,10 +172,12 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
             await asyncio.gather(*start_tasks, return_exceptions=True)
             
     async def restart_outdated_syncs(self) -> int:
+        from fustor_core.pipeline import PipelineState
         outdated_syncs = [
             inst for inst in self.list_instances() 
-            if inst.state == SyncState.RUNNING_CONF_OUTDATE
+            if inst.state & PipelineState.CONF_OUTDATED
         ]
+
         
         if not outdated_syncs:
             return 0

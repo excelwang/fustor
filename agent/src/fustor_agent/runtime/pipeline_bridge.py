@@ -117,6 +117,8 @@ class PipelineBridge:
             credential=self._extract_credential(sender_config),
             config=self._extract_sender_config(sender_config)
         )
+
+
         sender_handler = SenderHandlerAdapter(sender_driver)
         
         # Build pipeline config from sync config
@@ -142,22 +144,20 @@ class PipelineBridge:
     
     def _extract_credential(self, sender_config: SenderConfig) -> Dict[str, Any]:
         """Extract credential dict from sender config."""
-        if hasattr(sender_config, 'credential') and sender_config.credential:
-            cred = sender_config.credential
-            return {
-                "api_key": getattr(cred, 'api_key', ''),
-                "secret": getattr(cred, 'secret', '')
-            }
-        return {}
+        if hasattr(sender_config.credential, "model_dump"):
+            return sender_config.credential.model_dump()
+        elif hasattr(sender_config.credential, "dict"):
+            return sender_config.credential.dict()
+        return dict(sender_config.credential) if sender_config.credential else {}
     
     def _extract_sender_config(self, sender_config: SenderConfig) -> Dict[str, Any]:
         """Extract config dict from sender config."""
-        config = {}
-        if hasattr(sender_config, 'datastore_id'):
-            config["datastore_id"] = sender_config.datastore_id
-        if hasattr(sender_config, 'endpoint'):
-            config["endpoint"] = sender_config.endpoint
-        return config
+        return {
+            "batch_size": sender_config.batch_size,
+            "timeout_sec": sender_config.timeout_sec,
+            **sender_config.driver_params
+        }
+
     
     def _build_pipeline_config(self, sync_config: SyncConfig) -> Dict[str, Any]:
         """Build pipeline config from sync config."""

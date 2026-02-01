@@ -7,7 +7,8 @@ This is the V2 architecture replacement for SyncInstance.
 """
 import asyncio
 import logging
-from typing import Optional, Any, Dict, TYPE_CHECKING
+import threading
+from typing import Optional, Any, Dict, TYPE_CHECKING, Iterator
 
 from fustor_core.pipeline import Pipeline, PipelineState
 from fustor_core.pipeline.handler import SourceHandler
@@ -120,7 +121,8 @@ class AgentPipeline(Pipeline):
         """
         Stop the pipeline gracefully.
         """
-        if not self.is_running() and self.state != PipelineState.INITIALIZING:
+        if not self.is_running() and self.state not in (PipelineState.INITIALIZING, PipelineState.PAUSED):
+
             logger.debug(f"Pipeline {self.id} is not running")
             return
         
@@ -189,16 +191,21 @@ class AgentPipeline(Pipeline):
                 
                 if self.current_role == "leader":
                     await self._run_leader_sequence()
+                    # If leader sequence finishes (e.g. source exhausted), 
+                    # wait a bit before checking again to avoid busy loop
+                    await asyncio.sleep(1)
                 else:
                     # Follower: just wait and maintain heartbeat
                     self._set_state(PipelineState.PAUSED, "Follower mode - standby")
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(1) # Reduced from 5s to be more responsive
                 
         except asyncio.CancelledError:
             logger.info(f"Pipeline {self.id} control loop cancelled")
         except Exception as e:
             self._set_state(PipelineState.ERROR, f"Control loop error: {e}")
             logger.error(f"Pipeline {self.id} control loop error: {e}", exc_info=True)
+            await asyncio.sleep(5) # Wait before retry if error
+
     
     async def _run_leader_sequence(self) -> None:
         """
@@ -257,6 +264,22 @@ class AgentPipeline(Pipeline):
                 if task and not task.done():
                     task.cancel()
     
+    async def _aiter_sync(self, sync_iter: Iterator[Any]):
+        """Safely wrap a synchronous iterator into an async generator."""
+        def get_next():
+            try:
+                return next(sync_iter)
+            except StopIteration:
+                return StopIteration
+
+        while True:
+            # Run the next() call in a thread to avoid blocking the event loop
+            event = await asyncio.to_thread(get_next)
+            if event is StopIteration:
+                break
+            yield event
+
+
     async def _run_snapshot_sync(self) -> None:
         """Execute snapshot synchronization."""
         logger.info(f"Pipeline {self.id}: Starting snapshot sync")
@@ -265,15 +288,17 @@ class AgentPipeline(Pipeline):
         snapshot_iter = self.source_handler.get_snapshot_iterator()
         
         batch = []
-        for event in snapshot_iter:
+        # Support both sync and async iterators
+        if not hasattr(snapshot_iter, "__aiter__"):
+            snapshot_iter = self._aiter_sync(snapshot_iter)
+
+        async for event in snapshot_iter:
             batch.append(event)
-            
             if len(batch) >= self.batch_size:
                 success, _ = await self.sender_handler.send_batch(
                     self.session_id, batch, {"phase": "snapshot"}
                 )
-                if not success:
-                    raise RuntimeError("Snapshot batch send failed")
+                if not success: raise RuntimeError("Snapshot batch send failed")
                 self.statistics["events_pushed"] += len(batch)
                 batch = []
         
@@ -287,27 +312,41 @@ class AgentPipeline(Pipeline):
             self.statistics["events_pushed"] += len(batch)
         
         logger.info(f"Pipeline {self.id}: Snapshot sync complete")
-    
+
     async def _run_message_sync(self) -> None:
         """Execute realtime message synchronization."""
         logger.info(f"Pipeline {self.id}: Starting message sync")
         
         # Get message iterator from source
-        msg_iter = self.source_handler.get_message_iterator(start_position=-1)
+        # Pass a stop event if possible for better cleanup
+        stop_event = threading.Event()
+        msg_iter = self.source_handler.get_message_iterator(
+            start_position=-1, 
+            stop_event=stop_event
+        )
         
-        batch = []
-        for event in msg_iter:
-            batch.append(event)
-            
-            if len(batch) >= self.batch_size:
-                success, _ = await self.sender_handler.send_batch(
-                    self.session_id, batch, {"phase": "realtime"}
-                )
-                if not success:
-                    logger.warning("Message batch send failed, will retry")
-                else:
-                    self.statistics["events_pushed"] += len(batch)
-                batch = []
+        try:
+            batch = []
+            if not hasattr(msg_iter, "__aiter__"):
+                msg_iter = self._aiter_sync(msg_iter)
+
+            async for event in msg_iter:
+                if not self.is_running():
+                    break
+                    
+                batch.append(event)
+                if len(batch) >= self.batch_size:
+                    success, _ = await self.sender_handler.send_batch(
+                        self.session_id, batch, {"phase": "realtime"}
+                    )
+                    if success:
+                        self.statistics["events_pushed"] += len(batch)
+                    batch = []
+        finally:
+            # Signal stop to the underlying sync iterator
+            stop_event.set()
+
+
     
     async def _run_audit_loop(self) -> None:
         """Periodically run audit sync."""
@@ -397,10 +436,10 @@ class AgentPipeline(Pipeline):
         """Legacy access to event bus."""
         return self._bus
 
-    def get_dto(self) -> Dict[str, Any]:
+    def get_dto(self) -> "SyncInstanceDTO":
         """Get pipeline data transfer object compatible with SyncInstanceDTO."""
         # Map PipelineState to SyncState
-        from fustor_core.models.states import SyncState
+        from fustor_core.models.states import SyncState, SyncInstanceDTO
         
         state = SyncState.STOPPED
         if self.state & PipelineState.SNAPSHOT_PHASE:
@@ -416,12 +455,16 @@ class AgentPipeline(Pipeline):
         if self.state & PipelineState.ERROR:
             state |= SyncState.ERROR
 
-        return {
-            "id": self.id,
-            "state": str(state),
-            "info": self.info or "",
-            "statistics": self.statistics.copy(),
-            "bus_id": self._bus.id if self._bus else None,
-            "task_id": self.task_id,
-            "current_role": self.current_role,
-        }
+        # If it's running but no specific phase is set, mark it as starting or broadly running
+        if self.state & PipelineState.RUNNING and state == SyncState.STOPPED:
+            state = SyncState.STARTING
+
+        return SyncInstanceDTO(
+            id=self.id,
+            state=state,
+            info=self.info or "",
+            statistics=self.statistics.copy(),
+            bus_id=self._bus.id if self._bus else None,
+            task_id=self.task_id,
+            current_role=self.current_role,
+        )

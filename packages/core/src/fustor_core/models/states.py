@@ -33,6 +33,9 @@ class SyncInstanceDTO(BaseModel):
     statistics: Dict[str, Any]
     bus_info: Optional[EventBusInstance] = None
     bus_id: Optional[str] = None
+    task_id: Optional[str] = None
+    current_role: Optional[str] = None
+
 
 class AgentState(BaseModel):
     agent_id: str = Field(..., description="The unique identifier for the agent.")

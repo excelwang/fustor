@@ -1,7 +1,7 @@
 [project]
-name = "fustor-pusher-openapi"
+name = "fustor-sender-openapi"
 dynamic = ["version"]
-description = "An OpenAPI pusher for Fustor Agent"
+description = "An OpenAPI sender for Fustor Agent"
 requires-python = ">=3.11"
 dependencies = [ "fustor-core",]
 [[project.authors]]
@@ -18,13 +18,17 @@ version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/pusher-openapi"
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-openapi"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 license = "MIT"
 
+[project.entry-points."fustor_agent.drivers.senders"]
+openapi = "fustor_pusher_openapi:OpenApiDriver"
+
 [project.entry-points."fustor_agent.drivers.pushers"]
 openapi = "fustor_pusher_openapi:OpenApiDriver"
+
 
 [tool.setuptools.packages.find]
 where = [ "src",]

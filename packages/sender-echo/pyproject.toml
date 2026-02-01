@@ -1,7 +1,7 @@
 [project]
-name = "fustor-pusher-echo"
+name = "fustor-sender-echo"
 dynamic = ["version"]
-description = "An echo pusher for Fustor Agent"
+description = "An echo sender for Fustor Agent"
 requires-python = ">=3.11"
 dependencies = [ "fustor-core",]
 [[project.authors]]
@@ -18,7 +18,7 @@ version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/pusher-echo"
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-echo"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 license = "MIT"

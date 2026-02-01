@@ -6,9 +6,8 @@ members = [
     "packages/core",
     "packages/agent-sdk",
     "packages/fusion-sdk",
-    "packages/pusher-echo",
-    "packages/pusher-openapi",
-    "packages/pusher-fusion",
+    "packages/sender-echo",
+    "packages/sender-openapi",
     "packages/sender-http",
     "packages/receiver-http",
     "packages/schema-fs",
@@ -26,9 +25,8 @@ fustor-fusion = { workspace = true }
 fustor-core = { workspace = true }
 fustor-agent-sdk = { workspace = true }
 fustor-fusion-sdk = { workspace = true }
-fustor-pusher-echo = { workspace = true }
-fustor-pusher-openapi = { workspace = true }
-fustor-pusher-fusion = { workspace = true }
+fustor-sender-echo = { workspace = true }
+fustor-sender-openapi = { workspace = true }
 fustor-sender-http = { workspace = true }
 fustor-receiver-http = { workspace = true }
 fustor-schema-fs = { workspace = true }
@@ -44,9 +42,8 @@ pythonpath = [
     "agent/src",
     "fusion/src",
     "packages/core/src",
-    "packages/pusher-echo/src",
-    "packages/pusher-openapi/src",
-    "packages/pusher-fusion/src",
+    "packages/sender-echo/src",
+    "packages/sender-openapi/src",
     "packages/sender-http/src",
     "packages/receiver-http/src",
     "packages/schema-fs/src",

@@ -158,7 +158,7 @@ class App:
             recovered_buses[bus_id] = bus_runtime
             self.logger.info(f"Recovered EventBus '{bus_id}' for source '{source_id}' with state {bus_runtime.state.name}.")
 
-        # 2. Recover SyncInstances
+        # 2. Recover AgentPipelines
         if not sync_states:
             return
 
@@ -177,7 +177,7 @@ class App:
                 try:
                     state |= SyncState[part.split('.')[-1]]
                 except KeyError:
-                    self.logger.warning(f"Unknown SyncState part: {part}")
+                    self.logger.warning(f"Unknown state part: {part}")
             persisted_bus_id = sync_state_data.get("bus_id")
 
             if state in {SyncState.MESSAGE_SYNC,SyncState.RUNNING_CONF_OUTDATE, SyncState.STOPPING}:
