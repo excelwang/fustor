@@ -232,18 +232,18 @@ reset() / cleanup_expired_suspects()  # Optional
    - 废弃 datastore_id 概念
    - Pipeline 直接绑定 View
 
-### Phase 4: 配置与测试更新
+### Phase 4: 配置与测试更新 ✅ 完成
 
-10. **配置文件迁移**
-    - 目录重命名
-    - 添加新配置文件
+10. ✅ **配置文件迁移**
+    - senders-config.yaml (Agent)
+    - receivers-config.yaml (Fusion)
 
-11. **API 路径更新**
+11. ⬜ **API 路径更新** (暂缓)
     - `/api/v1/ingest` → `/api/v1/pipe`
     
-12. **测试更新**
-    - 更新 import 路径
-    - 适配新 API
+12. ✅ **测试更新**
+    - 更新 import 路径到 fustor_core
+    - 281 tests passing, 2 expected deprecation warnings
 
 ---
 
@@ -251,10 +251,10 @@ reset() / cleanup_expired_suspects()  # Optional
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
-| LogicalClock 迁移破坏一致性 | 高 | 保持接口不变，仅移动位置 |
-| 配置解析逻辑变更 | 中 | 渐进式迁移，保持旧格式兼容 |
-| Session 管理重构 | 高 | 先测试覆盖再改动 |
-| API 路径变更 | 中 | 一次性变更，清理旧路径 |
+| LogicalClock 迁移破坏一致性 | 高 | ✅ 保持接口不变，仅移动位置 |
+| 配置解析逻辑变更 | 中 | ✅ 渐进式迁移，保持旧格式兼容 |
+| Session 管理重构 | 高 | ⬜ 暂缓，先测试覆盖再改动 |
+| API 路径变更 | 中 | ⬜ 暂缓，一次性变更，清理旧路径 |
 
 ---
 
@@ -262,6 +262,9 @@ reset() / cleanup_expired_suspects()  # Optional
 
 1. ✅ 创建分支 `refactor/architecture-v2`
 2. ✅ 阅读现有代码，理解业务逻辑
-3. ⬜ 开始 Phase 1: 合并基础模块到 fustor-core
-4. ⬜ 创建 Pipeline, Transport 抽象
-5. ⬜ 创建 fustor-schema-fs
+3. ✅ Phase 1: 合并基础模块到 fustor-core
+4. ✅ Phase 2: Agent 重构 (sender-http)
+5. ✅ Phase 3: Fusion 重构 (receiver-http)
+6. ✅ Phase 4: 导入路径更新
+7. ⬜ 暂缓: Datastore → View 映射重构
+8. ⬜ 暂缓: API 路径更新
