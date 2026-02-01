@@ -145,33 +145,61 @@ class SyncInstance(AgentPipeline):
 - [x] Pipeline 抽象已定义 (fustor_core/pipeline/)
 - [x] Handler 抽象已定义 (SourceHandler, ViewHandler)
 - [x] SenderHandler 已创建 (fustor_core/pipeline/sender.py)
-- [x] AgentPipeline 骨架已创建 (fustor_agent/runtime/agent_pipeline.py)
+- [x] AgentPipeline 已创建 (fustor_agent/runtime/agent_pipeline.py)
 - [x] SenderHandlerAdapter 已创建 (fustor_agent/runtime/sender_handler_adapter.py)
 - [x] SourceHandlerAdapter 已创建 (fustor_agent/runtime/source_handler_adapter.py)
+- [x] PipelineBridge 已创建 (fustor_agent/runtime/pipeline_bridge.py)
 - [x] Agent Runtime 模块公开导出 (fustor_agent/runtime/__init__.py)
 - [x] FusionPipeline 已创建 (fustor_fusion/runtime/fusion_pipeline.py)
 - [x] ViewDriverAdapter 已创建 (fustor_fusion/runtime/view_handler_adapter.py)
 - [x] ViewManagerAdapter 已创建 (fustor_fusion/runtime/view_handler_adapter.py)
 - [x] Fusion Runtime 模块公开导出 (fustor_fusion/runtime/__init__.py)
-- [ ] SyncInstance → AgentPipeline 迁移 (可选, 渐进式)
 
-**当前测试状态**: 381 passed
+**当前测试状态**: 392 passed
 
-## Phase 2 完成 - Handler Adapter 层完备
+## Phase 2 完成 - Pipeline 架构就绪
 
-架构已完全就绪:
+### 架构图
 
 ```
 Agent Side:
   SourceHandlerAdapter → Source Drivers (FSDriver, etc.)
   SenderHandlerAdapter → Sender Transports (HTTPSender, etc.)
   AgentPipeline orchestrates Source → Sender
+  PipelineBridge enables migration from SyncInstance
 
 Fusion Side:
   ViewDriverAdapter → ViewDriver (FSViewDriver, etc.)
   ViewManagerAdapter → ViewManager (multi-driver routing)
   FusionPipeline dispatches to ViewHandlers
 ```
+
+### 迁移指南
+
+要启用新的 Pipeline 架构，设置环境变量：
+
+```bash
+export FUSTOR_USE_PIPELINE=true
+```
+
+或在代码中：
+
+```python
+from fustor_agent.runtime import create_pipeline_from_sync_config
+
+pipeline = create_pipeline_from_sync_config(
+    pipeline_id="my-sync",
+    agent_id="agent-1",
+    sync_config=sync_config,
+    source_config=source_config,
+    sender_config=sender_config,
+    sender_driver_service=sender_service,
+    source_driver_service=source_service
+)
+
+await pipeline.start()
+```
+
 
 
 
