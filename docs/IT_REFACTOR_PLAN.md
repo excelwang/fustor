@@ -229,17 +229,20 @@ it/
 - [x] 验证 Pipeline 模式行为
 ```
 
-### Phase 3: CI/CD 集成 (可选, 2-3 天)
+### Phase 3: CI/CD 集成 ✅ (2026-02-02 完成)
 
 ```
-任务 3.1: GitHub Actions 工作流
-- [ ] 创建 .github/workflows/integration-test.yml
-- [ ] 配置 Docker Compose 服务
-- [ ] 设置测试矩阵 (Pipeline/Legacy)
+任务 3.1: GitHub Actions 工作流 ✅
+- [x] 创建 .github/workflows/integration-tests.yml
+- [x] 创建 .github/workflows/unit-tests.yml
+- [x] 配置 Docker Compose 服务
+- [x] 设置测试矩阵 (Pipeline/Legacy)
 
 任务 3.2: 测试报告
-- [ ] 添加 pytest-html 报告
-- [ ] 集成 coverage 报告
+- [x] JUnit XML 报告输出
+- [x] GitHub Step Summary 集成
+- [ ] 添加 pytest-html 报告 (可选)
+- [ ] 集成 coverage 报告 (可选)
 ```
 
 ---
