@@ -59,12 +59,13 @@
 
 - **先到先得**：第一个建立 Session 的 Agent 成为 Leader
 - **故障转移**：仅当 Leader 心跳超时或断开后，Fusion 才释放 Leader 锁
+- **实现**：通过 `DatastoreStateManager` 管理 Leader 锁，`SessionManager` 管理会话生命周期
 
 ---
 
 ## 3. 消息类型
 
-Agent 向 Fusion 发送的消息分为四类，通过 `message_source` 字段区分：
+Agent 向 Fusion 发送的消息分为三类，通过 `message_source` 字段区分：
 
 | 类型 | 来源 | 说明 |
 |------|------|------|
@@ -76,98 +77,130 @@ Agent 向 Fusion 发送的消息分为四类，通过 `message_source` 字段区
 
 利用 POSIX 语义：创建/删除文件只更新**直接父目录**的 mtime。
 
+实现特点（`source-fs` 驱动）：
+- **并行扫描**：使用线程池并行处理子目录
+- **"真正的静默" (True Silence)**：目录 mtime 与缓存一致时，跳过文件扫描，但仍递归检查子目录
+- **审计跳过标记**：静默目录发送 `audit_skipped=True` 标记，保护子项不被误删
+
 ```python
-def audit_directory(dir_path, cache):
-    current_mtime = os.stat(dir_path).st_mtime
-    cached = cache.get(dir_path)
+def audit_worker():
+    current_dir_mtime = os.stat(root).st_mtime
+    cached_mtime = mtime_cache.get(root)
+    is_silent = cached_mtime is not None and cached_mtime == current_dir_mtime
     
-    # 目录 mtime 未变 → 直接子项无增删，但仍需递归检查子目录
-    if cached and cached.mtime == current_mtime:
-        for child in os.listdir(dir_path):
-            child_path = os.path.join(dir_path, child)
-            if os.path.isdir(child_path):
-                audit_directory(child_path, cache)  # 递归
-        return
+    if is_silent:
+        # 静默目录：发送带 audit_skipped=True 的事件，保护子项
+        send_audit_event(root, audit_skipped=True)
+    else:
+        # 目录变化：完整扫描所有子文件
+        for child in os.scandir(root):
+            if child.is_file():
+                send_audit_event(child.path, parent_path=root, parent_mtime=current_dir_mtime)
     
-    # 目录 mtime 变了 → 完整扫描
-    for child in os.listdir(dir_path):
-        child_path = os.path.join(dir_path, child)
-        stat = os.stat(child_path)
-        
-        if os.path.isdir(child_path):
-            audit_directory(child_path, cache)
-        else:
-            # 发送 audit 消息
-            send_audit_event(child_path, stat.st_mtime, stat.st_size)
-    
-    cache[dir_path] = CacheEntry(mtime=current_mtime)
+    # 始终递归检查子目录（即使静默）
+    for subdir in subdirs:
+        work_queue.put(subdir)
 ```
 
 ### 3.2 Audit 消息格式
 
-Audit 消息复用标准 Event 结构，但必须包含以下额外信息：
+Audit 消息复用标准 Event 结构，包含以下额外信息：
 
 ```json
 {
   "message_source": "audit",
-  "event_type": "UPDATE",  // INSERT / UPDATE / DELETE
+  "event_type": "UPDATE",
+  "index": 1706000000000,
   "rows": [
     {
       "path": "/data/file.txt",
-      "mtime": 1706000123.0,
+      "modified_time": 1706000123.0,
       "size": 10240,
       "parent_path": "/data",
-      "parent_mtime": 1706000100.0  // 关键：用于 Parent Mtime Check
+      "parent_mtime": 1706000100.0,
+      "audit_skipped": false
     }
   ]
 }
 ```
 
 **关键字段**：
-- `parent_mtime`: 扫描时父目录的 mtime，用于 Fusion 判断消息时效性
+- `parent_path` / `parent_mtime`: 用于 Parent Mtime Check (Rule 3)
+- `audit_skipped`: 标记目录是否因 mtime 未变而跳过扫描
+- `index`: 物理采集时刻（毫秒级 Unix 时间戳）
 
 ---
 
 ## 4. 状态管理
 
-Fusion 维护以下状态：
+Fusion 通过 `FSState` 类维护以下状态：
 
 ### 4.1 内存树 (Memory Tree)
 
-存储文件/目录的元数据，每个节点包含：
-- `path`: 文件路径
-- `mtime`: 最后修改时间（来自存储系统）
-- `size`: 文件大小
-- `last_updated_at`: Fusion 最后确认该文件状态点的本地物理时间戳（用于陈旧证据保护）
+存储文件/目录的元数据，每个节点（`DirectoryNode` / `FileNode`）包含：
+
+| 字段 | 类型 | 描述 |
+|------|------|------|
+| `path` | `str` | 文件绝对路径 |
+| `modified_time` | `float` | 最后修改时间（来自存储系统的 mtime） |
+| `size` | `int` | 文件大小（字节） |
+| `last_updated_at` | `float` | Fusion 本地物理时间戳，记录最后确认时刻 |
+| `integrity_suspect` | `bool` | 是否为可疑热文件 |
+| `known_by_agent` | `bool` | 是否被 Realtime 事件确认 |
+| `audit_skipped` | `bool` | (仅目录) 是否在审计中因静默被跳过 |
 
 ### 4.2 墓碑表 (Tombstone List)
 
 - **用途**：记录被 Realtime 删除的文件，防止滞后的 Snapshot/Audit 使其复活
-- **结构**：`Map<Path, DeleteLogicalTime>`
+- **结构**：`Dict[Path, Tuple[LogicalTime, PhysicalTime]]`
+  - `LogicalTime`: 删除时刻的逻辑时间戳（用于转世判定）
+  - `PhysicalTime`: 删除时刻的物理时间戳（用于 TTL 清理）
 - **生命周期**：
-  - **创建**：处理 Realtime Delete 时，记录删除时刻的逻辑时间戳
-  - **即时清除**：当更新的事件（mtime > tombstone_ts）到达时，Tombstone 被清除（文件转世 Reincarnation）
+  - **创建**：处理 Realtime Delete 时，记录双时间戳
+  - **即时清除**：当更新的事件满足 `mtime > tombstone_logical_ts` 时，Tombstone 被清除（文件转世 Reincarnation）
+  - **TTL 清理**：Audit-End 时清理 `physical_ts > 1 hour` 的过期墓碑
+
+```python
+# 创建墓碑
+logical_ts = self.state.logical_clock.get_watermark()
+physical_ts = time.time()
+self.state.tombstone_list[path] = (logical_ts, physical_ts)
+
+# TTL 清理 (Audit-End)
+tombstone_ttl_seconds = 3600.0  # 1 hour
+self.state.tombstone_list = {
+    path: (l_ts, p_ts) for path, (l_ts, p_ts) in self.state.tombstone_list.items()
+    if (now_physical - p_ts) < tombstone_ttl_seconds
+}
+```
+
 ### 4.3 可疑名单 (Suspect List)
 
-- **用途**：标记可能正处于 NFS 客户端缓存中、尚未完全刷新到存储中心的文件、未结束写入的不完整文件。
-- **来源**：任何 Snapshot/Audit 发现 `(LogicalWatermark - mtime) < threshold` 的文件。
+- **用途**：标记可能正处于 NFS 客户端缓存中、尚未完全刷新到存储中心的文件、未结束写入的不完整文件
+- **结构**：`Dict[Path, Tuple[ExpiryMonotonic, RecordedMtime]]`
+  - `ExpiryMonotonic`: TTL 到期时刻（基于 `time.monotonic()`）
+  - `RecordedMtime`: 加入名单时记录的文件 mtime
+- **来源**：任何 Snapshot/Audit 发现 `(LogicalWatermark - mtime) < hot_file_threshold` 的文件
 - **稳定性判定模型 (Stability-based Model)**：
-  - **实时移除**：收到文件 Realtime Update/Delete 时立即从名单移除并清除标记。
-  - **物理过期检查**：后台任务定期检查物理 TTL (基于 `monotonic_now`) 已到期的条目。
-    - **稳定 (Stable/Cold)**：比较当前 `node.mtime` 与加入名单时记录的 `recorded_mtime`。若一致，判定为“已冷却”，正式移除条目并清除 `integrity_suspect` 标记。
-    - **活跃 (Active/Hot)**：若 `node.mtime` 发生了变化，说明文件仍处于活跃变动中。此时为条目**续期**一个完整的物理 TTL 周期，并更新 `recorded_mtime`（无需重新计算逻辑 Age）。
+  - **实时移除**：收到文件 Realtime Update/Delete 时立即从名单移除并清除标记
+  - **物理过期检查**：后台任务定期检查物理 TTL 已到期的条目
+    - **稳定 (Stable/Cold)**：若 `node.mtime == recorded_mtime`，判定为"已冷却"，正式移除
+    - **活跃 (Active/Hot)**：若 mtime 发生变化，**续期**一个完整 TTL 周期，并更新 `recorded_mtime`
+- **堆优化**：使用 `heapq` 管理 `suspect_heap`，实现 O(log n) 高效过期检查
 - **API 标记**：`integrity_suspect: true`
 
 ### 4.4 盲区名单 (Blind-spot List)
 
-- **用途**：标记在无 Agent 客户端发生变更的文件
-- **来源**：Audit 发现的新增/删除，但不在 Tombstone 中且不是实时新增
-- **生命周期**：
-  - **持久化**：跨 Audit 周期和 Session 持久保留，不使用 TTL 自动过期（防止有效数据丢失）
-  - **清除**：
-    - 收到 Realtime Delete/Update 时移除相关条目
-    - Audit 再次看到文件时移除相关条目
-    - **Session 会话生命周期控制**：当检测到新的 Agent 会话序列 (Sequence) 开始时（如 API 触发 `on_session_start`），清空列表以重新发现盲区。
+包含两个子集：
+- `blind_spot_additions`: 盲区新增的文件
+- `blind_spot_deletions`: 盲区删除的文件
+
+**生命周期**：
+- **持久化**：跨 Audit 周期持久保留，不使用 TTL 自动过期（防止有效数据丢失）
+- **清除条件**：
+  - 收到 Realtime Delete/Update 时移除相关条目
+  - Audit 再次看到文件时从 `blind_spot_deletions` 移除
+  - **Session 生命周期控制**：`on_session_start` 时清空列表以重新发现盲区
 
 ---
 
@@ -175,140 +208,194 @@ Fusion 维护以下状态：
 
 核心原则：**Realtime 优先，Mtime 仲裁**
 
+由 `FSArbitrator` 类实现。
+
 ### 5.1 Realtime 消息处理
 
-```
-收到 Realtime 消息:
-    if INSERT / UPDATE:
-        → 更新内存树 (覆盖 mtime)
-        → 从 Suspect List 移除
-        → 从 Blind-spot List 移除
+```python
+if event.message_source == MessageSource.REALTIME:
+    if event_type in [INSERT, UPDATE]:
+        # 更新内存树
+        tree_manager.update_node(payload, path)
+        node.last_updated_at = time.time()  # 物理时间戳
+        node.known_by_agent = True
+        
+        # 一致性状态维护
+        suspect_list.pop(path, None)
+        node.integrity_suspect = False
+        blind_spot_deletions.discard(path)
+        blind_spot_additions.discard(path)
     
-    if DELETE:
-        → 从内存树删除
-        → 加入 Tombstone List
-        → 从 Blind-spot List 移除
+    elif event_type == DELETE:
+        # 从内存树删除
+        tree_manager.delete_node(path)
+        
+        # 创建墓碑（双时间戳）
+        logical_ts = logical_clock.get_watermark()
+        physical_ts = time.time()
+        tombstone_list[path] = (logical_ts, physical_ts)
+        
+        # 清理其他状态
+        suspect_list.pop(path, None)
+        blind_spot_deletions.discard(path)
+        blind_spot_additions.discard(path)
 ```
 
 ### 5.2 Snapshot 消息处理
 
-```
-收到 Snapshot 消息 (文件 X):
-    if X in Tombstone:
-        → 丢弃 (防止僵尸复活)
-    else:
-        → 添加到内存树
-        → 如果 (HybridNow - X.mtime) < 10min: 加入 Suspect List
+```python
+if event.message_source == MessageSource.SNAPSHOT:
+    if path in tombstone_list:
+        tombstone_ts, _ = tombstone_list[path]
+        event_ref_ts = event.index / 1000.0 if event.index > 0 else mtime
+        
+        if event_ref_ts > tombstone_ts or mtime > tombstone_ts:
+            # 文件转世：清除墓碑，接受更新
+            tombstone_list.pop(path, None)
+        else:
+            # 僵尸复活：丢弃
+            return
+    
+    # 添加/更新内存树
+    tree_manager.update_node(payload, path)
+    
+    # Suspect 判定
+    watermark = logical_clock.get_watermark()
+    if (watermark - mtime) < hot_file_threshold:
+        node.integrity_suspect = True
+        suspect_list[path] = (time.monotonic() + remaining_life, mtime)
 ```
 
 ### 5.3 Audit 消息处理
 
 #### 场景 1: Audit 报告"存在文件 X" (Smart Merge)
 
-```
-# Rule 1: Tombstone Protection
-if X in Tombstone:
-    if Audit.X.mtime > Tombstone.X.ts:
-        → 接受 (新文件转世 Reincarnation)
-        → 从 Tombstone 中移除 X
-        → 执行写入/更新
-    else:
-        → 丢弃 (确认是僵尸复活 Zombie)
-        return
-
-# Rule 2: Mtime Arbitration
-elif X in 内存树:
-    if Audit.X.mtime > Memory.X.mtime:
-        → 更新内存树 (盲区修改)
-    else:
-        → 维持现状 (Snapshot/Audit 不覆盖较新的状态)
-
-else:  # 内存中无 X
-    if Audit.Parent.mtime < Memory.Parent.mtime:
-        → 丢弃 (父目录已更新，X 是旧文件)
-    else:
-        → 添加到内存树
-        → 加入 Blind-spot List (盲区新增)
-        → 如果 (LogicalWatermark - X.mtime) < threshold: 加入 Suspect List
-```
-
-#### 场景 2: Audit 报告"目录 D 缺少文件 B" (Blind Spot Deletion)
-
-```
-if Parent D reported as "Skipped" (audit_skipped=True):
-    → 维持现状 (认为是 NFS 缓存导致的静默目录，保护子项不被误删)
-
-elif Parent D was Not Scanned in this cycle:
-    → 忽略 (不触发 Missing 判定)
-
-else (Full Scan on D confirmed):
-    if B in Memory Tree:
-        # Rule 3: 陈旧证据保护 (Stale Evidence Protection)
-        if B.last_updated_at > current_audit_start_logical_time:
-             → 丢弃删除指令 (该文件在审计开始后有过实时更新，审计视图已落后)
-        elif B in Tombstone:
-             → 忽略 (已处理)
+```python
+if event.message_source == MessageSource.AUDIT:
+    # Rule 1: Tombstone Protection
+    if path in tombstone_list:
+        tombstone_ts, _ = tombstone_list[path]
+        if mtime > tombstone_ts:
+            # 文件转世：接受
+            tombstone_list.pop(path, None)
         else:
-             → 将 B 从内存树中删除 (保证视图即真相)
-             → 将 B 加入 Blind Spot Deletion List
+            # 僵尸复活：丢弃
+            return
+    
+    existing = state.get_node(path)
+    
+    # Rule 2: Mtime Arbitration
+    if existing:
+        if existing.modified_time >= mtime and not payload.get('audit_skipped'):
+            # 内存中的版本更新或相同：维持现状
+            return
+    
+    # Rule 3: Parent Mtime Check (仅对内存中不存在的文件)
+    elif existing is None:
+        parent_path = payload.get('parent_path')
+        parent_mtime_audit = payload.get('parent_mtime')
+        memory_parent = directory_path_map.get(parent_path)
+        
+        if memory_parent and memory_parent.modified_time > (parent_mtime_audit or 0):
+            # 内存父目录更新：丢弃（X 是旧文件）
+            return
+        
+        # 通过检查：加入 Blind-spot List（盲区新增）
+        blind_spot_additions.add(path)
+        node.known_by_agent = False
+    
+    # 更新内存树
+    tree_manager.update_node(payload, path)
+    
+    # Suspect 判定
+    if (watermark - mtime) < hot_file_threshold:
+        node.integrity_suspect = True
+        suspect_list[path] = (expiry, mtime)
+```
+
+#### 场景 2: Audit 报告"目录 D 缺少文件 B" (Missing Item Detection)
+
+在 `handle_audit_end` 中执行：
+
+```python
+for path in audit_seen_paths:
+    dir_node = directory_path_map.get(path)
+    
+    # 保护 1: 审计跳过保护
+    if dir_node and getattr(dir_node, 'audit_skipped', False):
+        continue  # 静默目录的子项不参与 Missing 判定
+    
+    # 保护 2: 未扫描目录保护（隐式）
+    # 如果目录不在 audit_seen_paths 中，其子项不会被检查
+    
+    if dir_node:
+        for child_name, child_node in dir_node.children.items():
+            if child_node.path not in audit_seen_paths:
+                # 保护 3: Tombstone 保护
+                if child_node.path in tombstone_list:
+                    continue
+                
+                # 保护 4: 陈旧证据保护 (Stale Evidence Protection)
+                if child_node.last_updated_at > last_audit_start:
+                    continue  # 节点在审计后有更新，保护实时权威
+                
+                # 执行删除
+                tree_manager.delete_node(child_node.path)
+                blind_spot_deletions.add(child_node.path)
 ```
 
 ### 5.4 特殊场景：旧属性注入 (Old Mtime Injection)
 
-在使用 `cp -p`、`rsync -a` 或 `tar -x` 等操作时，新创建的文件会继承源文件的旧 `mtime`。这会导致简单的基于 `mtime` 的审计仲裁逻辑判定失效。
+使用 `cp -p`、`rsync -a` 或 `tar -x` 等操作时，新文件会继承源文件的旧 `mtime`。
 
-**问题背景：**
-- **$T_1$ (Audit 开始)**：Fusion 记录审计开始水位线。
-- **$T_2$ (实时创建)**：Agent 通过 Inotify 发现一个 `cp -p` 创建的新文件，其 `mtime` 被保留为一年前。
-- **$T_2$ (Fusion 同步)**：Fusion 接受该文件，并记录其 `last_updated_at = T_2`。
-- **$T_3$ (Audit 逻辑判定)**：由于审计的实际物理扫描发生在 $T_2$ 之前，其提交的扫描列表中没有该文件。
+**问题背景**：
+- **$T_1$ (Audit 开始)**：Fusion 记录 `last_audit_start`
+- **$T_2$ (实时创建)**：Agent 发现 `cp -p` 创建的新文件，mtime 为一年前
+- **$T_2$ (Fusion 同步)**：Fusion 接受文件，记录 `last_updated_at = T_2`
+- **$T_3$ (Audit 判定)**：审计扫描列表（物理扫描在 $T_2$ 前完成）中没有该文件
 
-**裁决逻辑保护：**
-若只对比 `mtime`，$T_{old} < T_1$ 会导致该文件被误判为“审计前本应存在但实际缺失”，从而被删除。引入 `last_updated_at` 后，Fusion 会检测到 `File.last_updated_at (T_2) > Audit.Start (T_1)`，从而识别出审计报告是**陈旧证据**，放弃删除操作，确保实时事件的绝对权威。
+**裁决逻辑保护**：
+若只对比 mtime，文件会被误判为"审计前本应存在但实际缺失"而被删除。通过检查 `last_updated_at > last_audit_start`，Fusion 识别出审计报告是**陈旧证据**，放弃删除操作。
 
 ---
 
 ## 6. 双轨时间系统 (Dual-Track Time System)
 
-为解决分布式环境下的时钟偏移（Clock Skew）和跳变文件（Future Timestamp）问题，Fustor 采用 **"统计学校准的主动时钟"** 方案。
-
-详细设计请参考独立文档：[LOGICAL_CLOCK_DESIGN.md](./LOGICAL_CLOCK_DESIGN.md)。
+详细设计请参考：[LOGICAL_CLOCK_DESIGN.md](./LOGICAL_CLOCK_DESIGN.md)
 
 ### 6.1 时间轨道概览
 
 | 轨道 | 定义 | 来源 | 核心用途 |
 | :--- | :--- | :--- | :--- |
-| **Physical Time** | 全局物理流逝参考 (TA) | Fusion/Agent 本地时钟 | 1. **事件索引 (Index)**: Agent 捕获事件的物理时刻。<br>2. **LRU 归一化**: Agent 影子参考系的基准。<br>3. **保底水位线**: 用于计算 BaseLine 的物理轴。 |
-| **Logical Clock (Watermark)** | **NFS 数据域逻辑时间 (TL)** | 统计校准合成 | **数据一致性核心基准**。<br>用于计算 Data Age，判定 Suspect 状态，生成墓碑。 |
+| **Physical Time** | 全局物理流逝参考 | Fusion/Agent 本地时钟 | 1. 事件索引 (index)<br>2. LRU 归一化<br>3. 陈旧证据保护<br>4. Tombstone TTL 清理 |
+| **Logical Clock (Watermark)** | NFS 数据域逻辑时间 | 统计校准合成 | 1. Data Age 计算<br>2. Suspect 状态判定<br>3. 墓碑逻辑时间戳 |
 
-### 6.2 核心设计要点
-
-1.  **物理锚定 (Physical Anchoring)**: Agent 侧彻底移除逻辑时钟模块，所有实时事件 `index` 锚定本地物理时间。
-2.  **影子参考系 (Shadow Reference Frame)**: Agent 内部通过 **P99 漂移校准算法** 将 NFS 时间映射到物理轴，保护 LRU 监听调度，免疫单点时钟跳变。
-3.  **物理引导演进**: 对于 `DELETE` 等无 `mtime` 的事件，Fusion 通过 `G_Skew` 将物理观察时刻映射到逻辑水位线，驱动 Watermark 稳健前进。
-4.  **信任窗口**: 在 `BaseLine + 1s` 范围内允许 FastPath 推进，兼顾实时性与稳定性。
-
-### 6.3 应用场景裁决表
+### 6.2 应用场景裁决表
 
 | 判定需求 | 时间源 | 判定逻辑 |
 | :--- | :--- | :--- |
 | **热文件判定 (Suspect Age)** | `Logical Time` | `age = watermark - file.mtime` |
-| **墓碑时效清理 (Tombstone TTL)**| `Physical Time` | `if now - ts > 1hr: purge` |
-| **陈旧证据保护 (Audit End)** | `Physical Time` | `if node.last_updated_at > audit_start_local_time: skip` |
-| **处理流时延 (Latency)** | `Logical Time` | `delay = watermark - file.mtime` |
-
----
+| **墓碑转世判定** | `Logical Time` | `if event.mtime > tombstone_logical_ts: reincarnate` |
+| **墓碑 TTL 清理** | `Physical Time` | `if (now - tombstone_physical_ts) > 1hr: purge` |
+| **陈旧证据保护** | `Physical Time` | `if node.last_updated_at > audit_start: skip_deletion` |
+| **Suspect TTL 过期** | `Monotonic Time` | `if time.monotonic() > expiry_monotonic: check_stability` |
 
 ---
 
 ## 7. 审计生命周期
 
-为支持 Tombstone 的精确清理，Agent 需发送生命周期信号：
+Agent 通过 API 发送生命周期信号，触发 Fusion 的一致性处理：
 
-| 信号 | 时机 | Fusion 动作 |
-|------|------|-------------|
-| `Audit-Start` | 审计开始 | 记录 `scan_start_time` |
-| `Audit-End` | 审计结束 | 清理 `create_time < scan_start_time` 的 Tombstone |
+| API | 时机 | Fusion 动作 |
+|-----|------|-------------|
+| `POST /consistency/audit/start` | 审计开始 | 调用 `handle_audit_start()`，记录 `last_audit_start = time.time()` |
+| `POST /consistency/audit/end` | 审计结束 | 等待队列排空后调用 `handle_audit_end()`，执行 Missing 判定和 Tombstone 清理 |
+
+**Audit-End 处理流程**：
+1. 等待事件队列排空（最多 10 秒）
+2. 执行 Tombstone TTL 清理（物理时间 > 1 小时）
+3. 执行 Missing Item Detection
+4. 重置 `last_audit_start` 和 `audit_seen_paths`
 
 ---
 
@@ -317,21 +404,21 @@ else (Full Scan on D confirmed):
 - **触发者**：Leader Agent
 - **频率**：2 分钟/次 (可配置 `sentinel_interval_sec`)
 - **目的**：验证 Suspect List 中文件的 mtime 稳定性
-- **消息类型**：`snapshot` 或直接 API 反馈
+- **实现**：Agent 调用 `FSDriver.perform_sentinel_check()` 获取文件最新状态
 
 ### API
 
 ```
 # 获取待巡检任务
 GET  /api/v1/ingest/consistency/sentinel/tasks
-     Response: {"type": "suspect_check", "paths": ["/file1.txt", ...]}
+     Response: {"type": "suspect_check", "paths": ["/file1.txt", ...], "source_id": 1}
 
 # 提交巡检结果
 POST /api/v1/ingest/consistency/sentinel/feedback
-     Body: {"type": "suspect_update", "updates": [{"path": "...", "mtime": 123.0}, ...]}
+     Body: {"type": "suspect_update", "updates": [{"path": "...", "mtime": 123.0, "status": "exists"}, ...]}
 ```
 
-Fusion 收到反馈后执行稳定性判定：若 mtime 与记录值一致，则确认文件已冷却，移除 Suspect 标记；若 mtime 变化，则续期 TTL。
+Fusion 收到反馈后通过 `provider.update_suspect()` 执行稳定性判定。
 
 ---
 
@@ -339,9 +426,9 @@ Fusion 收到反馈后执行稳定性判定：若 mtime 与记录值一致，则
 
 | 级别 | 条件 | 返回字段 |
 |------|------|----------|
-| 全局级 | Blind-spot List 非空 | `has_blind_spot: true` (通过 `/fs/stats`) |
+| 全局级 | Blind-spot List 非空 | `has_blind_spot: true` (通过 `/views/{view_id}/tree/stats`) |
 | 文件级 | 文件在 Suspect List 中 | `integrity_suspect: true` |
-| 盲区查询 | 需获取详细盲区文件列表 | 使用 `/fs/blind-spots` API |
+| 盲区查询 | 需获取详细盲区文件列表 | 使用 `/views/{view_id}/tree/blind-spots` API |
 
 ---
 
@@ -350,7 +437,17 @@ Fusion 收到反馈后执行稳定性判定：若 mtime 与记录值一致，则
 所有 SourceDriver 和 ViewDriver 必须支持 `message_source` 字段：
 
 - **SourceDriver**: 能够生成 `message_source` 为 `realtime`, `snapshot`, `audit` 类型的事件
-- **ViewDriver**: 在 `process_event` 中根据 `message_source` 执行不同的处理逻辑
+- **ViewDriver**: 在 `process_event()` 中根据 `message_source` 执行不同的处理逻辑
+
+### ViewDriver 生命周期钩子
+
+| 钩子 | 时机 | 用途 |
+|------|------|------|
+| `on_session_start` | 新 Session 序列开始 | 重置盲区列表与 Audit 缓冲区 |
+| `on_session_close` | Session 结束 | 执行必要的清理操作 |
+| `handle_audit_start` | 审计开始 | 记录 `last_audit_start` 物理时间戳 |
+| `handle_audit_end` | 审计结束 | 执行 Missing 判定和 Tombstone 清理 |
+| `cleanup_expired_suspects` | 后台定时任务 (每 0.5 秒) | 执行 mtime 稳定性检查 |
 
 ---
 
@@ -358,31 +455,59 @@ Fusion 收到反馈后执行稳定性判定：若 mtime 与记录值一致，则
 
 ### 11.1 陈旧证据保护 (Stale Evidence Protection)
 
-每个节点维护 `last_updated_at` 物理时间戳，记录最后一次被 Fusion 接收并更新的**本地时刻**（基于 `time.time()`）。
+每个节点维护 `last_updated_at` 物理时间戳（`time.time()`），记录最后一次被 Fusion 确认更新的时刻。
 
-在 `Audit-End` 执行 Missing 判定时：
+**关键行为**：
+- **Realtime 事件**：更新 `last_updated_at = time.time()`
+- **Snapshot/Audit 事件**：**不更新** `last_updated_at`（保留原值）
+
 ```python
-# 核心逻辑：基于 Fusion 本地物理时间的序列判定
-if node.last_updated_at > audit_start_local_time:
-    # 判定：该节点在审计扫描开始后，有过更及时的实时更新进入 Fusion。
-    # 结论：当前审计报告相对于该节点是“陈旧”的。
-    # 动作：跳过删除，保护实时权威。
+# arbitrator.py
+if not is_realtime and old_last_updated_at > 0:
+    node.last_updated_at = old_last_updated_at  # 保留旧值
 ```
 
 ### 11.2 审计跳过保护 (Audit Skipped Protection)
 
 当父目录被标记为 `audit_skipped=True` 时（因 mtime 未变而跳过扫描），其子项不会被 Missing 判定误删。
 
+```python
+# audit.py
+if dir_node and not getattr(dir_node, 'audit_skipped', False):
+    # 只对完整扫描的目录执行 Missing 判定
+    ...
+```
+
 ### 11.3 Suspect 堆优化 (Heap-based TTL)
 
-使用 `heapq` 管理 Suspect 条目的 TTL 到期时间，实现 O(log n) 的高效过期检查。
+使用 `heapq` 管理 Suspect 条目的 TTL 到期时间：
 
-### 11.4 ViewDriver 生命周期钩子
+```python
+# state.py
+self.suspect_list: Dict[str, Tuple[float, float]] = {}  # path -> (expiry_monotonic, recorded_mtime)
+self.suspect_heap: List[Tuple[float, str]] = []         # (expiry_monotonic, path)
 
-| 钩子 | 时机 | 用途 |
-|------|------|------|
-| `on_session_start` | 新 Session 序列开始 | 重置盲区列表与 Audit 缓冲区 |
-| `on_session_close` | Session 结束 | 执行必要的清理操作 |
-| `handle_audit_start` | 审计开始 | 记录逻辑时间戳 |
-| `handle_audit_end` | 审计结束 | 执行 Missing 判定和 Tombstone 清理 |
-| `cleanup_expired_suspects` | 后台定时任务 | 执行 mtime 稳定性检查 |
+# arbitrator.py - 添加
+heapq.heappush(self.state.suspect_heap, (expiry, path))
+
+# arbitrator.py - 清理
+while suspect_heap and suspect_heap[0][0] <= time.monotonic():
+    expires_at, path = heapq.heappop(suspect_heap)
+    # 验证并处理...
+```
+
+### 11.4 并发控制
+
+`FSViewProvider` 使用两级并发控制：
+- **全局信号量** (`_global_semaphore`): 限制并发事件处理数量
+- **全局独占锁** (`_global_exclusive_lock`): 用于 Audit Start/End 等需要独占访问的操作
+
+```python
+async def process_event(self, event):
+    async with self._global_semaphore:
+        return await self.arbitrator.process_event(event)
+
+async def handle_audit_end(self):
+    async with self._global_exclusive_lock():
+        await self.audit_manager.handle_end()
+```

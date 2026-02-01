@@ -20,7 +20,10 @@ class FSState:
         self.file_path_map: Dict[str, FileNode] = {}
         
         # Consistency State
-        self.tombstone_list: Dict[str, float] = {}
+        # tombstone_list: Path -> (logical_timestamp, physical_timestamp)
+        # - logical_timestamp: 用于转世判定 (mtime comparison)
+        # - physical_timestamp: 用于 TTL 清理 (1 hour expiry)
+        self.tombstone_list: Dict[str, Tuple[float, float]] = {}
         self.suspect_list: Dict[str, Tuple[float, float]] = {} # Path -> (expiry_monotonic, recorded_mtime)
         self.suspect_heap: List[Tuple[float, str]] = [] # (expiry_monotonic, path)
         
