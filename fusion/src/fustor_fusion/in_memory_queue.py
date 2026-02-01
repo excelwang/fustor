@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
 from collections import defaultdict
 from uuid import uuid4
-from fustor_event_model.models import EventBase
+from fustor_core.event import EventBase
 
 
 logger = logging.getLogger(__name__)

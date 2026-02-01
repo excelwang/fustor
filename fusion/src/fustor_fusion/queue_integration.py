@@ -6,7 +6,7 @@ import asyncio
 import logging
 from typing import Dict, List, Optional, Any
 from .in_memory_queue import memory_event_queue
-from fustor_event_model.models import EventBase
+from fustor_core.event import EventBase
 
 
 logger = logging.getLogger(__name__)

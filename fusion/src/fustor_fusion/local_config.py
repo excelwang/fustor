@@ -3,7 +3,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Dict, Any, Optional
-from fustor_common.paths import get_fustor_home_dir
+from fustor_core.common import get_fustor_home_dir
 
 logger = logging.getLogger(__name__)
 

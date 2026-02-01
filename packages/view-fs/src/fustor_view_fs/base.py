@@ -6,7 +6,7 @@ import os
 from contextlib import asynccontextmanager
 
 from fustor_core.drivers import ViewDriver
-from fustor_common.logical_clock import LogicalClock
+from fustor_core.clock import LogicalClock
 from .nodes import DirectoryNode, FileNode
 
 logger = logging.getLogger(__name__)

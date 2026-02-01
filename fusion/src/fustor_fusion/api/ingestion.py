@@ -18,7 +18,7 @@ from ..processing_manager import processing_manager
 from ..queue_integration import queue_based_ingestor, add_events_batch_to_queue, get_position_from_queue, update_position_in_queue
 from ..in_memory_queue import memory_event_queue
 
-from fustor_event_model.models import EventBase, EventType, MessageSource # Import EventBase, EventType, and MessageSource
+from fustor_core.event import EventBase, EventType, MessageSource
 
 from ..view_manager.manager import get_cached_view_manager
 from datetime import datetime

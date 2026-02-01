@@ -18,7 +18,7 @@ from typing import Any, Dict, Iterator, List, Tuple, Optional, Set
 from concurrent.futures import ThreadPoolExecutor
 from fustor_core.drivers import SourceDriver
 from fustor_core.models.config import SourceConfig
-from fustor_event_model.models import EventBase, UpdateEvent, DeleteEvent, MessageSource
+from fustor_core.event import EventBase, UpdateEvent, DeleteEvent, MessageSource
 
 from .components import _WatchManager, safe_path_handling
 from .event_handler import OptimizedWatchEventHandler, get_file_metadata

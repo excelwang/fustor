@@ -6,7 +6,7 @@ import stat
 from typing import Any, Dict, Optional
 
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
-from fustor_event_model.models import UpdateEvent, DeleteEvent
+from fustor_core.event import UpdateEvent, DeleteEvent
 
 from .components import _WatchManager
 

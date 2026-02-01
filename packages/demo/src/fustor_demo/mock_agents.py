@@ -4,7 +4,7 @@ import uuid
 import random
 
 from fustor_core.models.config import SourceConfig, PasswdCredential # Used for type hinting config in mock
-from fustor_event_model.models import EventType # Used for event types in mock
+from fustor_core.event import EventType
 from fustor_demo.store import demo_store
 
 # --- Helper to generate common event structure ---

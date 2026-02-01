@@ -1,6 +1,6 @@
 from typing import Dict, Any, List
 from datetime import datetime
-from fustor_event_model.models import EventBase, EventType
+from fustor_core.event import EventBase, EventType
 
 def map_s3_object_to_event(
     s3_object: Dict[str, Any], 

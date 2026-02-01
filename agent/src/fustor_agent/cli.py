@@ -8,8 +8,7 @@ import sys
 import subprocess
 import time
 
-from fustor_common.logging_config import setup_logging
-from fustor_common.paths import get_fustor_home_dir
+from fustor_core.common import setup_logging, get_fustor_home_dir
 from . import CONFIG_DIR, ConfigurationError
 
 # Define common logging path

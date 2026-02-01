@@ -3,7 +3,7 @@ import logging
 from typing import Dict, List, Optional, Any, Set, Tuple
 from collections import defaultdict
 import os
-from fustor_common.logical_clock import LogicalClock
+from fustor_core.clock import LogicalClock
 from .nodes import DirectoryNode, FileNode
 
 logger = logging.getLogger(__name__)

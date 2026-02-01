@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional, List, Any
 from pydantic import ValidationError
 
-from fustor_common.paths import get_fustor_home_dir
+from fustor_core.common import get_fustor_home_dir
 from fustor_core.models.config import SourceConfig
 from .validators import validate_url_safe_id
 

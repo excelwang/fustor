@@ -6,7 +6,7 @@ import os
 import logging
 import asyncio
 
-from fustor_event_model.models import EventBase, EventType # For type hinting if needed
+from fustor_core.event import EventBase, EventType
 
 from fustor_demo.store import demo_store
 from fustor_demo.mock_agents import (

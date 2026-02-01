@@ -9,9 +9,8 @@ import sys
 import subprocess
 import time
 
-from fustor_common.logging_config import setup_logging
-from fustor_common.exceptions import ConfigurationError # Re-use common ConfigurationError
-from fustor_common.paths import get_fustor_home_dir # NEW import
+from fustor_core.common import setup_logging, get_fustor_home_dir
+from fustor_core.exceptions import ConfigError as ConfigurationError
 
 # Define standard directories and file names for fusion
 HOME_FUSTOR_DIR = get_fustor_home_dir() # Use the common function
@@ -83,7 +82,7 @@ def start(reload, port, host, daemon, verbose, no_console_log):
         
         click.echo("Starting Fustor Fusion in the background...")
         # Use a common daemon launcher function to avoid module path issues
-        import fustor_common.daemon as daemon_module
+        import fustor_core.common.daemon as daemon_module
         daemon_module.start_daemon(
             service_module_path='fustor_fusion.main',
             app_var_name='app',

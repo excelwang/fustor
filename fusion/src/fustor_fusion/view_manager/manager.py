@@ -12,7 +12,7 @@ from fustor_core.drivers import ViewDriver
 from ..config import views_config
 import logging
 import asyncio
-from fustor_event_model.models import EventBase
+from fustor_core.event import EventBase
 from ..in_memory_queue import memory_event_queue
 
 logger = logging.getLogger(__name__)

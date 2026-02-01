@@ -6,7 +6,7 @@ from dotenv import load_dotenv, find_dotenv
 from pathlib import Path
 
 from fustor_core.models.config import AppConfig, SyncConfig, SyncConfigDict, SourceConfigDict, PusherConfigDict
-from fustor_common.paths import get_fustor_home_dir
+from fustor_core.common import get_fustor_home_dir
 
 # Standardize Fustor home directory across all services
 home_fustor_dir = get_fustor_home_dir()
@@ -24,7 +24,7 @@ load_dotenv(find_dotenv())
 STATE_FILE_NAME = 'agent-state.json'
 STATE_FILE_PATH = os.path.join(CONFIG_DIR, STATE_FILE_NAME)
 
-from fustor_common.exceptions import ConfigurationError
+from fustor_core.exceptions import ConfigError as ConfigurationError
 
 _app_config_instance: Optional[AppConfig] = None 
 

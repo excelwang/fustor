@@ -18,7 +18,7 @@ from .queue_integration import queue_based_ingestor, get_events_from_queue
 from .in_memory_queue import memory_event_queue
 from .processing_manager import processing_manager
 from . import runtime_objects
-from fustor_event_model.models import EventBase
+from fustor_core.event import EventBase
 
 # --- View Manager Module Imports ---
 from .view_manager.manager import process_event as process_single_event, cleanup_all_expired_suspects

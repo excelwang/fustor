@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from fustor_core.drivers import SourceDriver
 from fustor_core.models.config import SourceConfig, PasswdCredential
 from fustor_core.exceptions import DriverError
-from fustor_event_model.models import EventBase, EventType
+from fustor_core.event import EventBase, EventType
 
 from .config import OssDriverParams, QueueType
 from .mapper import map_s3_objects_to_events_batch

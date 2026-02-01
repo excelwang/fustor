@@ -1,6 +1,10 @@
 from pydantic import BaseModel, Field
-from fustor_common.models import ResponseBase
-from fustor_event_model.models import EventBase
+from fustor_core.event import EventBase
+
+# ResponseBase was from fustor_common.models, but we can define a simple base here
+class ResponseBase(BaseModel):
+    """Base response model."""
+    pass
 
 class EventCreate(EventBase):
     pass

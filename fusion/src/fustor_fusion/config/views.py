@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Dict, Optional, List
 from pydantic import BaseModel, field_validator
 
-from fustor_common.paths import get_fustor_home_dir
+from fustor_core.common import get_fustor_home_dir
 from .validators import validate_url_safe_id
 
 logger = logging.getLogger(__name__)

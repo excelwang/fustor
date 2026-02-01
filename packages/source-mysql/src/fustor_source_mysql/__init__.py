@@ -18,7 +18,7 @@ import os
 from fustor_core.drivers import SourceDriver
 from fustor_core.models.config import SourceConfig, PasswdCredential
 from fustor_core.exceptions import DriverError
-from fustor_event_model.models import EventBase, InsertEvent, UpdateEvent, DeleteEvent
+from fustor_core.event import EventBase, InsertEvent, UpdateEvent, DeleteEvent
 
 logger = logging.getLogger("fustor_agent.driver.mysql")
 

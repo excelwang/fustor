@@ -5,7 +5,7 @@ import heapq
 import logging
 import time
 from typing import Any, Dict, Tuple, Optional
-from fustor_event_model.models import MessageSource, EventType
+from fustor_core.event import MessageSource, EventType
 from .state import FSState
 from .tree import TreeManager
 
