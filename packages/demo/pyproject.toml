@@ -2,7 +2,7 @@
 name = "fustor-demo"
 dynamic = ["version"]
 description = "Fustor Bio-Fusion Demo for unified directory service"
-dependencies = [ "fastapi[all]>=0.104.1", "uvicorn>=0.23.2", "fustor-core", "fustor-event-model", "pydantic>=2.0.0", "httpx>=0.25.0",]
+dependencies = ["fastapi[all]>=0.104.1", "uvicorn>=0.23.2", "fustor-core", "pydantic>=2.0.0", "httpx>=0.25.0"]
 requires-python = ">=3.11"
 
 [build-system]

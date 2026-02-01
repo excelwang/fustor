@@ -13,8 +13,6 @@ dependencies = [
     "aiosqlite",
     "httpx",
     "orjson",
-    "fustor-common",
-    "fustor-event-model",
     "fustor-core",
     "PyYAML",
 ]

@@ -3,7 +3,7 @@ name = "fustor-source-fs"
 dynamic = ["version"]
 description = "Fustor Agent FS Source Driver"
 license = "MIT"
-dependencies = [ "fustor-core", "fustor-event-model", "watchdog",]
+dependencies = ["fustor-core", "fustor-schema-fs", "watchdog"]
 
 [build-system]
 requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]

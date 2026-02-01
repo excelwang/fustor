@@ -3,7 +3,7 @@ name = "fustor-fusion-sdk"
 dynamic = ["version"]
 description = "SDK for Fustor Fusion service"
 license = "MIT"
-dependencies = [ "fustor-common", "httpx", "pydantic"]
+dependencies = ["fustor-core", "httpx", "pydantic"]
 
 [build-system]
 requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]

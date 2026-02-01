@@ -4,9 +4,8 @@ dynamic = ["version"]
 description = "Fustor FS Consistent View Provider"
 license = "MIT"
 dependencies = [
-    "fustor-common",
-    "fustor-event-model",
     "fustor-core",
+    "fustor-schema-fs",
     "fastapi",
     "pydantic",
 ]
