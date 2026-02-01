@@ -44,13 +44,27 @@ Example Usage:
 
 from .fusion_pipeline import FusionPipeline
 
+from .view_handler_adapter import (
+    ViewDriverAdapter,
+    ViewManagerAdapter,
+    create_view_handler_from_driver,
+    create_view_handler_from_manager,
+)
+
 # Backward compatibility: re-export from original runtime.py location
 from .datastore_event_manager import DatastoreEventManager, datastore_event_manager
 
 __all__ = [
+    # Pipeline
     "FusionPipeline",
+    
+    # View Handler Adapters
+    "ViewDriverAdapter",
+    "ViewManagerAdapter",
+    "create_view_handler_from_driver",
+    "create_view_handler_from_manager",
+    
     # Backward compatibility exports
     "DatastoreEventManager",
     "datastore_event_manager",
 ]
-
