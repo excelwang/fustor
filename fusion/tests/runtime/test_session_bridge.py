@@ -32,6 +32,15 @@ def mock_pipeline():
     
     pipeline.get_session_role = get_role
     
+    # Mock get_session_info - returns session info with session_id added, or None if not found
+    def get_session_info(session_id):
+        session = pipeline._active_sessions.get(session_id)
+        if session:
+            return {**session, "session_id": session_id}
+        return None
+    
+    pipeline.get_session_info = get_session_info
+    
     return pipeline
 
 

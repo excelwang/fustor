@@ -11,7 +11,10 @@ API Structure:
 - /api/v1/pipe/ingest - Event ingestion
 - /api/v1/pipe/consistency - Consistency checks (signals)
 """
+import logging
 from fastapi import APIRouter
+
+logger = logging.getLogger(__name__)
 
 # Re-export existing routers with new paths
 from .session import session_router

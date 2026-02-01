@@ -33,13 +33,18 @@ class MockSender(Sender):
     async def connect(self) -> None:
         self.connected = True
     
-    async def create_session(self, task_id: str) -> Dict[str, Any]:
+    async def create_session(
+        self,
+        task_id: str,
+        source_type: Optional[str] = None,
+        session_timeout_seconds: Optional[int] = None
+    ) -> Dict[str, Any]:
         self.session_created = True
         self.session_id = f"sess-{task_id}"
         return {
             "session_id": self.session_id,
             "role": self.role,
-            "session_timeout_seconds": 30
+            "session_timeout_seconds": session_timeout_seconds or 30
         }
     
     async def send_events(

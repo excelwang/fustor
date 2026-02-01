@@ -123,34 +123,31 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # --- API Routing Version 1 ---
-from .api.pipe import pipe_router
+from .api.pipe import pipe_router, setup_pipe_v2_routers
 from .api.management import router as management_router
 
-# Core versioned router
-api_v1 = APIRouter()
-
-# 1. Pipeline Domain (/api/v1/pipe) - Main API
-api_v1.include_router(pipe_router, prefix="/pipe")
-
-# 2. View Domain (/api/v1/views)
-api_v1.include_router(view_router, prefix="/views")
-
-# 3. Management Domain (/api/v1/management)
-api_v1.include_router(management_router)
-
-
-# 4. V2 Setup (Before App & Router Include)
-# We must load receivers and setup routes BEFORE including the router in the app
+# 1. V2 Setup - MUST be done BEFORE including pipe_router in api_v1
+# because FastAPI's include_router copies routes at call time
 from .runtime.pipeline_manager import pipeline_manager as pm
-from .api.pipe import setup_pipe_v2_routers
 
 try:
     pm.load_receivers()
     setup_pipe_v2_routers()
 except Exception as e:
-    # Log but don't crash module load, let lifespan handle critical failures?
-    # Or crash if V2 is critical. For now, log.
+    # Log but don't crash module load, let lifespan handle critical failures
     logging.getLogger(__name__).error(f"Failed to setup V2 receivers: {e}")
+
+# Core versioned router
+api_v1 = APIRouter()
+
+# 2. Pipeline Domain (/api/v1/pipe) - Main API
+api_v1.include_router(pipe_router, prefix="/pipe")
+
+# 3. View Domain (/api/v1/views)
+api_v1.include_router(view_router, prefix="/views")
+
+# 4. Management Domain (/api/v1/management)
+api_v1.include_router(management_router)
 
 # Register the unified v1 router
 app.include_router(api_v1, prefix="/api/v1", tags=["v1"])

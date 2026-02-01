@@ -87,7 +87,12 @@ class EchoDriver(Sender):
         self.logger.info(f"[EchoSender] Heartbeat for session {self.session_id} from task {self.id}")
         return {"status": "ok", "role": self.config.get("mock_role", "leader")}
 
-    async def create_session(self, task_id: str) -> Dict[str, Any]:
+    async def create_session(
+        self,
+        task_id: str,
+        source_type: Optional[str] = None,
+        session_timeout_seconds: Optional[int] = None
+    ) -> Dict[str, Any]:
         """
         Creates a new session.
         """
@@ -95,11 +100,12 @@ class EchoDriver(Sender):
         session_id = str(uuid.uuid4())
         self.session_id = session_id
         role = self.config.get("mock_role", "leader")
+        timeout = session_timeout_seconds or self.config.get("session_timeout_seconds", 30)
         self.logger.info(f"[EchoSender] Created session {session_id} for task {task_id} with role {role}")
         return {
             "session_id": session_id,
             "role": role,
-            "session_timeout_seconds": self.config.get("session_timeout_seconds", 30)
+            "session_timeout_seconds": timeout
         }
 
     async def close_session(self) -> None:
