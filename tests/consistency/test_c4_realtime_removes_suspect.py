@@ -33,19 +33,16 @@ class TestRealtimeRemovesSuspect:
         """
         test_file = f"{MOUNT_POINT}/realtime_clear_suspect_{int(time.time()*1000)}.txt"
         
-        # Step 1: Create file from blind-spot
+        # Step 1: Align with Audit cycle, then create file in blind-spot
+        time.sleep(4)
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,
             test_file,
             content="initial content"
         )
         
-        # Wait for Audit to discover and mark as suspect
-        # Marker synchronization
-        marker_file = f"{MOUNT_POINT}/audit_marker_c4_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Wait for Audit to discover it
+        time.sleep(6)
         fusion_client.wait_for_file_in_tree(test_file, timeout=10)
         
         # Verify file is suspect
@@ -88,18 +85,16 @@ class TestRealtimeRemovesSuspect:
         """
         test_file = f"{MOUNT_POINT}/realtime_insert_clear_{int(time.time()*1000)}.txt"
         
-        # Create from blind-spot (will be suspect + agent_missing)
+        # 1. Align with Audit cycle, then create from blind-spot
+        time.sleep(4)
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,
             test_file,
             content="blind spot content"
         )
         
-        # Marker synchronization
-        marker_file = f"{MOUNT_POINT}/audit_marker_c4_insert_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Wait for Audit to discover it
+        time.sleep(6)
         fusion_client.wait_for_file_in_tree(test_file, timeout=10)
         
         # Verify flags

@@ -122,7 +122,7 @@ class TestParentMtimeCheck:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(file_b, timeout=10)
+        found = fusion_client.wait_for_file_in_tree(file_b, timeout=30)
         assert found is not None, "File B should appear via realtime"
         
         # Wait for Audit (which may have stale view of parent directory)

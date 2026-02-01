@@ -60,7 +60,8 @@ def cli():
 @click.option("--no-console-log", is_flag=True, hidden=True, help="Internal: Disable console logging for daemon process.")
 def start(reload, port, host, daemon, verbose, no_console_log):
     """Starts the Fustor Fusion service (in the foreground by default)."""
-    log_level = "DEBUG" if verbose else "INFO"
+    default_level = os.environ.get("FUSTOR_LOG_LEVEL", "INFO").upper()
+    log_level = "DEBUG" if verbose else default_level
     
     # Ensure log directory exists for the FUSION_LOG_FILE
     os.makedirs(os.path.dirname(FUSION_LOG_FILE), exist_ok=True)
