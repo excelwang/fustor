@@ -95,9 +95,10 @@ class ViewDriverAdapter(ViewHandler):
         """
         # Convert dict to EventBase if needed
         if isinstance(event, dict):
-                event = EventBase.model_validate(event)
+            event = EventBase.model_validate(event)
         
-        return await self._driver.process_event(event)
+        result = await self._driver.process_event(event)
+        return result if isinstance(result, bool) else True
     
     async def get_data_view(self, **kwargs) -> Any:
         """

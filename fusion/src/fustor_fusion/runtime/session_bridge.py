@@ -191,9 +191,8 @@ class PipelineSessionBridge:
         Priority: Pipeline session info, fallback to SessionManager.
         """
         # Try Pipeline first
-        if session_id in self._pipeline._active_sessions:
-            info = self._pipeline._active_sessions[session_id].copy()
-            info["session_id"] = session_id
+        info = self._pipeline.get_session_info(session_id)
+        if info:
             return info
         
         # Fallback to legacy
@@ -205,12 +204,12 @@ class PipelineSessionBridge:
     
     def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
         """Get all active sessions."""
-        return self._pipeline._active_sessions.copy()
+        return self._pipeline.get_all_sessions()
     
     @property
     def leader_session(self) -> Optional[str]:
         """Get the current leader session ID."""
-        return self._pipeline._leader_session
+        return self._pipeline.leader_session
 
 
 def create_session_bridge(

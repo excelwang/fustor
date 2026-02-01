@@ -32,24 +32,45 @@ class HTTPSender(Sender):
         from fustor_fusion_sdk.client import FusionClient
         
         api_key = credential.get("key") or credential.get("api_key")
-        self.client = FusionClient(base_url=endpoint, api_key=api_key)
+        
+        # Extended configuration
+        timeout = self.config.get("timeout", 30.0)
+        api_version = self.config.get("api_version", "legacy")
+        
+        self.client = FusionClient(
+            base_url=endpoint, 
+            api_key=api_key,
+            timeout=timeout,
+            api_version=api_version
+        )
     
     async def connect(self) -> None:
         """Establish connection (for HTTP, this is a no-op as we use stateless requests)."""
         self.logger.debug(f"HTTP Sender {self.id} ready for endpoint {self.endpoint}")
     
-    async def create_session(self, task_id: str) -> Dict[str, Any]:
+    async def create_session(
+        self, 
+        task_id: str,
+        source_type: Optional[str] = None,
+        session_timeout_seconds: Optional[int] = None
+    ) -> Dict[str, Any]:
         """
         Create a new session with Fusion.
         
         Args:
             task_id: Identifier for this sync task
+            source_type: Type of source
+            session_timeout_seconds: Requested timeout
             
         Returns:
             Session metadata including session_id, timeout, role
         """
         self.logger.info(f"Creating session for task {task_id}...")
-        session_data = await self.client.create_session(task_id)
+        session_data = await self.client.create_session(
+            task_id, 
+            source_type=source_type,
+            session_timeout_seconds=session_timeout_seconds
+        )
         
         if session_data and session_data.get("session_id"):
             self.session_id = session_data["session_id"]

@@ -97,7 +97,11 @@ class SenderHandlerAdapter(SenderHandler):
         """
         await self.initialize()
         
-        session_data = await self._sender.create_session(task_id)
+        session_data = await self._sender.create_session(
+            task_id,
+            source_type=source_type,
+            session_timeout_seconds=session_timeout_seconds
+        )
         
         session_id = session_data.get("session_id", "")
         metadata = {
@@ -158,7 +162,7 @@ class SenderHandlerAdapter(SenderHandler):
             events=events,
             source_type=source_type,
             is_end=is_final
-        )
+        ) or {}
         
         success = response.get("success", False)
         

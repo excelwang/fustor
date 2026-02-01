@@ -15,59 +15,7 @@ from fustor_core.pipeline.sender import SenderHandler
 from fustor_agent.runtime.agent_pipeline import AgentPipeline
 
 
-class MockSourceHandler(SourceHandler):
-    def __init__(self, events: List[Any] = None):
-        super().__init__("mock-source", {})
-        self.events = events or [{"index": i} for i in range(10)]
-        self.snapshot_calls = 0
-        self.message_calls = 0
-        self.audit_calls = 0
-    
-    def get_snapshot_iterator(self, **kwargs) -> Iterator[Any]:
-        self.snapshot_calls += 1
-        return iter(self.events)
-    
-    def get_message_iterator(self, start_position: int = -1, **kwargs):
-        self.message_calls += 1
-        stop_event = kwargs.get("stop_event")
-        
-        def generator():
-            while not (stop_event and stop_event.is_set()):
-                time.sleep(0.1)
-                yield from [] # Yielding nothing but staying alive
-                break # For testing purposes, we don't want an infinite loop in sync mode unless requested
-        
-        return generator()
-    
-    def get_audit_iterator(self, **kwargs) -> Iterator[Any]:
-
-        self.audit_calls += 1
-        return iter([])
-
-
-class MockSenderHandler(SenderHandler):
-    def __init__(self):
-        super().__init__("mock-sender", {})
-        self.session_id = "test-session"
-        self.role = "follower"
-        self.batches = []
-        self.heartbeat_calls = 0
-        self.session_closed = False
-    
-    async def create_session(self, task_id, source_type, **kwargs):
-        return self.session_id, {"role": self.role}
-    
-    async def send_heartbeat(self, session_id):
-        self.heartbeat_calls += 1
-        return {"role": self.role}
-    
-    async def send_batch(self, session_id, batch, context=None):
-        self.batches.append((batch, context))
-        return True, {}
-    
-    async def close_session(self, session_id):
-        self.session_closed = True
-        return True
+from .mocks import MockSourceHandler, MockSenderHandler
 
 
 @pytest.fixture

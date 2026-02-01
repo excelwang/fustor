@@ -24,6 +24,7 @@ Architecture:
 """
 import asyncio
 import logging
+import time
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
 from fustor_core.pipeline import Pipeline, PipelineState
@@ -101,6 +102,7 @@ class FusionPipeline(Pipeline):
         
         # Processing task
         self._processing_task: Optional[asyncio.Task] = None
+        self._cleanup_task: Optional[asyncio.Task] = None
         self._event_queue: asyncio.Queue = asyncio.Queue()
         
         # Statistics
@@ -151,6 +153,12 @@ class FusionPipeline(Pipeline):
             name=f"fusion-pipeline-{self.id}"
         )
         
+        # Start cleanup task
+        self._cleanup_task = asyncio.create_task(
+            self._session_cleanup_loop(),
+            name=f"fusion-pipeline-cleanup-{self.id}"
+        )
+        
         logger.info(f"FusionPipeline {self.id} started with {len(self._view_handlers)} view handlers")
     
     async def stop(self) -> None:
@@ -180,6 +188,9 @@ class FusionPipeline(Pipeline):
         self._leader_session = None
         
         self._set_state(PipelineState.STOPPED, "Pipeline stopped")
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            
         logger.info(f"FusionPipeline {self.id} stopped")
     
     async def _processing_loop(self) -> None:
@@ -239,7 +250,9 @@ class FusionPipeline(Pipeline):
                 "task_id": task_id,
                 "client_ip": client_ip,
                 "role": role,
-                "created_at": asyncio.get_event_loop().time(),
+                "created_at": time.time(),
+                "last_activity": time.time(),
+                "timeout": kwargs.get("session_timeout_seconds", 30),
             }
             
             self.statistics["sessions_created"] += 1
@@ -277,11 +290,43 @@ class FusionPipeline(Pipeline):
             
             logger.info(f"Session {session_id} closed")
     
+    async def keep_session_alive(self, session_id: str) -> bool:
+        """Update last activity for a session."""
+        async with self._lock:
+            if session_id in self._active_sessions:
+                self._active_sessions[session_id]["last_activity"] = time.time()
+                return True
+            return False
+
     def get_session_role(self, session_id: str) -> str:
         """Get the role of a session (leader/follower)."""
         session = self._active_sessions.get(session_id)
         return session.get("role", "unknown") if session else "unknown"
     
+    async def _session_cleanup_loop(self) -> None:
+        """Periodic task to clean up expired sessions."""
+        while self.is_running():
+            try:
+                await asyncio.sleep(5)  # Check every 5 seconds
+                
+                now = time.time()
+                expired_sessions = []
+                
+                async with self._lock:
+                    for s_id, s_info in self._active_sessions.items():
+                        timeout = s_info.get("timeout", 30)
+                        if now - s_info["last_activity"] > timeout:
+                            expired_sessions.append(s_id)
+                
+                for s_id in expired_sessions:
+                    logger.warning(f"Session {s_id} timed out. Terminating.")
+                    await self.on_session_closed(s_id)
+                    
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in session cleanup loop: {e}", exc_info=True)
+
     # --- Event Processing ---
     
     async def process_events(
@@ -306,7 +351,8 @@ class FusionPipeline(Pipeline):
         if not self.is_running():
             return {"success": False, "error": "Pipeline not running"}
         
-        self.statistics["events_received"] += len(events)
+        async with self._lock:
+            self.statistics["events_received"] += len(events)
         
         # Convert dict events to EventBase if needed
         processed_events = []
@@ -371,6 +417,24 @@ class FusionPipeline(Pipeline):
                 stats["views"][handler_id] = handler.get_stats()
         
         return stats
+        
+    
+    def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """Get information about a specific session."""
+        if session_id in self._active_sessions:
+            info = self._active_sessions[session_id].copy()
+            info["session_id"] = session_id
+            return info
+        return None
+    
+    def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
+        """Get all active sessions."""
+        return self._active_sessions.copy()
+        
+    @property
+    def leader_session(self) -> Optional[str]:
+        """Get the current leader session ID."""
+        return self._leader_session
     
     def __str__(self) -> str:
         return f"FusionPipeline({self.id}, state={self.state.name})"

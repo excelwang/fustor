@@ -14,56 +14,7 @@ from fustor_core.pipeline.sender import SenderHandler
 from fustor_agent.runtime.agent_pipeline import AgentPipeline
 
 
-class MockSourceHandler(SourceHandler):
-    """Mock source handler for testing."""
-    
-    schema_name = "test"
-    schema_version = "1.0"
-    
-    def __init__(self, events: List[Any] = None):
-        super().__init__("mock-source", {})
-        self.events = events or [{"id": i} for i in range(10)]
-    
-    def get_snapshot_iterator(self, **kwargs) -> Iterator[Any]:
-        return iter(self.events)
-    
-    def get_message_iterator(self, start_position: int = -1, **kwargs) -> Iterator[Any]:
-        return iter([])
-    
-    def get_audit_iterator(self, **kwargs) -> Iterator[Any]:
-        return iter([{"audit": True}])
-
-
-class MockSenderHandler(SenderHandler):
-    """Mock sender handler for testing."""
-    
-    schema_name = "test-sender"
-    
-    def __init__(self):
-        super().__init__("mock-sender", {})
-        self.session_created = False
-        self.batches_sent: List[List[Any]] = []
-    
-    async def create_session(
-        self, task_id: str, source_type: str,
-        session_timeout_seconds: int = 30, **kwargs
-    ) -> Tuple[str, Dict[str, Any]]:
-        self.session_created = True
-        return f"sess-{task_id}", {"role": "follower"}
-    
-    async def send_heartbeat(self, session_id: str) -> Dict[str, Any]:
-        return {"role": "follower", "session_id": session_id}
-    
-    async def send_batch(
-        self, session_id: str, events: List[Any],
-        batch_context: Dict[str, Any] = None
-    ) -> Tuple[bool, Dict[str, Any]]:
-        self.batches_sent.append(events.copy())
-        return True, {"count": len(events)}
-    
-    async def close_session(self, session_id: str) -> bool:
-        self.session_created = False
-        return True
+from .mocks import MockSourceHandler, MockSenderHandler
 
 
 @pytest.fixture

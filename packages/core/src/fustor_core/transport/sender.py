@@ -60,12 +60,19 @@ class Sender(ABC):
         raise NotImplementedError
     
     @abstractmethod
-    async def create_session(self, task_id: str) -> Dict[str, Any]:
+    async def create_session(
+        self, 
+        task_id: str, 
+        source_type: Optional[str] = None,
+        session_timeout_seconds: Optional[int] = None
+    ) -> Dict[str, Any]:
         """
         Create a new session with the Fusion receiver.
         
         Args:
             task_id: Identifier for this sync task
+            source_type: Type of source (e.g. 'fs', 'mysql')
+            session_timeout_seconds: Requested session timeout
             
         Returns:
             Session metadata including:

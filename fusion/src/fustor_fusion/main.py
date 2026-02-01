@@ -34,6 +34,14 @@ async def lifespan(app: FastAPI):
     
     # NEW: Initialize the global task manager reference
     runtime_objects.task_manager = processing_manager
+    
+    # V2: Initialize the Pipeline Manager
+    from .runtime.pipeline_manager import pipeline_manager as pm
+    runtime_objects.pipeline_manager = pm
+    
+    # Initialize pipelines (Async)
+    await pm.initialize_pipelines()
+    await pm.start()
 
     # Perform initial configuration load and start processors
     try:
@@ -101,6 +109,11 @@ async def lifespan(app: FastAPI):
 
     logger.info("Application shutdown initiated.")
     suspect_cleanup_task.cancel()
+    
+    # V2: Stop clinical pipeline
+    if runtime_objects.pipeline_manager:
+        await runtime_objects.pipeline_manager.stop()
+        
     await processing_manager.stop_all()
     await session_manager.stop_periodic_cleanup()
     logger.info("Application shutdown complete.")
@@ -124,6 +137,20 @@ api_v1.include_router(view_router, prefix="/views")
 
 # 3. Management Domain (/api/v1/management)
 api_v1.include_router(management_router)
+
+
+# 4. V2 Setup (Before App & Router Include)
+# We must load receivers and setup routes BEFORE including the router in the app
+from .runtime.pipeline_manager import pipeline_manager as pm
+from .api.pipe import setup_pipe_v2_routers
+
+try:
+    pm.load_receivers()
+    setup_pipe_v2_routers()
+except Exception as e:
+    # Log but don't crash module load, let lifespan handle critical failures?
+    # Or crash if V2 is critical. For now, log.
+    logging.getLogger(__name__).error(f"Failed to setup V2 receivers: {e}")
 
 # Register the unified v1 router
 app.include_router(api_v1, prefix="/api/v1", tags=["v1"])

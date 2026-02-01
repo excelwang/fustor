@@ -272,20 +272,20 @@ reset() / cleanup_expired_suspects()  # Optional
 5. Phase 3: Fusion 重构 (receiver-http, pipelines)
 6. Phase 4: 导入路径更新 + API 路径
 7. schema-fs: Pydantic 模型 + 22 个测试
-8. 术语迁移: Pusher → Sender (完整迁移，保持向后兼容)
+8. 术语迁移: Pusher → Sender (完整迁移，不用保留legacy代码!)
    - SenderConfig, SenderConfigDict
    - SenderDriverService, SenderConfigService
    - SenderDriverServiceInterface, SenderConfigServiceInterface
    - Entry points: fustor_agent.drivers.senders
    - AppConfig: get_senders(), add_sender(), delete_sender()
-9. Pipeline 抽象: Phase 2 完成
+9. Pipeline 抽象: Phase 2
    - AgentPipeline 完整实现 (含控制循环)
    - FusionPipeline 完整实现
    - SourceHandlerAdapter, SenderHandlerAdapter
    - ViewDriverAdapter, ViewManagerAdapter
    - PipelineBridge 迁移工具
    - 89 个 Pipeline 相关测试
-10. 废弃 datastores-config.yaml (添加废弃警告，优先 receivers-config)
+10. 移除 datastores-config.yaml
 11. Session 管理整合: PipelineSessionBridge
     - 桥接 FusionPipeline 与 SessionManager
     - 同步 session 创建/销毁
@@ -294,6 +294,8 @@ reset() / cleanup_expired_suspects()  # Optional
     - SyncInstanceService 支持 feature flag 切换
     - FUSTOR_USE_PIPELINE=true 启用新架构
     - 零风险渐进式迁移
+
+!! 务必完整迁移，不要遗留设计文档的要求，不要丢失关键业务逻辑，不必兼容的legacy代码（彻底清理旧代码，我们还处于初期开发阶段！）
 
 
 

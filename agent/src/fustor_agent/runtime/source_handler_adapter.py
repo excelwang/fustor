@@ -17,6 +17,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger("fustor_agent")
 
 
+from fustor_core.drivers import SourceDriver
+
 class SourceHandlerAdapter(SourceHandler):
     """
     Adapts a Source driver to the SourceHandler interface.
@@ -43,7 +45,7 @@ class SourceHandlerAdapter(SourceHandler):
     
     def __init__(
         self,
-        driver: Any,  # The actual driver instance
+        driver: SourceDriver,  # The actual driver instance
         config: Optional[Dict[str, Any]] = None
     ):
         """

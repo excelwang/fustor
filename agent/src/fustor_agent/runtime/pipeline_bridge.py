@@ -97,6 +97,19 @@ class PipelineBridge:
         """
         task_id = f"{agent_id}:{pipeline_id}"
         
+        # Validation
+        if not sync_config:
+            raise ValueError("sync_config cannot be None")
+        if not source_config:
+            raise ValueError("source_config cannot be None")
+        if not sender_config:
+            raise ValueError("sender_config cannot be None")
+            
+        if not getattr(sync_config, 'source', None):
+            raise ValueError("sync_config.source cannot be empty")
+        if not getattr(sync_config, 'sender', None):
+            raise ValueError("sync_config.sender cannot be empty")
+            
         # Create source handler via adapter
         source_driver_class = self._source_driver_service._get_driver_by_type(
             source_config.driver
@@ -123,9 +136,6 @@ class PipelineBridge:
         
         # Build pipeline config from sync config
         pipeline_config = self._build_pipeline_config(sync_config)
-        if initial_statistics:
-            # Pass through initial stats
-            pass
         
         # Create pipeline
         pipeline = AgentPipeline(

@@ -31,6 +31,9 @@ class PipelineState(IntFlag):
     SNAPSHOT_PHASE = auto()  # Currently in snapshot sync phase
     MESSAGE_PHASE = auto()   # Currently in message/realtime sync phase
     AUDIT_PHASE = auto()     # Currently in audit sync phase
+    RECONNECTING = auto()    # Currently attempting to reconnect
+    DRAINING = auto()        # Draining queues before stopping
+    STOPPING = auto()        # Gracefully stopping
 
 
 class Pipeline(ABC):

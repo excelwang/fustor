@@ -32,7 +32,13 @@ def sanitize_surrogate_characters(obj: Any) -> Any:
         return obj
 
 class FusionClient:
-    def __init__(self, base_url: str, api_key: str, api_version: str = "legacy"):
+    def __init__(
+        self, 
+        base_url: str, 
+        api_key: str, 
+        api_version: str = "legacy",
+        timeout: float = 30.0
+    ):
         """
         Initialize FusionClient.
         
@@ -40,11 +46,17 @@ class FusionClient:
             base_url: The base URL of the Fusion service
             api_key: API key for authentication
             api_version: API version to use ("pipe" uses /api/v1/pipe, "legacy" uses /api/v1/ingest)
+            timeout: Request timeout in seconds
         """
         self.base_url = base_url
         self.api_key = api_key
         self.api_version = api_version
-        self.client = httpx.AsyncClient(base_url=self.base_url, headers={"X-API-Key": self.api_key})
+        self.timeout = timeout
+        self.client = httpx.AsyncClient(
+            base_url=self.base_url, 
+            headers={"X-API-Key": self.api_key},
+            timeout=self.timeout
+        )
         
         # Set API paths based on version
         if api_version == "legacy":
@@ -58,13 +70,25 @@ class FusionClient:
             self._events_path = "/api/v1/pipe/ingest"
             self._consistency_path = "/api/v1/pipe/consistency"
 
-    async def create_session(self, task_id: str) -> Optional[Dict[str, Any]]:
+    async def create_session(
+        self, 
+        task_id: str, 
+        source_type: Optional[str] = None,
+        session_timeout_seconds: Optional[int] = None
+    ) -> Optional[Dict[str, Any]]:
         """
         Creates a new session and returns the session details (including ID and role).
         """
         try:
             # Sanitize task_id to handle any surrogate characters before JSON serialization
-            payload = {"task_id": task_id}
+            payload = {
+                "task_id": task_id,
+                "source_type": source_type,
+                "session_timeout_seconds": session_timeout_seconds
+            }
+            # Remove None values
+            payload = {k: v for k, v in payload.items() if v is not None}
+            
             response = await self.client.post(f"{self._session_path}/", json=payload)
             response.raise_for_status()
             return response.json()

@@ -37,7 +37,7 @@ class CreateSessionResponse(BaseModel):
 
 class EventBatch(BaseModel):
     """Batch of events to ingest."""
-    events: List[Dict[str, Any]]
+    events: List[EventBase]
     source_type: str = "message"  # 'message', 'snapshot', 'audit'
     is_end: bool = False
 
@@ -64,7 +64,7 @@ class SessionInfo:
 
 # Type aliases for callbacks
 SessionCreatedCallback = Callable[[str, str, str, Dict[str, Any]], Awaitable[SessionInfo]]
-EventReceivedCallback = Callable[[str, List[Dict[str, Any]], str, bool], Awaitable[bool]]
+EventReceivedCallback = Callable[[str, List[EventBase], str, bool], Awaitable[bool]]
 HeartbeatCallback = Callable[[str], Awaitable[Dict[str, Any]]]
 SessionClosedCallback = Callable[[str], Awaitable[None]]
 
@@ -99,9 +99,11 @@ class HTTPReceiver(Receiver):
         
         # API key to pipeline mapping
         self._api_key_to_pipeline: Dict[str, str] = {}
+        self._api_key_cache: Dict[str, str] = {}
+        
         
         # Session timeout configuration
-        self.session_timeout_seconds = config.get("session_timeout_seconds", 30) if config else 30
+        self.session_timeout_seconds = config.get("session_timeout_seconds", 30)
         
         # Create routers
         self._session_router = self._create_session_router()
@@ -127,6 +129,7 @@ class HTTPReceiver(Receiver):
     def register_api_key(self, api_key: str, pipeline_id: str):
         """Register an API key for a pipeline."""
         self._api_key_to_pipeline[api_key] = pipeline_id
+        self._api_key_cache.clear()  # Invalidate cache
         self.logger.debug(f"Registered API key for pipeline {pipeline_id}")
     
     async def validate_credential(self, credential: Dict[str, Any]) -> Optional[str]:
@@ -140,8 +143,19 @@ class HTTPReceiver(Receiver):
             Associated pipeline_id if valid, None if invalid
         """
         api_key = credential.get("api_key") or credential.get("key")
-        if api_key and api_key in self._api_key_to_pipeline:
-            return self._api_key_to_pipeline[api_key]
+        if not api_key:
+            return None
+            
+        # Check cache first
+        if api_key in self._api_key_cache:
+            return self._api_key_cache[api_key]
+            
+        # Check mapping
+        if api_key in self._api_key_to_pipeline:
+            pipeline_id = self._api_key_to_pipeline[api_key]
+            self._api_key_cache[api_key] = pipeline_id
+            return pipeline_id
+            
         return None
     
     async def start(self) -> None:
@@ -248,6 +262,7 @@ class HTTPReceiver(Receiver):
             request: Request,
         ):
             """Ingest a batch of events."""
+
             if receiver._on_event_received:
                 try:
                     success = await receiver._on_event_received(

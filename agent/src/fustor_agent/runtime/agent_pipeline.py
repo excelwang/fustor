@@ -39,7 +39,11 @@ class AgentPipeline(Pipeline):
     # Class-level timing constants
     CONTROL_LOOP_INTERVAL = 1.0
     FOLLOWER_STANDBY_INTERVAL = 1.0
+    ROLE_CHECK_INTERVAL = 1.0
     ERROR_RETRY_INTERVAL = 5.0
+    MAX_CONSECUTIVE_ERRORS = 5
+    BACKOFF_MULTIPLIER = 2
+    MAX_BACKOFF_SECONDS = 60
     
     def __init__(
         self,
@@ -94,6 +98,7 @@ class AgentPipeline(Pipeline):
             "events_pushed": 0,
             "last_pushed_event_id": None
         }
+        self._consecutive_errors = 0
     
     async def start(self) -> None:
         """
@@ -196,7 +201,7 @@ class AgentPipeline(Pipeline):
             while self.is_running():
                 # Wait until we have a role
                 if not self.current_role:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self.ROLE_CHECK_INTERVAL)
                     continue
                 
                 if self.current_role == "leader":
@@ -209,14 +214,28 @@ class AgentPipeline(Pipeline):
                     self._set_state(PipelineState.PAUSED, "Follower mode - standby")
                     await asyncio.sleep(self.FOLLOWER_STANDBY_INTERVAL)
                 
+                # Reset error counter on successful iteration
+                self._consecutive_errors = 0
+                
         except asyncio.CancelledError:
             logger.info(f"Pipeline {self.id} control loop cancelled")
             return
         except Exception as e:
-            self._set_state(PipelineState.ERROR, f"Control loop error: {e}")
+            self._consecutive_errors += 1
+            if self._consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
+                self._set_state(PipelineState.ERROR, f"Too many consecutive errors: {e}")
+                logger.error(f"Pipeline {self.id} stopped due to too many errors: {e}")
+                return
+
+            self._set_state(PipelineState.ERROR, f"Control loop error (retry {self._consecutive_errors}): {e}")
             logger.error(f"Pipeline {self.id} control loop error: {e}", exc_info=True)
-            # Sleep then continue loop to allow recovery
-            await asyncio.sleep(self.ERROR_RETRY_INTERVAL)
+            
+            # Exponential backoff
+            backoff = min(
+                self.ERROR_RETRY_INTERVAL * (self.BACKOFF_MULTIPLIER ** (self._consecutive_errors - 1)),
+                self.MAX_BACKOFF_SECONDS
+            )
+            await asyncio.sleep(backoff)
 
     
     async def _run_leader_sequence(self) -> None:
@@ -357,6 +376,14 @@ class AgentPipeline(Pipeline):
                         self.statistics["events_pushed"] += len(batch)
                     batch = []
         finally:
+            # Send remaining events in batch
+            if batch:
+                success, _ = await self.sender_handler.send_batch(
+                    self.session_id, batch, {"phase": "realtime", "is_final": True}
+                )
+                if success:
+                    self.statistics["events_pushed"] += len(batch)
+            
             # Signal stop to the underlying sync iterator
             stop_event.set()
 
