@@ -36,8 +36,13 @@ class SenderDriverService(SenderDriverServiceInterface):
         """
         discovered = {}
         
-        # Try new entry point first
-        for group in ["fustor_agent.drivers.senders", "fustor_agent.drivers.pushers"]:
+        # Try various entry point groups for compatibility
+        groups = [
+            "fustor_agent.senders",
+            "fustor_agent.drivers.senders",
+            "fustor_agent.drivers.pushers"
+        ]
+        for group in groups:
             try:
                 eps = entry_points(group=group)
                 for ep in eps:

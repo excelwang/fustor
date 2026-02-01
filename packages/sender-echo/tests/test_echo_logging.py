@@ -4,7 +4,7 @@ This test verifies the echo pusher can write to logs for various event types.
 """
 import pytest
 import logging
-from fustor_pusher_echo import EchoDriver
+from fustor_sender_echo import EchoDriver
 from fustor_core.models.config import SenderConfig, PasswdCredential
 from fustor_core.event import UpdateEvent, DeleteEvent, InsertEvent
 
@@ -13,12 +13,9 @@ from fustor_core.event import UpdateEvent, DeleteEvent, InsertEvent
 async def test_echo_driver_logs_update_events(caplog):
     """Test that echo driver properly logs UpdateEvent data."""
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="", 
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-update-echo", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-update-echo", "http://localhost", credential, config)
     
     # Create UpdateEvent similar to what fs would generate
     update_events = [
@@ -47,25 +44,21 @@ async def test_echo_driver_logs_update_events(caplog):
 
     # 2. Act & 3. Assert - Check logging
     with caplog.at_level(logging.INFO):
-        result = await driver.push(update_events, agent_id="agent-update", task_id="task-update-1")
+        result = await driver.send_events(update_events, source_type="realtime")
         
         # Verify logging content
-        assert "[EchoPusher]" in caplog.text
-        assert "Agent: agent-update" in caplog.text
-        assert "Task: task-update-1" in caplog.text
-    assert result == {"snapshot_needed": True}
+        assert "[EchoSender]" in caplog.text
+        assert "Task: test-update-echo" in caplog.text
+    assert result == {"success": True, "snapshot_needed": True}
 
 
 @pytest.mark.asyncio
 async def test_echo_driver_logs_delete_events(caplog):
     """Test that echo driver properly logs DeleteEvent data."""
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="", 
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-delete-echo", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-delete-echo", "http://localhost", credential, config)
     
     # Create DeleteEvent similar to what fs would generate
     delete_events = [
@@ -82,26 +75,22 @@ async def test_echo_driver_logs_delete_events(caplog):
 
     # 2. Act & 3. Assert - Check logging
     with caplog.at_level(logging.INFO):
-        result = await driver.push(delete_events, agent_id="agent-delete", task_id="task-delete-1")
+        result = await driver.send_events(delete_events, source_type="realtime")
         
         # Verify logging content
-        assert "[EchoPusher]" in caplog.text
-        assert "Agent: agent-delete" in caplog.text
-        assert "Task: task-delete-1" in caplog.text
+        assert "[EchoSender]" in caplog.text
+        assert "Task: test-delete-echo" in caplog.text
         assert "本批次: 2条" in caplog.text  # 2 rows in the delete event
-    assert result == {"snapshot_needed": True}
+    assert result == {"success": True, "snapshot_needed": True}
 
 
 @pytest.mark.asyncio
 async def test_echo_driver_logs_with_snapshot_end_flag(caplog):
     """Test that echo driver properly logs with snapshot end flag."""
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="", 
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-snapshot-echo", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-snapshot-echo", "http://localhost", credential, config)
     
     events = [
         UpdateEvent(
@@ -112,35 +101,30 @@ async def test_echo_driver_logs_with_snapshot_end_flag(caplog):
         )
     ]
 
-    # 2. Act & 3. Assert - Check logging with snapshot end flag
+    # 2. Act & 3. Assert - Check logging with end flag
     with caplog.at_level(logging.INFO):
-        result = await driver.push(
+        result = await driver.send_events(
             events, 
-            agent_id="agent-snapshot", 
-            task_id="task-snapshot-1", 
-            is_snapshot_end=True
+            source_type="realtime", 
+            is_end=True
         )
         
-        # Verify logging content includes snapshot end flag
-        assert "[EchoPusher]" in caplog.text
-        assert "Agent: agent-snapshot" in caplog.text
-        assert "Task: task-snapshot-1" in caplog.text
+        # Verify logging content includes end flag
+        assert "[EchoSender]" in caplog.text
+        assert "Task: test-snapshot-echo" in caplog.text
         assert "本批次: 1条" in caplog.text
         assert "累计: 1条" in caplog.text
-        assert "Flags: SNAPSHOT_END" in caplog.text
-        assert result == {"snapshot_needed": True}
+        assert "Flags: END" in caplog.text
+        assert result == {"success": True, "snapshot_needed": True}
 
 
 @pytest.mark.asyncio
 async def test_echo_driver_logs_with_multiple_flags(caplog):
     """Test that echo driver properly logs with multiple control flags."""
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="", 
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-flags-echo", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-flags-echo", "http://localhost", credential, config)
     
     events = [
         InsertEvent(
@@ -151,32 +135,27 @@ async def test_echo_driver_logs_with_multiple_flags(caplog):
         )
     ]
 
-    # 2. Act & 3. Assert - Check logging with multiple flags
+    # 2. Act & 3. Assert - Check logging with end flag
     with caplog.at_level(logging.INFO):
-        result = await driver.push(
+        result = await driver.send_events(
             events, 
-            agent_id="agent-flags", 
-            task_id="task-flags-1", 
-            is_snapshot_end=True,
-            snapshot_sync_suggested=True
+            source_type="realtime", 
+            is_end=True
         )
         
-        # Verify logging content includes both flags
-        assert "[EchoPusher]" in caplog.text
-        assert "Flags: SNAPSHOT_END, SNAPSHOT_SUGGESTED" in caplog.text
-        assert result == {"snapshot_needed": True}
+        # Verify logging content includes flag
+        assert "[EchoSender]" in caplog.text
+        assert "Flags: END" in caplog.text
+        assert result == {"success": True, "snapshot_needed": True}
 
 
 @pytest.mark.asyncio
 async def test_echo_driver_logs_first_event_data(caplog):
     """Test that echo driver logs the first event's data in JSON format."""
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="", 
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-data-echo", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-data-echo", "http://localhost", credential, config)
     
     # Create an event with structured data
     events = [
@@ -205,7 +184,7 @@ async def test_echo_driver_logs_first_event_data(caplog):
 
     # 2. Act & 3. Assert - Check that first event data is logged
     with caplog.at_level(logging.INFO):
-        await driver.push(events)
+        await driver.send_events(events, source_type="realtime")
         
         # Verify that the first event's data appears in logs (in JSON format)
         assert "/home/test/file.txt" in caplog.text  # First event's file path

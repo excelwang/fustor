@@ -7,7 +7,7 @@ import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from fustor_pusher_echo import EchoDriver
+from fustor_sender_echo import EchoDriver
 from fustor_core.models.config import SenderConfig, PasswdCredential
 from fustor_core.event import UpdateEvent
 
@@ -15,63 +15,54 @@ from fustor_core.event import UpdateEvent
 async def test_echo_pusher_requests_snapshot_on_first_push():
     """Test that echo pusher requests snapshot on the first push."""
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="dummy",  # Required field
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-echo", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-echo", "http://localhost", credential, config)
     
     # Simulate events
     events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}], fields=["id", "name"])]
 
     # 2. Act
-    result = await driver.push(events, task_id="echo-sync-fs", agent_id="test-agent")
+    result = await driver.send_events(events, source_type="snapshot")
 
     # 3. Assert
-    assert result == {"snapshot_needed": True}
+    assert result == {"success": True, "snapshot_needed": True}
 
 
 @pytest.mark.asyncio
 async def test_echo_pusher_requests_snapshot_on_first_push_for_any_task():
     """Test that echo pusher requests snapshot on the first push, regardless of task name."""
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="dummy",  # Required field
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-echo", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-echo", "http://localhost", credential, config)
     
     # Simulate events
     events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}], fields=["id", "name"])]
 
     # 2. Act
-    result = await driver.push(events, task_id="some-other-task", agent_id="test-agent")
+    result = await driver.send_events(events, source_type="realtime")
 
     # 3. Assert
-    assert result == {"snapshot_needed": True}
+    assert result == {"success": True, "snapshot_needed": True}
 
 
 @pytest.mark.asyncio
 async def test_echo_pusher_requests_snapshot_on_first_push_with_missing_task_id():
     """Test that echo pusher requests snapshot on the first push even when task_id is not provided."""
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="dummy",  # Required field
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-echo", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-echo", "http://localhost", credential, config)
     
     # Simulate events
     events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}], fields=["id", "name"])]
 
     # 2. Act
-    result = await driver.push(events, agent_id="test-agent")  # No task_id provided
+    result = await driver.send_events(events)  # Use defaults
 
     # 3. Assert
-    assert result == {"snapshot_needed": True}
+    assert result == {"success": True, "snapshot_needed": True}
 
 
 @pytest.mark.asyncio
@@ -81,33 +72,30 @@ async def test_echo_pusher_logs_properly():
     from io import StringIO
     
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="dummy",  # Required field
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-echo", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-echo", "http://localhost", credential, config)
     
     # Capture logs
     log_stream = StringIO()
     handler = logging.StreamHandler(log_stream)
-    logger = logging.getLogger(f"fustor_agent.pusher.echo.test-echo")
+    logger = logging.getLogger(f"fustor_agent.sender.echo.test-echo")
     logger.addHandler(handler)
     logger.setLevel(logging.INFO) # Ensure INFO logs are captured
     events = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1, "name": "test"}], fields=["id", "name"])]
 
     # 2. Act
-    result = await driver.push(events, task_id="echo-sync-fs", agent_id="test-agent", is_snapshot_end=True)
+    result = await driver.send_events(events, source_type="snapshot", is_end=True)
 
     # 3. Assert
-    assert result == {"snapshot_needed": True}
+    assert result == {"success": True, "snapshot_needed": True}
     log_output = log_stream.getvalue()
-    assert "[EchoPusher]" in log_output
-    assert "Agent: test-agent" in log_output
-    assert "Task: echo-sync-fs" in log_output
+    assert "[EchoSender]" in log_output
+    assert "[SNAPSHOT]" in log_output
+    assert "Task: test-echo" in log_output
     assert "本批次: 1条" in log_output
     assert "累计: 1条" in log_output
-    assert "Flags: SNAPSHOT_END" in log_output
+    assert "Flags: END" in log_output
     assert "First event data" in log_output
     
     # Cleanup
@@ -118,12 +106,9 @@ async def test_echo_pusher_logs_properly():
 async def test_echo_pusher_maintains_statistics():
     """Test that echo pusher maintains cumulative statistics while triggering snapshots."""
     # 1. Arrange
-    config = SenderConfig(
-        driver="echo", 
-        uri="dummy",  # Required field
-        credential=PasswdCredential(user="test")
-    )
-    driver = EchoDriver("test-stats", config)
+    credential = {"user": "test"}
+    config = {"batch_size": 10}
+    driver = EchoDriver("test-stats", "http://localhost", credential, config)
     
     # First batch of events
     events1 = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 1}, {"id": 2}], fields=["id"])]
@@ -132,15 +117,15 @@ async def test_echo_pusher_maintains_statistics():
     events2 = [UpdateEvent(event_schema="test", table="test", rows=[{"id": 3}], fields=["id"])]
 
     # 2. Act
-    result1 = await driver.push(events1, task_id="echo-task-1", agent_id="test-agent")
-    result2 = await driver.push(events2, task_id="echo-task-2", agent_id="test-agent")
+    result1 = await driver.send_events(events1, source_type="realtime")
+    result2 = await driver.send_events(events2, source_type="realtime")
 
     # 3. Assert
-    # First call should return snapshot_needed=True (echo-task-1 starts with "echo")
-    assert result1 == {"snapshot_needed": True}
+    # First call should return snapshot_needed=True
+    assert result1 == {"success": True, "snapshot_needed": True}
     
     # Second call should return snapshot_needed=False because the trigger is one-time
-    assert result2 == {"snapshot_needed": False}
+    assert result2 == {"success": True, "snapshot_needed": False}
     
     # Statistics should be cumulative (2 from first batch + 1 from second batch = 3 total)
     assert driver.total_rows == 3

@@ -20,20 +20,25 @@ class SourceDriverService(SourceDriverServiceInterface): # Inherit from the inte
 
     def _discover_installed_drivers(self) -> Dict[str, Any]:
         """
-        Scans for installed packages that register under the 'fustor_agent.drivers.sources'
-        entry point and loads their driver class.
+        Scans for installed packages that register under the source entry points.
         """
         discovered = {}
-        try:
-            eps = entry_points(group="fustor_agent.drivers.sources")
-            for ep in eps:
-                try:
-                    discovered[ep.name] = ep.load()
-                except Exception as e:
-                    logger.error(f"Failed to load source driver plugin '{ep.name}': {e}", exc_info=True)
-            logger.debug(f"DEBUG: Discovered source drivers: {discovered}") # Added debug print
-        except Exception as e:
-            logger.error(f"Error while discovering entry points: {e}", exc_info=True)
+        # Try various entry point groups for compatibility
+        groups = ["fustor_agent.sources", "fustor_agent.drivers.sources"]
+        for group in groups:
+            try:
+                eps = entry_points(group=group)
+                for ep in eps:
+                    if ep.name in discovered:
+                        continue
+                    try:
+                        discovered[ep.name] = ep.load()
+                    except Exception as e:
+                        logger.error(f"Failed to load source driver plugin '{ep.name}': {e}", exc_info=True)
+            except Exception as e:
+                logger.debug(f"No entry points found for group {group}: {e}")
+        
+        logger.debug(f"DEBUG: Discovered source drivers: {discovered}")
         return discovered
 
     def _get_driver_by_type(self, driver_type: str) -> Any:
@@ -127,4 +132,3 @@ class SourceDriverService(SourceDriverServiceInterface): # Inherit from the inte
         except Exception as e:
             logger.error(f"Error during check_privileges for driver '{driver_type}': {e}", exc_info=True)
             raise DriverError(f"An exception occurred during privilege check: {e}")
-
