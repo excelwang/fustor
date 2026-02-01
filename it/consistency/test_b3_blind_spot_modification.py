@@ -39,7 +39,7 @@ class TestBlindSpotFileModification:
         assert found is not None, "File should appear via realtime event"
         
         # Record original mtime from Fusion
-        original_mtime = found.get("mtime")
+        original_mtime = found.get("modified_time")
         
         # Step 2: Wait a bit, then modify file from blind-spot client
         time.sleep(2)
@@ -61,7 +61,7 @@ class TestBlindSpotFileModification:
         
         # Step 3: Before Audit, Fusion mtime should be unchanged
         tree = fusion_client.get_tree(path=test_file, max_depth=0)
-        mtime_before_audit = tree.get("mtime")
+        mtime_before_audit = tree.get("modified_time")
         assert mtime_before_audit == original_mtime, \
             "Fusion mtime should be unchanged before Audit"
         
@@ -77,7 +77,7 @@ class TestBlindSpotFileModification:
         mtime_after_audit = 0
         while time.time() - start < 10:
             tree_after = fusion_client.get_tree(path=test_file, max_depth=0)
-            mtime_after_audit = tree_after.get("mtime")
+            mtime_after_audit = tree_after.get("modified_time")
             if abs(mtime_after_audit - new_fs_mtime) < 0.001:
                 success = True
                 break
