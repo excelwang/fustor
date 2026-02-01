@@ -79,3 +79,29 @@ def get_path(row: dict) -> str:
 def get_mtime(row: dict) -> float:
     """Extract the modification time from a row."""
     return row.get("modified_time") or 0.0
+
+
+# Import Pydantic models (optional, requires pydantic)
+try:
+    from .models import FSRow, FSDeleteRow
+except ImportError:
+    FSRow = None
+    FSDeleteRow = None
+
+
+__all__ = [
+    # Constants
+    "SCHEMA_NAME",
+    "SCHEMA_VERSION",
+    "REQUIRED_FIELDS",
+    "OPTIONAL_FIELDS",
+    "DELETE_FIELDS",
+    # Validation functions
+    "validate_row",
+    "get_path",
+    "get_mtime",
+    # Pydantic models (optional)
+    "FSRow",
+    "FSDeleteRow",
+]
+

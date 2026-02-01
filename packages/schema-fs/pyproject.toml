@@ -21,12 +21,17 @@ classifiers = [
     "Programming Language :: Python :: 3.12",
 ]
 
-# No runtime dependencies - schema is pure data definition
+# No required runtime dependencies - core schema is pure data definition
+# Pydantic models are optional for type-safe validation
 dependencies = []
 
 [project.optional-dependencies]
+models = [
+    "pydantic>=2.0.0",
+]
 dev = [
     "pytest>=7.0.0",
+    "pydantic>=2.0.0",
 ]
 
 [tool.hatch.build.targets.wheel]
