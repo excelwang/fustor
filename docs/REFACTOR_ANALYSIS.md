@@ -278,12 +278,16 @@ reset() / cleanup_expired_suspects()  # Optional
    - SenderDriverServiceInterface, SenderConfigServiceInterface
    - Entry points: fustor_agent.drivers.senders
    - AppConfig: get_senders(), add_sender(), delete_sender()
-9. ✅ Pipeline 抽象: Phase 1 完成
-   - SenderHandler 抽象 (counterpart to SourceHandler)
-   - AgentPipeline 骨架实现
-   - 8 个单元测试
-10. ⬜ 暂缓: 废弃 datastores-config.yaml (需要更新所有测试)
-11. ⬜ 暂缓: Session 管理使用新 Pipeline 配置
+9. ✅ Pipeline 抽象: Phase 2 完成
+   - AgentPipeline 完整实现 (含控制循环)
+   - FusionPipeline 完整实现
+   - SourceHandlerAdapter, SenderHandlerAdapter
+   - ViewDriverAdapter, ViewManagerAdapter
+   - PipelineBridge 迁移工具
+   - 89 个 Pipeline 相关测试
+10. ✅ 废弃 datastores-config.yaml (添加废弃警告，优先 receivers-config)
+11. ⬜ 暂缓: Session 管理整合到 FusionPipeline
 12. ⬜ 暂缓: SyncInstance → AgentPipeline 完整迁移
 
-**当前测试状态**: 311 passed, 1 xfailed, 1 warning
+**当前测试状态**: 392 passed, 1 xfailed, 0 warnings
+
