@@ -21,7 +21,7 @@ from .services.instances.sync import SyncInstanceService
 
 # --- NEW: Import the new driver services ---
 from .services.drivers.source_driver import SourceDriverService
-from .services.drivers.pusher_driver import PusherDriverService
+from .services.drivers.sender_driver import SenderDriverService
 
 from fustor_core.models.states import SyncState, EventBusState
 
@@ -59,7 +59,7 @@ class App:
         
         # --- NEW: Instantiate the new driver services ---
         self.source_driver_service = SourceDriverService()
-        self.pusher_driver_service = PusherDriverService()
+        self.sender_driver_service = SenderDriverService()
 
         # Instance services
         # [MODIFIED] Correctly inject SourceDriverService into EventBusService
@@ -72,7 +72,7 @@ class App:
             self.source_config_service, # Pass the source config service
             self.pusher_config_service,
             self.event_bus_service, # Corrected: use self.event_bus_service
-            self.pusher_driver_service,
+            self.sender_driver_service,
             self.source_driver_service, # Added missing argument
             self.agent_id # Pass the agent_id to the service
         )

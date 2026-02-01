@@ -1,13 +1,13 @@
 import pytest
 from unittest.mock import MagicMock, AsyncMock
-from fustor_agent.services.drivers.pusher_driver import PusherDriverService
+from fustor_agent.services.drivers.sender_driver import SenderDriverService
 from fustor_core.exceptions import DriverError, ConfigError
 
 @pytest.fixture
 def pusher_driver_service(mocker):
-    """Fixture for a PusherDriverService with patched discovery."""
-    mocker.patch.object(PusherDriverService, '_discover_installed_drivers', return_value={})
-    yield PusherDriverService()
+    """Fixture for a SenderDriverService with patched discovery."""
+    mocker.patch.object(SenderDriverService, '_discover_installed_drivers', return_value={})
+    yield SenderDriverService()
 
 @pytest.fixture
 def mock_pusher_class():
@@ -30,7 +30,7 @@ class TestPusherDriverService:
 
     def test_get_driver_by_type_not_found(self, pusher_driver_service):
         """Tests that a DriverError is raised for a non-existent driver."""
-        with pytest.raises(DriverError, match="Pusher driver 'non_existent' not found."):
+        with pytest.raises(DriverError, match="Sender driver 'non_existent' not found."):
             pusher_driver_service._get_driver_by_type("non_existent")
 
     @pytest.mark.asyncio

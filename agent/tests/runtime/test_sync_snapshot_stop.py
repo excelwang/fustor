@@ -14,7 +14,7 @@ def mock_bus_service():
 
 @pytest.fixture
 def mock_pusher_driver_service():
-    with patch('fustor_agent.services.drivers.pusher_driver.PusherDriverService') as mock_service:
+    with patch('fustor_agent.services.drivers.sender_driver.SenderDriverService') as mock_service:
         mock_driver_class = MagicMock()
         mock_driver_class.return_value.push = AsyncMock()
         mock_driver_class.return_value.create_session = AsyncMock()

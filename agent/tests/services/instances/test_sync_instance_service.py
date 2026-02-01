@@ -5,7 +5,7 @@ import time
 
 from fustor_agent.runtime.sync import SyncInstance, SyncState
 from fustor_agent.services.drivers.source_driver import SourceDriverService
-from fustor_agent.services.drivers.pusher_driver import PusherDriverService
+from fustor_agent.services.drivers.sender_driver import SenderDriverService
 from fustor_agent.services.instances.bus import EventBusService
 from fustor_core.models.config import SyncConfig, SourceConfig, PusherConfig, PasswdCredential, FieldMapping
 
@@ -46,7 +46,7 @@ async def test_snapshot_flow_with_real_drivers(integration_configs, tmp_path: Pa
 
     # --- Use real services instead of mocks ---
     sds = SourceDriverService()
-    pds = PusherDriverService()
+    pds = SenderDriverService()
     bus_service = EventBusService(source_configs={"test_source": source_config}, source_driver_service=sds)
 
     # --- Setup the test condition ---
@@ -91,7 +91,7 @@ async def test_message_sync_flow_with_real_drivers(integration_configs, tmp_path
 
     # --- Use real services instead of mocks ---
     sds = SourceDriverService()
-    pds = PusherDriverService()
+    pds = SenderDriverService()
     bus_service = EventBusService(source_configs={"test_source": source_config}, source_driver_service=sds)
 
     # The pusher schema is needed for field mapping
