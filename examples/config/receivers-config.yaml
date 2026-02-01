@@ -1,0 +1,29 @@
+# Fusion Receivers Configuration Example
+#
+# Receivers define transport endpoints that accept events from Agents.
+# Each receiver can serve multiple pipelines via API key mapping.
+#
+# File location: $FUSTOR_FUSION_HOME/receivers-config.yaml
+
+http-main:
+  driver: http
+  bind_host: 0.0.0.0
+  port: 8102
+  session_timeout_seconds: 30
+  
+  # API keys map to pipeline IDs
+  # When Agent connects with an API key, we route to the associated pipeline
+  api_keys:
+    - key: fk_research_key
+      pipeline_id: pipe-http
+    - key: fk_archive_key
+      pipeline_id: pipe-archive
+
+# Example gRPC receiver (future)
+# grpc-main:
+#   driver: grpc
+#   bind_host: 0.0.0.0
+#   port: 8103
+#   api_keys:
+#     - key: fk_grpc_key
+#       pipeline_id: pipe-grpc

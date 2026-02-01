@@ -1,0 +1,19 @@
+# Fusion Pipeline Configuration Example
+# 
+# This configuration binds a Receiver to Views, defining how events flow
+# from Agent to View handlers.
+#
+# File location: $FUSTOR_FUSION_HOME/fusion-pipes-config/pipe-http.yaml
+
+id: pipe-http
+receiver: http-main        # Receiver ID from receivers-config.yaml
+views:                      # View IDs from views-config/
+  - fs-research
+  - fs-archive
+enabled: true
+session_timeout_seconds: 30
+allow_concurrent_push: false
+
+# Additional configuration (optional)
+extra:
+  description: "Main HTTP pipeline for research data"
