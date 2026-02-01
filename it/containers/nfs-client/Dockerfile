@@ -25,8 +25,9 @@ RUN pip install --no-cache-dir \
     /app/packages/agent-sdk \
     /app/packages/fusion-sdk \
     /app/packages/source-fs \
-    /app/packages/sender-http \
+    /app/packages/pusher-fusion \
     /app/agent
+
 
 
 # Create directories
