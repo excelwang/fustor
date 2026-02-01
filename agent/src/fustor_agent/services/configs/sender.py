@@ -8,19 +8,16 @@ The term "sender" aligns with the V2 architecture terminology.
 import logging
 from typing import Dict, Optional, List
 
-from fustor_core.models.config import AppConfig, PusherConfig
+from fustor_core.models.config import AppConfig, SenderConfig
 from fustor_agent.services.instances.sync import SyncInstanceService
 from fustor_agent.services.common import config_lock
 from .base import BaseConfigService
-from fustor_agent_sdk.interfaces import PusherConfigServiceInterface
+from fustor_agent_sdk.interfaces import SenderConfigServiceInterface
 
 logger = logging.getLogger("fustor_agent")
 
-# Type alias for clarity
-SenderConfig = PusherConfig
 
-
-class SenderConfigService(BaseConfigService[SenderConfig], PusherConfigServiceInterface):
+class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceInterface):
     """
     Manages the lifecycle of SenderConfig objects.
     

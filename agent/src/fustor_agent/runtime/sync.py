@@ -6,14 +6,14 @@ import time
 from typing import Optional, Any, TYPE_CHECKING, Dict
 from datetime import datetime, timezone
 
-from fustor_core.models.config import SyncConfig, PusherConfig, SourceConfig
+from fustor_core.models.config import SyncConfig, SenderConfig, SourceConfig
 from fustor_core.models.states import SyncState, SyncInstanceDTO
 from fustor_core.exceptions import DriverError
 from fustor_agent.runtime.bus import EventBusFailedError
 
 if TYPE_CHECKING:
     from fustor_agent.services.instances.bus import EventBusInstanceRuntime, EventBusService
-    from fustor_agent.services.drivers.pusher_driver import PusherDriverService
+    from fustor_agent.services.drivers.sender_driver import SenderDriverService
     from fustor_agent.services.drivers.source_driver import SourceDriverService
 
 logger = logging.getLogger("fustor_agent")
@@ -25,9 +25,9 @@ class SyncInstance:
         agent_id: str,
         config: SyncConfig,
         source_config: SourceConfig,
-        pusher_config: PusherConfig,
+        pusher_config: SenderConfig,  # Type updated, param name kept for compatibility
         bus_service: "EventBusService",
-        pusher_driver_service: "PusherDriverService",
+        pusher_driver_service: "SenderDriverService",  # Type updated
         source_driver_service: "SourceDriverService",
         pusher_schema: Dict[str, Any],
         initial_statistics: Optional[Dict[str, Any]] = None

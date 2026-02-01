@@ -11,9 +11,9 @@ from fustor_agent_sdk.interfaces import SyncInstanceServiceInterface # Import th
 if TYPE_CHECKING:
     from fustor_agent.services.configs.sync import SyncConfigService
     from fustor_agent.services.configs.source import SourceConfigService
-    from fustor_agent.services.configs.pusher import PusherConfigService
+    from fustor_agent.services.configs.sender import SenderConfigService
     from fustor_agent.services.instances.bus import EventBusService, EventBusInstanceRuntime
-    from fustor_agent.services.drivers.pusher_driver import PusherDriverService
+    from fustor_agent.services.drivers.sender_driver import SenderDriverService
     from fustor_agent.services.drivers.source_driver import SourceDriverService
 
 logger = logging.getLogger("fustor_agent")

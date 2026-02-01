@@ -45,14 +45,19 @@ class SourceConfigServiceInterface(BaseConfigService[SourceConfig]):
     async def discover_and_cache_fields(self, source_id: str, admin_user: str, admin_password: str):
         ...
 
-from fustor_core.models.config import PusherConfig
+from fustor_core.models.config import SenderConfig
 
-class PusherConfigServiceInterface(BaseConfigService[PusherConfig]):
+class SenderConfigServiceInterface(BaseConfigService[SenderConfig]):
     """
-    Interface for managing PusherConfig objects.
+    Interface for managing SenderConfig objects.
+    
+    Senders are responsible for transmitting events from Agent to Fusion.
     """
     async def cleanup_obsolete_configs(self) -> List[str]:
         ...
+
+# Backward compatibility alias
+PusherConfigServiceInterface = SenderConfigServiceInterface
 
 from fustor_core.models.config import SyncConfig
 
@@ -143,9 +148,11 @@ class SourceDriverServiceInterface(Protocol):
     async def check_privileges(self, driver_type: str, **kwargs) -> Tuple[bool, str]:
         ...
 
-class PusherDriverServiceInterface(Protocol):
+class SenderDriverServiceInterface(Protocol):
     """
-    Interface for discovering and interacting with Pusher driver classes.
+    Interface for discovering and interacting with Sender driver classes.
+    
+    Senders are responsible for transmitting events from Agent to Fusion.
     """
     def list_available_drivers(self) -> List[str]:
         ...
@@ -161,6 +168,10 @@ class PusherDriverServiceInterface(Protocol):
 
     async def get_needed_fields(self, driver_type: str, **kwargs) -> Dict[str, Any]:
         ...
+
+
+# Backward compatibility alias
+PusherDriverServiceInterface = SenderDriverServiceInterface
 
 from fustor_core.models.states import SyncState
 

@@ -10,12 +10,12 @@ from importlib.metadata import entry_points
 from typing import Any, Dict, Tuple, List
 
 from fustor_core.exceptions import DriverError, ConfigError
-from fustor_agent_sdk.interfaces import PusherDriverServiceInterface
+from fustor_agent_sdk.interfaces import SenderDriverServiceInterface
 
 logger = logging.getLogger("fustor_agent")
 
 
-class SenderDriverService(PusherDriverServiceInterface):
+class SenderDriverService(SenderDriverServiceInterface):
     """
     A service for discovering and interacting with Sender driver classes.
     
