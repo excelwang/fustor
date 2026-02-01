@@ -150,10 +150,28 @@ class SyncInstance(AgentPipeline):
 - [x] SourceHandlerAdapter 已创建 (fustor_agent/runtime/source_handler_adapter.py)
 - [x] Agent Runtime 模块公开导出 (fustor_agent/runtime/__init__.py)
 - [x] FusionPipeline 已创建 (fustor_fusion/runtime/fusion_pipeline.py)
+- [x] ViewDriverAdapter 已创建 (fustor_fusion/runtime/view_handler_adapter.py)
+- [x] ViewManagerAdapter 已创建 (fustor_fusion/runtime/view_handler_adapter.py)
 - [x] Fusion Runtime 模块公开导出 (fustor_fusion/runtime/__init__.py)
-- [ ] ViewHandlerAdapter 待创建 (包装现有 ViewManager)
-- [ ] SyncInstance → AgentPipeline 完整迁移
+- [ ] SyncInstance → AgentPipeline 迁移 (可选, 渐进式)
 
-**当前测试状态**: 358 passed
+**当前测试状态**: 381 passed
+
+## Phase 2 完成 - Handler Adapter 层完备
+
+架构已完全就绪:
+
+```
+Agent Side:
+  SourceHandlerAdapter → Source Drivers (FSDriver, etc.)
+  SenderHandlerAdapter → Sender Transports (HTTPSender, etc.)
+  AgentPipeline orchestrates Source → Sender
+
+Fusion Side:
+  ViewDriverAdapter → ViewDriver (FSViewDriver, etc.)
+  ViewManagerAdapter → ViewManager (multi-driver routing)
+  FusionPipeline dispatches to ViewHandlers
+```
+
 
 
