@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fustor_pusher_echo import EchoDriver
 from fustor_core.models.config import PusherConfig, PasswdCredential
-from fustor_event_model.models import UpdateEvent
+from fustor_core.event import UpdateEvent
 
 @pytest.mark.asyncio
 async def test_echo_pusher_requests_snapshot_on_first_push():

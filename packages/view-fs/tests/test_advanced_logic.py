@@ -3,7 +3,7 @@ import asyncio
 import time
 import unittest
 from fustor_view_fs import FSViewProvider
-from fustor_event_model.models import UpdateEvent, MessageSource, DeleteEvent
+from fustor_core.event import UpdateEvent, MessageSource, DeleteEvent
 
 @pytest.fixture
 def parser():

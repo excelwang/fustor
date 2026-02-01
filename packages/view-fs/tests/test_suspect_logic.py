@@ -4,7 +4,7 @@ import asyncio
 from unittest.mock import MagicMock
 import heapq
 from fustor_view_fs import FSViewProvider
-from fustor_event_model.models import UpdateEvent, MessageSource, EventType
+from fustor_core.event import UpdateEvent, MessageSource, EventType
 
 @pytest.fixture
 def parser():

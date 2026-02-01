@@ -6,7 +6,7 @@ import pytest
 import logging
 from fustor_pusher_echo import EchoDriver
 from fustor_core.models.config import PusherConfig, PasswdCredential
-from fustor_event_model.models import UpdateEvent, DeleteEvent, InsertEvent
+from fustor_core.event import UpdateEvent, DeleteEvent, InsertEvent
 
 
 @pytest.mark.asyncio

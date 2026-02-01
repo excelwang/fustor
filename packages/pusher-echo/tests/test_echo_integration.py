@@ -62,7 +62,7 @@ async def test_echo_sync_instance_triggers_snapshot():
     echo_driver = EchoDriver("echo-pusher", pusher_config)
     
     # Mock an event to simulate push
-    from fustor_event_model.models import UpdateEvent
+    from fustor_core.event import UpdateEvent
     mock_events = [UpdateEvent(event_schema="test", table="files", rows=[{"file_path": "/tmp/test.txt", "size": 100}], fields=["file_path", "size"])]    
     # When the echo pusher is called with a task ID that starts with "echo", 
     # it should return snapshot_needed=True, which should trigger the snapshot sync
@@ -83,7 +83,7 @@ async def test_snapshot_trigger_once_and_only_once():
     """
     from fustor_pusher_echo import EchoDriver
     from fustor_core.models.config import PusherConfig, PasswdCredential
-    from fustor_event_model.models import UpdateEvent
+    from fustor_core.event import UpdateEvent
     
     config = PusherConfig(
         driver="echo", 

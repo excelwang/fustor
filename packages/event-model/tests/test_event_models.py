@@ -1,6 +1,6 @@
 import pytest
 from pydantic import ValidationError
-from fustor_event_model.models import EventBase, EventType
+from fustor_core.event import EventBase, EventType
 
 def test_event_base():
     event = EventBase(

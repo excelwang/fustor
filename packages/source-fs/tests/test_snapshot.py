@@ -5,7 +5,7 @@ import time
 
 from fustor_source_fs import FSDriver
 from fustor_core.models.config import SourceConfig, PasswdCredential
-from fustor_event_model.models import UpdateEvent
+from fustor_core.event import UpdateEvent
 
 @pytest.fixture
 def fs_config(tmp_path: Path):

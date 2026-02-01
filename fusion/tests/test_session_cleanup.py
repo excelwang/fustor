@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from fustor_fusion.core.session_manager import SessionManager, SessionInfo
 from fustor_fusion.in_memory_queue import InMemoryEventQueue
 from fustor_fusion.datastore_state_manager import DatastoreStateManager, DatastoreState
-from fustor_event_model.models import InsertEvent
+from fustor_core.event import InsertEvent
 
 @pytest.fixture
 def mock_in_memory_queue():

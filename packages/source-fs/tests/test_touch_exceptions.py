@@ -12,7 +12,7 @@ from watchdog.events import FileSystemEvent
 from fustor_source_fs.components import _WatchManager
 from fustor_source_fs.event_handler import OptimizedWatchEventHandler, get_file_metadata
 from fustor_core.models.config import SourceConfig, PasswdCredential
-from fustor_event_model.models import UpdateEvent, DeleteEvent
+from fustor_core.event import UpdateEvent, DeleteEvent
 import queue
 
 

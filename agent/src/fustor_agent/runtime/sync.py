@@ -717,7 +717,7 @@ class SyncInstance:
             
             # If no events received and we haven't sent the initial trigger, create a fake event
             if not events_batch and not initial_event_sent:
-                from fustor_event_model.models import UpdateEvent
+                from fustor_core.event import UpdateEvent
                 # Create a fake initial event to trigger the pusher and potentially start snapshot sync
                 fake_event = UpdateEvent(
                     event_schema=self.config.source,  # Use source as event_schema

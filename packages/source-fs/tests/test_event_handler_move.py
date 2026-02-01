@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, call
 import shutil
 
 from watchdog.events import FileSystemEvent
-from fustor_event_model.models import DeleteEvent, UpdateEvent
+from fustor_core.event import DeleteEvent, UpdateEvent
 from fustor_source_fs.event_handler import OptimizedWatchEventHandler
 from fustor_source_fs.components import _WatchManager
 

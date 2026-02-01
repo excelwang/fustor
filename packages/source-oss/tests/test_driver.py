@@ -7,7 +7,7 @@ from typing import List, Dict, Any
 
 from fustor_core.models.config import SourceConfig, PasswdCredential
 from fustor_core.exceptions import DriverError
-from fustor_event_model.models import EventBase, EventType
+from fustor_core.event import EventBase, EventType
 
 from fustor_source_oss.driver import OssSourceDriver
 from fustor_source_oss.config import OssDriverParams, QueueType, PollingQueueConfig

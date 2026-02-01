@@ -7,7 +7,7 @@ from fustor_fusion.main import app
 from fustor_fusion.datastore_state_manager import datastore_state_manager
 from fustor_fusion.processing_manager import processing_manager
 from fustor_fusion.in_memory_queue import memory_event_queue
-from fustor_event_model.models import EventBase, EventType
+from fustor_core.event import EventBase, EventType
 
 # 模拟 API Key 认证
 async def mock_get_datastore_id():
