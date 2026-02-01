@@ -217,19 +217,20 @@ reset() / cleanup_expired_suspects()  # Optional
    - 提取通用逻辑到 Pipeline
    - FS 特有逻辑保留在 FSSourceHandler
 
-### Phase 3: Fusion 重构
+### Phase 3: Fusion 重构 🔄 进行中
 
-7. **创建 fustor-receiver-http**
-   - 从 fusion/api 抽取 HTTP 接收逻辑
-   - 实现 Receiver 抽象
+7. ✅ **创建 fustor-receiver-http**
+   - `packages/receiver-http/` - 新包，实现 Receiver 抽象
+   - 提供 FastAPI routers 用于 session 和 event 处理
+   - 回调架构支持灵活集成
 
-8. **重构 Datastore → View 映射**
+8. ✅ **创建 receivers-config.yaml 配置**
+   - `ReceiversConfigLoader` - 传输端点和 API key 管理
+   - 支持多 API key 映射到 pipeline
+
+9. ⬜ **重构 Datastore → View 映射** (暂缓)
    - 废弃 datastore_id 概念
    - Pipeline 直接绑定 View
-
-9. **重构 Session 管理**
-   - Session 属于 Pipeline
-   - View 通过 Pipeline 接收 Session 事件
 
 ### Phase 4: 配置与测试更新
 
