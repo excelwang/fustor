@@ -144,6 +144,9 @@ class SyncInstance(AgentPipeline):
 
 - [x] Pipeline 抽象已定义 (fustor_core/pipeline/)
 - [x] Handler 抽象已定义 (SourceHandler, ViewHandler)
-- [ ] SenderHandler 待创建
-- [ ] AgentPipeline 待创建
+- [x] SenderHandler 已创建 (fustor_core/pipeline/sender.py)
+- [x] AgentPipeline 骨架已创建 (fustor_agent/runtime/agent_pipeline.py)
+- [x] SenderHandlerAdapter 已创建 (fustor_agent/runtime/sender_handler_adapter.py)
+- [ ] SourceHandlerAdapter 待创建
 - [ ] FusionPipeline 待创建 (对应 Fusion 端)
+- [ ] SyncInstance → AgentPipeline 完整迁移
