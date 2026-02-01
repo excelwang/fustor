@@ -67,14 +67,14 @@ def docker_env():
     # 1. Create .fustor directory
     docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/views-config"])
     
-    # 2. Inject Datastores Config
-    ds_config = """
+    # 2. Inject Receivers Config (v2: renamed from 'datastores')
+    receivers_config = """
 integration-test-ds:
   api_key: "test-api-key-123"
   session_timeout_seconds: 3
   allow_concurrent_push: true
 """
-    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/datastores-config.yaml", ds_config)
+    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/receivers-config.yaml", receivers_config)
     
     # 3. Inject View Config
     view_config = """
@@ -186,8 +186,8 @@ shared-fs:
 """
     docker_manager.create_file_in_container(container_name, "/root/.fustor/sources-config.yaml", sources_config)
 
-    # 2. Pushers Config
-    pushers_config = f"""
+    # 2. Senders Config (v2: renamed from 'pushers')
+    senders_config = f"""
 fusion:
   driver: "fusion"
   endpoint: "{fusion_endpoint}"
@@ -197,14 +197,14 @@ fusion:
   driver_params:
     datastore_id: {datastore_id}
 """
-    docker_manager.create_file_in_container(container_name, "/root/.fustor/pushers-config.yaml", pushers_config)
+    docker_manager.create_file_in_container(container_name, "/root/.fustor/senders-config.yaml", senders_config)
 
     # 3. Syncs Config
     docker_manager.exec_in_container(container_name, ["mkdir", "-p", "/root/.fustor/syncs-config"])
     syncs_config = f"""
 id: "sync-task-1"
 source: "shared-fs"
-pusher: "fusion"
+sender: "fusion"  # v2: renamed from 'pusher'
 disabled: false
 audit_interval_sec: {AUDIT_INTERVAL}
 sentinel_interval_sec: 1
