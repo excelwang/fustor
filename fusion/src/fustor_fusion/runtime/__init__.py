@@ -51,6 +51,11 @@ from .view_handler_adapter import (
     create_view_handler_from_manager,
 )
 
+from .session_bridge import (
+    PipelineSessionBridge,
+    create_session_bridge,
+)
+
 # Backward compatibility: re-export from original runtime.py location
 from .datastore_event_manager import DatastoreEventManager, datastore_event_manager
 
@@ -64,7 +69,12 @@ __all__ = [
     "create_view_handler_from_driver",
     "create_view_handler_from_manager",
     
+    # Session Bridge
+    "PipelineSessionBridge",
+    "create_session_bridge",
+    
     # Backward compatibility exports
     "DatastoreEventManager",
     "datastore_event_manager",
 ]
+

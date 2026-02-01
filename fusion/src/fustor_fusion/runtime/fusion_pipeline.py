@@ -313,7 +313,7 @@ class FusionPipeline(Pipeline):
         processed_events = []
         for event in events:
             if isinstance(event, dict):
-                processed_events.append(EventBase.from_dict(event))
+                processed_events.append(EventBase.model_validate(event))
             else:
                 processed_events.append(event)
         
