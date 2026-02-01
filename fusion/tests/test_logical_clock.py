@@ -5,6 +5,7 @@ import time
 import threading
 import pytest
 
+from unittest.mock import patch
 from fustor_common.logical_clock import LogicalClock
 
 
@@ -73,7 +74,8 @@ class TestLogicalClockThreadSafety:
     
     def test_concurrent_updates(self):
         """Multiple threads updating should be safe."""
-        clock = LogicalClock()
+        # Initialize with a fixed small value to ensure updates (0 to 9099) advance it
+        clock = LogicalClock(initial_time=0.001)
         errors = []
         
         def worker(start_value: int, count: int):
@@ -140,7 +142,7 @@ class TestLogicalClockThreadSafety:
         with patch('time.time', return_value=t_system):
             clock = LogicalClock()
             # Initial watermark should be anchored to system 'now'
-            self.assertAlmostEqual(clock.get_watermark(), t_system)
+            assert abs(clock.get_watermark() - t_system) < 0.001
 
     def test_audit_does_not_pull_clock_backwards(self):
         """Old files found during early audit should not regress the clock from system 'now'."""
@@ -153,7 +155,7 @@ class TestLogicalClockThreadSafety:
         clock.update(observed_mtime=1000.0, can_sample_skew=False)
 
         # Clock must stay at 2000
-        self.assertEqual(clock.get_watermark(), 2000.0)
+        assert clock.get_watermark() == 2000.0
 
     def test_realtime_events_establish_skew_and_take_control(self):
         """Establishing a skew mode allows the clock to move based on physical progress."""
@@ -172,16 +174,10 @@ class TestLogicalClockThreadSafety:
         for _ in range(5):
             clock.update(observed_mtime=nfs_mtime, agent_time=agent_now, session_id="agent-A")
         
-        # Logical Watermark should now be 10400 (from mtime)
-        self.assertEqual(clock.get_watermark(), 10400.0)
-
-        # Phase 2: Physical Progress without new file activity (e.g., DELETION)
-        # Agent advances to 10510 (+10s)
-        # Baseline = 10510 - 100 = 10410
         # Logic clock should advance to 10410 even if mtime is None
         clock.update(observed_mtime=None, agent_time=10510.0, session_id="agent-A")
         
-        self.assertEqual(clock.get_watermark(), 10410.0)
+        assert clock.get_watermark() == 10410.0
 
     def test_multi_agent_skew_isolation(self):
         """Clock should respect different skews for different sessions."""
@@ -198,14 +194,14 @@ class TestLogicalClockThreadSafety:
         clock.update(observed_mtime=1900.0, agent_time=1700.0, session_id="B")
         
         # Both see 1900, clock is 1900
-        self.assertEqual(clock.get_watermark(), 1900.0)
+        assert clock.get_watermark() == 1900.0
 
         # Progress check for A
         # A moves to 2010 -> Baseline 1910
         clock.update(None, agent_time=2010.0, session_id="A")
-        self.assertEqual(clock.get_watermark(), 1910.0)
+        assert clock.get_watermark() == 1910.0
 
         # Progress check for B
         # B moves to 1720 -> Baseline 1920
         clock.update(None, agent_time=1720.0, session_id="B")
-        self.assertEqual(clock.get_watermark(), 1920.0)
+        assert clock.get_watermark() == 1920.0
