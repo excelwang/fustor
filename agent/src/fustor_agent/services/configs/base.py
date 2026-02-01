@@ -92,7 +92,7 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
                 status = "disabled" if updates['disabled'] else "enabled"
                 if self.sync_instance_service:
                     reason = f"Dependency {self.config_type_capitalized} '{id}' configuration was {status}."
-                    if self.config_type in ['source', 'pusher']:
+                    if self.config_type in ['source', 'sender', 'pusher']:  # Support both
                         await self.sync_instance_service.mark_dependent_syncs_outdated(self.config_type, id, reason, updates)
                     elif self.config_type == 'sync':
                         instance = self.sync_instance_service.get_instance(id)
@@ -106,7 +106,8 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
         dependent_syncs = [
             sync_id for sync_id, sync_config in self.app_config.get_syncs().items()
             if (self.config_type == 'source' and sync_config.source == id) or \
-               (self.config_type == 'pusher' and sync_config.pusher == id)
+               (self.config_type == 'sender' and sync_config.sender == id) or \
+               (self.config_type == 'pusher' and sync_config.sender == id)
         ]
 
         if dependent_syncs:

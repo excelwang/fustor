@@ -25,7 +25,7 @@ class SyncConfigYaml(BaseModel):
     """Configuration for a single sync task loaded from YAML."""
     id: str
     source: str
-    pusher: str
+    sender: Optional[str] = None  # New field name (v2), optional for migration
     disabled: bool = False
     fields_mapping: List[FieldMappingYaml] = []
     audit_interval_sec: int = 600
@@ -40,6 +40,30 @@ class SyncConfigYaml(BaseModel):
         if errors:
             raise ValueError("; ".join(errors))
         return v
+    
+    def __init__(self, **data):
+        """
+        Backward compatibility: accept 'pusher' field and migrate to 'sender'.
+        
+        If YAML has 'pusher' instead of 'sender', use it with a deprecation warning.
+        """
+        import warnings
+        
+        # If sender is not provided but pusher is in the raw data
+        if 'sender' not in data and 'pusher' in data:
+            warnings.warn(
+                f"SyncConfig field 'pusher' is deprecated. Please rename it to 'sender' in your YAML config.",
+                DeprecationWarning,
+                stacklevel=4
+            )
+            logger.warning(
+                f"Sync config '{data.get('id', 'unknown')}' uses deprecated 'pusher' field. "
+                f"Please update to 'sender'. Support for 'pusher' will be removed in a future version."
+            )
+            data['sender'] = data.pop('pusher')
+        
+        super().__init__(**data)
+
 
 
 class SyncsConfigLoader:
@@ -57,9 +81,11 @@ class SyncsConfigLoader:
     ```yaml
     id: sync-research
     source: fs-research
-    pusher: fusion-main
+    sender: fusion-main  # v2: renamed from 'pusher'
     disabled: false
     ```
+    
+    Backward compatibility: 'pusher' field is still accepted but deprecated.
     """
     
     def __init__(self, config_dir: Optional[Path] = None):

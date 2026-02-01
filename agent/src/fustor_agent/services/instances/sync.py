@@ -63,14 +63,14 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
         if not source_config:
             raise NotFoundError(f"Source config '{sync_config.source}' not found for sync '{id}'.")
         
-        pusher_config = self.pusher_config_service.get_config(sync_config.pusher)
-        if not pusher_config:
-            raise NotFoundError(f"Required Pusher config '{sync_config.pusher}' not found.")
+        sender_config = self.pusher_config_service.get_config(sync_config.sender)
+        if not sender_config:
+            raise NotFoundError(f"Required Sender config '{sync_config.sender}' not found.")
         
         self.logger.info(f"Attempting to start sync instance '{id}'...")
         try:
             pusher_schema = await self.pusher_driver_service.get_needed_fields(
-                driver_type=pusher_config.driver, endpoint=pusher_config.endpoint
+                driver_type=sender_config.driver, endpoint=sender_config.endpoint
             )
             
             # Check if we should use new Pipeline architecture
@@ -87,7 +87,7 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
                     agent_id=self.agent_id,
                     sync_config=sync_config,
                     source_config=source_config,
-                    sender_config=pusher_config,
+                    sender_config=sender_config,
                     event_bus=None  # EventBus integration TBD
                 )
                 
@@ -100,7 +100,7 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
                     agent_id=self.agent_id,
                     config=sync_config,
                     source_config=source_config,
-                    pusher_config=pusher_config,
+                    pusher_config=sender_config,
                     bus_service=self.bus_service,
                     pusher_driver_service=self.pusher_driver_service,
                     source_driver_service=self.source_driver_service,
@@ -159,7 +159,8 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
         affected_syncs = [
             inst for inst in self.list_instances() 
             if (dependency_type == "source" and inst.config.source == dependency_id) or
-               (dependency_type == "pusher" and inst.config.pusher == dependency_id)
+               (dependency_type == "sender" and inst.config.sender == dependency_id) or
+               (dependency_type == "pusher" and inst.config.sender == dependency_id)  # Legacy support
         ]
 
         logger.info(f"Marking syncs dependent on {dependency_type} '{dependency_id}' as outdated.")

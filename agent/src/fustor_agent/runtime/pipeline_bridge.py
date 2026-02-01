@@ -112,7 +112,7 @@ class PipelineBridge:
             sender_config.driver
         )
         sender_driver = sender_driver_class(
-            sender_id=sync_config.pusher,
+            sender_id=sync_config.sender,
             endpoint=sender_config.endpoint,
             credential=self._extract_credential(sender_config),
             config=self._extract_sender_config(sender_config)
