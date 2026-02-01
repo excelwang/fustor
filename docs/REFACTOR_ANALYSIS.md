@@ -217,7 +217,7 @@ reset() / cleanup_expired_suspects()  # Optional
    - 提取通用逻辑到 Pipeline
    - FS 特有逻辑保留在 FSSourceHandler
 
-### Phase 3: Fusion 重构 🔄 进行中
+### Phase 3: Fusion 重构 ✅ 完成
 
 7. ✅ **创建 fustor-receiver-http**
    - `packages/receiver-http/` - 新包，实现 Receiver 抽象
@@ -228,18 +228,22 @@ reset() / cleanup_expired_suspects()  # Optional
    - `ReceiversConfigLoader` - 传输端点和 API key 管理
    - 支持多 API key 映射到 pipeline
 
-9. ⬜ **重构 Datastore → View 映射** (暂缓)
-   - 废弃 datastore_id 概念
-   - Pipeline 直接绑定 View
+9. ✅ **创建 FusionPipelineConfig**
+   - `FusionPipelinesConfigLoader` - Pipeline 配置加载
+   - 支持 fusion-pipes-config/*.yaml 目录结构
+   - 直接绑定 Receiver → View
 
 ### Phase 4: 配置与测试更新 ✅ 完成
 
 10. ✅ **配置文件迁移**
     - senders-config.yaml (Agent)
     - receivers-config.yaml (Fusion)
+    - fusion-pipes-config/*.yaml (Fusion Pipeline)
 
-11. ⬜ **API 路径更新** (暂缓)
-    - `/api/v1/ingest` → `/api/v1/pipe`
+11. ✅ **API 路径更新**
+    - `/api/v1/pipe` 新路径 (推荐)
+    - `/api/v1/ingest` 保留向后兼容
+    - FusionSDK 支持 api_version 参数
     
 12. ✅ **测试更新**
     - 更新 import 路径到 fustor_core
@@ -254,7 +258,7 @@ reset() / cleanup_expired_suspects()  # Optional
 | LogicalClock 迁移破坏一致性 | 高 | ✅ 保持接口不变，仅移动位置 |
 | 配置解析逻辑变更 | 中 | ✅ 渐进式迁移，保持旧格式兼容 |
 | Session 管理重构 | 高 | ⬜ 暂缓，先测试覆盖再改动 |
-| API 路径变更 | 中 | ⬜ 暂缓，一次性变更，清理旧路径 |
+| API 路径变更 | 中 | ✅ 双路径支持，渐进迁移 |
 
 ---
 
@@ -264,7 +268,8 @@ reset() / cleanup_expired_suspects()  # Optional
 2. ✅ 阅读现有代码，理解业务逻辑
 3. ✅ Phase 1: 合并基础模块到 fustor-core
 4. ✅ Phase 2: Agent 重构 (sender-http)
-5. ✅ Phase 3: Fusion 重构 (receiver-http)
-6. ✅ Phase 4: 导入路径更新
-7. ⬜ 暂缓: Datastore → View 映射重构
-8. ⬜ 暂缓: API 路径更新
+5. ✅ Phase 3: Fusion 重构 (receiver-http, pipelines)
+6. ✅ Phase 4: 导入路径更新 + API 路径
+7. ⬜ 暂缓: 废弃 datastores-config.yaml (需要更新所有测试)
+8. ⬜ 暂缓: Session 管理使用新 Pipeline 配置
+
