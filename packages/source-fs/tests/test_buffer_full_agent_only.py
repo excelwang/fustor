@@ -65,7 +65,7 @@ async def test_transient_source_buffer_full_triggers_error(caplog):
             # 5. Configure Sync
             sync_config = SyncConfig(
                 source="test-fs-source",
-                pusher="test-echo-pusher",
+                sender="test-echo-pusher",
                 disabled=False,
                 fields_mapping=[
                     FieldMapping(to="file_path", source=["file_path"], required=True)

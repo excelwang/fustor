@@ -29,7 +29,7 @@ def sample_source_config():
 
 @pytest.fixture
 def sample_sync_config(sample_source_config):
-    return SyncConfig(source="source1", pusher="pusher1", disabled=False)
+    return SyncConfig(source="source1", sender="pusher1", disabled=False)
 
 class TestSourceConfigService:
     def test_set_dependencies(self, source_config_service):
@@ -89,8 +89,8 @@ class TestSourceConfigService:
             "src4": SourceConfig(driver="d", uri="u", credential=PasswdCredential(user="u"), disabled=False), # Not obsolete (enabled)
         }
         mock_app_config.get_syncs.return_value = {
-            "sync1": SyncConfig(source="src2", pusher="r1", disabled=False),
-            "sync2": SyncConfig(source="src4", pusher="r1", disabled=False),
+            "sync1": SyncConfig(source="src2", sender="r1", disabled=False),
+            "sync2": SyncConfig(source="src4", sender="r1", disabled=False),
         }
         
 

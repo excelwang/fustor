@@ -82,7 +82,7 @@ shared-fs:
 """
     docker_manager.create_file_in_container(container_name, "/root/.fustor/sources-config.yaml", sources_config)
 
-    # 2. Senders Config (v2: renamed from 'pushers')
+    # 2. Senders Config
     senders_config = f"""
 fusion:
   driver: "fusion"

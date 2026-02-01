@@ -29,7 +29,7 @@ def integration_configs(tmp_path: Path):
     # Configure the sync task with field mappings
     sync_config = SyncConfig(
         source="test_source", 
-        pusher="test_pusher",
+        sender="test_pusher",
         fields_mapping=[
             FieldMapping(to="target.file_path", source=["fs.files.file_path:0"]),
             FieldMapping(to="target.size", source=["fs.files.size:0"])

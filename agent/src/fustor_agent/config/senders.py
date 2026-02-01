@@ -2,10 +2,8 @@
 """
 Sender configuration loader from YAML files.
 
-This is the new naming for what was previously called "pushers".
-For backward compatibility, this loader will try to load from:
-1. senders-config.yaml (new)
-2. pushers-config.yaml (legacy)
+Configuration is now exclusively loaded from senders-config.yaml.
+Legacy pushers-config.yaml is no longer supported.
 """
 import yaml
 import logging
@@ -13,14 +11,10 @@ from pathlib import Path
 from typing import Dict, Optional, Any
 
 from fustor_core.common import get_fustor_home_dir
-from fustor_core.models.config import PusherConfig  # Still use PusherConfig internally
+from fustor_core.models.config import SenderConfig
 from .validators import validate_url_safe_id
 
 logger = logging.getLogger(__name__)
-
-
-# Type alias for clarity - SenderConfig is the same as PusherConfig
-SenderConfig = PusherConfig
 
 
 class SendersConfigLoader:
@@ -30,13 +24,13 @@ class SendersConfigLoader:
     Config file format:
     ```yaml
     fusion-main:
-      driver: http  # or 'fusion' for compatibility
+      driver: fusion
       endpoint: http://fusion:8101
       credential:
         key: fk_abc123
     ```
     
-    For backward compatibility, also supports pushers-config.yaml format.
+    Location: $FUSTOR_HOME/senders-config.yaml
     """
     
     def __init__(self, config_path: Optional[Path] = None):
@@ -44,8 +38,8 @@ class SendersConfigLoader:
         Initialize the loader.
         
         Args:
-            config_path: Explicit path to config file. If None, will search for
-                        senders-config.yaml or pushers-config.yaml in FUSTOR_HOME.
+            config_path: Explicit path to config file. If None, will use
+                        senders-config.yaml in FUSTOR_HOME.
         """
         self._explicit_path = config_path
         self._senders: Dict[str, SenderConfig] = {}
@@ -53,25 +47,12 @@ class SendersConfigLoader:
         self._active_path: Optional[Path] = None
     
     def _resolve_config_path(self) -> Optional[Path]:
-        """Find the configuration file, preferring new naming."""
+        """Find the configuration file."""
         if self._explicit_path is not None:
             return Path(self._explicit_path)
         
         home = get_fustor_home_dir()
-        
-        # Try new naming first
-        new_path = home / "senders-config.yaml"
-        if new_path.exists():
-            return new_path
-        
-        # Fall back to legacy naming
-        legacy_path = home / "pushers-config.yaml"
-        if legacy_path.exists():
-            logger.info(f"Using legacy pushers-config.yaml (migrate to senders-config.yaml)")
-            return legacy_path
-        
-        # Neither exists
-        return new_path  # Return new path for error messages
+        return home / "senders-config.yaml"
     
     @property
     def path(self) -> Path:
@@ -110,11 +91,6 @@ class SendersConfigLoader:
                         logger.error(f"Invalid sender ID {s_id_str}: {'; '.join(errors)}")
                         continue
                     
-                    # Map 'http' driver to 'fusion' for backward compatibility
-                    driver = s_data.get('driver', 'fusion')
-                    if driver == 'http':
-                        s_data['driver'] = 'fusion'
-                    
                     config = SenderConfig(**s_data)
                     self._senders[s_id_str] = config
                 except Exception as e:
@@ -152,7 +128,3 @@ class SendersConfigLoader:
 
 # Global instance
 senders_config = SendersConfigLoader()
-
-# Backward compatibility alias
-PushersConfigLoader = SendersConfigLoader
-pushers_config = senders_config

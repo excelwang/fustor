@@ -29,7 +29,7 @@ def sync_config_service(mock_app_config, mock_source_config_service, mock_pusher
 
 @pytest.fixture
 def sample_sync_config():
-    return SyncConfig(source="source1", pusher="pusher1", disabled=False)
+    return SyncConfig(source="source1", sender="pusher1", disabled=False)
 
 class TestSyncConfigService:
     def test_set_dependencies(self, sync_config_service):

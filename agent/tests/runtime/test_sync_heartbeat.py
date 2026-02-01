@@ -21,7 +21,7 @@ class TestSyncInstanceHeartbeat:
         return SyncConfig(
             id="test_sync",
             source="test_source",
-            pusher="test_pusher",
+            sender="test_pusher",
             fields_mapping=[
                 FieldMapping(to="events.content", source=["mock_db.mock_table.id:0"])
             ],

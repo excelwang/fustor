@@ -46,7 +46,7 @@ def sample_pusher_config():
 
 @pytest.fixture
 def sample_sync_config():
-    return SyncConfig(source="s1", pusher="r1", disabled=False)
+    return SyncConfig(source="s1", sender="r1", disabled=False)
 
 class TestBaseConfigService:
     @pytest.mark.asyncio

@@ -35,15 +35,15 @@ logger.setLevel(logging.DEBUG)
 def get_app_config() -> AppConfig:
     global _app_config_instance
     if _app_config_instance is None:
-        from .config import sources_config, pushers_config, syncs_config
+        from .config import sources_config, senders_config, syncs_config
 
         # 1. Load Sources
         sources_config.reload()
         valid_sources = sources_config.get_all()
 
-        # 2. Load Pushers
-        pushers_config.reload()
-        valid_pushers = pushers_config.get_all()
+        # 2. Load Senders
+        senders_config.reload()
+        valid_senders = senders_config.get_all()
 
         # 3. Load Syncs from directory
         syncs_config.reload()
@@ -58,7 +58,7 @@ def get_app_config() -> AppConfig:
 
         _app_config_instance = AppConfig(
             sources=SourceConfigDict(root=valid_sources),
-            pushers=SenderConfigDict(root=valid_pushers),
+            pushers=SenderConfigDict(root=valid_senders),
             syncs=SyncConfigDict(root=valid_syncs)
         )
 

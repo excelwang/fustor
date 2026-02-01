@@ -38,7 +38,7 @@ async def test_echo_sync_instance_triggers_snapshot():
     
     sync_config = SyncConfig(
         source="test-fs-source",
-        pusher="echo-pusher",
+        sender="echo-pusher",
         disabled=False,
         fields_mapping=[
             FieldMapping(

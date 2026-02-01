@@ -2,24 +2,22 @@
 """
 Configuration loaders for YAML-based configuration files.
 
-Naming conventions (new -> legacy):
-- senders-config.yaml -> pushers-config.yaml
-- agent-pipes-config/ -> syncs-config/
+Config files:
+- senders-config.yaml: Sender definitions (HTTP/Fusion endpoints)
+- sources-config.yaml: Source definitions (file systems, databases)
+- syncs-config/: Sync task definitions
 """
 from .syncs import SyncsConfigLoader, SyncConfigYaml, syncs_config
 from .sources import SourcesConfigLoader, sources_config
 from .senders import SendersConfigLoader, senders_config, SenderConfig
 from .validators import validate_url_safe_id
 
-# Backward compatibility aliases
-from .senders import PushersConfigLoader, pushers_config
-
 __all__ = [
-    # New naming
+    # Senders
     "SendersConfigLoader",
     "SenderConfig",
     "senders_config",
-    # Syncs (will be renamed to pipelines later)
+    # Syncs
     "SyncsConfigLoader",
     "SyncConfigYaml",
     "syncs_config",
@@ -28,7 +26,4 @@ __all__ = [
     "sources_config",
     # Validators
     "validate_url_safe_id",
-    # Legacy aliases
-    "PushersConfigLoader",
-    "pushers_config",
 ]

@@ -93,7 +93,7 @@ PusherConfig = SenderConfig
 
 class SyncConfig(BaseModel):
     source: str
-    sender: Optional[str] = None  # New field name (v2)
+    sender: str  # Required field (was optional for backward compatibility)
     disabled: bool = Field(default=True, description="是否禁用此同步任务")
     # --- START: 核心修改 ---
     # [REMOVED] The following two fields are obsolete in the new architecture.
@@ -105,12 +105,6 @@ class SyncConfig(BaseModel):
     audit_interval_sec: int = Field(default=600, ge=0, description="审计扫描间隔(秒)，0表示禁用，默认10分钟")
     sentinel_interval_sec: int = Field(default=120, ge=0, description="哨兵巡检间隔(秒)，0表示禁用，默认2分钟")
     heartbeat_interval_sec: int = Field(default=10, ge=1, description="心跳间隔(秒)，默认10秒")
-    
-    def __init__(self, **data):
-        """Backward compatibility: migrate 'pusher' to 'sender'."""
-        if 'sender' not in data and 'pusher' in data:
-            data['sender'] = data.pop('pusher')
-        super().__init__(**data)
 
 
 class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):

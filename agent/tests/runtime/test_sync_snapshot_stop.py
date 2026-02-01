@@ -30,7 +30,7 @@ def mock_source_driver_service():
 
 @pytest.fixture
 def mock_sync_config():
-    return SyncConfig(source="test-source", pusher="test-pusher", disabled=False)
+    return SyncConfig(source="test-source", sender="test-pusher", disabled=False)
 
 @pytest.fixture
 def mock_source_config():

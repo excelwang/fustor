@@ -22,7 +22,7 @@ def sample_pusher_config():
 
 @pytest.fixture
 def sample_sync_config(sample_pusher_config):
-    return SyncConfig(source="source1", pusher="pusher1", disabled=False)
+    return SyncConfig(source="source1", sender="pusher1", disabled=False)
 
 class TestPusherConfigService:
     def test_set_dependencies(self, pusher_config_service):
@@ -42,8 +42,8 @@ class TestPusherConfigService:
         }
         mock_app_config.get_pushers.return_value = initial_pushers
         mock_app_config.get_syncs.return_value = {
-            "sync1": SyncConfig(source="s1", pusher="rec2", disabled=False),
-            "sync2": SyncConfig(source="s1", pusher="rec4", disabled=False),
+            "sync1": SyncConfig(source="s1", sender="rec2", disabled=False),
+            "sync2": SyncConfig(source="s1", sender="rec4", disabled=False),
         }
 
         # Mock the async context manager for config_lock
@@ -66,7 +66,7 @@ class TestPusherConfigService:
         }
         mock_app_config.get_pushers.return_value = initial_pushers
         mock_app_config.get_syncs.return_value = {
-            "sync1": SyncConfig(source="s1", pusher="rec2", disabled=False),
+            "sync1": SyncConfig(source="s1", sender="rec2", disabled=False),
         }
 
         mock_config_lock.return_value.__aenter__ = AsyncMock(return_value=None)

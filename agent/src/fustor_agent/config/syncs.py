@@ -40,29 +40,6 @@ class SyncConfigYaml(BaseModel):
         if errors:
             raise ValueError("; ".join(errors))
         return v
-    
-    def __init__(self, **data):
-        """
-        Backward compatibility: accept 'pusher' field and migrate to 'sender'.
-        
-        If YAML has 'pusher' instead of 'sender', use it with a deprecation warning.
-        """
-        import warnings
-        
-        # If sender is not provided but pusher is in the raw data
-        if 'sender' not in data and 'pusher' in data:
-            warnings.warn(
-                f"SyncConfig field 'pusher' is deprecated. Please rename it to 'sender' in your YAML config.",
-                DeprecationWarning,
-                stacklevel=4
-            )
-            logger.warning(
-                f"Sync config '{data.get('id', 'unknown')}' uses deprecated 'pusher' field. "
-                f"Please update to 'sender'. Support for 'pusher' will be removed in a future version."
-            )
-            data['sender'] = data.pop('pusher')
-        
-        super().__init__(**data)
 
 
 

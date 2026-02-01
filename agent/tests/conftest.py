@@ -80,7 +80,7 @@ async def snapshot_phase_test_setup(test_app_instance: App, mocker):
     
     await test_app_instance.sync_config_service.add_config(sync_id, SyncConfig(
         source=source_id,
-        pusher=pusher_id,
+        sender=pusher_id,
         disabled=False,
         fields_mapping=[
             FieldMapping(to="events.content", source=["mock_db.mock_table.id:0", "mock_db.mock_table.name:1"])
@@ -146,7 +146,7 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
 
     await test_app_instance.sync_config_service.add_config(sync_id, SyncConfig(
         source=source_id,
-        pusher=pusher_id,
+        sender=pusher_id,
         disabled=False,
         fields_mapping=[
             FieldMapping(to="events.content", source=["mock_db.mock_table.id:0", "mock_db.mock_table.name:1"])

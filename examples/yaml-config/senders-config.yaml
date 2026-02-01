@@ -1,6 +1,6 @@
-# Example: pushers-config.yaml
-# Location: $FUSTOR_HOME/pushers-config.yaml
-# Defines push destinations where Agent sends data
+# Example: senders-config.yaml
+# Location: $FUSTOR_HOME/senders-config.yaml
+# Defines sender destinations where Agent sends data
 
 fusion-main:
   driver: fusion

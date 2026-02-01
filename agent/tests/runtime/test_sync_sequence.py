@@ -10,7 +10,7 @@ class TestSyncLeaderSequence:
 
     @pytest.fixture
     def sync_instance(self):
-        sync_config = SyncConfig(id="t1", source="s1", pusher="p1", disabled=False)
+        sync_config = SyncConfig(id="t1", source="s1", sender="p1", disabled=False)
         source_config = SourceConfig(id="s1", driver="fs", credential=PasswdCredential(user="u"), uri="/t", disabled=False)
         pusher_config = PusherConfig(id="p1", driver="fusion", credential=PasswdCredential(user="u"), endpoint="h", disabled=False)
         
