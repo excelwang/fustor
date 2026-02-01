@@ -21,13 +21,8 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-echo
 
 license = "MIT"
 
-# New entry point for V2 architecture
-[project.entry-points."fustor_agent.drivers.senders"]
-echo = "fustor_pusher_echo:EchoDriver"
-
-# Legacy entry point for backward compatibility
-[project.entry-points."fustor_agent.drivers.pushers"]
-echo = "fustor_pusher_echo:EchoDriver"
+[project.entry-points."fustor_agent.senders"]
+echo = "fustor_sender_echo:EchoDriver"
 
 [tool.setuptools.packages.find]
 where = [ "src",]
