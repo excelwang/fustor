@@ -1,13 +1,15 @@
 [project]
 name = "fustor-event-model"
 dynamic = ["version"]
-description = "Event models and schemas for Fustor services"
+description = "[DEPRECATED] Use fustor-core instead. Event models and schemas for Fustor services"
 requires-python = ">=3.11"
 license = "MIT"
-dependencies = [ "pydantic>=2.11.7",]
+dependencies = [
+    "fustor-core",
+]
 
 [build-system]
-requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
@@ -20,4 +22,4 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/packages/event-model
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 [tool.setuptools.packages.find]
-where = [ "src",]
+where = ["src"]
