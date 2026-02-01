@@ -24,7 +24,7 @@ TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "600"))
 # Timing Hierarchy
 # NFS actimeo=1 (set in docker-compose.yml)
 ACTIMEO = 1 
-AUDIT_INTERVAL = 7
+AUDIT_INTERVAL = 5
 
 # Container names
 CONTAINER_NFS_SERVER = "fustor-nfs-server"
@@ -85,7 +85,7 @@ driver: "fs"
 disabled: false
 driver_params:
   uri: "/mnt/shared-view"
-  hot_file_threshold: 5.0
+  hot_file_threshold: 10.0
 """
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/test-fs.yaml", view_config)
     

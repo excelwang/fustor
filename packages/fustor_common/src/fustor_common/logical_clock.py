@@ -27,9 +27,9 @@ class LogicalClock:
         Initialize the logical clock.
         
         Args:
-            initial_time: Initial clock value (default 0.0)
+            initial_time: Initial clock value (default 0.0, will use time.time())
         """
-        self._value = initial_time
+        self._value = initial_time if initial_time > 0 else time.time()
         self._lock = threading.Lock()
         
         # --- Robust Clock State ---
@@ -67,9 +67,7 @@ class LogicalClock:
         Returns:
             The current clock value after the update
         """
-        if observed_mtime is None:
-            return self.now()
-            
+        
         with self._lock:
             # --- Legacy Mode (Fallback if NO agent_time provided) ---
             if agent_time is None:
@@ -88,10 +86,13 @@ class LogicalClock:
             
             # --- Special Case: Deletion/Metadata event (observed_mtime is None) ---
             if observed_mtime is None:
+                session_skew = self._get_session_skew_locked(session_id)
                 g_skew = self._get_global_skew_locked()
-                if g_skew is not None:
+                effective_skew = session_skew if session_skew is not None else g_skew
+                
+                if effective_skew is not None:
                     # Advance clock to BaseLine to reflect physical progress
-                    baseline = agent_time - g_skew
+                    baseline = agent_time - effective_skew
                     if baseline > self._value:
                         self._value = baseline
                 return self._value
@@ -231,7 +232,7 @@ class LogicalClock:
     
     def reset(self, value: float = 0.0) -> None:
         with self._lock:
-            self._value = value
+            self._value = value if value > 0 else time.time()
             self._session_buffers.clear()
             self._global_histogram.clear()
             self._cached_global_skew = None
