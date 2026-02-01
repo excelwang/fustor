@@ -10,12 +10,13 @@ When reviewing refactor code, follow these steps:
 
 ## Review checklist
 
-1. **Correctness**: Does the code do what it's supposed to do as designed in documents?
-2. **Edge cases**: Are error conditions handled?
-3. **Style**: Does it follow project conventions?
-4. **Performance**: Are there obvious inefficiencies?
-5. **Maintainability**: Is the code easy to understand and maintain?
-6. **Efficiency**: Is the code efficient in terms of time and space complexity?
+1. **Correctness**: Does the neww code lost any functionality as designed in documents?
+2. **Correctness**: Does the neww code lost any functionality compared to master branch?
+3. **Edge cases**: Are error conditions handled?
+4. **Style**: Does it follow project conventions?
+5. **Performance**: Are there obvious inefficiencies?
+6. **Maintainability**: Is the code easy to understand and maintain?
+7. **Efficiency**: Is the code efficient in terms of time and space complexity?
 
 ## How to use it
 

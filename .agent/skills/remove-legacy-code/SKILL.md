@@ -20,6 +20,9 @@ When removing legacy code, follow these steps:
 3. if the legacy code has been replaced by the new code, check if the new code handles all edge cases;
 4. if the legacy code has not been replaced by the new code, check if the new code handles all edge cases;
 5. remove the legacy code if it is not used;
+6. do not consider to keep compatibility with the existing configuration or api;
+7. do not use legacy file name if the modular has been refactored;
+8. do not forget to update documents;
 
 ## How to provide feedback
 
