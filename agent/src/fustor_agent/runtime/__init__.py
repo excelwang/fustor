@@ -73,6 +73,12 @@ from .sender_handler_adapter import (
     create_sender_handler_from_config,
 )
 
+from .pipeline_bridge import (
+    PipelineBridge,
+    create_pipeline_from_sync_config,
+    should_use_pipeline,
+)
+
 __all__ = [
     # Pipeline
     "AgentPipeline",
@@ -86,4 +92,9 @@ __all__ = [
     "SenderHandlerAdapter",
     "SenderHandlerFactory",
     "create_sender_handler_from_config",
+    
+    # Migration Bridge
+    "PipelineBridge",
+    "create_pipeline_from_sync_config",
+    "should_use_pipeline",
 ]
