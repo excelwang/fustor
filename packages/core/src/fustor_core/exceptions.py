@@ -1,41 +1,71 @@
-from fastapi import HTTPException, status
+"""
+Fustor Core Exceptions.
 
+These are generic exceptions that don't depend on any web framework.
+HTTP mapping is done at the API layer (e.g., via FastAPI exception handlers).
+"""
 from typing import Optional, Any, Dict
 
-class fustor_agentException(HTTPException):
-    """Base exception for fustor_agent, mapping to HTTP exceptions."""
-    def __init__(self, status_code: int, detail: Any = None, headers: Optional[Dict[str, Any]] = None):
-        super().__init__(status_code=status_code, detail=detail, headers=headers)
 
-class ConfigError(fustor_agentException):
+class FustorException(Exception):
+    """Base exception for all Fustor errors."""
+    
+    # Default HTTP status code mapping (used by API layers)
+    status_code: int = 500
+    
+    def __init__(self, detail: str = "An error occurred", context: Optional[Dict[str, Any]] = None):
+        self.detail = detail
+        self.context = context or {}
+        super().__init__(detail)
+
+
+class ConfigError(FustorException):
     """Raised when there's an issue with configuration (e.g., not found, invalid)."""
-    def __init__(self, detail: str = "Configuration error", headers: Optional[Dict[str, Any]] = None):
-        super().__init__(status_code=status.HTTP_400_BAD_REQUEST, detail=detail, headers=headers)
+    status_code = 400
+    
+    def __init__(self, detail: str = "Configuration error", context: Optional[Dict[str, Any]] = None):
+        super().__init__(detail=detail, context=context)
 
-class NotFoundError(fustor_agentException):
+
+class NotFoundError(FustorException):
     """Raised when a requested resource (e.g., config, instance) is not found."""
-    def __init__(self, detail: str = "Resource not found", headers: Optional[Dict[str, Any]] = None):
-        super().__init__(status_code=status.HTTP_404_NOT_FOUND, detail=detail, headers=headers)
+    status_code = 404
+    
+    def __init__(self, detail: str = "Resource not found", context: Optional[Dict[str, Any]] = None):
+        super().__init__(detail=detail, context=context)
 
-class ConflictError(fustor_agentException):
+
+class ConflictError(FustorException):
     """Raised when a resource already exists and cannot be created again."""
-    def __init__(self, detail: str = "Resource already exists", headers: Optional[Dict[str, Any]] = None):
-        super().__init__(status_code=status.HTTP_409_CONFLICT, detail=detail, headers=headers)
+    status_code = 409
+    
+    def __init__(self, detail: str = "Resource already exists", context: Optional[Dict[str, Any]] = None):
+        super().__init__(detail=detail, context=context)
 
-class DriverError(fustor_agentException):
+
+class DriverError(FustorException):
     """Raised when there's an issue with a driver (e.g., connection, invalid parameters)."""
-    def __init__(self, detail: str = "Driver error", headers: Optional[Dict[str, Any]] = None):
-        super().__init__(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=detail, headers=headers)
+    status_code = 500
+    
+    def __init__(self, detail: str = "Driver error", context: Optional[Dict[str, Any]] = None):
+        super().__init__(detail=detail, context=context)
 
-class StateConflictError(fustor_agentException):
+
+class StateConflictError(FustorException):
     """Raised when an operation is attempted in an invalid state."""
-    def __init__(self, detail: str = "Operation not allowed in current state", headers: Optional[Dict[str, Any]] = None):
-        super().__init__(status_code=status.HTTP_409_CONFLICT, detail=detail, headers=headers)
+    status_code = 409
+    
+    def __init__(self, detail: str = "Operation not allowed in current state", context: Optional[Dict[str, Any]] = None):
+        super().__init__(detail=detail, context=context)
 
-class ValidationError(fustor_agentException):
+
+class ValidationError(FustorException):
     """Raised when input validation fails."""
-    def __init__(self, detail: str = "Validation error", headers: Optional[Dict[str, Any]] = None):
-        super().__init__(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=detail, headers=headers)
+    status_code = 422
+    
+    def __init__(self, detail: str = "Validation error", context: Optional[Dict[str, Any]] = None):
+        super().__init__(detail=detail, context=context)
+
 
 class TransientSourceBufferFullError(Exception):
     """Raised by MemoryEventBus when its buffer is full and the source is transient."""
