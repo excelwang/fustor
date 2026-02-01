@@ -211,13 +211,13 @@ it/
 - [ ] 修复任何因配置变更导致的失败
 ```
 
-### Phase 2: Fixtures 重构 (2-3 天)
+### Phase 2: Fixtures 重构 ✅ (2026-02-02 进行中)
 
 ```
-任务 2.1: 模块化 Fixtures
-- [ ] 创建 fixtures/ 目录结构
-- [ ] 拆分 conftest.py 到子模块
-- [ ] 更新 conftest.py 导入
+任务 2.1: 模块化 Fixtures ✅
+- [x] 创建 fixtures/ 目录结构
+- [x] 拆分 conftest.py 到子模块
+- [x] 更新 conftest.py 导入
 
 任务 2.2: 增强健壮性
 - [ ] 改进容器健康检查超时逻辑
