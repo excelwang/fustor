@@ -1,0 +1,30 @@
+---
+name: changes-review-skill
+description: 详细评审当前分支的测试代码，并给出评审报告和改进建议
+---
+
+# changes review skill
+
+When reviewing changes code, follow these steps:
+
+## Review checklist
+
+1. **Correctness**: Does the code do what it's supposed to do as designed in documents?
+2. **Edge cases**: Are error conditions handled?
+3. **Style**: Does it follow project conventions?
+4. **Performance**: Are there obvious inefficiencies?
+5. **Maintainability**: Is the code easy to understand and maintain?
+6. **Over-testing**: Are there redundant tests?
+7. **Test coverage**: Are there missing tests?
+
+## How to use it
+
+1. 请深入理解一下变更代码；
+2. 这些更改是由一个新手程序员开发的，请帮忙指出其开发的缺陷和修正建议（在尽量优雅的同时注意不要过度设计），梳理成完整的、具体的todo事项清单和开发建议。
+
+## How to provide feedback
+
+- Be specific about what needs to change
+- Explain why, not just what
+- Suggest alternatives when possible
+- write in a document in chinese for the newbie developer to read

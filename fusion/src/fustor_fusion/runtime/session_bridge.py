@@ -118,7 +118,7 @@ class PipelineSessionBridge:
         self._session_datastore_map[session_id] = datastore_id
         
         # Get role from pipeline
-        role = self._pipeline.get_session_role(session_id)
+        role = await self._pipeline.get_session_role(session_id)
         
         return {
             "session_id": session_id,
@@ -145,14 +145,14 @@ class PipelineSessionBridge:
         
         if datastore_id is not None:
             # Update legacy SessionManager
-            self._session_manager.keep_session_alive(
+            await self._session_manager.keep_session_alive(
                 datastore_id=datastore_id,
                 session_id=session_id,
                 client_ip=client_ip
             )
         
         # Get role from pipeline
-        role = self._pipeline.get_session_role(session_id)
+        role = await self._pipeline.get_session_role(session_id)
         
         return {
             "role": role,
@@ -173,38 +173,47 @@ class PipelineSessionBridge:
         
         if datastore_id is not None:
             # Remove from legacy SessionManager
-            self._session_manager.remove_session(
+            await self._session_manager.remove_session(
                 datastore_id=datastore_id,
                 session_id=session_id
             )
-            del self._session_datastore_map[session_id]
+            if session_id in self._session_datastore_map:
+                del self._session_datastore_map[session_id]
         
         # Close in Pipeline
         await self._pipeline.on_session_closed(session_id)
         
         return True
     
-    def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+    async def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
         Get session info from both systems.
         
         Priority: Pipeline session info, fallback to SessionManager.
         """
         # Try Pipeline first
-        info = self._pipeline.get_session_info(session_id)
+        info = await self._pipeline.get_session_info(session_id)
         if info:
             return info
         
         # Fallback to legacy
         datastore_id = self._session_datastore_map.get(session_id)
         if datastore_id is not None:
-            return self._session_manager.get_session_info(datastore_id, session_id)
+            legacy_info = await self._session_manager.get_session_info(datastore_id, session_id)
+            if legacy_info:
+                # Map legacy SessionInfo to dict for consistency
+                return {
+                    "session_id": legacy_info.session_id,
+                    "task_id": legacy_info.task_id,
+                    "client_ip": legacy_info.client_ip,
+                    "role": "unknown", # Legacy doesn't track role in same way
+                }
         
         return None
     
-    def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
+    async def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
         """Get all active sessions."""
-        return self._pipeline.get_all_sessions()
+        return await self._pipeline.get_all_sessions()
     
     @property
     def leader_session(self) -> Optional[str]:

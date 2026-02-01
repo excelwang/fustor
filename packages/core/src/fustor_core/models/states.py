@@ -18,6 +18,7 @@ class SyncState(Flag):
     RUNNING_CONF_OUTDATE = auto()
     STOPPING = auto()
     ERROR = auto()
+    RECONNECTING = auto()
 
 class EventBusInstance(BaseModel):
     id: str

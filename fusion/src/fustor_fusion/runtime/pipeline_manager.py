@@ -134,7 +134,7 @@ class PipelineManager:
             raise ValueError(f"Pipeline {pipeline_id} not found")
         
         await pipeline.on_session_created(session_id, task_id=task_id, **client_info)
-        role = pipeline.get_session_role(session_id)
+        role = await pipeline.get_session_role(session_id)
         
         return SessionInfo(
             session_id=session_id,
@@ -149,7 +149,7 @@ class PipelineManager:
         self, session_id: str, events: List[EventBase], source_type: str, is_end: bool
     ) -> bool:
         for pipeline in self._pipelines.values():
-            if pipeline.get_session_info(session_id):
+            if await pipeline.get_session_info(session_id):
                 result = await pipeline.process_events(
                     events, session_id, source_type, is_end=is_end
                 )
@@ -160,17 +160,17 @@ class PipelineManager:
 
     async def _on_heartbeat(self, session_id: str) -> Dict[str, Any]:
         for pipeline in self._pipelines.values():
-            if pipeline.get_session_info(session_id):
+            if await pipeline.get_session_info(session_id):
                 await pipeline.keep_session_alive(session_id)
                 return {
-                    "role": pipeline.get_session_role(session_id),
+                    "role": await pipeline.get_session_role(session_id),
                     "status": "ok"
                 }
         return {"status": "error", "message": "Session not found"}
 
     async def _on_session_closed(self, session_id: str):
         for pipeline in self._pipelines.values():
-            if pipeline.get_session_info(session_id):
+            if await pipeline.get_session_info(session_id):
                 await pipeline.on_session_closed(session_id)
                 break
 

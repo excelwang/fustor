@@ -104,31 +104,16 @@ class AgentPipeline(Pipeline):
         """
         Start the pipeline.
         
-        This creates a session with Fusion and starts the main control loop.
+        This initializes states and starts the main control loop.
         """
         if self.is_running():
             logger.warning(f"Pipeline {self.id} is already running")
             return
         
-        self._set_state(PipelineState.INITIALIZING, "Creating session...")
+        self._set_state(PipelineState.INITIALIZING, "Starting pipeline...")
         
-        try:
-            # Create session with Fusion
-            session_id, metadata = await self.sender_handler.create_session(
-                task_id=self.task_id,
-                source_type=self.source_handler.schema_name,
-                session_timeout_seconds=self.session_timeout_seconds
-            )
-            
-            await self.on_session_created(session_id, **metadata)
-            
-            # Start main control loop
-            self._main_task = asyncio.create_task(self._run_control_loop())
-            
-        except Exception as e:
-            self._set_state(PipelineState.ERROR, f"Failed to start: {e}")
-            logger.error(f"Pipeline {self.id} failed to start: {e}", exc_info=True)
-            raise
+        # Start main control loop - it will handle session creation
+        self._main_task = asyncio.create_task(self._run_control_loop())
     
     async def stop(self) -> None:
         """
@@ -197,8 +182,22 @@ class AgentPipeline(Pipeline):
         """
         self._set_state(PipelineState.RUNNING, "Waiting for role assignment...")
         
-        try:
-            while self.is_running():
+        # In V2, we keep trying unless explicitly stopped
+        while self.state != PipelineState.STOPPED:
+            try:
+                # Wait until we have a session (in case of disconnection)
+                if not self.session_id:
+                    self._set_state(PipelineState.RUNNING | PipelineState.RECONNECTING, "Attempting to create session...")
+                    try:
+                        session_id, metadata = await self.sender_handler.create_session(
+                            task_id=self.task_id,
+                            source_type=self.source_handler.schema_name,
+                            session_timeout_seconds=self.session_timeout_seconds
+                        )
+                        await self.on_session_created(session_id, **metadata)
+                    except Exception as e:
+                        raise RuntimeError(f"Session creation failed: {e}")
+
                 # Wait until we have a role
                 if not self.current_role:
                     await asyncio.sleep(self.ROLE_CHECK_INTERVAL)
@@ -214,28 +213,40 @@ class AgentPipeline(Pipeline):
                     self._set_state(PipelineState.PAUSED, "Follower mode - standby")
                     await asyncio.sleep(self.FOLLOWER_STANDBY_INTERVAL)
                 
-                # Reset error counter on successful iteration
-                self._consecutive_errors = 0
+                # Reset error counter on successful iteration or state achievement
+                if self._consecutive_errors > 0:
+                    logger.info(f"Pipeline {self.id} recovered after {self._consecutive_errors} errors")
+                    self._consecutive_errors = 0
                 
-        except asyncio.CancelledError:
-            logger.info(f"Pipeline {self.id} control loop cancelled")
-            return
-        except Exception as e:
-            self._consecutive_errors += 1
-            if self._consecutive_errors >= self.MAX_CONSECUTIVE_ERRORS:
-                self._set_state(PipelineState.ERROR, f"Too many consecutive errors: {e}")
-                logger.error(f"Pipeline {self.id} stopped due to too many errors: {e}")
-                return
+            except asyncio.CancelledError:
+                logger.info(f"Pipeline {self.id} control loop cancelled")
+                break
+            except Exception as e:
+                self._consecutive_errors += 1
+                
+                # Exponential backoff
+                backoff = min(
+                    self.ERROR_RETRY_INTERVAL * (self.BACKOFF_MULTIPLIER ** (self._consecutive_errors - 1)),
+                    self.MAX_BACKOFF_SECONDS
+                )
+                
+                self._set_state(PipelineState.ERROR | PipelineState.RECONNECTING, 
+                                f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
+                
+                logger.error(f"Pipeline {self.id} control loop error: {e}. Retrying in {backoff}s...", exc_info=True)
+                
+                # If session failed, ensure it's cleared so we try to recreate it
+                if self.session_id:
+                    try:
+                        # Clear tasks that might be hanging
+                        for task in [self._audit_task, self._sentinel_task, self._message_sync_task, self._snapshot_task]:
+                            if task and not task.done():
+                                task.cancel()
+                        await self.on_session_closed(self.session_id)
+                    except:
+                        pass
 
-            self._set_state(PipelineState.ERROR, f"Control loop error (retry {self._consecutive_errors}): {e}")
-            logger.error(f"Pipeline {self.id} control loop error: {e}", exc_info=True)
-            
-            # Exponential backoff
-            backoff = min(
-                self.ERROR_RETRY_INTERVAL * (self.BACKOFF_MULTIPLIER ** (self._consecutive_errors - 1)),
-                self.MAX_BACKOFF_SECONDS
-            )
-            await asyncio.sleep(backoff)
+                await asyncio.sleep(backoff)
 
     
     async def _run_leader_sequence(self) -> None:
@@ -295,23 +306,48 @@ class AgentPipeline(Pipeline):
                 if task and not task.done():
                     task.cancel()
     
-    _IAITER_SENTINEL = object()
-
-    async def _aiter_sync(self, sync_iter: Iterator[Any]):
-        """Safely wrap a synchronous iterator into an async generator."""
-        def get_next():
+    async def _aiter_sync(self, sync_iter: Iterator[Any], queue_size: int = 1000):
+        """
+        Safely and efficiently wrap a synchronous iterator into an async generator.
+        
+        This implementation runs the synchronous iterator in a dedicated background
+        thread and communicates items back via an asyncio.Queue, avoiding the overhead
+        of creating a new thread/Future for every single item.
+        """
+        queue = asyncio.Queue(maxsize=queue_size)
+        loop = asyncio.get_event_loop()
+        stop_event = threading.Event()
+        
+        def _producer():
             try:
-                return next(sync_iter)
-            except StopIteration:
-                return AgentPipeline._IAITER_SENTINEL
+                for item in sync_iter:
+                    if stop_event.is_set():
+                        break
+                    # Blocking put via run_coroutine_threadsafe to respect backpressure
+                    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+                    future.result() # Wait for the queue to have space
+            except Exception as e:
+                asyncio.run_coroutine_threadsafe(queue.put(e), loop)
+            finally:
+                asyncio.run_coroutine_threadsafe(queue.put(StopAsyncIteration), loop)
 
-        while True:
-            # Run the next() call in a thread to avoid blocking the event loop
-            event = await asyncio.to_thread(get_next)
-            if event is AgentPipeline._IAITER_SENTINEL:
-                break
-            yield event
+        # Start producer thread
+        thread = threading.Thread(target=_producer, name=f"PipelineSource-Producer-{self.id}", daemon=True)
+        thread.start()
 
+        try:
+            while True:
+                item = await queue.get()
+                if item is StopAsyncIteration:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+                queue.task_done()
+        finally:
+            stop_event.set()
+            # We don't block on thread join here to keep the async side responsive,
+            # but the thread will exit shortly after seeing the stop_event or finding the queue closed.
 
     async def _run_snapshot_sync(self) -> None:
         """Execute snapshot synchronization."""
@@ -331,7 +367,8 @@ class AgentPipeline(Pipeline):
                 success, _ = await self.sender_handler.send_batch(
                     self.session_id, batch, {"phase": "snapshot"}
                 )
-                if not success: raise RuntimeError("Snapshot batch send failed")
+                if not success: 
+                    raise RuntimeError("Snapshot batch send failed")
                 self.statistics["events_pushed"] += len(batch)
                 batch = []
         
@@ -364,7 +401,7 @@ class AgentPipeline(Pipeline):
                 msg_iter = self._aiter_sync(msg_iter)
 
             async for event in msg_iter:
-                if not self.is_running():
+                if not self.is_running() and not (self.state & PipelineState.RECONNECTING):
                     break
                     
                 batch.append(event)
@@ -375,37 +412,45 @@ class AgentPipeline(Pipeline):
                     if success:
                         self.statistics["events_pushed"] += len(batch)
                     batch = []
+        except asyncio.CancelledError:
+            logger.info(f"Message sync for {self.id} cancelled")
+            raise
         finally:
             # Send remaining events in batch
-            if batch:
-                success, _ = await self.sender_handler.send_batch(
-                    self.session_id, batch, {"phase": "realtime", "is_final": True}
-                )
-                if success:
-                    self.statistics["events_pushed"] += len(batch)
+            if batch and self.session_id:
+                try:
+                    success, _ = await self.sender_handler.send_batch(
+                        self.session_id, batch, {"phase": "realtime", "is_final": True}
+                    )
+                    if success:
+                        self.statistics["events_pushed"] += len(batch)
+                except Exception as e:
+                    logger.warning(f"Failed to push final message batch: {e}")
             
             # Signal stop to the underlying sync iterator
             stop_event.set()
 
-
-    
     async def _run_audit_loop(self) -> None:
         """Periodically run audit sync."""
-        while self.current_role == "leader":
-            await asyncio.sleep(self.audit_interval_sec)
-            
-            if self.current_role != "leader":
-                break
-            
+        while self.current_role == "leader" and self.is_running():
             try:
+                await asyncio.sleep(self.audit_interval_sec)
+                
+                if self.current_role != "leader" or not self.is_running():
+                    break
+                
                 await self._run_audit_sync()
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.error(f"Audit sync error: {e}")
+                logger.error(f"Audit loop error: {e}")
+                await asyncio.sleep(10) # Wait before retry
     
     async def _run_audit_sync(self) -> None:
         """Execute audit synchronization."""
         logger.debug(f"Pipeline {self.id}: Running audit sync")
         
+        old_state = self.state
         self._set_state(self.state | PipelineState.AUDIT_PHASE)
         
         try:
@@ -415,9 +460,11 @@ class AgentPipeline(Pipeline):
             )
             
             audit_iter = self.source_handler.get_audit_iterator()
+            if not hasattr(audit_iter, "__aiter__"):
+                audit_iter = self._aiter_sync(audit_iter)
             
             batch = []
-            for event in audit_iter:
+            async for event in audit_iter:
                 batch.append(event)
                 
                 if len(batch) >= self.batch_size:
@@ -432,14 +479,15 @@ class AgentPipeline(Pipeline):
                 )
         finally:
             # Always send audit end signal to ensure Fusion calls handle_audit_end()
-            try:
-                await self.sender_handler.send_batch(
-                    self.session_id, [], {"phase": "audit", "is_final": True}
-                )
-            except Exception as e:
-                logger.warning(f"Failed to send audit end signal: {e}")
+            if self.session_id:
+                try:
+                    await self.sender_handler.send_batch(
+                        self.session_id, [], {"phase": "audit", "is_final": True}
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to send audit end signal: {e}")
             # Clear audit phase flag
-            self._set_state(self.state & ~PipelineState.AUDIT_PHASE)
+            self._set_state(old_state & ~PipelineState.AUDIT_PHASE)
     
     async def _run_sentinel_loop(self) -> None:
         """Periodically run sentinel checks."""
@@ -507,6 +555,9 @@ class AgentPipeline(Pipeline):
         
         if self.state & PipelineState.ERROR:
             state |= SyncState.ERROR
+        
+        if self.state & PipelineState.RECONNECTING:
+            state |= SyncState.RECONNECTING
 
         # If it's running but no specific phase is set, mark it as starting or broadly running
         if self.state & PipelineState.RUNNING and state == SyncState.STOPPED:

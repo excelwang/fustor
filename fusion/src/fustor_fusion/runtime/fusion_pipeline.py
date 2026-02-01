@@ -305,10 +305,11 @@ class FusionPipeline(Pipeline):
                 return True
             return False
 
-    def get_session_role(self, session_id: str) -> str:
+    async def get_session_role(self, session_id: str) -> str:
         """Get the role of a session (leader/follower)."""
-        session = self._active_sessions.get(session_id)
-        return session.get("role", "unknown") if session else "unknown"
+        async with self._lock:
+            session = self._active_sessions.get(session_id)
+            return session.get("role", "unknown") if session else "unknown"
     
     async def _session_cleanup_loop(self) -> None:
         """Periodic task to clean up expired sessions."""
@@ -398,19 +399,20 @@ class FusionPipeline(Pipeline):
     
     # --- DTO & Stats ---
     
-    def get_dto(self) -> Dict[str, Any]:
+    async def get_dto(self) -> Dict[str, Any]:
         """Get pipeline status as a dictionary."""
-        return {
-            "id": self.id,
-            "datastore_id": self.datastore_id,
-            "state": self.state.name if hasattr(self.state, 'name') else str(self.state),
-            "info": self.info,
-            "view_handlers": self.get_available_views(),
-            "active_sessions": len(self._active_sessions),
-            "leader_session": self._leader_session,
-            "statistics": self.statistics.copy(),
-            "queue_size": self._event_queue.qsize(),
-        }
+        async with self._lock:
+            return {
+                "id": self.id,
+                "datastore_id": self.datastore_id,
+                "state": self.state.name if hasattr(self.state, 'name') else str(self.state),
+                "info": self.info,
+                "view_handlers": self.get_available_views(),
+                "active_sessions": len(self._active_sessions),
+                "leader_session": self._leader_session,
+                "statistics": self.statistics.copy(),
+                "queue_size": self._event_queue.qsize(),
+            }
     
     def get_aggregated_stats(self) -> Dict[str, Any]:
         """Get aggregated statistics from all view handlers."""
@@ -426,17 +428,19 @@ class FusionPipeline(Pipeline):
         return stats
         
     
-    def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+    async def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get information about a specific session."""
-        if session_id in self._active_sessions:
-            info = self._active_sessions[session_id].copy()
-            info["session_id"] = session_id
-            return info
-        return None
+        async with self._lock:
+            if session_id in self._active_sessions:
+                info = self._active_sessions[session_id].copy()
+                info["session_id"] = session_id
+                return info
+            return None
     
-    def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
+    async def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
         """Get all active sessions."""
-        return self._active_sessions.copy()
+        async with self._lock:
+            return self._active_sessions.copy()
         
     @property
     def leader_session(self) -> Optional[str]:
