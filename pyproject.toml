@@ -12,6 +12,7 @@ members = [
     "packages/pusher-openapi",
     "packages/pusher-fusion",
     "packages/sender-http",
+    "packages/receiver-http",
     "packages/schema-fs",
     "packages/source-elasticsearch",
     "packages/source-fs",
@@ -33,6 +34,7 @@ fustor-pusher-echo = { workspace = true }
 fustor-pusher-openapi = { workspace = true }
 fustor-pusher-fusion = { workspace = true }
 fustor-sender-http = { workspace = true }
+fustor-receiver-http = { workspace = true }
 fustor-schema-fs = { workspace = true }
 fustor-source-elasticsearch = { workspace = true }
 fustor-source-fs = { workspace = true }
@@ -50,6 +52,7 @@ pythonpath = [
     "packages/pusher-openapi/src",
     "packages/pusher-fusion/src",
     "packages/sender-http/src",
+    "packages/receiver-http/src",
     "packages/schema-fs/src",
     "packages/source-elasticsearch/src",
     "packages/source-fs/src",
