@@ -224,9 +224,9 @@ it/
 - [ ] 添加重试机制
 - [ ] 改进日志输出
 
-任务 2.3: 添加 Pipeline 集成测试
-- [ ] 创建 test_pipeline_*.py 测试
-- [ ] 验证 Pipeline 模式行为
+任务 2.3: 添加 Pipeline 集成测试 ✅
+- [x] 创建 test_pipeline_basic.py 测试
+- [x] 验证 Pipeline 模式行为
 ```
 
 ### Phase 3: CI/CD 集成 (可选, 2-3 天)
