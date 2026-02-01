@@ -202,12 +202,13 @@ class TestConvenienceFunction:
 class TestFeatureFlag:
     """Test should_use_pipeline feature flag."""
     
-    def test_default_is_false(self):
-        """Default should be False."""
+    def test_default_is_true(self):
+        """Default should be True."""
         with patch.dict(os.environ, {}, clear=True):
             # Clear env var if set
             os.environ.pop("FUSTOR_USE_PIPELINE", None)
-            assert should_use_pipeline() is False
+            assert should_use_pipeline() is True
+
     
     def test_env_var_true(self):
         """Env var 'true' should enable pipeline."""

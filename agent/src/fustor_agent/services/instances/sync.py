@@ -4,13 +4,13 @@ import logging
 
 from .base import BaseInstanceService
 from fustor_core.models.states import SyncState
-from fustor_agent.runtime.sync import SyncInstance
-from fustor_agent.runtime import AgentPipeline, PipelineBridge, should_use_pipeline
+from fustor_agent.runtime import AgentPipeline, PipelineBridge
 from fustor_core.exceptions import NotFoundError
 from fustor_agent_sdk.interfaces import SyncInstanceServiceInterface # Import the interface
 
-# Type alias for either SyncInstance or AgentPipeline
-SyncRuntime = Union[SyncInstance, AgentPipeline]
+# SyncRuntime is now always AgentPipeline
+SyncRuntime = AgentPipeline
+
 
 
 if TYPE_CHECKING:
@@ -69,45 +69,25 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
         
         self.logger.info(f"Attempting to start sync instance '{id}'...")
         try:
-            sender_schema = await self.sender_driver_service.get_needed_fields(
-                driver_type=sender_config.driver, endpoint=sender_config.endpoint
+            # Always use new Pipeline architecture
+            self.logger.info(f"Using AgentPipeline for '{id}'")
+            
+            bridge = PipelineBridge(
+                sender_driver_service=self.sender_driver_service,
+                source_driver_service=self.source_driver_service
             )
             
-            # Check if we should use new Pipeline architecture
-            if should_use_pipeline():
-                self.logger.info(f"Using AgentPipeline for '{id}' (FUSTOR_USE_PIPELINE=true)")
-                
-                bridge = PipelineBridge(
-                    sender_driver_service=self.sender_driver_service,
-                    source_driver_service=self.source_driver_service
-                )
-                
-                pipeline = bridge.create_pipeline(
-                    pipeline_id=id,
-                    agent_id=self.agent_id,
-                    sync_config=sync_config,
-                    source_config=source_config,
-                    sender_config=sender_config,
-                    event_bus=None  # EventBus integration TBD
-                )
-                
-                self.pool[id] = pipeline
-                await pipeline.start()
-            else:
-                # Legacy: Instantiate SyncInstance
-                sync_instance = SyncInstance(
-                    id=id,
-                    agent_id=self.agent_id,
-                    config=sync_config,
-                    source_config=source_config,
-                    sender_config=sender_config,
-                    bus_service=self.bus_service,
-                    sender_driver_service=self.sender_driver_service,
-                    source_driver_service=self.source_driver_service,
-                    sender_schema=sender_schema
-                )
-                self.pool[id] = sync_instance
-                await sync_instance.start()
+            pipeline = bridge.create_pipeline(
+                pipeline_id=id,
+                agent_id=self.agent_id,
+                sync_config=sync_config,
+                source_config=source_config,
+                sender_config=sender_config,
+                event_bus=None  # EventBus integration TBD
+            )
+            
+            self.pool[id] = pipeline
+            await pipeline.start()
             
             self.logger.info(f"Sync instance '{id}' start initiated successfully.")
 
@@ -117,6 +97,7 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
                 self.pool.pop(id)
             # Re-raise to be caught by the API layer
             raise
+
 
 
     async def stop_one(self, id: str, should_release_bus: bool = True):

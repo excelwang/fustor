@@ -61,7 +61,7 @@ class AgentPipeline(Pipeline):
         self.task_id = task_id
         self.source_handler = source_handler
         self.sender_handler = sender_handler
-        self.event_bus = event_bus
+        self._bus = event_bus  # Private attribute for bus
         
         # Role tracking (from heartbeat response)
         self.current_role: Optional[str] = None  # "leader" or "follower"
@@ -376,14 +376,52 @@ class AgentPipeline(Pipeline):
                 await self.sender_handler.send_batch(
                     self.session_id, [result], {"phase": "sentinel"}
                 )
-    
+
+    async def trigger_audit(self) -> None:
+
+        """Manually trigger an audit cycle."""
+        if self.current_role == "leader":
+            asyncio.create_task(self._run_audit_sync())
+        else:
+            logger.warning(f"Pipeline {self.id}: Cannot trigger audit, not a leader")
+
+    async def trigger_sentinel(self) -> None:
+        """Manually trigger a sentinel check."""
+        if self.current_role == "leader":
+            asyncio.create_task(self._run_sentinel_check())
+        else:
+            logger.warning(f"Pipeline {self.id}: Cannot trigger sentinel, not a leader")
+
+    @property
+    def bus(self) -> Optional["EventBusInstanceRuntime"]:
+        """Legacy access to event bus."""
+        return self._bus
+
     def get_dto(self) -> Dict[str, Any]:
-        """Get pipeline data transfer object."""
-        dto = super().get_dto()
-        dto.update({
+        """Get pipeline data transfer object compatible with SyncInstanceDTO."""
+        # Map PipelineState to SyncState
+        from fustor_core.models.states import SyncState
+        
+        state = SyncState.STOPPED
+        if self.state & PipelineState.SNAPSHOT_PHASE:
+            state |= SyncState.SNAPSHOT_SYNC
+        elif self.state & PipelineState.MESSAGE_PHASE:
+            state |= SyncState.MESSAGE_SYNC
+        elif self.state & PipelineState.AUDIT_PHASE:
+            state |= SyncState.AUDIT_SYNC
+        
+        if self.state & PipelineState.CONF_OUTDATED:
+            state |= SyncState.RUNNING_CONF_OUTDATE
+        
+        if self.state & PipelineState.ERROR:
+            state |= SyncState.ERROR
+
+        return {
+            "id": self.id,
+            "state": str(state),
+            "info": self.info or "",
+            "statistics": self.statistics.copy(),
+            "bus_id": self._bus.id if self._bus else None,
             "task_id": self.task_id,
             "current_role": self.current_role,
-            "statistics": self.statistics.copy(),
-            "source_type": self.source_handler.schema_name if self.source_handler else None,
-        })
-        return dto
+        }

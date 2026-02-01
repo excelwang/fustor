@@ -213,10 +213,17 @@ def create_pipeline_from_sync_config(
 
 
 # Feature flag for migration
-USE_AGENT_PIPELINE = False  # Set to True to use new pipeline
+# Feature flag for migration
+USE_AGENT_PIPELINE = True  # Set to True to use new pipeline
+
 
 def should_use_pipeline() -> bool:
     """Check if we should use AgentPipeline instead of SyncInstance."""
     import os
     env_flag = os.environ.get("FUSTOR_USE_PIPELINE", "").lower()
-    return env_flag in ("1", "true", "yes") or USE_AGENT_PIPELINE
+    if env_flag in ("1", "true", "yes"):
+        return True
+    if env_flag in ("0", "false", "no"):
+        return False
+    return USE_AGENT_PIPELINE
+

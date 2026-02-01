@@ -238,11 +238,11 @@ class ViewManagerAdapter(ViewHandler):
     
     async def on_session_start(self) -> None:
         """Handle session start for all providers."""
-        self._manager.on_session_start()
+        await self._manager.on_session_start()
     
     async def on_session_close(self) -> None:
         """Handle session close for all providers."""
-        self._manager.on_session_close()
+        await self._manager.on_session_close()
     
     async def handle_audit_start(self) -> None:
         """Handle audit start for all providers."""
