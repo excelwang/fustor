@@ -9,8 +9,8 @@ import os
 import logging
 import importlib
 import argparse
-from fustor_common.paths import get_fustor_home_dir
-from fustor_common.logging_config import setup_logging
+from fustor_core.common.paths import get_fustor_home_dir
+from fustor_core.common.logging_config import setup_logging
 
 
 def main():
