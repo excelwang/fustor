@@ -29,3 +29,4 @@ When reviewing refactor code, follow these steps:
 - Be specific about what needs to change
 - Explain why, not just what
 - Suggest alternatives when possible
+- write in a document for the newbie developer to read
