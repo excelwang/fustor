@@ -4,10 +4,60 @@ Docker Compose environment manager for integration tests.
 import os
 import subprocess
 import time
+import logging
+import functools
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Callable, TypeVar
+
+logger = logging.getLogger("fustor_test")
+
+# Type variable for retry decorator
+T = TypeVar('T')
 
 COMPOSE_FILE = Path(__file__).parent.parent / "docker-compose.yml"
+
+
+def retry(
+    max_attempts: int = 3,
+    delay: float = 1.0,
+    backoff: float = 2.0,
+    exceptions: tuple = (Exception,)
+) -> Callable:
+    """
+    Retry decorator with exponential backoff.
+    
+    Args:
+        max_attempts: Maximum number of retry attempts
+        delay: Initial delay between retries (seconds)
+        backoff: Multiplier for delay after each retry
+        exceptions: Tuple of exceptions to catch and retry
+    """
+    def decorator(func: Callable[..., T]) -> Callable[..., T]:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs) -> T:
+            last_exception = None
+            current_delay = delay
+            
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except exceptions as e:
+                    last_exception = e
+                    if attempt < max_attempts:
+                        logger.warning(
+                            f"{func.__name__} failed (attempt {attempt}/{max_attempts}): {e}. "
+                            f"Retrying in {current_delay:.1f}s..."
+                        )
+                        time.sleep(current_delay)
+                        current_delay *= backoff
+                    else:
+                        logger.error(
+                            f"{func.__name__} failed after {max_attempts} attempts: {e}"
+                        )
+            
+            raise last_exception
+        return wrapper
+    return decorator
 
 
 class DockerManager:
@@ -46,7 +96,8 @@ class DockerManager:
         command: list[str],
         workdir: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
-        capture_output: bool = True
+        capture_output: bool = True,
+        timeout: Optional[int] = None
     ) -> subprocess.CompletedProcess:
         """Execute command in a running container."""
         cmd = ["docker", "exec"]
@@ -57,7 +108,52 @@ class DockerManager:
                 cmd.extend(["-e", f"{k}={v}"])
         cmd.append(container)
         cmd.extend(command)
-        return subprocess.run(cmd, capture_output=capture_output, text=True)
+        return subprocess.run(cmd, capture_output=capture_output, text=True, timeout=timeout)
+
+    def exec_in_container_with_retry(
+        self,
+        container: str,
+        command: list[str],
+        max_attempts: int = 3,
+        delay: float = 1.0,
+        **kwargs
+    ) -> subprocess.CompletedProcess:
+        """
+        Execute command with automatic retry on failure.
+        
+        Args:
+            container: Target container name
+            command: Command to execute
+            max_attempts: Number of retry attempts
+            delay: Delay between retries (seconds)
+            **kwargs: Additional arguments passed to exec_in_container
+            
+        Returns:
+            CompletedProcess result
+        """
+        last_exception = None
+        for attempt in range(1, max_attempts + 1):
+            try:
+                result = self.exec_in_container(container, command, **kwargs)
+                if result.returncode == 0:
+                    return result
+                # Non-zero return might be intentional, so we don't retry
+                if attempt > 1:
+                    logger.info(f"Command succeeded on attempt {attempt}")
+                return result
+            except Exception as e:
+                last_exception = e
+                if attempt < max_attempts:
+                    logger.warning(
+                        f"exec_in_container failed (attempt {attempt}/{max_attempts}): {e}. "
+                        f"Retrying in {delay}s..."
+                    )
+                    time.sleep(delay)
+                    delay *= 2  # Exponential backoff
+        
+        if last_exception:
+            raise last_exception
+        raise RuntimeError("exec_in_container_with_retry failed unexpectedly")
 
     def get_logs(self, container: str, tail: int = 100) -> str:
         """Get container logs."""
@@ -69,18 +165,64 @@ class DockerManager:
         return result.stdout + result.stderr
 
     def wait_for_health(self, container: str, timeout: int = 120) -> bool:
-        """Wait for container to become healthy."""
+        """
+        Wait for container to become healthy with progress logging.
+        
+        Args:
+            container: Container name to check
+            timeout: Maximum seconds to wait
+            
+        Returns:
+            True if container became healthy, False if timeout
+        """
         start = time.time()
+        last_status = None
+        check_interval = 0.5
+        log_interval = 10  # Log every 10 seconds
+        last_log = 0
+        
+        logger.info(f"Waiting for {container} to become healthy (timeout: {timeout}s)...")
+        
         while time.time() - start < timeout:
-            result = subprocess.run(
-                ["docker", "inspect", "--format", "{{.State.Health.Status}}", container],
-                capture_output=True,
-                text=True
-            )
-            status = result.stdout.strip()
-            if status == "healthy":
-                return True
-            time.sleep(0.5)
+            try:
+                result = subprocess.run(
+                    ["docker", "inspect", "--format", "{{.State.Health.Status}}", container],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                status = result.stdout.strip()
+                
+                # Log status changes
+                if status != last_status:
+                    elapsed = int(time.time() - start)
+                    logger.info(f"Container {container} status: {status} (after {elapsed}s)")
+                    last_status = status
+                
+                if status == "healthy":
+                    elapsed = time.time() - start
+                    logger.info(f"✅ Container {container} healthy after {elapsed:.1f}s")
+                    return True
+                elif status == "unhealthy":
+                    # Try to get logs for debugging
+                    logs = self.get_logs(container, tail=20)
+                    logger.warning(f"Container {container} is unhealthy. Recent logs:\n{logs}")
+                    
+                # Periodic progress logging
+                elapsed = time.time() - start
+                if elapsed - last_log >= log_interval:
+                    logger.info(f"Still waiting for {container}... ({int(elapsed)}s/{timeout}s)")
+                    last_log = elapsed
+                    
+            except subprocess.TimeoutExpired:
+                logger.warning(f"Docker inspect timed out for {container}")
+            except Exception as e:
+                logger.warning(f"Error checking {container} health: {e}")
+                
+            time.sleep(check_interval)
+        
+        elapsed = time.time() - start
+        logger.error(f"❌ Container {container} did not become healthy within {timeout}s (last: {last_status})")
         return False
 
     def stop_container(self, container: str) -> None:
