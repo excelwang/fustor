@@ -5,6 +5,7 @@ These tests verify the state transitions and sequence of the pipeline.
 """
 import asyncio
 import pytest
+import time
 from unittest.mock import MagicMock, patch
 from typing import Iterator, List, Any, Dict, Tuple
 
@@ -26,15 +27,17 @@ class MockSourceHandler(SourceHandler):
         self.snapshot_calls += 1
         return iter(self.events)
     
-    async def get_message_iterator(self, start_position: int = -1, **kwargs):
+    def get_message_iterator(self, start_position: int = -1, **kwargs):
         self.message_calls += 1
-        try:
-            while True:
-                await asyncio.sleep(0.1)
-                # yield nothing but stay alive
-                if False: yield {} 
-        except asyncio.CancelledError:
-            pass
+        stop_event = kwargs.get("stop_event")
+        
+        def generator():
+            while not (stop_event and stop_event.is_set()):
+                time.sleep(0.1)
+                yield from [] # Yielding nothing but staying alive
+                break # For testing purposes, we don't want an infinite loop in sync mode unless requested
+        
+        return generator()
     
     def get_audit_iterator(self, **kwargs) -> Iterator[Any]:
 

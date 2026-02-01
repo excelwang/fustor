@@ -22,7 +22,7 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
     Manages the lifecycle of SenderConfig objects.
     
     Senders are responsible for transmitting events from Agent to Fusion.
-    This replaces the deprecated "PusherConfigService" terminology.
+    This replaces the deprecated "SenderConfigService" terminology.
     """
     
     def __init__(self, app_config: AppConfig):

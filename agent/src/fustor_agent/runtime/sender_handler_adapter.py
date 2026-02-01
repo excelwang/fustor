@@ -160,11 +160,12 @@ class SenderHandlerAdapter(SenderHandler):
             is_end=is_final
         )
         
-        # Handle audit end signal
-        if phase == "audit" and is_final:
-            await self._sender.signal_audit_end()
-        
         success = response.get("success", False)
+        
+        # Handle audit end signal
+        if phase == "audit" and is_final and success:
+            await self._sender.signal_audit_end()
+            
         return success, response
     
     async def close_session(self, session_id: str) -> bool:

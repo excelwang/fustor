@@ -1,5 +1,5 @@
 """
-Fuagent Echo Pusher Driver (Class-based)
+Fustor Echo Sender Driver (Class-based)
 """
 import json
 import logging
@@ -85,7 +85,7 @@ class EchoDriver(Sender):
         Sends a heartbeat to maintain session state.
         """
         self.logger.info(f"[EchoSender] Heartbeat for session {self.session_id} from task {self.id}")
-        return {"status": "ok", "role": "leader"}
+        return {"status": "ok", "role": self.config.get("mock_role", "leader")}
 
     async def create_session(self, task_id: str) -> Dict[str, Any]:
         """
@@ -94,12 +94,24 @@ class EchoDriver(Sender):
         import uuid
         session_id = str(uuid.uuid4())
         self.session_id = session_id
-        self.logger.info(f"[EchoSender] Created session {session_id} for task {task_id}")
+        role = self.config.get("mock_role", "leader")
+        self.logger.info(f"[EchoSender] Created session {session_id} for task {task_id} with role {role}")
         return {
             "session_id": session_id,
-            "role": "leader",
-            "session_timeout_seconds": 30
+            "role": role,
+            "session_timeout_seconds": self.config.get("session_timeout_seconds", 30)
         }
+
+    async def close_session(self) -> None:
+        """Close the current session."""
+        if self.session_id:
+            self.logger.info(f"[EchoSender] Closing session {self.session_id}")
+            self.session_id = None
+
+    async def close(self) -> None:
+        """Close the sender."""
+        self.logger.info(f"[EchoSender] Sender {self.id} closed")
+        self._snapshot_triggered = False
 
     @classmethod
     async def get_needed_fields(cls, **kwargs) -> Dict[str, Any]:

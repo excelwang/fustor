@@ -70,7 +70,7 @@
 
 ### a. 核心运行时接口
 
-*   `def __init__(self, config: PusherConfig):`
+*   `def __init__(self, config: SenderConfig):`
     *   **构造函数**: 保持不变。
 
 *   `async def create_session(self, task_id: str) -> str:`

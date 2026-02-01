@@ -97,6 +97,7 @@ class FusionPipeline(Pipeline):
         # Session tracking
         self._active_sessions: Dict[str, Dict[str, Any]] = {}
         self._leader_session: Optional[str] = None
+        self._lock = asyncio.Lock()  # Lock for thread-safe session management
         
         # Processing task
         self._processing_task: Optional[asyncio.Task] = None
@@ -223,60 +224,58 @@ class FusionPipeline(Pipeline):
     async def on_session_created(self, session_id: str, **kwargs) -> None:
         """
         Handle session creation.
-        
-        Called when an Agent creates a new session.
         """
-        task_id = kwargs.get("task_id")
-        client_ip = kwargs.get("client_ip")
-        
-        # Determine role (leader/follower)
-        role = "follower"
-        if not self._leader_session:
-            self._leader_session = session_id
-            role = "leader"
-        
-        self._active_sessions[session_id] = {
-            "task_id": task_id,
-            "client_ip": client_ip,
-            "role": role,
-            "created_at": asyncio.get_event_loop().time(),
-        }
-        
-        self.statistics["sessions_created"] += 1
-        
-        # Notify view handlers of session start
-        for handler in self._view_handlers.values():
-            if hasattr(handler, 'on_session_start'):
-                await handler.on_session_start()
-        
-        logger.info(f"Session {session_id} created with role={role}")
+        async with self._lock:
+            task_id = kwargs.get("task_id")
+            client_ip = kwargs.get("client_ip")
+            
+            # Determine role (leader/follower)
+            role = "follower"
+            if not self._leader_session:
+                self._leader_session = session_id
+                role = "leader"
+            
+            self._active_sessions[session_id] = {
+                "task_id": task_id,
+                "client_ip": client_ip,
+                "role": role,
+                "created_at": asyncio.get_event_loop().time(),
+            }
+            
+            self.statistics["sessions_created"] += 1
+            
+            # Notify view handlers of session start
+            for handler in self._view_handlers.values():
+                if hasattr(handler, 'on_session_start'):
+                    await handler.on_session_start()
+            
+            logger.info(f"Session {session_id} created with role={role}")
     
     async def on_session_closed(self, session_id: str) -> None:
         """
         Handle session closure.
-        
-        Called when an Agent closes its session.
         """
-        if session_id in self._active_sessions:
-            del self._active_sessions[session_id]
+        async with self._lock:
+            if session_id in self._active_sessions:
+                del self._active_sessions[session_id]
+                
+                # If leader left, elect new leader
+                if session_id == self._leader_session:
+                    self._leader_session = None
+                    if self._active_sessions:
+                        new_leader = next(iter(self._active_sessions))
+                        self._leader_session = new_leader
+                        self._active_sessions[new_leader]["role"] = "leader"
+                        logger.info(f"New leader elected: {new_leader}")
             
-            # If leader left, elect new leader
-            if session_id == self._leader_session:
-                self._leader_session = None
-                if self._active_sessions:
-                    new_leader = next(iter(self._active_sessions))
-                    self._leader_session = new_leader
-                    self._active_sessions[new_leader]["role"] = "leader"
-                    logger.info(f"New leader elected: {new_leader}")
-        
-        self.statistics["sessions_closed"] += 1
-        
-        # Notify view handlers of session close
-        for handler in self._view_handlers.values():
-            if hasattr(handler, 'on_session_close'):
-                await handler.on_session_close()
-        
-        logger.info(f"Session {session_id} closed")
+            self.statistics["sessions_closed"] += 1
+            
+            # Notify view handlers of session close
+            for handler in self._view_handlers.values():
+                if hasattr(handler, 'on_session_close'):
+                    await handler.on_session_close()
+            
+            logger.info(f"Session {session_id} closed")
     
     def get_session_role(self, session_id: str) -> str:
         """Get the role of a session (leader/follower)."""

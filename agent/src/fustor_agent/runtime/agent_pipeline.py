@@ -17,6 +17,7 @@ from fustor_core.pipeline.sender import SenderHandler
 if TYPE_CHECKING:
     from fustor_core.pipeline import PipelineContext
     from fustor_agent.services.instances.bus import EventBusInstanceRuntime
+    from fustor_core.models.states import SyncInstanceDTO
 
 logger = logging.getLogger("fustor_agent")
 
@@ -81,6 +82,11 @@ class AgentPipeline(Pipeline):
         self.sentinel_interval_sec = config.get("sentinel_interval_sec", 120)
         self.batch_size = config.get("batch_size", 100)
         
+        # Timing constants
+        self.CONTROL_LOOP_INTERVAL = 1.0
+        self.FOLLOWER_STANDBY_INTERVAL = 1.0
+        self.ERROR_RETRY_INTERVAL = 5.0
+        
         # Statistics
         self.statistics: Dict[str, Any] = {
             "events_pushed": 0,
@@ -121,28 +127,31 @@ class AgentPipeline(Pipeline):
         """
         Stop the pipeline gracefully.
         """
-        if not self.is_running() and self.state not in (PipelineState.INITIALIZING, PipelineState.PAUSED):
-
-            logger.debug(f"Pipeline {self.id} is not running")
+        if self.state == PipelineState.STOPPED:
+            logger.debug(f"Pipeline {self.id} is already stopped")
             return
         
+        old_state = self.state
         self._set_state(PipelineState.STOPPED, "Stopping...")
         
         # Cancel all tasks
-        for task in [
+        tasks_to_cancel = [
             self._main_task,
             self._heartbeat_task,
             self._snapshot_task,
             self._message_sync_task,
             self._audit_task,
             self._sentinel_task
-        ]:
+        ]
+        
+        for task in tasks_to_cancel:
             if task and not task.done():
                 task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+        
+        # Wait for tasks to finish
+        active_tasks = [t for t in tasks_to_cancel if t]
+        if active_tasks:
+            await asyncio.gather(*active_tasks, return_exceptions=True)
         
         # Close session
         if self.session_id:
@@ -193,18 +202,18 @@ class AgentPipeline(Pipeline):
                     await self._run_leader_sequence()
                     # If leader sequence finishes (e.g. source exhausted), 
                     # wait a bit before checking again to avoid busy loop
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(self.CONTROL_LOOP_INTERVAL)
                 else:
                     # Follower: just wait and maintain heartbeat
                     self._set_state(PipelineState.PAUSED, "Follower mode - standby")
-                    await asyncio.sleep(1) # Reduced from 5s to be more responsive
+                    await asyncio.sleep(self.FOLLOWER_STANDBY_INTERVAL)
                 
         except asyncio.CancelledError:
-            logger.info(f"Pipeline {self.id} control loop cancelled")
+            logger.info(f"Pipeline {self.id} {old_state.name if 'old_state' in locals() else ''} control loop cancelled")
         except Exception as e:
             self._set_state(PipelineState.ERROR, f"Control loop error: {e}")
             logger.error(f"Pipeline {self.id} control loop error: {e}", exc_info=True)
-            await asyncio.sleep(5) # Wait before retry if error
+            await asyncio.sleep(self.ERROR_RETRY_INTERVAL)
 
     
     async def _run_leader_sequence(self) -> None:
@@ -264,18 +273,21 @@ class AgentPipeline(Pipeline):
                 if task and not task.done():
                     task.cancel()
     
-    async def _aiter_sync(self, sync_iter: Iterator[Any]):
+    _IAITER_SENTINEL = object()
+
+    @staticmethod
+    async def _aiter_sync(sync_iter: Iterator[Any]):
         """Safely wrap a synchronous iterator into an async generator."""
         def get_next():
             try:
                 return next(sync_iter)
             except StopIteration:
-                return StopIteration
+                return AgentPipeline._IAITER_SENTINEL
 
         while True:
             # Run the next() call in a thread to avoid blocking the event loop
             event = await asyncio.to_thread(get_next)
-            if event is StopIteration:
+            if event is AgentPipeline._IAITER_SENTINEL:
                 break
             yield event
 
@@ -368,6 +380,11 @@ class AgentPipeline(Pipeline):
         self._set_state(self.state | PipelineState.AUDIT_PHASE)
         
         try:
+            # Signal audit start
+            await self.sender_handler.send_batch(
+                self.session_id, [], {"phase": "audit", "is_start": True}
+            )
+            
             audit_iter = self.source_handler.get_audit_iterator()
             
             batch = []

@@ -1,21 +1,19 @@
 [project]
 name = "fustor-sender-echo"
-dynamic = ["version"]
-description = "An echo sender for Fustor Agent"
-requires-python = ">=3.11"
-dependencies = [ "fustor-core",]
-[[project.authors]]
-name = "Huajin Wang"
-email = "wanghuajin999@163.com"
+version = "0.1.0"
+description = "Echo sender driver for Fustor"
+requires-python = ">= 3.10"
+dependencies = [
+    "fustor-core",
+]
+authors = [
+    { name = "Fustor Team" }
+]
+readme = "README.md"
 
 [build-system]
-requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools_scm]
-root = "../.."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-echo"

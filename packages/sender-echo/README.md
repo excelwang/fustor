@@ -1,4 +1,4 @@
-# fustor-pusher-echo
+# fustor-sender-echo
 
 This package provides an "echo" pusher driver for the Fustor Agent service. It serves as a basic example and debugging tool for `PusherDriver` implementations. Instead of pushing data to an external system, it simply logs all received events and control flags to the Fustor Agent's log output.
 
@@ -16,7 +16,7 @@ This package is part of the Fustor monorepo and is typically installed in editab
 
 ## Usage
 
-To use the `fustor-pusher-echo` driver, configure a Pusher in your Fustor Agent setup with the driver type `echo`. When a sync task is configured to use this pusher, all data processed by the Agent will be logged by this driver.
+To use the `fustor-sender-echo` driver, configure a Pusher in your Fustor Agent setup with the driver type `echo`. When a sync task is configured to use this pusher, all data processed by the Agent will be logged by this driver.
 
 This driver is particularly useful for:
 *   **Debugging**: Understanding the exact data and control signals being sent by the Fustor Agent.
