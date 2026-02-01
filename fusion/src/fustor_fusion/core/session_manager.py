@@ -3,9 +3,7 @@ import time
 from typing import Dict, Optional
 import logging
 from fustor_fusion_sdk.interfaces import SessionManagerInterface, SessionInfo # Import the interface and SessionInfo
-from ..in_memory_queue import memory_event_queue # NEW
-
-from ..config import datastores_config
+from ..in_memory_queue import memory_event_queue
 
 logger = logging.getLogger(__name__)
 

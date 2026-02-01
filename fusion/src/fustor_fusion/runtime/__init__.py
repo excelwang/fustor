@@ -2,7 +2,7 @@
 """
 Runtime components for Fustor Fusion.
 
-This module provides the new Pipeline-based architecture for Fusion:
+This module provides the Pipeline-based architecture for Fusion:
 
 FusionPipeline Architecture:
 ============================
@@ -56,7 +56,6 @@ from .session_bridge import (
     create_session_bridge,
 )
 
-# Backward compatibility: re-export from original runtime.py location
 from .datastore_event_manager import DatastoreEventManager, datastore_event_manager
 
 __all__ = [
@@ -73,8 +72,7 @@ __all__ = [
     "PipelineSessionBridge",
     "create_session_bridge",
     
-    # Backward compatibility exports
+    # Event Manager
     "DatastoreEventManager",
     "datastore_event_manager",
 ]
-

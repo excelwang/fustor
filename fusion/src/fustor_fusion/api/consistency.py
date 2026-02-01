@@ -1,3 +1,7 @@
+# fusion/src/fustor_fusion/api/consistency.py
+"""
+Consistency management API for audit cycles and sentinel checks.
+"""
 from fastapi import APIRouter, Depends, status, HTTPException
 import logging
 import asyncio
@@ -11,6 +15,7 @@ from ..processing_manager import processing_manager
 logger = logging.getLogger(__name__)
 
 consistency_router = APIRouter(tags=["Consistency Management"], prefix="/consistency")
+
 
 @consistency_router.post("/audit/start", summary="Signal start of an audit cycle")
 async def signal_audit_start(
@@ -35,15 +40,13 @@ async def signal_audit_start(
                 logger.error(f"Failed to handle audit start for provider {name}: {e}")
 
     if handled_count == 0 and provider_names:
-        # If providers exist but none support audit, that might be fine, but worth logging
         logger.debug(f"No providers handled audit start (available: {provider_names})")
     
-    # If NO providers exist at all, that's probably a configuration issue? 
-    # But strictly speaking, it's not a 404 resource not found, just an empty system.
     if not provider_names:
-         logger.warning(f"Audit start signal received but no view providers are loaded for datastore {datastore_id}")
+        logger.warning(f"Audit start signal received but no view providers are loaded for datastore {datastore_id}")
 
     return {"status": "audit_started", "providers_handled": handled_count}
+
 
 @consistency_router.post("/audit/end", summary="Signal end of an audit cycle")
 async def signal_audit_end(
@@ -54,11 +57,7 @@ async def signal_audit_end(
     This triggers missing item detection and cleanup logic.
     Broadcasts to all view providers that support audit handling.
     """
-    # Wait for queue to drain (with timeout)
-    # Problem 5 Fix: Removed hardcoded 1s sleep. 
-    # Since Agents await the HTTP response of the last batch before signaling end,
-    # the data is guaranteed to be in Fusion's memory when this is called.
-    max_wait = 10.0  # seconds
+    max_wait = 10.0
     wait_interval = 0.1
     elapsed = 0.0
     
@@ -66,9 +65,7 @@ async def signal_audit_end(
         queue_size = memory_event_queue.get_queue_size(datastore_id)
         inflight = processing_manager.get_inflight_count(datastore_id)
         if queue_size == 0 and inflight == 0:
-            # Settle period: wait one more interval to ensure no micro-bursts are in-flight
             await asyncio.sleep(wait_interval)
-            # Re-check
             if memory_event_queue.get_queue_size(datastore_id) == 0 and processing_manager.get_inflight_count(datastore_id) == 0:
                 break
         
@@ -120,16 +117,16 @@ async def get_sentinel_tasks(
             except Exception as e:
                 logger.error(f"Failed to get suspect list from provider {name}: {e}")
     
-    # Deduplicate paths if multiple providers track same items (unlikely but safe)
     if all_suspects_paths:
         unique_paths = list(set(all_suspects_paths))
         return {
-             'type': 'suspect_check', 
-             'paths': unique_paths,
-             'source_id': datastore_id
+            'type': 'suspect_check', 
+            'paths': unique_paths,
+            'source_id': datastore_id
         }
         
     return {}
+
 
 @consistency_router.post("/sentinel/feedback", summary="Submit sentinel check feedback")
 async def submit_sentinel_feedback(
@@ -153,8 +150,6 @@ async def submit_sentinel_feedback(
         for name in provider_names:
             provider = view_manager.get_provider(name)
             if hasattr(provider, 'update_suspect'):
-                # Pass updates to each provider
-                # Optimization: In future we might filter updates by provider responsibility
                 try:
                     count_for_provider = 0
                     for item in updates:
@@ -164,7 +159,7 @@ async def submit_sentinel_feedback(
                             await provider.update_suspect(path, float(mtime))
                             count_for_provider += 1
                     if count_for_provider > 0:
-                        processed_count += 1 # Count providers that processed something
+                        processed_count += 1
                 except Exception as e:
                     logger.error(f"Failed to update suspects in provider {name}: {e}")
 

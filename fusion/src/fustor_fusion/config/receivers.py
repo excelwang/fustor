@@ -191,6 +191,29 @@ class ReceiversConfigLoader:
         self.ensure_loaded()
         return self._api_key_to_receiver.get(api_key)
     
+    def get_active_pipelines(self) -> Dict[str, Any]:
+        """
+        Get all active pipeline IDs from configured API keys.
+        
+        This returns a dict compatible with processing_manager.sync_tasks().
+        
+        Returns:
+            Dict mapping pipeline_id to configuration info
+        """
+        self.ensure_loaded()
+        pipelines = {}
+        for api_key, pipeline_id in self._api_key_to_pipeline.items():
+            if pipeline_id not in pipelines:
+                # Get the receiver for this API key
+                receiver_id = self._api_key_to_receiver.get(api_key)
+                receiver = self._receivers.get(receiver_id) if receiver_id else None
+                pipelines[pipeline_id] = {
+                    "id": pipeline_id,
+                    "receiver_id": receiver_id,
+                    "session_timeout_seconds": receiver.session_timeout_seconds if receiver else 30,
+                }
+        return pipelines
+    
     def reload(self) -> Dict[str, ReceiverConfig]:
         """Force reload configuration from YAML file."""
         self._loaded = False

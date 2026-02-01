@@ -3,45 +3,39 @@ Test cases for session clear functionality.
 """
 import asyncio
 from unittest.mock import patch, Mock
-from dataclasses import dataclass
 import pytest
 
 from fustor_fusion.api.session import create_session
 from fustor_fusion.core.session_manager import session_manager
 from fustor_fusion.datastore_state_manager import datastore_state_manager
 
-@dataclass
-class DatastoreModel:
-    id: int
-    name: str
-    type: str
-    allow_concurrent_push: bool
-    session_timeout_seconds: int
 
 class MockRequest:
     def __init__(self, client_host="127.0.0.1"):
         self.client = Mock()
         self.client.host = client_host
 
+
+def make_session_config(allow_concurrent_push=False, session_timeout_seconds=30):
+    """Create a mock session config dict."""
+    return {
+        "allow_concurrent_push": allow_concurrent_push,
+        "session_timeout_seconds": session_timeout_seconds,
+    }
+
+
 @pytest.mark.asyncio
 async def test_clear_all_sessions():
     """
     Test that clear_all_sessions properly removes all sessions and releases locks
     """
-    # Reset managers before test
     await session_manager.cleanup_expired_sessions()
     datastore_state_manager._states.clear()
     
     datastore_id = 7
-    datastore = DatastoreModel(
-        id=datastore_id,
-        name="test_datastore7",
-        type="submit",
-        allow_concurrent_push=False,
-        session_timeout_seconds=30
-    )
+    config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     
-    with patch('fustor_fusion.api.session.datastores_config.get_datastore', return_value=datastore):
+    with patch('fustor_fusion.api.session._get_session_config', return_value=config):
         # Create a session
         payload = type('CreateSessionPayload', (), {})()
         payload.task_id = "task_to_clear"
@@ -59,8 +53,7 @@ async def test_clear_all_sessions():
         await session_manager.clear_all_sessions(datastore_id)
         
         # Verify session is gone
-        # The datastore entry itself might be gone if it was the last session
         if datastore_id in session_manager._sessions:
             assert session_id not in session_manager._sessions[datastore_id]
         else:
-             assert True # Datastore entry removed implies session removed
+            assert True  # Datastore entry removed implies session removed

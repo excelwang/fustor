@@ -31,7 +31,7 @@ async def test_audit_start_endpoint(mock_view_manager):
     manager.get_available_providers.return_value = ["file_directory"]
     manager.get_provider.return_value = provider
     
-    response = client.post("/api/v1/ingest/consistency/audit/start")
+    response = client.post("/api/v1/pipe/consistency/audit/start")
     
     assert response.status_code == 200
     assert response.json()["status"] == "audit_started"
@@ -52,7 +52,7 @@ async def test_audit_end_endpoint(mock_view_manager):
         mock_queue.get_queue_size.return_value = 0
         mock_pm.get_inflight_count.return_value = 0
         
-        response = client.post("/api/v1/ingest/consistency/audit/end")
+        response = client.post("/api/v1/pipe/consistency/audit/end")
     
     assert response.status_code == 200
     assert response.json()["status"] == "audit_ended"
@@ -68,7 +68,7 @@ async def test_get_sentinel_tasks_with_suspects(mock_view_manager):
     manager.get_available_providers.return_value = ["file_directory"]
     manager.get_provider.return_value = provider
     
-    response = client.get("/api/v1/ingest/consistency/sentinel/tasks")
+    response = client.get("/api/v1/pipe/consistency/sentinel/tasks")
     
     assert response.status_code == 200
     data = response.json()
@@ -86,7 +86,7 @@ async def test_get_sentinel_tasks_empty(mock_view_manager):
     manager.get_available_providers.return_value = ["file_directory"]
     manager.get_provider.return_value = provider
     
-    response = client.get("/api/v1/ingest/consistency/sentinel/tasks")
+    response = client.get("/api/v1/pipe/consistency/sentinel/tasks")
     
     assert response.status_code == 200
     assert response.json() == {}
@@ -100,7 +100,7 @@ async def test_submit_sentinel_feedback(mock_view_manager):
     manager.get_available_providers.return_value = ["file_directory"]
     manager.get_provider.return_value = provider
     
-    response = client.post("/api/v1/ingest/consistency/sentinel/feedback", json={
+    response = client.post("/api/v1/pipe/consistency/sentinel/feedback", json={
         "type": "suspect_update",
         "updates": [
             {"path": "/file1.txt", "mtime": 999.0}

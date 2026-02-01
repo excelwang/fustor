@@ -11,7 +11,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # --- Ingestor Service Specific Imports ---
-from .config import datastores_config
+from .config import receivers_config
 from .core.session_manager import session_manager
 from .datastore_state_manager import datastore_state_manager
 from .queue_integration import queue_based_ingestor, get_events_from_queue
@@ -37,8 +37,8 @@ async def lifespan(app: FastAPI):
 
     # Perform initial configuration load and start processors
     try:
-        datastores_config.reload()
-        await processing_manager.sync_tasks(datastores_config.get_all_datastores())
+        receivers_config.reload()
+        await processing_manager.sync_tasks(receivers_config.get_active_pipelines())
     except Exception as e:
         logger.error(f"Initial configuration load failed: {e}. Aborting startup.")
         raise
@@ -110,30 +110,19 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # --- API Routing Version 1 ---
-from .api.ingestion import ingestion_router
-from .api.session import session_router
-from .api.consistency import consistency_router
-from .api.management import router as management_router
 from .api.pipe import pipe_router
+from .api.management import router as management_router
 
 # Core versioned router
 api_v1 = APIRouter()
 
-# 1. NEW: Pipeline Domain (/api/v1/pipe) - Recommended
+# 1. Pipeline Domain (/api/v1/pipe) - Main API
 api_v1.include_router(pipe_router, prefix="/pipe")
 
-# 2. LEGACY: Ingestion Domain (/api/v1/ingest) - Backward compatible
-ingest_api = APIRouter(prefix="/ingest")
-ingest_api.include_router(session_router, prefix="/sessions")
-ingest_api.include_router(ingestion_router, prefix="/events")
-ingest_api.include_router(consistency_router) # already has /consistency prefix
-
-api_v1.include_router(ingest_api)
-
-# 3. View Domain (/api/v1/views)
+# 2. View Domain (/api/v1/views)
 api_v1.include_router(view_router, prefix="/views")
 
-# 4. Management Domain (/api/v1/management)
+# 3. Management Domain (/api/v1/management)
 api_v1.include_router(management_router)
 
 # Register the unified v1 router

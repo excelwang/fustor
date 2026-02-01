@@ -5,7 +5,7 @@ Management API for dynamic view start/stop operations.
 import logging
 from fastapi import APIRouter, HTTPException, status
 
-from ..config import views_config, datastores_config
+from ..config import views_config
 
 logger = logging.getLogger(__name__)
 
@@ -18,9 +18,8 @@ async def start_view(view_id: str):
     Start a view by ID.
     
     1. Load view config from YAML
-    2. Validate datastore exists
-    3. Register view with ViewManager
-    4. If active session exists, trigger on_session_start
+    2. Register view with ViewManager
+    3. If active session exists, trigger on_session_start
     """
     from ..runtime_objects import view_managers
     from ..core.session_manager import session_manager
@@ -42,14 +41,6 @@ async def start_view(view_id: str):
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"View '{view_id}' is disabled in config"
-        )
-    
-    # Validate datastore exists
-    ds = datastores_config.get_datastore(config.datastore_id)
-    if not ds:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Datastore {config.datastore_id} not found in datastores-config.yaml"
         )
     
     # Get or create ViewManager for this datastore
