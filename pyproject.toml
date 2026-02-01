@@ -5,8 +5,6 @@ members = [
     "benchmark",
     "packages/core",
     "packages/agent-sdk",
-    "packages/common",
-    "packages/event-model",
     "packages/fusion-sdk",
     "packages/pusher-echo",
     "packages/pusher-openapi",
@@ -27,8 +25,6 @@ fustor-agent = { workspace = true }
 fustor-fusion = { workspace = true }
 fustor-core = { workspace = true }
 fustor-agent-sdk = { workspace = true }
-fustor-common = { workspace = true }
-fustor-event-model = { workspace = true }
 fustor-fusion-sdk = { workspace = true }
 fustor-pusher-echo = { workspace = true }
 fustor-pusher-openapi = { workspace = true }

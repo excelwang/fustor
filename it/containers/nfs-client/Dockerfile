@@ -18,9 +18,8 @@ COPY packages /app/packages
 # Set fake version for setuptools-scm (since .git is not copied)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 
-# Install Fustor Agent and dependencies (using correct package names)
+# Install Fustor Agent and dependencies (all pip deps declared in package pyproject.toml)
 RUN pip install --no-cache-dir \
-    httpx pydantic pyyaml \
     /app/packages/core \
     /app/packages/agent-sdk \
     /app/packages/fusion-sdk \

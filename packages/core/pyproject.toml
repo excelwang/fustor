@@ -5,6 +5,9 @@ description = "Core foundation for Fustor - event models, pipeline/transport abs
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.11.7",
+    "colorlog>=6.0.0",
+    "pyyaml>=6.0",
+    "python-json-logger>=2.0.0",
 ]
 
 [[project.authors]]

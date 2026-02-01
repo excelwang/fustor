@@ -14,7 +14,6 @@ dependencies = [
     "httpx",
     "orjson",
     "fustor-core",
-    "PyYAML",
 ]
 [[project.authors]]
 name = "Huajin Wang"

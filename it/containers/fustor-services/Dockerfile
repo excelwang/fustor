@@ -16,9 +16,8 @@ COPY packages /app/packages
 # Set fake version for setuptools-scm (since .git is not copied)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 
-# Install Fustor packages
+# Install Fustor packages (all pip dependencies declared in package pyproject.toml)
 RUN pip install --no-cache-dir \
-    fastapi uvicorn pydantic pyyaml \
     /app/packages/core \
     /app/packages/fusion-sdk \
     /app/packages/schema-fs \
