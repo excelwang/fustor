@@ -279,10 +279,13 @@ class AgentPipeline(Pipeline):
         self._set_state(PipelineState.RUNNING | PipelineState.SNAPSHOT_PHASE, "Starting snapshot sync...")
         
         try:
+            self._snapshot_task = asyncio.current_task()
             await self._run_snapshot_sync()
         except Exception as e:
             self._set_state(PipelineState.ERROR, f"Snapshot sync failed: {e}")
             return
+        finally:
+            self._snapshot_task = None
         
         # Phase 2: Message sync + background tasks
         self._set_state(PipelineState.RUNNING | PipelineState.MESSAGE_PHASE, "Starting message sync...")
@@ -295,9 +298,19 @@ class AgentPipeline(Pipeline):
         
         # Run message sync (this blocks until we lose leader role)
         try:
-            await self._run_message_sync()
+            # We wrap message sync in a task so it can be cancelled by role change
+            self._message_sync_task = asyncio.create_task(self._run_message_sync())
+            await self._message_sync_task
         except asyncio.CancelledError:
-            pass
+            if self._message_sync_task and not self._message_sync_task.done():
+                self._message_sync_task.cancel()
+                try:
+                    await self._message_sync_task
+                except asyncio.CancelledError:
+                    pass
+            logger.info(f"Pipeline {self.id}: Message sync task cancelled")
+        finally:
+            self._message_sync_task = None
     
     async def _run_heartbeat_loop(self) -> None:
         """Maintain session through periodic heartbeats."""
