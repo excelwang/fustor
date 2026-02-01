@@ -211,7 +211,7 @@ it/
 - [ ] 修复任何因配置变更导致的失败
 ```
 
-### Phase 2: Fixtures 重构 ✅ (2026-02-02 进行中)
+### Phase 2: Fixtures 重构 ✅ (2026-02-02 完成)
 
 ```
 任务 2.1: 模块化 Fixtures ✅
@@ -219,10 +219,10 @@ it/
 - [x] 拆分 conftest.py 到子模块
 - [x] 更新 conftest.py 导入
 
-任务 2.2: 增强健壮性
-- [ ] 改进容器健康检查超时逻辑
-- [ ] 添加重试机制
-- [ ] 改进日志输出
+任务 2.2: 增强健壮性 ✅
+- [x] 改进容器健康检查超时逻辑
+- [x] 添加重试机制 (retry decorator + exec_with_retry)
+- [x] 改进日志输出
 
 任务 2.3: 添加 Pipeline 集成测试 ✅
 - [x] 创建 test_pipeline_basic.py 测试
