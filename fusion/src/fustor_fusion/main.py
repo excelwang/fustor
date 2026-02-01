@@ -114,11 +114,15 @@ from .api.ingestion import ingestion_router
 from .api.session import session_router
 from .api.consistency import consistency_router
 from .api.management import router as management_router
+from .api.pipe import pipe_router
 
 # Core versioned router
 api_v1 = APIRouter()
 
-# 1. Ingestion Domain (/api/v1/ingest)
+# 1. NEW: Pipeline Domain (/api/v1/pipe) - Recommended
+api_v1.include_router(pipe_router, prefix="/pipe")
+
+# 2. LEGACY: Ingestion Domain (/api/v1/ingest) - Backward compatible
 ingest_api = APIRouter(prefix="/ingest")
 ingest_api.include_router(session_router, prefix="/sessions")
 ingest_api.include_router(ingestion_router, prefix="/events")
@@ -126,10 +130,10 @@ ingest_api.include_router(consistency_router) # already has /consistency prefix
 
 api_v1.include_router(ingest_api)
 
-# 2. View Domain (/api/v1/views)
+# 3. View Domain (/api/v1/views)
 api_v1.include_router(view_router, prefix="/views")
 
-# 3. Management Domain (/api/v1/management)
+# 4. Management Domain (/api/v1/management)
 api_v1.include_router(management_router)
 
 # Register the unified v1 router
