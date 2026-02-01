@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import logging # Added import
 
 # Import necessary modules
-from fustor_core.models.config import SourceConfig, PusherConfig, SyncConfig, PasswdCredential, FieldMapping
+from fustor_core.models.config import SourceConfig, SenderConfig, SyncConfig, PasswdCredential, FieldMapping
 from fustor_agent.app import App
 from fustor_core.models.states import SyncState
 
@@ -51,16 +51,16 @@ async def test_transient_source_buffer_full_triggers_error(caplog):
             await app.source_config_service.add_config("test-fs-source", source_config)
             
             # 4. Configure Pusher (Echo)
-            pusher_config = PusherConfig(
+            sender_config = SenderConfig(
                 driver="echo",
-                endpoint="http://localhost:8080/echo",
+                uri="http://localhost:8080/echo",
                 credential=PasswdCredential(user="test", passwd="test"),
                 batch_size=1, # Slow consumer effectively
                 max_retries=1,
                 retry_delay_sec=1,
                 disabled=False
             )
-            await app.pusher_config_service.add_config("test-echo-pusher", pusher_config)
+            await app.sender_config_service.add_config("test-echo-pusher", sender_config)
             
             # 5. Configure Sync
             sync_config = SyncConfig(

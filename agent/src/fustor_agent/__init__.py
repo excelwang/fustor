@@ -58,7 +58,7 @@ def get_app_config() -> AppConfig:
 
         _app_config_instance = AppConfig(
             sources=SourceConfigDict(root=valid_sources),
-            pushers=SenderConfigDict(root=valid_senders),
+            senders=SenderConfigDict(root=valid_senders),
             syncs=SyncConfigDict(root=valid_syncs)
         )
 

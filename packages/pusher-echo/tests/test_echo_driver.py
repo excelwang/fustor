@@ -3,14 +3,14 @@ import json
 import logging
 from io import StringIO
 from fustor_pusher_echo import EchoDriver
-from fustor_core.models.config import PusherConfig, PasswdCredential
+from fustor_core.models.config import SenderConfig, PasswdCredential
 from fustor_core.event import InsertEvent
 
 @pytest.mark.asyncio
 async def test_echo_driver_push(caplog):
     """Tests the push method of the EchoDriver conforms to the new interface."""
     # 1. Arrange
-    config = PusherConfig(driver="echo", endpoint="", credential=PasswdCredential(user="test"))
+    config = SenderConfig(driver="echo", uri="", credential=PasswdCredential(user="test"))
     driver = EchoDriver("test-echo-id", config)
     events = [InsertEvent(event_schema="test_schema", table="test_table", rows=[{"id": 1, "msg": "hello"}], fields=["id", "msg"])]
     # 2. Act & 3. Assert - Check logging
@@ -51,7 +51,7 @@ async def test_echo_driver_get_wizard_steps():
 async def test_echo_driver_cumulative_push(caplog):
     """Tests that the driver correctly accumulates row counts over multiple pushes."""
     # 1. Arrange
-    config = PusherConfig(driver="echo", endpoint="", credential=PasswdCredential(user="test"))
+    config = SenderConfig(driver="echo", uri="", credential=PasswdCredential(user="test"))
     driver = EchoDriver("test-echo-id", config)
 
     # First batch

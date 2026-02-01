@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from fustor_agent.services.configs.base import BaseConfigService
-from fustor_core.models.config import AppConfig, SourceConfig, PusherConfig, SyncConfig, PasswdCredential
+from fustor_core.models.config import AppConfig, SourceConfig, SenderConfig, SyncConfig, PasswdCredential
 from fustor_core.exceptions import ConfigError, NotFoundError, ConflictError
 from fustor_core.models.states import SyncState
 
@@ -13,13 +13,13 @@ class MockConfig(SourceConfig):
 def mock_app_config():
     app_config = MagicMock(spec=AppConfig)
     app_config.get_sources.return_value = {}
-    app_config.get_pushers.return_value = {}
+    app_config.get_senders.return_value = {}
     app_config.get_syncs.return_value = {}
     app_config.add_source = MagicMock()
-    app_config.add_pusher = MagicMock()
+    app_config.add_sender = MagicMock()
     app_config.add_sync = MagicMock()
     app_config.delete_source = MagicMock()
-    app_config.delete_pusher = MagicMock()
+    app_config.delete_sender = MagicMock()
     app_config.delete_sync = MagicMock()
     return app_config
 
@@ -41,8 +41,8 @@ def sample_source_config():
     return SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
 
 @pytest.fixture
-def sample_pusher_config():
-    return PusherConfig(driver="http", endpoint="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
+def sample_sender_config():
+    return SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
 
 @pytest.fixture
 def sample_sync_config():

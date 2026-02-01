@@ -26,8 +26,8 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
     """
     
     def __init__(self, app_config: AppConfig):
-        # Still use 'pusher' internally for config file compatibility
-        super().__init__(app_config, None, 'pusher')
+        # Still use 'sender' internally for config file compatibility
+        super().__init__(app_config, None, 'sender')
         self.sync_instance_service: Optional[SyncInstanceService] = None
 
     def set_dependencies(self, sync_instance_service: SyncInstanceService):
@@ -59,7 +59,7 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
 
         deleted_ids = []
         async with config_lock:
-            sender_dict = self.app_config.get_pushers()
+            sender_dict = self.app_config.get_senders()
             for an_id in obsolete_ids:
                 if an_id in sender_dict:
                     sender_dict.pop(an_id)
@@ -69,9 +69,7 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
                 # Config persistence handled by YAML files now
                 pass
         
+        
         logger.info(f"Successfully cleaned up {len(deleted_ids)} sender configurations.")
         return deleted_ids
 
-
-# Backward compatibility alias
-PusherConfigService = SenderConfigService

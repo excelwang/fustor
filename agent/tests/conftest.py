@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, AsyncMock
 import yaml
 
 from fustor_agent.app import App
-from fustor_core.models.config import PusherConfig, SyncConfig, PasswdCredential, FieldMapping, SourceConfig
+from fustor_core.models.config import SenderConfig, SyncConfig, PasswdCredential, FieldMapping, SourceConfig
 from fustor_core.event import EventBase, InsertEvent
 
 @pytest.fixture(scope="function")
@@ -43,7 +43,7 @@ async def snapshot_phase_test_setup(test_app_instance: App, mocker):
 
     mock_pusher_driver = MagicMock()
     mock_pusher_driver.push = AsyncMock()
-    mocker.patch.object(test_app_instance.pusher_driver_service, 'get_latest_committed_index', AsyncMock(return_value=0))
+    mocker.patch.object(test_app_instance.sender_driver_service, 'get_latest_committed_index', AsyncMock(return_value=0))
     # --- REFACTORED: Provide a schema to guide the mapping logic ---
     mock_schema = {
         "properties": {
@@ -52,8 +52,8 @@ async def snapshot_phase_test_setup(test_app_instance: App, mocker):
             }
         }
     }
-    mocker.patch.object(test_app_instance.pusher_driver_service, 'get_needed_fields', AsyncMock(return_value=mock_schema))
-    mocker.patch.object(test_app_instance.pusher_driver_service, '_get_driver_by_type', return_value=mock_pusher_driver)
+    mocker.patch.object(test_app_instance.sender_driver_service, 'get_needed_fields', AsyncMock(return_value=mock_schema))
+    mocker.patch.object(test_app_instance.sender_driver_service, '_get_driver_by_type', return_value=mock_pusher_driver)
 
     snapshot_data = [{'id': 1, 'name': 'record_1'}, {'id': 2, 'name': 'record_2'}]
     snapshot_end_position = 12345
@@ -74,8 +74,8 @@ async def snapshot_phase_test_setup(test_app_instance: App, mocker):
     source_config = SourceConfig(driver="mock-mysql", uri="mock-uri", credential=PasswdCredential(user="mock"), disabled=False)
     await test_app_instance.source_config_service.add_config(source_id, source_config)
 
-    await test_app_instance.pusher_config_service.add_config(pusher_id, PusherConfig(
-        driver="mock-driver", endpoint="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
+    await test_app_instance.sender_config_service.add_config(pusher_id, SenderConfig(
+        driver="mock-driver", uri="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
     ))
     
     await test_app_instance.sync_config_service.add_config(sync_id, SyncConfig(
@@ -98,7 +98,7 @@ async def snapshot_phase_test_setup(test_app_instance: App, mocker):
 
     await test_app_instance.sync_config_service.delete_config(sync_id)
     await test_app_instance.source_config_service.delete_config(source_id)
-    await test_app_instance.pusher_config_service.delete_config(pusher_id)
+    await test_app_instance.sender_config_service.delete_config(pusher_id)
 
 @pytest_asyncio.fixture
 async def message_phase_test_setup(test_app_instance: App, mocker):
@@ -109,7 +109,7 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
 
     mock_pusher_driver = MagicMock()
     mock_pusher_driver.push = AsyncMock()
-    mocker.patch.object(test_app_instance.pusher_driver_service, 'get_latest_committed_index', AsyncMock(return_value=start_position))
+    mocker.patch.object(test_app_instance.sender_driver_service, 'get_latest_committed_index', AsyncMock(return_value=start_position))
     # --- REFACTORED: Provide a schema to guide the mapping logic ---
     mock_schema = {
         "properties": {
@@ -118,9 +118,9 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
             }
         }
     }
-    mocker.patch.object(test_app_instance.pusher_driver_service, 'get_needed_fields', AsyncMock(return_value=mock_schema))
+    mocker.patch.object(test_app_instance.sender_driver_service, 'get_needed_fields', AsyncMock(return_value=mock_schema))
     # --- END REFACTOR ---
-    mocker.patch.object(test_app_instance.pusher_driver_service, '_get_driver_by_type', return_value=mock_pusher_driver)
+    mocker.patch.object(test_app_instance.sender_driver_service, '_get_driver_by_type', return_value=mock_pusher_driver)
 
     message_data = [
         InsertEvent(event_schema='mock_db', table='mock_table', rows=[{'id': 101, 'name': 'realtime_1'}], index=start_position + 1),
@@ -140,8 +140,8 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
     source_config = SourceConfig(driver="mock-mysql", uri="mock-uri", credential=PasswdCredential(user="mock"), disabled=False)
     await test_app_instance.source_config_service.add_config(source_id, source_config)
 
-    await test_app_instance.pusher_config_service.add_config(pusher_id, PusherConfig(
-        driver="mock-driver", endpoint="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
+    await test_app_instance.sender_config_service.add_config(pusher_id, SenderConfig(
+        driver="mock-driver", uri="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
     ))
 
     await test_app_instance.sync_config_service.add_config(sync_id, SyncConfig(
@@ -166,4 +166,4 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
 
     await test_app_instance.sync_config_service.delete_config(sync_id)
     await test_app_instance.source_config_service.delete_config(source_id)
-    await test_app_instance.pusher_config_service.delete_config(pusher_id)
+    await test_app_instance.sender_config_service.delete_config(pusher_id)

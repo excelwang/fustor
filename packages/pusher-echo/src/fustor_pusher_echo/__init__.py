@@ -6,7 +6,7 @@ import logging
 from typing import Any, Dict, List
 
 from fustor_core.drivers import PusherDriver
-from fustor_core.models.config import PusherConfig
+from fustor_core.models.config import SenderConfig
 from fustor_core.event import EventBase
 
 
@@ -15,7 +15,7 @@ class EchoDriver(PusherDriver):
     An echo driver that inherits from the PusherDriver ABC.
     It prints batch and cumulative statistics for all received events.
     """
-    def __init__(self, id: str, config: PusherConfig):
+    def __init__(self, id: str, config: SenderConfig):
         """Initializes the driver and its statistics counters."""
         super().__init__(id, config)
         self.total_rows = 0

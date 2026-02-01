@@ -41,7 +41,7 @@ class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterfac
         ]
         return SyncConfig(
             source=y_cfg.source,
-            pusher=y_cfg.pusher,
+            sender=y_cfg.sender,
             disabled=y_cfg.disabled,
             fields_mapping=fields_mapping,
             audit_interval_sec=y_cfg.audit_interval_sec,
@@ -72,7 +72,7 @@ class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterfac
         return configs
 
     async def enable(self, id: str):
-        """Enables a Sync configuration, ensuring its source and pusher are also enabled."""
+        """Enables a Sync configuration, ensuring its source and sender are also enabled."""
         # First, call the parent enable method to actually enable the sync config
         await super().enable(id)
 
@@ -88,11 +88,11 @@ class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterfac
             raise ValueError(f"Source '{sync_config.source}' for sync '{id}' is disabled. Please enable the source first.")
 
         # Check if sender is enabled
-        sender_config = self.sender_config_service.get_config(sync_config.pusher)
+        sender_config = self.sender_config_service.get_config(sync_config.sender)
         if not sender_config:
-            raise ValueError(f"Sender '{sync_config.pusher}' for sync '{id}' not found.")
+            raise ValueError(f"Sender '{sync_config.sender}' for sync '{id}' not found.")
         if sender_config.disabled:
-            raise ValueError(f"Sender '{sync_config.pusher}' for sync '{id}' is disabled. Please enable the sender first.")
+            raise ValueError(f"Sender '{sync_config.sender}' for sync '{id}' is disabled. Please enable the sender first.")
 
         logger.info(f"Sync config '{id}' enabled successfully and its dependencies are active.")
         
@@ -128,14 +128,14 @@ class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterfac
                                 "description": "选择一个已配置并启用的数据源。",
                                 "enum": enabled_sources
                             },
-                            "pusher": {
+                            "sender": {
                                 "type": "string",
-                                "title": "选择 Pusher 配置",
+                                "title": "选择 Sender 配置",
                                 "description": "选择一个已配置并启用的接收端。",
                                 "enum": enabled_senders
                             }
                         },
-                        "required": ["id", "source", "pusher"]
+                        "required": ["id", "source", "sender"]
                     },
                     "validations": [] # This step triggers a data load action, not a simple validation
                 },

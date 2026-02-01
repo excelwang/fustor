@@ -2,7 +2,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fustor_agent.runtime.sync import SyncInstance
-from fustor_core.models.config import SyncConfig, SourceConfig, PusherConfig, PasswdCredential, FieldMapping
+from fustor_core.models.config import SyncConfig, SourceConfig, SenderConfig, PasswdCredential, FieldMapping
 from fustor_core.models.states import SyncState
 
 class TestSyncInstanceAuditSentinel:
@@ -29,19 +29,19 @@ class TestSyncInstanceAuditSentinel:
         )
 
     @pytest.fixture
-    def pusher_config(self):
-        return PusherConfig(
+    def sender_config(self):
+        return SenderConfig(
             id="pusher_id",
             driver="fusion",
             credential=PasswdCredential(user="test"),
-            endpoint="http://fusion",
+            uri="http://fusion",
             disabled=False
         )
 
     @pytest.fixture
-    def instance(self, sync_config, source_config, pusher_config):
+    def instance(self, sync_config, source_config, sender_config):
         bus_service = MagicMock()
-        pusher_driver_service = MagicMock()
+        sender_driver_service = MagicMock()
         source_driver_service = MagicMock()
         
         # Mock drivers
@@ -57,7 +57,7 @@ class TestSyncInstanceAuditSentinel:
         pusher_driver_mock.get_sentinel_tasks = AsyncMock(return_value={})
         pusher_driver_mock.submit_sentinel_results = AsyncMock(return_value=True)
 
-        pusher_driver_service._get_driver_by_type.return_value = MagicMock(return_value=pusher_driver_mock)
+        sender_driver_service._get_driver_by_type.return_value = MagicMock(return_value=pusher_driver_mock)
         source_driver_service._get_driver_by_type.return_value = MagicMock(return_value=source_driver_mock)
 
         inst = SyncInstance(
@@ -65,11 +65,11 @@ class TestSyncInstanceAuditSentinel:
             agent_id="agent_1",
             config=sync_config,
             source_config=source_config,
-            pusher_config=pusher_config,
+            sender_config=sender_config,
             bus_service=bus_service,
-            pusher_driver_service=pusher_driver_service,
+            sender_driver_service=sender_driver_service,
             source_driver_service=source_driver_service,
-            pusher_schema={"type": "object"}
+            sender_schema={"type": "object"}
         )
         
         inst.current_role = 'leader'

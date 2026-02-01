@@ -27,13 +27,13 @@ class FusionDriver(HTTPSender):
     
     def __init__(self, id: str, config):
         """
-        Initialize from legacy PusherConfig.
+        Initialize from legacy SenderConfig.
         
         Args:
             id: Driver ID
-            config: PusherConfig object (legacy)
+            config: SenderConfig object (legacy)
         """
-        # Extract fields from legacy PusherConfig
+        # Extract fields from legacy SenderConfig
         endpoint = config.endpoint
         credential = {"key": config.credential.key} if hasattr(config.credential, 'key') else {}
         super().__init__(

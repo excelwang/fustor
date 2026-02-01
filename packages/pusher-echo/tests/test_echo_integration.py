@@ -12,12 +12,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 @pytest.mark.asyncio
 async def test_echo_sync_instance_triggers_snapshot():
     """Integration test to verify echo pusher triggers snapshot in sync instance context."""
-    from fustor_core.models.config import SyncConfig, PusherConfig, SourceConfig, PasswdCredential, FieldMapping
+    from fustor_core.models.config import SyncConfig, SenderConfig, SourceConfig, PasswdCredential, FieldMapping
     
     # 1. Arrange - Create configurations
-    pusher_config = PusherConfig(
+    sender_config = SenderConfig(
         driver="echo",
-        endpoint="dummy",
+        uri="dummy",
         credential=PasswdCredential(user="echo-user"),
         batch_size=100,
         max_retries=10,
@@ -59,7 +59,7 @@ async def test_echo_sync_instance_triggers_snapshot():
     
     # Create echo pusher and verify it returns snapshot_needed=True for echo tasks
     from fustor_pusher_echo import EchoDriver
-    echo_driver = EchoDriver("echo-pusher", pusher_config)
+    echo_driver = EchoDriver("echo-pusher", sender_config)
     
     # Mock an event to simulate push
     from fustor_core.event import UpdateEvent
@@ -82,12 +82,12 @@ async def test_snapshot_trigger_once_and_only_once():
     Tests that the EchoPusher triggers a snapshot on the first push, and not on subsequent pushes.
     """
     from fustor_pusher_echo import EchoDriver
-    from fustor_core.models.config import PusherConfig, PasswdCredential
+    from fustor_core.models.config import SenderConfig, PasswdCredential
     from fustor_core.event import UpdateEvent
     
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="dummy",
+        uri="dummy",
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-driver", config)

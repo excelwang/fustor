@@ -25,27 +25,27 @@ class SyncInstance:
         agent_id: str,
         config: SyncConfig,
         source_config: SourceConfig,
-        pusher_config: SenderConfig,  # Type updated, param name kept for compatibility
+        sender_config: SenderConfig,  # Type updated, param name kept for compatibility
         bus_service: "EventBusService",
-        pusher_driver_service: "SenderDriverService",  # Type updated
+        sender_driver_service: "SenderDriverService",  # Type updated
         source_driver_service: "SourceDriverService",
-        pusher_schema: Dict[str, Any],
+        sender_schema: Dict[str, Any],
         initial_statistics: Optional[Dict[str, Any]] = None
     ):
         self.id = id
         self.task_id = f"{agent_id}:{id}"
         self.config = config
         self.source_config = source_config
-        self.pusher_config = pusher_config
+        self.sender_config = sender_config
         self.bus_service = bus_service
-        self.pusher_schema = pusher_schema
+        self.sender_schema = sender_schema
         self.session_id: Optional[str] = None
         
         source_driver_class = source_driver_service._get_driver_by_type(self.source_config.driver)
         self.source_driver_instance = source_driver_class(config.source, self.source_config)
 
-        pusher_driver_class = pusher_driver_service._get_driver_by_type(self.pusher_config.driver)
-        self.pusher_driver_instance = pusher_driver_class(config.sender, self.pusher_config)
+        sender_driver_class = sender_driver_service._get_driver_by_type(self.sender_config.driver)
+        self.sender_driver_instance = sender_driver_class(config.sender, self.sender_config)
 
         self.bus: Optional["EventBusInstanceRuntime"] = None
         self.state: SyncState = SyncState.STOPPED
@@ -133,7 +133,7 @@ class SyncInstance:
 
     async def _send_heartbeat(self):
         """发送心跳以维持会话状态"""
-        result = await self.pusher_driver_instance.heartbeat(
+        result = await self.sender_driver_instance.heartbeat(
             session_id=self.session_id
         )
         logger.debug(f"Heartbeat sent for sync '{self.id}', result: {result}")
@@ -215,7 +215,7 @@ class SyncInstance:
             pass
 
         # Close the driver's clients
-        await self.pusher_driver_instance.close()
+        await self.sender_driver_instance.close()
         
         # Also close the source driver to stop any background monitoring tasks
         if hasattr(self, 'source_driver_instance') and self.source_driver_instance:
@@ -232,18 +232,19 @@ class SyncInstance:
 
     async def _run_control_loop(self):
         try:
-            # First, request a session from the Ingestor via the pusher driver
+            # First, request a session from the Ingestor via the sender driver
             # Retry with backoff to handle transient API key sync delays (e.g. 401 during startup)
             session_data = None
-            max_retries = 5
+            max_retries = self.sender_config.max_retries
+            retry_delay = self.sender_config.retry_delay_sec
             for attempt in range(max_retries):
                 try:
-                    session_data = await self.pusher_driver_instance.create_session(self.task_id)
+                    session_data = await self.sender_driver_instance.create_session(self.task_id)
                     break
                 except Exception as e:
                     if attempt < max_retries - 1 and ("401" in str(e) or "Unauthorized" in str(e)):
-                        logger.warning(f"Failed to create session (attempt {attempt+1}/{max_retries}) due to unauthorized error. Retrying in 2s...")
-                        await asyncio.sleep(2)
+                        logger.warning(f"Failed to create session (attempt {attempt+1}/{max_retries}) due to unauthorized error. Retrying in {retry_delay}s...")
+                        await asyncio.sleep(retry_delay)
                     else:
                         raise
             
@@ -258,7 +259,7 @@ class SyncInstance:
             logger.info(f"任务 '{self.id}' 正在启动，已从Ingestor获取会话 ID: {self.session_id}, Role: {self.current_role}")
             
             self._set_state(SyncState.STARTING, "正在向接收端查询最新同步点位...")
-            start_position = await self.pusher_driver_instance.get_latest_committed_index(session_id=self.session_id)
+            start_position = await self.sender_driver_instance.get_latest_committed_index(session_id=self.session_id)
 
             # Set MESSAGE_SYNC state using bitwise OR
             self.state |= SyncState.MESSAGE_SYNC
@@ -452,7 +453,7 @@ class SyncInstance:
         self.state |= SyncState.SENTINEL_SWEEP
         try:
              # 1. Ask Pusher for tasks (Generic)
-             tasks = await self.pusher_driver_instance.get_sentinel_tasks(source_id=self.config.source)
+             tasks = await self.sender_driver_instance.get_sentinel_tasks(source_id=self.config.source)
              
              if not tasks:
                  return
@@ -474,7 +475,7 @@ class SyncInstance:
                  return
 
              # 3. Report Results (Generic)
-             await self.pusher_driver_instance.submit_sentinel_results(results)
+             await self.sender_driver_instance.submit_sentinel_results(results)
              logger.info(f"Sentinel check completed for {self.id}")
 
         except Exception as e:
@@ -494,7 +495,7 @@ class SyncInstance:
         logger.info(f"Audit sync started for {self.id}")
         
         try:
-            await self.pusher_driver_instance.signal_audit_start(source_id=self.config.source)
+            await self.sender_driver_instance.signal_audit_start(source_id=self.config.source)
         except NotImplementedError:
              pass
 
@@ -509,7 +510,7 @@ class SyncInstance:
                 try:
                     iterator = self.source_driver_instance.get_audit_iterator(
                         mtime_cache=self.audit_mtime_cache,
-                        batch_size=self.pusher_config.batch_size
+                        batch_size=self.sender_config.batch_size
                     )
                     for item in iterator:
                         if stop_event.is_set():
@@ -537,7 +538,7 @@ class SyncInstance:
                 current_event, finalized_mtimes = item
 
                 if current_event and current_event.rows:
-                    await self.pusher_driver_instance.push(
+                    await self.sender_driver_instance.push(
                         events=[current_event], 
                         session_id=self.session_id, 
                         source_type='audit' # Important for Fusion to distinguish
@@ -550,7 +551,7 @@ class SyncInstance:
             
             if snapshot_completed_successfully:
                 try:
-                    await self.pusher_driver_instance.signal_audit_end(source_id=self.config.source)
+                    await self.sender_driver_instance.signal_audit_end(source_id=self.config.source)
                 except NotImplementedError:
                     pass
                     
@@ -610,7 +611,7 @@ class SyncInstance:
                     snapshot_field_tracker.update_fields(required_source_fields)
 
                     iterator = self.source_driver_instance.get_snapshot_iterator(
-                        batch_size=self.pusher_config.batch_size,
+                        batch_size=self.sender_config.batch_size,
                         required_fields_tracker=snapshot_field_tracker
                     )
                     for event_batch in iterator:
@@ -649,7 +650,7 @@ class SyncInstance:
                 current_event.rows = final_rows_for_push
                 try:
                     push_start_time = time.monotonic()
-                    await self.pusher_driver_instance.push(events=[current_event], session_id=self.session_id, source_type='snapshot')
+                    await self.sender_driver_instance.push(events=[current_event], session_id=self.session_id, source_type='snapshot')
                     push_duration = time.monotonic() - push_start_time
                     logger.info(f"Sync '{self.id}' snapshot push latency: {push_duration:.4f} seconds")
                 except Exception as e:
@@ -665,7 +666,7 @@ class SyncInstance:
                 self._statistics["events_pushed"] += len(current_event.rows)
 
             if snapshot_completed_successfully: # Only call if the loop finished naturally
-                await self.pusher_driver_instance.push(events=[], task_id=self.id, session_id=self.session_id, is_snapshot_end=True, source_type='snapshot')
+                await self.sender_driver_instance.push(events=[], task_id=self.id, session_id=self.session_id, is_snapshot_end=True, source_type='snapshot')
                 logger.info(f"补充快照同步任务 '{self.id}' 完成。")
                 return True
 
@@ -711,14 +712,14 @@ class SyncInstance:
         while SyncState.MESSAGE_SYNC in self.state:
             events_batch = await self.bus.internal_bus.get_events_for(
                 self.id,
-                self.pusher_config.batch_size,
+                self.sender_config.batch_size,
                 0.2
             )
             
             # If no events received and we haven't sent the initial trigger, create a fake event
             if not events_batch and not initial_event_sent:
                 from fustor_core.event import UpdateEvent
-                # Create a fake initial event to trigger the pusher and potentially start snapshot sync
+                # Create a fake initial event to trigger the sender and potentially start snapshot sync
                 fake_event = UpdateEvent(
                     event_schema=self.config.source,  # Use source as event_schema
                     table="initial_trigger",    # Use a special table name for the trigger
@@ -728,7 +729,7 @@ class SyncInstance:
                 )
                 events_batch = [fake_event]
                 initial_event_sent = True
-                logger.debug(f"Sent initial trigger event for task '{self.id}' to ensure pusher is called")
+                logger.debug(f"Sent initial trigger event for task '{self.id}' to ensure sender is called")
             
             if not events_batch: 
                 continue
@@ -758,7 +759,7 @@ class SyncInstance:
                 continue
 
             push_start_time = time.monotonic()
-            response_dict = await self.pusher_driver_instance.push(
+            response_dict = await self.sender_driver_instance.push(
                 events=events_to_push, 
                 session_id=self.session_id,
                 is_snapshot_end=False
@@ -816,7 +817,7 @@ class SyncInstance:
 
             endpoint_name, target_field_name = mapping.to.split('.', 1)
             
-            target_field_schema = self.pusher_schema.get("properties", {}).get(f"{endpoint_name}.{target_field_name}")
+            target_field_schema = self.sender_schema.get("properties", {}).get(f"{endpoint_name}.{target_field_name}")
             expected_type = target_field_schema.get("type") if target_field_schema else None
 
             if expected_type == "object":
@@ -871,7 +872,7 @@ class SyncInstance:
             if '.' not in mapping.to: continue
             endpoint_name, target_field_name = mapping.to.split('.', 1)
             if endpoint_name not in processed_data: processed_data[endpoint_name] = {}
-            target_field_schema = self.pusher_schema.get("properties", {}).get(f"{endpoint_name}.{target_field_name}")
+            target_field_schema = self.sender_schema.get("properties", {}).get(f"{endpoint_name}.{target_field_name}")
             expected_type = target_field_schema.get("type") if target_field_schema else None
             if expected_type == "object":
                 object_payload = {}

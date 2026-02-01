@@ -2,7 +2,7 @@ import asyncio
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 from fustor_agent.runtime.sync import SyncInstance
-from fustor_core.models.config import SyncConfig, SourceConfig, PusherConfig, PasswdCredential
+from fustor_core.models.config import SyncConfig, SourceConfig, SenderConfig, PasswdCredential
 from fustor_core.models.states import SyncState
 
 class TestSyncLeaderSequence:
@@ -12,7 +12,7 @@ class TestSyncLeaderSequence:
     def sync_instance(self):
         sync_config = SyncConfig(id="t1", source="s1", sender="p1", disabled=False)
         source_config = SourceConfig(id="s1", driver="fs", credential=PasswdCredential(user="u"), uri="/t", disabled=False)
-        pusher_config = PusherConfig(id="p1", driver="fusion", credential=PasswdCredential(user="u"), endpoint="h", disabled=False)
+        sender_config = SenderConfig(id="p1", driver="fusion", credential=PasswdCredential(user="u"), uri="h", disabled=False)
         
         bus_service = MagicMock()
         pusher_driver_svc = MagicMock()
@@ -26,11 +26,11 @@ class TestSyncLeaderSequence:
             agent_id="agent_1",
             config=sync_config,
             source_config=source_config,
-            pusher_config=pusher_config,
+            sender_config=sender_config,
             bus_service=bus_service,
-            pusher_driver_service=pusher_driver_svc,
+            sender_driver_service=pusher_driver_svc,
             source_driver_service=source_driver_svc,
-            pusher_schema={}
+            sender_schema={}
         )
         inst.state = SyncState.MESSAGE_SYNC # Ensure not STOPPED
         inst.current_role = 'leader'

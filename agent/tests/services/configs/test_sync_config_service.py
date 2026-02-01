@@ -14,15 +14,15 @@ def mock_source_config_service():
     return MagicMock()
 
 @pytest.fixture
-def mock_pusher_config_service():
+def mock_sender_config_service():
     return MagicMock()
 
 @pytest.fixture
-def sync_config_service(mock_app_config, mock_source_config_service, mock_pusher_config_service):
+def sync_config_service(mock_app_config, mock_source_config_service, mock_sender_config_service):
     service = SyncConfigService(
         mock_app_config, 
         mock_source_config_service, 
-        mock_pusher_config_service
+        mock_sender_config_service
     )
     service.sync_instance_service = MagicMock() # Mock the injected dependency
     return service

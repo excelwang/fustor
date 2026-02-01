@@ -7,7 +7,7 @@ from fustor_agent.runtime.sync import SyncInstance, SyncState
 from fustor_agent.services.drivers.source_driver import SourceDriverService
 from fustor_agent.services.drivers.sender_driver import SenderDriverService
 from fustor_agent.services.instances.bus import EventBusService
-from fustor_core.models.config import SyncConfig, SourceConfig, PusherConfig, PasswdCredential, FieldMapping
+from fustor_core.models.config import SyncConfig, SourceConfig, SenderConfig, PasswdCredential, FieldMapping
 
 # This fixture sets up the configuration for the integration tests.
 @pytest.fixture
@@ -20,9 +20,9 @@ def integration_configs(tmp_path: Path):
         driver_params={"hot_data_cooloff_seconds": 0}
     )
     # Configure the echo driver
-    pusher_config = PusherConfig(
+    sender_config = SenderConfig(
         driver="echo", 
-        endpoint="", 
+        uri="", 
         credential=PasswdCredential(user="test"),
         batch_size=10
     )
@@ -35,14 +35,14 @@ def integration_configs(tmp_path: Path):
             FieldMapping(to="target.size", source=["fs.files.size:0"])
         ]
     )
-    return sync_config, source_config, pusher_config
+    return sync_config, source_config, sender_config
 
 import logging
 
 @pytest.mark.asyncio
 async def test_snapshot_flow_with_real_drivers(integration_configs, tmp_path: Path, caplog):
     """Integration test for the snapshot flow using fs and echo drivers."""
-    sync_config, source_config, pusher_config = integration_configs
+    sync_config, source_config, sender_config = integration_configs
 
     # --- Use real services instead of mocks ---
     sds = SourceDriverService()
@@ -53,7 +53,7 @@ async def test_snapshot_flow_with_real_drivers(integration_configs, tmp_path: Pa
     test_file = tmp_path / "test1.txt"
     test_file.write_text("hello")
 
-    pusher_schema = {
+    sender_schema = {
         "properties": {
             "target.file_path": {"type": "string"},
             "target.size": {"type": "integer"}
@@ -66,15 +66,15 @@ async def test_snapshot_flow_with_real_drivers(integration_configs, tmp_path: Pa
         agent_id="test-agent", 
         config=sync_config, 
         source_config=source_config,
-        pusher_config=pusher_config, 
+        sender_config=sender_config, 
         bus_service=bus_service,
-        pusher_driver_service=pds, 
+        sender_driver_service=pds, 
         source_driver_service=sds,
-        pusher_schema=pusher_schema
+        sender_schema=sender_schema
     )
 
     # --- Act & Assert ---
-    sync_instance.pusher_driver_instance.logger.setLevel(logging.INFO)
+    sync_instance.sender_driver_instance.logger.setLevel(logging.INFO)
     with caplog.at_level(logging.INFO):
         await sync_instance._run_snapshot_sync()
         
@@ -86,7 +86,7 @@ async def test_snapshot_flow_with_real_drivers(integration_configs, tmp_path: Pa
 @pytest.mark.asyncio
 async def test_message_sync_flow_with_real_drivers(integration_configs, tmp_path: Path, caplog):
     """Integration test for the message sync flow using fs and echo drivers."""
-    sync_config, source_config, pusher_config = integration_configs
+    sync_config, source_config, sender_config = integration_configs
     start_position = int(time.time() * 1000)
 
     # --- Use real services instead of mocks ---
@@ -95,7 +95,7 @@ async def test_message_sync_flow_with_real_drivers(integration_configs, tmp_path
     bus_service = EventBusService(source_configs={"test_source": source_config}, source_driver_service=sds)
 
     # The pusher schema is needed for field mapping
-    pusher_schema = {
+    sender_schema = {
         "properties": {
             "target.file_path": {"type": "string"},
             "target.size": {"type": "integer"}
@@ -108,11 +108,11 @@ async def test_message_sync_flow_with_real_drivers(integration_configs, tmp_path
         agent_id="test-agent", 
         config=sync_config, 
         source_config=source_config,
-        pusher_config=pusher_config, 
+        sender_config=sender_config, 
         bus_service=bus_service,
-        pusher_driver_service=pds, 
+        sender_driver_service=pds, 
         source_driver_service=sds,
-        pusher_schema=pusher_schema
+        sender_schema=sender_schema
     )
 
     # --- Act & Assert ---

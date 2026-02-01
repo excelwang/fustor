@@ -26,12 +26,13 @@ def test_api_key_credential_hash_and_eq():
     assert hash(cred1) != hash(cred3)
 
 def test_sender_config_batch_size_validation():
-    with pytest.raises(ConfigError, match="batch_size must be positive"):
-        SenderConfig(driver="test", endpoint="http://localhost", credential=PasswdCredential(user="u"), batch_size=0)
-    with pytest.raises(ConfigError, match="batch_size must be positive"):
-        SenderConfig(driver="test", endpoint="http://localhost", credential=PasswdCredential(user="u"), batch_size=-1)
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        SenderConfig(driver="test", uri="http://localhost", credential=PasswdCredential(user="u"), batch_size=0)
+    with pytest.raises(ValidationError):
+        SenderConfig(driver="test", uri="http://localhost", credential=PasswdCredential(user="u"), batch_size=-1)
     
-    config = SenderConfig(driver="test", endpoint="http://localhost", credential=PasswdCredential(user="u"), batch_size=1)
+    config = SenderConfig(driver="test", uri="http://localhost", credential=PasswdCredential(user="u"), batch_size=1)
     assert config.batch_size == 1
 
 def test_app_config_add_get_delete_source():
@@ -57,7 +58,7 @@ def test_app_config_add_get_delete_source():
 
 def test_app_config_add_get_delete_sender():
     app_config = AppConfig()
-    sender_config = SenderConfig(driver="http", endpoint="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
+    sender_config = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
 
     # Add pusher
     app_config.add_sender("my_sender", sender_config)
@@ -79,7 +80,7 @@ def test_app_config_add_get_delete_sender():
 def test_app_config_add_get_delete_sync():
     app_config = AppConfig()
     source_config = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
-    sender_config = SenderConfig(driver="http", endpoint="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
+    sender_config = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
     sync_config = SyncConfig(source="my_source", sender="my_sender", disabled=False)
 
     # Add sync without dependencies
@@ -110,7 +111,7 @@ def test_app_config_add_get_delete_sync():
 def test_app_config_delete_source_with_dependent_syncs():
     app_config = AppConfig()
     source_config = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
-    sender_config = SenderConfig(driver="http", endpoint="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
+    sender_config = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
     sync_config1 = SyncConfig(source="my_source", sender="my_sender", disabled=False)
     sync_config2 = SyncConfig(source="my_source", sender="my_sender", disabled=False) # Another sync using the same source
 
@@ -131,7 +132,7 @@ def test_app_config_delete_source_with_dependent_syncs():
 def test_app_config_delete_sender_with_dependent_syncs():
     app_config = AppConfig()
     source_config = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
-    sender_config = SenderConfig(driver="http", endpoint="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
+    sender_config = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
     sync_config1 = SyncConfig(source="my_source", sender="my_sender", disabled=False)
     sync_config2 = SyncConfig(source="my_source", sender="my_sender", disabled=False) # Another sync using the same pusher
 
@@ -153,8 +154,8 @@ def test_app_config_check_sync_is_disabled():
     app_config = AppConfig()
     source_config_enabled = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
     source_config_disabled = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=True)
-    sender_config_enabled = SenderConfig(driver="http", endpoint="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
-    sender_config_disabled = SenderConfig(driver="http", endpoint="http://localhost", credential=PasswdCredential(user="u"), disabled=True)
+    sender_config_enabled = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
+    sender_config_disabled = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=True)
 
     app_config.add_source("source_e", source_config_enabled)
     app_config.add_source("source_d", source_config_disabled)

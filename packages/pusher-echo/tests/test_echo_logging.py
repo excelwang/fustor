@@ -5,7 +5,7 @@ This test verifies the echo pusher can write to logs for various event types.
 import pytest
 import logging
 from fustor_pusher_echo import EchoDriver
-from fustor_core.models.config import PusherConfig, PasswdCredential
+from fustor_core.models.config import SenderConfig, PasswdCredential
 from fustor_core.event import UpdateEvent, DeleteEvent, InsertEvent
 
 
@@ -13,9 +13,9 @@ from fustor_core.event import UpdateEvent, DeleteEvent, InsertEvent
 async def test_echo_driver_logs_update_events(caplog):
     """Test that echo driver properly logs UpdateEvent data."""
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="", 
+        uri="", 
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-update-echo", config)
@@ -60,9 +60,9 @@ async def test_echo_driver_logs_update_events(caplog):
 async def test_echo_driver_logs_delete_events(caplog):
     """Test that echo driver properly logs DeleteEvent data."""
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="", 
+        uri="", 
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-delete-echo", config)
@@ -96,9 +96,9 @@ async def test_echo_driver_logs_delete_events(caplog):
 async def test_echo_driver_logs_with_snapshot_end_flag(caplog):
     """Test that echo driver properly logs with snapshot end flag."""
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="", 
+        uri="", 
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-snapshot-echo", config)
@@ -135,9 +135,9 @@ async def test_echo_driver_logs_with_snapshot_end_flag(caplog):
 async def test_echo_driver_logs_with_multiple_flags(caplog):
     """Test that echo driver properly logs with multiple control flags."""
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="", 
+        uri="", 
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-flags-echo", config)
@@ -171,9 +171,9 @@ async def test_echo_driver_logs_with_multiple_flags(caplog):
 async def test_echo_driver_logs_first_event_data(caplog):
     """Test that echo driver logs the first event's data in JSON format."""
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="", 
+        uri="", 
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-data-echo", config)

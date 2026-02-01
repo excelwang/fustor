@@ -57,7 +57,7 @@ class SenderConfigServiceInterface(BaseConfigService[SenderConfig]):
         ...
 
 # Backward compatibility alias
-PusherConfigServiceInterface = SenderConfigServiceInterface
+SenderConfigServiceInterface = SenderConfigServiceInterface
 
 from fustor_core.models.config import SyncConfig
 
@@ -66,7 +66,7 @@ class SyncConfigServiceInterface(BaseConfigService[SyncConfig]):
     Interface for managing SyncConfig objects.
     """
     async def enable(self, id: str):
-        """Enables a Sync configuration, ensuring its source and pusher are also enabled."""
+        """Enables a Sync configuration, ensuring its source and sender are also enabled."""
         ...
 
     def get_wizard_definition(self) -> Dict[str, Any]:

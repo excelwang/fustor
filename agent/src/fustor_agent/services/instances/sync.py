@@ -28,18 +28,18 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
         self, 
         sync_config_service: "SyncConfigService",
         source_config_service: "SourceConfigService",
-        pusher_config_service: "PusherConfigService",
+        sender_config_service: "SenderConfigService",
         bus_service: "EventBusService",
-        pusher_driver_service: "PusherDriverService",
+        sender_driver_service: "SenderDriverService",
         source_driver_service: "SourceDriverService",
         agent_id: str  # Added agent_id
     ):
         super().__init__()
         self.sync_config_service = sync_config_service
         self.source_config_service = source_config_service
-        self.pusher_config_service = pusher_config_service
+        self.sender_config_service = sender_config_service
         self.bus_service = bus_service
-        self.pusher_driver_service = pusher_driver_service
+        self.sender_driver_service = sender_driver_service
         self.source_driver_service = source_driver_service
         self.agent_id = agent_id  # Store agent_id
         self.logger = logging.getLogger("fustor_agent") 
@@ -63,13 +63,13 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
         if not source_config:
             raise NotFoundError(f"Source config '{sync_config.source}' not found for sync '{id}'.")
         
-        sender_config = self.pusher_config_service.get_config(sync_config.sender)
+        sender_config = self.sender_config_service.get_config(sync_config.sender)
         if not sender_config:
             raise NotFoundError(f"Required Sender config '{sync_config.sender}' not found.")
         
         self.logger.info(f"Attempting to start sync instance '{id}'...")
         try:
-            pusher_schema = await self.pusher_driver_service.get_needed_fields(
+            sender_schema = await self.sender_driver_service.get_needed_fields(
                 driver_type=sender_config.driver, endpoint=sender_config.endpoint
             )
             
@@ -78,7 +78,7 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
                 self.logger.info(f"Using AgentPipeline for '{id}' (FUSTOR_USE_PIPELINE=true)")
                 
                 bridge = PipelineBridge(
-                    sender_driver_service=self.pusher_driver_service,
+                    sender_driver_service=self.sender_driver_service,
                     source_driver_service=self.source_driver_service
                 )
                 
@@ -100,11 +100,11 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
                     agent_id=self.agent_id,
                     config=sync_config,
                     source_config=source_config,
-                    pusher_config=sender_config,
+                    sender_config=sender_config,
                     bus_service=self.bus_service,
-                    pusher_driver_service=self.pusher_driver_service,
+                    sender_driver_service=self.sender_driver_service,
                     source_driver_service=self.source_driver_service,
-                    pusher_schema=pusher_schema
+                    sender_schema=sender_schema
                 )
                 self.pool[id] = sync_instance
                 await sync_instance.start()
@@ -159,8 +159,7 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
         affected_syncs = [
             inst for inst in self.list_instances() 
             if (dependency_type == "source" and inst.config.source == dependency_id) or
-               (dependency_type == "sender" and inst.config.sender == dependency_id) or
-               (dependency_type == "pusher" and inst.config.sender == dependency_id)  # Legacy support
+               (dependency_type == "sender" and inst.config.sender == dependency_id)
         ]
 
         logger.info(f"Marking syncs dependent on {dependency_type} '{dependency_id}' as outdated.")

@@ -8,16 +8,16 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fustor_pusher_echo import EchoDriver
-from fustor_core.models.config import PusherConfig, PasswdCredential
+from fustor_core.models.config import SenderConfig, PasswdCredential
 from fustor_core.event import UpdateEvent
 
 @pytest.mark.asyncio
 async def test_echo_pusher_requests_snapshot_on_first_push():
     """Test that echo pusher requests snapshot on the first push."""
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="dummy",  # Required field
+        uri="dummy",  # Required field
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-echo", config)
@@ -36,9 +36,9 @@ async def test_echo_pusher_requests_snapshot_on_first_push():
 async def test_echo_pusher_requests_snapshot_on_first_push_for_any_task():
     """Test that echo pusher requests snapshot on the first push, regardless of task name."""
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="dummy",  # Required field
+        uri="dummy",  # Required field
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-echo", config)
@@ -57,9 +57,9 @@ async def test_echo_pusher_requests_snapshot_on_first_push_for_any_task():
 async def test_echo_pusher_requests_snapshot_on_first_push_with_missing_task_id():
     """Test that echo pusher requests snapshot on the first push even when task_id is not provided."""
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="dummy",  # Required field
+        uri="dummy",  # Required field
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-echo", config)
@@ -81,9 +81,9 @@ async def test_echo_pusher_logs_properly():
     from io import StringIO
     
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="dummy",  # Required field
+        uri="dummy",  # Required field
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-echo", config)
@@ -118,9 +118,9 @@ async def test_echo_pusher_logs_properly():
 async def test_echo_pusher_maintains_statistics():
     """Test that echo pusher maintains cumulative statistics while triggering snapshots."""
     # 1. Arrange
-    config = PusherConfig(
+    config = SenderConfig(
         driver="echo", 
-        endpoint="dummy",  # Required field
+        uri="dummy",  # Required field
         credential=PasswdCredential(user="test")
     )
     driver = EchoDriver("test-stats", config)

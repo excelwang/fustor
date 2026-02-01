@@ -3,9 +3,7 @@ from typing import List, Optional, Union, TypeAlias, Dict, Any
 from fustor_core.exceptions import ConfigError, NotFoundError
 
 class PasswdCredential(BaseModel):
-    # --- START FIX: Forbid extra fields to prevent incorrect model coercion ---
     model_config = ConfigDict(extra='forbid')
-    # --- END FIX ---
 
     user: str = Field(..., description="用户名")
     passwd: Optional[str] = Field(None, description="密码")
@@ -28,9 +26,7 @@ class PasswdCredential(BaseModel):
         return self._get_hashable_data() == other._get_hashable_data()
 
 class ApiKeyCredential(BaseModel):
-    # --- START FIX: Forbid extra fields to prevent incorrect model coercion ---
     model_config = ConfigDict(extra='forbid')
-    # --- END FIX ---
 
     user: Optional[str] = Field(None, description="用户名")
     key: str = Field(..., description="api key")
@@ -55,7 +51,6 @@ class FieldMapping(BaseModel):
     required: bool = Field(default=False, description="是否为必填字段")
 
 class SourceConfig(BaseModel):
-    # Assuming 'name' will be the key in the dict, it's not needed inside the model itself.
     driver: str
     uri: str
     credential: Credential
@@ -68,38 +63,40 @@ class SourceConfig(BaseModel):
 
 class SenderConfig(BaseModel):
     """
-    Configuration for a Sender (formerly Pusher).
+    Configuration for a Sender (formerly called Pusher).
     
-    Senders are responsible for transmitting events from Agent to Fusion.
+    Senders are responsible for sending events to downstream systems (e.g., Fusion).
     """
     driver: str
-    endpoint: str
+    uri: str = Field(..., alias="endpoint", description="目标端点URL")  # 'endpoint' alias for backward compat
     credential: Credential
-    batch_size: int = Field(default=100, description="单次推送事件的批处理大小")
+    batch_size: int = Field(default=1000, ge=1, description="每批消息最大条目")
     max_retries: int = Field(default=10, gt=0, description="推送失败时的最大重试次数")
     retry_delay_sec: int = Field(default=5, gt=0, description="推送重试前的等待秒数")
+    timeout_sec: int = Field(default=30, gt=0, description="网络请求超时(秒)")
     disabled: bool = Field(default=True, description="是否禁用此配置")
-    driver_params: Optional[Dict[str, Any]] = Field(default=None, description="驱动专属参数")
+    validation_error: Optional[str] = Field(None, exclude=True)
+    driver_params: Dict[str, Any] = Field(default_factory=dict, description="驱动专属参数")
+    # API version for FusionSDK compatibility ('v1' or 'v2')
+    api_version: str = Field(default='v2', pattern='^v[12]$', description="API version (v1 or v2)")
     
-    @field_validator('batch_size')
-    def batch_size_must_be_positive(cls, v):
-        if v <= 0:
-            raise ConfigError('batch_size must be positive')
-        return v
+    model_config = ConfigDict(populate_by_name=True)  # Allow using 'endpoint' or 'uri'
+    
+    @property
+    def endpoint(self) -> str:
+        """Alias for uri for backward compatibility."""
+        return self.uri
 
-
-# Backward compatibility alias
-PusherConfig = SenderConfig
 
 class SyncConfig(BaseModel):
-    source: str
-    sender: str  # Required field (was optional for backward compatibility)
-    disabled: bool = Field(default=True, description="是否禁用此同步任务")
-    # --- START: 核心修改 ---
-    # [REMOVED] The following two fields are obsolete in the new architecture.
-    # checkpoint_interval_events: int = Field(...)
-    # enable_checkpoint: bool = True
-    # --- END: 核心修改 ---
+    """
+    Configuration for a Sync task that connects a Source to a Sender.
+    
+    The 'sender' field specifies which sender configuration to use.
+    """
+    source: str = Field(..., description="数据源的配置 ID")
+    sender: str = Field(..., description="发送器的配置 ID")
+    disabled: bool = Field(default=True, description="是否禁用此配置")
     fields_mapping: List[FieldMapping] = Field(default_factory=list)
     # Consistency-related intervals (Section 7 of CONSISTENCY_DESIGN)
     audit_interval_sec: int = Field(default=600, ge=0, description="审计扫描间隔(秒)，0表示禁用，默认10分钟")
@@ -113,31 +110,23 @@ class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):
 class SenderConfigDict(RootModel[Dict[str, SenderConfig]]):
     root: Dict[str, SenderConfig] = Field(default_factory=dict)
 
-# Backward compatibility alias
-PusherConfigDict = SenderConfigDict
-
 class SyncConfigDict(RootModel[Dict[str, SyncConfig]]):
     root: Dict[str, SyncConfig] = Field(default_factory=dict)
 
 class AppConfig(BaseModel):
-    # FIX: Provide default factories for top-level configuration sections.
-    # This allows the application to start with an empty but valid config
-    # if the config.yaml file is missing or empty.
+    """
+    Application configuration containing sources, senders, and syncs.
+    """
     sources: SourceConfigDict = Field(default_factory=SourceConfigDict)
-    pushers: PusherConfigDict = Field(default_factory=PusherConfigDict)
+    senders: SenderConfigDict = Field(default_factory=SenderConfigDict)
     syncs: SyncConfigDict = Field(default_factory=SyncConfigDict)
 
     def get_sources(self) -> Dict[str, SourceConfig]:
         return self.sources.root
     
-    def get_pushers(self) -> Dict[str, SenderConfig]:
-        """Get all pusher/sender configurations. Alias: get_senders()"""
-        return self.pushers.root
-    
-    # New: Sender alias for forward compatibility
     def get_senders(self) -> Dict[str, SenderConfig]:
-        """Get all sender configurations. Alias for get_pushers()."""
-        return self.get_pushers()
+        """Get all sender configurations."""
+        return self.senders.root
 
     def get_syncs(self) -> Dict[str, SyncConfig]:
         return self.syncs.root
@@ -145,14 +134,9 @@ class AppConfig(BaseModel):
     def get_source(self, id: str) -> Optional[SourceConfig]:
         return self.get_sources().get(id)
     
-    def get_pusher(self, id: str) -> Optional[SenderConfig]:
-        """Get pusher/sender config by ID. Alias: get_sender()"""
-        return self.get_pushers().get(id)
-    
-    # New: Sender alias for forward compatibility
     def get_sender(self, id: str) -> Optional[SenderConfig]:
-        """Get sender config by ID. Alias for get_pusher()."""
-        return self.get_pusher(id)
+        """Get sender config by ID."""
+        return self.get_senders().get(id)
 
     def get_sync(self, id: str) -> Optional[SyncConfig]:
         return self.get_syncs().get(id)
@@ -164,18 +148,13 @@ class AppConfig(BaseModel):
         self.get_sources()[id] = config
         return config
 
-    def add_pusher(self, id: str, config: SenderConfig) -> SenderConfig:
-        """Add pusher/sender config. Alias: add_sender()"""
-        config_may = self.get_pusher(id)
+    def add_sender(self, id: str, config: SenderConfig) -> SenderConfig:
+        """Add sender config."""
+        config_may = self.get_sender(id)
         if config_may:
             raise ConfigError(f"Sender config with name '{id}' already exists.")
-        self.get_pushers()[id] = config
+        self.get_senders()[id] = config
         return config
-    
-    # New: Sender alias for forward compatibility
-    def add_sender(self, id: str, config: SenderConfig) -> SenderConfig:
-        """Add sender config. Alias for add_pusher()."""
-        return self.add_pusher(id, config)
 
     def add_sync(self, id: str, config: SyncConfig) -> SyncConfig:
         config_may = self.get_sync(id)
@@ -185,7 +164,7 @@ class AppConfig(BaseModel):
         # Dependency check
         if not self.get_source(config.source):
             raise NotFoundError(f"Dependency source '{config.source}' not found.")
-        if not self.get_pusher(config.sender):
+        if not self.get_sender(config.sender):
             raise NotFoundError(f"Dependency sender '{config.sender}' not found.")
         
         self.get_syncs()[id] = config
@@ -203,9 +182,9 @@ class AppConfig(BaseModel):
             
         return self.get_sources().pop(id)
     
-    def delete_pusher(self, id: str) -> SenderConfig:
-        """Delete pusher/sender config. Alias: delete_sender()"""
-        config = self.get_pusher(id)
+    def delete_sender(self, id: str) -> SenderConfig:
+        """Delete sender config."""
+        config = self.get_sender(id)
         if not config:
             raise NotFoundError(f"Sender config with id '{id}' not found.")
         
@@ -214,12 +193,7 @@ class AppConfig(BaseModel):
         for sync_id in sync_ids_to_delete:
             self.delete_sync(sync_id)
             
-        return self.get_pushers().pop(id)
-    
-    # New: Sender alias for forward compatibility
-    def delete_sender(self, id: str) -> SenderConfig:
-        """Delete sender config. Alias for delete_pusher()."""
-        return self.delete_pusher(id)
+        return self.get_senders().pop(id)
     
     def delete_sync(self, id: str) -> SyncConfig:
         config = self.get_sync(id)
@@ -239,7 +213,7 @@ class AppConfig(BaseModel):
         if not source_config:
             raise NotFoundError(f"Dependency source '{config.source}' not found for sync '{id}'.")
             
-        sender_config = self.pushers.root.get(config.sender)
+        sender_config = self.senders.root.get(config.sender)
         if not sender_config:
             raise NotFoundError(f"Dependency sender '{config.sender}' not found for sync '{id}'.")
             

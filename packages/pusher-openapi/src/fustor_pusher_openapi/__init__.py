@@ -8,7 +8,7 @@ from urllib.parse import urljoin
 
 from fustor_core.drivers import PusherDriver
 from fustor_core.exceptions import DriverError
-from fustor_core.models.config import PusherConfig, PasswdCredential, ApiKeyCredential
+from fustor_core.models.config import SenderConfig, PasswdCredential, ApiKeyCredential
 from fustor_core.event import EventBase
 from fustor_core.utils.retry import retry
 
@@ -26,7 +26,7 @@ class OpenApiDriver(PusherDriver):
     A class-based driver for OpenAPI endpoints that conforms to the PusherDriver ABC.
     """
 
-    def __init__(self, id: str, config: PusherConfig):
+    def __init__(self, id: str, config: SenderConfig):
         """Initializes the driver with its specific configuration and a persistent HTTP client."""
         super().__init__(id, config)
         self.endpoint = self.config.endpoint

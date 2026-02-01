@@ -92,12 +92,12 @@ class TestPushersConfigLoader:
         config_file.write_text(yaml.dump({
             "pusher-1": {
                 "driver": "fusion",
-                "endpoint": "http://1",
+                "uri": "http://1",
                 "credential": {"key": "k"}
             },
             "pusher-2": {
                 "driver": "fusion",
-                "endpoint": "http://2",
+                "uri": "http://2",
                 "credential": {"key": "k"}
             }
         }))
@@ -107,11 +107,11 @@ class TestPushersConfigLoader:
         
         p1 = loader.get("pusher-1")
         assert p1 is not None
-        assert p1.endpoint == "http://1"
+        assert p1.uri == "http://1"
         
         p2 = loader.get("pusher-2")
         assert p2 is not None
-        assert p2.endpoint == "http://2"
+        assert p2.uri == "http://2"
     
     def test_invalid_id_rejected(self, tmp_path):
         """Should reject pusher config with simple invalid ID."""
@@ -119,7 +119,7 @@ class TestPushersConfigLoader:
         config_file.write_text(yaml.dump({
             "Invalid ID": {
                 "driver": "fusion",
-                "endpoint": "http://1",
+                "uri": "http://1",
                 "credential": {"key": "k"}
             }
         }))

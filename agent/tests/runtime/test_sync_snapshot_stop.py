@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fustor_agent.runtime.sync import SyncInstance, SyncState
 from fustor_core.exceptions import DriverError
-from fustor_core.models.config import SyncConfig, SourceConfig, PusherConfig, ApiKeyCredential
+from fustor_core.models.config import SyncConfig, SourceConfig, SenderConfig, ApiKeyCredential
 from fustor_core.event import EventBase, InsertEvent
 
 # Mock dependencies
@@ -13,7 +13,7 @@ def mock_bus_service():
     return AsyncMock()
 
 @pytest.fixture
-def mock_pusher_driver_service():
+def mock_sender_driver_service():
     with patch('fustor_agent.services.drivers.sender_driver.SenderDriverService') as mock_service:
         mock_driver_class = MagicMock()
         mock_driver_class.return_value.push = AsyncMock()
@@ -30,45 +30,45 @@ def mock_source_driver_service():
 
 @pytest.fixture
 def mock_sync_config():
-    return SyncConfig(source="test-source", sender="test-pusher", disabled=False)
+    return SyncConfig(source="test-source", sender="test-sender", disabled=False)
 
 @pytest.fixture
 def mock_source_config():
     return SourceConfig(driver="mock", uri="mock://test", credential=ApiKeyCredential(key="mock-key"), max_queue_size=100)
 
 @pytest.fixture
-def mock_pusher_config():
-    return PusherConfig(driver="mock", endpoint="http://mock.com", credential=ApiKeyCredential(key="mock-key"), batch_size=10)
+def mock_sender_config():
+    return SenderConfig(driver="mock", uri="http://mock.com", credential=ApiKeyCredential(key="mock-key"), batch_size=10)
 
 @pytest.fixture
-def mock_pusher_schema():
+def mock_sender_schema():
     return {}
 
 @pytest.fixture
 def sync_instance(
     mock_sync_config,
     mock_source_config,
-    mock_pusher_config,
+    mock_sender_config,
     mock_bus_service,
-    mock_pusher_driver_service,
+    mock_sender_driver_service,
     mock_source_driver_service,
-    mock_pusher_schema
+    mock_sender_schema
 ):
     instance = SyncInstance(
         id="test-sync",
         agent_id="test-agent",
         config=mock_sync_config,
         source_config=mock_source_config,
-        pusher_config=mock_pusher_config,
+        sender_config=mock_sender_config,
         bus_service=mock_bus_service,
-        pusher_driver_service=mock_pusher_driver_service,
+        sender_driver_service=mock_sender_driver_service,
         source_driver_service=mock_source_driver_service,
-        pusher_schema=mock_pusher_schema
+        sender_schema=mock_sender_schema
     )
     # Mock the actual driver instances created by SyncInstance
-    instance.pusher_driver_instance = MagicMock()
-    instance.pusher_driver_instance.push = AsyncMock()
-    instance.pusher_driver_instance.create_session = AsyncMock()
+    instance.sender_driver_instance = MagicMock()
+    instance.sender_driver_instance.push = AsyncMock()
+    instance.sender_driver_instance.create_session = AsyncMock()
     instance.source_driver_instance = MagicMock()
     return instance
 
@@ -80,15 +80,15 @@ async def test_snapshot_stops_on_419_error(sync_instance):
     # The iterator should yield individual EventBase objects
     sync_instance.source_driver_instance.get_snapshot_iterator.return_value = iter([mock_event])
 
-    # Mock the pusher_driver_instance.push to raise a DriverError on the first call,
+    # Mock the sender_driver_instance.push to raise a DriverError on the first call,
     # and then return a normal response for subsequent calls (though the second call shouldn't happen)
-    sync_instance.pusher_driver_instance.push.side_effect = [
-        DriverError("HTTP Error 419 while pushing to pusher. A newer sync session has been started. This snapshot task is now obsolete and should stop."),
+    sync_instance.sender_driver_instance.push.side_effect = [
+        DriverError("HTTP Error 419 while pushing to sender. A newer sync session has been started. This snapshot task is now obsolete and should stop."),
         AsyncMock(return_value={}) # This second mock should not be reached if the break works
     ]
 
     # Mock create_session to return a session_id
-    sync_instance.pusher_driver_instance.create_session.return_value = {"session_id": "mock-session-id"}
+    sync_instance.sender_driver_instance.create_session.return_value = {"session_id": "mock-session-id"}
     sync_instance.session_id = "mock-session-id" # Manually set for _run_snapshot_sync context
 
     # Act
@@ -104,7 +104,7 @@ async def test_snapshot_stops_on_419_error(sync_instance):
     assert snapshot_task.done()
     
     # Check that the push method was called
-    sync_instance.pusher_driver_instance.push.assert_called_once()
+    sync_instance.sender_driver_instance.push.assert_called_once()
 
     # The state should reflect that the snapshot is no longer running
     # The finally block in _run_snapshot_sync should clear the SNAPSHOT_SYNC flag

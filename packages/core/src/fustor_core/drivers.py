@@ -17,7 +17,7 @@ from typing import (
 
 # Use local imports to avoid circular dependency with deprecated fustor_event_model
 from fustor_core.event.base import EventBase
-from fustor_core.models.config import SourceConfig, PusherConfig
+from fustor_core.models.config import SourceConfig, SenderConfig
 
 
 class ViewDriver(ABC):
@@ -117,7 +117,7 @@ class PusherDriver(ABC):
     These drivers are expected to be asynchronous.
     """
 
-    def __init__(self, id: str, config: PusherConfig):
+    def __init__(self, id: str, config: SenderConfig):
         """
         Initializes the driver with its specific configuration.
         """
@@ -133,7 +133,7 @@ class PusherDriver(ABC):
     
     async def get_latest_committed_index(self, **kwargs) -> int:
         """
-        Optional: Gets the last successfully processed index from the pusher endpoint.
+        Optional: Gets the last successfully processed index from the sender endpoint.
         Used for resumable syncs. A return value of -1 indicates starting from the beginning.
         """
         return -1
@@ -141,7 +141,7 @@ class PusherDriver(ABC):
     @abstractmethod
     async def heartbeat(self, **kwargs) -> Dict:
         """
-        Sends a heartbeat to maintain session state with the pusher endpoint.
+        Sends a heartbeat to maintain session state with the sender endpoint.
         The `kwargs` will contain `agent_id`, `task_id`, and `session_id`.
         Returns a dictionary with status information.
         """
@@ -150,7 +150,7 @@ class PusherDriver(ABC):
     @abstractmethod
     async def create_session(self, task_id: str) -> str:
         """
-        Creates a new session with the pusher endpoint.
+        Creates a new session with the sender endpoint.
         Returns the session ID string (or dict with session details).
         """
         raise NotImplementedError
@@ -191,7 +191,7 @@ class PusherDriver(ABC):
     @abstractmethod
     async def get_needed_fields(cls, **kwargs) -> Dict:
         """
-        Declares the data fields required by this pusher.
+        Declares the data fields required by this sender.
         Returns a JSON Schema dictionary. An empty dict means all fields are accepted.
         """
         raise NotImplementedError
