@@ -64,7 +64,7 @@ def test_app_config_add_get_delete_pusher():
     assert app_config.get_pusher("my_pusher") == pusher_config
 
     # Add duplicate pusher
-    with pytest.raises(ConfigError, match="Pusher config with name 'my_pusher' already exists."):
+    with pytest.raises(ConfigError, match="Sender config with name 'my_pusher' already exists."):
         app_config.add_pusher("my_pusher", pusher_config)
 
     # Delete pusher
@@ -73,7 +73,7 @@ def test_app_config_add_get_delete_pusher():
     assert app_config.get_pusher("my_pusher") is None
 
     # Delete non-existent pusher
-    with pytest.raises(NotFoundError, match="Pusher config with id 'non_existent' not found."):
+    with pytest.raises(NotFoundError, match="Sender config with id 'non_existent' not found."):
         app_config.delete_pusher("non_existent")
 
 def test_app_config_add_get_delete_sync():

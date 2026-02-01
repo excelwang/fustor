@@ -129,8 +129,14 @@ class AppConfig(BaseModel):
     def get_sources(self) -> Dict[str, SourceConfig]:
         return self.sources.root
     
-    def get_pushers(self) -> Dict[str, PusherConfig]:
+    def get_pushers(self) -> Dict[str, SenderConfig]:
+        """Get all pusher/sender configurations. Alias: get_senders()"""
         return self.pushers.root
+    
+    # New: Sender alias for forward compatibility
+    def get_senders(self) -> Dict[str, SenderConfig]:
+        """Get all sender configurations. Alias for get_pushers()."""
+        return self.get_pushers()
 
     def get_syncs(self) -> Dict[str, SyncConfig]:
         return self.syncs.root
@@ -138,8 +144,14 @@ class AppConfig(BaseModel):
     def get_source(self, id: str) -> Optional[SourceConfig]:
         return self.get_sources().get(id)
     
-    def get_pusher(self, id: str) -> Optional[PusherConfig]:
+    def get_pusher(self, id: str) -> Optional[SenderConfig]:
+        """Get pusher/sender config by ID. Alias: get_sender()"""
         return self.get_pushers().get(id)
+    
+    # New: Sender alias for forward compatibility
+    def get_sender(self, id: str) -> Optional[SenderConfig]:
+        """Get sender config by ID. Alias for get_pusher()."""
+        return self.get_pusher(id)
 
     def get_sync(self, id: str) -> Optional[SyncConfig]:
         return self.get_syncs().get(id)
@@ -151,12 +163,18 @@ class AppConfig(BaseModel):
         self.get_sources()[id] = config
         return config
 
-    def add_pusher(self, id: str, config: PusherConfig) -> PusherConfig:
+    def add_pusher(self, id: str, config: SenderConfig) -> SenderConfig:
+        """Add pusher/sender config. Alias: add_sender()"""
         config_may = self.get_pusher(id)
         if config_may:
-            raise ConfigError(f"Pusher config with name '{id}' already exists.")
+            raise ConfigError(f"Sender config with name '{id}' already exists.")
         self.get_pushers()[id] = config
         return config
+    
+    # New: Sender alias for forward compatibility
+    def add_sender(self, id: str, config: SenderConfig) -> SenderConfig:
+        """Add sender config. Alias for add_pusher()."""
+        return self.add_pusher(id, config)
 
     def add_sync(self, id: str, config: SyncConfig) -> SyncConfig:
         config_may = self.get_sync(id)
@@ -184,10 +202,11 @@ class AppConfig(BaseModel):
             
         return self.get_sources().pop(id)
     
-    def delete_pusher(self, id: str) -> PusherConfig:
+    def delete_pusher(self, id: str) -> SenderConfig:
+        """Delete pusher/sender config. Alias: delete_sender()"""
         config = self.get_pusher(id)
         if not config:
-            raise NotFoundError(f"Pusher config with id '{id}' not found.")
+            raise NotFoundError(f"Sender config with id '{id}' not found.")
         
         # Delete dependent syncs first
         sync_ids_to_delete = [sync_id for sync_id, cfg in self.syncs.root.items() if cfg.pusher == id]
@@ -195,6 +214,11 @@ class AppConfig(BaseModel):
             self.delete_sync(sync_id)
             
         return self.get_pushers().pop(id)
+    
+    # New: Sender alias for forward compatibility
+    def delete_sender(self, id: str) -> SenderConfig:
+        """Delete sender config. Alias for delete_pusher()."""
+        return self.delete_pusher(id)
     
     def delete_sync(self, id: str) -> SyncConfig:
         config = self.get_sync(id)
