@@ -63,7 +63,7 @@ testpaths = [
 ]
 addopts = "-v --tb=short"
 asyncio_default_fixture_loop_scope = "function"
-norecursedirs = ["tests"]
+norecursedirs = ["it"]
 filterwarnings = [
     "ignore:pythonjsonlogger.jsonlogger:DeprecationWarning",
     "ignore:'crypt' is deprecated and slated for removal:DeprecationWarning:passlib.utils",

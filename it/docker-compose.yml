@@ -30,7 +30,7 @@ services:
   fusion:
     build:
       context: ..
-      dockerfile: tests/containers/fustor-services/Dockerfile
+      dockerfile: it/containers/fustor-services/Dockerfile
     container_name: fustor-fusion
     command: [ "fustor-fusion", "start", "-h", "0.0.0.0" ]
     environment:
@@ -68,7 +68,7 @@ services:
   nfs-client-a:
     build:
       context: ..
-      dockerfile: tests/containers/nfs-client/Dockerfile
+      dockerfile: it/containers/nfs-client/Dockerfile
     container_name: fustor-nfs-client-a
     privileged: true
     cap_add:
@@ -112,7 +112,7 @@ services:
   nfs-client-b:
     build:
       context: ..
-      dockerfile: tests/containers/nfs-client/Dockerfile
+      dockerfile: it/containers/nfs-client/Dockerfile
     container_name: fustor-nfs-client-b
     privileged: true
     cap_add:
@@ -158,7 +158,7 @@ services:
   nfs-client-c:
     build:
       context: ..
-      dockerfile: tests/containers/nfs-client/Dockerfile
+      dockerfile: it/containers/nfs-client/Dockerfile
     container_name: fustor-nfs-client-c
     privileged: true
     cap_add:

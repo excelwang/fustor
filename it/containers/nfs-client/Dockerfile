@@ -34,7 +34,7 @@ RUN pip install --no-cache-dir \
 RUN mkdir -p /mnt/shared /data/agent
 
 # Copy entrypoint script
-COPY tests/containers/nfs-client/entrypoint.sh /entrypoint.sh
+COPY it/containers/nfs-client/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

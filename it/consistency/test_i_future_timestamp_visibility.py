@@ -1,8 +1,8 @@
 import logging
 import pytest
 import time
-from tests.utils.docker_manager import DockerManager
-from tests.utils.fusion_client import FusionClient
+from it.utils.docker_manager import DockerManager
+from it.utils.fusion_client import FusionClient
 
 logger = logging.getLogger("fustor_test")
 

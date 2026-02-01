@@ -69,11 +69,10 @@ def docker_env():
     
     # 2. Inject Datastores Config
     ds_config = """
-datastores:
-  integration-test-ds:
-    api_key: "test-api-key-123"
-    session_timeout_seconds: 3
-    allow_concurrent_push: true
+integration-test-ds:
+  api_key: "test-api-key-123"
+  session_timeout_seconds: 3
+  allow_concurrent_push: true
 """
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/datastores-config.yaml", ds_config)
     
@@ -173,51 +172,44 @@ def ensure_agent_running(container_name, api_key, datastore_id):
         "/root/.fustor/agent.id",
         content=agent_id
     )
-    
-    # 0. Initialize Fustor home and agent.id
-    docker_manager.exec_in_container(container_name, ["mkdir", "-p", "/root/.fustor/schemas"])
-    docker_manager.create_file_in_container(
-        container_name,
-        "/root/.fustor/agent.id",
-        content=agent_id
-    )
 
-    # 1. Generate Config Content
-    config_content = f"""
-sources:
-  shared-fs:
-    driver: "fs"
-    uri: "{mount_point}"
-    credential:
-      user: "unused"
-    disabled: false
-    driver_params:
-      throttle_interval_sec: 0.5
-
-pushers:
-  fusion:
-    driver: "fusion"
-    endpoint: "{fusion_endpoint}"
-    credential:
-      key: "{api_key}"
-    disabled: false
-    driver_params:
-      datastore_id: {datastore_id}
-
-syncs:
-  sync-task-1:
-    source: "shared-fs"
-    pusher: "fusion"
-    disabled: false
-    audit_interval_sec: {AUDIT_INTERVAL}
-    sentinel_interval_sec: 1
+    # 1. Sources Config
+    sources_config = f"""
+shared-fs:
+  driver: "fs"
+  uri: "{mount_point}"
+  credential:
+    user: "unused"
+  disabled: false
+  driver_params:
+    throttle_interval_sec: 0.5
 """
-    # 2. Write config file
-    docker_manager.create_file_in_container(
-        container_name, 
-        "/root/.fustor/agent-config.yaml", 
-        content=config_content
-    )
+    docker_manager.create_file_in_container(container_name, "/root/.fustor/sources-config.yaml", sources_config)
+
+    # 2. Pushers Config
+    pushers_config = f"""
+fusion:
+  driver: "fusion"
+  endpoint: "{fusion_endpoint}"
+  credential:
+    key: "{api_key}"
+  disabled: false
+  driver_params:
+    datastore_id: {datastore_id}
+"""
+    docker_manager.create_file_in_container(container_name, "/root/.fustor/pushers-config.yaml", pushers_config)
+
+    # 3. Syncs Config
+    docker_manager.exec_in_container(container_name, ["mkdir", "-p", "/root/.fustor/syncs-config"])
+    syncs_config = f"""
+id: "sync-task-1"
+source: "shared-fs"
+pusher: "fusion"
+disabled: false
+audit_interval_sec: {AUDIT_INTERVAL}
+sentinel_interval_sec: 1
+"""
+    docker_manager.create_file_in_container(container_name, "/root/.fustor/syncs-config/sync-task-1.yaml", syncs_config)
     
     # 3. Kill existing agent if running and clean up pid/state files
     docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])

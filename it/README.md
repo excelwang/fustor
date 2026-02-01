@@ -48,7 +48,7 @@ cd /home/huajin/fustor_monorepo
 pip install pytest pytest-asyncio requests
 
 # 运行所有集成测试
-uv run pytest tests/consistency/ -v
+uv run pytest it/consistency/ -v
 ```
 
 ### 环境重用说明 (FUSTOR_REUSE_ENV)
@@ -80,7 +80,7 @@ uv run pytest tests/consistency/ -v
 ## 目录结构
 
 ```
-tests/
+it/
 ├── docker-compose.yml          # Docker Compose 配置
 ├── conftest.py                 # Pytest fixtures (含配置注入逻辑)
 ├── README.md                   # 本文档
