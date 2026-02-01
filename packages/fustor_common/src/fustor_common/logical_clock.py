@@ -7,6 +7,7 @@ drift issues between Agent, Fusion, and NFS servers.
 """
 import threading
 import time
+import statistics
 from typing import Optional, Dict, Deque
 from collections import deque, Counter, defaultdict
 
@@ -47,7 +48,7 @@ class LogicalClock:
         self._cached_global_skew: Optional[int] = None
         self._dirty = False # If histogram changed, re-calc skew
 
-    def update(self, observed_mtime: float, agent_time: Optional[float] = None, session_id: Optional[str] = None) -> float:
+    def update(self, observed_mtime: float, agent_time: Optional[float] = None, session_id: Optional[str] = None, can_sample_skew: bool = True) -> float:
         """
         Update the logical clock.
         
@@ -61,6 +62,7 @@ class LogicalClock:
             observed_mtime: The mtime value observed from a file
             agent_time: The physical timestamp when the event was generated (event.index)
             session_id: The session ID of the source agent
+            can_sample_skew: Whether this event is suitable for skew sampling (Realtime vs Audit)
             
         Returns:
             The current clock value after the update
@@ -96,43 +98,44 @@ class LogicalClock:
 
             # --- Robust Mode ---
             try:
-                # 1. Update Statistics
-                if agent_time is not None and observed_mtime is not None:
-                     diff = int(agent_time - observed_mtime)
-                else:
-                     diff = 0 # Fallback should not happen in Robust path
+                # 1. Update Statistics (ONLY if it's a realtime/fresh observation)
+                if can_sample_skew and agent_time is not None and observed_mtime is not None:
+                    diff = int(agent_time - observed_mtime)
                 
-                if session_id not in self._session_buffers:
-                    self._session_buffers[session_id] = deque(maxlen=self._MAX_SAMPLES)
-                
-                buf = self._session_buffers[session_id]
-                
-                # If buffer full, remove old sample from histogram
-                if len(buf) == self._MAX_SAMPLES:
-                    old_val = buf[0]
-                    # Manual pop
-                    buf.popleft() 
+                    if session_id not in self._session_buffers:
+                        self._session_buffers[session_id] = deque(maxlen=self._MAX_SAMPLES)
                     
-                    if old_val in self._global_histogram:
-                        self._global_histogram[old_val] -= 1
-                        if self._global_histogram[old_val] <= 0:
-                            del self._global_histogram[old_val]
+                    buf = self._session_buffers[session_id]
+                    
+                    # If buffer full, remove old sample from histogram
+                    if len(buf) == self._MAX_SAMPLES:
+                        old_val = buf[0]
+                        buf.popleft() 
+                        
+                        if old_val in self._global_histogram:
+                            self._global_histogram[old_val] -= 1
+                            if self._global_histogram[old_val] <= 0:
+                                del self._global_histogram[old_val]
+                    
+                    buf.append(diff)
+                    self._global_histogram[diff] += 1
+                    self._dirty = True
                 
-                buf.append(diff)
-                self._global_histogram[diff] += 1
-                self._dirty = True
-                
-                # 2. Calculate/Get Global Skew
+                # 2. Get Appropriate Skew (Prefer current session's mode for physical anchoring)
+                session_skew = self._get_session_skew_locked(session_id)
                 g_skew = self._get_global_skew_locked()
                 
+                # Use session skew if available, otherwise global fallback
+                effective_skew = session_skew if session_skew is not None else g_skew
+                
                 # 3. Calculate Watermark Candidates
-                if g_skew is None:
+                if effective_skew is None:
                     # Fallback: No statistics yet
-                    if observed_mtime > self._value:
+                    if observed_mtime is not None and observed_mtime > self._value:
                         self._value = observed_mtime
                 else:
                     # BaseLine = AgentTime - Skew
-                    baseline = agent_time - g_skew
+                    baseline = agent_time - effective_skew
                     
                     # Trust Window Logic
                     upper_bound = baseline + self._trust_window
@@ -145,17 +148,13 @@ class LogicalClock:
                         pass
                     elif baseline < observed_mtime <= upper_bound:
                         # [Fast Path] mtime is within [BaseLine, BaseLine + 1.0s]
-                        # We trust this mtime is the latest valid edge
                         target_value = observed_mtime
                     elif observed_mtime > upper_bound:
-                         # [Future/Anomaly] mtime is too far ahead of BaseLine
-                         # We reject mtime, BUT we can advance to BaseLine (if BaseLine > current)
-                         # because BaseLine is derived from trusted AgentTime.
+                         # [Future/Anomaly] Advance to BaseLine only
                          if baseline > self._value:
                              target_value = baseline
                     else:
                         # observed_mtime <= baseline (but > current)
-                        # Safe update range
                         target_value = observed_mtime
 
                     # Monotonicity check
@@ -163,11 +162,19 @@ class LogicalClock:
                         self._value = target_value
             except Exception as e:
                 # Log error but return current value to proceed with event processing
-                # Printing as we might not have logger configured here
                 print(f"ERROR: LogicalClock update failed: {e}")
                 pass
 
             return self._value
+
+    def _get_session_skew_locked(self, session_id: Optional[str]) -> Optional[int]:
+        """Calculates skew for a specific session."""
+        if not session_id or session_id not in self._session_buffers:
+            return None
+        buf = self._session_buffers[session_id]
+        if not buf:
+            return None
+        return statistics.mode(buf)
 
     def _get_global_skew_locked(self) -> Optional[int]:
         """Recalculate or return cached global skew (Mode)."""

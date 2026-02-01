@@ -65,7 +65,7 @@ class FSArbitrator:
             if hasattr(event, 'session_id'):
                 session_id = event.session_id
 
-            self.state.logical_clock.update(mtime, agent_time=agent_time, session_id=session_id)
+            self.state.logical_clock.update(mtime, agent_time=agent_time, session_id=session_id, can_sample_skew=is_realtime)
             
             # Update latency (Lag) based on current watermark
             watermark = self.state.logical_clock.get_watermark()
