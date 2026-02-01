@@ -14,7 +14,7 @@ from fustor_agent_sdk.utils import get_or_generate_agent_id # Import the utility
 
 # Import existing config and instance services
 from .services.configs.source import SourceConfigService
-from .services.configs.pusher import PusherConfigService
+from .services.configs.sender import SenderConfigService
 from .services.configs.sync import SyncConfigService
 from .services.instances.bus import EventBusService, EventBusInstanceRuntime
 from .services.instances.sync import SyncInstanceService
@@ -49,11 +49,11 @@ class App:
         # 2. Initialize all services
         # Config services
         self.source_config_service = SourceConfigService(self._app_config)
-        self.pusher_config_service = PusherConfigService(self._app_config)
+        self.sender_config_service = SenderConfigService(self._app_config)
         self.sync_config_service = SyncConfigService(
             self._app_config,
             self.source_config_service,
-            self.pusher_config_service
+            self.sender_config_service
         )
         
         
@@ -70,7 +70,7 @@ class App:
         self.sync_instance_service = SyncInstanceService(
             self.sync_config_service,
             self.source_config_service, # Pass the source config service
-            self.pusher_config_service,
+            self.sender_config_service,
             self.event_bus_service, # Corrected: use self.event_bus_service
             self.sender_driver_service,
             self.source_driver_service, # Added missing argument
@@ -79,7 +79,7 @@ class App:
         
         # 3. Inject cross-service dependencies to resolve circular references
         self.source_config_service.set_dependencies(self.sync_instance_service)
-        self.pusher_config_service.set_dependencies(self.sync_instance_service)
+        self.sender_config_service.set_dependencies(self.sync_instance_service)
         self.sync_config_service.set_dependencies(self.sync_instance_service)
         self.event_bus_service.set_dependencies(self.sync_instance_service)
         

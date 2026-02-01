@@ -1,6 +1,6 @@
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
-from fustor_agent.services.configs.pusher import PusherConfigService
+from fustor_agent.services.configs.sender import SenderConfigService
 from fustor_core.models.config import AppConfig, PusherConfig, SyncConfig, PasswdCredential
 
 @pytest.fixture
@@ -12,7 +12,7 @@ def mock_app_config():
 
 @pytest.fixture
 def pusher_config_service(mock_app_config):
-    service = PusherConfigService(mock_app_config)
+    service = SenderConfigService(mock_app_config)
     service.sync_instance_service = MagicMock() # Mock the injected dependency
     return service
 

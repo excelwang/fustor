@@ -5,7 +5,7 @@ from fustor_core.models.config import AppConfig, SyncConfig, FieldMapping
 from fustor_agent.services.instances.sync import SyncInstanceService
 from .base import BaseConfigService
 from .source import SourceConfigService
-from .pusher import PusherConfigService
+from .sender import SenderConfigService
 from fustor_agent_sdk.interfaces import SyncConfigServiceInterface # Import the interface
 from fustor_agent.config.syncs import syncs_config, SyncConfigYaml # New YAML loader
 
@@ -19,12 +19,12 @@ class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterfac
         self,
         app_config: AppConfig,
         source_config_service: SourceConfigService,
-        pusher_config_service: PusherConfigService
+        sender_config_service: SenderConfigService
     ):
         super().__init__(app_config, None, 'sync')
         self.sync_instance_service: Optional[SyncInstanceService] = None
         self.source_config_service = source_config_service
-        self.pusher_config_service = pusher_config_service
+        self.sender_config_service = sender_config_service
         
         # Ensure YAML configs are loaded
         syncs_config.ensure_loaded()
@@ -87,12 +87,12 @@ class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterfac
         if source_config.disabled:
             raise ValueError(f"Source '{sync_config.source}' for sync '{id}' is disabled. Please enable the source first.")
 
-        # Check if pusher is enabled
-        pusher_config = self.pusher_config_service.get_config(sync_config.pusher)
-        if not pusher_config:
-            raise ValueError(f"Pusher '{sync_config.pusher}' for sync '{id}' not found.")
-        if pusher_config.disabled:
-            raise ValueError(f"Pusher '{sync_config.pusher}' for sync '{id}' is disabled. Please enable the pusher first.")
+        # Check if sender is enabled
+        sender_config = self.sender_config_service.get_config(sync_config.pusher)
+        if not sender_config:
+            raise ValueError(f"Sender '{sync_config.pusher}' for sync '{id}' not found.")
+        if sender_config.disabled:
+            raise ValueError(f"Sender '{sync_config.pusher}' for sync '{id}' is disabled. Please enable the sender first.")
 
         logger.info(f"Sync config '{id}' enabled successfully and its dependencies are active.")
         
@@ -101,12 +101,12 @@ class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterfac
         Returns the step definitions for the Sync Task configuration wizard.
         This structure is fetched by the frontend to dynamically build the UI.
         """
-        # Get lists of available (enabled) sources and pushers for dropdowns
+        # Get lists of available (enabled) sources and senders for dropdowns
         enabled_sources = [
             id for id, cfg in self.source_config_service.list_configs().items() if not cfg.disabled
         ]
-        enabled_pushers = [
-            id for id, cfg in self.pusher_config_service.list_configs().items() if not cfg.disabled
+        enabled_senders = [
+            id for id, cfg in self.sender_config_service.list_configs().items() if not cfg.disabled
         ]
 
         return {
@@ -132,7 +132,7 @@ class SyncConfigService(BaseConfigService[SyncConfig], SyncConfigServiceInterfac
                                 "type": "string",
                                 "title": "选择 Pusher 配置",
                                 "description": "选择一个已配置并启用的接收端。",
-                                "enum": enabled_pushers
+                                "enum": enabled_senders
                             }
                         },
                         "required": ["id", "source", "pusher"]
