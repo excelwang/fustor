@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fustor-pusher-fusion"
+name = "fustor-sender-http"
 dynamic = ["version"]
-description = "[DEPRECATED] Use fustor-sender-http instead. Fustor agent pusher driver for the Fustor Fusion service."
+description = "Fustor HTTP Sender - Transport layer for Agent to Fusion communication"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -14,7 +14,8 @@ classifiers = [
     "Operating System :: OS Independent",
 ]
 dependencies = [
-    "fustor-sender-http",  # Redirect to new package
+    "fustor-core",
+    "fustor-fusion-sdk",
 ]
 
 [[project.authors]]
@@ -22,12 +23,17 @@ name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [project.urls]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/pusher-fusion"
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-http"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
-# Keep legacy entry point for compatibility
+# Entry point for sender discovery
+[project.entry-points."fustor.senders"]
+http = "fustor_sender_http:HTTPSender"
+fusion = "fustor_sender_http:FusionSender"
+
+# Legacy entry point for backward compatibility
 [project.entry-points."fustor_agent.drivers.pushers"]
-fusion = "fustor_pusher_fusion:FusionDriver"
+fusion = "fustor_sender_http:HTTPSender"
 
 [tool.setuptools_scm]
 root = "../.."

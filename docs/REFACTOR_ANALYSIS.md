@@ -188,21 +188,21 @@ reset() / cleanup_expired_suspects()  # Optional
 
 ## 6. 重构阶段计划
 
-### Phase 1: 合并基础模块 (fustor-core)
+### Phase 1: 合并基础模块 (fustor-core) ✅ 已完成
 
-1. **合并 common, event-model 到 fustor-core**
+1. ✅ **合并 common, event-model 到 fustor-core**
    - 保留所有现有功能
    - 创建子模块结构: `common/`, `event/`, `clock/`
 
-2. **创建 Pipeline 抽象**
+2. ✅ **创建 Pipeline 抽象**
    - `fustor-core/pipeline/pipeline.py` - Pipeline ABC
    - `fustor-core/pipeline/context.py` - PipelineContext
    
-3. **创建 Transport 抽象**
+3. ✅ **创建 Transport 抽象**
    - `fustor-core/transport/sender.py` - Sender ABC
    - `fustor-core/transport/receiver.py` - Receiver ABC
 
-4. **创建 fustor-schema-fs**
+4. ✅ **创建 fustor-schema-fs**
    - 提取 EventBase 的 FS 特定字段
    - 定义 SCHEMA_NAME, SCHEMA_VERSION
 
