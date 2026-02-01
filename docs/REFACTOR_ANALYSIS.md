@@ -206,12 +206,13 @@ reset() / cleanup_expired_suspects()  # Optional
    - 提取 EventBase 的 FS 特定字段
    - 定义 SCHEMA_NAME, SCHEMA_VERSION
 
-### Phase 2: Agent 重构 🔄 进行中
+### Phase 2: Agent 重构 ✅ 完成
 
 5. ✅ **重命名 pusher → sender**
    - `packages/sender-http/` - 新包，实现 Sender 抽象
    - `packages/pusher-fusion/` - 废弃，重定向到 sender-http
    - `senders-config.yaml` - 新配置加载器，兼容 pushers-config.yaml
+   - `SenderDriverService` - 替代 PusherDriverService
 
 6. ⬜ **重构 SyncInstance → Pipeline** (暂缓)
    - 提取通用逻辑到 Pipeline
@@ -247,7 +248,7 @@ reset() / cleanup_expired_suspects()  # Optional
     
 12. ✅ **测试更新**
     - 更新 import 路径到 fustor_core
-    - 281 tests passing, 2 expected deprecation warnings
+    - 303 tests passing, 2 expected deprecation warnings
 
 ---
 
@@ -267,9 +268,10 @@ reset() / cleanup_expired_suspects()  # Optional
 1. ✅ 创建分支 `refactor/architecture-v2`
 2. ✅ 阅读现有代码，理解业务逻辑
 3. ✅ Phase 1: 合并基础模块到 fustor-core
-4. ✅ Phase 2: Agent 重构 (sender-http)
+4. ✅ Phase 2: Agent 重构 (sender-http, SenderDriverService)
 5. ✅ Phase 3: Fusion 重构 (receiver-http, pipelines)
 6. ✅ Phase 4: 导入路径更新 + API 路径
-7. ⬜ 暂缓: 废弃 datastores-config.yaml (需要更新所有测试)
-8. ⬜ 暂缓: Session 管理使用新 Pipeline 配置
-
+7. ✅ schema-fs: Pydantic 模型 + 22 个测试
+8. ⬜ 暂缓: 废弃 datastores-config.yaml (需要更新所有测试)
+9. ⬜ 暂缓: Session 管理使用新 Pipeline 配置
+10. ⬜ 暂缓: SyncInstance → Pipeline 抽象重构
