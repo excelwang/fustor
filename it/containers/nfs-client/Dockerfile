@@ -24,6 +24,7 @@ RUN pip install --no-cache-dir \
     /app/packages/core \
     /app/packages/agent-sdk \
     /app/packages/fusion-sdk \
+    /app/packages/schema-fs \
     /app/packages/source-fs \
     /app/packages/pusher-fusion \
     /app/agent

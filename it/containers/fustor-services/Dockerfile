@@ -21,6 +21,7 @@ RUN pip install --no-cache-dir \
     fastapi uvicorn pydantic pyyaml \
     /app/packages/core \
     /app/packages/fusion-sdk \
+    /app/packages/schema-fs \
     /app/packages/view-fs \
     /app/fusion
 
