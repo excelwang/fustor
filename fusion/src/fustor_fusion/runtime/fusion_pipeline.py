@@ -225,10 +225,17 @@ class FusionPipeline(Pipeline):
         for handler_id, handler in self._view_handlers.items():
             try:
                 if hasattr(handler, 'process_event'):
-                    await handler.process_event(event)
+                    success = await handler.process_event(event)
+                    if not success:
+                        self.statistics["errors"] += 1
+                        logger.warning(f"Handler {handler_id} returned False for event processing")
             except Exception as e:
                 logger.error(f"Error in handler {handler_id}: {e}", exc_info=True)
                 self.statistics["errors"] += 1
+                
+                # If we encounter too many errors, we might want to flag the pipeline
+                if self.statistics["errors"] > 1000: # Threshold for illustration
+                    self._set_state(self.state | PipelineState.ERROR, "Excessive handler errors")
     
     # --- Session Management ---
     

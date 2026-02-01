@@ -158,11 +158,22 @@ class SenderHandlerAdapter(SenderHandler):
             if context.get("is_start"):
                 await self._sender.signal_audit_start()
             
-        response = await self._sender.send_events(
-            events=events,
-            source_type=source_type,
-            is_end=is_final
-        ) or {}
+        # Compatibility handling: prefer send_events, fallback to push
+        if hasattr(self._sender, "send_events"):
+            response = await self._sender.send_events(
+                events=events,
+                source_type=source_type,
+                is_end=is_final
+            ) or {}
+        elif hasattr(self._sender, "push"):
+            # Legacy PusherDriver interface
+            response = await self._sender.push(
+                events=events,
+                source_type=source_type,
+                is_end=is_final
+            ) or {}
+        else:
+            raise AttributeError(f"Sender {self.id} has no 'send_events' or 'push' method")
         
         success = response.get("success", False)
         

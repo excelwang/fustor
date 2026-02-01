@@ -109,12 +109,14 @@ class ViewDriver(ABC):
 
 
 
-class PusherDriver(ABC):
+class SenderDriver(ABC):
     """
-    Abstract Base Class for all Pusher drivers.
+    Abstract Base Class for all Sender drivers.
 
-    Defines the contract for drivers that receive data from the Fuagent core.
-    These drivers are expected to be asynchronous.
+    Defines the contract for drivers that receive data from the Fuagent core
+    and transmit it to a destination (e.g., Fusion, Object Storage).
+    
+    This replaces the legacy PusherDriver terminology.
     """
 
     def __init__(self, id: str, config: SenderConfig):
@@ -125,33 +127,41 @@ class PusherDriver(ABC):
         self.config = config
 
     @abstractmethod
+    async def send_events(
+        self, 
+        events: List[EventBase], 
+        source_type: str = "message", 
+        is_end: bool = False,
+        **kwargs
+    ) -> Dict:
+        """
+        Transmits a list of events to the destination.
+        
+        Args:
+            events: List of events to send.
+            source_type: Type of events ('message', 'snapshot', 'audit').
+            is_end: Whether this is the final batch for the current session/phase.
+            **kwargs: Implementation specific parameters.
+        """
+        raise NotImplementedError
+
     async def push(self, events: List[EventBase], **kwargs) -> Dict:
         """
-        Receives and processes a list of events. This is the primary data-writing method.
+        Legacy compatibility method for the old Pusher interface.
+        Delegates to send_events if not overridden.
         """
-        raise NotImplementedError
-    
-    async def get_latest_committed_index(self, **kwargs) -> int:
-        """
-        Optional: Gets the last successfully processed index from the sender endpoint.
-        Used for resumable syncs. A return value of -1 indicates starting from the beginning.
-        """
-        return -1
-    
-    @abstractmethod
-    async def heartbeat(self, **kwargs) -> Dict:
-        """
-        Sends a heartbeat to maintain session state with the sender endpoint.
-        The `kwargs` will contain `agent_id`, `task_id`, and `session_id`.
-        Returns a dictionary with status information.
-        """
-        raise NotImplementedError
-    
-    @abstractmethod
+        return await self.send_events(events, **kwargs)
+
     async def create_session(self, task_id: str) -> str:
         """
-        Creates a new session with the sender endpoint.
+        Creates a new session with the destination.
         Returns the session ID string (or dict with session details).
+        """
+        raise NotImplementedError
+
+    async def heartbeat(self, **kwargs) -> Dict:
+        """
+        Sends a heartbeat to maintain session state.
         """
         raise NotImplementedError
 
@@ -214,9 +224,11 @@ class PusherDriver(ABC):
     async def get_wizard_steps(cls) -> Dict[str, Any]:
         """
         Optional: Provides configuration wizard steps for UI integration.
-        Returns a dictionary defining the steps.
         """
         return {} 
+
+# Alias for backward compatibility
+PusherDriver = SenderDriver
 
 class SourceDriver(ABC):
     """

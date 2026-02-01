@@ -30,6 +30,10 @@ class DatastoreStateManager:
     """管理所有数据存储的内存状态"""
     
     def __init__(self):
+        logger.warning(
+            "DatastoreStateManager is deprecated. "
+            "Please migrate to PipelineManager (Architecture V2)."
+        )
         self._states: Dict[str, DatastoreState] = {}
         self._lock = asyncio.Lock()
         
