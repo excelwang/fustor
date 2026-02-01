@@ -72,7 +72,12 @@ class SenderHandlerAdapter(SenderHandler):
     async def initialize(self) -> None:
         """Initialize the handler (connect the underlying sender)."""
         if not self._connected:
-            await self._sender.connect()
+            # Try both initialize and connect for maximum compatibility
+            if hasattr(self._sender, 'initialize'):
+                await self._sender.initialize()
+            elif hasattr(self._sender, 'connect'):
+                await self._sender.connect()
+                
             self._connected = True
             logger.debug(f"SenderHandlerAdapter {self.id} initialized")
     

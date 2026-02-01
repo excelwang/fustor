@@ -37,14 +37,16 @@ class AgentPipeline(Pipeline):
     This is designed to eventually replace SyncInstance.
     """
     
-    # Class-level timing constants
-    CONTROL_LOOP_INTERVAL = 1.0
-    FOLLOWER_STANDBY_INTERVAL = 1.0
-    ROLE_CHECK_INTERVAL = 1.0
-    ERROR_RETRY_INTERVAL = 5.0
-    MAX_CONSECUTIVE_ERRORS = 5
-    BACKOFF_MULTIPLIER = 2
-    MAX_BACKOFF_SECONDS = 60
+    # Class-level timing constants (all in seconds)
+    CONTROL_LOOP_INTERVAL = 1.0       # Wait time between control loop iterations
+    FOLLOWER_STANDBY_INTERVAL = 1.0    # Wait time for follower before checking role again
+    ROLE_CHECK_INTERVAL = 1.0         # Interval to check for role changes when none assigned
+    
+    # Error recovery and exponential backoff
+    ERROR_RETRY_INTERVAL = 5.0        # Initial retry delay after an error
+    MAX_CONSECUTIVE_ERRORS = 5        # Errors before considering pipeline in serious trouble
+    BACKOFF_MULTIPLIER = 2            # Multiplier for exponential backoff (e.g., 5s, 10s, 20s...)
+    MAX_BACKOFF_SECONDS = 60          # Maximum delay between retry attempts
     
     def __init__(
         self,
@@ -158,7 +160,7 @@ class AgentPipeline(Pipeline):
             await asyncio.gather(*active_tasks, return_exceptions=True)
         
         # Close session
-        if self.session_id:
+        if self.has_active_session():
             try:
                 await self.sender_handler.close_session(self.session_id)
             except Exception as e:
@@ -206,7 +208,7 @@ class AgentPipeline(Pipeline):
         while self.state != PipelineState.STOPPED:
             try:
                 # Wait until we have a session (in case of disconnection)
-                if not self.session_id:
+                if not self.has_active_session():
                     self._set_state(PipelineState.RUNNING | PipelineState.RECONNECTING, "Attempting to create session...")
                     try:
                         session_id, metadata = await self.sender_handler.create_session(
@@ -256,15 +258,15 @@ class AgentPipeline(Pipeline):
                 logger.error(f"Pipeline {self.id} control loop error: {e}. Retrying in {backoff}s...", exc_info=True)
                 
                 # If session failed, ensure it's cleared so we try to recreate it
-                if self.session_id:
+                if self.has_active_session():
                     try:
                         # Clear tasks that might be hanging
                         for task in [self._audit_task, self._sentinel_task, self._message_sync_task, self._snapshot_task]:
                             if task and not task.done():
                                 task.cancel()
                         await self.on_session_closed(self.session_id)
-                    except:
-                        pass
+                    except Exception as e:
+                        logger.debug(f"Error during cleanup after session loss: {e}")
 
                 await asyncio.sleep(backoff)
 
@@ -299,7 +301,7 @@ class AgentPipeline(Pipeline):
     
     async def _run_heartbeat_loop(self) -> None:
         """Maintain session through periodic heartbeats."""
-        while self.session_id:
+        while self.has_active_session():
             try:
                 response = await self.sender_handler.send_heartbeat(self.session_id)
                 
@@ -486,7 +488,7 @@ class AgentPipeline(Pipeline):
             raise
         finally:
             # Send remaining events in batch
-            if batch and self.session_id:
+            if batch and self.has_active_session():
                 try:
                     success, _ = await self.sender_handler.send_batch(
                         self.session_id, batch, {"phase": "realtime", "is_final": True}
@@ -501,18 +503,28 @@ class AgentPipeline(Pipeline):
 
     async def _run_audit_loop(self) -> None:
         """Periodically run audit sync."""
-        while self.current_role == "leader" and self.is_running():
+        while self.is_running():
+            # Check role at start of loop
+            if self.current_role != "leader":
+                await asyncio.sleep(self.ROLE_CHECK_INTERVAL)
+                continue
+
             try:
                 await asyncio.sleep(self.audit_interval_sec)
                 
-                if self.current_role != "leader" or not self.is_running():
+                # Double check status after sleep
+                if not self.is_running() or self.current_role != "leader":
                     break
+                
+                # Skip if no session (might have just disconnected)
+                if not self.has_active_session():
+                    continue
                 
                 await self._run_audit_sync()
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Audit loop error: {e}")
+                logger.error(f"Audit loop error: {e}", exc_info=True)
                 await asyncio.sleep(10) # Wait before retry
     
     async def _run_audit_sync(self) -> None:
@@ -548,7 +560,7 @@ class AgentPipeline(Pipeline):
                 )
         finally:
             # Always send audit end signal to ensure Fusion calls handle_audit_end()
-            if self.session_id:
+            if self.has_active_session():
                 try:
                     await self.sender_handler.send_batch(
                         self.session_id, [], {"phase": "audit", "is_final": True}
@@ -560,16 +572,29 @@ class AgentPipeline(Pipeline):
     
     async def _run_sentinel_loop(self) -> None:
         """Periodically run sentinel checks."""
-        while self.current_role == "leader":
-            await asyncio.sleep(self.sentinel_interval_sec)
-            
+        while self.is_running():
+            # Check role at start of loop
             if self.current_role != "leader":
-                break
-            
+                await asyncio.sleep(self.ROLE_CHECK_INTERVAL)
+                continue
+
             try:
+                await asyncio.sleep(self.sentinel_interval_sec)
+                
+                # Double check status after sleep
+                if not self.is_running() or self.current_role != "leader":
+                    break
+                
+                # Skip if no session
+                if not self.has_active_session():
+                    continue
+
                 await self._run_sentinel_check()
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.error(f"Sentinel check error: {e}")
+                logger.error(f"Sentinel check error: {e}", exc_info=True)
+                await asyncio.sleep(10)
     
     async def _run_sentinel_check(self) -> None:
         """Execute sentinel check."""
@@ -601,10 +626,54 @@ class AgentPipeline(Pipeline):
         else:
             logger.warning(f"Pipeline {self.id}: Cannot trigger sentinel, not a leader")
 
+    async def remap_to_new_bus(
+        self, 
+        new_bus: "EventBusInstanceRuntime", 
+        needed_position_lost: bool
+    ) -> None:
+        """
+        Remap this pipeline to a new EventBus instance.
+        
+        Called when bus splitting occurs due to subscriber position divergence.
+        This allows the pipeline to switch to a new bus without full restart.
+        
+        Args:
+            new_bus: The new bus instance to use
+            needed_position_lost: If True, pipeline should trigger resync
+                                  because the required position is no longer
+                                  available in the new bus
+        """
+        old_bus_id = self._bus.id if self._bus else None
+        self._bus = new_bus
+        
+        if needed_position_lost:
+            logger.warning(
+                f"Pipeline {self.id}: Position lost during bus remap "
+                f"(old_bus={old_bus_id}, new_bus={new_bus.id}). "
+                f"Will trigger resync."
+            )
+            # Cancel current message sync task - it will be restarted
+            if self._message_sync_task and not self._message_sync_task.done():
+                self._message_sync_task.cancel()
+            
+            # Signal that we should trigger a resync via control loop
+            # The RECONNECTING state will cause the control loop to 
+            # recreate session and restart sync phases
+            self._set_state(
+                PipelineState.RUNNING | PipelineState.RECONNECTING, 
+                f"Bus remap with position loss - triggering resync"
+            )
+        else:
+            logger.info(
+                f"Pipeline {self.id}: Remapped to new bus {new_bus.id} "
+                f"(from {old_bus_id})"
+            )
+
     @property
     def bus(self) -> Optional["EventBusInstanceRuntime"]:
         """Legacy access to event bus."""
         return self._bus
+
 
     def get_dto(self) -> SyncInstanceDTO:
         """Get pipeline data transfer object compatible with SyncInstanceDTO."""

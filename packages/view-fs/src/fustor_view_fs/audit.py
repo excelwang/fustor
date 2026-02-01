@@ -37,7 +37,8 @@ class AuditManager:
 
         # 1. Tombstone Cleanup (Rule: Purge tombstones older than 1 hour per §6.3)
         # Use physical local time for TTL calculation to be stable against logical clock jumps
-        tombstone_ttl_seconds = 3600.0  # 1 hour
+        # Reference: CONSISTENCY_DESIGN.md §6.3
+        tombstone_ttl_seconds = self.state.config.get("tombstone_ttl_seconds", 3600.0)
         now_physical = time.time()
         before = len(self.state.tombstone_list)
         

@@ -25,8 +25,6 @@ from .event_handler import OptimizedWatchEventHandler, get_file_metadata
 
 logger = logging.getLogger("fustor_agent.driver.fs")
             
-import threading
-
 class FSDriver(SourceDriver):
     _instances: Dict[str, 'FSDriver'] = {}
     _lock = threading.Lock()

@@ -84,9 +84,12 @@ class SourceHandlerAdapter(SourceHandler):
     async def initialize(self) -> None:
         """Initialize the handler."""
         if not self._initialized:
-            # Some drivers have async initialization
+            # Try both initialize and connect for maximum compatibility
             if hasattr(self._driver, 'initialize'):
                 await self._driver.initialize()
+            elif hasattr(self._driver, 'connect'):
+                await self._driver.connect()
+            
             self._initialized = True
             logger.debug(f"SourceHandlerAdapter {self.id} initialized")
     

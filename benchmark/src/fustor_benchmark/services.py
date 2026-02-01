@@ -77,7 +77,7 @@ class ServiceManager:
                 requests.get(url, timeout=1)
                 click.echo(f"{name} is up.")
                 return True
-            except:
+            except Exception:
                 time.sleep(0.5)
         click.echo(f"Error: {name} failed to start.")
         return False
@@ -279,7 +279,7 @@ class ServiceManager:
             try:
                 p.terminate()
                 p.wait(timeout=2)
-            except:
+            except Exception:
                 p.kill()
         self.processes = []
 

@@ -144,6 +144,10 @@ class Pipeline(ABC):
                                   PipelineState.MESSAGE_PHASE | 
                                   PipelineState.AUDIT_PHASE))
     
+    def has_active_session(self) -> bool:
+        """Check if pipeline has an active session with the remote peer."""
+        return self.session_id is not None
+
     def is_outdated(self) -> bool:
         """Check if pipeline configuration is outdated."""
         return bool(self.state & PipelineState.CONF_OUTDATED)

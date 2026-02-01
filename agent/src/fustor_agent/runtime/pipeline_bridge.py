@@ -30,10 +30,14 @@ logger = logging.getLogger("fustor_agent")
 
 class PipelineBridge:
     """
-    Factory for creating AgentPipeline from legacy configuration.
+    [MIGRATION] Factory for creating AgentPipeline from legacy configuration.
     
-    This bridges the gap between the old SyncInstance configuration style
-    and the new Pipeline architecture.
+    This class bridges the gap between the old SyncInstance configuration style
+    and the new Pipeline architecture. It will be deprecated once:
+    1. All configurations are migrated to the new schema-based format.
+    2. SyncInstance is fully removed from the codebase.
+    
+    Target deprecation: Fustor v3.0
     
     Example:
         bridge = PipelineBridge(

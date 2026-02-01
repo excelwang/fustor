@@ -106,6 +106,7 @@ mkdir -p ~/.fustor/syncs-config
 
 ## 📖 核心文档
 
+*   **[架构设计 V2 (最新)](docs/refactoring/1-ARCHITECTURE_V2.md)**: 了解 V2 架构的解耦设计、Pipeline 抽象与 Handler 适配器模式。
 *   **[配置指南](docs/CONFIGURATION.md)**: 详细的 YAML 配置说明。
 *   **[架构设计](docs/ARCHITECTURE.md)**: 了解 Fustor 的顶层设计和服务交互。
 *   **[一致性设计](docs/CONSISTENCY_DESIGN.md)**: 了解多 Agent 环境下的数据一致性机制。

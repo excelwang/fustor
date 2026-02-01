@@ -129,7 +129,7 @@ def start(daemon, verbose, no_console_log):
                 with open(PID_FILE, 'r') as f:
                     if int(f.read().strip()) == os.getpid():
                         os.remove(PID_FILE)
-            except:
+            except Exception:
                 pass
 
 @cli.command()
