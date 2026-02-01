@@ -6,7 +6,7 @@ import threading
 import pytest
 
 from unittest.mock import patch
-from fustor_common.logical_clock import LogicalClock
+from fustor_core.clock import LogicalClock
 
 
 class TestLogicalClockBasic:

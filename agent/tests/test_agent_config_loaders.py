@@ -8,7 +8,7 @@ from pathlib import Path
 import yaml
 
 from fustor_agent.config.sources import SourcesConfigLoader
-from fustor_agent.config.pushers import PushersConfigLoader
+from fustor_agent.config.senders import SendersConfigLoader as PushersConfigLoader
 
 
 class TestSourcesConfigLoader:

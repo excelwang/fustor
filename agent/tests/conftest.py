@@ -7,7 +7,7 @@ import yaml
 
 from fustor_agent.app import App
 from fustor_core.models.config import PusherConfig, SyncConfig, PasswdCredential, FieldMapping, SourceConfig
-from fustor_event_model.models import EventBase, InsertEvent
+from fustor_core.event import EventBase, InsertEvent
 
 @pytest.fixture(scope="function")
 def test_app_instance(tmp_path):

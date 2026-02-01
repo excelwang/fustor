@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fustor_agent.runtime.sync import SyncInstance, SyncState
 from fustor_core.exceptions import DriverError
 from fustor_core.models.config import SyncConfig, SourceConfig, PusherConfig, ApiKeyCredential
-from fustor_event_model.models import EventBase, InsertEvent
+from fustor_core.event import EventBase, InsertEvent
 
 # Mock dependencies
 @pytest.fixture

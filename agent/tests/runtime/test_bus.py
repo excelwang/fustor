@@ -1,7 +1,7 @@
 import pytest
 import asyncio
 from fustor_agent.runtime.bus import MemoryEventBus, EventBusFailedError
-from fustor_event_model.models import EventBase, InsertEvent
+from fustor_core.event import EventBase, InsertEvent
 from fustor_core.models.config import FieldMapping
 
 @pytest.mark.asyncio
