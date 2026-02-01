@@ -1,0 +1,99 @@
+# .github/workflows/unit-tests.yml
+# Unit test workflow for Fustor packages
+
+name: Unit Tests
+
+on:
+  push:
+    branches: [main, develop, 'refactor/*', 'feature/*']
+    paths:
+      - 'agent/**'
+      - 'fusion/**'
+      - 'packages/**'
+      - '.github/workflows/unit-tests.yml'
+      - 'pyproject.toml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'agent/**'
+      - 'fusion/**'
+      - 'packages/**'
+      - 'pyproject.toml'
+
+env:
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  test:
+    name: Run Unit Tests
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.5.14"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --all-packages
+
+      - name: Run unit tests
+        run: |
+          uv run pytest --ignore=it/ -q --tb=short --junit-xml=test-results.xml
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: test-results.xml
+
+      - name: Test Summary
+        if: always()
+        run: |
+          echo "## Unit Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          if [ -f test-results.xml ]; then
+            # Extract test counts from XML
+            TESTS=$(grep -oP 'tests="\K[0-9]+' test-results.xml | head -1 || echo "?")
+            FAILURES=$(grep -oP 'failures="\K[0-9]+' test-results.xml | head -1 || echo "?")
+            ERRORS=$(grep -oP 'errors="\K[0-9]+' test-results.xml | head -1 || echo "?")
+            echo "- Total: $TESTS tests" >> $GITHUB_STEP_SUMMARY
+            echo "- Failures: $FAILURES" >> $GITHUB_STEP_SUMMARY
+            echo "- Errors: $ERRORS" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  lint:
+    name: Lint Check
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.5.14"
+
+      - name: Set up Python
+        run: uv python install ${{ env.PYTHON_VERSION }}
+
+      - name: Install dependencies
+        run: uv sync --all-packages
+
+      - name: Run ruff check
+        run: |
+          uv run ruff check agent/ fusion/ packages/ --output-format=github || true
+        continue-on-error: true
+
+      - name: Run ruff format check
+        run: |
+          uv run ruff format --check agent/ fusion/ packages/ || true
+        continue-on-error: true
