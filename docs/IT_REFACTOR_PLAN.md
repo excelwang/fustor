@@ -193,17 +193,18 @@ it/
 
 ## 4. 实施计划
 
-### Phase 1: 配置兼容性 (1-2 天)
+### Phase 1: 配置兼容性 ✅ (已完成 2026-02-01)
 
 ```
 任务 1.1: 更新 conftest.py 配置注入
-- [ ] 添加 receivers-config.yaml 支持
-- [ ] 保留 datastores-config.yaml 作为 fallback
-- [ ] 更新 Agent 配置使用 senders-config.yaml
+- [x] 添加 receivers-config.yaml 支持
+- [x] 保留 datastores-config.yaml 作为 fallback
+- [x] 更新 Agent 配置使用 senders-config.yaml
 
 任务 1.2: 添加 Pipeline 测试标志
-- [ ] 添加 FUSTOR_USE_PIPELINE 环境变量支持
-- [ ] 修改 ensure_agent_running 函数
+- [x] 添加 FUSTOR_USE_PIPELINE 环境变量支持
+- [x] 修改 ensure_agent_running 函数
+- [x] 添加 use_pipeline fixture
 
 任务 1.3: 验证现有测试
 - [ ] 运行所有 24 个测试确保无回归

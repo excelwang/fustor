@@ -21,6 +21,9 @@ if not logger.handlers:
 # Test configuration
 TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "600"))
 
+# Pipeline mode: Set FUSTOR_USE_PIPELINE=true to test new architecture
+USE_PIPELINE = os.getenv("FUSTOR_USE_PIPELINE", "false").lower() in ("true", "1", "yes")
+
 # Timing Hierarchy
 # NFS actimeo=1 (set in docker-compose.yml)
 ACTIMEO = 1 
@@ -35,6 +38,28 @@ CONTAINER_CLIENT_C = "fustor-nfs-client-c"
 
 # Shared mount point inside containers
 MOUNT_POINT = "/mnt/shared"
+
+# Log Pipeline mode status at import time
+if USE_PIPELINE:
+    logger.info("🚀 Integration tests running in PIPELINE mode (AgentPipeline)")
+else:
+    logger.info("📦 Integration tests running in LEGACY mode (SyncInstance)")
+
+
+@pytest.fixture(scope="session")
+def use_pipeline():
+    """
+    Fixture that indicates if tests are running in Pipeline mode.
+    
+    Usage in tests:
+        def test_something(use_pipeline):
+            if use_pipeline:
+                # Pipeline-specific assertions
+            else:
+                # Legacy-specific assertions
+    """
+    return USE_PIPELINE
+
 
 @pytest.fixture(scope="session")
 def docker_env():
@@ -217,10 +242,17 @@ sentinel_interval_sec: 1
     docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent-state.json"])
     time.sleep(0.2)
     
-    # 4. Start new agent
+    # 4. Start new agent (with optional Pipeline mode)
+    env_prefix = ""
+    if USE_PIPELINE:
+        env_prefix = "FUSTOR_USE_PIPELINE=true "
+        logger.info(f"Starting agent in {container_name} with AgentPipeline mode")
+    else:
+        logger.info(f"Starting agent in {container_name} with legacy SyncInstance mode")
+    
     docker_manager.exec_in_container(
         container_name, 
-        ["sh", "-c", "nohup fustor-agent start -V > /data/agent/console.log 2>&1 &"]
+        ["sh", "-c", f"{env_prefix}nohup fustor-agent start -V > /data/agent/console.log 2>&1 &"]
     )
 
 
