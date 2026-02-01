@@ -1,5 +1,21 @@
+"""
+Test backward compatibility of fustor_common package.
+
+This module tests that the deprecated fustor_common package still works
+for backward compatibility. The deprecation warning is expected.
+"""
+import warnings
+
+# Suppress expected deprecation warning when importing fustor_common
+warnings.filterwarnings(
+    "ignore",
+    message="fustor_common is deprecated",
+    category=DeprecationWarning
+)
+
 import pytest
 from pydantic import ValidationError
+
 from fustor_common.models import (
     ResponseBase,
     ApiKeyBase,
@@ -13,6 +29,8 @@ from fustor_common.models import (
     AdminCredentials,
     DatastoreConfig,
 )
+
+
 
 def test_response_base():
     response = ResponseBase()
