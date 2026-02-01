@@ -206,13 +206,14 @@ reset() / cleanup_expired_suspects()  # Optional
    - 提取 EventBase 的 FS 特定字段
    - 定义 SCHEMA_NAME, SCHEMA_VERSION
 
-### Phase 2: Agent 重构
+### Phase 2: Agent 重构 🔄 进行中
 
-5. **重命名 pusher → sender**
-   - `packages/pusher-fusion/` → `packages/sender-http/`
-   - 配置目录调整
+5. ✅ **重命名 pusher → sender**
+   - `packages/sender-http/` - 新包，实现 Sender 抽象
+   - `packages/pusher-fusion/` - 废弃，重定向到 sender-http
+   - `senders-config.yaml` - 新配置加载器，兼容 pushers-config.yaml
 
-6. **重构 SyncInstance → Pipeline**
+6. ⬜ **重构 SyncInstance → Pipeline** (暂缓)
    - 提取通用逻辑到 Pipeline
    - FS 特有逻辑保留在 FSSourceHandler
 
