@@ -5,7 +5,7 @@ Configuration loaders for YAML-based configuration files.
 New configuration model (V2):
 - receivers-config.yaml: Transport endpoints and API keys
 - views-config/*.yaml: View handler configurations
-- fusion-pipes-config/*.yaml: Pipeline configurations (planned)
+- fusion-pipes-config/*.yaml: Pipeline configurations (Receiver → View binding)
 
 Legacy configuration (deprecated):
 - datastores-config.yaml: Combined API keys and settings (use receivers-config.yaml)
@@ -13,6 +13,7 @@ Legacy configuration (deprecated):
 from .datastores import DatastoresConfigLoader, DatastoreConfig, datastores_config
 from .views import ViewsConfigLoader, ViewConfig, views_config
 from .receivers import ReceiversConfigLoader, ReceiverConfig, receivers_config
+from .pipelines import FusionPipelinesConfigLoader, FusionPipelineConfig, fusion_pipelines_config
 from .validators import validate_url_safe_id
 
 __all__ = [
@@ -20,6 +21,10 @@ __all__ = [
     "ReceiversConfigLoader",
     "ReceiverConfig",
     "receivers_config",
+    # Pipelines
+    "FusionPipelinesConfigLoader",
+    "FusionPipelineConfig",
+    "fusion_pipelines_config",
     # Views
     "ViewsConfigLoader",
     "ViewConfig",
@@ -31,3 +36,4 @@ __all__ = [
     # Validators
     "validate_url_safe_id",
 ]
+
