@@ -88,9 +88,10 @@ class TestFusionPipelineInit:
         assert fusion_pipeline.allow_concurrent_push == pipeline_config["allow_concurrent_push"]
         assert fusion_pipeline.queue_batch_size == pipeline_config["queue_batch_size"]
     
-    def test_dto(self, fusion_pipeline):
+    @pytest.mark.asyncio
+    async def test_dto(self, fusion_pipeline):
         """get_dto should return pipeline info."""
-        dto = fusion_pipeline.get_dto()
+        dto = await fusion_pipeline.get_dto()
         assert dto["id"] == "test-pipeline"
         assert dto["datastore_id"] == "1"
         assert "mock-view" in dto["view_handlers"]
@@ -130,7 +131,7 @@ class TestFusionPipelineSession:
         
         await fusion_pipeline.on_session_created("sess-1", task_id="agent:sync")
         
-        assert fusion_pipeline.get_session_role("sess-1") == "leader"
+        assert await fusion_pipeline.get_session_role("sess-1") == "leader"
         assert mock_view_handler.session_starts == 1
         
         await fusion_pipeline.stop()
@@ -143,8 +144,8 @@ class TestFusionPipelineSession:
         await fusion_pipeline.on_session_created("sess-1", task_id="agent1:sync")
         await fusion_pipeline.on_session_created("sess-2", task_id="agent2:sync")
         
-        assert fusion_pipeline.get_session_role("sess-1") == "leader"
-        assert fusion_pipeline.get_session_role("sess-2") == "follower"
+        assert await fusion_pipeline.get_session_role("sess-1") == "leader"
+        assert await fusion_pipeline.get_session_role("sess-2") == "follower"
         
         await fusion_pipeline.stop()
     
@@ -158,7 +159,7 @@ class TestFusionPipelineSession:
         
         await fusion_pipeline.on_session_closed("sess-1")
         
-        assert fusion_pipeline.get_session_role("sess-2") == "leader"
+        assert await fusion_pipeline.get_session_role("sess-2") == "leader"
         
         await fusion_pipeline.stop()
 

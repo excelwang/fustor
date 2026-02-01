@@ -13,6 +13,7 @@ from typing import Optional, Any, Dict, TYPE_CHECKING, Iterator
 from fustor_core.pipeline import Pipeline, PipelineState
 from fustor_core.pipeline.handler import SourceHandler
 from fustor_core.pipeline.sender import SenderHandler
+from fustor_core.models.states import SyncState, SyncInstanceDTO
 
 if TYPE_CHECKING:
     from fustor_core.pipeline import PipelineContext
@@ -53,6 +54,7 @@ class AgentPipeline(Pipeline):
         source_handler: SourceHandler,
         sender_handler: SenderHandler,
         event_bus: Optional["EventBusInstanceRuntime"] = None,
+        bus_service: Any = None,
         context: Optional["PipelineContext"] = None
     ):
         """
@@ -65,6 +67,7 @@ class AgentPipeline(Pipeline):
             source_handler: Handler for reading source data
             sender_handler: Handler for sending data to Fusion
             event_bus: Optional event bus for inter-component messaging
+            bus_service: Optional service for bus management
             context: Optional shared context
         """
         super().__init__(pipeline_id, config, context)
@@ -73,6 +76,7 @@ class AgentPipeline(Pipeline):
         self.source_handler = source_handler
         self.sender_handler = sender_handler
         self._bus = event_bus  # Private attribute for bus
+        self._bus_service = bus_service
         
         # Role tracking (from heartbeat response)
         self.current_role: Optional[str] = None  # "leader" or "follower"
@@ -112,6 +116,15 @@ class AgentPipeline(Pipeline):
         
         self._set_state(PipelineState.INITIALIZING, "Starting pipeline...")
         
+        # Initialize handlers
+        try:
+            await self.source_handler.initialize()
+            await self.sender_handler.initialize()
+        except Exception as e:
+            self._set_state(PipelineState.ERROR, f"Initialization failed: {e}")
+            logger.error(f"Pipeline {self.id} initialization failed: {e}")
+            return
+
         # Start main control loop - it will handle session creation
         self._main_task = asyncio.create_task(self._run_control_loop())
     
@@ -152,6 +165,13 @@ class AgentPipeline(Pipeline):
                 logger.warning(f"Error closing session: {e}")
             await self.on_session_closed(self.session_id)
         
+        # Close handlers
+        try:
+            await self.source_handler.close()
+            await self.sender_handler.close()
+        except Exception as e:
+            logger.warning(f"Error closing handlers: {e}")
+
         self._set_state(PipelineState.STOPPED, "Stopped")
     
     async def on_session_created(self, session_id: str, **kwargs) -> None:
@@ -387,7 +407,56 @@ class AgentPipeline(Pipeline):
         """Execute realtime message synchronization."""
         logger.info(f"Pipeline {self.id}: Starting message sync")
         
-        # Get message iterator from source
+        if self._bus:
+            await self._run_bus_message_sync()
+        else:
+            await self._run_driver_message_sync()
+
+    async def _run_bus_message_sync(self) -> None:
+        """Execute message sync using EventBus."""
+        logger.info(f"Pipeline {self.id}: Reading from EventBus {self._bus.id}")
+        
+        try:
+            while self.is_running():
+                # Get events from bus
+                events = await self._bus.internal_bus.get_events_for(
+                    self.id, batch_size=self.batch_size, timeout=1.0
+                )
+                
+                if not events:
+                    continue
+                
+                # Send to Fusion
+                success, _ = await self.sender_handler.send_batch(
+                    self.session_id, events, {"phase": "realtime"}
+                )
+                
+                if success:
+                    self.statistics["events_pushed"] += len(events)
+                    # Commit to bus
+                    if self._bus_service:
+                        await self._bus_service.commit_and_handle_split(
+                            self._bus.id, 
+                            self.id, 
+                            len(events), 
+                            events[-1].index,
+                            self.config.get("fields_mapping", [])
+                        )
+                    else:
+                        await self._bus.internal_bus.commit(self.id, len(events), events[-1].index)
+                else:
+                    logger.warning(f"Pipeline {self.id}: Failed to send bus events")
+                    await asyncio.sleep(1.0) # Wait before retry
+                    
+        except asyncio.CancelledError:
+            logger.info(f"Bus message sync for {self.id} cancelled")
+            raise
+        except Exception as e:
+            logger.error(f"Pipeline {self.id} bus sync error: {e}", exc_info=True)
+            raise
+
+    async def _run_driver_message_sync(self) -> None:
+        """Execute message sync directly from driver."""
         # Pass a stop event if possible for better cleanup
         stop_event = threading.Event()
         msg_iter = self.source_handler.get_message_iterator(
@@ -413,7 +482,7 @@ class AgentPipeline(Pipeline):
                         self.statistics["events_pushed"] += len(batch)
                     batch = []
         except asyncio.CancelledError:
-            logger.info(f"Message sync for {self.id} cancelled")
+            logger.info(f"Driver message sync for {self.id} cancelled")
             raise
         finally:
             # Send remaining events in batch
@@ -537,10 +606,9 @@ class AgentPipeline(Pipeline):
         """Legacy access to event bus."""
         return self._bus
 
-    def get_dto(self) -> "SyncInstanceDTO":
+    def get_dto(self) -> SyncInstanceDTO:
         """Get pipeline data transfer object compatible with SyncInstanceDTO."""
         # Map PipelineState to SyncState
-        from fustor_core.models.states import SyncState, SyncInstanceDTO
         
         state = SyncState.STOPPED
         if self.state & PipelineState.SNAPSHOT_PHASE:

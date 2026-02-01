@@ -75,6 +75,24 @@ class SourceDriverService(SourceDriverServiceInterface): # Inherit from the inte
         except Exception:
             return True
 
+    def is_driver_transient(self, driver_type: str, config: Any = None) -> bool:
+        """Checks if a driver type is transient."""
+        try:
+            driver_class = self._get_driver_by_type(driver_type)
+            # If we have config, we can instantiate to check property
+            if config:
+                probe = driver_class(id="probe", config=config)
+                return probe.is_transient
+            
+            # Fallback: check if the class itself has it (rare) or check property on class
+            prop = getattr(driver_class, "is_transient", None)
+            if isinstance(prop, property):
+                # We really need an instance to check a property
+                return False # Default to non-transient
+            return bool(prop)
+        except Exception:
+            return False
+
     async def get_wizard_definition_by_type(self, driver_type: str) -> Dict[str, Any]:
         """Gets the wizard step definitions for a given driver type by calling the class method."""
         try:

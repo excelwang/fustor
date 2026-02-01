@@ -75,6 +75,7 @@ class PipelineBridge:
         source_config: SourceConfig,
         sender_config: SenderConfig,
         event_bus: Optional["EventBusInstanceRuntime"] = None,
+        bus_service: Any = None,
         initial_statistics: Optional[Dict[str, Any]] = None
     ) -> AgentPipeline:
         """
@@ -90,6 +91,7 @@ class PipelineBridge:
             source_config: Source configuration
             sender_config: Sender configuration  
             event_bus: Optional event bus
+            bus_service: Optional bus service for the pipeline
             initial_statistics: Optional initial statistics
             
         Returns:
@@ -144,7 +146,8 @@ class PipelineBridge:
             config=pipeline_config,
             source_handler=source_handler,
             sender_handler=sender_handler,
-            event_bus=event_bus
+            event_bus=event_bus,
+            bus_service=bus_service
         )
         
         if initial_statistics:

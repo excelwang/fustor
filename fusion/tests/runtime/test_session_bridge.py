@@ -26,20 +26,24 @@ def mock_pipeline():
     pipeline.on_session_closed = AsyncMock()
     
     # Mock get_session_role
-    def get_role(session_id):
+    async def get_role(session_id):
         session = pipeline._active_sessions.get(session_id)
         return session.get("role", "unknown") if session else "unknown"
     
     pipeline.get_session_role = get_role
     
     # Mock get_session_info - returns session info with session_id added, or None if not found
-    def get_session_info(session_id):
+    async def get_session_info(session_id):
         session = pipeline._active_sessions.get(session_id)
         if session:
             return {**session, "session_id": session_id}
         return None
     
     pipeline.get_session_info = get_session_info
+    
+    async def get_all_sessions():
+        return {sid: {**s, "session_id": sid} for sid, s in pipeline._active_sessions.items()}
+    pipeline.get_all_sessions = get_all_sessions
     
     return pipeline
 
@@ -48,10 +52,11 @@ def mock_pipeline():
 def mock_session_manager():
     """Create a mock SessionManager."""
     manager = MagicMock()
-    manager.create_session_entry = MagicMock()
-    manager.keep_session_alive = MagicMock()
-    manager.remove_session = MagicMock()
-    manager.get_session_info = MagicMock(return_value=None)
+    manager.create_session_entry = AsyncMock()
+    manager.keep_session_alive = AsyncMock()
+    manager.terminate_session = AsyncMock()
+    manager.remove_session = AsyncMock()
+    manager.get_session_info = AsyncMock(return_value=None)
     return manager
 
 
@@ -79,28 +84,33 @@ class TestSessionCreation:
     @pytest.mark.asyncio
     async def test_create_session(self, session_bridge, mock_pipeline, mock_session_manager):
         """create_session should create in both systems."""
-        # Simulate pipeline setting role
-        async def set_role(session_id, **kwargs):
-            mock_pipeline._active_sessions[session_id] = {"role": "leader"}
-        
-        mock_pipeline.on_session_created = set_role
-        
-        result = await session_bridge.create_session(
-            task_id="agent-1:sync-1",
-            client_ip="192.168.1.1",
-            session_timeout_seconds=60
-        )
-        
-        # Verify session manager was called
-        mock_session_manager.create_session_entry.assert_called_once()
-        call_args = mock_session_manager.create_session_entry.call_args
-        assert call_args.kwargs["datastore_id"] == 1
-        assert call_args.kwargs["task_id"] == "agent-1:sync-1"
-        assert call_args.kwargs["client_ip"] == "192.168.1.1"
-        
-        # Verify result
-        assert "session_id" in result
-        assert result["timeout_seconds"] == 60
+        # Wrap everything in a patch for datastore_state_manager to avoid side effects
+        with patch("fustor_fusion.datastore_state_manager.datastore_state_manager.try_become_leader", AsyncMock(return_value=True)), \
+             patch("fustor_fusion.datastore_state_manager.datastore_state_manager.set_authoritative_session", AsyncMock()), \
+             patch("fustor_fusion.datastore_state_manager.datastore_state_manager.lock_for_session", AsyncMock()):
+            
+            # Simulate pipeline setting role
+            async def set_role(session_id, **kwargs):
+                mock_pipeline._active_sessions[session_id] = {"role": "leader"}
+            
+            mock_pipeline.on_session_created = set_role
+            
+            result = await session_bridge.create_session(
+                task_id="agent-1:sync-1",
+                client_ip="192.168.1.1",
+                session_timeout_seconds=60
+            )
+            
+            # Verify session manager was called
+            mock_session_manager.create_session_entry.assert_called_once()
+            call_args = mock_session_manager.create_session_entry.call_args
+            assert call_args.kwargs["datastore_id"] == 1
+            assert call_args.kwargs["task_id"] == "agent-1:sync-1"
+            assert call_args.kwargs["client_ip"] == "192.168.1.1"
+            
+            # Verify result
+            assert "session_id" in result
+            assert result["timeout_seconds"] == 60
     
     @pytest.mark.asyncio
     async def test_create_session_returns_role(self, session_bridge, mock_pipeline):
@@ -147,56 +157,70 @@ class TestSessionClose:
     @pytest.mark.asyncio
     async def test_close_session(self, session_bridge, mock_pipeline, mock_session_manager):
         """close_session should close in both systems."""
-        # First create a session
-        async def set_role(session_id, **kwargs):
-            mock_pipeline._active_sessions[session_id] = {"role": "leader"}
-        
-        mock_pipeline.on_session_created = set_role
-        mock_pipeline.on_session_closed = AsyncMock()
-        
-        create_result = await session_bridge.create_session(task_id="agent:sync")
-        session_id = create_result["session_id"]
-        
-        # Close session
-        result = await session_bridge.close_session(session_id)
-        
-        # Verify session manager was called
-        mock_session_manager.remove_session.assert_called_once()
-        
-        # Verify pipeline was called
-        mock_pipeline.on_session_closed.assert_called_once_with(session_id)
-        
-        assert result is True
+        with patch("fustor_fusion.datastore_state_manager.datastore_state_manager.unlock_for_session", AsyncMock()), \
+             patch("fustor_fusion.datastore_state_manager.datastore_state_manager.release_leader", AsyncMock()):
+            # First create a session
+            async def set_role(session_id, **kwargs):
+                mock_pipeline._active_sessions[session_id] = {"role": "leader"}
+            
+            mock_pipeline.on_session_created = set_role
+            mock_pipeline.on_session_closed = AsyncMock()
+            
+            # Initialize map
+            session_bridge._session_datastore_map["sess-123"] = 1
+            
+            # Close session
+            result = await session_bridge.close_session("sess-123")
+            
+            # Verify session manager was called (terminate_session is used now)
+            mock_session_manager.terminate_session.assert_called_once_with(
+                datastore_id=1,
+                session_id="sess-123"
+            )
+            
+            # Verify pipeline was called
+            mock_pipeline.on_session_closed.assert_called_once_with("sess-123")
+            
+            assert result is True
 
 
 class TestGetSessionInfo:
     """Test session info retrieval."""
     
-    def test_get_session_info_from_pipeline(self, session_bridge, mock_pipeline):
+    @pytest.mark.asyncio
+    async def test_get_session_info_from_pipeline(self, session_bridge, mock_pipeline):
         """get_session_info should get info from pipeline first."""
         mock_pipeline._active_sessions["sess-1"] = {
             "role": "leader",
             "task_id": "agent:sync"
         }
         
-        info = session_bridge.get_session_info("sess-1")
+        info = await session_bridge.get_session_info("sess-1")
         
         assert info["role"] == "leader"
         assert info["session_id"] == "sess-1"
     
-    def test_get_session_info_fallback_to_legacy(self, session_bridge, mock_session_manager):
+    @pytest.mark.asyncio
+    async def test_get_session_info_fallback_to_legacy(self, session_bridge, mock_session_manager):
         """get_session_info should fallback to session manager."""
         session_bridge._session_datastore_map["sess-1"] = 1
-        mock_session_manager.get_session_info.return_value = {"task_id": "old"}
+        mock_session_info = MagicMock()
+        mock_session_info.session_id = "sess-1"
+        mock_session_info.task_id = "old"
+        mock_session_info.client_ip = "1.2.3.4"
         
-        info = session_bridge.get_session_info("sess-1")
+        mock_session_manager.get_session_info.return_value = mock_session_info
         
-        assert info == {"task_id": "old"}
+        info = await session_bridge.get_session_info("sess-1")
+        
+        assert info["task_id"] == "old"
+        assert info["session_id"] == "sess-1"
         mock_session_manager.get_session_info.assert_called_once_with(1, "sess-1")
     
-    def test_get_session_info_not_found(self, session_bridge):
+    @pytest.mark.asyncio
+    async def test_get_session_info_not_found(self, session_bridge):
         """get_session_info should return None if not found."""
-        info = session_bridge.get_session_info("nonexistent")
+        info = await session_bridge.get_session_info("nonexistent")
         assert info is None
 
 

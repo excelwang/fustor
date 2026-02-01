@@ -26,6 +26,7 @@ class PipelineManager:
         self._pipelines: Dict[str, FusionPipeline] = {}
         self._receivers: Dict[str, Receiver] = {}
         self._bridges: Dict[str, Any] = {}
+        self._session_to_pipeline: Dict[str, str] = {}
         self._lock = asyncio.Lock()
     
     def load_receivers(self):
@@ -129,38 +130,60 @@ class PipelineManager:
     async def _on_session_created(
         self, session_id: str, task_id: str, pipeline_id: str, client_info: Dict[str, Any]
     ) -> SessionInfo:
-        pipeline = self._pipelines.get(pipeline_id)
-        if not pipeline:
-            raise ValueError(f"Pipeline {pipeline_id} not found")
-        
-        await pipeline.on_session_created(session_id, task_id=task_id, **client_info)
-        role = await pipeline.get_session_role(session_id)
-        
-        return SessionInfo(
-            session_id=session_id,
-            task_id=task_id,
-            pipeline_id=pipeline_id,
-            role=role,
-            created_at=time.time(),
-            last_heartbeat=time.time()
-        )
+        async with self._lock:
+            pipeline = self._pipelines.get(pipeline_id)
+            if not pipeline:
+                raise ValueError(f"Pipeline {pipeline_id} not found")
+            
+            bridge = self._bridges.get(pipeline_id)
+            if bridge:
+                # Use bridge to sync with legacy SessionManager
+                result = await bridge.create_session(
+                    task_id=task_id,
+                    client_ip=client_info.get("client_ip"),
+                    session_id=session_id
+                )
+                role = result["role"]
+            else:
+                await pipeline.on_session_created(session_id, task_id=task_id, **client_info)
+                role = await pipeline.get_session_role(session_id)
+            
+            # Register mapping
+            self._session_to_pipeline[session_id] = pipeline_id
+            
+            return SessionInfo(
+                session_id=session_id,
+                task_id=task_id,
+                pipeline_id=pipeline_id,
+                role=role,
+                created_at=time.time(),
+                last_heartbeat=time.time()
+            )
 
     async def _on_event_received(
         self, session_id: str, events: List[EventBase], source_type: str, is_end: bool
     ) -> bool:
-        for pipeline in self._pipelines.values():
-            if await pipeline.get_session_info(session_id):
+        pipeline_id = self._session_to_pipeline.get(session_id)
+        if pipeline_id:
+            pipeline = self._pipelines.get(pipeline_id)
+            if pipeline:
                 result = await pipeline.process_events(
                     events, session_id, source_type, is_end=is_end
                 )
                 return result.get("success", False)
         
-        logger.warning(f"Session {session_id} not found in any pipeline")
+        logger.warning(f"Session {session_id} not found in any pipeline mapping")
         return False
 
     async def _on_heartbeat(self, session_id: str) -> Dict[str, Any]:
-        for pipeline in self._pipelines.values():
-            if await pipeline.get_session_info(session_id):
+        pipeline_id = self._session_to_pipeline.get(session_id)
+        if pipeline_id:
+            bridge = self._bridges.get(pipeline_id)
+            if bridge:
+                return await bridge.keep_alive(session_id)
+            
+            pipeline = self._pipelines.get(pipeline_id)
+            if pipeline:
                 await pipeline.keep_session_alive(session_id)
                 return {
                     "role": await pipeline.get_session_role(session_id),
@@ -169,10 +192,16 @@ class PipelineManager:
         return {"status": "error", "message": "Session not found"}
 
     async def _on_session_closed(self, session_id: str):
-        for pipeline in self._pipelines.values():
-            if await pipeline.get_session_info(session_id):
-                await pipeline.on_session_closed(session_id)
-                break
+        async with self._lock:
+            pipeline_id = self._session_to_pipeline.pop(session_id, None)
+            if pipeline_id:
+                bridge = self._bridges.get(pipeline_id)
+                if bridge:
+                    await bridge.close_session(session_id)
+                else:
+                    pipeline = self._pipelines.get(pipeline_id)
+                    if pipeline:
+                        await pipeline.on_session_closed(session_id)
 
 # Global singleton
 pipeline_manager = PipelineManager()

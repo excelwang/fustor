@@ -77,13 +77,35 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
                 source_driver_service=self.source_driver_service
             )
             
+            # NEW: EventBus integration
+            event_bus = None
+            is_transient = self.source_driver_service.is_driver_transient(source_config.driver, source_config)
+            
+            if not is_transient:
+                try:
+                    # We assume start from position 0 for new pipelines (or from saved state TBD)
+                    # Mapping comes from source_config or sync_config? 
+                    field_mappings = getattr(sync_config, "fields_mapping", [])
+                    
+                    event_bus, _ = await self.bus_service.get_or_create_bus_for_subscriber(
+                        source_id=sync_config.source,
+                        source_config=source_config,
+                        sync_id=id,
+                        required_position=0, 
+                        fields_mapping=field_mappings
+                    )
+                    self.logger.info(f"Subscribed to EventBus {event_bus.id} for sync '{id}'")
+                except Exception as e:
+                    self.logger.warning(f"Failed to acquire EventBus for '{id}': {e}. Falling back to direct driver.")
+
             pipeline = bridge.create_pipeline(
                 pipeline_id=id,
                 agent_id=self.agent_id,
                 sync_config=sync_config,
                 source_config=source_config,
                 sender_config=sender_config,
-                event_bus=None  # EventBus integration TBD
+                event_bus=event_bus,
+                bus_service=self.bus_service
             )
             
             self.pool[id] = pipeline

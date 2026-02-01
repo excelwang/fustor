@@ -77,7 +77,8 @@ class PipelineSessionBridge:
         task_id: str,
         client_ip: Optional[str] = None,
         session_timeout_seconds: Optional[int] = None,
-        allow_concurrent_push: Optional[bool] = None
+        allow_concurrent_push: Optional[bool] = None,
+        session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Create a session in both Pipeline and SessionManager.
@@ -87,6 +88,7 @@ class PipelineSessionBridge:
             client_ip: Client IP address
             session_timeout_seconds: Session timeout
             allow_concurrent_push: Whether to allow concurrent push
+            session_id: Optional session ID to use (if already generated)
             
         Returns:
             Session info dict with session_id, role, etc.
@@ -94,11 +96,20 @@ class PipelineSessionBridge:
         import uuid
         import time
         
-        session_id = str(uuid.uuid4())
+        session_id = session_id or str(uuid.uuid4())
         datastore_id = int(self._pipeline.datastore_id)
         
+        from fustor_fusion.datastore_state_manager import datastore_state_manager
+        
+        # Leader/Follower election (First-Come-First-Serve)
+        is_leader = await datastore_state_manager.try_become_leader(datastore_id, session_id)
+        if is_leader:
+            await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
+            if not allow_concurrent_push:
+                await datastore_state_manager.lock_for_session(datastore_id, session_id)
+        
         # Create in legacy SessionManager
-        self._session_manager.create_session_entry(
+        await self._session_manager.create_session_entry(
             datastore_id=datastore_id,
             session_id=session_id,
             task_id=task_id,
@@ -108,10 +119,12 @@ class PipelineSessionBridge:
         )
         
         # Create in Pipeline
+        # Pass is_leader hint if the pipeline supports it
         await self._pipeline.on_session_created(
             session_id=session_id,
             task_id=task_id,
-            client_ip=client_ip
+            client_ip=client_ip,
+            is_leader=is_leader
         )
         
         # Track mapping
@@ -172,11 +185,17 @@ class PipelineSessionBridge:
         datastore_id = self._session_datastore_map.get(session_id)
         
         if datastore_id is not None:
-            # Remove from legacy SessionManager
-            await self._session_manager.remove_session(
+            # Remove from legacy SessionManager and release locks/leader
+            await self._session_manager.terminate_session(
                 datastore_id=datastore_id,
                 session_id=session_id
             )
+            
+            # Explicitly release leader/lock just in case terminate_session didn't cover everything
+            from fustor_fusion.datastore_state_manager import datastore_state_manager
+            await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+            await datastore_state_manager.release_leader(datastore_id, session_id)
+            
             if session_id in self._session_datastore_map:
                 del self._session_datastore_map[session_id]
         

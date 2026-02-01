@@ -248,8 +248,16 @@ class FusionPipeline(Pipeline):
             client_ip = kwargs.get("client_ip")
             
             # Determine role (leader/follower)
+            is_leader_hint = kwargs.get("is_leader")
             role = "follower"
-            if not self._leader_session:
+            
+            if is_leader_hint is True:
+                self._leader_session = session_id
+                role = "leader"
+            elif is_leader_hint is False:
+                role = "follower"
+            elif not self._leader_session:
+                # Default FCFS election if no hint provided
                 self._leader_session = session_id
                 role = "leader"
             
