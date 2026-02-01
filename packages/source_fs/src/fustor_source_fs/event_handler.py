@@ -37,27 +37,17 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
     Event handler that processes watchdog events immediately using dedicated
     on_* methods, which is the idiomatic way to use watchdog.
     """
-    def __init__(self, event_queue: queue.Queue, watch_manager: _WatchManager, logical_clock=None):
+    def __init__(self, event_queue: queue.Queue, watch_manager: _WatchManager):
         super().__init__()
         self.event_queue = event_queue
         self.watch_manager = watch_manager
-        self.logical_clock = logical_clock
         # Path -> last_sent_time mapping to throttle on_modified for files
         self.last_modified_sent: Dict[str, float] = {}
         self.throttle_interval = float(getattr(watch_manager, 'throttle_interval', 5.0))
 
     def _get_index(self, mtime=None):
-        if self.logical_clock:
-            if mtime is not None:
-                 # Problem 2 Fix: Strictly advance local logical clock with observed mtime
-                 self.logical_clock.update(float(mtime))
-            
-            # Index is ALWAYS the logic watermark * 1000 (ms)
-            return int(self.logical_clock.get_watermark() * 1000)
-        
-        # Fallback if no logical clock provided (should not happen in production)
-        if mtime is not None:
-            return int(mtime * 1000)
+        # Index is now purely based on physical time to avoid logical clock contamination
+        # from NFS future mtimes during event generation.
         return int(time.time() * 1000)
 
     def _touch_recursive_bottom_up(self, path: str):
@@ -157,6 +147,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
 
             if event.is_directory:
                 self.watch_manager.unschedule_recursive(event.src_path)
+            
             row = {"file_path": event.src_path}
             delete_event = DeleteEvent(
                 event_schema=self.watch_manager.root_path,

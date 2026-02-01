@@ -121,7 +121,7 @@ class _WatchManager:
     Manages a single inotify instance and its watches, including LRU pruning.
     This is a more resource-efficient implementation.
     """
-    def __init__(self, root_path: str, event_handler, min_monitoring_window_days: float = 30.0, stop_driver_event: threading.Event = None, logical_clock=None, throttle_interval: float = 5.0):
+    def __init__(self, root_path: str, event_handler, min_monitoring_window_days: float = 30.0, stop_driver_event: threading.Event = None, throttle_interval: float = 5.0):
         logger.info(f"Creating a new Inotify instance for root path {root_path}.")
         self.watch_limit = 10000000  # This now only limits watches, not instances.
         self.lru_cache = _LRUCache(self.watch_limit)
@@ -130,7 +130,6 @@ class _WatchManager:
         self._lock = threading.RLock()
         self.min_monitoring_window_days = min_monitoring_window_days
         self.stop_driver_event = stop_driver_event 
-        self.logical_clock = logical_clock
         self.throttle_interval = throttle_interval
 
         # Directly use the low-level Inotify class
@@ -139,23 +138,11 @@ class _WatchManager:
         # Use safe_path_encode to handle potential surrogate characters in root_path
         self.inotify = Inotify(safe_path_encode(root_path), recursive=False)
         
-        # Tether to current filesystem time if possible
-        if self.logical_clock:
-            try:
-                st = os.stat(root_path)
-                self.logical_clock.update(st.st_mtime)
-            except OSError:
-                pass
-
         self._stop_event = threading.Event()
         self.inotify_thread = threading.Thread(target=self._event_processing_loop, daemon=True)
 
     def _get_current_time(self) -> float:
-        """Returns the current time using logical clock if available, otherwise wall clock."""
-        if self.logical_clock:
-            return self.logical_clock.get_watermark()
-        if hasattr(self.event_handler, 'logical_clock') and self.event_handler.logical_clock:
-            return self.event_handler.logical_clock.get_watermark()
+        """Returns the current time (Agent physical time)."""
         return time.time()
 
     def _event_processing_loop(self):

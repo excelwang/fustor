@@ -23,9 +23,6 @@ from fustor_event_model.models import EventBase, UpdateEvent, DeleteEvent, Messa
 from .components import _WatchManager, safe_path_handling
 from .event_handler import OptimizedWatchEventHandler, get_file_metadata
 
-# Import LogicalClock for hybrid time synchronization
-from fustor_common.logical_clock import LogicalClock
-
 logger = logging.getLogger("fustor_agent.driver.fs")
             
 import threading
@@ -63,11 +60,8 @@ class FSDriver(SourceDriver):
         super().__init__(id, config)
         self.uri = self.config.uri
         self.event_queue: queue.Queue[EventBase] = queue.Queue()
-        self.clock_offset = 0.0
+        self.drift_from_nfs = 0.0
         self._stop_driver_event = threading.Event()
-        
-        # Logical clock for hybrid time synchronization
-        self._logical_clock = LogicalClock()
         
         min_monitoring_window_days = self.config.driver_params.get("min_monitoring_window_days", 30.0)
         throttle_interval = self.config.driver_params.get("throttle_interval_sec", 5.0)
@@ -76,13 +70,11 @@ class FSDriver(SourceDriver):
             event_handler=None, 
             min_monitoring_window_days=min_monitoring_window_days, 
             stop_driver_event=self._stop_driver_event, 
-            logical_clock=self._logical_clock,
             throttle_interval=throttle_interval
         )
         self.event_handler = OptimizedWatchEventHandler(
             self.event_queue, 
-            self.watch_manager, 
-            logical_clock=self._logical_clock
+            self.watch_manager
         )
         self.watch_manager.event_handler = self.event_handler
         self._pre_scan_completed = False
@@ -148,7 +140,6 @@ class FSDriver(SourceDriver):
                                     else:
                                         st = entry.stat(follow_symlinks=False)
                                         latest_mtime = max(latest_mtime, st.st_mtime)
-                                        self._logical_clock.update(st.st_mtime)
                                 except OSError:
                                     error_count += 1
 
@@ -199,44 +190,34 @@ class FSDriver(SourceDriver):
                     latest = max(latest, dir_mtime_map.get(subdir, 0))
                 dir_mtime_map[path] = latest
             
-            # Step 2: Zero offset - we trust NFS time implicitly now.
-            self.clock_offset = 0.0
-            logger.info(f"[fs] Client-server time delta normalization disabled (observation-driven mode).")
-
-            # Log final statistics before sorting
-            # Log final statistics before sorting
+            # Establish Shadow Reference Frame for Watch Scheduling
+            drift_from_nfs = 0.0
             if dir_mtime_map:
-                # CRITICAL: Initialize logical clock with the true recursive mtime of the ROOT
-                # This ensures our watermark starts at the latest moment observed anywhere in the tree.
+                # 1. Identify a 'Stable Horizon': Use the 99th percentile of mtimes to ignore outliers
+                mtimes = sorted(dir_mtime_map.values())
+                # Use the 99.9th percentile or high index to capture 'now' while ignoring 0.1% outliers
+                p99_idx = max(0, len(mtimes) - 1 - (len(mtimes) // 1000))
+                latest_mtime_stable = mtimes[p99_idx]
+                
+                # 2. Calculate the base drift between NFS (logical) and Agent (physical)
+                self.drift_from_nfs = latest_mtime_stable - time.time()
+                drift_from_nfs = self.drift_from_nfs
+                
+                # 3. Calculate logging stats
                 root_recursive_mtime = dir_mtime_map.get(self.uri, 0.0)
-                if root_recursive_mtime > 0:
-                    self._logical_clock.update(root_recursive_mtime)
-
-                now = self._logical_clock.get_watermark()
-                
-                # Optimization: root_recursive_mtime IS the newest timestamp in the tree by definition.
-                # We skip O(N) scan for newest_dir path to save time on large datasets.
-                newest_age = now - root_recursive_mtime
-                
-                # Finding oldest is still O(N) but less critical. Let's just log summary stats.
-                # oldest_dir = min(dir_mtime_map.items(), key=lambda x: x[1]) # Skipped for performance
+                newest_relative_age = latest_mtime_stable - root_recursive_mtime
                 
                 logger.info(
                     f"[fs] Pre-scan completed: processed {total_entries} entries, "
-                    f"errors: {error_count}, newest_age: {newest_age/86400:.2f} days (timestamp: {root_recursive_mtime})"
+                    f"errors: {error_count}, newest_relative_age: {newest_relative_age/86400:.2f} days, drift: {drift_from_nfs:.2f}s"
                 )
 
             logger.info(f"[fs] Found {len(dir_mtime_map)} total directories. Building capacity-aware, hierarchy-complete watch set...")
             sorted_dirs = sorted(dir_mtime_map.items(), key=lambda item: item[1], reverse=True)[:self.watch_manager.watch_limit]
             old_limit = self.watch_manager.watch_limit
-            for path, _ in sorted_dirs:
-                server_mtime = dir_mtime_map.get(path)
-                if server_mtime:
-                    # Normalize to client time domain while preserving relative differences
-                    lru_timestamp = server_mtime + self.clock_offset
-                else:
-                    # Fallback for parents that might not have been in mtime_map (though they should be)
-                    lru_timestamp = self._logical_clock.get_watermark()
+            for path, server_mtime in sorted_dirs:
+                # Normalize server_mtime into Agent's physical domain for stable TTL logic
+                lru_timestamp = server_mtime - drift_from_nfs
                 self.watch_manager.schedule(path, lru_timestamp)
                 if self.watch_manager.watch_limit < old_limit:
                     break  # Stop if we hit the limit during scheduling
@@ -257,18 +238,13 @@ class FSDriver(SourceDriver):
             
         file_pattern = driver_params.get("file_pattern", "*")
         batch_size = kwargs.get("batch_size", 100)
-        snapshot_time = int(self._logical_clock.get_watermark() * 1000)
+        snapshot_time = int(time.time() * 1000)
 
         results_queue = queue.Queue(maxsize=batch_size * 2)
         work_queue = queue.Queue()
         work_queue.put(self.uri)
         
-        # Initialize logical clock with root mtime to tether to NFS time domain
-        try:
-            root_st = os.stat(self.uri)
-            self._logical_clock.update(root_st.st_mtime)
-        except OSError:
-            pass
+        # Snapshot work baseline.
 
         pending_dirs = 1
         map_lock = threading.Lock()
@@ -306,7 +282,6 @@ class FSDriver(SourceDriver):
                                 elif fnmatch.fnmatch(entry.name, file_pattern):
                                     st = entry.stat()
                                     meta = get_file_metadata(entry.path, stat_info=st)
-                                    self._logical_clock.update(meta['modified_time'])
                                     latest_mtime_in_subtree = max(latest_mtime_in_subtree, meta['modified_time'])
                                     local_batch.append(meta)
                                     if len(local_batch) >= batch_size:
@@ -332,7 +307,7 @@ class FSDriver(SourceDriver):
                             index=snapshot_time
                         ))
                     
-                    self.watch_manager.touch(root, latest_mtime_in_subtree + self.clock_offset, is_recursive_upward=False)
+                    self.watch_manager.touch(root, latest_mtime_in_subtree - self.drift_from_nfs, is_recursive_upward=False)
 
                 except OSError:
                     pass
@@ -389,13 +364,6 @@ class FSDriver(SourceDriver):
         # This is essential for the message-first architecture and must block
         # until completion to prevent race conditions downstream.
         
-        # Initialize logical clock with root mtime to tether to NFS time domain
-        try:
-            root_st = os.stat(self.uri)
-            self._logical_clock.update(root_st.st_mtime)
-        except OSError:
-            pass
-
         self._perform_pre_scan_and_schedule()
 
         def _iterator_func() -> Iterator[EventBase]:
@@ -442,19 +410,13 @@ class FSDriver(SourceDriver):
             
         batch_size = kwargs.get("batch_size", 100)
         file_pattern = self.config.driver_params.get("file_pattern", "*")
-        audit_time = int(self._logical_clock.get_watermark() * 1000)
+        audit_time = int(time.time() * 1000)
         
         results_queue = queue.Queue(maxsize=batch_size * 2)
         work_queue = queue.Queue()
         work_queue.put((self.uri, None))
         
-        # Initialize logical clock with root mtime to tether to NFS time domain
-        try:
-            root_st = os.stat(self.uri)
-            self._logical_clock.update(root_st.st_mtime)
-        except OSError:
-            pass
-        
+        # Audit work baseline established by physical time.
         pending_dirs = 1
         map_lock = threading.Lock()
         stop_workers = threading.Event()
@@ -513,7 +475,6 @@ class FSDriver(SourceDriver):
                                 elif not is_silent and fnmatch.fnmatch(entry.name, file_pattern):
                                     st = entry.stat()
                                     meta = get_file_metadata(entry.path, stat_info=st)
-                                    self._logical_clock.update(meta['modified_time'])
                                     # Add parent info for Rule 3 arbitration
                                     meta['parent_path'] = root
                                     meta['parent_mtime'] = current_dir_mtime

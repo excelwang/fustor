@@ -138,7 +138,7 @@ Fusion 维护以下状态：
 - `path`: 文件路径
 - `mtime`: 最后修改时间（来自存储系统）
 - `size`: 文件大小
-- `last_updated_at`: Fusion 最后确认该文件状态点的逻辑时间戳（用于陈旧证据保护）
+- `last_updated_at`: Fusion 最后确认该文件状态点的本地物理时间戳（用于陈旧证据保护）
 
 ### 4.2 墓碑表 (Tombstone List)
 
@@ -278,14 +278,15 @@ else (Full Scan on D confirmed):
 
 | 轨道 | 定义 | 来源 | 核心用途 |
 | :--- | :--- | :--- | :--- |
-| **Physical Time** | Fusion Server 的系统时间 (`time.time()`) | Fusion 本地时钟 | 1. `last_updated_at` (新鲜度保护)<br>2. `last_audit_start` (审计周期)<br>3. `suspect_ttl` (状态过期)<br>4. **保底水位线** (Watchdog) |
-| **Logical Clock (Watermark)** | **NFS Server 的估算物理时间** | 算法合成 | **数据一致性核心基准**。<br>用于计算 Data Age，判定 Suspect 状态。 |
+| **Physical Time** | 全局物理流逝参考 (TA) | Fusion/Agent 本地时钟 | 1. **事件索引 (Index)**: Agent 捕获事件的物理时刻。<br>2. **LRU 归一化**: Agent 影子参考系的基准。<br>3. **保底水位线**: 用于计算 BaseLine 的物理轴。 |
+| **Logical Clock (Watermark)** | **NFS 数据域逻辑时间 (TL)** | 统计校准合成 | **数据一致性核心基准**。<br>用于计算 Data Age，判定 Suspect 状态，生成墓碑。 |
 
-### 6.2 核心差异点
+### 6.2 核心设计要点
 
-1.  **主动时钟**: 不再单纯被动依赖 `Max(mtime)`，而是基于 `AgentTime - Skew` 主动推进，免疫单点时钟跳变。
-2.  **信任窗口**: 在 `BaseLine + 1s` 范围内允许 FastPath 推进，兼顾实时性与稳定性。
-3.  **兜底机制**: 仅在冷启动无法计算 Skew 时使用 Fusion 本地时间兜底。
+1.  **物理锚定 (Physical Anchoring)**: Agent 侧彻底移除逻辑时钟模块，所有实时事件 `index` 锚定本地物理时间。
+2.  **影子参考系 (Shadow Reference Frame)**: Agent 内部通过 **P99 漂移校准算法** 将 NFS 时间映射到物理轴，保护 LRU 监听调度，免疫单点时钟跳变。
+3.  **物理引导演进**: 对于 `DELETE` 等无 `mtime` 的事件，Fusion 通过 `G_Skew` 将物理观察时刻映射到逻辑水位线，驱动 Watermark 稳健前进。
+4.  **信任窗口**: 在 `BaseLine + 1s` 范围内允许 FastPath 推进，兼顾实时性与稳定性。
 
 ### 6.3 应用场景裁决表
 

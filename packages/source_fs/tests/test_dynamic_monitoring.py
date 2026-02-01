@@ -49,19 +49,17 @@ def test_lru_pruning_and_cascading_unschedule(fs_config: SourceConfig, tmp_path:
             
             # Act
             # 1. Fill the watch manager up to its limit
-            base_ts = driver._logical_clock.get_watermark() + 1000
+            base_ts = time.time()
             for i in range(watch_limit):
-                timestamp = base_ts + i # Logical time
-                driver._logical_clock.update(timestamp)
+                timestamp = base_ts + i 
                 driver.watch_manager.schedule(str(dirs[i]), timestamp)
-
+            
             # 2. Access some to change LRU order. 0 is now the most recent.
             driver.watch_manager.touch(str(dirs[0]))
 
-            # 3. Add one more directory, which should trigger pruning of dir[1]
+            # 3. Add one more directory, which should trigger pruning of dir[1] (the oldest now)
             lru_path_to_be_evicted = str(dirs[1])
-            trigger_ts = base_ts + 4000 # Much larger to ensure scheduled
-            driver._logical_clock.update(trigger_ts)
+            trigger_ts = base_ts + 4000 
             driver.watch_manager.schedule(str(dirs[watch_limit]), trigger_ts)
 
             # Give event processing thread time to process the event

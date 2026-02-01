@@ -15,10 +15,8 @@
 
 Fustor 严格区分“数据一致性时间”与“系统运行时间”。
 
-| 轨道 | 定义 | 来源 | 作用 |
-| :--- | :--- | :--- | :--- |
-| **Physical Time** | Fusion Server 的系统时间 (`time.time()`) | Fusion 本地时钟 | 1. `last_updated_at` (新鲜度保护)<br>2. `last_audit_start` (审计周期)<br>3. `suspect_ttl` (状态过期)<br>4. **保底水位线** (Watchdog) |
-| **Logical Clock (Watermark)** | **NFS Server 的估算物理时间** | 算法合成 | **数据一致性核心基准**。<br>用于计算 Data Age，判定 Suspect 状态。 |
+| **Physical Time** | 全局物理流逝参考 (TA) | Fusion/Agent 本地时钟 | 1. **事件索引 (Index)**: Agent 捕获事件的物理时刻。<br>2. **LRU 归一化**: Agent 影子参考系的基准。<br>3. **保底水位线**: 用于计算 BaseLine 的物理轴。 |
+| **Logical Clock (Watermark)** | **NFS 数据域逻辑时间 (TL)** | 统计校准合成 | **数据一致性核心基准**。<br>用于计算 Data Age，判定 Suspect 状态，生成墓碑。 |
 
 ## 3. 稳健逻辑时钟算法 (Robust Logical Clock Algorithm)
 
@@ -26,8 +24,11 @@ Fustor 严格区分“数据一致性时间”与“系统运行时间”。
 
 ### 3.1 算法逻辑
 
-1.  **优先计算 (Primary)**: 尝试基于 `BaseLine` (AgentTime - Skew) 和 `FastPath` (信任窗口) 计算水位线。
-2.  **兜底 (Fallback)**: **仅当** 无法计算上述值时（例如系统冷启动且无实时事件样本），使用 `FusionLocalTime` 临时顶替水位线，以防止系统死锁。
+1.  **分层解耦 (Decoupling)**: Agent 侧彻底移除逻辑时钟，仅负责物理上报；Fusion 侧负责逻辑仲裁。
+2.  **物理锚定 (Physical Anchoring)**: 事件 `index` 始终为 Agent 物理时间，不仅用于排序，还作为 Fusion 计算 Skew 的“物理观测锚点”。
+3.  **影子参考系 (Shadow Reference Frame)**: Agent 内部通过 **P99 漂移校准算法** 将 NFS 时间映射到物理轴，保护 LRU 调度。
+4.  **优先计算 (Primary)**: Fusion 基于 `BaseLine` (AgentTime - Skew) 和 `FastPath` (信任窗口) 计算水位线。
+5.  **兜底 (Fallback)**: **仅当** 无法计算上述值时（例如系统冷启动且无实时事件样本），使用 `FusionLocalTime` 临时顶替水位线，以防止系统死锁。
 
 **注意**: 不应直接取 `max(..., FusionLocalTime)`，因为 Fusion 本地时钟可能与 NFS 存在固有偏差，强制取 Max 会破坏 Skew 校准结果。
 
@@ -55,9 +56,15 @@ Fustor 严格区分“数据一致性时间”与“系统运行时间”。
     *   `FastPath = mtime` (水位线立即推进到此)。
     *   通过此机制，系统的响应延迟理论上降为 0。
 
-#### C. 兜底机制 (Fallback Strategy)
-*   **FusionLocalTime**: 当系统冷启动导致样本不足无法计算 Skew 时，使用 Fusion 本地时间作为**临时水位线**。
-*   一旦累积了足够的样本并算出 `G_Skew`，立即切换回 `BaseLine` 模式，不再参考 Fusion 本地时间（除非再次发生所有 Session 断开的情况）。
+#### D. 影子参考系 (Agent-side Shadow Reference Frame)
+为防止 NFS 的时间跳变干扰 Agent 本身的资源管理（LRU）：
+1.  **P99 漂移采样**: Agent 在扫描时计算所有目录 `mtime` 的第 99.9 百分位点 $M_{p99}$，并计算 $Drift = M_{p99} - T_{phys}$。
+2.  **归一化调度**: LRU 排序和 30 天保护窗口使用 $M_{dir} - Drift$。这使得跳变到未来的孤立文件只会“自保”，而不会导致全树的归一化年龄被拉大而丢失监听。
+
+#### E. 删除事件处理 (Deletions)
+由于文件被删除后已无 `mtime`，系统采取 **“物理引导演进”**：
+1.  **Agent**: 发送 `mtime = None` 的删除事件，但携带高精度的物理 `index`。
+2.  **Fusion (LogicalClock.update)**: 识别到 `mtime` 为空，自动根据该 Agent 的 `G_Skew` 将水位线推进到 $BaseLine$，$Watermark$ 的前进由物理观察时刻驱动，确保墓碑 (Tombstone) 的逻辑新鲜度。
 
 ## 4. 事件处理策略表 (Arbitration Policies)
 

@@ -4,7 +4,7 @@ import time
 import heapq
 import logging
 import time
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Tuple, Optional
 from fustor_event_model.models import MessageSource, EventType
 from .state import FSState
 from .tree import TreeManager
@@ -46,8 +46,8 @@ class FSArbitrator:
             rows_processed += 1
             if rows_processed % 100 == 0: await asyncio.sleep(0)
 
-            # Update clock with row mtime
-            mtime = payload.get('modified_time', 0.0) or 0.0
+            # Update clock with row mtime. For deletions, mtime might be None.
+            mtime = payload.get('modified_time')
             
             # Extract Agent Time and Session ID for Robust Clock
             agent_time = None
@@ -69,7 +69,8 @@ class FSArbitrator:
             
             # Update latency (Lag) based on current watermark
             watermark = self.state.logical_clock.get_watermark()
-            self.state.last_event_latency = max(0.0, (watermark - mtime) * 1000.0)
+            effective_mtime_for_lag = mtime if mtime is not None else watermark
+            self.state.last_event_latency = max(0.0, (watermark - effective_mtime_for_lag) * 1000.0)
             
             if is_audit:
                 self.state.audit_seen_paths.add(path)
@@ -82,18 +83,12 @@ class FSArbitrator:
         
         return True
 
-    async def _handle_delete(self, path: str, is_realtime: bool, mtime: float):
+    async def _handle_delete(self, path: str, is_realtime: bool, mtime: Optional[float]):
         self.logger.debug(f"DEBUG_ARB: DELETE_EVENT for {path} realtime={is_realtime}")
         if is_realtime:
-            existing = self.state.get_node(path)
-            existing_mtime = existing.modified_time if existing else 0.0
-            
             await self.tree_manager.delete_node(path)
             
-            # Update clock with the time of deletion (either index or existing mtime)
-            self.state.logical_clock.update(existing_mtime)
-            
-            # Create Tombstone with Dual-Track timestamps
+            # Watermark has been updated in the caller loop using logical_clock.update()
             logical_ts = self.state.logical_clock.get_watermark()
             physical_ts = time.time()
             self.state.tombstone_list[path] = (logical_ts, physical_ts)

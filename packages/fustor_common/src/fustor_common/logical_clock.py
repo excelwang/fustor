@@ -69,17 +69,29 @@ class LogicalClock:
             return self.now()
             
         with self._lock:
-            # --- Legacy Mode (Fallback or No Context) ---
-            if agent_time is None or session_id is None:
+            # --- Legacy Mode (Fallback if NO agent_time provided) ---
+            if agent_time is None:
                 # If we have NO history (clock is 0), we must initialize using mtime
                 if self._value == 0.0:
-                     self._value = observed_mtime
-                elif observed_mtime > self._value:
+                     self._value = observed_mtime if observed_mtime is not None else 0.0
+                elif observed_mtime is not None and observed_mtime > self._value:
                      # Legacy behavior: blindly advance to newer mtime
-                     # We skip Trust Window/Skew checks because we lack agent context to calculate BaseLine.
-                     # This preserves backward compatibility for tests and non-agent sources.
                      self._value = observed_mtime
                 
+                return self._value
+
+            # Use a default session_id if none provided
+            if session_id is None:
+                session_id = "_default_local_session"
+            
+            # --- Special Case: Deletion/Metadata event (observed_mtime is None) ---
+            if observed_mtime is None:
+                g_skew = self._get_global_skew_locked()
+                if g_skew is not None:
+                    # Advance clock to BaseLine to reflect physical progress
+                    baseline = agent_time - g_skew
+                    if baseline > self._value:
+                        self._value = baseline
                 return self._value
 
             # --- Robust Mode ---
