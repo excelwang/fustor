@@ -286,8 +286,12 @@ reset() / cleanup_expired_suspects()  # Optional
    - PipelineBridge 迁移工具
    - 89 个 Pipeline 相关测试
 10. ✅ 废弃 datastores-config.yaml (添加废弃警告，优先 receivers-config)
-11. ⬜ 暂缓: Session 管理整合到 FusionPipeline
+11. ✅ Session 管理整合: PipelineSessionBridge
+    - 桥接 FusionPipeline 与 SessionManager
+    - 同步 session 创建/销毁
+    - 9 个单元测试
 12. ⬜ 暂缓: SyncInstance → AgentPipeline 完整迁移
 
-**当前测试状态**: 392 passed, 1 xfailed, 0 warnings
+**当前测试状态**: 401 passed, 1 xfailed, 0 warnings
+
 
