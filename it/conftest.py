@@ -220,7 +220,7 @@ sentinel_interval_sec: 1
     # 4. Start new agent
     docker_manager.exec_in_container(
         container_name, 
-        ["sh", "-c", "export FUSTOR_LOG_LEVEL=DEBUG && nohup fustor-agent start > /data/agent/console.log 2>&1 &"]
+        ["sh", "-c", "nohup fustor-agent start -V > /data/agent/console.log 2>&1 &"]
     )
 
 

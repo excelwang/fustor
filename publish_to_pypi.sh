@@ -61,7 +61,7 @@ publish_package "packages/event-model" "fustor-event-model"
 
 # --- Phase 2: Clients & Basic Connectors ---
 echo "--- Phase 2: Publishing Clients & Basic Connectors ---"
-publish_package "packages/web-ui" "fustor-web-ui"
+
 publish_package "packages/pusher-echo" "fustor-pusher-echo"
 publish_package "packages/pusher-openapi" "fustor-pusher-openapi"
 publish_package "packages/source-elasticsearch" "fustor-source-elasticsearch"

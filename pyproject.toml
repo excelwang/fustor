@@ -15,7 +15,6 @@ members = [
     "packages/source-fs",
     "packages/source-mysql",
     "packages/source-oss",
-    "packages/web-ui",
     "packages/demo",
     "packages/view-fs"
 ]
@@ -35,7 +34,6 @@ fustor-source-elasticsearch = { workspace = true }
 fustor-source-fs = { workspace = true }
 fustor-source-mysql = { workspace = true }
 fustor-source-oss = { workspace = true }
-fustor-web-ui = { workspace = true }
 fustor-demo = { workspace = true }
 fustor-view-fs = { workspace = true }
 
@@ -51,7 +49,6 @@ pythonpath = [
     "packages/source-fs/src",
     "packages/source-mysql/src",
     "packages/source-oss/src",
-    "packages/web-ui/src",
     "packages/demo/src",
     "packages/view-fs/src"
 ]
