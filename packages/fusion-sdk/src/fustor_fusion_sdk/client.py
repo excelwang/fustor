@@ -32,10 +32,31 @@ def sanitize_surrogate_characters(obj: Any) -> Any:
         return obj
 
 class FusionClient:
-    def __init__(self, base_url: str, api_key: str):
+    def __init__(self, base_url: str, api_key: str, api_version: str = "legacy"):
+        """
+        Initialize FusionClient.
+        
+        Args:
+            base_url: The base URL of the Fusion service
+            api_key: API key for authentication
+            api_version: API version to use ("pipe" uses /api/v1/pipe, "legacy" uses /api/v1/ingest)
+        """
         self.base_url = base_url
         self.api_key = api_key
+        self.api_version = api_version
         self.client = httpx.AsyncClient(base_url=self.base_url, headers={"X-API-Key": self.api_key})
+        
+        # Set API paths based on version
+        if api_version == "legacy":
+            # Legacy paths for backward compatibility
+            self._session_path = "/api/v1/ingest/sessions"
+            self._events_path = "/api/v1/ingest/events"
+            self._consistency_path = "/api/v1/ingest/consistency"
+        else:
+            # New pipe-based paths (recommended)
+            self._session_path = "/api/v1/pipe/session"
+            self._events_path = "/api/v1/pipe/ingest"
+            self._consistency_path = "/api/v1/pipe/consistency"
 
     async def create_session(self, task_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -44,7 +65,7 @@ class FusionClient:
         try:
             # Sanitize task_id to handle any surrogate characters before JSON serialization
             payload = {"task_id": task_id}
-            response = await self.client.post("/api/v1/ingest/sessions/", json=payload)
+            response = await self.client.post(f"{self._session_path}/", json=payload)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -59,7 +80,7 @@ class FusionClient:
         Retrieves generic sentinel tasks (e.g. suspect checks).
         """
         try:
-            response = await self.client.get(f"/api/v1/ingest/consistency/sentinel/tasks")
+            response = await self.client.get(f"{self._consistency_path}/sentinel/tasks")
             response.raise_for_status()
             return response.json()
         except Exception as e:
@@ -71,7 +92,7 @@ class FusionClient:
         Submits feedback for sentinel tasks.
         """
         try:
-            response = await self.client.post("/api/v1/ingest/consistency/sentinel/feedback", json=feedback)
+            response = await self.client.post(f"{self._consistency_path}/sentinel/feedback", json=feedback)
             response.raise_for_status()
             return True
         except Exception as e:
@@ -94,7 +115,7 @@ class FusionClient:
                 "source_type": sanitized_source_type,
                 "is_snapshot_end": is_snapshot_end
             }
-            response = await self.client.post("/api/v1/ingest/events/", json=payload)
+            response = await self.client.post(f"{self._events_path}/", json=payload)
             response.raise_for_status()
             return True
         except httpx.HTTPStatusError as e:
@@ -111,7 +132,7 @@ class FusionClient:
         """
         try:
             headers = {"session-id": session_id}
-            response = await self.client.post("/api/v1/ingest/sessions/heartbeat", headers=headers)
+            response = await self.client.post(f"{self._session_path}/heartbeat", headers=headers)
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
@@ -125,7 +146,7 @@ class FusionClient:
         """Signals the start of an audit cycle."""
         try:
              # Updated to new consistency API path
-             response = await self.client.post("/api/v1/ingest/consistency/audit/start")
+             response = await self.client.post(f"{self._consistency_path}/audit/start")
              response.raise_for_status()
              return True
         except Exception as e:
@@ -136,7 +157,7 @@ class FusionClient:
         """Signals the end of an audit cycle."""
         try:
              # Updated to new consistency API path
-             response = await self.client.post("/api/v1/ingest/consistency/audit/end")
+             response = await self.client.post(f"{self._consistency_path}/audit/end")
              response.raise_for_status()
              return True
         except Exception as e:
