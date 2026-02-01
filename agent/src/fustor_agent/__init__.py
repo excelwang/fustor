@@ -61,42 +61,6 @@ def get_app_config() -> AppConfig:
             s_dict = s_yaml.model_dump(exclude={'id'})
             valid_syncs[s_id] = SyncConfig(**s_dict)
 
-        # 4. Backward Compatibility Check: Legacy agent-config.yaml
-        # If we have no sources and no pushers from the new files, try the old file.
-        if not valid_sources and not valid_pushers:
-            config_file_path = os.environ.get("FUSTOR_AGENT_CONFIG") or os.path.join(CONFIG_DIR, CONFIG_FILE_NAME)
-            if os.path.exists(config_file_path):
-                logger.info(f"Attempting to load legacy config from {config_file_path}")
-                try:
-                    with open(config_file_path, 'r', encoding='utf-8') as f:
-                        raw_data = yaml.safe_load(f) or {}
-                    
-                    # Merge sources if not already loaded from separate file
-                    if not valid_sources:
-                        for s_id, config_data in raw_data.get('sources', {}).items():
-                            try:
-                                valid_sources[s_id] = SourceConfig(**config_data)
-                            except Exception as e:
-                                logger.error(f"Legacy source '{s_id}' invalid: {e}")
-                    
-                    # Merge pushers if not already loaded from separate file
-                    if not valid_pushers:
-                        for p_id, config_data in raw_data.get('pushers', {}).items():
-                            try:
-                                valid_pushers[p_id] = PusherConfig(**config_data)
-                            except Exception as e:
-                                logger.error(f"Legacy pusher '{p_id}' invalid: {e}")
-                                
-                    # Merge syncs if not already loaded from directory
-                    if not valid_syncs:
-                        for sy_id, config_data in raw_data.get('syncs', {}).items():
-                            try:
-                                valid_syncs[sy_id] = SyncConfig(**config_data)
-                            except Exception as e:
-                                logger.error(f"Legacy sync '{sy_id}' invalid: {e}")
-                except Exception as e:
-                    logger.warning(f"Failed to load legacy config: {e}")
-
         _app_config_instance = AppConfig(
             sources=SourceConfigDict(root=valid_sources),
             pushers=PusherConfigDict(root=valid_pushers),

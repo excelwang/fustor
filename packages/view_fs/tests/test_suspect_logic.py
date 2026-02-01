@@ -10,6 +10,8 @@ from fustor_event_model.models import UpdateEvent, MessageSource, EventType
 def parser():
     p = FSViewProvider(datastore_id="1", view_id="test_view")
     p.hot_file_threshold = 30.0
+    # Reset clock to a small value so 1000.0 is considered "hot" (vs time.time())
+    p._logical_clock.reset(0.001)
     return p
 
 @pytest.mark.asyncio

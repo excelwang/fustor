@@ -53,14 +53,10 @@ class PushersConfigLoader:
             if not isinstance(data, dict):
                 data = {}
 
-            # Support both flat and nested 'pushers' key for compatibility
             candidates = []
-            if "pushers" in data and isinstance(data["pushers"], dict):
-                candidates.extend(data["pushers"].items())
             
             for k, v in data.items():
-                if k != "pushers":
-                    candidates.append((k, v))
+                candidates.append((k, v))
             
             for p_id, p_data in candidates:
                 if not isinstance(p_data, dict):

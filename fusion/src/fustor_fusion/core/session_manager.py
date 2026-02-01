@@ -5,7 +5,7 @@ import logging
 from fustor_fusion_sdk.interfaces import SessionManagerInterface, SessionInfo # Import the interface and SessionInfo
 from ..in_memory_queue import memory_event_queue # NEW
 
-from ..config import fusion_config
+from ..config import datastores_config
 
 logger = logging.getLogger(__name__)
 
@@ -13,12 +13,12 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
     """
     内存中的session管理器，用于跟踪所有活跃的session
     """
-    def __init__(self, default_session_timeout: int = None):
+    def __init__(self, default_session_timeout: int = 30):
         # {datastore_id: {session_id: SessionInfo}}
         self._sessions: Dict[int, Dict[str, SessionInfo]] = {}
         self._lock = asyncio.Lock()
         # Use configured timeout if not provided
-        self._default_session_timeout = default_session_timeout or fusion_config.FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS
+        self._default_session_timeout = default_session_timeout
         self._periodic_cleanup_task: Optional[asyncio.Task] = None
     
     async def create_session_entry(self, datastore_id: int, session_id: str, 

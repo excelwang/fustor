@@ -9,7 +9,7 @@ View Drivers are discovered dynamically via the 'fustor.view_drivers' entry poin
 from typing import Dict, Any, Optional, Type
 from importlib.metadata import entry_points
 from fustor_core.drivers import ViewDriver
-from ..config import fusion_config, views_config
+from ..config import views_config
 import logging
 import asyncio
 from fustor_event_model.models import EventBase

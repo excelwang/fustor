@@ -11,7 +11,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 # --- Ingestor Service Specific Imports ---
-from .config import fusion_config, datastores_config
+from .config import datastores_config
 from .core.session_manager import session_manager
 from .datastore_state_manager import datastore_state_manager
 from .queue_integration import queue_based_ingestor, get_events_from_queue

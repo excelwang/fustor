@@ -54,19 +54,14 @@ class SourcesConfigLoader:
             if not isinstance(data, dict):
                 data = {}
 
-            # Support both flat and nested 'sources' key for compatibility
             candidates = []
-            if "sources" in data and isinstance(data["sources"], dict):
-                candidates.extend(data["sources"].items())
             
             for k, v in data.items():
-                if k != "sources":
-                    candidates.append((k, v))
+                candidates.append((k, v))
             
             for s_id, s_data in candidates:
                 if not isinstance(s_data, dict):
                     continue
-                
                 try:
                     s_id_str = str(s_id)
                     # Validate ID early

@@ -29,8 +29,6 @@ class DirectoryNode:
                 'size': self.size,
                 'modified_time': self.modified_time,
                 'created_time': self.created_time,
-                'mtime': self.modified_time,  # Alias for compatibility
-                'ctime': self.created_time,   # Alias for compatibility
                 'integrity_suspect': self.integrity_suspect
             })
 
@@ -82,8 +80,6 @@ class FileNode:
                 'size': self.size,
                 'modified_time': self.modified_time,
                 'created_time': self.created_time,
-                'mtime': self.modified_time,  # Alias for compatibility
-                'ctime': self.created_time,   # Alias for compatibility
                 'integrity_suspect': self.integrity_suspect
             })
         return result

@@ -58,11 +58,9 @@ class TestDatastoresConfigLoader:
         """Should load valid datastore config."""
         config_file = tmp_path / "datastores-config.yaml"
         config_file.write_text(yaml.dump({
-            "datastores": {
-                "test-ds": {
-                    "session_timeout_seconds": 60,
-                    "api_key": "fk_test123"
-                }
+            "test-ds": {
+                "session_timeout_seconds": 60,
+                "api_key": "fk_test123"
             }
         }))
         
@@ -71,7 +69,6 @@ class TestDatastoresConfigLoader:
         
         ds = loader.get_datastore("test-ds")
         assert ds is not None
-        assert ds.id == "test-ds"
         assert ds.session_timeout_seconds == 60
         assert ds.api_key == "fk_test123"
 
@@ -90,18 +87,17 @@ class TestDatastoresConfigLoader:
         
         ds = loader.get_datastore("test-ds")
         assert ds is not None
-        assert ds.id == "test-ds"
         assert ds.session_timeout_seconds == 60
         assert ds.api_key == "fk_test123"
     
     def test_validate_api_key(self, tmp_path):
         """Should validate API key and return datastore_id."""
+    def test_validate_api_key(self, tmp_path):
+        """Should validate API key and return datastore_id."""
         config_file = tmp_path / "datastores-config.yaml"
         config_file.write_text(yaml.dump({
-            "datastores": {
-                "ds1": {"api_key": "key1"},
-                "ds2": {"api_key": "key2"}
-            }
+            "ds1": {"api_key": "key1"},
+            "ds2": {"api_key": "key2"}
         }))
         
         loader = DatastoresConfigLoader(config_file)
@@ -115,9 +111,7 @@ class TestDatastoresConfigLoader:
         """Should save new API key to YAML file."""
         config_file = tmp_path / "datastores-config.yaml"
         config_file.write_text(yaml.dump({
-            "datastores": {
-                "ds1": {"api_key": "old_key"}
-            }
+            "ds1": {"api_key": "old_key"}
         }))
         
         loader = DatastoresConfigLoader(config_file)
@@ -129,9 +123,9 @@ class TestDatastoresConfigLoader:
         with open(config_file) as f:
             data = yaml.safe_load(f)
         
-        # Should respect the existing 'datastores' key if it was present
-        assert "datastores" in data
-        assert data["datastores"]["ds1"]["api_key"] == "new_key"
+        # Should use flat structure
+        assert "ds1" in data
+        assert data["ds1"]["api_key"] == "new_key"
         
         # Verify internal state was updated
         assert loader.validate_api_key("new_key") == "ds1"
@@ -141,10 +135,8 @@ class TestDatastoresConfigLoader:
         """Should return all registered datastore IDs."""
         config_file = tmp_path / "datastores-config.yaml"
         config_file.write_text(yaml.dump({
-            "datastores": {
-                "ds1": {"api_key": "key1"},
-                "ds2": {"api_key": "key2"}
-            }
+            "ds1": {"api_key": "key1"},
+            "ds2": {"api_key": "key2"}
         }))
         loader = DatastoresConfigLoader(config_file)
         loader.load()
@@ -154,9 +146,7 @@ class TestDatastoresConfigLoader:
         """Should reload configuration from file."""
         config_file = tmp_path / "datastores-config.yaml"
         config_file.write_text(yaml.dump({
-            "datastores": {
-                "ds1": {"api_key": "key1"}
-            }
+            "ds1": {"api_key": "key1"}
         }))
         loader = DatastoresConfigLoader(config_file)
         loader.load()
@@ -164,9 +154,7 @@ class TestDatastoresConfigLoader:
 
         # Modify file and reload
         config_file.write_text(yaml.dump({
-            "datastores": {
-                "ds1": {"api_key": "key1-updated"}
-            }
+            "ds1": {"api_key": "key1-updated"}
         }))
         loader.reload()
         assert loader.get_datastore("ds1").api_key == "key1-updated"
@@ -175,9 +163,7 @@ class TestDatastoresConfigLoader:
         """Should reject datastore config with URL-unsafe ID."""
         config_file = tmp_path / "datastores-config.yaml"
         config_file.write_text(yaml.dump({
-            "datastores": {
-                "Invalid ID": {"api_key": "key1"}
-            }
+            "Invalid ID": {"api_key": "key1"}
         }))
         
         loader = DatastoresConfigLoader(config_file)

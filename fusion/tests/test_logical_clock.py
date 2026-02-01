@@ -172,36 +172,41 @@ class TestLogicalClockThreadSafety:
         
         # Inject some samples to stabilize Mode
         for _ in range(5):
-            clock.update(observed_mtime=nfs_mtime, agent_time=agent_now, session_id="agent-A")
+            clock.update(observed_mtime=nfs_mtime, agent_time=agent_now) # Removed session_id
         
         # Logic clock should advance to 10410 even if mtime is None
-        clock.update(observed_mtime=None, agent_time=10510.0, session_id="agent-A")
+        clock.update(observed_mtime=None, agent_time=10510.0) # Removed session_id
         
         assert clock.get_watermark() == 10410.0
 
-    def test_multi_agent_skew_isolation(self):
-        """Clock should respect different skews for different sessions."""
+    def test_global_consensus_isolates_rogue_agent(self):
+        """Clock should follow the majority skew and ignore a rogue agent's unstable samples."""
         t_start = 1000.0
         with patch('time.time', return_value=t_start):
             clock = LogicalClock()
 
-        # Agent A: Skew 100 (Agent is ahead)
-        # At AgentTime 2000, NFS Time is 1900
-        clock.update(observed_mtime=1900.0, agent_time=2000.0, session_id="A")
+        # 1. Majority of samples (3 agents) establish a Skew of 100
+        # Formula: Diff = AgentTime - mtime = 2000 - 1900 = 100
+        for i in range(3):
+            clock.update(observed_mtime=1900.0, agent_time=2000.0)
         
-        # Agent B: Skew -200 (Agent is behind)
-        # At AgentTime 1700, NFS Time is 1900
-        clock.update(observed_mtime=1900.0, agent_time=1700.0, session_id="B")
-        
-        # Both see 1900, clock is 1900
         assert clock.get_watermark() == 1900.0
+        assert clock._cached_global_skew == 100
 
-        # Progress check for A
-        # A moves to 2010 -> Baseline 1910
-        clock.update(None, agent_time=2010.0, session_id="A")
-        assert clock.get_watermark() == 1910.0
+        # 2. A rogue agent appears with a wildly different skew of 5000 (Agent is far in future)
+        # Diff = 6900 - 1900 = 5000
+        clock.update(observed_mtime=1900.0, agent_time=6900.0)
 
-        # Progress check for B
-        # B moves to 1720 -> Baseline 1920
-        clock.update(None, agent_time=1720.0, session_id="B")
-        assert clock.get_watermark() == 1920.0
+        # 3. VERIFY: The global skew MUST still be 100 (because it's the Mode)
+        assert clock._cached_global_skew == 100
+        
+        # 4. Progress check: Even if rogue agent sends a deletion at its 'physical' 7000,
+        # it should be translated using the global skew (100), not its own (5000).
+        # Baseline = 7000 - 100 = 6900
+        clock.update(None, agent_time=7000.0)
+        
+        # The clock will advance to 6900 because we trust the ROGUE agent's physical flow
+        # but translated via the STABLE global skew.
+        # Note: In a real rogue scenario, if its physical time is wrong, we still 
+        # follow its 'tick', but the translation is now consistent with the cluster.
+        assert clock.get_watermark() == 6900.0

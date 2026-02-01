@@ -18,12 +18,10 @@ class TestSourcesConfigLoader:
         """Should load valid source config with both flat and nested structures."""
         config_file = tmp_path / "sources-config.yaml"
         config_file.write_text(yaml.dump({
-            "sources": {
-                "source-1": {
-                    "driver": "fs",
-                    "uri": "/tmp/1",
-                    "credential": {"user": "u", "passwd": "p"}
-                }
+            "source-1": {
+                "driver": "fs",
+                "uri": "/tmp/1",
+                "credential": {"user": "u", "passwd": "p"}
             },
             "source-2": {
                 "driver": "s3",
@@ -92,12 +90,10 @@ class TestPushersConfigLoader:
         """Should load valid pusher config with both flat and nested structures."""
         config_file = tmp_path / "pushers-config.yaml"
         config_file.write_text(yaml.dump({
-            "pushers": {
-                "pusher-1": {
-                    "driver": "fusion",
-                    "endpoint": "http://1",
-                    "credential": {"key": "k"}
-                }
+            "pusher-1": {
+                "driver": "fusion",
+                "endpoint": "http://1",
+                "credential": {"key": "k"}
             },
             "pusher-2": {
                 "driver": "fusion",
