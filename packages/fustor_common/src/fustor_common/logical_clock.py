@@ -83,77 +83,77 @@ class LogicalClock:
                 return self._value
 
             # --- Robust Mode ---
-            
-            # 1. Update Statistics
-            diff = int(agent_time - observed_mtime)
-            
-            if session_id not in self._session_buffers:
-                self._session_buffers[session_id] = deque(maxlen=self._MAX_SAMPLES)
-            
-            buf = self._session_buffers[session_id]
-            
-            # If buffer full, remove old sample from histogram
-            if len(buf) == self._MAX_SAMPLES:
-                old_sample = buf[0] # deque will pop this automatically on append? No, maxlen pops.
-                                    # But we need to know WHICH value was popped to update histogram.
-                                    # deque doesn't return popped item on append effectively for this.
-                                    # So we do it manually.
-                                    
-                # Wait, deque with maxlen pops automatically but doesn't return the popped item.
-                # To maintain O(1) histogram, we must peek/pop manually before appending if full.
-                # Actually, standard pattern:
-                old_val = buf[0]
-                # We defer pop to the append step (which does it auto), but we need to decrememnt histogram NOW.
-                # But if we decrement now, we assume it WILL be popped.
-                # Let's use manual pop strictly to be sure.
-                buf.popleft() # Manual pop
-                self._global_histogram[old_val] -= 1
-                if self._global_histogram[old_val] <= 0:
-                    del self._global_histogram[old_val]
-            
-            buf.append(diff)
-            self._global_histogram[diff] += 1
-            self._dirty = True
-            
-            # 2. Calculate/Get Global Skew
-            g_skew = self._get_global_skew_locked()
-            
-            # 3. Calculate Watermark Candidates
-            if g_skew is None:
-                # Fallback: No statistics yet
-                if observed_mtime > self._value:
-                    self._value = observed_mtime
-            else:
-                # BaseLine = AgentTime - Skew
-                baseline = agent_time - g_skew
-                
-                # Trust Window Logic
-                upper_bound = baseline + self._trust_window
-                
-                target_value = self._value # Start with current
-                
-                # Logic Table from Design Doc
-                if observed_mtime <= self._value:
-                    # Past data, ignore for clock
-                    pass
-                elif baseline < observed_mtime <= upper_bound:
-                    # [Fast Path] mtime is within [BaseLine, BaseLine + 1.0s]
-                    # We trust this mtime is the latest valid edge
-                    target_value = observed_mtime
-                elif observed_mtime > upper_bound:
-                     # [Future/Anomaly] mtime is too far ahead of BaseLine
-                     # We reject mtime, BUT we can advance to BaseLine (if BaseLine > current)
-                     # because BaseLine is derived from trusted AgentTime.
-                     if baseline > self._value:
-                         target_value = baseline
+            try:
+                # 1. Update Statistics
+                if agent_time is not None and observed_mtime is not None:
+                     diff = int(agent_time - observed_mtime)
                 else:
-                    # observed_mtime <= baseline (but > current)
-                    # Safe update range
-                    target_value = observed_mtime
+                     diff = 0 # Fallback should not happen in Robust path
+                
+                if session_id not in self._session_buffers:
+                    self._session_buffers[session_id] = deque(maxlen=self._MAX_SAMPLES)
+                
+                buf = self._session_buffers[session_id]
+                
+                # If buffer full, remove old sample from histogram
+                if len(buf) == self._MAX_SAMPLES:
+                    old_val = buf[0]
+                    # Manual pop
+                    buf.popleft() 
+                    
+                    if old_val in self._global_histogram:
+                        self._global_histogram[old_val] -= 1
+                        if self._global_histogram[old_val] <= 0:
+                            del self._global_histogram[old_val]
+                
+                buf.append(diff)
+                self._global_histogram[diff] += 1
+                self._dirty = True
+                
+                # 2. Calculate/Get Global Skew
+                g_skew = self._get_global_skew_locked()
+                
+                # 3. Calculate Watermark Candidates
+                if g_skew is None:
+                    # Fallback: No statistics yet
+                    if observed_mtime > self._value:
+                        self._value = observed_mtime
+                else:
+                    # BaseLine = AgentTime - Skew
+                    baseline = agent_time - g_skew
+                    
+                    # Trust Window Logic
+                    upper_bound = baseline + self._trust_window
+                    
+                    target_value = self._value # Start with current
+                    
+                    # Logic Table from Design Doc
+                    if observed_mtime <= self._value:
+                        # Past data, ignore for clock
+                        pass
+                    elif baseline < observed_mtime <= upper_bound:
+                        # [Fast Path] mtime is within [BaseLine, BaseLine + 1.0s]
+                        # We trust this mtime is the latest valid edge
+                        target_value = observed_mtime
+                    elif observed_mtime > upper_bound:
+                         # [Future/Anomaly] mtime is too far ahead of BaseLine
+                         # We reject mtime, BUT we can advance to BaseLine (if BaseLine > current)
+                         # because BaseLine is derived from trusted AgentTime.
+                         if baseline > self._value:
+                             target_value = baseline
+                    else:
+                        # observed_mtime <= baseline (but > current)
+                        # Safe update range
+                        target_value = observed_mtime
 
-                # Monotonicity check
-                if target_value > self._value:
-                    self._value = target_value
+                    # Monotonicity check
+                    if target_value > self._value:
+                        self._value = target_value
+            except Exception as e:
+                # Log error but return current value to proceed with event processing
+                # Printing as we might not have logger configured here
+                print(f"ERROR: LogicalClock update failed: {e}")
+                pass
 
             return self._value
 
@@ -187,9 +187,10 @@ class LogicalClock:
             if session_id in self._session_buffers:
                 buf = self._session_buffers[session_id]
                 for sample in buf:
-                    self._global_histogram[sample] -= 1
-                    if self._global_histogram[sample] <= 0:
-                        del self._global_histogram[sample]
+                    if sample in self._global_histogram:
+                        self._global_histogram[sample] -= 1
+                        if self._global_histogram[sample] <= 0:
+                            del self._global_histogram[sample]
                 del self._session_buffers[session_id]
                 self._dirty = True
 

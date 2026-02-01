@@ -84,14 +84,18 @@ class TestSuspectClearingConditions:
         filename = f"delete_suspect_{int(time.time())}.txt"
         file_path = f"{MOUNT_POINT}/{filename}"
         
-        # 1. Create file in blind spot
+        # 1. Start a partial wait to align with audit cycle, but create file LATER
+        # This ensuring that when audit picks it up, it's still 'hot' (age < 5s)
+        time.sleep(4)
+        
+        # 2. Create file in blind spot
         docker_manager.exec_in_container(
             CONTAINER_CLIENT_C,
             ["sh", "-c", f"echo 'will be deleted' > {file_path}"]
         )
         
-        # 2. Wait for Audit to discover it
-        wait_for_audit()
+        # 3. Wait for Audit to discover it (rest of the wait)
+        time.sleep(6)
         
         found = fusion_client.wait_for_file_in_tree(file_path, timeout=10)
         assert found is not None, "File should be discovered"
@@ -159,8 +163,7 @@ class TestSuspectClearingConditions:
         
         # 3. Wait for file to "stabilize" (mtime doesn't change)
         # Wait for hot_file_threshold (5s in test config) + buffer
-        # The cleanup runs periodically (every 0.5s as per arbitrator.py:23)
-        time.sleep(10)
+        time.sleep(7)
         
         # 4. Check if suspect cleared (may need polling)
         start = time.time()

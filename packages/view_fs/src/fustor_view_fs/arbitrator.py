@@ -20,7 +20,7 @@ class FSArbitrator:
         self.state = state
         self.tree_manager = tree_manager
         self.hot_file_threshold = hot_file_threshold
-        self.logger = logging.getLogger(f"fustor_view.fs.arbitrator.{state.datastore_id}")
+        self.logger = logging.getLogger(f"fustor_fusion.view_fs.arbitrator.{state.datastore_id}")
         self.suspect_cleanup_interval = 0.5
 
     async def process_event(self, event: Any) -> bool:
@@ -57,6 +57,10 @@ class FSArbitrator:
                  agent_time = float(event.index)
             elif hasattr(event, 'timestamp'):
                  agent_time = float(event.timestamp)
+            
+            # Heuristic: Normalize milliseconds to seconds if needed
+            if agent_time and agent_time > 1e11:
+                agent_time /= 1000.0
                  
             if hasattr(event, 'session_id'):
                 session_id = event.session_id
@@ -79,6 +83,7 @@ class FSArbitrator:
         return True
 
     async def _handle_delete(self, path: str, is_realtime: bool, mtime: float):
+        self.logger.debug(f"DEBUG_ARB: DELETE_EVENT for {path} realtime={is_realtime}")
         if is_realtime:
             existing = self.state.get_node(path)
             existing_mtime = existing.modified_time if existing else 0.0
@@ -98,11 +103,14 @@ class FSArbitrator:
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
         else:
-            # Audit/Snapshot delete: subject to Tombstone protection
-            if path not in self.state.tombstone_list:
+            # Audit/Snapshot delete logic
+            if path in self.state.tombstone_list:
+                self.logger.debug(f"DEBUG_ARB: AUDIT_DELETE_BLOCKED_BY_TOMBSTONE for {path}")
+            else:
                 await self.tree_manager.delete_node(path)
-                self.state.blind_spot_deletions.discard(path)
+                self.state.blind_spot_deletions.add(path)
                 self.state.blind_spot_additions.discard(path)
+        self.logger.debug(f"DEBUG_ARB: DELETE_DONE for {path}")
 
     async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float):
         # 1. Tombstone Protection
@@ -156,15 +164,20 @@ class FSArbitrator:
 
         # 3. Blind Spot and Suspect Management
         if is_realtime:
+            self.logger.debug(f"DEBUG_ARB: REALTIME_EVENT for {path}. Current blind_spot_additions: {path in self.state.blind_spot_additions}")
             self.state.suspect_list.pop(path, None)
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
             node.integrity_suspect = False
             node.known_by_agent = True
+            self.logger.debug(f"DEBUG_ARB: REALTIME_DONE for {path}. Now agent_known={node.known_by_agent}, missing={path in self.state.blind_spot_additions}")
         else:
             # Manage Suspect List (Hot Data)
-            age = self.state.logical_clock.get_watermark() - mtime
+            watermark = self.state.logical_clock.get_watermark()
+            age = watermark - mtime
             mtime_changed = (existing is None) or (abs(old_mtime - mtime) > 1e-6)
+            
+            self.logger.debug(f"DEBUG_ARB: NON_REALTIME {path} source={source} mtime_changed={mtime_changed} age={age:.1f}")
             
             if mtime_changed:
                 if is_audit:
