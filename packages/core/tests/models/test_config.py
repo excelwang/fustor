@@ -87,7 +87,7 @@ def test_app_config_add_get_delete_sync():
         app_config.add_sync("my_sync", sync_config)
     
     app_config.add_source("my_source", source_config)
-    with pytest.raises(NotFoundError, match="Dependency pusher 'my_pusher' not found."):
+    with pytest.raises(NotFoundError, match="Dependency sender 'my_pusher' not found."):
         app_config.add_sync("my_sync", sync_config)
 
     app_config.add_pusher("my_pusher", pusher_config)
@@ -192,5 +192,5 @@ def test_app_config_check_sync_is_disabled():
 
     # Missing pusher dependency
     sync_missing_pusher = SyncConfig(source="source_e", pusher="non_existent_pusher", disabled=False)
-    with pytest.raises(NotFoundError, match="Dependency pusher 'non_existent_pusher' not found."):
+    with pytest.raises(NotFoundError, match="Dependency sender 'non_existent_pusher' not found."):
         app_config.add_sync("sync_missing_pusher", sync_missing_pusher)

@@ -93,7 +93,7 @@ PusherConfig = SenderConfig
 
 class SyncConfig(BaseModel):
     source: str
-    pusher: str
+    sender: Optional[str] = None  # New field name (v2)
     disabled: bool = Field(default=True, description="是否禁用此同步任务")
     # --- START: 核心修改 ---
     # [REMOVED] The following two fields are obsolete in the new architecture.
@@ -105,6 +105,13 @@ class SyncConfig(BaseModel):
     audit_interval_sec: int = Field(default=600, ge=0, description="审计扫描间隔(秒)，0表示禁用，默认10分钟")
     sentinel_interval_sec: int = Field(default=120, ge=0, description="哨兵巡检间隔(秒)，0表示禁用，默认2分钟")
     heartbeat_interval_sec: int = Field(default=10, ge=1, description="心跳间隔(秒)，默认10秒")
+    
+    def __init__(self, **data):
+        """Backward compatibility: migrate 'pusher' to 'sender'."""
+        if 'sender' not in data and 'pusher' in data:
+            data['sender'] = data.pop('pusher')
+        super().__init__(**data)
+
 
 class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):
     root: Dict[str, SourceConfig] = Field(default_factory=dict)
@@ -184,8 +191,8 @@ class AppConfig(BaseModel):
         # Dependency check
         if not self.get_source(config.source):
             raise NotFoundError(f"Dependency source '{config.source}' not found.")
-        if not self.get_pusher(config.pusher):
-            raise NotFoundError(f"Dependency pusher '{config.pusher}' not found.")
+        if not self.get_pusher(config.sender):
+            raise NotFoundError(f"Dependency sender '{config.sender}' not found.")
         
         self.get_syncs()[id] = config
         return config
@@ -209,7 +216,7 @@ class AppConfig(BaseModel):
             raise NotFoundError(f"Sender config with id '{id}' not found.")
         
         # Delete dependent syncs first
-        sync_ids_to_delete = [sync_id for sync_id, cfg in self.syncs.root.items() if cfg.pusher == id]
+        sync_ids_to_delete = [sync_id for sync_id, cfg in self.syncs.root.items() if cfg.sender == id]
         for sync_id in sync_ids_to_delete:
             self.delete_sync(sync_id)
             
@@ -238,8 +245,8 @@ class AppConfig(BaseModel):
         if not source_config:
             raise NotFoundError(f"Dependency source '{config.source}' not found for sync '{id}'.")
             
-        pusher_config = self.pushers.root.get(config.pusher)
-        if not pusher_config:
-            raise NotFoundError(f"Dependency pusher '{config.pusher}' not found for sync '{id}'.")
+        sender_config = self.pushers.root.get(config.sender)
+        if not sender_config:
+            raise NotFoundError(f"Dependency sender '{config.sender}' not found for sync '{id}'.")
             
-        return source_config.disabled or pusher_config.disabled
+        return source_config.disabled or sender_config.disabled

@@ -43,7 +43,7 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
             A list of the configuration IDs that were deleted.
         """
         all_sync_configs = self.app_config.get_syncs().values()
-        in_use_sender_ids = {sync.pusher for sync in all_sync_configs}
+        in_use_sender_ids = {sync.sender for sync in all_sync_configs}
 
         all_sender_configs = self.list_configs()
         obsolete_ids = [

@@ -45,7 +45,7 @@ class SyncInstance:
         self.source_driver_instance = source_driver_class(config.source, self.source_config)
 
         pusher_driver_class = pusher_driver_service._get_driver_by_type(self.pusher_config.driver)
-        self.pusher_driver_instance = pusher_driver_class(config.pusher, self.pusher_config)
+        self.pusher_driver_instance = pusher_driver_class(config.sender, self.pusher_config)
 
         self.bus: Optional["EventBusInstanceRuntime"] = None
         self.state: SyncState = SyncState.STOPPED

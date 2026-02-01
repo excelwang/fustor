@@ -3,7 +3,7 @@
 
 id: sync-research
 source: fs-research
-pusher: fusion-main
+sender: fusion-main  # v2: renamed from 'pusher'
 disabled: false
 audit_interval_sec: 600
 sentinel_interval_sec: 120
