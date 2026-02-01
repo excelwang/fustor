@@ -26,10 +26,9 @@ email = "wanghuajin999@163.com"
 Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-http"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
-# Entry point for sender discovery
-[project.entry-points."fustor.senders"]
-http = "fustor_sender_http:HTTPSender"
-fusion = "fustor_sender_http:FusionSender"
+# New entry point for V2 architecture
+[project.entry-points."fustor_agent.drivers.senders"]
+fusion = "fustor_sender_http:HTTPSender"
 
 # Legacy entry point for backward compatibility
 [project.entry-points."fustor_agent.drivers.pushers"]
