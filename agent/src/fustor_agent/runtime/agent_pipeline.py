@@ -36,6 +36,11 @@ class AgentPipeline(Pipeline):
     This is designed to eventually replace SyncInstance.
     """
     
+    # Class-level timing constants
+    CONTROL_LOOP_INTERVAL = 1.0
+    FOLLOWER_STANDBY_INTERVAL = 1.0
+    ERROR_RETRY_INTERVAL = 5.0
+    
     def __init__(
         self,
         pipeline_id: str,
@@ -82,10 +87,7 @@ class AgentPipeline(Pipeline):
         self.sentinel_interval_sec = config.get("sentinel_interval_sec", 120)
         self.batch_size = config.get("batch_size", 100)
         
-        # Timing constants
-        self.CONTROL_LOOP_INTERVAL = 1.0
-        self.FOLLOWER_STANDBY_INTERVAL = 1.0
-        self.ERROR_RETRY_INTERVAL = 5.0
+
         
         # Statistics
         self.statistics: Dict[str, Any] = {
@@ -131,7 +133,6 @@ class AgentPipeline(Pipeline):
             logger.debug(f"Pipeline {self.id} is already stopped")
             return
         
-        old_state = self.state
         self._set_state(PipelineState.STOPPED, "Stopping...")
         
         # Cancel all tasks
@@ -209,10 +210,12 @@ class AgentPipeline(Pipeline):
                     await asyncio.sleep(self.FOLLOWER_STANDBY_INTERVAL)
                 
         except asyncio.CancelledError:
-            logger.info(f"Pipeline {self.id} {old_state.name if 'old_state' in locals() else ''} control loop cancelled")
+            logger.info(f"Pipeline {self.id} control loop cancelled")
+            return
         except Exception as e:
             self._set_state(PipelineState.ERROR, f"Control loop error: {e}")
             logger.error(f"Pipeline {self.id} control loop error: {e}", exc_info=True)
+            # Sleep then continue loop to allow recovery
             await asyncio.sleep(self.ERROR_RETRY_INTERVAL)
 
     
@@ -275,8 +278,7 @@ class AgentPipeline(Pipeline):
     
     _IAITER_SENTINEL = object()
 
-    @staticmethod
-    async def _aiter_sync(sync_iter: Iterator[Any]):
+    async def _aiter_sync(self, sync_iter: Iterator[Any]):
         """Safely wrap a synchronous iterator into an async generator."""
         def get_next():
             try:
@@ -399,9 +401,16 @@ class AgentPipeline(Pipeline):
             
             if batch:
                 await self.sender_handler.send_batch(
-                    self.session_id, batch, {"phase": "audit", "is_final": True}
+                    self.session_id, batch, {"phase": "audit"}
                 )
         finally:
+            # Always send audit end signal to ensure Fusion calls handle_audit_end()
+            try:
+                await self.sender_handler.send_batch(
+                    self.session_id, [], {"phase": "audit", "is_final": True}
+                )
+            except Exception as e:
+                logger.warning(f"Failed to send audit end signal: {e}")
             # Clear audit phase flag
             self._set_state(self.state & ~PipelineState.AUDIT_PHASE)
     
