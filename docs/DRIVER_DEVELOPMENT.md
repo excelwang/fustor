@@ -57,12 +57,12 @@ def get_audit_iterator(self, **kwargs) -> Iterator[EventBase]:
 
 此流程适用于希望为 Fustor Agent 官方仓库贡献新驱动的开发者。
 
-1.  **创建插件包结构**: 在 `packages/` 目录下为新驱动创建一个符合 `[type]_[name]` 命名规范的目录。
+1.  **创建插件包结构**: 在 `packages/` 目录下为新驱动创建一个符合 `[type]-[name]` 命名规范的目录。
     ```bash
-    mkdir -p packages/source_postgres/src/fustor_source_postgres
+    mkdir -p packages/source-postgres/src/fustor_source_postgres
     ```
 
-2.  **创建 `pyproject.toml`**: 在 `packages/source_postgres/` 目录下创建 `pyproject.toml` 文件。
+2.  **创建 `pyproject.toml`**: 在 `packages/source-postgres/` 目录下创建 `pyproject.toml` 文件。
     ```toml
     [project]
     name = "fustor-source-postgres"

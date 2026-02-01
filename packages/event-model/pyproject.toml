@@ -16,7 +16,7 @@ version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/fustor_event_model"
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/event-model"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 [tool.setuptools.packages.find]

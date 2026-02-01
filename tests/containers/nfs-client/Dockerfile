@@ -21,13 +21,13 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 # Install Fustor Agent and dependencies (using correct package names)
 RUN pip install --no-cache-dir \
     httpx pydantic pyyaml \
-    /app/packages/fustor_common \
+    /app/packages/common \
     /app/packages/core \
-    /app/packages/fustor_event_model \
-    /app/packages/fustor_agent_sdk \
-    /app/packages/fustor_fusion_sdk \
-    /app/packages/source_fs \
-    /app/packages/pusher_fusion \
+    /app/packages/event-model \
+    /app/packages/agent-sdk \
+    /app/packages/fusion-sdk \
+    /app/packages/source-fs \
+    /app/packages/pusher-fusion \
     /app/agent
 
 # Create directories

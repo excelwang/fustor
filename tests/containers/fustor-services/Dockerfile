@@ -19,11 +19,11 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 # Install Fustor packages
 RUN pip install --no-cache-dir \
     fastapi uvicorn pydantic pyyaml \
-    /app/packages/fustor_common \
+    /app/packages/common \
     /app/packages/core \
-    /app/packages/fustor_event_model \
-    /app/packages/fustor_fusion_sdk \
-    /app/packages/view_fs \
+    /app/packages/event-model \
+    /app/packages/fusion-sdk \
+    /app/packages/view-fs \
     /app/fusion
 
 # Create data directory

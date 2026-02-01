@@ -15,7 +15,7 @@ version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/demo_bio_fusion"
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/demo"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 license = "MIT"

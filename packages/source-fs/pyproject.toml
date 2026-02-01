@@ -15,7 +15,7 @@ version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/source_fs"
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/source-fs"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 [project.entry-points."fustor_agent.drivers.sources"]

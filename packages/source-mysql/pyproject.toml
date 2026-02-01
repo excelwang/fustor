@@ -18,7 +18,7 @@ version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/source_mysql"
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/source-mysql"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 license = "MIT"

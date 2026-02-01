@@ -47,11 +47,11 @@ services:
     volumes:
       - fusion-data:/data/fusion
       - ../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
-      - ../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
+      - ../packages/common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
       - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
-      - ../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
-      - ../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
-      - ../packages/view_fs/src/fustor_view_fs:/usr/local/lib/python3.11/site-packages/fustor_view_fs
+      - ../packages/event-model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
+      - ../packages/fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../packages/view-fs/src/fustor_view_fs:/usr/local/lib/python3.11/site-packages/fustor_view_fs
 
     ports:
       - "18102:8102"
@@ -87,13 +87,13 @@ services:
     volumes:
       - agent-a-data:/data/agent
       - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
-      - ../packages/source_fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
-      - ../packages/pusher_fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
-      - ../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
+      - ../packages/source-fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
+      - ../packages/pusher-fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
+      - ../packages/common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
       - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
-      - ../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
-      - ../packages/fustor_agent_sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
-      - ../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../packages/event-model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
+      - ../packages/agent-sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
+      - ../packages/fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18100:8100"
     networks:
@@ -131,13 +131,13 @@ services:
     volumes:
       - agent-b-data:/data/agent
       - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
-      - ../packages/source_fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
-      - ../packages/pusher_fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
-      - ../packages/fustor_common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
+      - ../packages/source-fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
+      - ../packages/pusher-fusion/src/fustor_pusher_fusion:/usr/local/lib/python3.11/site-packages/fustor_pusher_fusion
+      - ../packages/common/src/fustor_common:/usr/local/lib/python3.11/site-packages/fustor_common
       - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
-      - ../packages/fustor_event_model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
-      - ../packages/fustor_agent_sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
-      - ../packages/fustor_fusion_sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../packages/event-model/src/fustor_event_model:/usr/local/lib/python3.11/site-packages/fustor_event_model
+      - ../packages/agent-sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
+      - ../packages/fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18103:8100"
     networks:

@@ -18,7 +18,7 @@ version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/pusher_openapi"
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/pusher-openapi"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 license = "MIT"
