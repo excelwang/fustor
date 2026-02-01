@@ -16,10 +16,10 @@ When reviewing refactored test code, follow these steps:
 5. **Test coverage**: Are there missing tests?
 
 ## How to use it
-
-1. 请深入理解一下原版(master分支)的测试代码；
-2. 请深入理解一下当前分支的测试代码；
-3. 比较两者，找出当前分支的缺陷和修正建议，梳理成完整的、具体的todo事项清单和开发建议。
+1. 请深入理解当前分支的业务代码；
+2. 请深入理解一下原版(master分支)的测试代码；
+3. 请深入理解一下当前分支的测试代码；
+4. 比较两者，找出当前分支的缺陷和修正建议，梳理成完整的、具体的todo事项清单和开发建议。
 
 ## How to provide feedback
 
