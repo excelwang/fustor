@@ -30,7 +30,6 @@ class FSState:
         self.blind_spot_deletions: Set[str] = set()
         self.blind_spot_additions: Set[str] = set()
         
-        self.current_session_id: Optional[str] = None
         self.logical_clock = LogicalClock()
         
         self.last_event_latency = 0.0
@@ -56,4 +55,3 @@ class FSState:
         self.blind_spot_additions.clear()
         self.logical_clock.reset(0.0)
         self.last_event_latency = 0.0
-        self.current_session_id = None

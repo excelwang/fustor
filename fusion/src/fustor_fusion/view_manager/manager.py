@@ -169,15 +169,15 @@ class ViewManager:
                     self.logger.error(f"Error cleaning up suspects for provider {name}: {e}")
 
 
-    async def on_session_start(self, session_id: str):
+    async def on_session_start(self):
         """Dispatch session start event to all providers."""
         for name, provider in self.providers.items():
-            await provider.on_session_start(session_id)
+            await provider.on_session_start()
 
-    async def on_session_close(self, session_id: str):
+    async def on_session_close(self):
         """Dispatch session close event to all providers for cleanup."""
         for name, provider in self.providers.items():
-            await provider.on_session_close(session_id)
+            await provider.on_session_close()
 
     async def get_aggregated_stats(self) -> Dict[str, Any]:
         """
@@ -286,15 +286,15 @@ async def process_event(event: EventBase, datastore_id: str) -> Dict[str, bool]:
     return await manager.process_event(event)
 
 
-async def on_session_start(datastore_id: str, session_id: str):
+async def on_session_start(datastore_id: str):
     """Notify view providers that a new session has started."""
     manager = await get_cached_view_manager(datastore_id)
-    await manager.on_session_start(session_id)
+    await manager.on_session_start()
 
 
-async def on_session_close(datastore_id: str, session_id: str):
+async def on_session_close(datastore_id: str):
     """Notify view providers that a session has closed for cleanup."""
     ds_id_str = str(datastore_id)
     if ds_id_str in _view_manager_cache:
         manager = _view_manager_cache[ds_id_str]
-        await manager.on_session_close(session_id)
+        await manager.on_session_close()

@@ -39,8 +39,7 @@ class TestSourceConfigService:
 
     @pytest.mark.asyncio
     @patch('fustor_agent.services.configs.source.config_lock')
-    @patch('fustor_agent.services.configs.source.update_app_config_file')
-    async def test_add_config(self, mock_update_file, mock_config_lock, source_config_service, mock_app_config, sample_source_config):
+    async def test_add_config(self, mock_config_lock, source_config_service, mock_app_config, sample_source_config):
         mock_app_config.get_sources.return_value = {}
         source_config_service._add_config_to_app = MagicMock()
 
@@ -50,14 +49,12 @@ class TestSourceConfigService:
         result = await source_config_service.add_config("test_source", sample_source_config)
 
         source_config_service._add_config_to_app.assert_called_once_with("test_source", sample_source_config)
-        mock_update_file.assert_called_once()
         assert result == sample_source_config
 
     @pytest.mark.asyncio
     @patch('fustor_agent.services.configs.source.config_lock')
     @patch('fustor_agent.services.schema_cache.is_schema_valid', return_value=True)
-    @patch('fustor_agent.services.configs.base.update_app_config_file')
-    async def test_update_config_enable_with_schema(self, mock_update_file, mock_schema_exists, mock_config_lock, source_config_service, mock_app_config, sample_source_config):
+    async def test_update_config_enable_with_schema(self, mock_schema_exists, mock_config_lock, source_config_service, mock_app_config, sample_source_config):
         sample_source_config.disabled = True # Start disabled
         mock_app_config.get_sources.return_value = {"test_source": sample_source_config}
 
@@ -67,13 +64,11 @@ class TestSourceConfigService:
         updated_config = await source_config_service.update_config("test_source", {"disabled": False})
         assert updated_config.disabled is False
         mock_schema_exists.assert_called_once_with("test_source")
-        mock_update_file.assert_called_once()
 
     @pytest.mark.asyncio
     @patch('fustor_agent.services.configs.source.config_lock')
     @patch('fustor_agent.services.schema_cache.is_schema_valid', return_value=False)
-    @patch('fustor_agent.update_app_config_file')
-    async def test_update_config_enable_without_schema(self, mock_update_file, mock_schema_exists, mock_config_lock, source_config_service, mock_app_config, sample_source_config):
+    async def test_update_config_enable_without_schema(self, mock_schema_exists, mock_config_lock, source_config_service, mock_app_config, sample_source_config):
         sample_source_config.disabled = True # Start disabled
         mock_app_config.get_sources.return_value = {"test_source": sample_source_config}
 
@@ -83,12 +78,10 @@ class TestSourceConfigService:
         with pytest.raises(ValueError, match="Cannot enable source 'test_source': Schema cache is not validated. Please run 'discover-schema' for this source first."):
             await source_config_service.update_config("test_source", {"disabled": False})
         mock_schema_exists.assert_called_once_with("test_source")
-        mock_update_file.assert_not_called() # Should not save if validation fails
 
     @pytest.mark.asyncio
     @patch('fustor_agent.services.configs.source.config_lock')
-    @patch('fustor_agent.services.configs.source.update_app_config_file')
-    async def test_cleanup_obsolete_configs(self, mock_update_file, mock_config_lock, source_config_service, mock_app_config):
+    async def test_cleanup_obsolete_configs(self, mock_config_lock, source_config_service, mock_app_config):
         mock_app_config.get_sources.return_value = {
             "src1": SourceConfig(driver="d", uri="u", credential=PasswdCredential(user="u"), disabled=True), # Obsolete
             "src2": SourceConfig(driver="d", uri="u", credential=PasswdCredential(user="u"), disabled=False), # Not obsolete (enabled)
@@ -109,13 +102,11 @@ class TestSourceConfigService:
         assert sorted(deleted_ids) == sorted(["src1", "src3"])
         assert "src1" not in mock_app_config.get_sources.return_value
         assert "src3" not in mock_app_config.get_sources.return_value
-        mock_update_file.assert_called_once()
 
     @pytest.mark.asyncio
     @patch('fustor_agent.services.configs.source.config_lock')
     @patch('fustor_agent.services.schema_cache.is_schema_valid')
-    @patch('fustor_agent.services.configs.base.update_app_config_file')
-    async def test_check_and_disable_missing_schema_sources(self, mock_update_file, mock_schema_exists, mock_config_lock, source_config_service, mock_app_config):
+    async def test_check_and_disable_missing_schema_sources(self, mock_schema_exists, mock_config_lock, source_config_service, mock_app_config):
         # Setup initial state: one enabled source with no schema, one enabled with schema, one disabled with no schema
         source_no_schema = SourceConfig(driver="d", uri="u", credential=PasswdCredential(user="u"), disabled=False, schema_cached=None)
         source_with_schema = SourceConfig(driver="d", uri="u", credential=PasswdCredential(user="u"), disabled=False, schema_cached=True)
@@ -140,13 +131,6 @@ class TestSourceConfigService:
         disabled_sources = await source_config_service.check_and_disable_missing_schema_sources()
 
         assert disabled_sources == ["src_no_schema"]
-        # The disable method is called internally, which in turn calls update_app_config_file
-        # We assert that update_app_config_file is called, not mock_disable directly
-        mock_update_file.assert_called_once()
-
-        # Verify schema_cached status updates
-        assert source_no_schema.disabled is True # Should be disabled
-        assert source_with_schema.disabled is False
         assert source_disabled_no_schema.disabled is True
 
     

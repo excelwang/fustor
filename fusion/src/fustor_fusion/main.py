@@ -38,7 +38,7 @@ async def lifespan(app: FastAPI):
     # Perform initial configuration load and start processors
     try:
         datastores_config.reload()
-        await processing_manager.sync_tasks(list(datastores_config.get_all_datastores().values()))
+        await processing_manager.sync_tasks(datastores_config.get_all_datastores())
     except Exception as e:
         logger.error(f"Initial configuration load failed: {e}. Aborting startup.")
         raise

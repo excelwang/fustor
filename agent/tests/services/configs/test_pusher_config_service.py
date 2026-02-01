@@ -31,9 +31,8 @@ class TestPusherConfigService:
         assert pusher_config_service.sync_instance_service == mock_sync_service
 
     @pytest.mark.asyncio
-    @patch('fustor_agent.services.configs.pusher.update_app_config_file')
     @patch('fustor_agent.services.common.config_lock')
-    async def test_cleanup_obsolete_configs(self, mock_config_lock, mock_update_file, pusher_config_service, mock_app_config):
+    async def test_cleanup_obsolete_configs(self, mock_config_lock, pusher_config_service, mock_app_config):
         # Setup mock app_config state
         initial_pushers = {
             "rec1": PusherConfig(driver="d", endpoint="e", credential=PasswdCredential(user="u"), disabled=True), # Obsolete
@@ -56,12 +55,11 @@ class TestPusherConfigService:
         assert sorted(deleted_ids) == sorted(["rec1", "rec3"])
         assert "rec1" not in mock_app_config.get_pushers.return_value
         assert "rec3" not in mock_app_config.get_pushers.return_value
-        mock_update_file.assert_called_once()
+        assert "rec3" not in mock_app_config.get_pushers.return_value
 
     @pytest.mark.asyncio
-    @patch('fustor_agent.services.configs.pusher.update_app_config_file')
     @patch('fustor_agent.services.common.config_lock')
-    async def test_cleanup_obsolete_configs_no_obsolete(self, mock_config_lock, mock_update_file, pusher_config_service, mock_app_config):
+    async def test_cleanup_obsolete_configs_no_obsolete(self, mock_config_lock, pusher_config_service, mock_app_config):
         initial_pushers = {
             "rec1": PusherConfig(driver="d", endpoint="e", credential=PasswdCredential(user="u"), disabled=False),
             "rec2": PusherConfig(driver="d", endpoint="e", credential=PasswdCredential(user="u"), disabled=True), # Used by sync
@@ -77,4 +75,3 @@ class TestPusherConfigService:
         deleted_ids = await pusher_config_service.cleanup_obsolete_configs()
 
         assert deleted_ids == []
-        mock_update_file.assert_not_called()

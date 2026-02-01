@@ -50,66 +50,56 @@ def sample_sync_config():
 
 class TestBaseConfigService:
     @pytest.mark.asyncio
-    @patch('fustor_agent.services.configs.base.update_app_config_file')
-    async def test_add_config(self, mock_update_file, base_config_service, mock_app_config, sample_source_config):
+    async def test_add_config(self, base_config_service, mock_app_config, sample_source_config):
         mock_app_config.get_sources.return_value = {}
         mock_app_config.add_source.return_value = sample_source_config
 
         result = await base_config_service.add_config("test_source", sample_source_config)
 
         mock_app_config.add_source.assert_called_once_with("test_source", sample_source_config)
-        mock_update_file.assert_called_once()
         assert result == sample_source_config
 
     @pytest.mark.asyncio
-    @patch('fustor_agent.services.configs.base.update_app_config_file')
-    async def test_update_config_enable_disable(self, mock_update_file, base_config_service, mock_app_config, mock_sync_instance_service, sample_source_config):
+    async def test_update_config_enable_disable(self, base_config_service, mock_app_config, mock_sync_instance_service, sample_source_config):
         # Setup initial state
         mock_app_config.get_sources.return_value = {"test_source": sample_source_config}
 
         # Test disabling
         updated_config = await base_config_service.update_config("test_source", {"disabled": True})
         assert updated_config.disabled is True
-        mock_update_file.assert_called_once()
         mock_sync_instance_service.mark_dependent_syncs_outdated.assert_called_once_with(
             "source", "test_source", "Dependency Source 'test_source' configuration was disabled.", {"disabled": True}
         )
-        mock_update_file.reset_mock()
+        # Reset mocks
         mock_sync_instance_service.mark_dependent_syncs_outdated.reset_mock()
 
         # Test enabling
         updated_config = await base_config_service.update_config("test_source", {"disabled": False})
         assert updated_config.disabled is False
-        mock_update_file.assert_called_once()
         mock_sync_instance_service.mark_dependent_syncs_outdated.assert_called_once_with(
             "source", "test_source", "Dependency Source 'test_source' configuration was enabled.", {"disabled": False}
         )
 
     @pytest.mark.asyncio
-    @patch('fustor_agent.services.configs.base.update_app_config_file')
-    async def test_update_config_non_disabled_field(self, mock_update_file, base_config_service, mock_app_config, mock_sync_instance_service, sample_source_config):
+    async def test_update_config_non_disabled_field(self, base_config_service, mock_app_config, mock_sync_instance_service, sample_source_config):
         mock_app_config.get_sources.return_value = {"test_source": sample_source_config}
 
         updated_config = await base_config_service.update_config("test_source", {"max_retries": 20})
         assert updated_config.max_retries == 20
-        mock_update_file.assert_called_once()
         mock_sync_instance_service.mark_dependent_syncs_outdated.assert_not_called()
 
     @pytest.mark.asyncio
-    @patch('fustor_agent.services.configs.base.update_app_config_file')
-    async def test_delete_config_source_pusher(self, mock_update_file, base_config_service, mock_app_config, mock_sync_instance_service, sample_source_config):
+    async def test_delete_config_source_pusher(self, base_config_service, mock_app_config, mock_sync_instance_service, sample_source_config):
         mock_app_config.get_sources.return_value = {"test_source": sample_source_config}
         mock_app_config.delete_source.return_value = sample_source_config
 
         result = await base_config_service.delete_config("test_source")
 
         mock_app_config.delete_source.assert_called_once_with("test_source")
-        mock_update_file.assert_called_once()
         assert result == sample_source_config
 
     @pytest.mark.asyncio
-    @patch('fustor_agent.services.configs.base.update_app_config_file')
-    async def test_delete_config_sync(self, mock_update_file, mock_app_config, mock_sync_instance_service, sample_sync_config):
+    async def test_delete_config_sync(self, mock_app_config, mock_sync_instance_service, sample_sync_config):
         sync_service = BaseConfigService(mock_app_config, mock_sync_instance_service, "sync")
         mock_app_config.get_syncs.return_value = {"test_sync": sample_sync_config}
         mock_app_config.delete_sync.return_value = sample_sync_config
@@ -118,7 +108,6 @@ class TestBaseConfigService:
 
         mock_sync_instance_service.stop_one.assert_called_once_with("test_sync")
         mock_app_config.delete_sync.assert_called_once_with("test_sync")
-        mock_update_file.assert_called_once()
         assert result == sample_sync_config
 
     @pytest.mark.asyncio

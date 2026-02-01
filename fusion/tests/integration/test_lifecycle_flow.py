@@ -82,7 +82,7 @@ async def test_start_stop_view_lifecycle(mock_managers, mock_configs, mock_loade
     assert "view-1" in view_managers["1"].providers
     
     # Verify on_session_start called (because we mocked active session)
-    mock_provider.on_session_start.assert_called_with("sess-1")
+    mock_provider.on_session_start.assert_called_with()
     
     # --- 2. Start View Again ---
     response = client.post("/api/v1/management/views/view-1/start")

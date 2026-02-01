@@ -29,13 +29,10 @@ class ProcessingManager:
                 self._tasks[ds_id_str] = task
                 logger.info(f"Started dynamic background processing task for datastore {ds_id_str}.")
 
-    async def sync_tasks(self, datastore_configs: List[Any]):
+    async def sync_tasks(self, datastore_configs: Dict[str, Any]):
         """根据配置同步处理任务 (由 reload_configs_job 调用)"""
-        for config in datastore_configs:
-            # DatastoreConfig object has 'id' field
-            ds_id = getattr(config, 'id', None)
-            if ds_id is not None:
-                await self.ensure_processor(ds_id)
+        for ds_id, config in datastore_configs.items():
+            await self.ensure_processor(ds_id)
 
     async def _per_datastore_processing_loop(self, datastore_id: str):
         """优化的后台处理循环：事件驱动 + 状态追踪"""

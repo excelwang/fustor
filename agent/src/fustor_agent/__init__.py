@@ -1,14 +1,11 @@
 from __future__ import annotations
 import os
-import yaml
 import logging
 from typing import Optional, Dict
 from dotenv import load_dotenv, find_dotenv
-from pydantic import ValidationError
-import tempfile
 from pathlib import Path
 
-from fustor_core.models.config import AppConfig, SourceConfig, PusherConfig, SyncConfig, SourceConfigDict, PusherConfigDict, SyncConfigDict
+from fustor_core.models.config import AppConfig, SyncConfig, SyncConfigDict, SourceConfigDict, PusherConfigDict
 from fustor_common.paths import get_fustor_home_dir
 
 # Standardize Fustor home directory across all services
@@ -24,9 +21,7 @@ if home_dotenv_path.is_file():
 # Load .env from project root (lowest priority) - will not override already set variables
 load_dotenv(find_dotenv())
 
-CONFIG_FILE_NAME = 'agent-config.yaml' # Renamed from config.yaml
 STATE_FILE_NAME = 'agent-state.json'
-
 STATE_FILE_PATH = os.path.join(CONFIG_DIR, STATE_FILE_NAME)
 
 from fustor_common.exceptions import ConfigurationError
@@ -69,25 +64,4 @@ def get_app_config() -> AppConfig:
 
     return _app_config_instance
 
-def update_app_config_file():
-    """Atomically writes the in-memory configuration back to the file."""
-    global _app_config_instance
-    if _app_config_instance is not None:
-        # Ensure the target directory exists.
-        if CONFIG_DIR: # Only try to make dirs if CONFIG_DIR is not empty
-            os.makedirs(CONFIG_DIR, exist_ok=True) 
-        
-        # Determine the directory for the temporary file.
-        temp_file_parent_dir = CONFIG_DIR if CONFIG_DIR else '.'
-
-        fd, tmp_path = tempfile.mkstemp(dir=temp_file_parent_dir, prefix=".config_tmp_", suffix=".yaml")
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as tmp_file:
-                config_dict = _app_config_instance.model_dump(by_alias=True, exclude_none=True)
-                yaml.dump(config_dict, tmp_file, default_flow_style=False, allow_unicode=True)
-            os.replace(tmp_path, os.path.join(CONFIG_DIR, CONFIG_FILE_NAME))
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
-
-__all__ = ["get_app_config", "update_app_config_file", "CONFIG_DIR", "CONFIG_FILE_NAME", "STATE_FILE_PATH", "ConfigurationError"]
+__all__ = ["get_app_config", "CONFIG_DIR", "STATE_FILE_PATH", "ConfigurationError"]

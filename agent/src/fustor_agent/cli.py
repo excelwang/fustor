@@ -11,7 +11,7 @@ import time
 
 from fustor_common.logging_config import setup_logging
 from fustor_common.paths import get_fustor_home_dir # NEW import
-from . import CONFIG_DIR, CONFIG_FILE_NAME, ConfigurationError
+from . import CONFIG_DIR, ConfigurationError
 
 # Define common logging path
 HOME_FUSTOR_DIR = get_fustor_home_dir() # Use the common function
@@ -48,12 +48,9 @@ def cli():
 @click.option("-h", "--host", default="127.0.0.1", help="Host to bind the server to.")
 @click.option("-D", "--daemon", is_flag=True, help="Run the service as a background daemon.")
 @click.option("-V", "--verbose", is_flag=True, help="Enable verbose (DEBUG level) logging.")
-@click.option("-C", "--config", default=None, help="Path to configuration file.")
 @click.option("--no-console-log", is_flag=True, hidden=True, help="Internal: Disable console logging.")
-def start(reload, port, host, daemon, verbose, no_console_log, config):
+def start(reload, port, host, daemon, verbose, no_console_log):
     """Starts the FuAgent monitoring service (in the foreground by default)."""
-    if config:
-        os.environ["FUSTOR_AGENT_CONFIG"] = config
     log_level = "DEBUG" if verbose else "INFO"
     # Disable console logging if --no-console-log is passed (used by daemonized process)
     setup_logging(log_file_path=AGENT_LOG_FILE, base_logger_name="fustor_agent", level=log_level.upper(), console_output=(not no_console_log))
@@ -127,7 +124,7 @@ def start(reload, port, host, daemon, verbose, no_console_log, config):
     except ConfigurationError as e:
         click.echo("="*60)
         click.echo(click.style(f"FuAgent Configuration Error: {e}", fg="red"))
-        click.echo(f"Please check your configuration file at: '{os.path.join(CONFIG_DIR, CONFIG_FILE_NAME)}'")
+        click.echo(f"Please check your configuration files in: '{CONFIG_DIR}'")
         click.echo("="*60)
     except Exception as e:
         logger.critical(f"An unexpected error occurred during startup: {e}", exc_info=True)

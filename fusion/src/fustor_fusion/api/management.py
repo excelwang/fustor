@@ -82,7 +82,7 @@ async def start_view(view_id: str):
         sessions = await session_manager.get_datastore_sessions(datastore_id)
         if sessions:
             session_id = list(sessions.keys())[0]
-            await provider.on_session_start(session_id)
+            await provider.on_session_start()
             logger.info(f"Triggered on_session_start for view {view_id}")
         
     except Exception as e:

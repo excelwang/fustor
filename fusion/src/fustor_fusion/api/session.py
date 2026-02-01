@@ -114,7 +114,7 @@ async def create_session(
     
     # Notify parsers about the new session for lifecycle management (e.g. blind-spot reset)
     try:
-        await on_session_start(datastore_id, session_id)
+        await on_session_start(datastore_id)
         logger.info(f"Triggered on_session_start for {session_id} on datastore {datastore_id}")
     except Exception as e:
         logger.error(f"Failed to trigger on_session_start during session creation: {e}")
@@ -198,7 +198,7 @@ async def end_session(
     
     # Notify view providers of session closure for cleanup
     try:
-        await on_session_close(datastore_id, session_id)
+        await on_session_close(datastore_id)
     except Exception as e:
         logger.warning(f"Failed to notify view providers of session close: {e}")
     

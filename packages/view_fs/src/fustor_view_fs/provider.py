@@ -49,22 +49,21 @@ class FSViewProvider(FSViewBase):
         async with self._global_semaphore:
             return self.arbitrator.cleanup_expired_suspects()
 
-    async def on_session_start(self, session_id: str):
+    async def on_session_start(self):
         """Handles new session lifecycle."""
         async with self._global_exclusive_lock():
             # If we were in an audit, it's now invalid
             self.state.last_audit_start = None
             self.state.audit_seen_paths.clear()
-            self.state.current_session_id = session_id
             
             # Per CONSISTENCY_DESIGN.md §4.4: Clear blind-spot lists on new session
             # Blind spots may be rediscovered by the new session
             self.state.blind_spot_additions.clear()
             self.state.blind_spot_deletions.clear()
             
-            self.logger.info(f"Session {session_id} started. Cleared audit buffer and blind-spot lists.")
+            self.logger.info(f"New session sequence started. Cleared audit buffer and blind-spot lists.")
 
-    async def on_session_close(self, session_id: str):
+    async def on_session_close(self):
         """Handles session closure."""
         # Generic FS provider doesn't reset on session close usually,
         # unless configured as 'live' only.

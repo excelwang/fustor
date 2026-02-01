@@ -2,7 +2,7 @@
 import logging
 from typing import Dict, Optional, TypeVar, Generic, Any
 
-from fustor_agent import update_app_config_file
+from fustor_agent import get_app_config
 from fustor_core.models.config import AppConfig
 from fustor_agent.services.common import config_lock
 from fustor_agent.services.instances.sync import SyncInstanceService
@@ -64,7 +64,7 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
         """添加一个新的配置项并持久化到文件。"""
         async with config_lock:
             self._add_config_to_app(id, config)
-            update_app_config_file()
+            # Removed legacy persistence call
             logger.info(f"{self.config_type_capitalized} '{id}' configuration added.")
             return config
 
@@ -84,7 +84,7 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
             for key, value in updates.items():
                 setattr(conf, key, value)
             
-            update_app_config_file()
+            # Removed legacy persistence call
             logger.info(f"{self.config_type_capitalized} '{id}' configuration updated.")
 
             # Check if disabled status changed and notify if necessary
@@ -121,7 +121,7 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
                 await self.sync_instance_service.stop_one(id)
             
             conf = self._delete_config_from_app(id)
-            update_app_config_file()
+            # Removed legacy persistence call
             logger.info(f"{self.config_type_capitalized} '{id}' configuration deleted.")
         
         return conf

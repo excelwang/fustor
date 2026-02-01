@@ -54,12 +54,7 @@ class SourcesConfigLoader:
             if not isinstance(data, dict):
                 data = {}
 
-            candidates = []
-            
-            for k, v in data.items():
-                candidates.append((k, v))
-            
-            for s_id, s_data in candidates:
+            for s_id, s_data in data.items():
                 if not isinstance(s_data, dict):
                     continue
                 try:

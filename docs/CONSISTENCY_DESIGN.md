@@ -167,7 +167,7 @@ Fusion 维护以下状态：
   - **清除**：
     - 收到 Realtime Delete/Update 时移除相关条目
     - Audit 再次看到文件时移除相关条目
-    - **Session 重置**：当检测到新的 Agent Session (如重启或Leader切换) 时，盲区可能会被重新发现，清空整个列表
+    - **Session 会话生命周期控制**：当检测到新的 Agent 会话序列 (Sequence) 开始时（如 API 触发 `on_session_start`），清空列表以重新发现盲区。
 
 ---
 
@@ -381,8 +381,8 @@ if node.last_updated_at > audit_start_local_time:
 
 | 钩子 | 时机 | 用途 |
 |------|------|------|
-| `on_session_start` | 新 Session 加入 | 重置盲区列表 |
-| `on_session_close` | Session 结束 | 清理 Session 相关状态 |
+| `on_session_start` | 新 Session 序列开始 | 重置盲区列表与 Audit 缓冲区 |
+| `on_session_close` | Session 结束 | 执行必要的清理操作 |
 | `handle_audit_start` | 审计开始 | 记录逻辑时间戳 |
 | `handle_audit_end` | 审计结束 | 执行 Missing 判定和 Tombstone 清理 |
 | `cleanup_expired_suspects` | 后台定时任务 | 执行 mtime 稳定性检查 |

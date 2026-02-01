@@ -95,7 +95,7 @@ class TestBlindSpotSessionReset:
         assert len(provider.state.blind_spot_additions) == 2
         
         # Action: 启动新 Session
-        await provider.on_session_start("new-session-123")
+        await provider.on_session_start()
         
         # Assert: 盲区列表被清空
         assert len(provider.state.blind_spot_additions) == 0, \
@@ -113,7 +113,7 @@ class TestBlindSpotSessionReset:
         assert len(provider.state.blind_spot_deletions) == 2
         
         # Action: 启动新 Session
-        await provider.on_session_start("new-session-456")
+        await provider.on_session_start()
         
         # Assert: 盲区删除列表被清空
         assert len(provider.state.blind_spot_deletions) == 0, \
@@ -129,7 +129,7 @@ class TestBlindSpotSessionReset:
         provider.state.audit_seen_paths.add("/some/path")
         
         # Action: 启动新 Session
-        await provider.on_session_start("new-session-789")
+        await provider.on_session_start()
         
         # Assert: audit 状态被清空
         assert provider.state.last_audit_start is None

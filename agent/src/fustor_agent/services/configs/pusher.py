@@ -3,7 +3,7 @@
 import logging
 from typing import Dict, Optional, List
 
-from fustor_agent import update_app_config_file
+# Removed legacy import
 from fustor_core.models.config import AppConfig, PusherConfig
 from fustor_agent.services.instances.sync import SyncInstanceService
 from fustor_agent.services.common import config_lock
@@ -60,7 +60,8 @@ class PusherConfigService(BaseConfigService[PusherConfig], PusherConfigServiceIn
                     deleted_ids.append(an_id)
             
             if deleted_ids:
-                update_app_config_file()
+                # Removed legacy persistence call
+                pass
         
         logger.info(f"Successfully cleaned up {len(deleted_ids)} pusher configurations.")
         return deleted_ids

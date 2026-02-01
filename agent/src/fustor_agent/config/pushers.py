@@ -53,12 +53,7 @@ class PushersConfigLoader:
             if not isinstance(data, dict):
                 data = {}
 
-            candidates = []
-            
-            for k, v in data.items():
-                candidates.append((k, v))
-            
-            for p_id, p_data in candidates:
+            for p_id, p_data in data.items():
                 if not isinstance(p_data, dict):
                     continue
                 

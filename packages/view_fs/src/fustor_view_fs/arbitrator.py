@@ -36,7 +36,6 @@ class FSArbitrator:
             self.state.last_audit_start = time.time()
             self.logger.info(f"Auto-detected Audit Start at local time: {self.state.last_audit_start}")
 
-        self.state.current_session_id = getattr(event, "session_id", self.state.current_session_id)
         
         rows_processed = 0
         for payload in event.rows:
@@ -49,9 +48,8 @@ class FSArbitrator:
             # Update clock with row mtime. For deletions, mtime might be None.
             mtime = payload.get('modified_time')
             
-            # Extract Agent Time and Session ID for Robust Clock
+            # Extract Agent Time for Robust Clock
             agent_time = None
-            session_id = self.state.current_session_id
             
             if hasattr(event, 'index'):
                  agent_time = float(event.index)
@@ -62,8 +60,6 @@ class FSArbitrator:
             if agent_time and agent_time > 1e11:
                 agent_time /= 1000.0
                  
-            if hasattr(event, 'session_id'):
-                session_id = event.session_id
 
             self.state.logical_clock.update(mtime, agent_time=agent_time, can_sample_skew=is_realtime)
             
