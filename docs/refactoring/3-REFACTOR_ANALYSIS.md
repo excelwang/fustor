@@ -188,65 +188,65 @@ reset() / cleanup_expired_suspects()  # Optional
 
 ## 6. 重构阶段计划
 
-### Phase 1: 合并基础模块 (fustor-core) ✅ 已完成
+### Phase 1: 合并基础模块 (fustor-core) 
 
-1. ✅ **合并 common, event-model 到 fustor-core**
+1. **合并 common, event-model 到 fustor-core**
    - 保留所有现有功能
    - 创建子模块结构: `common/`, `event/`, `clock/`
 
-2. ✅ **创建 Pipeline 抽象**
+2. **创建 Pipeline 抽象**
    - `fustor-core/pipeline/pipeline.py` - Pipeline ABC
    - `fustor-core/pipeline/context.py` - PipelineContext
    
-3. ✅ **创建 Transport 抽象**
+3. **创建 Transport 抽象**
    - `fustor-core/transport/sender.py` - Sender ABC
    - `fustor-core/transport/receiver.py` - Receiver ABC
 
-4. ✅ **创建 fustor-schema-fs**
+4. **创建 fustor-schema-fs**
    - 提取 EventBase 的 FS 特定字段
    - 定义 SCHEMA_NAME, SCHEMA_VERSION
 
-### Phase 2: Agent 重构 ✅ 完成
+### Phase 2: Agent 重构 
 
-5. ✅ **重命名 pusher → sender**
+5. **重命名 pusher → sender**
    - `packages/sender-http/` - 新包，实现 Sender 抽象
    - `packages/pusher-fusion/` - 废弃，重定向到 sender-http
    - `senders-config.yaml` - 新配置加载器，兼容 pushers-config.yaml
    - `SenderDriverService` - 替代 PusherDriverService
 
-6. ⬜ **重构 SyncInstance → Pipeline** (暂缓)
+6. **重构 SyncInstance → Pipeline** 
    - 提取通用逻辑到 Pipeline
    - FS 特有逻辑保留在 FSSourceHandler
 
-### Phase 3: Fusion 重构 ✅ 完成
+### Phase 3: Fusion 重构 
 
-7. ✅ **创建 fustor-receiver-http**
+7. **创建 fustor-receiver-http**
    - `packages/receiver-http/` - 新包，实现 Receiver 抽象
    - 提供 FastAPI routers 用于 session 和 event 处理
    - 回调架构支持灵活集成
 
-8. ✅ **创建 receivers-config.yaml 配置**
+8. **创建 receivers-config.yaml 配置**
    - `ReceiversConfigLoader` - 传输端点和 API key 管理
    - 支持多 API key 映射到 pipeline
 
-9. ✅ **创建 FusionPipelineConfig**
+9. **创建 FusionPipelineConfig**
    - `FusionPipelinesConfigLoader` - Pipeline 配置加载
    - 支持 fusion-pipes-config/*.yaml 目录结构
    - 直接绑定 Receiver → View
 
-### Phase 4: 配置与测试更新 ✅ 完成
+### Phase 4: 配置与测试更新 
 
-10. ✅ **配置文件迁移**
+10. **配置文件迁移**
     - senders-config.yaml (Agent)
     - receivers-config.yaml (Fusion)
     - fusion-pipes-config/*.yaml (Fusion Pipeline)
 
-11. ✅ **API 路径更新**
+11. **API 路径更新**
     - `/api/v1/pipe` 新路径 (推荐)
     - `/api/v1/ingest` 保留向后兼容
     - FusionSDK 支持 api_version 参数
     
-12. ✅ **测试更新**
+12. **测试更新**
     - 更新 import 路径到 fustor_core
     - 303 tests passing, 2 expected deprecation warnings
 
@@ -256,55 +256,44 @@ reset() / cleanup_expired_suspects()  # Optional
 
 | 风险 | 影响 | 缓解措施 |
 |------|------|---------|
-| LogicalClock 迁移破坏一致性 | 高 | ✅ 保持接口不变，仅移动位置 |
-| 配置解析逻辑变更 | 中 | ✅ 渐进式迁移，保持旧格式兼容 |
-| Session 管理重构 | 高 | ⬜ 暂缓，先测试覆盖再改动 |
-| API 路径变更 | 中 | ✅ 双路径支持，渐进迁移 |
+| LogicalClock 迁移破坏一致性 | 高 | 保持接口不变，仅移动位置 |
+| 配置解析逻辑变更 | 中 | 渐进式迁移，保持旧格式兼容 |
+| Session 管理重构 | 高 | 暂缓，先测试覆盖再改动 |
+| API 路径变更 | 中 | 双路径支持，渐进迁移 |
 
 ---
 
 ## 8. 下一步行动
 
-1. ✅ 创建分支 `refactor/architecture-v2`
-2. ✅ 阅读现有代码，理解业务逻辑
-3. ✅ Phase 1: 合并基础模块到 fustor-core
-4. ✅ Phase 2: Agent 重构 (sender-http, SenderDriverService)
-5. ✅ Phase 3: Fusion 重构 (receiver-http, pipelines)
-6. ✅ Phase 4: 导入路径更新 + API 路径
-7. ✅ schema-fs: Pydantic 模型 + 22 个测试
-8. ✅ 术语迁移: Pusher → Sender (完整迁移，保持向后兼容)
+1. 创建分支 `refactor/architecture-v2`
+2. 阅读现有代码，理解业务逻辑
+3. Phase 1: 合并基础模块到 fustor-core
+4. Phase 2: Agent 重构 (sender-http, SenderDriverService)
+5. Phase 3: Fusion 重构 (receiver-http, pipelines)
+6. Phase 4: 导入路径更新 + API 路径
+7. schema-fs: Pydantic 模型 + 22 个测试
+8. 术语迁移: Pusher → Sender (完整迁移，保持向后兼容)
    - SenderConfig, SenderConfigDict
    - SenderDriverService, SenderConfigService
    - SenderDriverServiceInterface, SenderConfigServiceInterface
    - Entry points: fustor_agent.drivers.senders
    - AppConfig: get_senders(), add_sender(), delete_sender()
-9. ✅ Pipeline 抽象: Phase 2 完成
+9. Pipeline 抽象: Phase 2 完成
    - AgentPipeline 完整实现 (含控制循环)
    - FusionPipeline 完整实现
    - SourceHandlerAdapter, SenderHandlerAdapter
    - ViewDriverAdapter, ViewManagerAdapter
    - PipelineBridge 迁移工具
    - 89 个 Pipeline 相关测试
-10. ✅ 废弃 datastores-config.yaml (添加废弃警告，优先 receivers-config)
-11. ✅ Session 管理整合: PipelineSessionBridge
+10. 废弃 datastores-config.yaml (添加废弃警告，优先 receivers-config)
+11. Session 管理整合: PipelineSessionBridge
     - 桥接 FusionPipeline 与 SessionManager
     - 同步 session 创建/销毁
     - 9 个单元测试
-12. ✅ SyncInstance → AgentPipeline 迁移
+12. SyncInstance → AgentPipeline 迁移
     - SyncInstanceService 支持 feature flag 切换
     - FUSTOR_USE_PIPELINE=true 启用新架构
     - 零风险渐进式迁移
-
-**当前测试状态**: 401 passed, 1 xfailed, 0 warnings
-
-## 重构完成！
-
-所有主要重构任务已完成。架构现在支持：
-
-1. **双轨运行**: SyncInstance (生产) 和 AgentPipeline (可选) 可并行
-2. **渐进式迁移**: 通过环境变量 `FUSTOR_USE_PIPELINE` 控制
-3. **向后兼容**: 所有旧配置格式仍然支持
-4. **完整测试覆盖**: 401 个测试确保功能正确
 
 
 
