@@ -66,8 +66,12 @@ class SourceConfig(BaseModel):
     validation_error: Optional[str] = Field(None, exclude=True)
     driver_params: Dict[str, Any] = Field(default_factory=dict, description="驱动专属参数")
 
-class PusherConfig(BaseModel):
-    # Assuming 'name' will be the key in the dict
+class SenderConfig(BaseModel):
+    """
+    Configuration for a Sender (formerly Pusher).
+    
+    Senders are responsible for transmitting events from Agent to Fusion.
+    """
     driver: str
     endpoint: str
     credential: Credential
@@ -82,6 +86,10 @@ class PusherConfig(BaseModel):
         if v <= 0:
             raise ConfigError('batch_size must be positive')
         return v
+
+
+# Backward compatibility alias
+PusherConfig = SenderConfig
 
 class SyncConfig(BaseModel):
     source: str
@@ -101,8 +109,11 @@ class SyncConfig(BaseModel):
 class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):
     root: Dict[str, SourceConfig] = Field(default_factory=dict)
 
-class PusherConfigDict(RootModel[Dict[str, PusherConfig]]):
-    root: Dict[str, PusherConfig] = Field(default_factory=dict)
+class SenderConfigDict(RootModel[Dict[str, SenderConfig]]):
+    root: Dict[str, SenderConfig] = Field(default_factory=dict)
+
+# Backward compatibility alias
+PusherConfigDict = SenderConfigDict
 
 class SyncConfigDict(RootModel[Dict[str, SyncConfig]]):
     root: Dict[str, SyncConfig] = Field(default_factory=dict)

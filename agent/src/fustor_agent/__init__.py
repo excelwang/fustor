@@ -5,7 +5,7 @@ from typing import Optional, Dict
 from dotenv import load_dotenv, find_dotenv
 from pathlib import Path
 
-from fustor_core.models.config import AppConfig, SyncConfig, SyncConfigDict, SourceConfigDict, PusherConfigDict
+from fustor_core.models.config import AppConfig, SyncConfig, SyncConfigDict, SourceConfigDict, SenderConfigDict
 from fustor_core.common import get_fustor_home_dir
 
 # Standardize Fustor home directory across all services
@@ -58,7 +58,7 @@ def get_app_config() -> AppConfig:
 
         _app_config_instance = AppConfig(
             sources=SourceConfigDict(root=valid_sources),
-            pushers=PusherConfigDict(root=valid_pushers),
+            pushers=SenderConfigDict(root=valid_pushers),
             syncs=SyncConfigDict(root=valid_syncs)
         )
 
