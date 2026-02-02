@@ -16,6 +16,7 @@ When reviewing changes code, follow these steps:
 5. **Maintainability**: Is the code easy to understand and maintain?
 6. **Over-testing**: Are there redundant tests?
 7. **Test coverage**: Are there missing tests?
+8. **Test code pollution**: Does the test code pollute the business code? include twist the business logic to make it easier to test, or add extra methods to the business code to make it easier to test.
 
 ## How to use it
 

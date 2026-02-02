@@ -42,7 +42,7 @@ class TestLeaderElectionFirst:
         assert leader_session is not None, "No leader elected"
         
         # The first agent (agent-a) should be the leader
-        assert leader_session.get("agent_id", "").startswith("agent-a"), \
+        assert leader_session.get("agent_id", "").startswith("client-a"), \
             f"Expected agent-a to be leader, got {leader_session.get('agent_id')}"
         
         # Verify leader has the correct capabilities

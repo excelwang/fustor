@@ -64,7 +64,7 @@ class TestNewLeaderResumesDuties:
                     break
             
             assert new_leader is not None, "New leader should exist"
-            assert new_leader.get("agent_id", "").startswith("agent-b"), \
+            assert new_leader.get("agent_id", "").startswith("client-b"), \
                 "Agent B should be the new leader"
             
             # Create file from blind-spot
@@ -218,17 +218,17 @@ class TestNewLeaderResumesDuties:
             roles = {}
             for s in sessions:
                 aid = s.get("agent_id", "")
-                if aid.startswith("agent-a"):
-                    roles["agent-a"] = s.get("role")
-                elif aid.startswith("agent-b"):
-                    roles["agent-b"] = s.get("role")
+                if aid.startswith("client-a"):
+                    roles["client-a"] = s.get("role")
+                elif aid.startswith("client-b"):
+                    roles["client-b"] = s.get("role")
             
             # B should remain leader
-            assert roles.get("agent-b") == "leader", \
+            assert roles.get("client-b") == "leader", \
                 f"Agent B should remain leader, got roles: {roles}"
             
             # A should be follower
-            assert roles.get("agent-a") == "follower", \
+            assert roles.get("client-a") == "follower", \
                 f"Returning Agent A should become follower, got roles: {roles}"
             
         finally:

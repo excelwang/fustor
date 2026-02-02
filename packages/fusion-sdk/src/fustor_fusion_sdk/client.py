@@ -143,6 +143,8 @@ class FusionClient:
             response.raise_for_status()
             return True
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 419:
+                raise
             logger.error(f"HTTP error occurred during event push: {e.response.status_code} - {e.response.text}")
             return False
         except Exception as e:
@@ -160,6 +162,8 @@ class FusionClient:
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:
+            if e.response.status_code == 419:
+                raise
             logger.error(f"HTTP error occurred during heartbeat: {e.response.status_code} - {e.response.text}")
             return None
         except Exception as e:

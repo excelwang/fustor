@@ -7,8 +7,10 @@ from Fustor Agent to Fustor Fusion.
 import logging
 from typing import Any, Dict, List, Optional
 
+import httpx
 from fustor_core.transport import Sender
 from fustor_core.event import EventBase
+from fustor_core.exceptions import SessionObsoletedError
 
 
 class HTTPSender(Sender):
@@ -117,18 +119,27 @@ class HTTPSender(Sender):
         
         total_rows = sum(len(e.get("rows", [])) for e in event_dicts)
         
-        success = await self.client.push_events(
-            session_id=self.session_id,
-            events=event_dicts,
-            source_type=source_type,
-            is_snapshot_end=is_end
-        )
-        
-        if success:
-            self.logger.info(f"[{source_type}] Sent {len(events)} events ({total_rows} rows).")
-            return {"success": True}
-        else:
-            self.logger.error(f"[{source_type}] Failed to send {len(events)} events.")
+        try:
+            success = await self.client.push_events(
+                session_id=self.session_id,
+                events=event_dicts,
+                source_type=source_type,
+                is_snapshot_end=is_end
+            )
+            
+            if success:
+                self.logger.info(f"[{source_type}] Sent {len(events)} events ({total_rows} rows).")
+                return {"success": True}
+            else:
+                self.logger.error(f"[{source_type}] Failed to send {len(events)} events.")
+                return {"success": False, "error": "Push failed"}
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 419:
+                raise SessionObsoletedError(f"Session {self.session_id} is obeselete (419)")
+            self.logger.error(f"[{source_type}] Failed to send {len(events)} events: {e}")
+            return {"success": False, "error": f"Push failed: {e}"}
+        except Exception as e:
+            self.logger.error(f"[{source_type}] Failed to send {len(events)} events: {e}")
             return {"success": False, "error": "Push failed"}
     
     async def heartbeat(self) -> Dict[str, Any]:
@@ -142,14 +153,20 @@ class HTTPSender(Sender):
             self.logger.error("Cannot send heartbeat: session_id is not set.")
             return {"status": "error", "message": "Session ID not set"}
         
-        result = await self.client.send_heartbeat(self.session_id)
-        
-        if result:
-            self.logger.debug("Heartbeat sent successfully.")
-            return result
-        else:
-            self.logger.error("Failed to send heartbeat.")
-            return {"status": "error", "message": "Heartbeat failed"}
+        try:
+            result = await self.client.send_heartbeat(self.session_id)
+            
+            if result:
+                self.logger.debug("Heartbeat sent successfully.")
+                return result
+            else:
+                self.logger.error("Failed to send heartbeat.")
+                return {"status": "error", "message": "Heartbeat failed"}
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 419:
+                raise SessionObsoletedError(f"Session {self.session_id} is obeselete (419)")
+            self.logger.error(f"Failed to send heartbeat: {e}")
+            return {"status": "error", "message": f"Heartbeat failed: {e}"}
     
     async def close_session(self) -> None:
         """Close the current session gracefully."""

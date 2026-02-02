@@ -34,7 +34,7 @@ class TestFollowerIOIsolation:
         # Find follower session
         follower_session = None
         for session in sessions:
-            if session.get("agent_id", "").startswith("agent-b"):
+            if session.get("agent_id", "").startswith("client-b"):
                 follower_session = session
                 break
         

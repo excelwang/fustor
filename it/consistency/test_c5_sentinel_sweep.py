@@ -94,4 +94,4 @@ class TestSentinelSweep:
         # This is more of a smoke test for role management
         leader_session = fusion_client.get_leader_session()
         assert leader_session is not None, "Leader session must exist"
-        assert "agent-a" in leader_session.get("agent_id", "")
+        assert "client-a" in leader_session.get("agent_id", "")

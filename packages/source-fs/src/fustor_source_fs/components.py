@@ -132,14 +132,18 @@ class _WatchManager:
         self.stop_driver_event = stop_driver_event 
         self.throttle_interval = throttle_interval
 
-        # Directly use the low-level Inotify class
-        # We watch the root path non-recursively just to initialize the instance.
-        # All other watches are added dynamically.
-        # Use safe_path_encode to handle potential surrogate characters in root_path
-        self.inotify = Inotify(safe_path_encode(root_path), recursive=False)
+        self.inotify = None
+        self._ensure_inotify()
         
         self._stop_event = threading.Event()
-        self.inotify_thread = threading.Thread(target=self._event_processing_loop, daemon=True)
+        self.inotify_thread = None
+    
+    def _ensure_inotify(self):
+        """Ensure inotify instance is created and valid."""
+        if self.inotify is None:
+            # Directly use the low-level Inotify class
+            # We watch the root path non-recursively just to initialize the instance.
+            self.inotify = Inotify(safe_path_encode(self.root_path), recursive=False)
 
     def _get_current_time(self) -> float:
         """Returns the current time (Agent physical time)."""
@@ -280,6 +284,7 @@ class _WatchManager:
                     return
 
             try:
+                self._ensure_inotify()
                 self.inotify.add_watch(safe_path_encode(path))
                 self.lru_cache.put(path, WatchEntry(timestamp_to_use))
             except OSError as e:
@@ -355,8 +360,29 @@ class _WatchManager:
                 current_path = os.path.dirname(current_path)
 
     def start(self):
-        logger.info("WatchManager: Starting inotify event thread.")
-        self.inotify_thread.start()
+        with self._lock:
+            if self.inotify_thread and self.inotify_thread.is_alive():
+                logger.warning("WatchManager: already running")
+                return
+
+            logger.info(f"WatchManager: Starting inotify for root path {self.root_path}")
+            
+            # Ensure inotify is valid (recreate if stopped)
+            if self._stop_event.is_set():
+                self.inotify = None
+                self._ensure_inotify()
+                
+                # Re-add existing watches from LRU cache if we had to recreate inotify
+                for path in self.lru_cache.cache.keys():
+                    try:
+                        self.inotify.add_watch(safe_path_encode(path))
+                    except OSError as e:
+                        logger.warning(f"Failed to re-add watch for {path}: {e}")
+
+            self._stop_event.clear()
+            self.inotify_thread = threading.Thread(target=self._event_processing_loop, daemon=True)
+            self.inotify_thread.start()
+            logger.info("WatchManager: Inotify event thread started.")
 
     def stop(self):
         logger.info("WatchManager: Stopping inotify event thread.")

@@ -158,7 +158,7 @@ async def heartbeat(
     
     if not si:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
+            status_code=419,  # Session Obsoleted
             detail=f"Session {session_id} not found"
         )
     
@@ -192,7 +192,7 @@ async def end_session(
     
     if not success:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND, 
+            status_code=419,  # Session Obsoleted
             detail=f"Session {session_id} not found"
         )
     
