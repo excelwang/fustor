@@ -61,8 +61,8 @@ async def start_view(view_id: str):
         from fustor_fusion_sdk.loaders import load_view
         provider_class = load_view(config.driver)
         provider = provider_class(
-            view_id=view_id,
-            datastore_id=v_group_id,
+            id=view_id,
+            view_id=v_group_id,
             config=config.driver_params
         )
         await provider.initialize()
@@ -83,7 +83,7 @@ async def start_view(view_id: str):
             detail=f"Failed to start view: {e}"
         )
     
-    return {"status": "started", "view_id": view_id, "view_group_id": v_group_id, "datastore_id": v_group_id}
+    return {"status": "started", "view_id": view_id, "view_group_id": v_group_id}
 
 
 @router.post("/views/{view_id}/stop")

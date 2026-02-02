@@ -36,3 +36,9 @@
 - [x] Replace `datastore_id` usage with `view_id` in `packages/fusion-sdk` where applicable (excluding the alias definition).
 - [x] Clean up terminology in `packages/sender-echo` (descriptions and logs).
 - [x] Verify no `DeprecationWarning` related to `datastore_id` are triggered during tests. (Verified by running relevant tests)
+
+## Phase 7: Final Review Cleanup
+- [x] Clean up `fusion/src/fustor_fusion/runtime/session_bridge.py`: usage of `datastore_id`.
+- [x] Clean up `fusion/src/fustor_fusion/api/pipe.py`: remove debug comments. (Verified clean)
+- [x] Clean up `fusion/tests/runtime/test_fusion_pipeline.py`: usage of `datastore_id` in assertions. (Verified clean)
+- [x] Final verification of no deprecated usages in active code paths. (Ran tests)

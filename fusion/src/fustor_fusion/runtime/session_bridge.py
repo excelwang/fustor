@@ -97,7 +97,6 @@ class PipelineSessionBridge:
         import time
         
         session_id = session_id or str(uuid.uuid4())
-        # Support both new string view_id and legacy integer datastore_id
         view_id = str(self._pipeline.view_id)
         
         from fustor_fusion.view_state_manager import view_state_manager

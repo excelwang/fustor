@@ -69,7 +69,7 @@ class PipelineManager:
                 for v_id in p_cfg.views:
                     try:
                         # We use view_id from extra or default to pipeline_id
-                        view_id = p_cfg.extra.get("view_id", p_cfg.extra.get("datastore_id", p_id))
+                        view_id = p_cfg.extra.get("view_id", p_id)
                         vm = await get_cached_view_manager(view_id)
                         handler = create_view_handler_from_manager(vm)
                         view_handlers.append(handler)
@@ -79,7 +79,7 @@ class PipelineManager:
                 pipeline = FusionPipeline(
                     pipeline_id=p_id,
                     config={
-                        "view_id": p_cfg.extra.get("view_id", p_cfg.extra.get("datastore_id", p_id)),
+                        "view_id": p_cfg.extra.get("view_id", p_id),
                         "allow_concurrent_push": p_cfg.allow_concurrent_push,
                         "session_timeout_seconds": p_cfg.session_timeout_seconds
                     },
