@@ -109,6 +109,20 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error during view auto-start: {e}", exc_info=True)
 
+    # --- Register Routers (AFTER all V2 setup is complete) ---
+    # Registering inside lifespan ensures that setup_pipe_v2_routers has correctly 
+    # populated pipe_router.
+    
+    # 1. Pipeline Domain (/api/v1/pipe) - Main API
+    api_v1 = APIRouter()
+    api_v1.include_router(pipe_router, prefix="/pipe")
+    api_v1.include_router(view_router, prefix="/views")
+    api_v1.include_router(management_router)
+    
+    # Finally include versioned router in app
+    app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
+    
+    logger.info("Application lifespan initialization complete. READY.")
     yield # Ready
 
     logger.info("Application shutdown initiated.")
@@ -129,23 +143,10 @@ app = FastAPI(lifespan=lifespan)
 # --- API Routing Version 1 ---
 from .api.pipe import pipe_router, setup_pipe_v2_routers
 from .api.management import router as management_router
+from .api.views import view_router
 
-# 1. V2 Setup - MUST be done BEFORE including pipe_router in api_v1
-# because FastAPI's include_router copies routes at call time
+# NOTE: Routers are now included inside lifespan() after V2 initialization.
 
-# Core versioned router
-api_v1 = APIRouter()
-# 2. Pipeline Domain (/api/v1/pipe) - Main API
-api_v1.include_router(pipe_router, prefix="/pipe")
-
-# 3. View Domain (/api/v1/views)
-api_v1.include_router(view_router, prefix="/views")
-
-# 4. Management Domain (/api/v1/management)
-api_v1.include_router(management_router)
-
-# Register the unified v1 router
-app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
 
 
 ui_dir = os.path.dirname(__file__)

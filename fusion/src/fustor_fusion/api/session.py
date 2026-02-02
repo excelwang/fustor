@@ -9,7 +9,11 @@ from typing import List, Dict, Any, Optional
 import time
 import uuid
 
-from ..auth.dependencies import get_datastore_id_from_api_key
+from ..auth.dependencies import get_view_id_from_api_key
+
+# Alias for backward compatibility
+get_datastore_id_from_api_key = get_view_id_from_api_key
+
 from ..config import receivers_config
 from ..core.session_manager import session_manager
 from ..datastore_state_manager import datastore_state_manager
@@ -88,7 +92,7 @@ async def _should_allow_new_session(
 async def create_session(
     payload: CreateSessionPayload,
     request: Request,
-    view_id: str = Depends(get_datastore_id_from_api_key),
+    view_id: str = Depends(get_view_id_from_api_key),
 ):
     view_id = str(view_id)
     session_config = _get_session_config(view_id)
@@ -156,7 +160,7 @@ async def create_session(
 @session_router.post("/heartbeat", tags=["Session Management"], summary="Session heartbeat keepalive")
 async def heartbeat(
     request: Request,
-    view_id: str = Depends(get_datastore_id_from_api_key),
+    view_id: str = Depends(get_view_id_from_api_key),
     session_id: str = Header(..., description="Session ID"),
 ):
     view_id = str(view_id)
@@ -191,7 +195,7 @@ async def heartbeat(
 
 @session_router.delete("/", tags=["Session Management"], summary="End session")
 async def end_session(
-    view_id: str = Depends(get_datastore_id_from_api_key),
+    view_id: str = Depends(get_view_id_from_api_key),
     session_id: str = Header(..., description="Session ID"),
 ):
     view_id = str(view_id)
@@ -221,7 +225,7 @@ async def end_session(
 
 @session_router.get("/", tags=["Session Management"], summary="List active sessions")
 async def list_sessions(
-    view_id: str = Depends(get_datastore_id_from_api_key),
+    view_id: str = Depends(get_view_id_from_api_key),
 ):
     view_id = str(view_id)
     sessions = await session_manager.get_datastore_sessions(view_id)

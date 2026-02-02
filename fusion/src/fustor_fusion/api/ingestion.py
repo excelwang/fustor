@@ -39,7 +39,7 @@ def _get_pipeline_config(pipeline_id: str) -> Dict[str, Any]:
 @ingestion_router.get("/stats", summary="Get global ingestion statistics", dependencies=[Depends(get_view_id_from_api_key)])
 async def get_global_stats():
     """
-    Get aggregated statistics across all active datastores and sessions for the monitoring dashboard.
+    Get aggregated statistics across all active pipelines for the monitoring dashboard.
     """
     active_pipelines = receivers_config.get_active_pipelines()
     
@@ -49,12 +49,11 @@ async def get_global_stats():
     oldest_item_info = {"path": "N/A", "age_days": 0}
     max_staleness_seconds = -1
 
-    now = datetime.now().timestamp()
-
     for pipeline_id, cfg in active_pipelines.items():
-        ds_id = int(pipeline_id) if pipeline_id.isdigit() else hash(pipeline_id) % 10000
+        # V2 uses string IDs directly
+        view_id = pipeline_id
         
-        ds_sessions = await session_manager.get_datastore_sessions(ds_id)
+        ds_sessions = await session_manager.get_datastore_sessions(view_id)
         for s_id, s_info in ds_sessions.items():
             task_id = s_info.task_id or f"Task-{s_id[:6]}"
             
@@ -75,7 +74,7 @@ async def get_global_stats():
                 }
 
         try:
-            view_manager = await get_cached_view_manager(ds_id)
+            view_manager = await get_cached_view_manager(view_id)
             stats = await view_manager.get_aggregated_stats()
             
             total_volume += stats.get("total_volume", 0)

@@ -53,6 +53,10 @@ class PipelineManager:
 
     async def initialize_pipelines(self):
         """Initialize pipelines and receivers based on configuration."""
+        # Ensure receivers are loaded first (sync)
+        if not self._receivers:
+            self.load_receivers()
+            
         async with self._lock:
             pipes_cfg = fusion_pipelines_config.reload()
             for p_id, p_cfg in pipes_cfg.items():
