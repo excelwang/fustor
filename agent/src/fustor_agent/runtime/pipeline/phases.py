@@ -30,6 +30,7 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
                 
             batch.append(event)
             if len(batch) >= pipeline.batch_size:
+                batch = pipeline.map_batch(batch)
                 success, response = await pipeline.sender_handler.send_batch(
                     pipeline.session_id, batch, {"phase": "snapshot"}
                 )
@@ -42,6 +43,7 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
                 
         # Send remaining events in batch
         if batch and pipeline.has_active_session():
+            batch = pipeline.map_batch(batch)
             success, response = await pipeline.sender_handler.send_batch(
                 pipeline.session_id, batch, {"phase": "snapshot", "is_final": True}
             )
@@ -77,6 +79,7 @@ async def run_driver_message_sync(pipeline: "AgentPipeline") -> None:
                 
             batch.append(event)
             if len(batch) >= pipeline.batch_size:
+                batch = pipeline.map_batch(batch)
                 success, response = await pipeline.sender_handler.send_batch(
                     pipeline.session_id, batch, {"phase": "realtime"}
                 )
@@ -93,6 +96,7 @@ async def run_driver_message_sync(pipeline: "AgentPipeline") -> None:
         # Send remaining events in batch
         if batch and pipeline.has_active_session():
             try:
+                batch = pipeline.map_batch(batch)
                 success, response = await pipeline.sender_handler.send_batch(
                     pipeline.session_id, batch, {"phase": "realtime", "is_final": True}
                 )
@@ -126,6 +130,7 @@ async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
                 continue
                 
             # 2. Sync send to fusion
+            events = pipeline.map_batch(events)
             success, response = await pipeline.sender_handler.send_batch(
                 pipeline.session_id, events, {"phase": "realtime"}
             )
@@ -185,12 +190,14 @@ async def run_audit_sync(pipeline: "AgentPipeline") -> None:
             
             batch.append(event)
             if len(batch) >= pipeline.batch_size:
+                batch = pipeline.map_batch(batch)
                 await pipeline.sender_handler.send_batch(
                     pipeline.session_id, batch, {"phase": "audit"}
                 )
                 batch = []
         
         if batch:
+            batch = pipeline.map_batch(batch)
             await pipeline.sender_handler.send_batch(
                 pipeline.session_id, batch, {"phase": "audit"}
             )

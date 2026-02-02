@@ -28,4 +28,4 @@ When reviewing changes code, follow these steps:
 - Be specific about what needs to change
 - Explain why, not just what
 - Suggest alternatives when possible
-- write in a document in chinese for the newbie developer to read
+- if there are exsiting a refactor review artifact, please update it with your new observation and suggestion, and change the commit id of the refactor branch to the latest commit id you have reviewed

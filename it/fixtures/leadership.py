@@ -19,7 +19,8 @@ from fixtures.agents import (
     CONTAINER_CLIENT_A, 
     CONTAINER_CLIENT_B,
     AUDIT_INTERVAL,
-    ensure_agent_running
+    ensure_agent_running,
+    MOUNT_POINT
 )
 
 logger = logging.getLogger("fustor_test")
@@ -95,9 +96,49 @@ def leader_follower_agents(setup_agents, fusion_client):
         
     # 1. Start Client A
     logger.info("Restarting Agent A...")
+    ensure_agent_running(CONTAINER_CLIENT_A, api_key, view_id)
+    
+    # Wait for A to become leader
+    time.sleep(2)
+
+    # 2. Start Client B
     logger.info("Restarting Agent B...")
-    ensure_agent_running(CONTAINER_CLIENT_B, api_key, datastore_id)
+    ensure_agent_running(CONTAINER_CLIENT_B, api_key, view_id)
     
     # Wait for B
     time.sleep(1)
     logger.info("Leadership reset complete.")
+    
+    return {
+        "leader": client_A,
+        "follower": client_B
+    }
+
+@pytest.fixture
+def reset_leadership(setup_agents, fusion_client):
+    """
+    Fixture to manually trigger a leadership reset.
+    """
+    api_key = setup_agents["api_key"]
+    view_id = setup_agents["view_id"]
+    
+    async def _reset():
+        logger.warning("Forcing leadership reset via fixture...")
+        # Stop everyone
+        for container in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B]:
+            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"])
+        
+        # Wait for sessions to vanish
+        start_cleanup = time.time()
+        while time.time() - start_cleanup < 6:
+            if not fusion_client.get_sessions():
+                break
+            time.sleep(0.5)
+            
+        # Restart A then B
+        ensure_agent_running(CONTAINER_CLIENT_A, api_key, view_id)
+        time.sleep(2)
+        ensure_agent_running(CONTAINER_CLIENT_B, api_key, view_id)
+        logger.info("Leadership reset via fixture complete.")
+        
+    return _reset

@@ -8,13 +8,14 @@ This is the V2 architecture replacement for SyncInstance.
 import asyncio
 import logging
 import threading
-from typing import Optional, Any, Dict, TYPE_CHECKING, Iterator
+from typing import Optional, Any, Dict, List, TYPE_CHECKING, Iterator
 
 from fustor_core.pipeline import Pipeline, PipelineState
 from fustor_core.pipeline.handler import SourceHandler
 from fustor_core.pipeline.sender import SenderHandler
 from fustor_core.models.states import PipelineInstanceDTO
 from fustor_core.exceptions import SessionObsoletedError
+from fustor_core.pipeline.mapper import EventMapper
 
 if TYPE_CHECKING:
     from fustor_core.pipeline import PipelineContext
@@ -71,6 +72,9 @@ class AgentPipeline(Pipeline):
         self.sender_handler = sender_handler
         self._bus = event_bus  # Private attribute for bus
         self._bus_service = bus_service
+        
+        # Field Mapper
+        self._mapper = EventMapper(config.get("fields_mapping", []))
         
         # Role tracking (from heartbeat response)
         self.current_role: Optional[str] = None  # "leader" or "follower"
@@ -406,6 +410,12 @@ class AgentPipeline(Pipeline):
         async for item in aiter_sync_wrapper(sync_iter, self.id, queue_size):
             yield item
 
+    def map_batch(self, batch: List[Any]) -> List[Any]:
+        """Apply field mapping to a batch of events."""
+        if self._mapper.mappings:
+            logger.info(f"Pipeline {self.id}: Mapping batch of {len(batch)} events")
+        return self._mapper.map_batch(batch)
+
     async def _run_snapshot_sync(self) -> None:
         """Execute snapshot synchronization."""
         from .pipeline.phases import run_snapshot_sync
@@ -429,7 +439,7 @@ class AgentPipeline(Pipeline):
                 
                 self._bus, position_lost = await self._bus_service.get_or_create_bus_for_subscriber(
                     source_id=self.config.get("source"),
-                    source_config=self.source_handler._config,
+                    source_config=self.source_handler.config,
                     sync_id=self.id,
                     required_position=start_position,
                     fields_mapping=self.config.get("fields_mapping", [])

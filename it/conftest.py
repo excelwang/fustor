@@ -48,7 +48,7 @@ logger.info("🚀 Integration tests running in V2 AgentPipeline mode")
 # so we re-export fixtures here for pytest to discover them.
 
 from fixtures.docker import docker_env, clean_shared_dir
-from fixtures.fusion import test_datastore, test_api_key, fusion_client
+from fixtures.fusion import test_view, test_datastore, test_api_key, fusion_client
 from fixtures.agents import setup_agents
 from fixtures.leadership import wait_for_audit, reset_leadership
 

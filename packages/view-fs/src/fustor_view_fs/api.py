@@ -93,9 +93,16 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
         view_id: str = Depends(get_view_id_dep)
     ) -> None:
         """Reset the directory tree structure by clearing all entries for a specific view."""
-        provider = await get_provider_func(view_id)
-        if provider:
-            await provider.reset()
+        # Try global reset first (clears sessions, leadership, and cache)
+        try:
+            from fustor_fusion.view_manager.manager import reset_views
+            await reset_views(view_id)
+            return
+        except (ImportError, Exception):
+            # Fallback to provider-specific reset if fustor_fusion not available
+            provider = await get_provider_func(view_id)
+            if provider:
+                await provider.reset()
 
     @router.get("/suspect-list", summary="Get Suspect List for Sentinel Sweep")
     async def get_suspect_list_api(

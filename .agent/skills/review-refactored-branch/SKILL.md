@@ -16,10 +16,10 @@ description: 详细评审当前的重构分支与原版分支(master)的差异�
 5. **Maintainability**: Is the code easy to understand and maintain?
 6. **Efficiency**: Is the code efficient in terms of time and space complexity? or over-engineered?
 
-## Step by Step to do the review and make sure you follow the steps strictly
+## Step by Step to do the review and make sure you follow the step orders strictly
 
-1. 切换到master分支，请深入理解一下master分支的原始代码（若已完成可以跳过）；
-2. 切换到最新的重构分支，请深入理解一下最新的重构分支的 `specifications/` 目录下的文档（若已完成可以跳过）,作为后续代码评审的权威依据；
+1. git checkout master，切换到master分支，请深入理解一下master分支的原始代码（若已完成可以跳过）；
+2. git checkout <refactor-branch>, 切换到最新的重构分支，请深入理解一下最新的重构分支的 `specifications/` 目录下的文档（若已完成可以跳过）,作为后续代码评审的权威依据；
 3. 评审一下最新的重构分支的代码实现；
 4. 这些更改是由一个新手程序员开发的，请帮忙指出其开发的缺陷和修正建议（在尽量优雅的同时注意不要过度设计），梳理成完整的、具体的todo事项清单和开发建议。
 
@@ -28,4 +28,4 @@ description: 详细评审当前的重构分支与原版分支(master)的差异�
 - Be specific about what needs to change
 - Explain why, not just what
 - Suggest alternatives when possible
-- generate a refactored-branch-review artifact in md format in chinese, the artifact should contain two huge tables, one with 6 columns: "ID", "design item", "item description", "master impl", "refactor impl", "suggestion". the other table is for undocumented functionality in master branch compared to refactor branch with 5 columns: "ID", "functionality", "master impl", "refactor impl", "suggestion"
+- generate a refactored-branch-review artifact in md format in chinese, the artifact should remember the commit version of master branch and refactor branch, and contain two huge tables, one with 6 columns: "ID", "design item", "item description", "master impl", "refactor impl", "suggestion". the other table is for undocumented functionality in master branch compared to refactor branch with 5 columns: "ID", "functionality", "master impl", "refactor impl", "suggestion"

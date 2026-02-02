@@ -243,10 +243,21 @@ class ViewManager:
 async def reset_views(view_id: str) -> bool:
     """
     Reset all views by clearing cached manager and data for a specific view.
+    Also clears associated sessions and leadership state.
     """
     view_id_str = str(view_id)
-    logger.info(f"Resetting views for view {view_id_str}")
+    logger.info(f"Resetting views and clearing sessions/leadership for view {view_id_str}")
     try:
+        from ..core.session_manager import session_manager
+        from ..view_state_manager import view_state_manager
+        
+        # 1. Clear sessions first (this also triggers provider.on_session_close eventually)
+        await session_manager.clear_all_sessions(view_id_str)
+        
+        # 2. Clear leadership and authoritative state
+        await view_state_manager.clear_state(view_id_str)
+
+        # 3. Purge manager from cache
         async with _cache_lock:
             if view_id_str in _view_manager_cache:
                 del _view_manager_cache[view_id_str]

@@ -2,3 +2,4 @@
   - [ ] allow_concurrent_push 
   - [ ] datastore words
   - [ ] may duplicate push
+  - [ ] FUSTOR_USE_PIPELINE
