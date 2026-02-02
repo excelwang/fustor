@@ -103,6 +103,13 @@ class SyncConfig(BaseModel):
     sentinel_interval_sec: int = Field(default=120, ge=0, description="哨兵巡检间隔(秒)，0表示禁用，默认2分钟")
     heartbeat_interval_sec: int = Field(default=10, ge=1, description="心跳间隔(秒)，默认10秒")
 
+    # Reliability Configuration
+    error_retry_interval: float = Field(default=5.0, gt=0, description="错误重试初始间隔(秒)")
+    max_consecutive_errors: int = Field(default=5, ge=1, description="最大连续错误次数(触发告警)")
+    backoff_multiplier: float = Field(default=2.0, ge=1.0, description="指数退避倍数")
+    max_backoff_seconds: float = Field(default=60, ge=1.0, description="最大退避时间(秒)")
+    session_timeout_seconds: int = Field(default=30, gt=0, description="会话超时时间(秒)")
+
 # Backward compatibility alias
 PipelineConfig = SyncConfig
 

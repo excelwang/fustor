@@ -8,6 +8,8 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, Iterator, List
 import logging
 
+from ..event import EventBase
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,7 +76,7 @@ class SourceHandler(Handler):
     """
     
     @abstractmethod
-    def get_snapshot_iterator(self, **kwargs) -> Iterator[Any]:
+    def get_snapshot_iterator(self, **kwargs) -> Iterator[EventBase]:
         """
         Perform a full snapshot of the source data.
         
@@ -84,7 +86,7 @@ class SourceHandler(Handler):
         raise NotImplementedError
     
     @abstractmethod
-    def get_message_iterator(self, start_position: int = -1, **kwargs) -> Iterator[Any]:
+    def get_message_iterator(self, start_position: int = -1, **kwargs) -> Iterator[EventBase]:
         """
         Perform incremental data capture (CDC).
         
@@ -96,7 +98,7 @@ class SourceHandler(Handler):
         """
         raise NotImplementedError
     
-    def get_audit_iterator(self, **kwargs) -> Iterator[Any]:
+    def get_audit_iterator(self, **kwargs) -> Iterator[EventBase]:
         """
         Perform a consistency audit of the source data.
         
@@ -131,7 +133,7 @@ class ViewHandler(Handler):
     """
     
     @abstractmethod
-    async def process_event(self, event: Any) -> bool:
+    async def process_event(self, event: EventBase) -> bool:
         """
         Process a single event and update internal state.
         
