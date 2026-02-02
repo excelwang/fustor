@@ -32,14 +32,14 @@ from .constants import (
 
 
 
-def ensure_agent_running(container_name, api_key, datastore_id, mount_point=MOUNT_POINT):
+def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POINT):
     """
     Ensure agent is configured and running in the container.
     
     Args:
         container_name: Docker container name
         api_key: API key for authentication
-        datastore_id: Datastore ID for the sync
+        view_id: View ID for the sync
         mount_point: Path to the NFS mount point
     """
     fusion_endpoint = FUSION_ENDPOINT
@@ -78,7 +78,7 @@ fusion:
     key: "{api_key}"
   disabled: false
   driver_params:
-    datastore_id: {datastore_id}
+    view_id: {view_id}
     api_version: "pipe"
 """
     docker_manager.create_file_in_container(container_name, "/root/.fustor/senders-config.yaml", senders_config)
@@ -112,18 +112,12 @@ sentinel_interval_sec: {SENTINEL_INTERVAL}
 
 
 @pytest.fixture(scope="session")
-def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
+def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     """
-    Configure agents in NFS client containers with API key and datastore.
-    
-    Returns a dict with agent configuration info:
-        - api_key: The API key used
-        - datastore_id: The datastore ID used
-        - containers: Dict with leader, follower, blind container names
-        - ensure_agent_running: Helper function to start agents
+    Ensure agents are running and healthy.
     """
+    view_id = test_view["id"]
     api_key = test_api_key["key"]
-    datastore_id = test_datastore["id"]
     
     # Clean Slate: Stop all agents first
     logger.info("Cleaning up existing agents preventing stale leadership...")

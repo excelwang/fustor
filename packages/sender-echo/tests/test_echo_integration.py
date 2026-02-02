@@ -7,14 +7,14 @@ from fustor_sender_echo import EchoDriver
 from fustor_core.event import UpdateEvent
 
 @pytest.mark.asyncio
-async def test_echo_sync_instance_triggers_snapshot():
+async def test_echo_pipeline_instance_triggers_snapshot():
     """Integration test to verify echo sender triggers snapshot."""
     # 1. Arrange - Create configurations
     credential = {"user": "echo-user"}
     config = {"batch_size": 100}
     
     # Create echo sender and verify it returns snapshot_needed=True
-    echo_driver = EchoDriver("echo-pusher", "http://localhost", credential, config)
+    echo_driver = EchoDriver("echo-sender", "http://localhost", credential, config)
     
     # Mock an event to simulate push
     mock_events = [UpdateEvent(event_schema="test", table="files", rows=[{"file_path": "/tmp/test.txt", "size": 100}], fields=["file_path", "size"])]    

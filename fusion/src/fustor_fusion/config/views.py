@@ -6,8 +6,8 @@ import yaml
 import logging
 from pathlib import Path
 from typing import Dict, Optional, List
-from pydantic import BaseModel, field_validator, Field, AliasChoices
 from typing import Dict, Optional, List, Any
+from pydantic import BaseModel, field_validator, Field, AliasChoices, model_validator
 
 from fustor_core.common import get_fustor_home_dir
 from .validators import validate_url_safe_id
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class ViewConfig(BaseModel):
     """Configuration for a single view."""
     id: str
-    view_id: str = Field(validation_alias=AliasChoices('view_id', 'datastore_id'))
+    view_id: Optional[str] = Field(default=None, validation_alias=AliasChoices('view_id', 'datastore_id'))
     driver: str
     disabled: bool = False
     driver_params: dict = {}
@@ -41,6 +41,15 @@ class ViewConfig(BaseModel):
         if errors:
             raise ValueError("; ".join(errors))
         return s
+
+    @model_validator(mode='before')
+    @classmethod
+    def set_default_view_id(cls, data: Any) -> Any:
+        # If view_id/datastore_id is not provided, default to id
+        if isinstance(data, dict):
+            if 'view_id' not in data and 'datastore_id' not in data and 'id' in data:
+                data['view_id'] = str(data['id'])
+        return data
     
     @property
     def datastore_id(self) -> str:

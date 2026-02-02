@@ -48,16 +48,17 @@ Fusion 是 Fustor 平台的核心存储与查询引擎。它负责接收来自 A
 
 ## 配置参考 (Configuration)
 
-Fusion 的行为可以通过 `fusion-config.yaml` 进行深度定制。
+Fusion 的视图配置采用目录结构管理，默认位于 `$FUSTOR_HOME/views-config/`。每个 `.yaml` 文件定义一个视图配置。
+
+例如 `views-config/test-fs.yaml`:
 
 ```yaml
-views:
-  test-fs:            # view_id，对应 API 路径 /views/test-fs/
-    driver: "fs"      # 使用的驱动程序名称
-    disabled: false
-    datastore_id: 1   # 该视图实例服务的数据仓库 ID
-    driver_params:
-      hot_file_threshold: 30
+id: test-fs           # 视图实例名称，对应 API 路径 /views/test-fs/
+                        # 同时也作为 view_id (Legacy: datastore_id)
+driver: fs            # 使用的驱动程序名称
+disabled: false
+driver_params:
+  hot_file_threshold: 30
 ```
 
 

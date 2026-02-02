@@ -7,11 +7,11 @@ from fustor_view_fs.api import create_fs_router
 from fustor_view_fs.provider import FSViewProvider
 
 # Mock Dependencies
-async def mock_check_snapshot(datastore_id: int):
+async def mock_check_snapshot(view_id: str):
     pass # Always pass
 
-def mock_get_datastore_id():
-    return 1
+def mock_get_view_id():
+    return "1"
 
 # Setup App with Router
 @pytest.fixture
@@ -20,13 +20,13 @@ def app_client():
     # Setup default return values for provider methods to simulate a tree
     # We will let individual tests override this or set specific return values
     
-    async def get_provider(datastore_id: int):
+    async def get_provider(view_id: str):
         return provider
 
     router = create_fs_router(
         get_provider_func=get_provider,
         check_snapshot_func=mock_check_snapshot,
-        get_view_id_dep=mock_get_datastore_id
+        get_view_id_dep=mock_get_view_id
     )
     
     app = FastAPI()

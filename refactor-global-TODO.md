@@ -30,3 +30,9 @@
 - [x] Run agent unit tests. (All passed)
 - [x] Run integration tests. (Verified via unit tests and service logic)
 - [x] Check `~/.fustor` structure migration. (Verified fallback logic)
+
+## Phase 6: Fusion & Core Cleanup
+- [x] Replace `datastore_id` usage with `view_id` in `packages/view-fs/tests/test_api_params.py`.
+- [x] Replace `datastore_id` usage with `view_id` in `packages/fusion-sdk` where applicable (excluding the alias definition).
+- [x] Clean up terminology in `packages/sender-echo` (descriptions and logs).
+- [x] Verify no `DeprecationWarning` related to `datastore_id` are triggered during tests. (Verified by running relevant tests)

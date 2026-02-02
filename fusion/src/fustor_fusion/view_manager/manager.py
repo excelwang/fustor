@@ -127,8 +127,8 @@ class ViewManager:
                         # For auto-discovery, we use the schema name as the view instance name
                         # No default config provided
                         provider = driver_cls(
-                            view_id=schema,
-                            datastore_id=self.view_id,
+                            id=schema,  # Use schema as ID for auto-discovered driver
+                            view_id=self.view_id,
                             config={}
                         )
                         await provider.initialize()
