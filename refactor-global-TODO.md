@@ -26,5 +26,21 @@
     - Verified non-blocking behavior via `test_fusion_pipeline_queue.py`.
 
 - [x] **2.2 Verify Correctness**
-    - Passed integration tests for queue processing.
+    - Passed consistency tests and fuzzing tests.
+
+## Phase 3: Bug Fixing (Completed)
+
+- [x] **3.1 Fix `ViewManager` Constructor & Calls**
+    - Supported `view_id` alias in `__init__`.
+    - Fixed keyword arguments in driver instantiation.
+- [x] **3.2 Fix Async `get_stats` calls**
+    - Updated `FusionPipeline.get_aggregated_stats` to be async.
+    - Updated all tests and callers to `await` the stats.
+- [x] **3.3 Fix Tombstone Resurrection Logic**
+    - Changed `FSArbitrator` to use translated logical `watermark` for arbitration instead of raw `index`.
+- [x] **3.4 Fix Legacy Imports**
+    - Migrated `fustor_event_model` remnants to `fustor_core`.
+
+## Final Verification
+- [x] All 406 tests passed successfully.
 

@@ -183,7 +183,7 @@ class TestFusionPipelineDto:
         """Aggregated stats should include view stats."""
         await fusion_pipeline.start()
         
-        stats = fusion_pipeline.get_aggregated_stats()
+        stats = await fusion_pipeline.get_aggregated_stats()
         
         assert "pipeline" in stats
         assert "views" in stats

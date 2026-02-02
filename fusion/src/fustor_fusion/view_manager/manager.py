@@ -60,10 +60,11 @@ class ViewManager:
     based on event type or content.
     """
     
-    def __init__(self, datastore_id: str = None):
+    def __init__(self, datastore_id: str = None, view_id: str = None):
         self.providers: Dict[str, ViewDriver] = {}
         self.logger = logging.getLogger(__name__)
-        self.datastore_id = datastore_id
+        self.view_id = view_id or datastore_id
+        self.datastore_id = self.view_id
     
     async def initialize_providers(self):
         """Initialize view providers by loading them from entry points."""
@@ -96,8 +97,8 @@ class ViewManager:
                 
                 try:
                     provider = driver_cls(
-                        view_id=view_name,
-                        datastore_id=self.datastore_id,
+                        id=view_name,
+                        view_id=self.view_id,
                         config=driver_params
                     )
                     await provider.initialize()
@@ -116,8 +117,8 @@ class ViewManager:
                          # For auto-discovery, we use the schema name as the view instance name
                          # No default config provided
                          provider = driver_cls(
-                             view_id=schema,
-                             datastore_id=self.datastore_id,
+                             id=schema,
+                             view_id=self.view_id,
                              config={}
                          )
                          await provider.initialize()

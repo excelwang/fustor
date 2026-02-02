@@ -79,7 +79,7 @@ class FSArbitrator:
             if event.event_type == EventType.DELETE:
                 await self._handle_delete(path, is_realtime, mtime)
             elif event.event_type in [EventType.INSERT, EventType.UPDATE]:
-                await self._handle_upsert(path, payload, event, message_source, mtime)
+                await self._handle_upsert(path, payload, event, message_source, mtime, watermark)
         
         return True
 
@@ -114,16 +114,15 @@ class FSArbitrator:
             self.state.blind_spot_additions.discard(path)
         self.logger.debug(f"DELETE_DONE for {path}")
 
-    async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float):
+    async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float, watermark: float):
         # 1. Tombstone Protection
         if path in self.state.tombstone_list:
             tombstone_ts, _ = self.state.tombstone_list[path] # Use logical timestamp for arbitration
             is_realtime = (source == MessageSource.REALTIME)
             
             # Check if this is "New activity" after deletion
-            # Enforce Seconds: Don't divide index by 1000.0
-            event_ref_ts = float(event.index) if event.index > 0 else mtime
-            if event_ref_ts > (tombstone_ts + self.TOMBSTONE_EPSILON) or mtime > (tombstone_ts + self.TOMBSTONE_EPSILON):
+            # Use translated watermark for arbitration instead of raw index
+            if watermark > (tombstone_ts + self.TOMBSTONE_EPSILON) or mtime > (tombstone_ts + self.TOMBSTONE_EPSILON):
                 self.logger.info(f"TOMBSTONE_CLEARED for {path}")
                 self.state.tombstone_list.pop(path, None)
             else:
