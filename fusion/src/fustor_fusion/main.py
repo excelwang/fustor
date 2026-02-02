@@ -40,8 +40,8 @@ async def lifespan(app: FastAPI):
     runtime_objects.pipeline_manager = pm
     
     # NEW: Setup V2 API routers after pipeline_manager is available
-    from .api.pipe import setup_pipe_v2_routers
-    setup_pipe_v2_routers()
+    from .api.pipe import setup_pipe_routers
+    setup_pipe_routers()
     
     # Initialize pipelines (Async)
     await pm.initialize_pipelines()
@@ -141,7 +141,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(lifespan=lifespan)
 
 # --- API Routing Version 1 ---
-from .api.pipe import pipe_router, setup_pipe_v2_routers
+from .api.pipe import pipe_router, setup_pipe_routers
 from .api.management import router as management_router
 from .api.views import view_router
 

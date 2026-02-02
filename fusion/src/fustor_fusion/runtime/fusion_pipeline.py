@@ -238,29 +238,28 @@ class FusionPipeline(Pipeline):
                 if self.statistics["errors"] > 1000: # Threshold for illustration
                     self._set_state(self.state | PipelineState.ERROR, "Excessive handler errors")
     
+    
     # --- Session Management ---
     
-    async def on_session_created(self, session_id: str, **kwargs) -> None:
+    async def on_session_created(
+        self, 
+        session_id: str, 
+        task_id: Optional[str] = None, 
+        is_leader: bool = False,
+        **kwargs
+    ) -> None:
         """
-        Handle session creation.
-        """
-        from ..core.session_manager import session_manager
+        Handle session creation notification.
         
-        # Centralized session creation
-        await session_manager.create_session_entry(
-            view_id=self.view_id,
-            session_id=session_id,
-            task_id=kwargs.get("task_id"),
-            client_ip=kwargs.get("client_ip"),
-            allow_concurrent_push=kwargs.get("allow_concurrent_push", self.allow_concurrent_push),
-            session_timeout_seconds=kwargs.get("session_timeout_seconds", 30)
-        )
+        Args:
+            session_id: The ID of the created session
+            task_id: Originating task ID
+            is_leader: Whether this session has been elected as leader (by bridge)
+            **kwargs: Additional metadata
+        """
+        # Note: Session creation in backing store is handled by PipelineSessionBridge
         
         self.statistics["sessions_created"] += 1
-        
-        # Leader/Follower Election (Architecture V2)
-        from ..datastore_state_manager import datastore_state_manager
-        is_leader = await datastore_state_manager.try_become_leader(self.view_id, session_id)
         
         # Notify view handlers of session start
         for handler in self._view_handlers.values():
@@ -271,19 +270,18 @@ class FusionPipeline(Pipeline):
     
     async def on_session_closed(self, session_id: str) -> None:
         """
-        Handle session closure.
+        Handle session closure notification.
         """
-        from ..core.session_manager import session_manager
-        from ..datastore_state_manager import datastore_state_manager
-        
-        # Remove from central manager
-        await session_manager.remove_session(self.view_id, session_id)
+        # Note: Session removal from backing store is handled by PipelineSessionBridge
         
         self.statistics["sessions_closed"] += 1
         
+        from ..core.session_manager import session_manager
+        from ..datastore_state_manager import datastore_state_manager
+
         # New Leader Election (Architecture V2)
-        # If the closed session was the leader, we should trigger a re-election
-        # among the remaining active sessions for this view.
+        # If a session closes, we need to ensure there is a leader if sessions remain.
+        # We query the session_manager (source of truth) for remaining sessions.
         remaining_sessions = await session_manager.get_datastore_sessions(self.view_id)
         if remaining_sessions:
             current_leader = await datastore_state_manager.get_leader(self.view_id)

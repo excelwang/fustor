@@ -141,17 +141,18 @@ class PipelineManager:
                 raise ValueError(f"Pipeline {pipeline_id} not found")
             
             bridge = self._bridges.get(pipeline_id)
-            if bridge:
-                # Use bridge to sync with legacy SessionManager
-                result = await bridge.create_session(
-                    task_id=task_id,
-                    client_ip=client_info.get("client_ip"),
-                    session_id=session_id
-                )
-                role = result["role"]
-            else:
-                await pipeline.on_session_created(session_id, task_id=task_id, **client_info)
-                role = await pipeline.get_session_role(session_id)
+            if not bridge:
+                logger.warning(f"Bridge missing for pipeline {pipeline_id} in create_session, creating on-the-fly")
+                bridge = create_session_bridge(pipeline)
+                self._bridges[pipeline_id] = bridge
+
+            # Use bridge to sync with legacy SessionManager
+            result = await bridge.create_session(
+                task_id=task_id,
+                client_ip=client_info.get("client_ip"),
+                session_id=session_id
+            )
+            role = result["role"]
             
             # Register mapping
             self._session_to_pipeline[session_id] = pipeline_id
@@ -187,6 +188,7 @@ class PipelineManager:
             if bridge:
                 return await bridge.keep_alive(session_id)
             
+            # Fallback (though ideally bridge is always present now)
             pipeline = self._pipelines.get(pipeline_id)
             if pipeline:
                 await pipeline.keep_session_alive(session_id)
@@ -201,12 +203,15 @@ class PipelineManager:
             pipeline_id = self._session_to_pipeline.pop(session_id, None)
             if pipeline_id:
                 bridge = self._bridges.get(pipeline_id)
+                if not bridge:
+                     pipeline = self._pipelines.get(pipeline_id)
+                     if pipeline:
+                         logger.warning(f"Bridge missing for pipeline {pipeline_id} in close_session, creating on-the-fly")
+                         bridge = create_session_bridge(pipeline)
+                         self._bridges[pipeline_id] = bridge
+                
                 if bridge:
                     await bridge.close_session(session_id)
-                else:
-                    pipeline = self._pipelines.get(pipeline_id)
-                    if pipeline:
-                        await pipeline.on_session_closed(session_id)
 
 # Global singleton
 pipeline_manager = PipelineManager()

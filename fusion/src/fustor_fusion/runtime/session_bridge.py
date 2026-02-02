@@ -161,7 +161,7 @@ class PipelineSessionBridge:
         if datastore_id is not None:
             # Update legacy SessionManager
             await self._session_manager.keep_session_alive(
-                datastore_id=datastore_id,
+                view_id=datastore_id,
                 session_id=session_id,
                 client_ip=client_ip
             )
@@ -189,7 +189,7 @@ class PipelineSessionBridge:
         if datastore_id is not None:
             # Remove from legacy SessionManager and release locks/leader
             await self._session_manager.terminate_session(
-                datastore_id=datastore_id,
+                view_id=datastore_id,
                 session_id=session_id
             )
             

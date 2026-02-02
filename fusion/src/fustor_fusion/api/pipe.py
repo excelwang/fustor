@@ -24,10 +24,10 @@ from .consistency import consistency_router
 # Create unified pipe router
 pipe_router = APIRouter(tags=["Pipeline"])
 
-def setup_pipe_v2_routers():
+def setup_pipe_routers():
     """
-    Mount V2 routers from HTTPReceiver into the pipe_router, 
-    falling back to legacy routers if V2 is not available.
+    Mount routers from HTTPReceiver into the pipe_router, 
+    falling back to legacy routers if configured.
     
     This is called during application lifespan startup.
     """
@@ -36,18 +36,22 @@ def setup_pipe_v2_routers():
     # 1. Clear existing routes to avoid duplicates if called multiple times (e.g. during tests)
     pipe_router.routes = []
     
-    v2_success = False
-    if runtime_objects.pipeline_manager:
-        # Get the default HTTP receiver (e.g., 'http-main')
-        receiver = runtime_objects.pipeline_manager.get_receiver("http-main")
-        if receiver and hasattr(receiver, "get_session_router"):
-            logger.info("Mounting V2 Session and Ingestion routers from HTTPReceiver")
-            pipe_router.include_router(receiver.get_session_router(), prefix="/session")
-            pipe_router.include_router(receiver.get_ingestion_router(), prefix="/ingest")
-            v2_success = True
+    if runtime_objects.pipeline_manager is None:
+        logger.error("setup_pipe_routers called before pipeline_manager initialized!")
+        return False
+        
+    success = False
+    
+    # Get the default HTTP receiver (e.g., 'http-main')
+    receiver = runtime_objects.pipeline_manager.get_receiver("http-main")
+    if receiver and hasattr(receiver, "get_session_router"):
+        logger.info("Mounting Session and Ingestion routers from HTTPReceiver")
+        pipe_router.include_router(receiver.get_session_router(), prefix="/session")
+        pipe_router.include_router(receiver.get_ingestion_router(), prefix="/ingest")
+        success = True
             
-    if not v2_success:
-        logger.warning("V2 HTTPReceiver not found, falling back to legacy routers")
+    if not success:
+        logger.warning("HTTPReceiver not found, falling back to legacy routers")
         # Fallback to legacy
         pipe_router.include_router(session_router, prefix="/session")
         pipe_router.include_router(ingestion_router, prefix="/ingest")
@@ -55,8 +59,8 @@ def setup_pipe_v2_routers():
     # Consistency router is common for both or handles its own delegation
     pipe_router.include_router(consistency_router)
     
-    return v2_success
+    return success
 
 # NOTE: We no longer mount routers here at module level.
-# They are mounted via setup_pipe_v2_routers() in main.py lifespan.
+# They are mounted via setup_pipe_routers() in main.py lifespan.
 

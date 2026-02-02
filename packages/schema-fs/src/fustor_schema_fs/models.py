@@ -71,6 +71,53 @@ class FSDeleteRow(BaseModel):
                 data['path'] = data['file_path']
         return data
     
+    
     def get_normalized_path(self) -> str:
         """Get the normalized path."""
         return self.path or self.file_path or ""
+
+
+# --- Event Models ---
+
+from typing import List, Union
+from fustor_core.event import EventBase, EventType
+from fustor_core.event.types import MessageSource
+
+class FSEventBase(EventBase):
+    """Base class for FS-specific events."""
+    event_schema: str = Field("fs", description="Schema name is always 'fs'")
+    table: str = Field("files", description="Default table name for FS events")
+    
+class FSInsertEvent(FSEventBase):
+    """
+    Event representing a file/directory creation.
+    """
+    event_type: EventType = EventType.INSERT
+    rows: List[FSRow] = Field(..., description="List of created files/directories")
+    fields: List[str] = Field(
+        default=["path", "file_name", "size", "modified_time", "is_directory"],
+        description="Fields present in the rows"
+    )
+
+class FSUpdateEvent(FSEventBase):
+    """
+    Event representing a file/directory modification.
+    """
+    event_type: EventType = EventType.UPDATE
+    rows: List[FSRow] = Field(..., description="List of modified files/directories")
+    fields: List[str] = Field(
+        default=["path", "file_name", "size", "modified_time", "is_directory"],
+        description="Fields present in the rows"
+    )
+
+class FSDeleteEvent(FSEventBase):
+    """
+    Event representing a file/directory deletion.
+    """
+    event_type: EventType = EventType.DELETE
+    rows: List[FSDeleteRow] = Field(..., description="List of deleted files/directories")
+    fields: List[str] = Field(
+        default=["path"],
+        description="Fields present in the rows"
+    )
+

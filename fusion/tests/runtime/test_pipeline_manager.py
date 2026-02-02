@@ -83,21 +83,27 @@ class TestPipelineManager:
 
     @pytest.mark.asyncio
     async def test_callbacks(self, pipeline_manager):
-        # Manually inject a mock pipeline
+        # Manually inject a mock pipeline and bridge
         mock_pipeline = AsyncMock(spec=FusionPipeline)
         mock_pipeline.get_session_role.return_value = "leader"
         mock_pipeline.get_session_info.return_value = {"id": "sess-1"}
         mock_pipeline.process_events.return_value = {"success": True}
         
+        mock_bridge = AsyncMock()
+        mock_bridge.create_session.return_value = {"role": "leader"}
+        mock_bridge.keep_alive.return_value = {"status": "ok", "role": "leader"}
+        
         pipeline_manager._pipelines["pipe-1"] = mock_pipeline
+        pipeline_manager._bridges["pipe-1"] = mock_bridge
         
         # Test session created
         session_info = await pipeline_manager._on_session_created(
-            "sess-1", "task-1", "pipe-1", {}
+            "sess-1", "task-1", "pipe-1", {"client_ip": "1.2.3.4"}
         )
         assert session_info.session_id == "sess-1"
         assert session_info.role == "leader"
-        mock_pipeline.on_session_created.assert_called_once()
+        # Bridge should be called, not pipeline directly (pipeline called via bridge)
+        mock_bridge.create_session.assert_called_once()
         
         # Test event received
         events = []
@@ -106,3 +112,4 @@ class TestPipelineManager:
         )
         assert result is True
         mock_pipeline.process_events.assert_called_once()
+

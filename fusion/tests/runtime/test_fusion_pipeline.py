@@ -127,9 +127,13 @@ class TestFusionPipelineSession:
     @pytest.mark.asyncio
     async def test_session_created_first_is_leader(self, fusion_pipeline, mock_view_handler):
         """First session should become leader."""
+        from fustor_fusion.runtime.session_bridge import create_session_bridge
+        bridge = create_session_bridge(fusion_pipeline)
+        
         await fusion_pipeline.start()
         
-        await fusion_pipeline.on_session_created("sess-1", task_id="agent:sync")
+        # Use bridge to create session (handles election and backing store)
+        await bridge.create_session(task_id="agent:sync", session_id="sess-1")
         
         assert await fusion_pipeline.get_session_role("sess-1") == "leader"
         assert mock_view_handler.session_starts == 1
@@ -139,10 +143,13 @@ class TestFusionPipelineSession:
     @pytest.mark.asyncio
     async def test_session_created_second_is_follower(self, fusion_pipeline):
         """Second session should be follower."""
+        from fustor_fusion.runtime.session_bridge import create_session_bridge
+        bridge = create_session_bridge(fusion_pipeline)
+        
         await fusion_pipeline.start()
         
-        await fusion_pipeline.on_session_created("sess-1", task_id="agent1:sync")
-        await fusion_pipeline.on_session_created("sess-2", task_id="agent2:sync")
+        await bridge.create_session(task_id="agent1:sync", session_id="sess-1")
+        await bridge.create_session(task_id="agent2:sync", session_id="sess-2")
         
         assert await fusion_pipeline.get_session_role("sess-1") == "leader"
         assert await fusion_pipeline.get_session_role("sess-2") == "follower"
@@ -152,12 +159,16 @@ class TestFusionPipelineSession:
     @pytest.mark.asyncio
     async def test_leader_election_on_close(self, fusion_pipeline):
         """New leader should be elected when leader leaves."""
+        from fustor_fusion.runtime.session_bridge import create_session_bridge
+        bridge = create_session_bridge(fusion_pipeline)
+        
         await fusion_pipeline.start()
         
-        await fusion_pipeline.on_session_created("sess-1", task_id="agent1:sync")
-        await fusion_pipeline.on_session_created("sess-2", task_id="agent2:sync")
+        await bridge.create_session(task_id="agent1:sync", session_id="sess-1")
+        await bridge.create_session(task_id="agent2:sync", session_id="sess-2")
         
-        await fusion_pipeline.on_session_closed("sess-1")
+        # Close via bridge (which calls pipeline.on_session_closed)
+        await bridge.close_session("sess-1")
         
         assert await fusion_pipeline.get_session_role("sess-2") == "leader"
         

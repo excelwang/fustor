@@ -174,7 +174,7 @@ class TestSessionClose:
             
             # Verify session manager was called (terminate_session is used now)
             mock_session_manager.terminate_session.assert_called_once_with(
-                datastore_id="1",
+                view_id="1",
                 session_id="sess-123"
             )
             

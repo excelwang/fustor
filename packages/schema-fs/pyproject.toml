@@ -23,7 +23,7 @@ classifiers = [
 
 # No required runtime dependencies - core schema is pure data definition
 # Pydantic models are optional for type-safe validation
-dependencies = []
+dependencies = ["fustor-core"]
 
 [project.optional-dependencies]
 models = [

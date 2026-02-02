@@ -83,10 +83,13 @@ def get_mtime(row: dict) -> float:
 
 # Import Pydantic models (optional, requires pydantic)
 try:
-    from .models import FSRow, FSDeleteRow
+    from .models import FSRow, FSDeleteRow, FSInsertEvent, FSUpdateEvent, FSDeleteEvent
 except ImportError:
     FSRow = None
     FSDeleteRow = None
+    FSInsertEvent = None
+    FSUpdateEvent = None
+    FSDeleteEvent = None
 
 
 __all__ = [
@@ -103,5 +106,8 @@ __all__ = [
     # Pydantic models (optional)
     "FSRow",
     "FSDeleteRow",
+    "FSInsertEvent",
+    "FSUpdateEvent",
+    "FSDeleteEvent",
 ]
 
