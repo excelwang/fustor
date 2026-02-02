@@ -7,23 +7,32 @@ Config files:
 - sources-config.yaml: Source definitions (file systems, databases)
 - syncs-config/: Sync task definitions
 """
-from .syncs import SyncsConfigLoader, SyncConfigYaml, syncs_config
+from .pipelines import PipelinesConfigLoader, AgentPipelineConfig, pipelines_config
 from .sources import SourcesConfigLoader, sources_config
 from .senders import SendersConfigLoader, senders_config, SenderConfig
 from .validators import validate_url_safe_id
+
+# Backward compatibility aliases
+SyncsConfigLoader = PipelinesConfigLoader
+SyncConfigYaml = AgentPipelineConfig
+syncs_config = pipelines_config
 
 __all__ = [
     # Senders
     "SendersConfigLoader",
     "SenderConfig",
     "senders_config",
-    # Syncs
-    "SyncsConfigLoader",
-    "SyncConfigYaml",
-    "syncs_config",
+    # Pipelines
+    "PipelinesConfigLoader",
+    "AgentPipelineConfig",
+    "pipelines_config",
     # Sources
     "SourcesConfigLoader",
     "sources_config",
     # Validators
     "validate_url_safe_id",
+    # Legacy aliases
+    "SyncsConfigLoader",
+    "SyncConfigYaml",
+    "syncs_config",
 ]

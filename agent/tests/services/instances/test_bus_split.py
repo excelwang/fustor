@@ -35,7 +35,7 @@ def event_bus_service(source_config, mock_source_driver_service):
         source_configs={"test_source": source_config},
         source_driver_service=mock_source_driver_service
     )
-    service.sync_instance_service = AsyncMock()
+    service.pipeline_instance_service = AsyncMock()
     return service
 
 @pytest.mark.asyncio
@@ -90,11 +90,11 @@ async def test_bus_split_logic(event_bus_service, source_config):
     )
     
     # 4. Verify results
-    # check if remap_sync_to_new_bus was called for S2
-    event_bus_service.sync_instance_service.remap_sync_to_new_bus.assert_called_once()
-    call_args = event_bus_service.sync_instance_service.remap_sync_to_new_bus.call_args
-    sync_id, new_bus_runtime, lost = call_args[0]
+    # check if remap_pipeline_to_new_bus was called for S2
+    event_bus_service.pipeline_instance_service.remap_pipeline_to_new_bus.assert_called_once()
+    call_args = event_bus_service.pipeline_instance_service.remap_pipeline_to_new_bus.call_args
+    pipeline_id, new_bus_runtime, lost = call_args[0]
     
-    assert sync_id == "S2"
+    assert pipeline_id == "S2"
     # CRITICAL: Is it a NEW bus or the SAME bus?
     assert new_bus_runtime is not bus_runtime, "Should have created a NEW bus during split!"

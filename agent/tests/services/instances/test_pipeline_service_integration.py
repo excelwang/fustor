@@ -8,11 +8,11 @@ from fustor_agent.runtime import AgentPipeline
 from fustor_agent.services.drivers.source_driver import SourceDriverService
 from fustor_agent.services.drivers.sender_driver import SenderDriverService
 from fustor_agent.services.instances.bus import EventBusService
-from fustor_agent.services.instances.sync import SyncInstanceService
-from fustor_agent.services.configs.sync import SyncConfigService
+from fustor_agent.services.instances.pipeline import PipelineInstanceService
+from fustor_agent.services.configs.pipeline import PipelineConfigService
 from fustor_agent.services.configs.source import SourceConfigService
 from fustor_agent.services.configs.sender import SenderConfigService
-from fustor_core.models.config import SyncConfig, SourceConfig, SenderConfig, PasswdCredential, FieldMapping, AppConfig
+from fustor_core.models.config import PipelineConfig, SourceConfig, SenderConfig, PasswdCredential, FieldMapping, AppConfig
 
 @pytest.fixture
 def integration_configs(tmp_path: Path):
@@ -30,7 +30,7 @@ def integration_configs(tmp_path: Path):
         batch_size=10,
         disabled=False
     )
-    sync_config = SyncConfig(
+    pipeline_config = PipelineConfig(
         source="test_source", 
         sender="test_sender",
         disabled=False,
@@ -40,7 +40,7 @@ def integration_configs(tmp_path: Path):
             FieldMapping(to="target.size", source=["fs.files.size:0"])
         ]
     )
-    return sync_config, source_config, sender_config
+    return pipeline_config, source_config, sender_config
 
 class MockSenderDriver:
     """Mock for EchoDriver to avoid real network if any, though Echo is usually local."""
@@ -55,32 +55,32 @@ class MockSenderDriver:
     async def close_session(self): pass
 
 @pytest.mark.asyncio
-async def test_sync_instance_service_integration(integration_configs, tmp_path: Path, caplog):
-    """Integration test for SyncInstanceService using AgentPipeline."""
-    sync_config, source_config, sender_config = integration_configs
+async def test_pipeline_instance_service_integration(integration_configs, tmp_path: Path, caplog):
+    """Integration test for PipelineInstanceService using AgentPipeline."""
+    pipeline_config, source_config, sender_config = integration_configs
     
     # Setup AppConfig
     app_config = AppConfig()
     app_config.add_source("test_source", source_config)
     app_config.add_sender("test_sender", sender_config)
-    app_config.add_sync("test_sync", sync_config)
+    app_config.add_pipeline("test_pipeline", pipeline_config)
 
     from unittest.mock import patch
-    with patch("fustor_agent.services.configs.sync.syncs_config") as mock_syncs:
-        mock_syncs.get_all.return_value = {}
-        mock_syncs.get.return_value = None
+    with patch("fustor_agent.services.configs.pipeline.pipelines_config") as mock_pipes:
+        mock_pipes.get_all.return_value = {}
+        mock_pipes.get.return_value = None
         
         # Initialize Services
         source_cfg_svc = SourceConfigService(app_config)
         sender_cfg_svc = SenderConfigService(app_config)
-        sync_cfg_svc = SyncConfigService(app_config, source_cfg_svc, sender_cfg_svc)
+        pipeline_cfg_svc = PipelineConfigService(app_config, source_cfg_svc, sender_cfg_svc)
         
         source_dr_svc = SourceDriverService()
         sender_dr_svc = SenderDriverService()
         bus_svc = EventBusService(source_configs={"test_source": source_config}, source_driver_service=source_dr_svc)
         
-        service = SyncInstanceService(
-            sync_config_service=sync_cfg_svc,
+        service = PipelineInstanceService(
+            pipeline_config_service=pipeline_cfg_svc,
             source_config_service=source_cfg_svc,
             sender_config_service=sender_cfg_svc,
             bus_service=bus_svc,
@@ -95,13 +95,13 @@ async def test_sync_instance_service_integration(integration_configs, tmp_path: 
 
         # Act
         with caplog.at_level(logging.INFO):
-            await service.start_one("test_sync")
+            await service.start_one("test_pipeline")
             
             # Give some time for AgentPipeline to run its sequence
             await asyncio.sleep(1)
             
             # Verify instance in pool
-            instance = service.get_instance("test_sync")
+            instance = service.get_instance("test_pipeline")
             assert instance is not None
             assert isinstance(instance, AgentPipeline)
             
@@ -110,6 +110,6 @@ async def test_sync_instance_service_integration(integration_configs, tmp_path: 
             assert "Using AgentPipeline" in caplog.text
             assert "Snapshot sync complete" in caplog.text or "Starting message sync" in caplog.text
 
-            await service.stop_one("test_sync")
-            assert service.get_instance("test_sync") is None
+            await service.stop_one("test_pipeline")
+            assert service.get_instance("test_pipeline") is None
 

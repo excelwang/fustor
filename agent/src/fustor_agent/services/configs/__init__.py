@@ -1,9 +1,9 @@
 from .source import SourceConfigService
 from .sender import SenderConfigService
-from .sync import SyncConfigService
+from .pipeline import PipelineConfigService
 
 __all__ = [
     "SourceConfigService", 
     "SenderConfigService",
-    "SyncConfigService"
+    "PipelineConfigService"
 ]

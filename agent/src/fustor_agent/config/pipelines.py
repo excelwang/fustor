@@ -1,6 +1,6 @@
-# agent/src/fustor_agent/config/syncs.py
+# agent/src/fustor_agent/config/pipelines.py
 """
-Sync configuration loader from YAML files in a directory.
+Agent Pipeline configuration loader from YAML files in a directory.
 """
 import yaml
 import logging
@@ -21,8 +21,8 @@ class FieldMappingYaml(BaseModel):
     required: bool = False
 
 
-class SyncConfigYaml(BaseModel):
-    """Configuration for a single sync task loaded from YAML."""
+class AgentPipelineConfig(BaseModel):
+    """Configuration for a single agent pipeline loaded from YAML."""
     id: str
     source: str
     sender: Optional[str] = None
@@ -53,53 +53,57 @@ class SyncConfigYaml(BaseModel):
     @classmethod
     def validate_id(cls, v: str) -> str:
         """Validate that ID is URL-safe."""
-        errors = validate_url_safe_id(v, "sync id")
+        errors = validate_url_safe_id(v, "pipeline id")
         if errors:
             raise ValueError("; ".join(errors))
         return v
 
 
+# Backward compatibility alias
+SyncConfigYaml = AgentPipelineConfig
 
-class SyncsConfigLoader:
+
+
+class PipelinesConfigLoader:
     """
-    Loads and manages sync configurations from a directory of YAML files.
+    Loads and manages pipeline configurations from a directory of YAML files.
     
     Directory structure:
     ```
-    syncs-config/
-      sync-research.yaml
-      sync-archive.yaml
+    agent-pipes-config/
+      pipe-research.yaml
+      pipe-archive.yaml
     ```
     
-    Each file format:
-    ```yaml
-    id: sync-research
-    source: fs-research
-    sender: fusion-main  # v2: renamed from 'pusher'
-    disabled: false
-    ```
-    
-    Backward compatibility: 'pusher' field is still accepted but deprecated.
+    Backward compatibility:
+    Falls back to 'syncs-config/' if 'agent-pipes-config/' does not exist.
     """
     
     def __init__(self, config_dir: Optional[Path] = None):
         if config_dir is None:
-            config_dir = get_fustor_home_dir() / "syncs-config"
+            home = get_fustor_home_dir()
+            config_dir = home / "agent-pipes-config"
+            
+            # Fallback to legacy syncs-config directory
+            if not config_dir.exists() and (home / "syncs-config").exists():
+                logger.info(f"Using legacy 'syncs-config' directory as '{config_dir}' not found.")
+                config_dir = home / "syncs-config"
+                
         self.dir = Path(config_dir)
-        self._syncs: Dict[str, SyncConfigYaml] = {}
+        self._pipelines: Dict[str, AgentPipelineConfig] = {}
         self._loaded = False
     
-    def scan(self) -> Dict[str, SyncConfigYaml]:
+    def scan(self) -> Dict[str, AgentPipelineConfig]:
         """
-        Scan directory and load all sync configurations.
+        Scan directory and load all pipeline configurations.
         
         Returns:
-            Dict of sync_id -> SyncConfigYaml
+            Dict of pipeline_id -> AgentPipelineConfig
         """
-        self._syncs.clear()
+        self._pipelines.clear()
         
         if not self.dir.exists():
-            logger.debug(f"Syncs config directory not found: {self.dir}")
+            logger.debug(f"Pipelines config directory not found: {self.dir}")
             self._loaded = True
             return {}
         
@@ -112,42 +116,47 @@ class SyncsConfigLoader:
                     logger.warning(f"Empty config file: {yaml_file}")
                     continue
                 
-                config = SyncConfigYaml(**data)
-                self._syncs[config.id] = config
-                logger.debug(f"Loaded sync config: {config.id}")
+                config = AgentPipelineConfig(**data)
+                self._pipelines[config.id] = config
+                logger.debug(f"Loaded pipeline config: {config.id}")
                 
             except Exception as e:
-                logger.error(f"Failed to load sync config from {yaml_file}: {e}")
+                logger.error(f"Failed to load pipeline config from {yaml_file}: {e}")
         
         self._loaded = True
-        logger.info(f"Loaded {len(self._syncs)} sync configs from {self.dir}")
-        return self._syncs
+        logger.info(f"Loaded {len(self._pipelines)} pipeline configs from {self.dir}")
+        return self._pipelines
     
     def ensure_loaded(self) -> None:
         """Ensure configurations are loaded."""
         if not self._loaded:
             self.scan()
     
-    def get(self, sync_id: str) -> Optional[SyncConfigYaml]:
-        """Get sync configuration by ID."""
+    def get(self, pipeline_id: str) -> Optional[AgentPipelineConfig]:
+        """Get pipeline configuration by ID."""
         self.ensure_loaded()
-        return self._syncs.get(sync_id)
+        return self._pipelines.get(pipeline_id)
     
-    def get_all(self) -> Dict[str, SyncConfigYaml]:
-        """Get all sync configurations."""
+    def get_all(self) -> Dict[str, AgentPipelineConfig]:
+        """Get all pipeline configurations."""
         self.ensure_loaded()
-        return self._syncs.copy()
+        return self._pipelines.copy()
     
-    def get_enabled(self) -> Dict[str, SyncConfigYaml]:
-        """Get all enabled (not disabled) sync configurations."""
+    def get_enabled(self) -> Dict[str, AgentPipelineConfig]:
+        """Get all enabled (not disabled) pipeline configurations."""
         self.ensure_loaded()
-        return {k: v for k, v in self._syncs.items() if not v.disabled}
+        return {k: v for k, v in self._pipelines.items() if not v.disabled}
     
-    def reload(self) -> Dict[str, SyncConfigYaml]:
+    def reload(self) -> Dict[str, AgentPipelineConfig]:
         """Force reload all configurations."""
         self._loaded = False
         return self.scan()
 
 
+# Backward compatibility aliases
+SyncsConfigLoader = PipelinesConfigLoader
+
+
 # Global instance
-syncs_config = SyncsConfigLoader()
+pipelines_config = PipelinesConfigLoader()
+syncs_config = pipelines_config

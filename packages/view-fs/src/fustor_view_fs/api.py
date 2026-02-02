@@ -24,7 +24,7 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
     Factory function to create the FS router with proper dependencies.
     
     Args:
-        get_provider_func: Async function to get the FSViewProvider for a datastore
+        get_provider_func: Async function to get the FSViewProvider for a view
         check_snapshot_func: Async function to check snapshot status (includes Core + Live logic)
         get_view_id_dep: FastAPI dependency to get view_id from API key
 
@@ -92,7 +92,7 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
     async def reset_directory_tree_api(
         view_id: str = Depends(get_view_id_dep)
     ) -> None:
-        """Reset the directory tree structure by clearing all entries for a specific datastore."""
+        """Reset the directory tree structure by clearing all entries for a specific view."""
         provider = await get_provider_func(view_id)
         if provider:
             await provider.reset()
@@ -101,7 +101,7 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
     async def get_suspect_list_api(
         view_id: str = Depends(get_view_id_dep)
     ) -> List[Dict[str, Any]]:
-        """Get the current Suspect List for this datastore."""
+        """Get the current Suspect List for this view."""
         provider = await get_provider_func(view_id)
         if not provider:
             return []
@@ -132,7 +132,7 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
     async def get_blind_spots_api(
         view_id: str = Depends(get_view_id_dep)
     ) -> Dict[str, Any]:
-        """Get the current Blind-spot List for this datastore."""
+        """Get the current Blind-spot List for this view."""
         provider = await get_provider_func(view_id)
         if not provider:
             return {"error": "Provider not initialized"}

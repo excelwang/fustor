@@ -68,7 +68,7 @@ class SessionManagerInterface(Protocol):
 class ViewProvider(Protocol):
     """
     Interface for a View Provider driver.
-    Views expose datastore content via specific protocols (e.g. FUSE/NFS).
+    Views expose content via specific protocols (e.g. FUSE/NFS).
     """
     def __init__(self, view_id: str, datastore_id: Optional[str] = None, **kwargs):
         ...

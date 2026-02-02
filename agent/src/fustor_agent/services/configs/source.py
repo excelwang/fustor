@@ -5,7 +5,7 @@ from typing import Dict, Optional, List, Any
 
 # Removed legacy import
 from fustor_core.models.config import AppConfig, SourceConfig
-from fustor_agent.services.instances.sync import SyncInstanceService
+from fustor_agent.services.instances.pipeline import PipelineInstanceService
 from .base import BaseConfigService
 from fustor_agent.services.common import config_lock
 from fustor_agent.services import schema_cache # Import schema_cache at the top level
@@ -21,14 +21,14 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
     """
     def __init__(self, app_config: AppConfig):
         super().__init__(app_config, None, 'source')
-        self.sync_instance_service: Optional[SyncInstanceService] = None
+        self.pipeline_instance_service: Optional[PipelineInstanceService] = None
 
-    def set_dependencies(self, sync_instance_service: SyncInstanceService):
+    def set_dependencies(self, pipeline_instance_service: PipelineInstanceService):
         """
-        Injects the SyncInstanceService for dependency management.
+        Injects the PipelineInstanceService for dependency management.
         This is to resolve circular dependencies between services.
         """
-        self.sync_instance_service = sync_instance_service
+        self.pipeline_instance_service = pipeline_instance_service
 
     async def add_config(self, id: str, config: SourceConfig) -> SourceConfig:
         """
@@ -68,13 +68,13 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
     async def cleanup_obsolete_configs(self) -> List[str]:
         """
         Finds and deletes all Source configurations that are both disabled and
-        not used by any sync tasks.
+        not used by any pipeline tasks.
 
         Returns:
             A list of the configuration IDs that were deleted.
         """
-        all_sync_configs = self.app_config.get_syncs().values()
-        in_use_source_ids = {sync.source for sync in all_sync_configs}
+        all_pipeline_configs = self.app_config.get_pipelines().values()
+        in_use_source_ids = {p.source for p in all_pipeline_configs}
 
         all_source_configs = self.list_configs()
         obsolete_ids = [

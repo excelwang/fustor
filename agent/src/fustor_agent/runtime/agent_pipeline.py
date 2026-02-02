@@ -13,13 +13,13 @@ from typing import Optional, Any, Dict, TYPE_CHECKING, Iterator
 from fustor_core.pipeline import Pipeline, PipelineState
 from fustor_core.pipeline.handler import SourceHandler
 from fustor_core.pipeline.sender import SenderHandler
-from fustor_core.models.states import SyncState, SyncInstanceDTO
+from fustor_core.models.states import PipelineInstanceDTO
 from fustor_core.exceptions import SessionObsoletedError
 
 if TYPE_CHECKING:
     from fustor_core.pipeline import PipelineContext
     from fustor_agent.services.instances.bus import EventBusInstanceRuntime
-    from fustor_core.models.states import SyncInstanceDTO
+    from fustor_core.models.states import PipelineInstanceDTO
 
 logger = logging.getLogger("fustor_agent")
 
@@ -55,7 +55,7 @@ class AgentPipeline(Pipeline):
         Initialize the AgentPipeline.
         
         Args:
-            pipeline_id: Unique identifier for this pipeline (sync_id)
+            pipeline_id: Unique identifier for this pipeline
             task_id: Full task identifier (agent_id:sync_id)
             config: Pipeline configuration
             source_handler: Handler for reading source data
@@ -591,10 +591,12 @@ class AgentPipeline(Pipeline):
         return self._bus
 
 
-    def get_dto(self) -> SyncInstanceDTO:
-        """Get pipeline data transfer object compatible with SyncInstanceDTO."""
-        # Map PipelineState to SyncState
+    def get_dto(self) -> PipelineInstanceDTO:
+        """Get pipeline data transfer object compatible with PipelineInstanceDTO."""
+        # Map PipelineState to legacy-compatible states internally if needed, 
+        # but here we just use PipelineState (which is an alias for SyncState anyway)
         
+        from fustor_core.models.states import SyncState
         state = SyncState.STOPPED
         if self.state & PipelineState.SNAPSHOT_PHASE:
             state |= SyncState.SNAPSHOT_SYNC
@@ -616,7 +618,7 @@ class AgentPipeline(Pipeline):
         if self.state & PipelineState.RUNNING and state == SyncState.STOPPED:
             state = SyncState.STARTING
 
-        return SyncInstanceDTO(
+        return PipelineInstanceDTO(
             id=self.id,
             state=state,
             info=self.info or "",

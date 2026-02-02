@@ -90,7 +90,7 @@ class SenderConfig(BaseModel):
 
 class SyncConfig(BaseModel):
     """
-    Configuration for a Sync task that connects a Source to a Sender.
+    Configuration for a Sync task (now called Pipeline) that connects a Source to a Sender.
     
     The 'sender' field specifies which sender configuration to use.
     """
@@ -103,6 +103,9 @@ class SyncConfig(BaseModel):
     sentinel_interval_sec: int = Field(default=120, ge=0, description="哨兵巡检间隔(秒)，0表示禁用，默认2分钟")
     heartbeat_interval_sec: int = Field(default=10, ge=1, description="心跳间隔(秒)，默认10秒")
 
+# Backward compatibility alias
+PipelineConfig = SyncConfig
+
 
 class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):
     root: Dict[str, SourceConfig] = Field(default_factory=dict)
@@ -113,13 +116,26 @@ class SenderConfigDict(RootModel[Dict[str, SenderConfig]]):
 class SyncConfigDict(RootModel[Dict[str, SyncConfig]]):
     root: Dict[str, SyncConfig] = Field(default_factory=dict)
 
+# Backward compatibility alias
+PipelineConfigDict = SyncConfigDict
+
 class AppConfig(BaseModel):
     """
-    Application configuration containing sources, senders, and syncs.
+    Application configuration containing sources, senders, and pipelines.
     """
+    model_config = ConfigDict(populate_by_name=True)
+
     sources: SourceConfigDict = Field(default_factory=SourceConfigDict)
     senders: SenderConfigDict = Field(default_factory=SenderConfigDict)
-    syncs: SyncConfigDict = Field(default_factory=SyncConfigDict)
+    pipelines: PipelineConfigDict = Field(
+        default_factory=PipelineConfigDict,
+        validation_alias='syncs'
+    )
+
+    @property
+    def syncs(self) -> SyncConfigDict:
+        """Alias for pipelines for backward compatibility."""
+        return self.pipelines
 
     def get_sources(self) -> Dict[str, SourceConfig]:
         return self.sources.root
@@ -128,8 +144,12 @@ class AppConfig(BaseModel):
         """Get all sender configurations."""
         return self.senders.root
 
+    def get_pipelines(self) -> Dict[str, PipelineConfig]:
+        return self.pipelines.root
+
     def get_syncs(self) -> Dict[str, SyncConfig]:
-        return self.syncs.root
+        """Alias for get_pipelines."""
+        return self.get_pipelines()
     
     def get_source(self, id: str) -> Optional[SourceConfig]:
         return self.get_sources().get(id)
@@ -138,8 +158,12 @@ class AppConfig(BaseModel):
         """Get sender config by ID."""
         return self.get_senders().get(id)
 
+    def get_pipeline(self, id: str) -> Optional[PipelineConfig]:
+        return self.get_pipelines().get(id)
+
     def get_sync(self, id: str) -> Optional[SyncConfig]:
-        return self.get_syncs().get(id)
+        """Alias for get_pipeline."""
+        return self.get_pipeline(id)
     
     def add_source(self, id: str, config: SourceConfig) -> SourceConfig:
         config_may = self.get_source(id)
@@ -156,10 +180,10 @@ class AppConfig(BaseModel):
         self.get_senders()[id] = config
         return config
 
-    def add_sync(self, id: str, config: SyncConfig) -> SyncConfig:
-        config_may = self.get_sync(id)
+    def add_pipeline(self, id: str, config: PipelineConfig) -> PipelineConfig:
+        config_may = self.get_pipeline(id)
         if config_may:
-            raise ConfigError(f"Sync config with id '{id}' already exists.")
+            raise ConfigError(f"Pipeline config with id '{id}' already exists.")
         
         # Dependency check
         if not self.get_source(config.source):
@@ -167,18 +191,22 @@ class AppConfig(BaseModel):
         if not self.get_sender(config.sender):
             raise NotFoundError(f"Dependency sender '{config.sender}' not found.")
         
-        self.get_syncs()[id] = config
+        self.get_pipelines()[id] = config
         return config
+
+    def add_sync(self, id: str, config: SyncConfig) -> SyncConfig:
+        """Alias for add_pipeline."""
+        return self.add_pipeline(id, config)
     
     def delete_source(self, id: str) -> SourceConfig:
         config = self.get_source(id)
         if not config:
             raise NotFoundError(f"Source config with id '{id}' not found.")
         
-        # Delete dependent syncs first
-        sync_ids_to_delete = [sync_id for sync_id, cfg in self.get_syncs().items() if cfg.source == id]
-        for sync_id in sync_ids_to_delete:
-            self.delete_sync(sync_id)
+        # Delete dependent pipelines first
+        pipeline_ids_to_delete = [pid for pid, cfg in self.get_pipelines().items() if cfg.source == id]
+        for pid in pipeline_ids_to_delete:
+            self.delete_pipeline(pid)
             
         return self.get_sources().pop(id)
     
@@ -188,33 +216,41 @@ class AppConfig(BaseModel):
         if not config:
             raise NotFoundError(f"Sender config with id '{id}' not found.")
         
-        # Delete dependent syncs first
-        sync_ids_to_delete = [sync_id for sync_id, cfg in self.syncs.root.items() if cfg.sender == id]
-        for sync_id in sync_ids_to_delete:
-            self.delete_sync(sync_id)
+        # Delete dependent pipelines first
+        pipeline_ids_to_delete = [pid for pid, cfg in self.get_pipelines().items() if cfg.sender == id]
+        for pid in pipeline_ids_to_delete:
+            self.delete_pipeline(pid)
             
         return self.get_senders().pop(id)
     
-    def delete_sync(self, id: str) -> SyncConfig:
-        config = self.get_sync(id)
+    def delete_pipeline(self, id: str) -> PipelineConfig:
+        config = self.get_pipeline(id)
         if not config:
-            raise NotFoundError(f"Sync config with id '{id}' not found.")
-        return self.get_syncs().pop(id)
+            raise NotFoundError(f"Pipeline config with id '{id}' not found.")
+        return self.get_pipelines().pop(id)
 
-    def check_sync_is_disabled(self, id: str) -> bool:
-        config = self.get_sync(id)
+    def delete_sync(self, id: str) -> SyncConfig:
+        """Alias for delete_pipeline."""
+        return self.delete_pipeline(id)
+
+    def check_pipeline_is_disabled(self, id: str) -> bool:
+        config = self.get_pipeline(id)
         if not config:
-            raise NotFoundError(f"Sync with id '{id}' not found.")
+            raise NotFoundError(f"Pipeline with id '{id}' not found.")
         
         if config.disabled:
             return True
         
         source_config = self.sources.root.get(config.source)
         if not source_config:
-            raise NotFoundError(f"Dependency source '{config.source}' not found for sync '{id}'.")
+            raise NotFoundError(f"Dependency source '{config.source}' not found for pipeline '{id}'.")
             
         sender_config = self.senders.root.get(config.sender)
         if not sender_config:
-            raise NotFoundError(f"Dependency sender '{config.sender}' not found for sync '{id}'.")
+            raise NotFoundError(f"Dependency sender '{config.sender}' not found for pipeline '{id}'.")
             
         return source_config.disabled or sender_config.disabled
+
+    def check_sync_is_disabled(self, id: str) -> bool:
+        """Alias for check_pipeline_is_disabled."""
+        return self.check_pipeline_is_disabled(id)

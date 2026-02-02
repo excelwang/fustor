@@ -15,9 +15,9 @@ from fustor_agent_sdk.utils import get_or_generate_agent_id # Import the utility
 # Import existing config and instance services
 from .services.configs.source import SourceConfigService
 from .services.configs.sender import SenderConfigService
-from .services.configs.sync import SyncConfigService
+from .services.configs.pipeline import PipelineConfigService
 from .services.instances.bus import EventBusService, EventBusInstanceRuntime
-from .services.instances.sync import SyncInstanceService
+from .services.instances.pipeline import PipelineInstanceService
 
 # --- NEW: Import the new driver services ---
 from .services.drivers.source_driver import SourceDriverService
@@ -50,7 +50,7 @@ class App:
         # Config services
         self.source_config_service = SourceConfigService(self._app_config)
         self.sender_config_service = SenderConfigService(self._app_config)
-        self.sync_config_service = SyncConfigService(
+        self.pipeline_config_service = PipelineConfigService(
             self._app_config,
             self.source_config_service,
             self.sender_config_service
@@ -67,8 +67,8 @@ class App:
             self.source_config_service.list_configs(),
             self.source_driver_service
         )
-        self.sync_instance_service = SyncInstanceService(
-            self.sync_config_service,
+        self.pipeline_instance_service = PipelineInstanceService(
+            self.pipeline_config_service,
             self.source_config_service, # Pass the source config service
             self.sender_config_service,
             self.event_bus_service, # Corrected: use self.event_bus_service
@@ -78,10 +78,10 @@ class App:
         )
         
         # 3. Inject cross-service dependencies to resolve circular references
-        self.source_config_service.set_dependencies(self.sync_instance_service)
-        self.sender_config_service.set_dependencies(self.sync_instance_service)
-        self.sync_config_service.set_dependencies(self.sync_instance_service)
-        self.event_bus_service.set_dependencies(self.sync_instance_service)
+        self.source_config_service.set_dependencies(self.pipeline_instance_service)
+        self.sender_config_service.set_dependencies(self.pipeline_instance_service)
+        self.pipeline_config_service.set_dependencies(self.pipeline_instance_service)
+        self.event_bus_service.set_dependencies(self.pipeline_instance_service)
         
         self.logger.info("All services initialized and dependencies injected.")
 
@@ -100,8 +100,8 @@ class App:
                 "Please run 'fustor_agent discover-schema --source-id <id> --admin-user <user> --admin-password <password>' for each to re-enable."
             )
 
-        self.logger.info("Attempting to automatically start enabled sync tasks...")
-        await self.sync_instance_service.start_all_enabled()
+        self.logger.info("Attempting to automatically start enabled pipeline tasks...")
+        await self.pipeline_instance_service.start_all_enabled()
 
     async def _load_and_recover_states(self):
         """
@@ -127,7 +127,7 @@ class App:
             return
 
         bus_states = saved_states.get("event_buses", {})
-        sync_states = saved_states.get("sync_tasks", {})
+        pipeline_states = saved_states.get("sync_tasks", saved_states.get("pipeline_tasks", {}))
 
         # 1. Recover EventBusInstances first
         recovered_buses: Dict[str, EventBusInstanceRuntime] = {}
@@ -159,18 +159,18 @@ class App:
             self.logger.info(f"Recovered EventBus '{bus_id}' for source '{source_id}' with state {bus_runtime.state.name}.")
 
         # 2. Recover AgentPipelines
-        if not sync_states:
+        if not pipeline_states:
             return
 
-        self.logger.info(f"Found {len(sync_states)} sync tasks to recover.")
+        self.logger.info(f"Found {len(pipeline_states)} pipeline tasks to recover.")
         recovery_tasks = []
-        for sync_id, sync_state_data in sync_states.items():
-            sync_conf = self.sync_config_service.get_config(sync_id)
-            if not sync_conf:
-                self.logger.warning(f"Sync configuration '{sync_id}' not found in current config. Skipping recovery.")
+        for pipeline_id, pipeline_state_data in pipeline_states.items():
+            pipeline_conf = self.pipeline_config_service.get_config(pipeline_id)
+            if not pipeline_conf :
+                self.logger.warning(f"Pipeline configuration '{pipeline_id}' not found in current config. Skipping recovery.")
                 continue
             
-            state_str = sync_state_data.get("state", "STOPPED")
+            state_str = pipeline_state_data.get("state", "STOPPED")
             state_parts = [part.strip() for part in state_str.split('|')]
             state = SyncState(0)
             for part in state_parts:
@@ -178,26 +178,26 @@ class App:
                     state |= SyncState[part.split('.')[-1]]
                 except KeyError:
                     self.logger.warning(f"Unknown state part: {part}")
-            persisted_bus_id = sync_state_data.get("bus_id")
+            persisted_bus_id = pipeline_state_data.get("bus_id")
 
             if state in {SyncState.MESSAGE_SYNC,SyncState.RUNNING_CONF_OUTDATE, SyncState.STOPPING}:
-                self.logger.warning(f"Sync task '{sync_id}' was active on last shutdown. Recovering...")
+                self.logger.warning(f"Pipeline task '{pipeline_id}' was active on last shutdown. Recovering...")
                 
-                # Define async closure to capture sync_id
-                async def recover_task(current_sync_id, current_persisted_bus_id):
+                # Define async closure to capture pipeline_id
+                async def recover_task(current_pipeline_id, current_persisted_bus_id):
                     try:
                         # Ensure the bus is started if it was producing
                         if current_persisted_bus_id and current_persisted_bus_id in recovered_buses:
                             bus_runtime = recovered_buses[current_persisted_bus_id]
                             if bus_runtime.state == EventBusState.PRODUCING:
                                 await bus_runtime.start_producer() # Ensure producer is running
-                            await bus_runtime.internal_bus.subscribe(current_sync_id, 0, []) # Re-subscribe with empty mapping, it will be updated
+                            await bus_runtime.internal_bus.subscribe(current_pipeline_id, 0, []) # Re-subscribe with empty mapping, it will be updated
                         
-                        await self.sync_instance_service.start_one(current_sync_id)
+                        await self.pipeline_instance_service.start_one(current_pipeline_id)
                     except Exception as e:
-                        self.logger.error(f"Failed to recover and restart sync '{current_sync_id}': {e}", exc_info=True)
+                        self.logger.error(f"Failed to recover and restart pipeline '{current_pipeline_id}': {e}", exc_info=True)
 
-                recovery_tasks.append(recover_task(sync_id, persisted_bus_id))
+                recovery_tasks.append(recover_task(pipeline_id, persisted_bus_id))
 
         if recovery_tasks:
             await asyncio.gather(*recovery_tasks)
@@ -208,8 +208,8 @@ class App:
         Applies all pending configuration changes by restarting affected tasks.
         """
         self.logger.info("Applying pending configuration changes...")
-        restarted_count = await self.sync_instance_service.restart_outdated_syncs()
-        self.logger.info(f"Successfully applied changes by restarting {restarted_count} sync tasks.")
+        restarted_count = await self.pipeline_instance_service.restart_outdated_pipelines()
+        self.logger.info(f"Successfully applied changes by restarting {restarted_count} pipeline tasks.")
 
     import shutil # Add this import at the top of the file
 
@@ -220,18 +220,19 @@ class App:
         """
         self.logger.info("Shutting down application...")
         
-        await self.sync_instance_service.stop_all()
+        await self.pipeline_instance_service.stop_all()
 
         self.logger.info(f"Saving final runtime state to '{STATE_FILE_PATH}'...")
         
         bus_dtos = [bus.get_dto().model_dump() for bus in self.event_bus_service.list_instances()]
         
-        syncs_raw = self.sync_instance_service.list_instances()
-        sync_dtos = [sync.get_dto().model_dump() for sync in syncs_raw] 
+        pipelines_raw = self.pipeline_instance_service.list_instances()
+        pipeline_dtos = [p.get_dto().model_dump() for p in pipelines_raw] 
 
         current_states = {
             "event_buses": {bus['id']: bus for bus in bus_dtos},
-            "sync_tasks": {sync['id']: sync for sync in sync_dtos},
+            "pipeline_tasks": {p['id']: p for p in pipeline_dtos},
+            "sync_tasks": {p['id']: p for p in pipeline_dtos}, # Compatibility
         }
         
         temp_file_path = None

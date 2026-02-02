@@ -35,7 +35,7 @@ from fustor_agent.runtime.bus import MemoryEventBus
 from fustor_core.exceptions import ConfigError, NotFoundError, DriverError, TransientSourceBufferFullError
 
 if TYPE_CHECKING:
-    from fustor_agent.services.instances.sync import SyncInstanceService
+    from fustor_agent.services.instances.pipeline import PipelineInstanceService
     from fustor_agent.services.drivers.source_driver import SourceDriverService
 
 logger = logging.getLogger("fustor_agent")
@@ -202,9 +202,10 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
         self.source_driver_service = source_driver_service
         self.bus_by_signature: Dict[Any, EventBusInstanceRuntime] = {}
         self._bus_creation_locks: Dict[str, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
+        self.pipeline_instance_service: Optional["PipelineInstanceService"] = None
 
-    def set_dependencies(self, sync_instance_service: "SyncInstanceService"):
-        self.sync_instance_service = sync_instance_service
+    def set_dependencies(self, pipeline_instance_service: "PipelineInstanceService"):
+        self.pipeline_instance_service = pipeline_instance_service
 
     def _generate_source_signature(self, source_config: SourceConfig) -> Any:
         return (source_config.driver, source_config.uri, source_config.credential)
@@ -232,7 +233,7 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
                 bus_runtime = None
 
             if bus_runtime and not bus_runtime.internal_bus.can_subscribe(required_position):
-                logger.info(f"Existing bus '{bus_runtime.id}' is unsuitable for sync '{sync_id}' (requires position {required_position}, bus starts at {bus_runtime.internal_bus.buffer_start_position}). Creating a new bus.")
+                logger.info(f"Existing bus '{bus_runtime.id}' is unsuitable for pipeline '{sync_id}' (requires position {required_position}, bus starts at {bus_runtime.internal_bus.buffer_start_position}). Creating a new bus.")
                 bus_runtime = None
 
             if not bus_runtime:
@@ -318,5 +319,5 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
                 force_new=True
             )
             
-            # The remapping sync instance needs to know about the signal too
-            await self.sync_instance_service.remap_sync_to_new_bus(task_to_split_id, new_bus, needed_position_lost)
+            # The remapping pipeline instance needs to know about the signal too
+            await self.pipeline_instance_service.remap_pipeline_to_new_bus(task_to_split_id, new_bus, needed_position_lost)

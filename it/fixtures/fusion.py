@@ -20,8 +20,8 @@ logger = logging.getLogger("fustor_test")
 
 
 @pytest.fixture(scope="session")
-def test_datastore() -> dict:
-    """Return static test datastore info."""
+def test_view() -> dict:
+    """Return static test view info."""
     return {
         "id": "integration-test-ds",
         "name": "integration-test-ds",
@@ -29,13 +29,16 @@ def test_datastore() -> dict:
         "session_timeout_seconds": 3
     }
 
+# Backward compatibility alias
+test_datastore = test_view
+
 
 @pytest.fixture(scope="session")
-def test_api_key(test_datastore) -> dict:
+def test_api_key(test_view) -> dict:
     """Return static API key info."""
     return {
         "key": "test-api-key-123",
-        "datastore_id": "integration-test-ds",
+        "view_id": "integration-test-ds",
         "name": "integration-test-key"
     }
 

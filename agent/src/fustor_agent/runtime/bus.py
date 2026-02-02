@@ -90,11 +90,11 @@ class MemoryEventBus:
                 self._producer_can_put.set()
             self._consumer_can_get.set()
 
-    async def get_events_for(self, sync_task_id: str, batch_size: int, timeout: float) -> List[EventBase]:
+    async def get_events_for(self, pipeline_id: str, batch_size: int, timeout: float) -> List[EventBase]:
         if self.failed:
             raise EventBusFailedError(f"Bus '{self.id}' failed: {self.error_message}")
         async with self.lock:
-            state = self.subscribers.get(sync_task_id)
+            state = self.subscribers.get(pipeline_id)
             if not state: return []
             last_consumed_index = state.get('last_consumed_index', self.buffer_start_position - 1)
             events = []
@@ -111,7 +111,7 @@ class MemoryEventBus:
         except asyncio.TimeoutError:
             return []
         async with self.lock:
-            state = self.subscribers.get(sync_task_id)
+            state = self.subscribers.get(pipeline_id)
             if not state: return []
             last_consumed_index = state.get('last_consumed_index', self.buffer_start_position - 1)
             events = []
@@ -122,16 +122,16 @@ class MemoryEventBus:
                         break
             return events
 
-    async def commit(self, sync_task_id: str, num_events_consumed: int, last_consumed_position: int) -> Optional[str]:
+    async def commit(self, pipeline_id: str, num_events_consumed: int, last_consumed_position: int) -> Optional[str]:
         async with self.lock:
-            state = self.subscribers.get(sync_task_id)
+            state = self.subscribers.get(pipeline_id)
             if not state:
-                logger.warning(f"Commit called for non-existent subscriber '{sync_task_id}' on bus '{self.id}'.")
+                logger.warning(f"Commit called for non-existent subscriber '{pipeline_id}' on bus '{self.id}'.")
                 return None
             state['last_consumed_index'] = last_consumed_position
             state['last_seen_position'] = last_consumed_position
             self._update_low_watermark()
-            task_to_split = self._check_for_split(committed_subscriber_id=sync_task_id)
+            task_to_split = self._check_for_split(committed_subscriber_id=pipeline_id)
             self._trim_buffer()
             return task_to_split
 
@@ -141,11 +141,11 @@ class MemoryEventBus:
         self.error_message = error
         self._producer_can_put.set()
 
-    async def subscribe(self, sync_task_id: str, initial_position: int, fields_mapping: List[FieldMapping]):
+    async def subscribe(self, pipeline_id: str, initial_position: int, fields_mapping: List[FieldMapping]):
         async with self.lock:
-            if sync_task_id in self.subscribers:
+            if pipeline_id in self.subscribers:
                 return
-            self.subscribers[sync_task_id] = {
+            self.subscribers[pipeline_id] = {
                 'last_seen_position': initial_position - 1,
                 'last_consumed_index': initial_position - 1
             }
@@ -158,21 +158,21 @@ class MemoryEventBus:
                         required_source_fields.add(field_name)
             
             # Store the required fields. If None, it means all fields are required.
-            self.subscriber_field_map[sync_task_id] = required_source_fields
+            self.subscriber_field_map[pipeline_id] = required_source_fields
             self._recalculate_required_fields()
             
             log_fields = "ALL_FIELDS" if required_source_fields is None else required_source_fields
-            logger.info(f"Task '{sync_task_id}' subscribed to Bus '{self.id}' at event index {initial_position - 1}. Required fields: {log_fields}")
+            logger.info(f"Pipeline '{pipeline_id}' subscribed to Bus '{self.id}' at event index {initial_position - 1}. Required fields: {log_fields}")
             self._update_low_watermark()
 
-    async def unsubscribe(self, sync_task_id: str):
+    async def unsubscribe(self, pipeline_id: str):
         async with self.lock:
-            if sync_task_id in self.subscribers:
-                del self.subscribers[sync_task_id]
-                if sync_task_id in self.subscriber_field_map:
-                    del self.subscriber_field_map[sync_task_id]
+            if pipeline_id in self.subscribers:
+                del self.subscribers[pipeline_id]
+                if pipeline_id in self.subscriber_field_map:
+                    del self.subscriber_field_map[pipeline_id]
                 self._recalculate_required_fields()
-                logger.info(f"Task '{sync_task_id}' unsubscribed from Bus '{self.id}'.")
+                logger.info(f"Pipeline '{pipeline_id}' unsubscribed from Bus '{self.id}'.")
                 self._update_low_watermark()
                 
     def _update_low_watermark(self):
@@ -236,14 +236,14 @@ class MemoryEventBus:
     def get_subscriber_count(self) -> int:
         return len(self.subscribers)
 
-    async def update_subscriber_position(self, sync_task_id: str, new_position: int):
+    async def update_subscriber_position(self, pipeline_id: str, new_position: int):
         async with self.lock:
-            state = self.subscribers.get(sync_task_id)
+            state = self.subscribers.get(pipeline_id)
             if state:
                 if new_position > state['last_consumed_index']:
                     state['last_consumed_index'] = new_position
                     state['last_seen_position'] = new_position
-                    logger.info(f"Bus '{self.id}': Subscriber '{sync_task_id}' position updated to {new_position}.")
+                    logger.info(f"Bus '{self.id}': Subscriber '{pipeline_id}' position updated to {new_position}.")
                     self._update_low_watermark()
             else:
-                logger.warning(f"Bus '{self.id}': Attempted to update position for non-existent subscriber '{sync_task_id}'.")
+                logger.warning(f"Bus '{self.id}': Attempted to update position for non-existent subscriber '{pipeline_id}'.")

@@ -5,7 +5,7 @@ from typing import Optional, Dict
 from dotenv import load_dotenv, find_dotenv
 from pathlib import Path
 
-from fustor_core.models.config import AppConfig, SyncConfig, SyncConfigDict, SourceConfigDict, SenderConfigDict
+from fustor_core.models.config import AppConfig, PipelineConfig, PipelineConfigDict, SourceConfigDict, SenderConfigDict
 from fustor_core.common import get_fustor_home_dir
 
 # Standardize Fustor home directory across all services
@@ -35,7 +35,7 @@ logger.setLevel(logging.DEBUG)
 def get_app_config() -> AppConfig:
     global _app_config_instance
     if _app_config_instance is None:
-        from .config import sources_config, senders_config, syncs_config
+        from .config import sources_config, senders_config, pipelines_config
 
         # 1. Load Sources
         sources_config.reload()
@@ -45,21 +45,21 @@ def get_app_config() -> AppConfig:
         senders_config.reload()
         valid_senders = senders_config.get_all()
 
-        # 3. Load Syncs from directory
-        syncs_config.reload()
-        valid_syncs_yaml = syncs_config.get_all()
-        valid_syncs: Dict[str, SyncConfig] = {}
+        # 3. Load Pipelines from directory
+        pipelines_config.reload()
+        valid_pipelines_yaml = pipelines_config.get_all()
+        valid_pipelines: Dict[str, PipelineConfig] = {}
         
-        # Convert SyncConfigYaml to SyncConfig
-        for s_id, s_yaml in valid_syncs_yaml.items():
-            # SyncConfig doesn't have 'id' field, it's the key in the dict
-            s_dict = s_yaml.model_dump(exclude={'id'})
-            valid_syncs[s_id] = SyncConfig(**s_dict)
+        # Convert AgentPipelineConfig to PipelineConfig
+        for p_id, p_yaml in valid_pipelines_yaml.items():
+            # PipelineConfig doesn't have 'id' field, it's the key in the dict
+            p_dict = p_yaml.model_dump(exclude={'id'})
+            valid_pipelines[p_id] = PipelineConfig(**p_dict)
 
         _app_config_instance = AppConfig(
             sources=SourceConfigDict(root=valid_sources),
             senders=SenderConfigDict(root=valid_senders),
-            syncs=SyncConfigDict(root=valid_syncs)
+            pipelines=PipelineConfigDict(root=valid_pipelines)
         )
 
     return _app_config_instance

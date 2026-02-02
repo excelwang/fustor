@@ -9,7 +9,7 @@ import logging
 from typing import Dict, Optional, List
 
 from fustor_core.models.config import AppConfig, SenderConfig
-from fustor_agent.services.instances.sync import SyncInstanceService
+from fustor_agent.services.instances.pipeline import PipelineInstanceService
 from fustor_agent.services.common import config_lock
 from .base import BaseConfigService
 from fustor_agent_sdk.interfaces import SenderConfigServiceInterface
@@ -28,22 +28,22 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
     def __init__(self, app_config: AppConfig):
         # Still use 'sender' internally for config file compatibility
         super().__init__(app_config, None, 'sender')
-        self.sync_instance_service: Optional[SyncInstanceService] = None
+        self.pipeline_instance_service: Optional[PipelineInstanceService] = None
 
-    def set_dependencies(self, sync_instance_service: SyncInstanceService):
-        """Injects the SyncInstanceService for dependency management."""
-        self.sync_instance_service = sync_instance_service
+    def set_dependencies(self, pipeline_instance_service: PipelineInstanceService):
+        """Injects the PipelineInstanceService for dependency management."""
+        self.pipeline_instance_service = pipeline_instance_service
 
     async def cleanup_obsolete_configs(self) -> List[str]:
         """
         Finds and deletes all Sender configurations that are both disabled and
-        not used by any sync tasks.
+        not used by any pipeline tasks.
 
         Returns:
             A list of the configuration IDs that were deleted.
         """
-        all_sync_configs = self.app_config.get_syncs().values()
-        in_use_sender_ids = {sync.sender for sync in all_sync_configs}
+        all_pipeline_configs = self.app_config.get_pipelines().values()
+        in_use_sender_ids = {p.sender for p in all_pipeline_configs}
 
         all_sender_configs = self.list_configs()
         obsolete_ids = [

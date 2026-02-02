@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from fustor_agent.services.configs.source import SourceConfigService
-from fustor_core.models.config import AppConfig, SourceConfig, SyncConfig, PasswdCredential
+from fustor_core.models.config import AppConfig, SourceConfig, PipelineConfig, PasswdCredential
 from fustor_core.exceptions import NotFoundError
 
 @pytest.fixture
@@ -12,15 +12,15 @@ def mock_app_config():
     return app_config
 
 @pytest.fixture
-def mock_sync_instance_service():
+def mock_pipeline_instance_service():
     mock = MagicMock()
-    mock.mark_dependent_syncs_outdated = AsyncMock()
+    mock.mark_dependent_pipelines_outdated = AsyncMock()
     return mock
 
 @pytest.fixture
-def source_config_service(mock_app_config, mock_sync_instance_service):
+def source_config_service(mock_app_config, mock_pipeline_instance_service):
     service = SourceConfigService(mock_app_config)
-    service.set_dependencies(mock_sync_instance_service)
+    service.set_dependencies(mock_pipeline_instance_service)
     return service
 
 @pytest.fixture
@@ -28,14 +28,14 @@ def sample_source_config():
     return SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
 
 @pytest.fixture
-def sample_sync_config(sample_source_config):
-    return SyncConfig(source="source1", sender="pusher1", disabled=False)
+def sample_pipeline_config(sample_source_config):
+    return PipelineConfig(source="source1", sender="sender1", disabled=False)
 
 class TestSourceConfigService:
     def test_set_dependencies(self, source_config_service):
-        mock_sync_service = MagicMock()
-        source_config_service.set_dependencies(mock_sync_service)
-        assert source_config_service.sync_instance_service == mock_sync_service
+        mock_pipeline_service = MagicMock()
+        source_config_service.set_dependencies(mock_pipeline_service)
+        assert source_config_service.pipeline_instance_service == mock_pipeline_service
 
     @pytest.mark.asyncio
     @patch('fustor_agent.services.configs.source.config_lock')
@@ -88,9 +88,9 @@ class TestSourceConfigService:
             "src3": SourceConfig(driver="d", uri="u", credential=PasswdCredential(user="u"), disabled=True), # Obsolete
             "src4": SourceConfig(driver="d", uri="u", credential=PasswdCredential(user="u"), disabled=False), # Not obsolete (enabled)
         }
-        mock_app_config.get_syncs.return_value = {
-            "sync1": SyncConfig(source="src2", sender="r1", disabled=False),
-            "sync2": SyncConfig(source="src4", sender="r1", disabled=False),
+        mock_app_config.get_pipelines.return_value = {
+            "p1": PipelineConfig(source="src2", sender="r1", disabled=False),
+            "p2": PipelineConfig(source="src4", sender="r1", disabled=False),
         }
         
 
