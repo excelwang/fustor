@@ -4,6 +4,11 @@ Fustor HTTP Sender - Transport layer for Agent to Fusion communication.
 This package implements the HTTP transport protocol for sending events
 from Fustor Agent to Fustor Fusion.
 """
+try:
+    from ._version import version as __version__
+except ImportError:
+    __version__ = "unknown"
+
 import logging
 from typing import Any, Dict, List, Optional
 

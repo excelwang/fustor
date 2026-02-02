@@ -80,7 +80,7 @@ async def test_arbitrator_tombstone_protection(arbitrator, fs_state):
         EventType.INSERT,
         [{"path": "/ghost.txt", "size": 500, "modified_time": 2500.0}],
         source=MessageSource.SNAPSHOT,
-        index=2500000 # 2500s in ms
+        index=2500.0 # 2500s (Seconds)
     )
     await arbitrator.process_event(new_snapshot_event)
     assert "/ghost.txt" not in fs_state.tombstone_list

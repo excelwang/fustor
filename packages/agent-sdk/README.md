@@ -1,45 +1,69 @@
-# fustor-agent-sdk
+# Fustor Agent SDK
 
-This package provides a Software Development Kit (SDK) for interacting with the Fustor Agent service. It offers a set of interfaces, data models, and utility functions to facilitate programmatic access and integration with the Agent's functionalities.
+This package provides the Software Development Kit (SDK) for extending and interacting with the Fustor Agent service. It focuses on the **V2 Pipeline-centric architecture**, enabling developers to build custom data sources and delivery mechanisms.
+
+## Conceptual Overview (V2 Architecture)
+
+In the V2 architecture, the Fustor Agent operates through **Pipelines**. A pipeline coordinates the flow of data from a **Source** to a **Sender**.
+
+```mermaid
+graph LR
+    Source[Source Driver] -- Events --> Bus[Event Bus]
+    Bus -- Polled Events --> Pipeline[Agent Pipeline]
+    Pipeline -- Batched Events --> Sender[Sender Handler]
+    Sender -- HTTP/gRPC --> Fusion[Fustor Fusion]
+```
 
 ## Features
 
-*   **Interfaces**: Defines abstract interfaces for various components of the Fustor Agent (Configs, Drivers, Instances), allowing for consistent interaction patterns across different implementations.
-*   **Models**: Provides Pydantic data models for configuration and state management, building upon `fustor-core`.
-*   **Utilities**: Includes helper functions and classes to simplify common tasks when working with the Fustor Agent runtime.
+*   **Pipeline Interfaces**: Standardized abstract classes for `AgentPipeline`, `SourceDriver`, and `SenderHandler`.
+*   **Driver Framework**: Tools and base classes to implement custom source drivers (e.g., MySQL, OSS, custom APIs).
+*   **Sender Framework**: Robust handlers for delivering data to various destinations, supporting retry logic and role management (Leader/Follower).
+*   **Configuration SDK**: Specialized Pydantic models and services to manage dynamic pipeline configurations.
 
 ## Installation
 
-This package is part of the Fustor monorepo and is typically installed in editable mode within the monorepo's development environment using `uv sync`.
+```bash
+uv sync --package fustor-agent-sdk
+```
 
 ## Usage
 
-Developers can use this SDK to build custom applications, new drivers, or integrations that need to communicate with or extend the Fustor Agent service. It abstracts away the complex internal logic of event bus management and data serialization.
+### 1. Implementing a Custom Source Driver
 
-### Example: Working with Pipeline Configurations
+To add a new data source, implement the `SourceDriver` interface:
 
 ```python
-from fustor_core.models.config import PipelineConfig, FieldMapping
-from fustor_agent_sdk.interfaces import PipelineConfigServiceInterface
+from fustor_core.drivers import SourceDriver
+from fustor_core.event import EventBase
 
-# Assume service is initialized in your application
-async def setup_pipeline(service: PipelineConfigServiceInterface):
-    # Define a new pipeline configuration
-    config = PipelineConfig(
-        source="research-db",
-        sender="fusion-http",
-        disabled=False,
-        fields_mapping=[
-            FieldMapping(source=["uuid"], to="id", required=True),
-            FieldMapping(source=["content"], to="data")
-        ]
-    )
-    
-    # Register the pipeline
-    await service.add_config(id="research-pipeline", config=config)
-    print("Pipeline registered successfully")
+class MyCustomSource(SourceDriver):
+    def get_event_iterator(self, **kwargs):
+        # Your logic to fetch changes from the source
+        for change in self._fetch_external_changes():
+             yield EventBase(...)
 ```
+
+### 2. Programmatic Pipeline Management
+
+```python
+from fustor_agent_sdk.interfaces import PipelineConfigServiceInterface
+from fustor_core.models.config import PipelineConfig
+
+async def register_pipeline(service: PipelineConfigServiceInterface):
+    config = PipelineConfig(
+        source_uri="custom://my-stream",
+        sender_id="fusion-main",
+        enabled=True
+    )
+    await service.add_config(id="stream-1", config=config)
+```
+
+## Extensibility
+
+The SDK is designed to be modular. You can replace the default `EventBus` or `Persistence` layer by implementing the corresponding interfaces provided in `fustor_agent_sdk.interfaces`.
 
 ## Dependencies
 
-*   `fustor-core`: Provides foundational elements, common models, and shared components.
+*   `fustor-core`: Foundational models and core synchronization logic.
+*   `fustor-common`: Shared utilities and constants.

@@ -58,8 +58,8 @@ class FSArbitrator:
             agent_time = None
             
             if hasattr(event, 'index') and event.index > 0:
-                 # Wire format 'index' is MILLISECONDS (int) per schema convention
-                 agent_time = float(event.index) / 1000.0
+                 # Enforce Seconds: Agent logical time in seconds
+                 agent_time = float(event.index)
             elif hasattr(event, 'timestamp'):
                  agent_time = float(event.timestamp)
                  # Fallback heuristic for generic timestamps

@@ -408,7 +408,7 @@ class FSDriver(SourceDriver):
             
         batch_size = kwargs.get("batch_size", 100)
         file_pattern = self.config.driver_params.get("file_pattern", "*")
-        audit_time = int(time.time() * 1000) # Use milliseconds for wire-format index
+        audit_time = int(time.time()) # Use seconds for wire-format index
         
         results_queue = queue.Queue(maxsize=batch_size * 2)
         work_queue = queue.Queue()
