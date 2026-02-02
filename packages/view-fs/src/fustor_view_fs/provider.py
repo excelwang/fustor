@@ -20,7 +20,7 @@ class FSViewProvider(FSViewBase):
         super().__init__(view_id, datastore_id, config)
         
         # Composition Root
-        self.state = FSState(datastore_id)
+        self.state = FSState(datastore_id, config=self.config)
         self.tree_manager = TreeManager(self.state)
         self.arbitrator = FSArbitrator(
             self.state, 

@@ -9,35 +9,8 @@ from fustor_core.pipeline import PipelineState
 from fustor_agent.runtime.agent_pipeline import AgentPipeline
 from .mocks import MockSourceHandler, MockSenderHandler
 
-# Speed up tests by shortening intervals
-AgentPipeline.CONTROL_LOOP_INTERVAL = 0.01
-AgentPipeline.ROLE_CHECK_INTERVAL = 0.01
-AgentPipeline.FOLLOWER_STANDBY_INTERVAL = 0.01
-AgentPipeline.ERROR_RETRY_INTERVAL = 0.01
+# Using fixtures and fast intervals from conftest.py
 
-@pytest.fixture
-def mock_source():
-    ms = MockSourceHandler()
-    # Make message iterator block so it doesn't end immediately
-    async def mock_aiter_msg():
-        while True:
-            await asyncio.sleep(0.1)
-            yield {"index": 999}
-    ms.get_message_iterator = MagicMock(return_value=mock_aiter_msg())
-    return ms
-
-@pytest.fixture
-def mock_sender():
-    return MockSenderHandler()
-
-@pytest.fixture
-def pipeline_config():
-    return {
-        "batch_size": 5,
-        "heartbeat_interval_sec": 0.01,
-        "audit_interval_sec": 0.05,
-        "sentinel_interval_sec": 0,
-    }
 
 class TestAgentErrorRecovery:
     
@@ -147,7 +120,66 @@ class TestAgentErrorRecovery:
         assert call_count == 1 # Second call (audit end) should have been skipped or handled safely
         
     @pytest.mark.asyncio
+    async def test_initialization_error_sets_error_state(self, mock_source, mock_sender, pipeline_config):
+        """Pipeline should go to ERROR state if handler initialization fails."""
+        mock_source.initialize = AsyncMock(side_effect=RuntimeError("Init failed"))
+        
+        pipeline = AgentPipeline(
+            "test-id", "agent:test-id", pipeline_config,
+            mock_source, mock_sender
+        )
+        
+        await pipeline.start()
+        
+        assert pipeline.state == PipelineState.ERROR
+        assert "Initialization failed" in pipeline.info
+
+    @pytest.mark.asyncio
+    async def test_session_obsolete_clears_session_immediately(
+        self, mock_source, mock_sender, pipeline_config
+    ):
+        """Pipeline should clear session and reconnect immediately on SessionObsoletedError."""
+        from fustor_core.exceptions import SessionObsoletedError
+        
+        mock_sender.role = "leader"
+        pipeline = AgentPipeline(
+            "test-id", "agent:test-id", pipeline_config,
+            mock_source, mock_sender
+        )
+        
+        # Setup: Success first time, then 419 error, then success again
+        # Note: send_batch is called multiple times during leader sequence
+        mock_sender.create_session = AsyncMock(side_effect=[
+            ("sess-1", {"role": "leader"}),
+            ("sess-2", {"role": "leader"}),
+        ])
+        
+        mock_sender.send_batch = AsyncMock(side_effect=[
+            (True, {"success": True}), # Snapshot batch 1
+            (True, {"success": True}), # Snapshot batch 2
+            SessionObsoletedError("Session dead"), # Realtime batch
+            (True, {"success": True}), # Post-recovery batch
+        ])
+        
+        # Wait for recovery
+        await pipeline.start()
+        
+        # Give it time to hit the error and recover
+        # Since we use 'continue' and no backoff for 419, it should be fast
+        await asyncio.sleep(0.4)
+        
+        try:
+            # Should have called create_session at least twice (initial + recovery)
+            assert mock_sender.create_session.call_count >= 2
+            # Should be back with an active session
+            assert pipeline.has_active_session()
+            assert pipeline.session_id == "sess-2"
+        finally:
+            await pipeline.stop()
+
+    @pytest.mark.asyncio
     async def test_exponential_backoff_values(self, mock_source, mock_sender, pipeline_config):
+
         """Test that consecutive errors increase backoff."""
         pipeline = AgentPipeline(
             "test-id", "agent:test-id", pipeline_config,

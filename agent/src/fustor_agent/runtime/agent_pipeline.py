@@ -14,6 +14,7 @@ from fustor_core.pipeline import Pipeline, PipelineState
 from fustor_core.pipeline.handler import SourceHandler
 from fustor_core.pipeline.sender import SenderHandler
 from fustor_core.models.states import SyncState, SyncInstanceDTO
+from fustor_core.exceptions import SessionObsoletedError
 
 if TYPE_CHECKING:
     from fustor_core.pipeline import PipelineContext
@@ -243,6 +244,16 @@ class AgentPipeline(Pipeline):
             except asyncio.CancelledError:
                 logger.info(f"Pipeline {self.id} control loop cancelled")
                 break
+            except SessionObsoletedError as e:
+                logger.warning(f"Pipeline {self.id} session is obsolete: {e}. Reconnecting immediately.")
+                # Clear session so we recreate it in the next iteration
+                if self.has_active_session():
+                    await self._cleanup_leader_tasks()
+                    await self.on_session_closed(self.session_id)
+                
+                # No backoff for obsolete session, just restart the loop
+                continue
+
             except Exception as e:
                 self._consecutive_errors += 1
                 
@@ -260,13 +271,10 @@ class AgentPipeline(Pipeline):
                 # If session failed, ensure it's cleared so we try to recreate it
                 if self.has_active_session():
                     try:
-                        # Clear tasks that might be hanging
-                        for task in [self._audit_task, self._sentinel_task, self._message_sync_task, self._snapshot_task]:
-                            if task and not task.done():
-                                task.cancel()
+                        await self._cleanup_leader_tasks()
                         await self.on_session_closed(self.session_id)
-                    except Exception as e:
-                        logger.debug(f"Error during cleanup after session loss: {e}")
+                    except Exception as e2:
+                        logger.debug(f"Error during cleanup after session loss: {e2}")
 
                 await asyncio.sleep(backoff)
 
@@ -322,12 +330,22 @@ class AgentPipeline(Pipeline):
                 if new_role != self.current_role:
                     await self._handle_role_change(new_role)
                 
+            except SessionObsoletedError as e:
+                await self._handle_fatal_error(e)
+                break
             except Exception as e:
-                logger.error(f"Heartbeat error: {e}")
-                # Don't fail the pipeline on heartbeat errors
+                logger.warning(f"Pipeline {self.id} heartbeat error: {e}")
+                # Don't kill the loop for transient heartbeat errors
             
             await asyncio.sleep(self.heartbeat_interval_sec)
     
+    async def _cleanup_leader_tasks(self) -> None:
+        """Cancel all active leader-specific tasks."""
+        current = asyncio.current_task()
+        for task in [self._audit_task, self._sentinel_task, self._message_sync_task, self._snapshot_task]:
+            if task and task != current and not task.done():
+                task.cancel()
+                
     async def _handle_role_change(self, new_role: str) -> None:
         """Handle role change from heartbeat response."""
         old_role = self.current_role
@@ -335,12 +353,21 @@ class AgentPipeline(Pipeline):
         
         logger.info(f"Pipeline {self.id}: Role changed {old_role} -> {new_role}")
         
-        if new_role == "follower" and old_role == "leader":
+        if (new_role == "follower" or new_role is None) and old_role == "leader":
             # Lost leadership - cancel leader tasks
-            for task in [self._audit_task, self._sentinel_task, self._message_sync_task]:
-                if task and not task.done():
-                    task.cancel()
-    
+            await self._cleanup_leader_tasks()
+
+    async def _handle_fatal_error(self, error: Exception) -> None:
+        """Handle fatal errors from background tasks."""
+        if isinstance(error, SessionObsoletedError):
+            logger.warning(f"Pipeline {self.id} detected obsolete session: {error}")
+            # Reset session_id so the control loop knows to reconnect
+            if self.has_active_session():
+                await self._cleanup_leader_tasks()
+                await self.on_session_closed(self.session_id)
+        else:
+            logger.error(f"Pipeline {self.id} fatal background error: {error}", exc_info=True)
+            self._set_state(PipelineState.ERROR, str(error))
     async def _aiter_sync(self, sync_iter: Iterator[Any], queue_size: int = 1000):
         """
         Safely and efficiently wrap a synchronous iterator into an async generator.
@@ -536,9 +563,13 @@ class AgentPipeline(Pipeline):
                 await self._run_audit_sync()
             except asyncio.CancelledError:
                 break
+            except SessionObsoletedError as e:
+                await self._handle_fatal_error(e)
+                break
             except Exception as e:
                 logger.error(f"Audit loop error: {e}", exc_info=True)
-                await asyncio.sleep(10) # Wait before retry
+                # For generic errors, wait longer to avoid flooding
+                await asyncio.sleep(self.ERROR_RETRY_INTERVAL * 10)
     
     async def _run_audit_sync(self) -> None:
         """Execute audit synchronization."""

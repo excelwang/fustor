@@ -7,16 +7,18 @@ from typing import List, Dict, Any, Tuple
 from urllib.parse import urljoin
 
 from fustor_core.drivers import PusherDriver
-from fustor_core.exceptions import DriverError
+from fustor_core.exceptions import DriverError, SessionObsoletedError
 from fustor_core.models.config import SenderConfig, PasswdCredential, ApiKeyCredential
 from fustor_core.event import EventBase
 from fustor_core.utils.retry import retry
 
 logger = logging.getLogger("fustor_agent.driver.openapi")
 
-class SessionObsoletedError(Exception):
-    """当会话被标记为过时，不需要重试的异常"""
-    pass
+# Note: We keep the name but it now inherits from core exception
+# for better catch-ability in the pipeline.
+# The local definition is kept for backward compatibility if needed, 
+# but it's better to use the core one.
+
 
 # Module-level cache for OpenAPI specifications to improve performance
 _spec_cache = {}

@@ -36,6 +36,12 @@ class MockSourceHandler(SourceHandler):
         self.audit_calls += 1
         return iter([])
 
+    def reset(self):
+        """Reset all call counters."""
+        self.snapshot_calls = 0
+        self.message_calls = 0
+        self.audit_calls = 0
+
 
 class MockSenderHandler(SenderHandler):
     """Mock sender handler for testing."""
@@ -75,3 +81,11 @@ class MockSenderHandler(SenderHandler):
         self.session_created = False
         self.session_closed = True
         return True
+
+    def reset(self):
+        """Reset all call counters and storage."""
+        self.session_created = False
+        self.session_closed = False
+        self.batches_sent.clear()
+        self.batches.clear()
+        self.heartbeat_calls = 0

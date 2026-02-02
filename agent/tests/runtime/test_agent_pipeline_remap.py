@@ -6,34 +6,9 @@ This tests the hot-migration of a pipeline to a new EventBus instance
 when bus splitting occurs.
 """
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
-import asyncio
-
+from unittest.mock import MagicMock
 from fustor_core.pipeline import PipelineState
 from fustor_agent.runtime.agent_pipeline import AgentPipeline
-
-from .mocks import MockSourceHandler, MockSenderHandler
-
-
-@pytest.fixture
-def mock_source():
-    return MockSourceHandler()
-
-
-@pytest.fixture
-def mock_sender():
-    return MockSenderHandler()
-
-
-@pytest.fixture
-def pipeline_config():
-    return {
-        "batch_size": 5,
-        "heartbeat_interval_sec": 1,
-        "audit_interval_sec": 0,
-        "sentinel_interval_sec": 0,
-    }
-
 
 @pytest.fixture
 def mock_bus():
@@ -43,7 +18,6 @@ def mock_bus():
     bus.internal_bus = MagicMock()
     return bus
 
-
 @pytest.fixture
 def new_mock_bus():
     """Create a second mock EventBusInstanceRuntime for remap target."""
@@ -51,7 +25,6 @@ def new_mock_bus():
     bus.id = "bus-67890"
     bus.internal_bus = MagicMock()
     return bus
-
 
 @pytest.fixture
 def agent_pipeline(mock_source, mock_sender, pipeline_config, mock_bus):
@@ -63,7 +36,6 @@ def agent_pipeline(mock_source, mock_sender, pipeline_config, mock_bus):
         sender_handler=mock_sender,
         event_bus=mock_bus
     )
-
 
 class TestRemapToNewBus:
     """Tests for remap_to_new_bus method."""

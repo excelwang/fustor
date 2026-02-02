@@ -4,32 +4,8 @@ Tests for AgentPipeline role transitions (Leader <-> Follower).
 """
 import pytest
 import asyncio
-from unittest.mock import MagicMock, AsyncMock
 from fustor_core.pipeline import PipelineState
 from fustor_agent.runtime.agent_pipeline import AgentPipeline
-from .mocks import MockSourceHandler, MockSenderHandler
-
-# Speed up tests
-AgentPipeline.CONTROL_LOOP_INTERVAL = 0.01
-AgentPipeline.ROLE_CHECK_INTERVAL = 0.01
-AgentPipeline.FOLLOWER_STANDBY_INTERVAL = 0.01
-
-@pytest.fixture
-def mock_source():
-    return MockSourceHandler()
-
-@pytest.fixture
-def mock_sender():
-    return MockSenderHandler()
-
-@pytest.fixture
-def pipeline_config():
-    return {
-        "batch_size": 5,
-        "heartbeat_interval_sec": 0.01,
-        "audit_interval_sec": 0,
-        "sentinel_interval_sec": 0,
-    }
 
 class TestAgentRoleSwitch:
     
@@ -67,7 +43,7 @@ class TestAgentRoleSwitch:
         # Change role via heartbeat
         mock_sender.role = "follower"
         
-        # Wait for heartbeat to process (0.01s interval)
+        # Wait for heartbeat to process
         await asyncio.sleep(0.05)
         
         # Assertions

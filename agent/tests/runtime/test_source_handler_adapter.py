@@ -114,6 +114,20 @@ class TestSourceHandlerAdapterLifecycle:
         assert mock_driver.closed
         assert adapter._initialized is False
 
+    @pytest.mark.asyncio
+    async def test_initialize_failure(self, adapter, mock_driver):
+        """initialize() should propagate errors from driver initialize/connect."""
+        # Use an object that has initialize method
+        class FailingDriver:
+            id = "failing"
+            async def initialize(self):
+                raise RuntimeError("Access denied")
+        
+        adapter = SourceHandlerAdapter(FailingDriver())
+        with pytest.raises(RuntimeError, match="Access denied"):
+            await adapter.initialize()
+
+
 
 class TestSourceHandlerAdapterSnapshot:
     """Test snapshot iteration."""
@@ -134,6 +148,14 @@ class TestSourceHandlerAdapterSnapshot:
         adapter.get_snapshot_iterator(foo="bar")
         
         mock.get_snapshot_iterator.assert_called_once_with(foo="bar")
+
+    def test_get_snapshot_iterator_failure(self, adapter, mock_driver):
+        """get_snapshot_iterator should propagate errors from driver."""
+        mock_driver.get_snapshot_iterator = MagicMock(side_effect=RuntimeError("Source offline"))
+        
+        with pytest.raises(RuntimeError, match="Source offline"):
+            adapter.get_snapshot_iterator()
+
 
 
 class TestSourceHandlerAdapterMessage:

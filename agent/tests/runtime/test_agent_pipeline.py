@@ -6,36 +6,8 @@ Note: Full lifecycle tests are skipped because they require async task coordinat
 Those tests should be done as integration tests with proper timeouts.
 """
 import pytest
-from typing import Iterator, List, Any, Dict, Tuple
-
 from fustor_core.pipeline import PipelineState
-from fustor_core.pipeline.handler import SourceHandler
-from fustor_core.pipeline.sender import SenderHandler
 from fustor_agent.runtime.agent_pipeline import AgentPipeline
-
-
-from .mocks import MockSourceHandler, MockSenderHandler
-
-
-@pytest.fixture
-def mock_source():
-    return MockSourceHandler()
-
-
-@pytest.fixture
-def mock_sender():
-    return MockSenderHandler()
-
-
-@pytest.fixture
-def pipeline_config():
-    return {
-        "batch_size": 5,
-        "heartbeat_interval_sec": 1,
-        "audit_interval_sec": 0,
-        "sentinel_interval_sec": 0,
-    }
-
 
 @pytest.fixture
 def agent_pipeline(mock_source, mock_sender, pipeline_config):
@@ -46,7 +18,6 @@ def agent_pipeline(mock_source, mock_sender, pipeline_config):
         source_handler=mock_source,
         sender_handler=mock_sender
     )
-
 
 class TestAgentPipelineInit:
     """Test AgentPipeline initialization."""

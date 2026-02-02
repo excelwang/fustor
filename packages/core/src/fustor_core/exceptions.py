@@ -67,6 +67,15 @@ class ValidationError(FustorException):
         super().__init__(detail=detail, context=context)
 
 
+class SessionObsoletedError(FustorException):
+    """Raised when a sync session is no longer valid (e.g., replaced by a newer one)."""
+    status_code = 419
+    
+    def __init__(self, detail: str = "Session is obsolete", context: Optional[Dict[str, Any]] = None):
+        super().__init__(detail=detail, context=context)
+
+
 class TransientSourceBufferFullError(Exception):
+
     """Raised by MemoryEventBus when its buffer is full and the source is transient."""
     pass
