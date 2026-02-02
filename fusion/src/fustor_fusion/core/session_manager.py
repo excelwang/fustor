@@ -234,6 +234,11 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     
                 logger.info(f"Cleared all data for view {view_id} as no sessions remain after removal.")
             
+            # Release leader role and locks via state manager
+            from ..datastore_state_manager import datastore_state_manager
+            await datastore_state_manager.release_leader(view_id, session_id)
+            await datastore_state_manager.unlock_for_session(view_id, session_id)
+            
             return True
 
     async def cleanup_expired_sessions(self):

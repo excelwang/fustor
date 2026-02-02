@@ -97,11 +97,8 @@ class FusionPipeline(Pipeline):
         self._view_handlers: Dict[str, ViewHandler] = {}
         for handler in (view_handlers or []):
             self.register_view_handler(handler)
-        
-        # Session tracking (consolidated via SessionManager in most setups)
-        self._active_sessions: Dict[str, Dict[str, Any]] = {}
-        self._leader_session: Optional[str] = None
-        self._lock = asyncio.Lock()  # Lock for thread-safe session management
+        # Session tracking - handled centrally via PipelineManager/SessionManager
+        self._lock = asyncio.Lock()  # Generic lock for pipeline state
         
         # Processing task
         self._processing_task: Optional[asyncio.Task] = None
@@ -259,23 +256,43 @@ class FusionPipeline(Pipeline):
             session_timeout_seconds=kwargs.get("session_timeout_seconds", 30)
         )
         
+        self.statistics["sessions_created"] += 1
+        
+        # Leader/Follower Election (Architecture V2)
+        from ..datastore_state_manager import datastore_state_manager
+        is_leader = await datastore_state_manager.try_become_leader(self.view_id, session_id)
+        
         # Notify view handlers of session start
         for handler in self._view_handlers.values():
             if hasattr(handler, 'on_session_start'):
                 await handler.on_session_start()
         
-        logger.info(f"Session {session_id} created for view {self.view_id}")
+        logger.info(f"Session {session_id} created for view {self.view_id} (role={'leader' if is_leader else 'follower'})")
     
     async def on_session_closed(self, session_id: str) -> None:
         """
         Handle session closure.
         """
         from ..core.session_manager import session_manager
+        from ..datastore_state_manager import datastore_state_manager
         
         # Remove from central manager
         await session_manager.remove_session(self.view_id, session_id)
         
         self.statistics["sessions_closed"] += 1
+        
+        # New Leader Election (Architecture V2)
+        # If the closed session was the leader, we should trigger a re-election
+        # among the remaining active sessions for this view.
+        remaining_sessions = await session_manager.get_datastore_sessions(self.view_id)
+        if remaining_sessions:
+            current_leader = await datastore_state_manager.get_leader(self.view_id)
+            if not current_leader:
+                # No leader, try to elect from remaining
+                for sid in remaining_sessions.keys():
+                    if await datastore_state_manager.try_become_leader(self.view_id, sid):
+                        logger.info(f"New leader elected for view {self.view_id} after session close: {sid}")
+                        break
         
         # Notify view handlers of session close
         for handler in self._view_handlers.values():
@@ -385,6 +402,7 @@ class FusionPipeline(Pipeline):
             return {
                 "id": self.id,
                 "view_id": self.view_id,
+                "datastore_id": self.view_id, # Backward compatibility
                 "state": self.state.name if hasattr(self.state, 'name') else str(self.state),
                 "info": self.info,
                 "view_handlers": self.get_available_views(),
@@ -433,11 +451,12 @@ class FusionPipeline(Pipeline):
     def leader_session(self) -> Optional[str]:
         """
         Get the current leader session ID.
-        Note: This is async in implementation, so this property might be stale.
-        Prefer calling datastore_state_manager directly.
+        Note: This is now a 'best effort' getter as the source of truth is async.
+        For accurate results, use async get_dto() or datastore_state_manager.
         """
-        # We can't easily do async in property, return None or last known?
-        # For V2, we should probably remove this property from base class or make it a method.
+        # We don't have a sync way to get the leader from the async manager.
+        # But we can check our known sessions to see if any are leader if we really needed to.
+        # For now, we accept it might return None if accessed synchronously.
         return None
     
     def __str__(self) -> str:

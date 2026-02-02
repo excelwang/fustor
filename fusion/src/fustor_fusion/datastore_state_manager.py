@@ -291,6 +291,10 @@ class DatastoreStateManager:
                 return state.leader_session_id
             return None
 
+    async def get_leader(self, datastore_id: str) -> Optional[str]:
+        """Alias for get_leader_session_id to match FusionPipeline expectations."""
+        return await self.get_leader_session_id(datastore_id)
+
     async def clear_state(self, datastore_id: str):
         """
         Purge the runtime state for a given datastore.
