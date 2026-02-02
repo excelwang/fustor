@@ -93,7 +93,8 @@ class AgentPipeline(Pipeline):
         self.heartbeat_interval_sec = config.get("heartbeat_interval_sec", 10) # Seconds between heartbeats
         self.audit_interval_sec = config.get("audit_interval_sec", 600)       # Seconds between audit cycles (0 to disable)
         self.sentinel_interval_sec = config.get("sentinel_interval_sec", 120) # Seconds between sentinel checks (0 to disable)
-        self.batch_size = config.get("batch_size", 100)                     # Events per push
+        self.batch_size = config.get("batch_size", 100)
+        self.iterator_queue_size = config.get("iterator_queue_size", 1000)                     # Events per push
 
         # Timing and backoff configurations (Reliability)
         self.control_loop_interval = config.get("control_loop_interval", 1.0) # Seconds between control loop iterations
@@ -443,12 +444,13 @@ class AgentPipeline(Pipeline):
         else:
             logger.error(f"Pipeline {self.id} fatal background error: {error}", exc_info=True)
             self._set_state(PipelineState.ERROR, str(error))
-    async def _aiter_sync(self, sync_iter: Iterator[Any], queue_size: int = 1000):
+    async def _aiter_sync(self, sync_iter: Iterator[Any], queue_size: Optional[int] = None):
         """
         Safely and efficiently wrap a synchronous iterator into an async generator.
         """
         from .pipeline.worker import aiter_sync_wrapper
-        async for item in aiter_sync_wrapper(sync_iter, self.id, queue_size):
+        q_size = queue_size if queue_size is not None else self.iterator_queue_size
+        async for item in aiter_sync_wrapper(sync_iter, self.id, q_size):
             yield item
 
     def map_batch(self, batch: List[Any]) -> List[Any]:

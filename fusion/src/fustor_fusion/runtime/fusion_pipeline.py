@@ -446,16 +446,24 @@ class FusionPipeline(Pipeline):
                 "queue_size": self._event_queue.qsize(),
             }
     
-    def get_aggregated_stats(self) -> Dict[str, Any]:
+    async def get_aggregated_stats(self) -> Dict[str, Any]:
         """Get aggregated statistics from all view handlers."""
+        pipeline_stats = self.statistics.copy()
+        pipeline_stats["queue_size"] = self._event_queue.qsize()
+        
         stats = {
-            "pipeline": self.statistics.copy(),
+            "pipeline": pipeline_stats,
             "views": {},
         }
         
         for handler_id, handler in self._view_handlers.items():
             if hasattr(handler, 'get_stats'):
-                stats["views"][handler_id] = handler.get_stats()
+                # Handle both sync and async get_stats
+                res = handler.get_stats()
+                if asyncio.iscoroutine(res):
+                    stats["views"][handler_id] = await res
+                else:
+                    stats["views"][handler_id] = res
         
         return stats
         
