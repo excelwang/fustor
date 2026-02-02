@@ -42,7 +42,7 @@ class PipelineInstanceDTO(BaseModel):
 
 class AgentState(BaseModel):
     agent_id: str = Field(..., description="The unique identifier for the agent.")
-    pipeline_tasks: Dict[str, PipelineInstanceDTO] = Field(
+    pipeline s: Dict[str, PipelineInstanceDTO] = Field(
         default_factory=dict, 
         description="A dictionary of all pipeline tasks, keyed by their ID."
     )

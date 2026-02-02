@@ -127,7 +127,7 @@ class App:
             return
 
         bus_states = saved_states.get("event_buses", {})
-        pipeline_states = saved_states.get("pipeline_tasks", {})
+        pipeline_states = saved_states.get("pipeline s", {})
 
         # 1. Recover EventBusInstances first
         recovered_buses: Dict[str, EventBusInstanceRuntime] = {}
@@ -231,7 +231,7 @@ class App:
 
         current_states = {
             "event_buses": {bus['id']: bus for bus in bus_dtos},
-            "pipeline_tasks": {p['id']: p for p in pipeline_dtos},
+            "pipeline s": {p['id']: p for p in pipeline_dtos},
         }
         
         temp_file_path = None

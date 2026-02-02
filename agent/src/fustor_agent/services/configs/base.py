@@ -111,7 +111,7 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
 
         if dependent_pipelines:
             raise ConflictError(
-                f"{self.config_type_capitalized} '{id}' cannot be deleted because it is used by the following sync tasks: {', '.join(dependent_pipelines)}. "
+                f"{self.config_type_capitalized} '{id}' cannot be deleted because it is used by the following pipeline tasks: {', '.join(dependent_pipelines)}. "
                 f"Please delete these tasks first."
             )
 

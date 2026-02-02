@@ -70,7 +70,7 @@ class PipelineConfigServiceInterface(BaseConfigService[PipelineConfig]):
 
     def get_wizard_definition(self) -> Dict[str, Any]:
         """
-        Returns the step definitions for the Pipeline Task configuration wizard.
+        Returns the step definitions for the Pipeline  configuration wizard.
         """
         ...
 

@@ -342,7 +342,7 @@ class AgentPipeline(Pipeline):
         
         try:
             self._snapshot_task = asyncio.current_task()
-            await self._run_message_sync()
+            await self._run_snapshot_sync()
         except SessionObsoletedError:
             raise
         except Exception as e:
@@ -455,10 +455,10 @@ class AgentPipeline(Pipeline):
             logger.info(f"Pipeline {self.id}: Mapping batch of {len(batch)} events")
         return self._mapper.map_batch(batch)
 
-    async def _run_message_sync(self) -> None:
+    async def _run_snapshot_sync(self) -> None:
         """Execute snapshot sync phase."""
-        from .pipeline.phases import run_message_sync
-        await run_message_sync(self)
+        from .pipeline.phases import run_snapshot_sync
+        await run_snapshot_sync(self)
 
     async def _run_message_sync(self) -> None:
         """Execute realtime message sync phase.
