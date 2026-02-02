@@ -111,6 +111,7 @@ class AgentPipeline(Pipeline):
             "events_pushed": 0,
             "last_pushed_event_id": None
         }
+        self.audit_context: Dict[str, Any] = {} # D-05: Incremental audit state (mtime cache)
         self._consecutive_errors = 0
         self._last_heartbeat_at = 0.0  # Time of last successful role update (monotonic)
 

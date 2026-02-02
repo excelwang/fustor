@@ -9,8 +9,8 @@ Based on `refactored-branch-review.md` (2026-02-02).
 - [x] **D-06**: Pass the retrieved `start_position` to `_run_driver_message_sync` (currently hardcoded to `-1`) to enable correct resume behavior in Driver Mode.
 
 ### 2. Fix Incremental Audit (Performance)
-- [ ] **D-05**: Introduce `audit_context` (containing `mtime_cache`) in `AgentPipeline` to persist state across audit cycles.
-- [ ] **U-02**: Update `phases.py` / `run_audit_sync` to correctly handle `(Event, mtime_update)` tuples from Source Driver, ensuring `mtime_cache` is updated even when Event is `None` (Silent Directory).
+- [x] **D-05**: Introduce `audit_context` (containing `mtime_cache`) in `AgentPipeline` to persist state across audit cycles.
+- [x] **U-02**: Update `phases.py` / `run_audit_sync` to correctly handle `(Event, mtime_update)` tuples from Source Driver, ensuring `mtime_cache` is updated even when Event is `None` (Silent Directory).
 
 ## Completed
 - [x] **Consistency**: Add property-based tests for `FSArbitrator` to cover edge cases. <!-- id: 1 -->

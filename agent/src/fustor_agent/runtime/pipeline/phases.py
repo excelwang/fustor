@@ -174,7 +174,7 @@ async def run_audit_sync(pipeline: "AgentPipeline") -> None:
     
     try:
         # Signal start (happens automatically in handler adapter)
-        audit_iter = pipeline.source_handler.get_audit_iterator()
+        audit_iter = pipeline.source_handler.get_audit_iterator(mtime_cache=pipeline.audit_context)
         
         batch = []
         if not hasattr(audit_iter, "__aiter__"):
@@ -188,8 +188,12 @@ async def run_audit_sync(pipeline: "AgentPipeline") -> None:
             # Unpack the tuple: event can be None (for silent dirs), mtime_cache_update is a dict
             if isinstance(item, tuple) and len(item) == 2:
                 event, mtime_cache_update = item
+                # Update cache immediately (D-05/U-02)
+                if mtime_cache_update:
+                    pipeline.audit_context.update(mtime_cache_update)
+                    
                 if event is None:
-                    continue  # Skip None events (used for mtime cache updates only)
+                    continue  # Skip None events (silent dirs)
             else:
                 # Handle case where iterator yields plain events (for other drivers)
                 event = item
