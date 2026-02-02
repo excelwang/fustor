@@ -330,7 +330,7 @@ def leader_session(self) -> Optional[str]:
   - `fusion/src/fustor_fusion/queue_integration.py` ❌ 删除
   - `fusion/src/fustor_fusion/in_memory_queue.py` ❌ 删除
   - `fusion/src/fustor_fusion/processing_manager.py` ❌ 删除
-  - `fusion/src/fustor_fusion/datastore_event_manager.py` ❌ 删除
+  - `fusion/src/fustor_fusion/runtime/datastore_event_manager.py` ❌ 删除
   - 更新 `main.py` 移除所有 Legacy import
 - [ ] **修复 phases.py 批次发送失败处理**: 确保失败时不丢失数据
 - [ ] **datastore_id 废弃警告**: 在 `FusionPipeline.datastore_id` 添加 DeprecationWarning
@@ -446,7 +446,7 @@ Fusion tests: 94 passed
 | `fusion/src/fustor_fusion/in_memory_queue.py` | Legacy 内存队列实现 | 🔴 高 |
 | `fusion/src/fustor_fusion/queue_integration.py` | Legacy 队列适配层 | 🔴 高 |
 | `fusion/src/fustor_fusion/processing_manager.py` | Legacy 处理任务管理 | 🔴 高 |
-| `fusion/src/fustor_fusion/datastore_event_manager.py` | Legacy 事件管理 | 🔴 高 |
+| `fusion/src/fustor_fusion/runtime/datastore_event_manager.py` | Legacy 事件管理 | 🔴 高 |
 
 ### C.2 需要修改的文件
 
@@ -467,7 +467,7 @@ Fusion tests: 94 passed
 rm fusion/src/fustor_fusion/in_memory_queue.py
 rm fusion/src/fustor_fusion/queue_integration.py
 rm fusion/src/fustor_fusion/processing_manager.py
-rm fusion/src/fustor_fusion/datastore_event_manager.py
+rm fusion/src/fustor_fusion/runtime/datastore_event_manager.py
 
 # 2. 更新 main.py 移除 Legacy 引用
 # 3. 运行测试确保无回归
