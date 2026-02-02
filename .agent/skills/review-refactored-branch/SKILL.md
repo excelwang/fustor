@@ -29,4 +29,4 @@ description: 详细评审当前的重构分支与原版分支(master)的差异�
 - Be specific about what needs to change
 - Explain why, not just what
 - Suggest alternatives when possible
-- generate a refactored-branch-review artifact in md format in chinese, the artifact should remember the commit version of master branch and refactor branch, and contain two huge tables, one with 6 columns: "ID", "design item", "item description", "master impl", "refactor impl", "suggestion". the other table is for undocumented functionality in master branch compared to refactor branch with 5 columns: "ID", "functionality", "master impl", "refactor impl", "suggestion"
+- generate a refactored-branch-review artifact in md format in chinese, the artifact should remember the commit version of master branch and refactor branch
