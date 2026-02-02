@@ -45,8 +45,10 @@ class EventFuzzer:
             
             if is_stale:
                 mtime = self.current_time - self.rng.uniform(50.0, 200.0)
+                event_time = mtime + self.rng.uniform(0.1, 1.0) # Report time slightly after mtime
             else:
                 mtime = self.current_time
+                event_time = self.current_time
                 
             row = {
                 "path": path,
@@ -58,7 +60,7 @@ class EventFuzzer:
                 "event_type": evt_type,
                 "rows": [row],
                 "message_source": source,
-                "index": int(self.current_time * 1000) # Agent logical time
+                "index": int(event_time * 1000) # Agent logical time
             }
             events.append(event)
             

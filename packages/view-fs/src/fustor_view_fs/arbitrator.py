@@ -104,10 +104,17 @@ class FSArbitrator:
             # Audit/Snapshot delete logic
             if path in self.state.tombstone_list:
                 self.logger.debug(f"AUDIT_DELETE_BLOCKED_BY_TOMBSTONE for {path}")
-            else:
-                await self.tree_manager.delete_node(path)
-                self.state.blind_spot_deletions.add(path)
-                self.state.blind_spot_additions.discard(path)
+                return
+            
+            existing = self.state.get_node(path)
+            if existing and mtime is not None:
+                if existing.modified_time > mtime:
+                    self.logger.info(f"AUDIT_DELETE_STALE: Ignoring delete for {path} (Memory: {existing.modified_time} > Audit: {mtime})")
+                    return
+
+            await self.tree_manager.delete_node(path)
+            self.state.blind_spot_deletions.add(path)
+            self.state.blind_spot_additions.discard(path)
         self.logger.debug(f"DELETE_DONE for {path}")
 
     async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float):
