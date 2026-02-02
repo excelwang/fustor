@@ -45,7 +45,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          uv run pytest --ignore=it/ -q --tb=short --junit-xml=test-results.xml
+          uv run pytest --ignore=it/ -v --tb=short --junit-xml=test-results.xml
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
@@ -54,23 +54,8 @@ jobs:
           name: test-results
           path: test-results.xml
 
-      - name: Test Summary
-        if: always()
-        run: |
-          echo "## Unit Test Results" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f test-results.xml ]; then
-            # Extract test counts from XML
-            TESTS=$(grep -oP 'tests="\K[0-9]+' test-results.xml | head -1 || echo "?")
-            FAILURES=$(grep -oP 'failures="\K[0-9]+' test-results.xml | head -1 || echo "?")
-            ERRORS=$(grep -oP 'errors="\K[0-9]+' test-results.xml | head -1 || echo "?")
-            echo "- Total: $TESTS tests" >> $GITHUB_STEP_SUMMARY
-            echo "- Failures: $FAILURES" >> $GITHUB_STEP_SUMMARY
-            echo "- Errors: $ERRORS" >> $GITHUB_STEP_SUMMARY
-          fi
-
   lint:
-    name: Lint Check
+    name: Code Quality
     runs-on: ubuntu-latest
     
     steps:
@@ -90,10 +75,13 @@ jobs:
 
       - name: Run ruff check
         run: |
-          uv run ruff check agent/ fusion/ packages/ --output-format=github || true
-        continue-on-error: true
+          uv run ruff check .
 
       - name: Run ruff format check
         run: |
-          uv run ruff format --check agent/ fusion/ packages/ || true
-        continue-on-error: true
+          uv run ruff format --check .
+
+      - name: Run mypy type check
+        run: |
+          # Only check core and SDK packages for now to avoid overwhelming errors in legacy code
+          uv run mypy packages/core/src packages/agent-sdk/src packages/fusion-sdk/src

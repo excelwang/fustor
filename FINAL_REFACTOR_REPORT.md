@@ -50,16 +50,22 @@ The automated refactoring process has been successfully completed for the High P
 - **Result**: Automated conversion to `receivers-config.yaml` and `views-config/*.yaml`.
 
 ### 6. Observability (Medium Priority)
-- **Objective**: Standardize metrics collection.
-- **Action**: Verified unified `Metrics` interface in `fustor_core/common/metrics.py`.
-- **Result**: Core components can now instrument code without coupling to specific backends.
+- **Objective**: Standardize metrics collection across all senders.
+- **Action**: Implemented unified `Metrics` interface and integrated it into the `Sender` base class using a Template Method pattern.
+- **Result**: Automatic instrumentation of throughput and latency for all transport implementations.
 
-## Next Steps
-
-- **Low Priority**:
-    - Improve SDK documentation.
-    - Standardize CI/CD.
+### 7. Documentation & DevOps (Low Priority)
+- **SDK Documentation**: Fully updated `agent-sdk`, `fusion-sdk`, and `core` READMEs with V2 terminology (Pipeline, Sender, etc.) and created a central `docs/README.md`.
+- **CI/CD Standardization**:
+    - Stabilized `.github/workflows/unit-tests.yml` with strict linting (`ruff`) and static typing (`mypy`).
+    - Centralized tool configurations in `pyproject.toml`.
 
 ## Conclusion
 
-The core architecture is now more robust, type-safe, and testable. High and Medium priority refactoring tasks are complete.
+All refactoring tasks identified in the global roadmap have been successfully completed. The system now features:
+1. **Robust Consistency**: Validated Smart Merge and Tombstone protection.
+2. **Modern Architecture**: Clean separation between Sources, Senders, and Pipelines.
+3. **High Reliability**: Fine-grained backoff and retry controls.
+4. **Professional Tooling**: Integrated metrics, standardized logging, and strict quality checks.
+
+The codebase is now in a stable state, ready for the next phase of development or production deployment.

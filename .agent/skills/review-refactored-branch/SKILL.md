@@ -15,6 +15,7 @@ description: 详细评审当前的重构分支与原版分支(master)的差异�
 4. **Performance**: Are there obvious inefficiencies?
 5. **Maintainability**: Is the code easy to understand and maintain?
 6. **Efficiency**: Is the code efficient in terms of time and space complexity? or over-engineered?
+7. is there any log spam? 
 
 ## Step by Step to do the review and make sure you follow the step orders strictly
 

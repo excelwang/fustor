@@ -1,13 +1,18 @@
 # fustor-core
 
-This package contains core components, abstractions, and utilities shared across various Fustor services and plugins within the monorepo. It provides foundational elements such as base classes for drivers, common exceptions, data models, and utility functions.
+This package contains core components, abstractions, and utilities shared across the Fustor ecosystem. It serves as the foundation for both the Agent and Fusion services, as well as all driver extensions.
 
-## Contents
+## Key Components
 
-*   `drivers.py`: Defines abstract base classes (ABCs) for `SourceDriver` and `PusherDriver`, establishing the contract for all data source and data pusher implementations.
-*   `exceptions.py`: Contains custom exception classes used throughout the Fustor ecosystem for consistent error handling.
-*   `models/`: Houses Pydantic models for various data structures, ensuring data validation and serialization.
-*   `utils/`: Provides general utility functions that are commonly used by different Fustor components.
+*   **`pipeline/`**: Core abstractions for the V2 Pipeline architecture (Handlers, Mappers, Context).
+*   **`transport/`**: Protocol-agnostic interfaces for `Sender` and `Receiver`.
+*   **`common/`**:
+    *   `logging_config.py`: Standardized, decoupled logging setup.
+    *   `metrics.py`: Unified metrics interface (Counter, Gauge, Histogram).
+*   **`models/`**: Pydantic models for `PipelineConfig`, `EventBase`, and system states.
+*   **`clock/`**: Logical and Hybrid Clock implementations for data consistency.
+*   **`drivers.py`**: Base classes for `SourceDriver` and `SenderDriver`.
+*   **`exceptions.py`**: Standardized exception hierarchy for Fustor.
 
 ## Installation
 
@@ -15,8 +20,4 @@ This package is part of the Fustor monorepo and is typically installed in editab
 
 ## Usage
 
-Components from `fustor-core` are imported and utilized by other Fustor services (e.g., `agent`, `fusion`) and plugin packages (e.g., `source-mysql`, `pusher-fusion`) to ensure consistency and reusability.
-
-## Note on Package Structure
-
-It has been observed that the `__init__.py` file is missing from the `fustor_core` package directory (`packages/core/src/fustor_core/`). While the package's contents are still accessible, this is an unconventional Python package structure and might lead to issues with package discovery or imports in certain environments. It is recommended to add an empty `__init__.py` file to this directory.
+`fustor-core` is the dependency root for almost all other packages in the monorepo. It ensures that different plugins (Sources/Senders) and core services (Agent/Fusion) speak the same language and follow the same architectural patterns.

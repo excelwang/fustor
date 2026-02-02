@@ -15,5 +15,5 @@ Based on `refactored-branch-review.md`.
 
 ## Low Priority (Documentation/DevOps)
 
-- [ ] **Architecture**: Improve SDK documentation. <!-- id: 6 -->
-- [ ] **Packages**: Standardize CI/CD workflows. <!-- id: 7 -->
+- [x] **Architecture**: Improve SDK documentation. <!-- id: 6 -->
+- [x] **Packages**: Standardize CI/CD workflows. <!-- id: 7 -->
