@@ -20,7 +20,7 @@ When reviewing changes code, follow these steps:
 
 ## How to use it
 
-1. 请深入理解一下变更代码；
+1. 请使用git diff命令深入理解一下变更代码；
 2. 这些更改是由一个新手程序员开发的，请帮忙指出其开发的缺陷和修正建议（在尽量优雅的同时注意不要过度设计），梳理成完整的、具体的todo事项清单和开发建议。
 
 
