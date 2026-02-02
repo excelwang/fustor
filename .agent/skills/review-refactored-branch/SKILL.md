@@ -1,5 +1,5 @@
 ---
-name: refactor-review-skill
+name: review-refactor-skill
 description: 详细评审当前的重构分支与原版分支(master)的差异，并给出评审报告和改进建议
 ---
 

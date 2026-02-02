@@ -1,5 +1,5 @@
 ---
-name: refactored-test-review-skill
+name: review-refactored-test-skill
 description: 详细评审当前分支的测试代码，并给出评审报告和改进建议
 ---
 

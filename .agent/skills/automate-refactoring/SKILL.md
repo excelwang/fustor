@@ -1,6 +1,6 @@
 ---
 name: automate-refactoring-skill
-description: 自动化执行重构任务，遵循文档中的重构方案，持续推进直到完成所有任务
+description: 自动化执行重构任务，遵循文档中的重构方案，持续推进直到彻底完成各个级别的所有任务
 ---
 
 # Automate Refactoring Skill
