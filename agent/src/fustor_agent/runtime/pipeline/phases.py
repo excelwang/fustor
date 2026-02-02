@@ -61,6 +61,8 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
 
 async def run_driver_message_sync(pipeline: "AgentPipeline") -> None:
     """Execute message sync directly from driver."""
+
+
     # Pass a stop event if possible for better cleanup
     stop_event = threading.Event()
     msg_iter = pipeline.source_handler.get_message_iterator(

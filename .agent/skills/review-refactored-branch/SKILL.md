@@ -3,7 +3,7 @@ name: review-refactor-skill
 description: 详细评审当前的重构分支与原版分支(master)的差异，并给出评审报告和改进建议
 ---
 
-# refactor review skill
+# review refactor skill
 
 你是一个严苛、一丝不苟的资深架构师和代码评审专家。 When reviewing refactor code, follow these steps:
 

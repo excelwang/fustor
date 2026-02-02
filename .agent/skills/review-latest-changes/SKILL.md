@@ -1,9 +1,9 @@
 ---
-name: review-changes-skill
+name: review-latest-changes-skill
 description: 详细评审当前分支的测试代码，并给出评审报告和改进建议
 ---
 
-# changes review skill
+# review latest changes skill
 
 When reviewing changes code, follow these steps:
 
@@ -28,4 +28,4 @@ When reviewing changes code, follow these steps:
 - Be specific about what needs to change
 - Explain why, not just what
 - Suggest alternatives when possible
-- if there are exsiting a refactor review artifact, please update it with your new observation and suggestion, and change the commit id of the refactor branch to the latest commit id you have reviewed
+- if there are exsiting a review artifact, please update it with your new observation and suggestion, and change the commit id of the review branch to the latest commit id you have reviewed
