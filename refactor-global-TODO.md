@@ -10,7 +10,7 @@ Based on `refactored-branch-review.md`.
 
 ## Medium Priority
 
-- [ ] **Configuration**: Create migration guide/script for old `datastores-config.yaml`. <!-- id: 4 -->
+- [x] **Configuration**: Create migration guide/script for old `datastores-config.yaml`. <!-- id: 4 -->
 - [x] **Observability**: Add unified Metrics interface in `fustor-core`. <!-- id: 5 -->
 
 ## Low Priority (Documentation/DevOps)
