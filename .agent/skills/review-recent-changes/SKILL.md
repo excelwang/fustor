@@ -1,9 +1,9 @@
 ---
-name: review-latest-changes-skill
+name: review-recent-changes-skill
 description: 详细评审当前分支的测试代码，并给出评审报告和改进建议
 ---
 
-# review latest changes skill
+# review recent changes skill
 
 When reviewing changes code, follow these steps:
 
