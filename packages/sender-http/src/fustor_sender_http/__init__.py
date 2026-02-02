@@ -135,7 +135,7 @@ class HTTPSender(Sender):
                 return {"success": False, "error": "Push failed"}
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 419:
-                raise SessionObsoletedError(f"Session {self.session_id} is obeselete (419)")
+                raise SessionObsoletedError(f"Session {self.session_id} is obsolete (419)")
             self.logger.error(f"[{source_type}] Failed to send {len(events)} events: {e}")
             return {"success": False, "error": f"Push failed: {e}"}
         except Exception as e:
@@ -164,7 +164,7 @@ class HTTPSender(Sender):
                 return {"status": "error", "message": "Heartbeat failed"}
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 419:
-                raise SessionObsoletedError(f"Session {self.session_id} is obeselete (419)")
+                raise SessionObsoletedError(f"Session {self.session_id} is obsolete (419)")
             self.logger.error(f"Failed to send heartbeat: {e}")
             return {"status": "error", "message": f"Heartbeat failed: {e}"}
     

@@ -25,9 +25,9 @@ from .constants import (
     CONTAINER_CLIENT_C, 
     MOUNT_POINT, 
     AUDIT_INTERVAL,
-    SENTINEL_INTERVAL
+    SENTINEL_INTERVAL,
+    FUSION_ENDPOINT
 )
-
 
 
 
@@ -42,7 +42,7 @@ def ensure_agent_running(container_name, api_key, datastore_id, mount_point=MOUN
         datastore_id: Datastore ID for the sync
         mount_point: Path to the NFS mount point
     """
-    fusion_endpoint = "http://fustor-fusion:8102"
+    fusion_endpoint = FUSION_ENDPOINT
     
     # Generate unique agent ID
     agent_id = f"{container_name.replace('fustor-nfs-', '')}-{os.urandom(2).hex()}"

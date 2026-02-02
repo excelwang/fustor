@@ -13,6 +13,11 @@ CONTAINER_FUSION = "fustor-fusion"
 # Shared mount point
 MOUNT_POINT = "/mnt/shared"
 
+# Fusion API connection
+FUSION_PORT = 8102
+FUSION_HOST = "fustor-fusion"
+FUSION_ENDPOINT = f"http://{FUSION_HOST}:{FUSION_PORT}"
+
 # Test timing configurations
 AUDIT_INTERVAL = 5  # seconds
 SENTINEL_INTERVAL = 1  # seconds

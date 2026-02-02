@@ -191,10 +191,12 @@ async def end_session(
     success = await session_manager.terminate_session(datastore_id, session_id)
     
     if not success:
-        raise HTTPException(
-            status_code=419,  # Session Obsoleted
-            detail=f"Session {session_id} not found"
-        )
+        # Session labels as "not found" but the goal of ending it is achieved
+        logger.info(f"Session {session_id} not found or already terminated. Treating as success.")
+        return {
+            "status": "ok",
+            "message": f"Session {session_id} already terminated"
+        }
     
     await datastore_state_manager.unlock_for_session(datastore_id, session_id)
     await datastore_state_manager.release_leader(datastore_id, session_id)

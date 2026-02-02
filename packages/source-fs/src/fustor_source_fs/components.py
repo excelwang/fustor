@@ -141,9 +141,11 @@ class _WatchManager:
     def _ensure_inotify(self):
         """Ensure inotify instance is created and valid."""
         if self.inotify is None:
-            # Directly use the low-level Inotify class
-            # We watch the root path non-recursively just to initialize the instance.
-            self.inotify = Inotify(safe_path_encode(self.root_path), recursive=False)
+            with self._lock:
+                if self.inotify is None:
+                    # Directly use the low-level Inotify class
+                    # We watch the root path non-recursively just to initialize the instance.
+                    self.inotify = Inotify(safe_path_encode(self.root_path), recursive=False)
 
     def _get_current_time(self) -> float:
         """Returns the current time (Agent physical time)."""
@@ -385,8 +387,12 @@ class _WatchManager:
             logger.info("WatchManager: Inotify event thread started.")
 
     def stop(self):
-        logger.info("WatchManager: Stopping inotify event thread.")
-        self._stop_event.set()
+        with self._lock:
+            logger.info("WatchManager: Stopping inotify event thread.")
+            self._stop_event.set()
+            # We don't join here to avoid potential deadlock with the event processing loop 
+            # if it's waiting for a lock we're holding.
+            # The daemon status ensures it will be cleaned up if the main process exits.
         self.inotify.close()  # This will interrupt the blocking read_events() call
         if self.inotify_thread.is_alive():
             self.inotify_thread.join(timeout=5.0)
