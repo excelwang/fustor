@@ -2,7 +2,8 @@
 
 > 评审日期: 2026-02-02  
 > 评审分支: `refactor/architecture-v2`  
-> 对比基准: `master`
+> 对比基准: `master`  
+> 最新评审提交: `345e19b`
 
 ---
 
@@ -13,6 +14,56 @@
 **代码质量**: ⭐⭐⭐⭐☆ (4/5) - 结构清晰，但存在一些可改进之处
 
 **测试覆盖**: ⭐⭐⭐⭐⭐ (5/5) - 136个运行时测试全部通过
+
+---
+
+## 🆕 最新提交评审 (345e19b)
+
+### 提交概述
+`feat: Implement agent pipeline synchronization phases with sync-to-async iterator wrapper and update session ID types.`
+
+### ✅ 已解决的问题
+
+| 原问题 | 状态 | 说明 |
+|--------|------|------|
+| AgentPipeline 文件过大 (803行) | ✅ 已修复 | 拆分为 phases.py (214行) + worker.py (66行) |
+| `_aiter_sync` 线程泄漏 | ✅ 已修复 | worker.py 添加 `thread.join(timeout=0.5)` |
+| view_id 术语迁移 | 🔄 进行中 | SessionManager 已开始迁移 |
+
+### 🐛 新发现的 Bug
+
+#### 🔴 P0 - 严重: session_manager.py 变量名不一致
+
+**问题**: 重命名 `datastore_id` → `view_id` 时，部分位置遗漏未改。
+
+**影响**: 运行时会抛出 `NameError: name 'datastore_id' is not defined`
+
+**位置**:
+```
+fusion/src/fustor_fusion/core/session_manager.py:
+  - 第80行: _schedule_session_cleanup(datastore_id, ...) 应为 view_id
+  - 第128行: if (datastore_id in self._sessions ...) 应为 view_id
+  - 第129行: session_id in self._sessions[datastore_id] 应为 view_id
+  - 第131行: self._sessions[datastore_id][session_id] 应为 view_id
+```
+
+#### 🟡 P1 - 中等: 缺少 `__init__.py`
+
+**位置**: `agent/src/fustor_agent/runtime/pipeline/`
+
+**问题**: 新创建的子包缺少 `__init__.py`，虽然隐式命名空间包可工作，但不符合项目一致性。
+
+#### 🟡 P1 - 中等: phases.py 异常处理不一致
+
+**位置**: `phases.py:14-49` (`run_snapshot_sync`)
+
+**问题**: 该函数没有 `try/except CancelledError` 保护，与其他阶段函数不一致。
+
+#### 🟢 P2 - 轻微: 中文注释错误
+
+**位置**: `session_manager.py:61`
+
+**问题**: `更新现有会话的活跃时间并重置其清理任务任务。` - "任务"重复
 
 ---
 
@@ -119,34 +170,25 @@ warnings.warn(
 
 ---
 
-### 3. 【中优先级】AgentPipeline 文件过大
+### 3. ✅ 【已解决】AgentPipeline 文件过大
 
-**问题描述**: `agent/src/fustor_agent/runtime/agent_pipeline.py` 有 803 行代码，职责过多。
+> **状态**: 在 Commit 345e19b 中已解决
 
-**当前职责**:
-1. Session 生命周期管理
-2. Snapshot/Message/Audit 同步
-3. Heartbeat 管理
-4. 错误恢复与重连
-5. EventBus 集成
-6. 角色切换 (Leader/Follower)
+**原问题**: `agent/src/fustor_agent/runtime/agent_pipeline.py` 有 803 行代码，职责过多。
 
-**建议拆分**:
+**解决方案**: 拆分为:
 ```
 agent/src/fustor_agent/runtime/
-├── agent_pipeline.py          # 主协调器 (~200行)
-├── pipeline_phases/
-│   ├── snapshot.py            # Snapshot 同步逻辑
-│   ├── message.py             # Message 同步逻辑
-│   └── audit.py               # Audit 同步逻辑
-├── heartbeat.py               # Heartbeat 管理
-└── error_recovery.py          # 错误恢复策略
+├── agent_pipeline.py          # 主协调器 (~550行)
+├── pipeline/
+│   ├── phases.py              # 各同步阶段逻辑 (214行)
+│   └── worker.py              # 异步迭代器包装器 (66行)
 ```
 
 **TODO清单**:
-- [ ] 将 `_run_snapshot_sync` 抽取到独立模块
-- [ ] 将 `_run_message_sync` 和 `_run_bus_message_sync` 抽取
-- [ ] 将 `_run_audit_loop` 和 `_run_sentinel_loop` 抽取
+- [x] 将 `_run_snapshot_sync` 抽取到独立模块
+- [x] 将 `_run_message_sync` 和 `_run_bus_message_sync` 抽取
+- [x] 将 `_run_audit_loop` 和 `_run_sentinel_loop` 抽取
 
 ---
 
@@ -218,39 +260,25 @@ def setup_pipe_v2_routers():
 
 ---
 
-### 7. 【低优先级】_aiter_sync 可能存在内存泄漏
+### 7. ✅ 【已解决】_aiter_sync 可能存在内存泄漏
 
-**问题描述**: `AgentPipeline._aiter_sync` 中的生产者线程在某些边缘情况下可能不会正确终止。
+> **状态**: 在 Commit 345e19b 中已解决
 
-**问题代码** (agent_pipeline.py:394-436):
+**原问题**: `AgentPipeline._aiter_sync` 中的生产者线程在某些边缘情况下可能不会正确终止。
+
+**解决方案**: 将逻辑移至 `pipeline/worker.py`，并添加线程清理:
 ```python
-async def _aiter_sync(self, sync_iter: Iterator[Any], queue_size: int = 1000):
-    ...
-    thread = threading.Thread(target=_producer, name=f"PipelineSource-Producer-{self.id}", daemon=True)
-    thread.start()
-    
-    try:
-        while True:
-            item = await queue.get()
-            ...
-    finally:
-        stop_event.set()
-        # 注意: 线程不会被 join，可能导致资源未释放
-```
-
-**建议修复**:
-```python
+# worker.py:58-65
 finally:
     stop_event.set()
-    # Give thread a chance to exit gracefully
-    thread.join(timeout=1.0)
+    thread.join(timeout=0.5)
     if thread.is_alive():
-        logger.warning(f"Producer thread {thread.name} did not exit cleanly")
+        logger.warning(f"Producer thread {thread.name} did not terminate within timeout")
 ```
 
 **TODO清单**:
-- [ ] 添加线程 join 以确保资源释放
-- [ ] 添加超时处理避免阻塞
+- [x] 添加线程 join 以确保资源释放
+- [x] 添加超时处理避免阻塞
 
 ---
 
@@ -299,22 +327,25 @@ RUNNING ──────► ERROR ──────────────�
 
 ## 📋 完整 TODO 清单
 
-### 高优先级 (P0)
+### 🔴 高优先级 (P0)
 
-1. [ ] 统一 `datastore_id` → `view_id` 术语迁移
-2. [ ] 废弃 `datastores-config.yaml`，完成配置迁移
-3. [ ] 确保 V2 API 路由在正确时机初始化
+1. [ ] **[NEW BUG]** 修复 session_manager.py 变量名不一致 (datastore_id vs view_id)
+2. [ ] 统一 `datastore_id` → `view_id` 术语迁移 (进行中)
+3. [ ] 废弃 `datastores-config.yaml`，完成配置迁移
+4. [ ] 确保 V2 API 路由在正确时机初始化
 
-### 中优先级 (P1)
+### 🟡 中优先级 (P1)
 
-4. [ ] 拆分 `AgentPipeline` 为多个模块 (500行以内)
-5. [ ] 统一 Session 管理逻辑
-6. [ ] 完善 HTTPReceiver 回调注册
+5. [x] ~~拆分 `AgentPipeline` 为多个模块~~ (345e19b)
+6. [ ] 统一 Session 管理逻辑
+7. [ ] 完善 HTTPReceiver 回调注册
+8. [ ] 添加 `__init__.py` 到 `agent/.../runtime/pipeline/`
+9. [ ] 修复 phases.py `run_snapshot_sync` 异常处理不一致
 
-### 低优先级 (P2)
+### 🟢 低优先级 (P2)
 
-7. [ ] 修复 `_aiter_sync` 线程资源释放
-8. [ ] 完成 schema-fs 包测试
+10. [x] ~~修复 `_aiter_sync` 线程资源释放~~ (345e19b)
+11. [ ] 完成 schema-fs 包测试
 9. [ ] 添加 Pipeline 状态机文档
 10. [ ] 清理 pusher 术语残留 (在兼容期结束后)
 
