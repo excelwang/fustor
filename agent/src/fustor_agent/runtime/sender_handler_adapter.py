@@ -201,6 +201,23 @@ class SenderHandlerAdapter(SenderHandler):
             logger.warning(f"Error closing session {session_id}: {e}")
             return False
     
+    async def get_latest_committed_index(self, session_id: str) -> int:
+        """
+        Get the latest committed event index from Fusion.
+        
+        Delegates to the underlying Sender's get_latest_committed_index method.
+        """
+        if hasattr(self._sender, "get_latest_committed_index"):
+            return await self._sender.get_latest_committed_index(session_id)
+        
+        # Fallback for senders that don't support resume (safest default is 0 or -1?)
+        # 0 means "start from beginning" which might cause duplication.
+        # -1 means "start from now" which might cause loss.
+        # Given D-04 concerns data integrity, we should default to 0 (replay is safer than loss) 
+        # or error out if critical. But for now, 0 seems appropriate default if not supported.
+        logger.warning(f"Sender {self.id} does not support get_latest_committed_index. Defaulting to 0.")
+        return 0
+
     async def test_connection(self, **kwargs) -> Tuple[bool, str]:
         """Test connectivity by attempting to connect."""
         try:

@@ -81,6 +81,9 @@ class MockSenderHandler(SenderHandler):
         self.session_created = False
         self.session_closed = True
         return True
+    
+    async def get_latest_committed_index(self, session_id: str) -> int:
+        return 0
 
     def reset(self):
         """Reset all call counters and storage."""

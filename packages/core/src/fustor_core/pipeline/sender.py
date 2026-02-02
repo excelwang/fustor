@@ -93,6 +93,19 @@ class SenderHandler(Handler):
             True if closed successfully
         """
         raise NotImplementedError
+
+    @abstractmethod
+    async def get_latest_committed_index(self, session_id: str) -> int:
+        """
+        Get the latest committed event index from Fusion.
+        
+        Args:
+            session_id: The session identifier
+            
+        Returns:
+            The latest confirmed event index (or 0 if none)
+        """
+        raise NotImplementedError
     
     async def test_connection(self, **kwargs) -> Tuple[bool, str]:
         """

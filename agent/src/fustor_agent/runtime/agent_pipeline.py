@@ -267,6 +267,20 @@ class AgentPipeline(Pipeline):
                             session_timeout_seconds=self.session_timeout_seconds
                         )
                         await self.on_session_created(session_id, **metadata)
+                        
+                        # D-04: Restore Resume Capability
+                        # Query Fusion for the last committed index to ensure we resume from where we left off
+                        try:
+                            committed_index = await self.sender_handler.get_latest_committed_index(session_id)
+                            current_stats_index = self.statistics.get("last_pushed_event_id")
+                            
+                            # Only update if we don't have a newer local value (unlikely on fresh start, but safe)
+                            if current_stats_index is None or committed_index > current_stats_index:
+                                self.statistics["last_pushed_event_id"] = committed_index
+                                logger.info(f"Pipeline {self.id}: Resumed from committed index {committed_index}")
+                        except Exception as e:
+                            logger.warning(f"Pipeline {self.id}: Failed to fetch committed index: {e}. Defaulting to 0/Latest.")
+
                     except Exception as e:
                         raise RuntimeError(f"Session creation failed: {e}")
 
@@ -458,11 +472,12 @@ class AgentPipeline(Pipeline):
         logger.info(f"Pipeline {self.id}: Starting message sync")
         
         # Try to setup EventBus for high-throughput mode
+        # Determine start position for resume (D-04/D-06)
+        start_position = self.statistics.get("last_pushed_event_id", 0) or 0
+        
+        # Try to setup EventBus for high-throughput mode
         if self._bus_service and not self._bus:
             try:
-                # Get the last committed position from Fusion
-                start_position = self.statistics.get("last_pushed_event_id", 0) or 0
-                
                 self._bus, position_lost = await self._bus_service.get_or_create_bus_for_subscriber(
                     source_id=self.config.get("source"),
                     source_config=self.source_handler.config,
@@ -485,17 +500,17 @@ class AgentPipeline(Pipeline):
         if self._bus:
             await self._run_bus_message_sync()
         else:
-            await self._run_driver_message_sync()
+            await self._run_driver_message_sync(start_position)
 
     async def _run_bus_message_sync(self) -> None:
         """Execute message sync reading from an internal event bus."""
         from .pipeline.phases import run_bus_message_sync
         await run_bus_message_sync(self)
 
-    async def _run_driver_message_sync(self) -> None:
+    async def _run_driver_message_sync(self, start_position: int = -1) -> None:
         """Execute message sync directly from driver."""
         from .pipeline.phases import run_driver_message_sync
-        await run_driver_message_sync(self)
+        await run_driver_message_sync(self, start_position)
 
     async def _run_audit_loop(self) -> None:
         """Periodically run audit sync."""
