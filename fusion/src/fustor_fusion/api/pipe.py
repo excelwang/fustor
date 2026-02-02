@@ -58,6 +58,40 @@ def setup_pipe_routers():
     # Consistency router is common for both or handles its own delegation
     pipe_router.include_router(consistency_router)
     
+    # Add unified session listing for IT tests
+    @pipe_router.get("/session/", tags=["Pipeline"])
+    async def list_active_sessions():
+        """
+        List all active sessions across all view_ids.
+        Mainly for integration tests and monitoring.
+        """
+        from ..core.session_manager import session_manager
+        from ..datastore_state_manager import datastore_state_manager
+        
+        all_sessions = []
+        # session_manager has all sessions bridged from pipelines
+        # We iterate over all view_ids that have sessions
+        # In a real system we'd query pipeline_manager but bridge is easier for now.
+        
+        # Get all managed view_ids from datastore_state_manager or similar
+        # For simplicity, session_manager.get_all_sessions() returns EVERYTHING.
+        # Wait, does it have get_all_sessions()?
+        
+        # Let's check session_manager.py
+        sessions_by_view = await session_manager.get_all_active_sessions()
+        for view_id, sessions in sessions_by_view.items():
+            for sid, si in sessions.items():
+                is_leader = await datastore_state_manager.is_leader(view_id, sid)
+                all_sessions.append({
+                    "session_id": sid,
+                    "task_id": si.task_id,
+                    "agent_id": si.task_id, # IT tests expect agent_id
+                    "view_id": view_id,
+                    "role": "leader" if is_leader else "follower"
+                })
+        
+        return {"active_sessions": all_sessions, "count": len(all_sessions)}
+
     return success
 
 # NOTE: We no longer mount routers here at module level.

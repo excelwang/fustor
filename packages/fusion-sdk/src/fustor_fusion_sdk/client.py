@@ -139,7 +139,7 @@ class FusionClient:
                 "source_type": sanitized_source_type,
                 "is_snapshot_end": is_snapshot_end
             }
-            response = await self.client.post(f"{self._events_path}/", json=payload)
+            response = await self.client.post(f"{self._events_path}/{session_id}/events", json=payload)
             response.raise_for_status()
             return True
         except httpx.HTTPStatusError as e:
@@ -157,8 +157,7 @@ class FusionClient:
         Returns the response dict if successful, None otherwise.
         """
         try:
-            headers = {"session-id": session_id}
-            response = await self.client.post(f"{self._session_path}/heartbeat", headers=headers)
+            response = await self.client.post(f"{self._session_path}/{session_id}/heartbeat")
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as e:

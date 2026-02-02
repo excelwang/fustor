@@ -87,7 +87,23 @@ driver_params:
 """
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/test-fs.yaml", view_config)
     
-    # 4. Reload Fusion
+    # 4. Inject Fusion Pipeline Config (V2 binding)
+    pipeline_config = f"""
+id: "integration-test-ds"
+receiver: "http-main"
+views:
+  - "test-fs"
+enabled: true
+session_timeout_seconds: {SESSION_TIMEOUT}
+allow_concurrent_push: true
+extra:
+  view_id: "integration-test-ds"
+"""
+    docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/fusion-pipes-config"])
+    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/fusion-pipes-config/integration-test-ds.yaml", pipeline_config)
+
+    # 5. Reload Fusion
+
     docker_manager.restart_container(CONTAINER_FUSION)
     docker_manager.wait_for_health(CONTAINER_FUSION)
     

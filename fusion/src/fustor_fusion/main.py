@@ -37,13 +37,15 @@ async def lifespan(app: FastAPI):
     from .runtime.pipeline_manager import pipeline_manager as pm
     runtime_objects.pipeline_manager = pm
     
-    # NEW: Setup Pipeline API routers after pipeline_manager is available
+    # NEW: Initialize pipelines and receivers first (so they are available for router setup)
+    await pm.initialize_pipelines()
+    
+    # NEW: Setup Pipeline API routers after pipeline_manager/receivers are available
     from .api.pipe import setup_pipe_routers
     setup_pipe_routers()
     
-    # Initialize pipelines (Async)
-    await pm.initialize_pipelines()
     await pm.start()
+
 
     # Perform initial configuration load and start processors
     try:

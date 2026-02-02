@@ -194,6 +194,12 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         view_id = str(view_id)
         async with self._lock:
             return self._sessions.get(view_id, {}).copy()
+
+    async def get_all_active_sessions(self) -> Dict[str, Dict[str, SessionInfo]]:
+        """获取所有活跃的session信息，返回 {view_id: {session_id: SessionInfo}}"""
+        async with self._lock:
+            # We need to deep copy the outter dict and shallow copy the inner dicts
+            return {vid: s.copy() for vid, s in self._sessions.items()}
     
     async def remove_session(self, view_id: str, session_id: str) -> bool:
         """
