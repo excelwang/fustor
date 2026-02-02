@@ -59,6 +59,11 @@ config:
 - Rename `syncs-config/` to `agent-pipes-config/`.
 - Update config files to use `pipeline_id` instead of `sync_id`.
 - Ensure `sender` references a valid entries in `senders-config.yaml`.
+- [Optional] Tune reliability parameters:
+  ```yaml
+  request_timeout_seconds: 30
+  max_retries: 5
+  ```
 
 ### 3. Migrate `pushers-config.yaml`
 
