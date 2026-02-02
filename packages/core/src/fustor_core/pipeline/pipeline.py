@@ -28,9 +28,9 @@ class PipelineState(IntFlag):
     PAUSED = auto()
     ERROR = auto()
     CONF_OUTDATED = auto()  # Configuration has changed, needs restart
-    SNAPSHOT_PHASE = auto()  # Currently in snapshot sync phase
+    SNAPSHOT_PHASE = auto()  # Currently in snapshot phase phase
     MESSAGE_PHASE = auto()   # Currently in message/realtime sync phase
-    AUDIT_PHASE = auto()     # Currently in audit sync phase
+    AUDIT_PHASE = auto()     # Currently in audit phase phase
     RECONNECTING = auto()    # Currently attempting to reconnect
     DRAINING = auto()        # Draining queues before stopping
     STOPPING = auto()        # Gracefully stopping

@@ -207,7 +207,7 @@ async def test_same_task_id_with_concurrent_push():
 @pytest.mark.asyncio
 async def test_stale_lock_handling():
     """
-    Test the handling of stale locks where datastore is locked by a session not in session manager
+    Test the handling of stale locks where view is locked by a session not in session manager
     """
     await session_manager.cleanup_expired_sessions()
     view_state_manager._states.clear()

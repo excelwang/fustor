@@ -42,7 +42,7 @@ class ServiceManager:
             f.write(f"FUSTOR_HOME={self.env_dir}\n")
             f.write(f"FUSTOR_LOG_LEVEL=DEBUG\n")
         
-        # V2: Inject Receivers Config for Fusion (replacing datastores-config)
+        # V2: Inject Receivers Config for Fusion (replacing views-config)
         self.api_key = "bench-api-key-123456"
         receivers_config = {
             "receivers": {
@@ -66,7 +66,7 @@ class ServiceManager:
         os.makedirs(os.path.join(self.env_dir, "views-config"), exist_ok=True)
         view_config = {
             "bench-view": {
-                "datastore_id": 1,
+                "view_id": 1,
                 "driver": "fs",
                 "disabled": False,
                 "driver_params": {"uri": "/tmp/bench-view"}
@@ -252,23 +252,23 @@ class ServiceManager:
             time.sleep(0.5)
         return None
 
-    def trigger_agent_audit(self, sync_id="bench-pipe"):
+    def trigger_agent_audit(self, pipeline_id="bench-pipe"):
         """Triggers audit for a sync instance via Agent API."""
-        url = f"http://localhost:{self.agent_port}/api/instances/syncs/{sync_id}/_actions/trigger_audit"
+        url = f"http://localhost:{self.agent_port}/api/instances/pipelines/{pipeline_id}/_actions/trigger_audit"
         res = requests.post(url)
         res.raise_for_status()
         return res.json()
 
-    def trigger_agent_sentinel(self, sync_id="bench-pipe"):
+    def trigger_agent_sentinel(self, pipeline_id="bench-pipe"):
         """Triggers sentinel for a sync instance via Agent API."""
-        url = f"http://localhost:{self.agent_port}/api/instances/syncs/{sync_id}/_actions/trigger_sentinel"
+        url = f"http://localhost:{self.agent_port}/api/instances/pipelines/{pipeline_id}/_actions/trigger_sentinel"
         res = requests.post(url)
         res.raise_for_status()
         return res.json()
 
-    def wait_for_leader(self, sync_id="bench-pipe", timeout=30, start_offset=0):
-        click.echo(f"Waiting for {sync_id} to become LEADER...")
-        pattern = rf"Assigned LEADER role for {sync_id}"
+    def wait_for_leader(self, pipeline_id="bench-pipe", timeout=30, start_offset=0):
+        click.echo(f"Waiting for {pipeline_id} to become LEADER...")
+        pattern = rf"Assigned LEADER role for {pipeline_id}"
         return self.wait_for_log(self.get_agent_log_path(), pattern, start_offset=start_offset, timeout=timeout)
 
     def stop_agent(self):

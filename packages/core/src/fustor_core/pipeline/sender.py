@@ -38,7 +38,7 @@ class SenderHandler(Handler):
         Create a new session with the Fusion endpoint.
         
         Args:
-            task_id: Unique identifier for the sync task
+            task_id: Unique identifier for the pipeline task
             source_type: Type of source (e.g., "fs", "mysql")
             session_timeout_seconds: Session timeout value
             **kwargs: Additional session parameters

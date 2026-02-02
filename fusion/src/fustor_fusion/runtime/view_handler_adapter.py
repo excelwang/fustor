@@ -31,7 +31,7 @@ class ViewDriverAdapter(ViewHandler):
         
         driver = FSViewDriver(
             view_id="fs-view",
-            datastore_id="1",
+            view_id="1",
             config={"mode": "live"}
         )
         handler = ViewDriverAdapter(driver)

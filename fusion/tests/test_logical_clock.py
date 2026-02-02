@@ -81,7 +81,8 @@ class TestLogicalClockThreadSafety:
         def worker(start_value: int, count: int):
             try:
                 for i in range(count):
-                    clock.update(start_value + i)
+                    val = start_value + i
+                    clock.update(val, agent_time=val + 100.0)
             except Exception as e:
                 errors.append(e)
         

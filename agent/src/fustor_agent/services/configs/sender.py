@@ -2,7 +2,7 @@
 """
 Sender Configuration Service.
 
-This is the new naming for what was previously called "Pusher Config Service".
+Sender configuration service.
 The term "sender" aligns with the V2 architecture terminology.
 """
 import logging
@@ -22,7 +22,7 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
     Manages the lifecycle of SenderConfig objects.
     
     Senders are responsible for transmitting events from Agent to Fusion.
-    This replaces the deprecated "PusherConfigService" terminology.
+    Sender configuration service.
     """
     
     def __init__(self, app_config: AppConfig):

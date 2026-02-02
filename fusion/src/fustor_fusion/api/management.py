@@ -92,7 +92,7 @@ async def stop_view(view_id: str):
     Stop a view by ID.
     
     1. Unregister view from ViewManager
-    2. If no other views for this datastore, terminate sessions
+    2. If no other views for this view group, terminate sessions
     3. Return should_shutdown if no views left at all
     """
     from ..runtime_objects import view_managers
@@ -121,7 +121,7 @@ async def stop_view(view_id: str):
     except Exception as e:
         logger.error(f"Error stopping view {view_id}: {e}", exc_info=True)
     
-    # Check if other views exist for this datastore
+    # Check if other views exist for this view group
     remaining_views = len(vm.providers)
     
     if remaining_views == 0:

@@ -23,7 +23,7 @@ from .services.instances.pipeline import PipelineInstanceService
 from .services.drivers.source_driver import SourceDriverService
 from .services.drivers.sender_driver import SenderDriverService
 
-from fustor_core.models.states import SyncState, EventBusState
+from fustor_core.models.states import PipelineState, EventBusState
 
 class App:
     """
@@ -127,7 +127,7 @@ class App:
             return
 
         bus_states = saved_states.get("event_buses", {})
-        pipeline_states = saved_states.get("sync_tasks", saved_states.get("pipeline_tasks", {}))
+        pipeline_states = saved_states.get("pipeline_tasks", {})
 
         # 1. Recover EventBusInstances first
         recovered_buses: Dict[str, EventBusInstanceRuntime] = {}
@@ -172,15 +172,15 @@ class App:
             
             state_str = pipeline_state_data.get("state", "STOPPED")
             state_parts = [part.strip() for part in state_str.split('|')]
-            state = SyncState(0)
+            state = PipelineState(0)
             for part in state_parts:
                 try:
-                    state |= SyncState[part.split('.')[-1]]
+                    state |= PipelineState[part.split('.')[-1]]
                 except KeyError:
                     self.logger.warning(f"Unknown state part: {part}")
             persisted_bus_id = pipeline_state_data.get("bus_id")
 
-            if state in {SyncState.MESSAGE_SYNC,SyncState.RUNNING_CONF_OUTDATE, SyncState.STOPPING}:
+            if state in {PipelineState.MESSAGE_SYNC, PipelineState.RUNNING_CONF_OUTDATE, PipelineState.STOPPING}:
                 self.logger.warning(f"Pipeline task '{pipeline_id}' was active on last shutdown. Recovering...")
                 
                 # Define async closure to capture pipeline_id
@@ -232,7 +232,6 @@ class App:
         current_states = {
             "event_buses": {bus['id']: bus for bus in bus_dtos},
             "pipeline_tasks": {p['id']: p for p in pipeline_dtos},
-            "sync_tasks": {p['id']: p for p in pipeline_dtos}, # Compatibility
         }
         
         temp_file_path = None

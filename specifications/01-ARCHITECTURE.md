@@ -520,7 +520,7 @@ Agent 收到响应后，设置心跳间隔为 `timeout_seconds / 2`。
 | (新增) | → `fustor-sender-grpc` | 新增 |
 | (抽取) | → `fustor-receiver-http` | 抽取 |
 | (新增) | → `fustor-receiver-grpc` | 新增 |
-| `datastores-config.yaml` | (废弃) | 废弃 |
+| `views-config.yaml` | (废弃) | 废弃 |
 
 ---
 

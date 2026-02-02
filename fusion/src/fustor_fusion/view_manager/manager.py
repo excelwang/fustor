@@ -60,26 +60,25 @@ class ViewManager:
     based on event type or content.
     """
     
-    def __init__(self, datastore_id: str = None, view_id: str = None):
+    def __init__(self, view_id: str):
         self.providers: Dict[str, ViewDriver] = {}
         self.logger = logging.getLogger(__name__)
-        self.view_id = view_id or datastore_id
-        self.datastore_id = self.view_id
+        self.view_id = view_id
     
     async def initialize_providers(self):
         """Initialize view providers by loading them from entry points."""
-        if not self.datastore_id:
+        if not self.view_id:
             return
             
-        self.logger.info(f"Initializing view providers for datastore {self.datastore_id}")
+        self.logger.info(f"Initializing view providers for view {self.view_id}")
         
         available_drivers = _load_view_drivers()
         
         # Try loading from views_config loader
-        view_configs = views_config.get_by_datastore(self.datastore_id)
+        view_configs = views_config.get_by_view(self.view_id)
         
         if view_configs:
-            self.logger.info(f"Using view configuration for datastore {self.datastore_id}: {[v.id for v in view_configs]}")
+            self.logger.info(f"Using view configuration for view {self.view_id}: {[v.id for v in view_configs]}")
             for config in view_configs:
                 view_name = config.id
                 driver_type = config.driver
@@ -123,11 +122,11 @@ class ViewManager:
                          )
                          await provider.initialize()
                          self.providers[schema] = provider
-                         self.logger.info(f"Initialized ViewDriver '{schema}' for datastore {self.datastore_id}")
+                         self.logger.info(f"Initialized ViewDriver '{schema}' for view {self.view_id}")
                      except Exception as e:
                          self.logger.error(f"Failed to initialize ViewDriver '{schema}': {e}", exc_info=True)
             else:
-                 self.logger.info(f"Fusion config active but no views configured for datastore {self.datastore_id}")
+                 self.logger.info(f"Fusion config active but no views configured for view {self.view_id}")
 
 
     
@@ -230,43 +229,43 @@ class ViewManager:
                          
         return aggregated
 
-async def reset_views(datastore_id: str) -> bool:
+async def reset_views(view_id: str) -> bool:
     """
-    Reset all views by clearing cached manager and data for a specific datastore.
+    Reset all views by clearing cached manager and data for a specific view.
     """
-    ds_id_str = str(datastore_id)
-    logger.info(f"Resetting views for datastore {ds_id_str}")
+    v_id_str = str(view_id)
+    logger.info(f"Resetting views for view {v_id_str}")
     try:
         async with _cache_lock:
-            if ds_id_str in _view_manager_cache:
-                del _view_manager_cache[ds_id_str]
+            if v_id_str in _view_manager_cache:
+                del _view_manager_cache[v_id_str]
         
-        # await memory_event_queue.clear_datastore_data(ds_id_str)
+        # await memory_event_queue.clear_view_data(v_id_str)
         return True
     except Exception as e:
-        logger.error(f"Failed to reset views for datastore {ds_id_str}: {e}", exc_info=True)
+        logger.error(f"Failed to reset views for view {v_id_str}: {e}", exc_info=True)
         return False
 
 
 
 
-async def get_cached_view_manager(datastore_id: str) -> 'ViewManager':
+async def get_cached_view_manager(view_id: str) -> 'ViewManager':
     """
-    Gets a cached ViewManager for a given datastore_id.
+    Gets a cached ViewManager for a given view_id.
     If not in cache, it creates, initializes, and caches one.
     """
-    ds_id_str = str(datastore_id)
-    if ds_id_str in _view_manager_cache:
-        return _view_manager_cache[ds_id_str]
+    v_id_str = str(view_id)
+    if v_id_str in _view_manager_cache:
+        return _view_manager_cache[v_id_str]
 
     async with _cache_lock:
-        if ds_id_str in _view_manager_cache:
-            return _view_manager_cache[ds_id_str]
+        if v_id_str in _view_manager_cache:
+            return _view_manager_cache[v_id_str]
         
-        logger.info(f"Creating new view manager for datastore {ds_id_str}")
-        new_manager = ViewManager(datastore_id=ds_id_str)
+        logger.info(f"Creating new view manager for view {v_id_str}")
+        new_manager = ViewManager(view_id=v_id_str)
         await new_manager.initialize_providers()
-        _view_manager_cache[ds_id_str] = new_manager
+        _view_manager_cache[v_id_str] = new_manager
         return new_manager
 
 
@@ -276,26 +275,26 @@ async def cleanup_all_expired_suspects():
         try:
             await manager.cleanup_expired_suspects()
         except Exception as e:
-            logger.error(f"Error during suspect cleanup for datastore {manager.datastore_id}: {e}")
+            logger.error(f"Error during suspect cleanup for view {manager.view_id}: {e}")
 
 
 # --- Public Interface for Processing events ---
 
-async def process_event(event: EventBase, datastore_id: str) -> Dict[str, bool]:
+async def process_event(event: EventBase, view_id: str) -> Dict[str, bool]:
     """Process a single event with all available view providers"""
-    manager = await get_cached_view_manager(datastore_id)
+    manager = await get_cached_view_manager(view_id)
     return await manager.process_event(event)
 
 
-async def on_session_start(datastore_id: str):
+async def on_session_start(view_id: str):
     """Notify view providers that a new session has started."""
-    manager = await get_cached_view_manager(datastore_id)
+    manager = await get_cached_view_manager(view_id)
     await manager.on_session_start()
 
 
-async def on_session_close(datastore_id: str):
+async def on_session_close(view_id: str):
     """Notify view providers that a session has closed for cleanup."""
-    ds_id_str = str(datastore_id)
-    if ds_id_str in _view_manager_cache:
-        manager = _view_manager_cache[ds_id_str]
+    v_id_str = str(view_id)
+    if v_id_str in _view_manager_cache:
+        manager = _view_manager_cache[v_id_str]
         await manager.on_session_close()

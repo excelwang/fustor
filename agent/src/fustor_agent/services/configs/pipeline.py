@@ -6,14 +6,14 @@ from fustor_agent.services.instances.pipeline import PipelineInstanceService
 from .base import BaseConfigService
 from .source import SourceConfigService
 from .sender import SenderConfigService
-from fustor_agent_sdk.interfaces import SyncConfigServiceInterface # Import the interface
+from fustor_agent_sdk.interfaces import PipelineConfigServiceInterface # Import the interface
 from fustor_agent.config.pipelines import pipelines_config, AgentPipelineConfig # New YAML loader
 
 logger = logging.getLogger("fustor_agent")
 
-class PipelineConfigService(BaseConfigService[PipelineConfig], SyncConfigServiceInterface): # Inherit from the interface
+class PipelineConfigService(BaseConfigService[PipelineConfig], PipelineConfigServiceInterface): # Inherit from the interface
     """
-    Manages PipelineConfig objects, supporting both legacy AppConfig and new YAML config files.
+    Manages PipelineConfig objects, supporting both AppConfig and new YAML config files.
     """
     def __init__(
         self,
@@ -168,4 +168,4 @@ class PipelineConfigService(BaseConfigService[PipelineConfig], SyncConfigService
         }
 
 # Backward compatibility alias
-SyncConfigService = PipelineConfigService
+PipelineConfigService = PipelineConfigService

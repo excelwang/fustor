@@ -33,20 +33,13 @@ class AgentPipelineConfig(BaseModel):
     heartbeat_interval_sec: int = 10
     
 
-    @model_validator(mode='before')
-    @classmethod
-    def handle_pusher_alias(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            # Map legacy 'pusher' to new 'sender'
-            if 'pusher' in data and not data.get('sender'):
-                data['sender'] = data.pop('pusher')
-        return data
+
 
     @field_validator('sender')
     @classmethod
     def validate_sender(cls, v: Optional[str]) -> str:
         if v is None:
-            raise ValueError("Field 'sender' (formerly 'pusher') is required")
+            raise ValueError("Field 'sender' is required")
         return v
     
     @field_validator('id')
@@ -59,8 +52,7 @@ class AgentPipelineConfig(BaseModel):
         return v
 
 
-# Backward compatibility alias
-SyncConfigYaml = AgentPipelineConfig
+
 
 
 
@@ -76,7 +68,7 @@ class PipelinesConfigLoader:
     ```
     
     Backward compatibility:
-    Falls back to 'syncs-config/' if 'agent-pipes-config/' does not exist.
+    None.
     """
     
     def __init__(self, config_dir: Optional[Path] = None):
@@ -84,11 +76,6 @@ class PipelinesConfigLoader:
             home = get_fustor_home_dir()
             config_dir = home / "agent-pipes-config"
             
-            # Fallback to legacy syncs-config directory
-            if not config_dir.exists() and (home / "syncs-config").exists():
-                logger.info(f"Using legacy 'syncs-config' directory as '{config_dir}' not found.")
-                config_dir = home / "syncs-config"
-                
         self.dir = Path(config_dir)
         self._pipelines: Dict[str, AgentPipelineConfig] = {}
         self._loaded = False
@@ -153,10 +140,5 @@ class PipelinesConfigLoader:
         return self.scan()
 
 
-# Backward compatibility aliases
-SyncsConfigLoader = PipelinesConfigLoader
-
-
 # Global instance
 pipelines_config = PipelinesConfigLoader()
-syncs_config = pipelines_config

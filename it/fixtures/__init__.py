@@ -18,7 +18,7 @@ if str(_it_dir) not in sys.path:
     sys.path.insert(0, str(_it_dir))
 
 from fixtures.docker import docker_env, clean_shared_dir
-from fixtures.fusion import fusion_client, test_api_key, test_datastore
+from fixtures.fusion import fusion_client, test_api_key, test_view
 from fixtures.agents import setup_agents
 from fixtures.leadership import reset_leadership, wait_for_audit
 
@@ -29,7 +29,7 @@ __all__ = [
     # Fusion
     "fusion_client", 
     "test_api_key",
-    "test_datastore",
+    "test_view",
     # Agents
     "setup_agents",
     # Leadership

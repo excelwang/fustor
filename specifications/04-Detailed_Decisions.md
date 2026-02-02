@@ -48,7 +48,7 @@
 |---|------|---------|
 | 5.1 | 一个 **API Key** 可以访问多个 **Fusion Pipeline** 吗？ | A) 1:1（每个 Key 固定一个 Pipeline）<br>B) 1:N（一个 Key 可访问多个 Pipeline） |
 | 5.2 | 如果 5.1 是 1:N，如何在请求中指定目标 Pipeline？ | A) URL 路径中<br>B) 请求头中<br>C) 请求体中 |
-| 5.3 | 废弃 Datastore 后，原来的 `datastore_id` 概念如何映射？ | A) 用 pipeline_id 替代<br>B) 用 view_id 替代<br>C) 用 receiver_id 替代 |
+| 5.3 | 废弃 View 后，原来的 `view_id` 概念如何映射？ | A) 用 pipeline_id 替代<br>B) 用 view_id 替代<br>C) 用 receiver_id 替代 |
 
 ---
 
@@ -62,7 +62,7 @@
 | 6.4 | **Tombstone 列表** | View 级别 | ？ |
 | 6.5 | **审计跳过优化**（parent mtime 未变则跳过） | Source 级别 | ？ |
 | 6.6 | **热文件检测**（hot_file_threshold） | View 级别 | ？ |
-| 6.7 | **断点续传**（从 latest_index 恢复） | Datastore 级别 | ？移到 Session？ |
+| 6.7 | **断点续传**（从 latest_index 恢复） | View 级别 | ？移到 Session？ |
 
 ---
 
@@ -84,7 +84,7 @@
 |---|------|---------|
 | 8.1 | Agent 的 `syncs-config/` 重命名为 `pipelines-config/`？ | 确认 |
 | 8.2 | Agent 的 [pushers-config.yaml](cci:7://file:///home/huajin/fustor_monorepo/examples/yaml-config/pushers-config.yaml:0:0-0:0) 重命名为 `senders-config.yaml`？ | 确认 |
-| 8.3 | Fusion 废弃 [datastores-config.yaml](cci:7://file:///home/huajin/fustor_monorepo/examples/yaml-config/datastores-config.yaml:0:0-0:0)？ | 确认 |
+| 8.3 | Fusion 废弃 [views-config.yaml](cci:7://file:///home/huajin/fustor_monorepo/examples/yaml-config/views-config.yaml:0:0-0:0)？ | 确认 |
 | 8.4 | Fusion 新增 `receivers-config.yaml`？ | 确认 |
 | 8.5 | Fusion 新增 `pipelines-config/`？ | 确认 |
 
@@ -117,7 +117,7 @@
 1. **2.1 / 2.2 / 2.3**: Receiver → Pipeline → View 的关系基数
 2. **3.2**: Leader/Follower 是否保留
 3. **3.3 / 3.4**: LogicalClock 和审计周期的层级
-4. **5.3**: datastore_id 的替代策略
+4. **5.3**: view_id 的替代策略
 5. **6.x**: 现有一致性功能是否全部保留
 6. **7.4 / 7.5**: 仲裁器和一致性状态是 FS 特有还是通用
 
@@ -182,7 +182,7 @@
 │                                                                                      │
 │   API Key 是 Transport 级别 (Receiver 持有)                                           │
 │   Pipeline 与 Receiver 的对应关系在配置文件中                                          │
-│   用 view_id 替代 datastore_id                                                       │
+│   用 view_id 替代 view_id                                                       │
 │                                                                                      │
 │   ───────────────────────────────────────────────────────────────────────────────── │
 │                                                                                      │
@@ -245,7 +245,7 @@
 |---|------|---------|
 | 5.1 | API Key 访问范围 | **B) Transport 级别，1:N** |
 | 5.2 | Pipeline 路由方式 | **配置文件中定义，不在消息中** |
-| 5.3 | datastore_id 替代 | **用 view_id 替代** |
+| 5.3 | view_id 替代 | **用 view_id 替代** |
 
 ## 现有功能保留
 
@@ -262,7 +262,7 @@
 |------|-------|--------|
 | Sender/Receiver | `senders-config.yaml` | `receivers-config.yaml` |
 | Pipeline | `agent-pipes-config/` | `fusion-pipes-config/` |
-| datastores-config | - | **(废弃)** |
+| views-config | - | **(废弃)** |
 
 ## API 路径
 

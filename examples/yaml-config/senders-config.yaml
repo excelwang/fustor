@@ -9,7 +9,7 @@ fusion-main:
   credential:
     key: fk_example_api_key_replace_me
   driver_params:
-    datastore_id: 1
+    view_id: 1
     batch_size: 100
     timeout_sec: 30
 
@@ -20,4 +20,4 @@ fusion-backup:
   credential:
     key: fk_backup_api_key_replace_me
   driver_params:
-    datastore_id: 2
+    view_id: 2

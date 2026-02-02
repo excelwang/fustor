@@ -1,9 +1,5 @@
-# agent/src/fustor_agent/runtime/agent_pipeline.py
 """
-Agent Pipeline implementation.
-
 AgentPipeline orchestrates the flow: Source -> Sender
-This is the V2 architecture replacement for SyncInstance.
 """
 import asyncio
 import logging
@@ -33,12 +29,12 @@ class AgentPipeline(Pipeline):
     
     Orchestrates the data flow from Source to Sender:
     1. Session lifecycle management with Fusion
-    2. Snapshot sync phase
-    3. Realtime message sync phase
+    2. Snapshot phase phase
+    3. Realtime message phase phase
     4. Periodic audit and sentinel checks
     5. Heartbeat and role management (Leader/Follower)
     
-    This is designed to eventually replace SyncInstance.
+    This is the core pipeline implementation.
     """
     
 
@@ -59,7 +55,7 @@ class AgentPipeline(Pipeline):
         
         Args:
             pipeline_id: Unique identifier for this pipeline
-            task_id: Full task identifier (agent_id:sync_id)
+            task_id: Full task identifier (agent_id:pipeline_id)
             config: Pipeline configuration
             source_handler: Handler for reading source data
             sender_handler: Handler for sending data to Fusion
@@ -250,8 +246,8 @@ class AgentPipeline(Pipeline):
         
         State machine:
         1. Wait for LEADER role
-        2. Run snapshot sync (SNAPSHOT_PHASE)
-        3. Start message sync (MESSAGE_PHASE)
+        2. Run snapshot phase (SNAPSHOT_PHASE)
+        3. Start message phase (MESSAGE_PHASE)
         4. Handle role changes
         """
         self._set_state(PipelineState.RUNNING, "Waiting for role assignment...")
@@ -339,10 +335,10 @@ class AgentPipeline(Pipeline):
     
     async def _run_leader_sequence(self) -> None:
         """
-        Run the leader sequence: Snapshot -> Message Sync + Audit/Sentinel loops.
+        Run the leader sequence: Snapshot -> Message Phase + Audit/Sentinel loops.
         """
-        # Phase 1: Snapshot sync
-        self._set_state(PipelineState.RUNNING | PipelineState.SNAPSHOT_PHASE, "Starting snapshot sync...")
+        # Phase 1: Snapshot phase
+        self._set_state(PipelineState.RUNNING | PipelineState.SNAPSHOT_PHASE, "Starting snapshot phase...")
         
         try:
             self._snapshot_task = asyncio.current_task()
@@ -350,13 +346,13 @@ class AgentPipeline(Pipeline):
         except SessionObsoletedError:
             raise
         except Exception as e:
-            self._set_state(PipelineState.ERROR, f"Snapshot sync failed: {e}")
+            self._set_state(PipelineState.ERROR, f"Snapshot phase failed: {e}")
             return
         finally:
             self._snapshot_task = None
         
-        # Phase 2: Message sync + background tasks
-        self._set_state(PipelineState.RUNNING | PipelineState.MESSAGE_PHASE, "Starting message sync...")
+        # Phase 2: Message phase + background tasks
+        self._set_state(PipelineState.RUNNING | PipelineState.MESSAGE_PHASE, "Starting message phase...")
         
         # Start audit and sentinel loops
         if self.audit_interval_sec > 0:
@@ -364,9 +360,9 @@ class AgentPipeline(Pipeline):
         if self.sentinel_interval_sec > 0:
             self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
         
-        # Run message sync (this blocks until we lose leader role)
+        # Run message phase (this blocks until we lose leader role)
         try:
-            # We wrap message sync in a task so it can be cancelled by role change
+            # We wrap message phase in a task so it can be cancelled by role change
             self._message_sync_task = asyncio.create_task(self._run_message_sync())
             await self._message_sync_task
         except asyncio.CancelledError:
@@ -376,7 +372,7 @@ class AgentPipeline(Pipeline):
                     await self._message_sync_task
                 except asyncio.CancelledError:
                     pass
-            logger.info(f"Pipeline {self.id}: Message sync task cancelled")
+            logger.info(f"Pipeline {self.id}: Message phase task cancelled")
         finally:
             self._message_sync_task = None
     
@@ -438,7 +434,7 @@ class AgentPipeline(Pipeline):
                 await self._cleanup_leader_tasks()
                 await self.on_session_closed(self.session_id)
             
-            # Explicitly cancel message sync task to break leader sequence if active
+            # Explicitly cancel message phase task to break leader sequence if active
             if self._message_sync_task and not self._message_sync_task.done():
                 self._message_sync_task.cancel()
         else:
@@ -460,19 +456,19 @@ class AgentPipeline(Pipeline):
         return self._mapper.map_batch(batch)
 
     async def _run_snapshot_sync(self) -> None:
-        """Execute snapshot synchronization."""
+        """Execute snapshot phasehronization."""
         from .pipeline.phases import run_snapshot_sync
         await run_snapshot_sync(self)
 
     async def _run_message_sync(self) -> None:
-        """Execute realtime message synchronization.
+        """Execute realtime message phasehronization.
         
         This method implements the Master-style high-throughput pattern:
         1. If bus_service is available, dynamically create/reuse EventBus
         2. If position is lost, trigger supplemental snapshot
         3. Fall back to direct driver mode if no bus_service
         """
-        logger.info(f"Pipeline {self.id}: Starting message sync")
+        logger.info(f"Pipeline {self.id}: Starting message phase")
         
         # Try to setup EventBus for high-throughput mode
         # Determine start position for resume (D-04/D-06)
@@ -506,17 +502,17 @@ class AgentPipeline(Pipeline):
             await self._run_driver_message_sync(start_position)
 
     async def _run_bus_message_sync(self) -> None:
-        """Execute message sync reading from an internal event bus."""
+        """Execute message phase reading from an internal event bus."""
         from .pipeline.phases import run_bus_message_sync
         await run_bus_message_sync(self)
 
     async def _run_driver_message_sync(self, start_position: int = -1) -> None:
-        """Execute message sync directly from driver."""
+        """Execute message phase directly from driver."""
         from .pipeline.phases import run_driver_message_sync
         await run_driver_message_sync(self, start_position)
 
     async def _run_audit_loop(self) -> None:
-        """Periodically run audit sync."""
+        """Periodically run audit phase."""
         while self.is_running():
             # Check role at start of loop
             if self.current_role != "leader":
@@ -545,7 +541,7 @@ class AgentPipeline(Pipeline):
                 await asyncio.sleep(backoff)
     
     async def _run_audit_sync(self) -> None:
-        """Execute audit synchronization."""
+        """Execute audit phasehronization."""
         from .pipeline.phases import run_audit_sync
         await run_audit_sync(self)
     
@@ -621,13 +617,13 @@ class AgentPipeline(Pipeline):
                 f"(old_bus={old_bus_id}, new_bus={new_bus.id}). "
                 f"Will trigger resync."
             )
-            # Cancel current message sync task - it will be restarted
+            # Cancel current message phase task - it will be restarted
             if self._message_sync_task and not self._message_sync_task.done():
                 self._message_sync_task.cancel()
             
             # Signal that we should trigger a resync via control loop
             # The RECONNECTING state will cause the control loop to 
-            # recreate session and restart sync phases
+            # recreate session and restart pipeline phases
             self._set_state(
                 PipelineState.RUNNING | PipelineState.RECONNECTING, 
                 f"Bus remap with position loss - triggering resync"
@@ -645,31 +641,28 @@ class AgentPipeline(Pipeline):
 
 
     def get_dto(self) -> PipelineInstanceDTO:
-        """Get pipeline data transfer object compatible with PipelineInstanceDTO."""
-        # Map PipelineState to legacy-compatible states internally if needed, 
-        # but here we just use PipelineState (which is an alias for SyncState anyway)
+        """Get pipeline data transfer object representation."""
+        from fustor_core.models.states import PipelineState as TaskState
         
-        from fustor_core.models.states import SyncState
-        state = SyncState.STOPPED
+        state = TaskState.STOPPED
         if self.state & PipelineState.SNAPSHOT_PHASE:
-            state |= SyncState.SNAPSHOT_SYNC
+            state |= TaskState.SNAPSHOT_SYNC
         elif self.state & PipelineState.MESSAGE_PHASE:
-            state |= SyncState.MESSAGE_SYNC
+            state |= TaskState.MESSAGE_SYNC
         elif self.state & PipelineState.AUDIT_PHASE:
-            state |= SyncState.AUDIT_SYNC
+            state |= TaskState.AUDIT_SYNC
         
         if self.state & PipelineState.CONF_OUTDATED:
-            state |= SyncState.RUNNING_CONF_OUTDATE
+            state |= TaskState.RUNNING_CONF_OUTDATE
         
         if self.state & PipelineState.ERROR:
-            state |= SyncState.ERROR
+            state |= TaskState.ERROR
         
         if self.state & PipelineState.RECONNECTING:
-            state |= SyncState.RECONNECTING
+            state |= TaskState.RECONNECTING
 
-        # If it's running but no specific phase is set, mark it as starting or broadly running
-        if self.state & PipelineState.RUNNING and state == SyncState.STOPPED:
-            state = SyncState.STARTING
+        if self.state & PipelineState.RUNNING and state == TaskState.STOPPED:
+            state = TaskState.STARTING
 
         return PipelineInstanceDTO(
             id=self.id,

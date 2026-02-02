@@ -31,10 +31,10 @@ def view_config_file(tmp_path):
     config_dir = tmp_path / "views"
     config_dir.mkdir()
     
-    view_id = "test_view"
+    view_unit_id = "test_view"
     view_config = {
-        "id": view_id,
-        "datastore_id": "1",
+        "id": view_unit_id,
+        "view_id": "1",
         "driver": "fs",
         "disabled": False,
         "driver_params": {
@@ -42,7 +42,7 @@ def view_config_file(tmp_path):
         }
     }
     
-    config_file = config_dir / f"{view_id}.yaml"
+    config_file = config_dir / f"{view_unit_id}.yaml"
     with open(config_file, "w") as f:
         yaml.dump(view_config, f)
         
@@ -52,7 +52,7 @@ def view_config_file(tmp_path):
     views_config.dir = Path(config_dir)
     views_config.reload()
     
-    yield view_id
+    yield view_unit_id
     
     # Restore
     views_config.dir = original_dir
@@ -69,7 +69,8 @@ async def test_view_api_start_stop_lifecycle(client, view_config_file):
     5. Stop view
     6. Verify stopped
     """
-    view_id = view_config_file
+    view_unit_id = view_config_file
+    view_group_id = "1"
     
     # 1. Initial State
     resp = await client.get("/api/v1/management/views")
@@ -82,36 +83,37 @@ async def test_view_api_start_stop_lifecycle(client, view_config_file):
         MockProviderClass = MagicMock(return_value=MockProvider)
         mock_load.return_value = MockProviderClass
         
-        resp = await client.post(f"/api/v1/management/views/{view_id}/start")
+        resp = await client.post(f"/api/v1/management/views/{view_unit_id}/start")
         assert resp.status_code == 200
         assert resp.json()["status"] == "started"
         
         # 3. Verify Running
         resp = await client.get("/api/v1/management/views")
         # Management API returns string keys for JSON compatibility
-        assert "1" in resp.json()["running_views"]
-        assert view_id in resp.json()["running_views"]["1"]
+        running_views = resp.json()["running_views"]
+        assert view_group_id in running_views
+        assert view_unit_id in running_views[view_group_id]
         
         # 4. Idempotency
-        resp = await client.post(f"/api/v1/management/views/{view_id}/start")
+        resp = await client.post(f"/api/v1/management/views/{view_unit_id}/start")
         assert resp.status_code == 200
         assert resp.json()["status"] == "already_running"
         
         # 5. Stop View
-        resp = await client.post(f"/api/v1/management/views/{view_id}/stop")
+        resp = await client.post(f"/api/v1/management/views/{view_unit_id}/stop")
         assert resp.status_code == 200
         assert resp.json()["status"] == "stopped"
         
         # 6. Verify Stopped
         resp = await client.get("/api/v1/management/views")
         running_views = resp.json()["running_views"]
-        assert "1" not in running_views or view_id not in running_views["1"]
+        assert view_group_id not in running_views or view_unit_id not in running_views[view_group_id]
 
 @pytest.mark.asyncio
 async def test_view_stop_terminates_session(client, view_config_file):
-    """Stopping the last view of a datastore should terminate its sessions."""
-    view_id = view_config_file
-    datastore_id = "1" # Use STRING here to match Fusion's config-based routing
+    """Stopping the last view of a view should terminate its sessions."""
+    view_unit_id = view_config_file
+    view_group_id = "1"
     
     with patch("fustor_fusion_sdk.loaders.load_view") as mock_load:
         MockProvider = AsyncMock()
@@ -120,21 +122,21 @@ async def test_view_stop_terminates_session(client, view_config_file):
         mock_load.return_value = MockProviderClass
         
         # Start view
-        await client.post(f"/api/v1/management/views/{view_id}/start")
+        await client.post(f"/api/v1/management/views/{view_unit_id}/start")
         
-        # Manually create a session for this datastore
+        # Manually create a session for this view
         session_id = str(os.urandom(8).hex())
         await session_manager.create_session_entry(
-            view_id=datastore_id,
+            view_id=view_group_id,
             session_id=session_id,
             task_id="test-task",
             client_ip="127.0.0.1"
         )
-        assert await session_manager.get_session_info(datastore_id, session_id) is not None
+        assert await session_manager.get_session_info(view_group_id, session_id) is not None
         
         # Stop view
-        resp = await client.post(f"/api/v1/management/views/{view_id}/stop")
+        resp = await client.post(f"/api/v1/management/views/{view_unit_id}/stop")
         assert resp.status_code == 200
         
         # Verify session is terminated
-        assert await session_manager.get_session_info(datastore_id, session_id) is None
+        assert await session_manager.get_session_info(view_group_id, session_id) is None

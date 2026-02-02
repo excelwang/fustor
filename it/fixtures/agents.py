@@ -164,18 +164,18 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     else:
         raise RuntimeError("Agent A did not become leader within 30 seconds")
 
-    # Wait for Datastore to be READY (Snapshot complete)
-    logger.info("Waiting for Datastore to be ready (initial snapshot completion)...")
+    # Wait for View to be READY (Snapshot complete)
+    logger.info("Waiting for View to be ready (initial snapshot completion)...")
     start_ready = time.time()
     while time.time() - start_ready < 30:
         try:
             fusion_client.get_stats()
-            logger.info("Datastore is READY.")
+            logger.info("View is READY.")
             break
         except Exception:
             time.sleep(0.5)
     else:
-        logger.warning("Datastore readiness check timed out. Proceeding anyway.")
+        logger.warning("View readiness check timed out. Proceeding anyway.")
 
     # Start Agent B as Follower
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_B}...")

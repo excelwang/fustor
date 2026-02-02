@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, AsyncMock
 import yaml
 
 from fustor_agent.app import App
-from fustor_core.models.config import SenderConfig, SyncConfig, PasswdCredential, FieldMapping, SourceConfig
+from fustor_core.models.config import SenderConfig, PipelineConfig, PasswdCredential, FieldMapping, SourceConfig
 from fustor_core.event import EventBase, InsertEvent
 
 @pytest.fixture(scope="function")
@@ -78,7 +78,7 @@ async def snapshot_phase_test_setup(test_app_instance: App, mocker):
         driver="mock-driver", uri="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
     ))
     
-    await test_app_instance.sync_config_service.add_config(sync_id, SyncConfig(
+    await test_app_instance.sync_config_service.add_config(sync_id, PipelineConfig(
         source=source_id,
         sender=pusher_id,
         disabled=False,
@@ -144,7 +144,7 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
         driver="mock-driver", uri="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
     ))
 
-    await test_app_instance.sync_config_service.add_config(sync_id, SyncConfig(
+    await test_app_instance.sync_config_service.add_config(sync_id, PipelineConfig(
         source=source_id,
         sender=pusher_id,
         disabled=False,

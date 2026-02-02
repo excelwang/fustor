@@ -9,8 +9,7 @@ from typing import Any, Dict
 
 from fustor_agent.runtime import (
     PipelineBridge,
-    create_pipeline_from_sync_config,
-    should_use_pipeline,
+    create_pipeline_from_config,
     AgentPipeline,
 )
 
@@ -56,10 +55,10 @@ def mock_source_driver_service():
 
 
 @pytest.fixture
-def mock_sync_config():
+def mock_pipeline_config():
     config = MagicMock()
     config.source = "my-source"
-    config.pusher = "my-sender"
+    config.sender = "my-sender"
     config.batch_size = 50
     config.heartbeat_interval_sec = 5
     config.audit_interval_sec = 300
@@ -81,7 +80,7 @@ def mock_sender_config():
     config = MagicMock()
     config.driver = "http"
     config.endpoint = "http://fusion:8000"
-    config.datastore_id = 1
+    config.view_id = "1"
     config.credential = MagicMock()
     config.credential.api_key = "test-key"
     config.credential.secret = "test-secret"
@@ -114,29 +113,29 @@ class TestPipelineBridgeCreatePipeline:
     """Test PipelineBridge.create_pipeline."""
     
     def test_create_pipeline_returns_agent_pipeline(
-        self, pipeline_bridge, mock_sync_config, mock_source_config, mock_sender_config
+        self, pipeline_bridge, mock_pipeline_config, mock_source_config, mock_sender_config
     ):
         """create_pipeline should return AgentPipeline instance."""
         pipeline = pipeline_bridge.create_pipeline(
-            pipeline_id="test-sync",
+            pipeline_id="test-pipeline",
             agent_id="agent-1",
-            sync_config=mock_sync_config,
+            pipeline_config=mock_pipeline_config,
             source_config=mock_source_config,
             sender_config=mock_sender_config
         )
         
         assert isinstance(pipeline, AgentPipeline)
-        assert pipeline.id == "test-sync"
-        assert pipeline.task_id == "agent-1:test-sync"
+        assert pipeline.id == "test-pipeline"
+        assert pipeline.task_id == "agent-1:test-pipeline"
     
     def test_pipeline_has_handlers(
-        self, pipeline_bridge, mock_sync_config, mock_source_config, mock_sender_config
+        self, pipeline_bridge, mock_pipeline_config, mock_source_config, mock_sender_config
     ):
         """Pipeline should have source and sender handlers."""
         pipeline = pipeline_bridge.create_pipeline(
-            pipeline_id="test-sync",
+            pipeline_id="test-pipeline",
             agent_id="agent-1",
-            sync_config=mock_sync_config,
+            pipeline_config=mock_pipeline_config,
             source_config=mock_source_config,
             sender_config=mock_sender_config
         )
@@ -144,14 +143,14 @@ class TestPipelineBridgeCreatePipeline:
         assert pipeline.source_handler is not None
         assert pipeline.sender_handler is not None
     
-    def test_pipeline_config_from_sync_config(
-        self, pipeline_bridge, mock_sync_config, mock_source_config, mock_sender_config
+    def test_pipeline_config_from_pipeline_config(
+        self, pipeline_bridge, mock_pipeline_config, mock_source_config, mock_sender_config
     ):
         """Pipeline config should come from sync config."""
         pipeline = pipeline_bridge.create_pipeline(
-            pipeline_id="test-sync",
+            pipeline_id="test-pipeline",
             agent_id="agent-1",
-            sync_config=mock_sync_config,
+            pipeline_config=mock_pipeline_config,
             source_config=mock_source_config,
             sender_config=mock_sender_config
         )
@@ -161,15 +160,15 @@ class TestPipelineBridgeCreatePipeline:
         assert pipeline.audit_interval_sec == 300
     
     def test_initial_statistics_passed(
-        self, pipeline_bridge, mock_sync_config, mock_source_config, mock_sender_config
+        self, pipeline_bridge, mock_pipeline_config, mock_source_config, mock_sender_config
     ):
         """Initial statistics should be passed to pipeline."""
         initial_stats = {"events_pushed": 100}
         
         pipeline = pipeline_bridge.create_pipeline(
-            pipeline_id="test-sync",
+            pipeline_id="test-pipeline",
             agent_id="agent-1",
-            sync_config=mock_sync_config,
+            pipeline_config=mock_pipeline_config,
             source_config=mock_source_config,
             sender_config=mock_sender_config,
             initial_statistics=initial_stats
@@ -179,17 +178,17 @@ class TestPipelineBridgeCreatePipeline:
 
 
 class TestConvenienceFunction:
-    """Test create_pipeline_from_sync_config."""
+    """Test create_pipeline_from_config."""
     
     def test_convenience_function(
         self, mock_sender_driver_service, mock_source_driver_service,
-        mock_sync_config, mock_source_config, mock_sender_config
+        mock_pipeline_config, mock_source_config, mock_sender_config
     ):
         """Convenience function should work correctly."""
-        pipeline = create_pipeline_from_sync_config(
-            pipeline_id="test-sync",
+        pipeline = create_pipeline_from_config(
+            pipeline_id="test-pipeline",
             agent_id="agent-1",
-            sync_config=mock_sync_config,
+            pipeline_config=mock_pipeline_config,
             source_config=mock_source_config,
             sender_config=mock_sender_config,
             sender_driver_service=mock_sender_driver_service,
@@ -199,33 +198,4 @@ class TestConvenienceFunction:
         assert isinstance(pipeline, AgentPipeline)
 
 
-class TestFeatureFlag:
-    """Test should_use_pipeline feature flag."""
-    
-    def test_default_is_true(self):
-        """Default should be True."""
-        with patch.dict(os.environ, {}, clear=True):
-            # Clear env var if set
-            os.environ.pop("FUSTOR_USE_PIPELINE", None)
-            assert should_use_pipeline() is True
 
-    
-    def test_env_var_true(self):
-        """Env var 'true' should enable pipeline."""
-        with patch.dict(os.environ, {"FUSTOR_USE_PIPELINE": "true"}):
-            assert should_use_pipeline() is True
-    
-    def test_env_var_1(self):
-        """Env var '1' should enable pipeline."""
-        with patch.dict(os.environ, {"FUSTOR_USE_PIPELINE": "1"}):
-            assert should_use_pipeline() is True
-    
-    def test_env_var_yes(self):
-        """Env var 'yes' should enable pipeline."""
-        with patch.dict(os.environ, {"FUSTOR_USE_PIPELINE": "yes"}):
-            assert should_use_pipeline() is True
-    
-    def test_env_var_false(self):
-        """Env var 'false' should disable pipeline."""
-        with patch.dict(os.environ, {"FUSTOR_USE_PIPELINE": "false"}):
-            assert should_use_pipeline() is False

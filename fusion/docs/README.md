@@ -54,7 +54,7 @@ Fusion 的视图配置采用目录结构管理，默认位于 `$FUSTOR_HOME/view
 
 ```yaml
 id: test-fs           # 视图实例名称，对应 API 路径 /views/test-fs/
-                        # 同时也作为 view_id (Legacy: datastore_id)
+                        # 同时也作为 view_id (Legacy: view_id)
 driver: fs            # 使用的驱动程序名称
 disabled: false
 driver_params:
@@ -123,7 +123,7 @@ Fusion 维护以下状态：
 
 ### 3. 心跳存续依赖 (Heartbeat Availability Dependency)
 为了防止权威 Agent 崩溃导致视图陈旧（Stale Data Risk）：
-*   **硬链接可用性**：一旦权威 Agent 的 **心跳丢失 (Heartbeat Timeout)**，Fusion 必须立即将对应的 Datastore 状态切换为 **503 Service Unavailable**。
+*   **硬链接可用性**：一旦权威 Agent 的 **心跳丢失 (Heartbeat Timeout)**，Fusion 必须立即将对应的 View 状态切换为 **503 Service Unavailable**。
 *   **逻辑理由**：心跳丢失意味着实时事件流（inotify）可能已中断，此时 Fusion 看到的树结构不再是对物理事实的准确感知。
 
 ## 性能优化建议

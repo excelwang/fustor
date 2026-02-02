@@ -3,12 +3,12 @@ Fuagent pusher driver for OpenAPI endpoints. (Class-based refactoring)
 """
 import httpx
 import logging
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 from urllib.parse import urljoin
 
 from fustor_core.transport import Sender
 from fustor_core.exceptions import DriverError, SessionObsoletedError
-from fustor_core.models.config import SenderConfig
+from fustor_core.models.config import SenderConfig, ApiKeyCredential, PasswdCredential
 from fustor_core.event import EventBase
 from fustor_core.utils.retry import retry
 
@@ -71,10 +71,10 @@ class OpenApiDriver(Sender):
         
             # If still no suitable path found, use a default
             if not batch_endpoint_path:
-                logger.debug(f"Pusher endpoint {self.endpoint} spec does not define 'x-fustor_agent-ingest-batch-endpoint' and no suitable batch endpoint found in spec. Using default path '/batch'.")
+                logger.debug(f"Sender endpoint {self.endpoint} spec does not define 'x-fustor_agent-ingest-batch-endpoint' and no suitable batch endpoint found in spec. Using default path '/batch'.")
                 batch_endpoint_path = "/batch"
             else:
-                logger.debug(f"Pusher endpoint {self.endpoint} spec does not define 'x-fustor_agent-ingest-batch-endpoint', using discovered path '{batch_endpoint_path}' from available endpoints.")
+                logger.debug(f"Sender endpoint {self.endpoint} spec does not define 'x-fustor_agent-ingest-batch-endpoint', using discovered path '{batch_endpoint_path}' from available endpoints.")
         
         # Construct the target URL regardless of how batch_endpoint_path was determined
         server_url_from_spec = spec.get("servers", [{}])[0].get("url", "")
@@ -103,17 +103,17 @@ class OpenApiDriver(Sender):
 
             # Handle 204 No Content responses specially - they have no body and shouldn't be parsed as JSON
             if resp.status_code == 204:
-                logger.debug(f"Pusher responded with 204 No Content, no response body to parse.")
+                logger.debug(f"Sender responded with 204 No Content, no response body to parse.")
                 return {}
 
             try:
                 response_data = resp.json()
                 if not isinstance(response_data, dict):
-                    logger.warning(f"Pusher response is not a JSON object: {response_data}")
+                    logger.warning(f"Sender response is not a JSON object: {response_data}")
                     return {}
                 return response_data
             except ValueError:
-                logger.warning(f"Pusher response was not valid JSON. Status: {resp.status_code}")
+                logger.warning(f"Sender response was not valid JSON. Status: {resp.status_code}")
                 return {}
 
         except httpx.HTTPStatusError as e:

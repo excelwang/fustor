@@ -210,6 +210,3 @@ class HTTPSender(Sender):
             self.logger.error(f"Failed to submit sentinel results: {e}")
             return False
 
-
-# Alias for backward compatibility with entry point name
-FusionSender = HTTPSender

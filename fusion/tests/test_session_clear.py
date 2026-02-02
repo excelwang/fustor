@@ -49,11 +49,11 @@ async def test_clear_all_sessions():
         assert session_id in session_manager._sessions[view_id]
         assert await view_state_manager.is_locked_by_session(view_id, session_id)
         
-        # Clear all sessions for this datastore
+        # Clear all sessions for this view
         await session_manager.clear_all_sessions(view_id)
         
         # Verify session is gone
         if view_id in session_manager._sessions:
             assert session_id not in session_manager._sessions[view_id]
         else:
-            assert True  # Datastore entry removed implies session removed
+            assert True  # View entry removed implies session removed

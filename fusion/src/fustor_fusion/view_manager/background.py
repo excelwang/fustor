@@ -32,29 +32,29 @@ class BackgroundTaskStatus:
     def __init__(self):
         self.status = {}
     
-    def update_status(self, datastore_id: int, task_name: str, status: str, details: Optional[Dict[str, Any]] = None):
-        """Update status for a specific task and datastore"""
-        if datastore_id not in self.status:
-            self.status[datastore_id] = {}
+    def update_status(self, view_id: int, task_name: str, status: str, details: Optional[Dict[str, Any]] = None):
+        """Update status for a specific task and view"""
+        if view_id not in self.status:
+            self.status[view_id] = {}
         
-        self.status[datastore_id][task_name] = {
+        self.status[view_id][task_name] = {
             'status': status,
             'last_updated': asyncio.get_event_loop().time(),
             'details': details or {}
         }
     
-    def get_status(self, datastore_id: int, task_name: str = None):
-        """Get status for a task or all tasks for a datastore"""
-        if datastore_id not in self.status:
+    def get_status(self, view_id: int, task_name: str = None):
+        """Get status for a task or all tasks for a view"""
+        if view_id not in self.status:
             return None
         
         if task_name:
-            return self.status[datastore_id].get(task_name)
+            return self.status[view_id].get(task_name)
         else:
-            return self.status[datastore_id]
+            return self.status[view_id]
     
     def get_all_status(self):
-        """Get status for all datastores and tasks"""
+        """Get status for all views and tasks"""
         return self.status
 
 
@@ -62,19 +62,19 @@ class BackgroundTaskStatus:
 task_status = BackgroundTaskStatus()
 
 
-async def get_background_task_status(datastore_id: int = None, task_name: str = None):
+async def get_background_task_status(view_id: int = None, task_name: str = None):
     """
     Get the status of background view tasks.
     """
-    if datastore_id is not None:
-        return task_status.get_status(datastore_id, task_name)
+    if view_id is not None:
+        return task_status.get_status(view_id, task_name)
     else:
         return task_status.get_all_status()
 
 
-async def process_view_events_loop(datastore_id: int):
+async def process_view_events_loop(view_id: int):
     """
-    Background loop to process events for a specific datastore.
+    Background loop to process events for a specific view.
     This is called by the main processing loop in Fusion.
     """
     # Note: The actual batching/polling logic is now in main.py

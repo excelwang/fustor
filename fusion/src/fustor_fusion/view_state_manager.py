@@ -1,6 +1,6 @@
 """
-内存数据存储状态管理器
-用于管理数据存储的运行时状态，替代数据库中的 ViewStateModel
+内存视图状态管理器
+用于管理视图的运行时状态，替代数据库中的 ViewStateModel
 """
 import asyncio
 import logging
@@ -24,8 +24,7 @@ class ViewState:
     # Leader/Follower: First-Come-First-Serve
     leader_session_id: Optional[str] = None
 
-# Legacy alias
-ViewState = ViewState
+
 
 
 class ViewStateManager:

@@ -44,7 +44,7 @@ class SourceDriverService(SourceDriverServiceInterface): # Inherit from the inte
     def _get_driver_by_type(self, driver_type: str) -> Any:
         """
         Loads a driver class by its name.
-        This method is intended for internal use by services like SyncInstanceService.
+        This method is intended for internal use by services like PipelineInstanceService.
         """
         if not driver_type:
             raise ConfigError("Driver type cannot be empty.")

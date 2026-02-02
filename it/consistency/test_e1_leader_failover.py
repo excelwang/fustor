@@ -84,7 +84,7 @@ class TestLeaderFailover:
             setup_agents["ensure_agent_running"](
                 CONTAINER_CLIENT_A, 
                 setup_agents["api_key"], 
-                setup_agents["datastore_id"]
+                setup_agents["view_id"]
             )
             time.sleep(10)  # Wait for restart
 
@@ -135,7 +135,7 @@ class TestLeaderFailover:
                     time.sleep(1)
             
             if not ready:
-                pytest.fail("Datastore failed to become ready after failover (New Leader Snapshot timed out)")
+                pytest.fail("View failed to become ready after failover (New Leader Snapshot timed out)")
             
             # Data should still be accessible
             # After failover, Agent B should perform Audit and report the missing file
@@ -154,6 +154,6 @@ class TestLeaderFailover:
             setup_agents["ensure_agent_running"](
                 CONTAINER_CLIENT_A, 
                 setup_agents["api_key"], 
-                setup_agents["datastore_id"]
+                setup_agents["view_id"]
             )
             time.sleep(10)

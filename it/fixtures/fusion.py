@@ -30,7 +30,7 @@ def test_view() -> dict:
     }
 
 # Backward compatibility alias
-test_datastore = test_view
+test_view = test_view
 
 
 @pytest.fixture(scope="session")

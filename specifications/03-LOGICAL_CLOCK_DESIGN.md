@@ -89,7 +89,7 @@ Fusion 放弃被动的 `Max(mtime)` 机制，采用 **"统计学校准的主动�
         return float(mode_key)
     ```
     - 选取出现频率最高 (Mode) 的差异值作为权威偏差
-    - **De-sessionization**: 时钟独立于会话，同一 Datastore 下所有 Agent 的样本进入全局池共同校准
+    - **De-sessionization**: 时钟独立于会话，同一 View 下所有 Agent 的样本进入全局池共同校准
 
 3.  **推进**:
     ```python

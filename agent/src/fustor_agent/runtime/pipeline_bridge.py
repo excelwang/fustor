@@ -1,20 +1,10 @@
-# agent/src/fustor_agent/runtime/pipeline_bridge.py
 """
-Bridge between legacy SyncInstance and new AgentPipeline.
-
-This module provides utilities to gradually migrate from SyncInstance
-to AgentPipeline without breaking existing functionality.
-
-Migration Strategy:
-1. SyncInstance remains the production code path
-2. AgentPipeline can be used in parallel for testing
-3. Feature flags control which path is active
-4. Eventually SyncInstance is deprecated
+Pipeline factory and configuration bridge.
 """
 import logging
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
-from fustor_core.models.config import SyncConfig, SenderConfig, SourceConfig
+from fustor_core.models.config import PipelineConfig, SenderConfig, SourceConfig
 
 from .agent_pipeline import AgentPipeline
 from .source_handler_adapter import SourceHandlerAdapter
@@ -30,25 +20,18 @@ logger = logging.getLogger("fustor_agent")
 
 class PipelineBridge:
     """
-    [MIGRATION] Factory for creating AgentPipeline from legacy configuration.
-    
-    This class bridges the gap between the old SyncInstance configuration style
-    and the new Pipeline architecture. It will be deprecated once:
-    1. All configurations are migrated to the new schema-based format.
-    2. SyncInstance is fully removed from the codebase.
-    
-    Target deprecation: Fustor v3.0
+    Factory for creating AgentPipeline from configuration.
     
     Example:
-        bridge = PipelineBridge(
+        factory = PipelineBridge(
             sender_driver_service=sender_service,
             source_driver_service=source_service
         )
         
-        pipeline = bridge.create_pipeline(
-            pipeline_id="my-sync",
+        pipeline = factory.create_pipeline(
+            pipeline_id="my-pipeline",
             agent_id="agent-1",
-            sync_config=sync_config,
+            pipeline_config=pipeline_config,
             source_config=source_config,
             sender_config=sender_config
         )
@@ -75,7 +58,7 @@ class PipelineBridge:
         self,
         pipeline_id: str,
         agent_id: str,
-        sync_config: SyncConfig,
+        pipeline_config: PipelineConfig,
         source_config: SourceConfig,
         sender_config: SenderConfig,
         event_bus: Optional["EventBusInstanceRuntime"] = None,
@@ -91,7 +74,7 @@ class PipelineBridge:
         Args:
             pipeline_id: Unique identifier for this pipeline
             agent_id: The agent's ID
-            sync_config: Sync configuration
+            sync_config: Pipeline configuration
             source_config: Source configuration
             sender_config: Sender configuration  
             event_bus: Optional event bus
@@ -104,24 +87,24 @@ class PipelineBridge:
         task_id = f"{agent_id}:{pipeline_id}"
         
         # Validation
-        if not sync_config:
-            raise ValueError("sync_config cannot be None")
+        if not pipeline_config:
+            raise ValueError("pipeline_config cannot be None")
         if not source_config:
             raise ValueError("source_config cannot be None")
         if not sender_config:
             raise ValueError("sender_config cannot be None")
             
-        if not getattr(sync_config, 'source', None):
-            raise ValueError("sync_config.source cannot be empty")
-        if not getattr(sync_config, 'sender', None):
-            raise ValueError("sync_config.sender cannot be empty")
+        if not getattr(pipeline_config, 'source', None):
+            raise ValueError("pipeline_config.source cannot be empty")
+        if not getattr(pipeline_config, 'sender', None):
+            raise ValueError("pipeline_config.sender cannot be empty")
             
         # Create source handler via adapter
         source_driver_class = self._source_driver_service._get_driver_by_type(
             source_config.driver
         )
         source_driver = source_driver_class(
-            id=sync_config.source,
+            id=pipeline_config.source,
             config=source_config
         )
         source_handler = SourceHandlerAdapter(source_driver, config=source_config)
@@ -131,8 +114,8 @@ class PipelineBridge:
             sender_config.driver
         )
         sender_driver = sender_driver_class(
-            sender_id=sync_config.sender,
-            endpoint=sender_config.endpoint,
+            sender_id=pipeline_config.sender,
+            endpoint=sender_config.uri,
             credential=self._extract_credential(sender_config),
             config=self._extract_sender_config(sender_config)
         )
@@ -140,14 +123,14 @@ class PipelineBridge:
 
         sender_handler = SenderHandlerAdapter(sender_driver, config=sender_config)
         
-        # Build pipeline config from sync config
-        pipeline_config = self._build_pipeline_config(sync_config)
+        # Build runtime config
+        runtime_config = self._build_runtime_config(pipeline_config)
         
         # Create pipeline
         pipeline = AgentPipeline(
             pipeline_id=pipeline_id,
             task_id=task_id,
-            config=pipeline_config,
+            config=runtime_config,
             source_handler=source_handler,
             sender_handler=sender_handler,
             event_bus=event_bus,
@@ -176,23 +159,23 @@ class PipelineBridge:
         }
 
     
-    def _build_pipeline_config(self, sync_config: SyncConfig) -> Dict[str, Any]:
-        """Build pipeline config from sync config."""
+    def _build_runtime_config(self, pipeline_config: PipelineConfig) -> Dict[str, Any]:
+        """Build runtime config from pipeline config."""
         config = {
-            "batch_size": getattr(sync_config, 'batch_size', 100),
-            "heartbeat_interval_sec": getattr(sync_config, 'heartbeat_interval_sec', 10),
-            "audit_interval_sec": getattr(sync_config, 'audit_interval_sec', 600),
-            "sentinel_interval_sec": getattr(sync_config, 'sentinel_interval_sec', 120),
-            "session_timeout_seconds": getattr(sync_config, 'session_timeout_seconds', 30),
-            "fields_mapping": getattr(sync_config, 'fields_mapping', []),
+            "batch_size": getattr(pipeline_config, 'batch_size', 100),
+            "heartbeat_interval_sec": getattr(pipeline_config, 'heartbeat_interval_sec', 10),
+            "audit_interval_sec": getattr(pipeline_config, 'audit_interval_sec', 600),
+            "sentinel_interval_sec": getattr(pipeline_config, 'sentinel_interval_sec', 120),
+            "session_timeout_seconds": getattr(pipeline_config, 'session_timeout_seconds', 30),
+            "fields_mapping": getattr(pipeline_config, 'fields_mapping', []),
         }
         return config
 
 
-def create_pipeline_from_sync_config(
+def create_pipeline_from_config(
     pipeline_id: str,
     agent_id: str,
-    sync_config: SyncConfig,
+    pipeline_config: PipelineConfig,
     source_config: SourceConfig,
     sender_config: SenderConfig,
     sender_driver_service: "SenderDriverService",
@@ -200,12 +183,12 @@ def create_pipeline_from_sync_config(
     event_bus: Optional["EventBusInstanceRuntime"] = None
 ) -> AgentPipeline:
     """
-    Convenience function to create an AgentPipeline from sync configuration.
+    Convenience function to create an AgentPipeline from pipeline configuration.
     
     Args:
         pipeline_id: Pipeline ID
         agent_id: Agent ID
-        sync_config: Sync configuration
+        sync_config: Pipeline configuration
         source_config: Source configuration
         sender_config: Sender configuration
         sender_driver_service: Sender driver service
@@ -215,33 +198,20 @@ def create_pipeline_from_sync_config(
     Returns:
         Configured AgentPipeline
     """
-    bridge = PipelineBridge(
+    factory = PipelineBridge(
         sender_driver_service=sender_driver_service,
         source_driver_service=source_driver_service
     )
     
-    return bridge.create_pipeline(
+    return factory.create_pipeline(
         pipeline_id=pipeline_id,
         agent_id=agent_id,
-        sync_config=sync_config,
+        pipeline_config=pipeline_config,
         source_config=source_config,
         sender_config=sender_config,
         event_bus=event_bus
     )
 
 
-# Feature flag for migration
-# Feature flag for migration
-USE_AGENT_PIPELINE = True  # Set to True to use new pipeline
 
-
-def should_use_pipeline() -> bool:
-    """Check if we should use AgentPipeline instead of SyncInstance."""
-    import os
-    env_flag = os.environ.get("FUSTOR_USE_PIPELINE", "").lower()
-    if env_flag in ("1", "true", "yes"):
-        return True
-    if env_flag in ("0", "false", "no"):
-        return False
-    return USE_AGENT_PIPELINE
 

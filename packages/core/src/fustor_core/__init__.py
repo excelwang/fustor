@@ -34,7 +34,7 @@ from .exceptions import (
     StateConflictError,
     ValidationError,
 )
-from .drivers import SourceDriver, PusherDriver, ViewDriver
+from .drivers import SourceDriver, SenderDriver, ViewDriver
 
 __all__ = [
     # Submodules
@@ -66,8 +66,8 @@ __all__ = [
     "DriverError",
     "StateConflictError",
     "ValidationError",
-    # Drivers (legacy, for compatibility)
+    # Drivers
     "SourceDriver",
-    "PusherDriver",
+    "SenderDriver",
     "ViewDriver",
 ]

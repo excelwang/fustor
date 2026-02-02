@@ -133,11 +133,11 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     if time.monotonic() - session_info.last_activity >= timeout_seconds:
                         del self._sessions[view_id][session_id]
                         
-                        # Clean up empty datastore entries
+                        # Clean up empty view entries
                         if not self._sessions[view_id]:
                             del self._sessions[view_id]
                             
-                            # NEW: Check if this is a 'live' datastore and clear data
+                            # NEW: Check if this is a 'live' view and clear data
                             from ..view_manager.manager import reset_views
                             
                             is_live = await self._check_if_view_live(view_id)
@@ -170,7 +170,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     if not self._sessions[view_id]:
                         del self._sessions[view_id]
                     
-                    # Release any associated lock in the datastore state manager
+                    # Release any associated lock in the view state manager
                     await view_state_manager.unlock_for_session(view_id, session_id)
                     # Release leader role if this session was the leader
                     await view_state_manager.release_leader(view_id, session_id)
@@ -194,12 +194,6 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         view_id = str(view_id)
         async with self._lock:
             return self._sessions.get(view_id, {}).copy()
-
-    async def get_datastore_sessions(self, datastore_id: str) -> Dict[str, SessionInfo]:
-        """Deprecated alias for get_view_sessions."""
-        import warnings
-        warnings.warn("get_datastore_sessions is deprecated, use get_view_sessions instead", DeprecationWarning, stacklevel=2)
-        return await self.get_view_sessions(datastore_id)
 
     async def get_all_active_sessions(self) -> Dict[str, Dict[str, SessionInfo]]:
         """获取所有活跃的session信息，返回 {view_id: {session_id: SessionInfo}}"""
@@ -302,7 +296,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         
                         logger.info(f"Cleared all data for view {view_id} as no sessions remain after cleanup.")
                     
-                    # Release any associated lock in the datastore state manager
+                    # Release any associated lock in the view state manager
                     await view_state_manager.unlock_for_session(view_id, session_id)
                     # Release leader role if this session was the leader
                     await view_state_manager.release_leader(view_id, session_id)
@@ -320,7 +314,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         # First, try to remove the session
         success = await self.remove_session(view_id, session_id)
         
-        # Then, ensure the lock is also released from the datastore state manager
+        # Then, ensure the lock is also released from the view state manager
         if success:
             await view_state_manager.unlock_for_session(view_id, session_id)
             # Check if this was the last session for the view

@@ -2,7 +2,7 @@
 # Location: $FUSTOR_HOME/views-config/research-fs.yaml
 
 id: research-fs
-datastore_id: 1
+view_id: 1
 driver: fs
 disabled: false
 driver_params:

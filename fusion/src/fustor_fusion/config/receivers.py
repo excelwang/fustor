@@ -2,7 +2,7 @@
 """
 Receiver configuration loader from YAML files.
 
-This replaces the API key management that was in datastores-config.yaml.
+This replaces the API key management that was in views-config.yaml.
 Receivers define transport endpoints and their associated credentials.
 
 Config file format:

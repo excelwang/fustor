@@ -56,22 +56,21 @@ class SenderConfigServiceInterface(BaseConfigService[SenderConfig]):
     async def cleanup_obsolete_configs(self) -> List[str]:
         ...
 
-# Backward compatibility alias
-SenderConfigServiceInterface = SenderConfigServiceInterface
 
-from fustor_core.models.config import SyncConfig
 
-class SyncConfigServiceInterface(BaseConfigService[SyncConfig]):
+from fustor_core.models.config import PipelineConfig
+
+class PipelineConfigServiceInterface(BaseConfigService[PipelineConfig]):
     """
-    Interface for managing SyncConfig objects.
+    Interface for managing PipelineConfig objects.
     """
     async def enable(self, id: str):
-        """Enables a Sync configuration, ensuring its source and sender are also enabled."""
+        """Enables a Pipeline configuration, ensuring its source and sender are also enabled."""
         ...
 
     def get_wizard_definition(self) -> Dict[str, Any]:
         """
-        Returns the step definitions for the Sync Task configuration wizard.
+        Returns the step definitions for the Pipeline Task configuration wizard.
         """
         ...
 
@@ -92,20 +91,20 @@ class EventBusServiceInterface(BaseInstanceServiceInterface):
     """
     Interface for managing EventBusService objects.
     """
-    def set_dependencies(self, sync_instance_service: "SyncInstanceService"):
+    def set_dependencies(self, pipeline_instance_service: "PipelineInstanceService"):
         ...
 
     async def get_or_create_bus_for_subscriber(
         self, 
         source_id: str,
         source_config: SourceConfig, 
-        sync_id: str,
+        pipeline_id: str,
         required_position: int,
         fields_mapping: List[FieldMapping]
     ) -> Tuple[Any, bool]: # Use Any for EventBusInstanceRuntime to avoid circular import
         ...
 
-    async def release_subscriber(self, bus_id: str, sync_id: str):
+    async def release_subscriber(self, bus_id: str, pipeline_id: str):
         ...
 
     async def release_all_unused_buses(self):
@@ -114,7 +113,7 @@ class EventBusServiceInterface(BaseInstanceServiceInterface):
     async def commit_and_handle_split(
         self, 
         bus_id: str, 
-        sync_id: str, 
+        pipeline_id: str, 
         num_events: int, 
         last_consumed_position: int,
         fields_mapping: List[FieldMapping]
@@ -170,14 +169,12 @@ class SenderDriverServiceInterface(Protocol):
         ...
 
 
-# Backward compatibility alias
-PusherDriverServiceInterface = SenderDriverServiceInterface
 
-from fustor_core.models.states import SyncState
+from fustor_core.models.states import PipelineState
 
-class SyncInstanceServiceInterface(BaseInstanceServiceInterface):
+class PipelineInstanceServiceInterface(BaseInstanceServiceInterface):
     """
-    Interface for managing SyncInstanceService objects.
+    Interface for managing PipelineInstanceService objects.
     """
     async def start_one(self, id: str):
         ...
@@ -185,16 +182,16 @@ class SyncInstanceServiceInterface(BaseInstanceServiceInterface):
     async def stop_one(self, id: str, should_release_bus: bool = True):
         ...
 
-    async def remap_sync_to_new_bus(self, sync_id: str, new_bus: Any, needed_position_lost: bool):
+    async def remap_pipeline_to_new_bus(self, pipeline_id: str, new_bus: Any, needed_position_lost: bool):
         ...
 
-    async def mark_dependent_syncs_outdated(self, dependency_type: str, dependency_id: str, reason_info: str, updates: Optional[Dict[str, Any]] = None):
+    async def mark_dependent_pipelines_outdated(self, dependency_type: str, dependency_id: str, reason_info: str, updates: Optional[Dict[str, Any]] = None):
         ...
 
     async def start_all_enabled(self):
         ...
 
-    async def restart_outdated_syncs(self) -> int:
+    async def restart_outdated_pipelines(self) -> int:
         ...
 
     async def stop_all(self):

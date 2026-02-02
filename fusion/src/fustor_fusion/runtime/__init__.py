@@ -27,8 +27,8 @@ Example Usage:
 
     # Create pipeline
     pipeline = FusionPipeline(
-        pipeline_id="datastore-1",
-        config={"datastore_id": 1},
+        pipeline_id="view-1",
+        config={"view_id": 1},
         view_handlers=[fs_view_handler]
     )
 

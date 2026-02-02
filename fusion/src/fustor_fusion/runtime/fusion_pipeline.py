@@ -80,16 +80,13 @@ class FusionPipeline(Pipeline):
             pipeline_id: Unique identifier (typically view_id)
             config: Configuration dict containing:
                 - view_id: str
-                - allow_concurrent_push: bool
-                - queue_batch_size: int
             view_handlers: List of ViewHandler instances to dispatch events to
             context: Optional PipelineContext for dependency injection
         """
         super().__init__(pipeline_id, config, context)
         
-        # Consistent terminology: view_id is the primary identifier
-        self.view_id = str(config.get("view_id", config.get("datastore_id", pipeline_id)))
-        # self.datastore_id is now a property
+        # Terminology: view_id is the primary identifier
+        self.view_id = str(config.get("view_id", pipeline_id))
 
         
         self.allow_concurrent_push = config.get("allow_concurrent_push", True)
@@ -436,7 +433,6 @@ class FusionPipeline(Pipeline):
             return {
                 "id": self.id,
                 "view_id": self.view_id,
-                "datastore_id": self.view_id, # Backward compatibility
                 "state": self.state.name if hasattr(self.state, 'name') else str(self.state),
                 "info": self.info,
                 "view_handlers": self.get_available_views(),
@@ -500,10 +496,5 @@ class FusionPipeline(Pipeline):
     def __str__(self) -> str:
         return f"FusionPipeline({self.id}, state={self.state.name})"
 
-    @property
-    def datastore_id(self) -> str:
-        """Deprecated alias for view_id."""
-        import warnings
-        warnings.warn("datastore_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
-        return self.view_id
+
 

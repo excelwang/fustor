@@ -1,7 +1,7 @@
-# Example: datastores-config.yaml
-# Location: $FUSTOR_HOME/datastores-config.yaml
+# Example: views-config.yaml
+# Location: $FUSTOR_HOME/views-config.yaml
 
-datastores:
+views:
   research-data:
     session_timeout_seconds: 30
     allow_concurrent_push: true

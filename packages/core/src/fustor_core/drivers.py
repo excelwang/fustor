@@ -1,7 +1,7 @@
 """
 Abstract Base Classes for Fuagent Drivers.
 
-This module defines the formal interface for Source and Pusher drivers.
+This module defines the formal interface for Source and Sender drivers.
 All drivers must inherit from the appropriate base class and implement its
 abstract methods.
 """
@@ -40,7 +40,7 @@ class ViewDriver(ABC):
         
         Args:
             id: Unique identifier for this view instance.
-            view_id: identifier for the view group/datastore.
+            view_id: identifier for the view group.
             config: Driver-specific configuration dictionary.
         """
         self.id = id
@@ -53,23 +53,7 @@ class ViewDriver(ABC):
         """
         pass
     
-    @property
-    def datastore_id(self) -> str:
-        """Deprecated alias for view_id."""
-        import warnings
-        warnings.warn("datastore_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
-        return self.view_id
 
-    @datastore_id.setter
-    def datastore_id(self, value: str):
-        self.view_id = str(value)
-
-    @property
-    def original_view_id(self) -> str:
-        """Deprecated alias for id (the instance ID)."""
-        import warnings
-        warnings.warn("view_id (as instance ID) is deprecated, use .id instead", DeprecationWarning, stacklevel=2)
-        return self.id
     
     @property
     def requires_full_reset_on_session_close(self) -> bool:
@@ -133,8 +117,6 @@ class SenderDriver(ABC):
 
     Defines the contract for drivers that receive data from the Fuagent core
     and transmit it to a destination (e.g., Fusion, Object Storage).
-    
-    This replaces the legacy PusherDriver terminology.
     """
 
     def __init__(self, id: str, config: SenderConfig):
@@ -163,12 +145,7 @@ class SenderDriver(ABC):
         """
         raise NotImplementedError
 
-    async def push(self, events: List[EventBase], **kwargs) -> Dict:
-        """
-        Legacy compatibility method for the old Pusher interface.
-        Delegates to send_events if not overridden.
-        """
-        return await self.send_events(events, **kwargs)
+
 
     async def create_session(self, task_id: str) -> str:
         """
@@ -245,16 +222,13 @@ class SenderDriver(ABC):
         """
         return {} 
 
-# Alias for backward compatibility
-PusherDriver = SenderDriver
+
 
 class SourceDriver(ABC):
     """
     Abstract Base Class for all Source drivers.
 
     Defines the contract for drivers that produce data for the Fuagent core.
-    Note the mix of synchronous and asynchronous methods, reflecting the current
-    design of existing drivers (e.g., threading-based fs vs. async network drivers).
     """
 
     def __init__(self, id: str, config: SourceConfig):

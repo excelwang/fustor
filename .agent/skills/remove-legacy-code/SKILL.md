@@ -23,6 +23,7 @@ When removing legacy code, follow these steps:
 6. do not consider to keep compatibility with the existing configuration or api;
 7. do not use legacy file name if the modular has been refactored;
 8. do not forget to update documents;
+9. check backward and compitable terms. Keep the check loop until no file or code using legacy terms
 
 ## How to provide feedback
 

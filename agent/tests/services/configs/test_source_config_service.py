@@ -8,7 +8,7 @@ from fustor_core.exceptions import NotFoundError
 def mock_app_config():
     app_config = MagicMock(spec=AppConfig)
     app_config.get_sources.return_value = {}
-    app_config.get_syncs.return_value = {}
+    app_config.get_pipelines.return_value = {}
     return app_config
 
 @pytest.fixture

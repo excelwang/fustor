@@ -14,16 +14,6 @@ class SessionInfo:
     client_ip: Optional[str] = None
     cleanup_task: Optional[asyncio.Task] = None
 
-    @property
-    def datastore_id(self) -> str:
-        """Deprecated alias for view_id."""
-        import warnings
-        warnings.warn("datastore_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
-        return self.view_id
-
-    @datastore_id.setter
-    def datastore_id(self, value: str):
-        self.view_id = str(value) if value is not None else None
 
 class SessionManagerInterface(Protocol):
     """
@@ -44,10 +34,6 @@ class SessionManagerInterface(Protocol):
         ...
 
     async def get_view_sessions(self, view_id: str) -> Dict[str, SessionInfo]:
-        ...
-    
-    # Legacy alias
-    async def get_datastore_sessions(self, datastore_id: str) -> Dict[str, SessionInfo]:
         ...
 
     async def remove_session(self, view_id: str, session_id: str) -> bool:
@@ -70,7 +56,7 @@ class ViewProvider(Protocol):
     Interface for a View Provider driver.
     Views expose content via specific protocols (e.g. FUSE/NFS).
     """
-    def __init__(self, view_id: str, datastore_id: Optional[str] = None, **kwargs):
+    def __init__(self, id: str, view_id: str, **kwargs):
         ...
 
     async def initialize(self) -> None:

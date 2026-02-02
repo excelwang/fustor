@@ -33,7 +33,7 @@ async def test_api_unavailable_initially(client):
     # Use generic status check endpoint
     response = await client.get("/api/v1/views/test/status_check")
     assert response.status_code == 503
-    assert "Initial snapshot sync in progress" in response.json()["detail"]
+    assert "Initial snapshot phase in progress" in response.json()["detail"]
 
 @pytest.mark.asyncio
 async def test_api_unavailable_during_sync(client):

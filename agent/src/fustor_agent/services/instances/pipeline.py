@@ -3,16 +3,15 @@ from typing import TYPE_CHECKING, Dict, Any, Optional, Union
 import logging 
 
 from .base import BaseInstanceService
-from fustor_core.models.states import SyncState
+from fustor_core.models.states import PipelineState
 from fustor_agent.runtime import AgentPipeline, PipelineBridge
 from fustor_core.exceptions import NotFoundError
-from fustor_agent_sdk.interfaces import SyncInstanceServiceInterface # Import the interface
+from fustor_agent_sdk.interfaces import PipelineInstanceServiceInterface # Import the interface
 
 # PipelineRuntime is now always AgentPipeline
 PipelineRuntime = AgentPipeline
 
-# Backward compatibility alias
-SyncRuntime = PipelineRuntime
+
 
 
 
@@ -26,7 +25,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("fustor_agent")
 
-class PipelineInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # Inherit from the interface
+class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterface): # Inherit from the interface
     def __init__(
         self, 
         pipeline_config_service: "PipelineConfigService",
@@ -99,7 +98,7 @@ class PipelineInstanceService(BaseInstanceService, SyncInstanceServiceInterface)
                     event_bus, _ = await self.bus_service.get_or_create_bus_for_subscriber(
                         source_id=pipeline_config.source,
                         source_config=source_config,
-                        sync_id=id,
+                        pipeline_id=id,
                         required_position=0, 
                         fields_mapping=field_mappings
                     )
@@ -110,7 +109,7 @@ class PipelineInstanceService(BaseInstanceService, SyncInstanceServiceInterface)
             pipeline = bridge.create_pipeline(
                 pipeline_id=id,
                 agent_id=self.agent_id,
-                sync_config=pipeline_config,
+                pipeline_config=pipeline_config,
                 source_config=source_config,
                 sender_config=sender_config,
                 event_bus=event_bus,
@@ -167,9 +166,7 @@ class PipelineInstanceService(BaseInstanceService, SyncInstanceServiceInterface)
         
         self.logger.info(f"Pipeline task '{pipeline_id}' remapped to bus '{new_bus.id}' successfully.")
 
-    async def remap_sync_to_new_bus(self, sync_id: str, new_bus: "EventBusInstanceRuntime", needed_position_lost: bool):
-        """Alias for remap_pipeline_to_new_bus."""
-        await self.remap_pipeline_to_new_bus(sync_id, new_bus, needed_position_lost)
+
 
     async def mark_dependent_pipelines_outdated(self, dependency_type: str, dependency_id: str, reason_info: str, updates: Optional[Dict[str, Any]] = None):
         from fustor_core.pipeline import PipelineState
@@ -190,9 +187,7 @@ class PipelineInstanceService(BaseInstanceService, SyncInstanceServiceInterface)
             pipeline_instance.info = reason_info # Update info directly
         self.logger.info(f"Marked {len(affected_pipelines)} pipelines as outdated.")
 
-    async def mark_dependent_syncs_outdated(self, *args, **kwargs):
-        """Alias for mark_dependent_pipelines_outdated."""
-        await self.mark_dependent_pipelines_outdated(*args, **kwargs)
+
 
 
     async def start_all_enabled(self):
@@ -230,9 +225,7 @@ class PipelineInstanceService(BaseInstanceService, SyncInstanceServiceInterface)
         
         return len(outdated_pipelines)
 
-    async def restart_outdated_syncs(self) -> int:
-        """Alias for restart_outdated_pipelines."""
-        return await self.restart_outdated_pipelines()
+
 
     async def stop_all(self):
         self.logger.info("Stopping all pipeline instances...")
@@ -256,5 +249,3 @@ class PipelineInstanceService(BaseInstanceService, SyncInstanceServiceInterface)
             raise NotFoundError(f"Pipeline instance '{id}' not found.")
         await instance.trigger_sentinel()
 
-# Backward compatibility alias
-SyncInstanceService = PipelineInstanceService

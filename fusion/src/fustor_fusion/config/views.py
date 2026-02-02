@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 class ViewConfig(BaseModel):
     """Configuration for a single view."""
     id: str
-    view_id: Optional[str] = Field(default=None, validation_alias=AliasChoices('view_id', 'datastore_id'))
+    view_id: str
     driver: str
     disabled: bool = False
     driver_params: dict = {}
@@ -45,16 +45,13 @@ class ViewConfig(BaseModel):
     @model_validator(mode='before')
     @classmethod
     def set_default_view_id(cls, data: Any) -> Any:
-        # If view_id/datastore_id is not provided, default to id
+        # If view_id is not provided, default to id
         if isinstance(data, dict):
-            if 'view_id' not in data and 'datastore_id' not in data and 'id' in data:
+            if 'view_id' not in data and 'id' in data:
                 data['view_id'] = str(data['id'])
         return data
     
-    @property
-    def datastore_id(self) -> str:
-        """Deprecated alias for view_id."""
-        return self.view_id
+
 
 
 class ViewsConfigLoader:
@@ -71,7 +68,7 @@ class ViewsConfigLoader:
     Each file format:
     ```yaml
     id: research-fs
-    datastore_id: 1
+    view_id: 1
     driver: fs
     disabled: false
     driver_params:
@@ -109,9 +106,7 @@ class ViewsConfigLoader:
                     logger.warning(f"Empty config file: {yaml_file}")
                     continue
                 
-                # Ensure datastore_id is treated as string for validation
-                if "datastore_id" in data:
-                    data["datastore_id"] = str(data["datastore_id"])
+
 
                 config = ViewConfig(**data)
                 self._views[config.id] = config
@@ -150,9 +145,7 @@ class ViewsConfigLoader:
         v_id_str = str(view_id)
         return [v for v in self._views.values() if v.view_id == v_id_str]
 
-    # Legacy alias
-    def get_by_datastore(self, datastore_id: str) -> List[ViewConfig]:
-        return self.get_by_view(datastore_id)
+
     
     def reload(self) -> Dict[str, ViewConfig]:
         """Force reload all configurations."""

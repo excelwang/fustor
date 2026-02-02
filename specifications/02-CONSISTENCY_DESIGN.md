@@ -59,7 +59,7 @@
 
 - **先到先得**：第一个建立 Session 的 Agent 成为 Leader
 - **故障转移**：仅当 Leader 心跳超时或断开后，Fusion 才释放 Leader 锁
-- **实现**：通过 `DatastoreStateManager` 管理 Leader 锁，`SessionManager` 管理会话生命周期
+- **实现**：通过 `ViewStateManager` 管理 Leader 锁，`SessionManager` 管理会话生命周期
 
 ---
 

@@ -3,7 +3,7 @@
 Fusion Pipeline configuration loader from YAML files.
 
 This defines how events flow from Receivers to Views in Fusion.
-Replaces the old datastore_id concept with direct Pipeline → View binding.
+Replaces the old view_id concept with direct Pipeline → View binding.
 
 Config file format (fusion-pipes-config/pipe-http.yaml):
 ```yaml

@@ -53,7 +53,7 @@ class TestNewLeaderResumesDuties:
                 except Exception:
                     time.sleep(1)
             if not ready:
-                pytest.fail("Datastore failed to become ready after failover in test_new_leader_performs_audit")
+                pytest.fail("View failed to become ready after failover in test_new_leader_performs_audit")
             
             # Verify B is now leader
             sessions = fusion_client.get_sessions()
@@ -105,7 +105,7 @@ class TestNewLeaderResumesDuties:
             setup_agents["ensure_agent_running"](
                 CONTAINER_CLIENT_A, 
                 setup_agents["api_key"], 
-                setup_agents["datastore_id"]
+                setup_agents["view_id"]
             )
             time.sleep(10)
 
@@ -159,7 +159,7 @@ class TestNewLeaderResumesDuties:
                 except Exception:
                     time.sleep(1)
             if not ready:
-                pytest.fail("Datastore failed to become ready after failover in test_new_leader_performs_snapshot")
+                pytest.fail("View failed to become ready after failover in test_new_leader_performs_snapshot")
             
             # Create new file while B is leader
             new_file = f"{test_dir}/after_failover.txt"
@@ -180,7 +180,7 @@ class TestNewLeaderResumesDuties:
             setup_agents["ensure_agent_running"](
                 CONTAINER_CLIENT_A, 
                 setup_agents["api_key"], 
-                setup_agents["datastore_id"]
+                setup_agents["view_id"]
             )
             time.sleep(10)
 
@@ -207,7 +207,7 @@ class TestNewLeaderResumesDuties:
             setup_agents["ensure_agent_running"](
                 CONTAINER_CLIENT_A, 
                 setup_agents["api_key"], 
-                setup_agents["datastore_id"]
+                setup_agents["view_id"]
             )
             # Wait for A to register new session
             time.sleep(15)

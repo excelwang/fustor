@@ -1,8 +1,7 @@
-# src/fustor_agent/services/drivers/sender_driver.py
 """
 Sender Driver Service.
 
-This is the new naming for what was previously called "Pusher Driver Service".
+Sender driver service for discovering and loading sender drivers.
 The term "sender" aligns with the V2 architecture terminology.
 """
 import logging
@@ -20,7 +19,7 @@ class SenderDriverService(SenderDriverServiceInterface):
     A service for discovering and interacting with Sender driver classes.
     
     Senders are responsible for transmitting events from Agent to Fusion.
-    This replaces the deprecated "PusherDriverService" terminology.
+    Sender driver service.
     """
     
     def __init__(self):
@@ -32,7 +31,6 @@ class SenderDriverService(SenderDriverServiceInterface):
         """
         Scans for installed packages that register under the sender entry points.
         
-        Supports both new 'fustor_agent.drivers.senders' and legacy 'fustor_agent.drivers.pushers'.
         """
         discovered = {}
         
@@ -121,5 +119,4 @@ class SenderDriverService(SenderDriverServiceInterface):
         return list(self._discovered_drivers.keys())
 
 
-# Backward compatibility alias
-PusherDriverService = SenderDriverService
+# SenderDriverService is now the primary name.

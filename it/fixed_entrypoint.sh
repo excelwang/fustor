@@ -41,7 +41,7 @@ pushers:
     config:
       endpoint: "${FUSION_ENDPOINT}"
       api_key: "${API_KEY}"
-      datastore_id: "${DATASTORE_ID}"
+      view_id: "${VIEW_ID}"
 EOF
 
     # Start agent in background

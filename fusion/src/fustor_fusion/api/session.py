@@ -1,6 +1,6 @@
 # fusion/src/fustor_fusion/api/session.py
 """
-Session management API for creating, maintaining, and closing sync sessions.
+Session management API for creating, maintaining, and closing pipeline sessions.
 """
 from fastapi import APIRouter, Depends, status, HTTPException, Header, Query, Request
 from pydantic import BaseModel
@@ -11,7 +11,6 @@ import uuid
 
 from ..auth.dependencies import get_view_id_from_api_key
 
-# Note: get_datastore_id_from_api_key was removed. Use get_view_id_from_api_key.
 
 from ..config import receivers_config
 from ..core.session_manager import session_manager
@@ -87,7 +86,7 @@ async def _should_allow_new_session(
             return False
 
 
-@session_router.post("/", summary="Create new sync session")
+@session_router.post("/", summary="Create new pipeline session")
 async def create_session(
     payload: CreateSessionPayload,
     request: Request,
@@ -234,7 +233,7 @@ async def list_sessions(
         session_data = {
             "session_id": session_id,
             "task_id": session_info.task_id,
-            "agent_id": session_info.task_id,
+            
             "client_ip": session_info.client_ip,
             "last_activity": session_info.last_activity,
             "created_at": session_info.created_at,
@@ -246,7 +245,7 @@ async def list_sessions(
         session_data["role"] = "leader" if is_leader else "follower"
         session_data["can_snapshot"] = is_leader
         session_data["can_audit"] = is_leader
-        session_data["can_realtime"] = True
+        session_data["can_send"] = True
         
         session_list.append(session_data)
     

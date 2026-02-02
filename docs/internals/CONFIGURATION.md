@@ -21,7 +21,7 @@ $FUSTOR_HOME/
 ```
 
 ### Deprecated (V1)
-- `datastores-config.yaml` (Replaced by `receivers-config.yaml` + `views-config`)
+- `views-config.yaml` (Replaced by `receivers-config.yaml` + `views-config`)
 - `pushers-config.yaml` (Replaced by `senders-config.yaml`)
 - `syncs-config/` (Replaced by `agent-pipes-config/`)
 

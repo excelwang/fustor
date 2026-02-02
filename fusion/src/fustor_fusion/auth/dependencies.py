@@ -29,6 +29,5 @@ async def get_view_id_from_api_key(x_api_key: str = Header(..., alias="X-API-Key
     )
 
 
-# Note: get_datastore_id_from_api_key and get_pipeline_id_from_api_key aliases were removed.
 # All APIs must use get_view_id_from_api_key.
 

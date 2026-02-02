@@ -62,7 +62,7 @@ def docker_env():
     # 1. Create .fustor directory
     docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/views-config"])
     
-    # 2. Inject Receivers Config (v2: renamed from 'datastores')
+    # 2. Inject Receivers Config (v2: renamed from 'views')
     receivers_config = f"""
 http-main:
   driver: "http"
@@ -78,7 +78,7 @@ http-main:
     # 3. Inject View Config
     view_config = """
 id: "integration-test-ds"
-datastore_id: "integration-test-ds"
+view_id: "integration-test-ds"
 driver: "fs"
 disabled: false
 driver_params:

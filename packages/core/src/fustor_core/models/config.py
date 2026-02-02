@@ -63,12 +63,12 @@ class SourceConfig(BaseModel):
 
 class SenderConfig(BaseModel):
     """
-    Configuration for a Sender (formerly called Pusher).
+    Configuration for a Sender.
     
     Senders are responsible for sending events to downstream systems (e.g., Fusion).
     """
     driver: str
-    uri: str = Field(..., alias="endpoint", description="目标端点URL")  # 'endpoint' alias for backward compat
+    uri: str = Field(..., description="目标端点URL")
     credential: Credential
     batch_size: int = Field(default=1000, ge=1, description="每批消息最大条目")
     max_retries: int = Field(default=10, gt=0, description="推送失败时的最大重试次数")
@@ -80,17 +80,12 @@ class SenderConfig(BaseModel):
     # API version for FusionSDK compatibility ('v1' or 'v2')
     api_version: str = Field(default='v2', pattern='^v[12]$', description="API version (v1 or v2)")
     
-    model_config = ConfigDict(populate_by_name=True)  # Allow using 'endpoint' or 'uri'
-    
-    @property
-    def endpoint(self) -> str:
-        """Alias for uri for backward compatibility."""
-        return self.uri
+    model_config = ConfigDict(extra='ignore')
 
 
-class SyncConfig(BaseModel):
+class PipelineConfig(BaseModel):
     """
-    Configuration for a Sync task (now called Pipeline) that connects a Source to a Sender.
+    Configuration for a Pipeline task that connects a Source to a Sender.
     
     The 'sender' field specifies which sender configuration to use.
     """
@@ -110,9 +105,6 @@ class SyncConfig(BaseModel):
     max_backoff_seconds: float = Field(default=60, ge=1.0, description="最大退避时间(秒)")
     session_timeout_seconds: int = Field(default=30, gt=0, description="会话超时时间(秒)")
 
-# Backward compatibility alias
-PipelineConfig = SyncConfig
-
 
 class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):
     root: Dict[str, SourceConfig] = Field(default_factory=dict)
@@ -120,11 +112,8 @@ class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):
 class SenderConfigDict(RootModel[Dict[str, SenderConfig]]):
     root: Dict[str, SenderConfig] = Field(default_factory=dict)
 
-class SyncConfigDict(RootModel[Dict[str, SyncConfig]]):
-    root: Dict[str, SyncConfig] = Field(default_factory=dict)
-
-# Backward compatibility alias
-PipelineConfigDict = SyncConfigDict
+class PipelineConfigDict(RootModel[Dict[str, PipelineConfig]]):
+    root: Dict[str, PipelineConfig] = Field(default_factory=dict)
 
 class AppConfig(BaseModel):
     """
@@ -135,14 +124,8 @@ class AppConfig(BaseModel):
     sources: SourceConfigDict = Field(default_factory=SourceConfigDict)
     senders: SenderConfigDict = Field(default_factory=SenderConfigDict)
     pipelines: PipelineConfigDict = Field(
-        default_factory=PipelineConfigDict,
-        validation_alias='syncs'
+        default_factory=PipelineConfigDict
     )
-
-    @property
-    def syncs(self) -> SyncConfigDict:
-        """Alias for pipelines for backward compatibility."""
-        return self.pipelines
 
     def get_sources(self) -> Dict[str, SourceConfig]:
         return self.sources.root
@@ -153,10 +136,6 @@ class AppConfig(BaseModel):
 
     def get_pipelines(self) -> Dict[str, PipelineConfig]:
         return self.pipelines.root
-
-    def get_syncs(self) -> Dict[str, SyncConfig]:
-        """Alias for get_pipelines."""
-        return self.get_pipelines()
     
     def get_source(self, id: str) -> Optional[SourceConfig]:
         return self.get_sources().get(id)
@@ -165,12 +144,9 @@ class AppConfig(BaseModel):
         """Get sender config by ID."""
         return self.get_senders().get(id)
 
+
     def get_pipeline(self, id: str) -> Optional[PipelineConfig]:
         return self.get_pipelines().get(id)
-
-    def get_sync(self, id: str) -> Optional[SyncConfig]:
-        """Alias for get_pipeline."""
-        return self.get_pipeline(id)
     
     def add_source(self, id: str, config: SourceConfig) -> SourceConfig:
         config_may = self.get_source(id)
@@ -200,10 +176,6 @@ class AppConfig(BaseModel):
         
         self.get_pipelines()[id] = config
         return config
-
-    def add_sync(self, id: str, config: SyncConfig) -> SyncConfig:
-        """Alias for add_pipeline."""
-        return self.add_pipeline(id, config)
     
     def delete_source(self, id: str) -> SourceConfig:
         config = self.get_source(id)
@@ -236,10 +208,6 @@ class AppConfig(BaseModel):
             raise NotFoundError(f"Pipeline config with id '{id}' not found.")
         return self.get_pipelines().pop(id)
 
-    def delete_sync(self, id: str) -> SyncConfig:
-        """Alias for delete_pipeline."""
-        return self.delete_pipeline(id)
-
     def check_pipeline_is_disabled(self, id: str) -> bool:
         config = self.get_pipeline(id)
         if not config:
@@ -258,6 +226,3 @@ class AppConfig(BaseModel):
             
         return source_config.disabled or sender_config.disabled
 
-    def check_sync_is_disabled(self, id: str) -> bool:
-        """Alias for check_pipeline_is_disabled."""
-        return self.check_pipeline_is_disabled(id)

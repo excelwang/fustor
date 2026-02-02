@@ -163,22 +163,15 @@ class SenderHandlerAdapter(SenderHandler):
             if context.get("is_start"):
                 await self._sender.signal_audit_start()
             
-        # Compatibility handling: prefer send_events, fallback to push
+        # All V2 senders must implement send_events
         if hasattr(self._sender, "send_events"):
             response = await self._sender.send_events(
                 events=events,
                 source_type=source_type,
                 is_end=is_final
             ) or {}
-        elif hasattr(self._sender, "push"):
-            # Legacy PusherDriver interface
-            response = await self._sender.push(
-                events=events,
-                source_type=source_type,
-                is_end=is_final
-            ) or {}
         else:
-            raise AttributeError(f"Sender {self.id} has no 'send_events' or 'push' method")
+            raise AttributeError(f"Sender {self.id} has no 'send_events' method (legacy 'push' is no longer supported)")
         
         success = response.get("success", False)
         
@@ -285,7 +278,7 @@ class SenderHandlerFactory:
         # Create sender instance
         sender = driver_class(
             sender_id=handler_id or f"sender-{driver_type}",
-            endpoint=sender_config.endpoint,
+            endpoint=sender_config.uri,
             credential=credential_dict,
             config={
                 "batch_size": sender_config.batch_size,
