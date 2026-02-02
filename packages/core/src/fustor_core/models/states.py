@@ -44,6 +44,6 @@ class AgentState(BaseModel):
     agent_id: str = Field(..., description="The unique identifier for the agent.")
     pipeline s: Dict[str, PipelineInstanceDTO] = Field(
         default_factory=dict, 
-        description="A dictionary of all pipeline tasks, keyed by their ID."
+        description="A dictionary of all pipeline s, keyed by their ID."
     )
     event_buses: Dict[str, EventBusInstance] = Field(default_factory=dict, description="A dictionary of all active event buses, keyed by their ID.")
