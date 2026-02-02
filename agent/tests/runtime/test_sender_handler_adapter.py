@@ -47,7 +47,7 @@ class MockSender(Sender):
             "session_timeout_seconds": session_timeout_seconds or 30
         }
     
-    async def send_events(
+    async def _send_events_impl(
         self, 
         events: List[Any], 
         source_type: str = "message",
@@ -231,7 +231,7 @@ class TestSenderHandlerAdapterBatch:
     @pytest.mark.asyncio
     async def test_send_batch_error_propagation(self, adapter, mock_sender):
         """send_batch should propagate generic exceptions."""
-        mock_sender.send_events = AsyncMock(side_effect=RuntimeError("Network failure"))
+        mock_sender._send_events_impl = AsyncMock(side_effect=RuntimeError("Network failure"))
         
         with pytest.raises(RuntimeError, match="Network failure"):
             await adapter.send_batch("sess-test", [{"id": 1}])
@@ -240,7 +240,7 @@ class TestSenderHandlerAdapterBatch:
     async def test_send_batch_session_obsolete_error(self, adapter, mock_sender):
         """send_batch should propagate SessionObsoletedError (important for pipeline)."""
         from fustor_core.exceptions import SessionObsoletedError
-        mock_sender.send_events = AsyncMock(side_effect=SessionObsoletedError("Expired"))
+        mock_sender._send_events_impl = AsyncMock(side_effect=SessionObsoletedError("Expired"))
         
         with pytest.raises(SessionObsoletedError, match="Expired"):
             await adapter.send_batch("sess-test", [{"id": 1}])

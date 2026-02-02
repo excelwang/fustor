@@ -1,6 +1,6 @@
 # Fustor Documentation
 
-Welcome to the Fustor documentation. Fustor is a high-reliability, consistency-aware data synchronization platform designed for NFS, S3, MySQL CDC, and other data sources. It can sync data from multiple sources to a central Fusion service, which then serves as a single source of truth for the data, using various views.
+Welcome to the Fustor documentation. Fustor is a high-reliability, consistency-aware data synchronization platform designed for NFS, S3, MySQL CDC, and other data sources. It can sync data from multiple sources to a central Fusion service, which then serves as a single source of truth for the data, using various views like dir tree and graph
 
 ## Core Concepts
 
