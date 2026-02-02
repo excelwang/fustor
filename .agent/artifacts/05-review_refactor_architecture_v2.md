@@ -16,12 +16,13 @@
 
 ### 1.1 重构目标回顾
 
-根据 `docs/top-level-specifications/01-ARCHITECTURE.md` 和 `04-Detailed_Decisions.md`，本次重构的核心目标是：
+根据 `.agent/artifacts/01-ARCHITECTURE.md` 和 `.agent/artifacts/04-Detailed_Decisions.md`，本次重构的核心目标是：
 
-1. **解耦与对称化**: 将 Agent/Fusion 架构对称化，通过 Pipeline 统一编排 Source->Sender 和 Receiver->View 流程
+1. **解耦与对称化**: 将 Agent/Fusion 架构对称化，通过 Pipeline 统一编排 Source→Sender 和 Receiver→View 流程
 2. **分层清晰**: Core 层提供抽象，Driver 层提供具体实现，Runtime 层负责编排
 3. **术语统一**: `pusher` 重命名为 `sender`, `datastore_id` 重命名为 `view_id`
 4. **可扩展性**: 通过 Schema 包定义数据契约，支持第三方扩展
+5. **一致性保障**: 保留 Leader/Follower、Sentinel、Suspect/Blind-spot/Tombstone 等 fs 特有机制
 
 ### 1.2 总体评分
 
@@ -286,17 +287,32 @@ def leader_session(self) -> Optional[str]:
 
 ### 4.1 一致性特性保留情况
 
-根据设计决策 6.x，以下功能需保留在 V2 中：
+根据 `.agent/artifacts/02-CONSISTENCY_DESIGN.md` 和 `.agent/artifacts/04-Detailed_Decisions.md` 设计决策 6.x，以下功能需保留在 V2 中：
 
-| 功能 | 状态 | 实现位置 |
-|------|------|----------|
-| Sentinel 验证 | ✅ 已实现 | `phases.run_sentinel_check()` |
-| Suspect/Blind-spot/Tombstone Lists | ✅ 已实现 | `view-fs` 驱动 |
-| 热点文件检测 | ⚠️ 未验证 | 需检查 `view-fs` |
-| Audit 跳过优化 | ⚠️ 未验证 | 需检查 `source-fs` |
-| 断点续传 | ✅ Pipeline 级别 | `AgentPipeline._run_control_loop` |
+| 功能 | 设计文档要求 | 实现位置 | 状态 |
+|------|--------------|----------|------|
+| Leader/Follower 机制 | fs 特有设计，保留在 view-fs/source-fs | `AgentPipeline`, `FusionPipeline` | ✅ 已实现 |
+| Sentinel 巡检 | view-fs, source-fs | `phases.run_sentinel_check()` | ✅ 已实现 |
+| Suspect List (热文件检测) | view-fs | `FSViewProvider` | ✅ 已实现 |
+| Blind-spot List (盲区检测) | view-fs | `FSViewProvider` | ✅ 已实现 |
+| Tombstone List (墓碑保护) | view-fs | `FSViewProvider` | ✅ 已实现 |
+| Audit 跳过优化 | source-fs, view-fs | `source-fs` 驱动 | ⚠️ 需验证 |
+| 断点续传 | Pipeline 级别 | `AgentPipeline` | ✅ 已实现 |
+| LogicalClock | View 级别 | `fustor_core.clock` | ✅ 已实现 |
+| 陈旧证据保护 | `last_updated_at` 字段 | `view-fs` | ✅ 已实现 |
 
-### 4.2 API 路径迁移
+### 4.2 一致性组件层级验证
+
+根据 `.agent/artifacts/04-Detailed_Decisions.md` 3.x 确认：
+
+| 组件 | 设计要求 | 实际实现 | 状态 |
+|------|----------|----------|------|
+| LogicalClock | View 级别 | `FSViewProvider` 持有 | ✅ 符合 |
+| Leader/Follower | fs 特有 | `view-fs` 实现 | ✅ 符合 |
+| 审计周期 | View 级别, fs 特有 | `FSViewProvider.handle_audit_*` | ✅ 符合 |
+| Session 超时 | Pipeline 配置 | `AgentPipeline.config` | ✅ 符合 |
+
+### 4.3 API 路径迁移
 
 | 旧路径 | 新路径 | 状态 |
 |--------|--------|------|
@@ -347,11 +363,12 @@ Fusion tests: 94 passed
 
 本次 V2 架构重构整体上是成功的，代码结构更加清晰，分层更加合理。主要的改进空间在于：
 
-1. **遗留代码清理**: 需要更彻底地移除或隔离 Legacy 模式代码
+1. **Legacy 代码彻底清理**: 必须完全移除 Legacy 模式代码，不接受 deprecated 标记
 2. **错误处理**: 部分关键路径的错误处理需要加强
-3. **术语统一**: `datastore_id` -> `view_id` 的迁移需要更彻底
+3. **术语统一**: `datastore_id` → `view_id` 的迁移需要更彻底
+4. **一致性验证**: 需要增加 E2E 测试验证完整的一致性流程
 
-建议在合并前完成高优先级的 TODO 项，并在后续迭代中逐步处理中低优先级项。
+**合并前必须完成**：高优先级 TODO 项（特别是 Legacy 代码删除）。
 
 ---
 

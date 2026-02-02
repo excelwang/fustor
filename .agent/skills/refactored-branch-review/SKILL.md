@@ -20,7 +20,7 @@ description: 详细评审当前的重构分支与原版分支(master)的差异�
 ## Step by Step to do the review and make sure you follow the steps strictly
 
 1. 切换到master分支，请深入理解一下master分支的原始代码（若已完成可以跳过）；
-2. 切换到最新的重构分支，请深入理解一下最新的重构分支的top-level-specifications文档（若已完成可以跳过）,作为后续代码评审的权威依据；
+2. 切换到最新的重构分支，请深入理解一下最新的重构分支的.agent/artifacts（若已完成可以跳过）,作为后续代码评审的权威依据；
 3. 评审一下最新的重构分支的代码实现；
 4. 这些更改是由一个新手程序员开发的，请帮忙指出其开发的缺陷和修正建议（在尽量优雅的同时注意不要过度设计），梳理成完整的、具体的todo事项清单和开发建议。
 
