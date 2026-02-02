@@ -70,7 +70,7 @@ class PipelineSessionBridge:
         self._session_manager = session_manager
         
         # Map session_id -> view_id (for legacy compatibility)
-        self._session_datastore_map: Dict[str, str] = {}
+        self._session_view_map: Dict[str, str] = {}
     
     async def create_session(
         self,
@@ -98,17 +98,17 @@ class PipelineSessionBridge:
         
         session_id = session_id or str(uuid.uuid4())
         # Support both new string view_id and legacy integer datastore_id
-        view_id = str(self._pipeline.datastore_id)
+        view_id = str(self._pipeline.view_id)
         
-        from fustor_fusion.datastore_state_manager import datastore_state_manager
+        from fustor_fusion.view_state_manager import view_state_manager
         
         # Leader/Follower election (First-Come-First-Serve)
-        # Note: datastore_state_manager should handle string IDs too
-        is_leader = await datastore_state_manager.try_become_leader(view_id, session_id)
+        # Note: view_state_manager should handle string IDs too
+        is_leader = await view_state_manager.try_become_leader(view_id, session_id)
         if is_leader:
-            await datastore_state_manager.set_authoritative_session(view_id, session_id)
+            await view_state_manager.set_authoritative_session(view_id, session_id)
             if not allow_concurrent_push:
-                await datastore_state_manager.lock_for_session(view_id, session_id)
+                await view_state_manager.lock_for_session(view_id, session_id)
         
         # Create in legacy SessionManager
         await self._session_manager.create_session_entry(
@@ -130,7 +130,7 @@ class PipelineSessionBridge:
         )
         
         # Track mapping
-        self._session_datastore_map[session_id] = view_id
+        self._session_view_map[session_id] = view_id
         
         # Get role from pipeline
         role = await self._pipeline.get_session_role(session_id)
@@ -156,12 +156,12 @@ class PipelineSessionBridge:
         Returns:
             Heartbeat response with role, tasks, etc.
         """
-        datastore_id = self._session_datastore_map.get(session_id)
+        view_id = self._session_view_map.get(session_id)
         
-        if datastore_id is not None:
+        if view_id is not None:
             # Update legacy SessionManager
             await self._session_manager.keep_session_alive(
-                view_id=datastore_id,
+                view_id=view_id,
                 session_id=session_id,
                 client_ip=client_ip
             )
@@ -184,22 +184,22 @@ class PipelineSessionBridge:
         Returns:
             True if successfully closed
         """
-        datastore_id = self._session_datastore_map.get(session_id)
+        view_id = self._session_view_map.get(session_id)
         
-        if datastore_id is not None:
+        if view_id is not None:
             # Remove from legacy SessionManager and release locks/leader
             await self._session_manager.terminate_session(
-                view_id=datastore_id,
+                view_id=view_id,
                 session_id=session_id
             )
             
             # Explicitly release leader/lock just in case terminate_session didn't cover everything
-            from fustor_fusion.datastore_state_manager import datastore_state_manager
-            await datastore_state_manager.unlock_for_session(datastore_id, session_id)
-            await datastore_state_manager.release_leader(datastore_id, session_id)
+            from fustor_fusion.view_state_manager import view_state_manager
+            await view_state_manager.unlock_for_session(view_id, session_id)
+            await view_state_manager.release_leader(view_id, session_id)
             
-            if session_id in self._session_datastore_map:
-                del self._session_datastore_map[session_id]
+            if session_id in self._session_view_map:
+                del self._session_view_map[session_id]
         
         # Close in Pipeline
         await self._pipeline.on_session_closed(session_id)
@@ -218,9 +218,9 @@ class PipelineSessionBridge:
             return info
         
         # Fallback to legacy
-        datastore_id = self._session_datastore_map.get(session_id)
-        if datastore_id is not None:
-            legacy_info = await self._session_manager.get_session_info(datastore_id, session_id)
+        view_id = self._session_view_map.get(session_id)
+        if view_id is not None:
+            legacy_info = await self._session_manager.get_session_info(view_id, session_id)
             if legacy_info:
                 # Map legacy SessionInfo to dict for consistency
                 return {

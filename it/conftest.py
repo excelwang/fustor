@@ -35,7 +35,7 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 # ============================================================================
-from fixtures.constants import TEST_TIMEOUT, CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C, MOUNT_POINT, AUDIT_INTERVAL
+from fixtures.constants import TEST_TIMEOUT, CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C, CONTAINER_FUSION, CONTAINER_NFS_SERVER, MOUNT_POINT, AUDIT_INTERVAL
 
 # Log architecture status
 logger.info("🚀 Integration tests running in V2 AgentPipeline mode")

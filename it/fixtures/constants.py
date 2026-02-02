@@ -9,6 +9,7 @@ CONTAINER_CLIENT_A = "fustor-nfs-client-a"
 CONTAINER_CLIENT_B = "fustor-nfs-client-b"
 CONTAINER_CLIENT_C = "fustor-nfs-client-c"
 CONTAINER_FUSION = "fustor-fusion"
+CONTAINER_NFS_SERVER = "fustor-nfs-server"
 
 # Shared mount point
 MOUNT_POINT = "/mnt/shared"

@@ -15,7 +15,7 @@ from ..auth.dependencies import get_view_id_from_api_key
 
 from ..config import receivers_config
 from ..core.session_manager import session_manager
-from ..datastore_state_manager import datastore_state_manager
+from ..view_state_manager import view_state_manager
 from ..view_manager.manager import reset_views, on_session_start, on_session_close
 
 
@@ -71,7 +71,7 @@ async def _should_allow_new_session(
     if allow_concurrent_push:
         return True
     else:
-        locked_session_id = await datastore_state_manager.get_locked_session_id(view_id)
+        locked_session_id = await view_state_manager.get_locked_session_id(view_id)
         logger.debug(f"View {view_id} is locked by session: {locked_session_id}")
 
         if not locked_session_id:
@@ -80,7 +80,7 @@ async def _should_allow_new_session(
 
         if locked_session_id not in active_session_ids:
             logger.warning(f"View {view_id} is locked by a stale session {locked_session_id} that is no longer active. Unlocking automatically.")
-            await datastore_state_manager.unlock_for_session(view_id, locked_session_id)
+            await view_state_manager.unlock_for_session(view_id, locked_session_id)
             return True
         else:
             logger.warning(f"View {view_id} is locked by an active session {locked_session_id}. Denying new session {session_id}.")
@@ -111,10 +111,10 @@ async def create_session(
         )
     
     # Leader/Follower election (First-Come-First-Serve)
-    is_leader = await datastore_state_manager.try_become_leader(view_id, session_id)
+    is_leader = await view_state_manager.try_become_leader(view_id, session_id)
     
     if is_leader:
-        await datastore_state_manager.set_authoritative_session(view_id, session_id)
+        await view_state_manager.set_authoritative_session(view_id, session_id)
 
     active_sessions = await session_manager.get_datastore_sessions(view_id)
     if not active_sessions and allow_concurrent_push:
@@ -143,7 +143,7 @@ async def create_session(
     )
     
     if not allow_concurrent_push:
-        await datastore_state_manager.lock_for_session(view_id, session_id)
+        await view_state_manager.lock_for_session(view_id, session_id)
     
     role = "leader" if is_leader else "follower"
     
@@ -171,16 +171,16 @@ async def heartbeat(
             detail=f"Session {session_id} not found"
         )
     
-    is_locked_by_session = await datastore_state_manager.is_locked_by_session(view_id, session_id)
+    is_locked_by_session = await view_state_manager.is_locked_by_session(view_id, session_id)
     if not is_locked_by_session:
-        await datastore_state_manager.lock_for_session(view_id, session_id)
+        await view_state_manager.lock_for_session(view_id, session_id)
     
     await session_manager.keep_session_alive(view_id, session_id, client_ip=request.client.host)
     
-    is_leader = await datastore_state_manager.try_become_leader(view_id, session_id)
+    is_leader = await view_state_manager.try_become_leader(view_id, session_id)
     
     if is_leader:
-        await datastore_state_manager.set_authoritative_session(view_id, session_id)
+        await view_state_manager.set_authoritative_session(view_id, session_id)
         
     role = "leader" if is_leader else "follower"
 
@@ -208,8 +208,8 @@ async def end_session(
             "message": f"Session {session_id} already terminated"
         }
     
-    await datastore_state_manager.unlock_for_session(view_id, session_id)
-    await datastore_state_manager.release_leader(view_id, session_id)
+    await view_state_manager.unlock_for_session(view_id, session_id)
+    await view_state_manager.release_leader(view_id, session_id)
     
     try:
         await on_session_close(view_id)
@@ -242,7 +242,7 @@ async def list_sessions(
             "session_timeout_seconds": session_info.session_timeout_seconds
         }
         
-        is_leader = await datastore_state_manager.is_leader(view_id, session_id)
+        is_leader = await view_state_manager.is_leader(view_id, session_id)
         session_data["role"] = "leader" if is_leader else "follower"
         session_data["can_snapshot"] = is_leader
         session_data["can_audit"] = is_leader

@@ -11,7 +11,7 @@ import logging
 
 from ..view_manager.manager import get_cached_view_manager
 from ..auth.dependencies import get_view_id_from_api_key
-from ..datastore_state_manager import datastore_state_manager
+from ..view_state_manager import view_state_manager
 from .. import runtime_objects
 from ..config.views import views_config
 
@@ -22,7 +22,7 @@ view_router = APIRouter(tags=["Data Views"])
 
 async def _check_core_readiness(view_id: str):
     """Internal helper to check core system readiness (snapshot signal, queue, inflight)."""
-    is_signal_complete = await datastore_state_manager.is_snapshot_complete(view_id)
+    is_signal_complete = await view_state_manager.is_snapshot_complete(view_id)
     
     queue_size = 0
     pm = runtime_objects.pipeline_manager

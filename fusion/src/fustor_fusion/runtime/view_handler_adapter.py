@@ -155,7 +155,7 @@ class ViewManagerAdapter(ViewHandler):
     Example usage:
         from fustor_fusion.view_manager.manager import ViewManager
         
-        manager = ViewManager(datastore_id="1")
+        manager = ViewManager(view_id="1")
         await manager.initialize_providers()
         
         handler = ViewManagerAdapter(manager)
@@ -179,7 +179,7 @@ class ViewManagerAdapter(ViewHandler):
             config: Optional configuration overrides
         """
         super().__init__(
-            handler_id=f"view-manager-{view_manager.datastore_id}",
+            handler_id=f"view-manager-{view_manager.view_id}",
             config=config or {}
         )
         self._manager = view_manager

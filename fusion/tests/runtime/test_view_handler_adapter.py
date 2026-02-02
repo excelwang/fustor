@@ -19,9 +19,9 @@ class MockViewDriver:
     
     target_schema = "mock"
     
-    def __init__(self, view_id: str = "mock-view", datastore_id: str = "1"):
+    def __init__(self, view_id: str = "mock-view"):
         self.view_id = view_id
-        self.datastore_id = datastore_id
+        self.view_id_legacy = "1"  # Keep for legacy internal checks if any
         self.config = {"mode": "batch"}
         self.events_processed: List[Any] = []
         self.session_starts = 0
@@ -75,8 +75,8 @@ class MockViewDriver:
 class MockViewManager:
     """Mock ViewManager for testing."""
     
-    def __init__(self, datastore_id: str = "1"):
-        self.datastore_id = datastore_id
+    def __init__(self, view_id: str = "1"):
+        self.view_id = view_id
         self.providers: Dict[str, MockViewDriver] = {
             "fs": MockViewDriver(view_id="fs-view"),
             "db": MockViewDriver(view_id="db-view"),

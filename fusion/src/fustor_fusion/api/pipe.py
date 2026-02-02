@@ -72,8 +72,6 @@ def setup_pipe_routers():
             raise HTTPException(status_code=404, detail="Pipeline not found")
         return await pipeline.get_dto()
     
-    # ... existing session listing ...
-
     @pipe_router.get("/session/", tags=["Pipeline"])
     async def list_active_sessions():
         """
@@ -81,22 +79,13 @@ def setup_pipe_routers():
         Mainly for integration tests and monitoring.
         """
         from ..core.session_manager import session_manager
-        from ..datastore_state_manager import datastore_state_manager
+        from ..view_state_manager import view_state_manager
         
         all_sessions = []
-        # session_manager has all sessions bridged from pipelines
-        # We iterate over all view_ids that have sessions
-        # In a real system we'd query pipeline_manager but bridge is easier for now.
-        
-        # Get all managed view_ids from datastore_state_manager or similar
-        # For simplicity, session_manager.get_all_sessions() returns EVERYTHING.
-        # Wait, does it have get_all_sessions()?
-        
-        # Let's check session_manager.py
         sessions_by_view = await session_manager.get_all_active_sessions()
         for view_id, sessions in sessions_by_view.items():
             for sid, si in sessions.items():
-                is_leader = await datastore_state_manager.is_leader(view_id, sid)
+                is_leader = await view_state_manager.is_leader(view_id, sid)
                 all_sessions.append({
                     "session_id": sid,
                     "task_id": si.task_id,

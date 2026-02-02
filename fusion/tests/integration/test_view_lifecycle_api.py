@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 from fustor_fusion.main import app
 from fustor_fusion.runtime_objects import view_managers
 from fustor_fusion.core.session_manager import session_manager
-from fustor_fusion.datastore_state_manager import datastore_state_manager
+from fustor_fusion.view_state_manager import view_state_manager
 
 @pytest_asyncio.fixture
 async def client():

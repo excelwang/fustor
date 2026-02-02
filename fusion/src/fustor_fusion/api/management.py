@@ -47,7 +47,7 @@ async def start_view(view_id: str):
     datastore_id = config.datastore_id
     if datastore_id not in view_managers:
         from ..view_manager.manager import ViewManager
-        view_managers[datastore_id] = ViewManager(datastore_id=datastore_id)
+        view_managers[datastore_id] = ViewManager(view_id=datastore_id)
     
     vm = view_managers[datastore_id]
     

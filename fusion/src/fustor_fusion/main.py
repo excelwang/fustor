@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 # --- Ingestor Service Specific Imports ---
 from .config import receivers_config
 from .core.session_manager import session_manager
-from .datastore_state_manager import datastore_state_manager
+from .view_state_manager import view_state_manager
 from . import runtime_objects
 from fustor_core.event import EventBase
 

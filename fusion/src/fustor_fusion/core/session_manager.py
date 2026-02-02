@@ -103,7 +103,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         Schedule cleanup for a single session after timeout.
         """
         view_id = str(view_id)
-        from ..datastore_state_manager import datastore_state_manager
+        from ..view_state_manager import view_state_manager
         
         try:
             while True:
@@ -152,9 +152,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                             logger.info(f"Cleared all session-associated data for view {view_id}.")
                         
                         # Release any associated lock and leader role
-                        from ..datastore_state_manager import datastore_state_manager
-                        await datastore_state_manager.unlock_for_session(view_id, session_id)
-                        await datastore_state_manager.release_leader(view_id, session_id)
+                        from ..view_state_manager import view_state_manager
+                        await view_state_manager.unlock_for_session(view_id, session_id)
+                        await view_state_manager.release_leader(view_id, session_id)
                         
                         logger.info(f"Session {session_id} on view {view_id} expired and removed")
         except asyncio.CancelledError:
@@ -171,9 +171,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         del self._sessions[view_id]
                     
                     # Release any associated lock in the datastore state manager
-                    await datastore_state_manager.unlock_for_session(view_id, session_id)
+                    await view_state_manager.unlock_for_session(view_id, session_id)
                     # Release leader role if this session was the leader
-                    await datastore_state_manager.release_leader(view_id, session_id)
+                    await view_state_manager.release_leader(view_id, session_id)
 
     
     async def get_session_info(self, view_id: str, session_id: str) -> Optional[SessionInfo]:
@@ -242,9 +242,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 logger.info(f"Cleared all data for view {view_id} as no sessions remain after removal.")
             
             # Release leader role and locks via state manager
-            from ..datastore_state_manager import datastore_state_manager
-            await datastore_state_manager.release_leader(view_id, session_id)
-            await datastore_state_manager.unlock_for_session(view_id, session_id)
+            from ..view_state_manager import view_state_manager
+            await view_state_manager.release_leader(view_id, session_id)
+            await view_state_manager.unlock_for_session(view_id, session_id)
             
             return True
 
@@ -252,7 +252,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         """
         Clean up all expired sessions across all views
         """
-        from ..datastore_state_manager import datastore_state_manager
+        from ..view_state_manager import view_state_manager
         
         async with self._lock:
             current_time = time.monotonic()
@@ -297,9 +297,9 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         logger.info(f"Cleared all data for view {view_id} as no sessions remain after cleanup.")
                     
                     # Release any associated lock in the datastore state manager
-                    await datastore_state_manager.unlock_for_session(view_id, session_id)
+                    await view_state_manager.unlock_for_session(view_id, session_id)
                     # Release leader role if this session was the leader
-                    await datastore_state_manager.release_leader(view_id, session_id)
+                    await view_state_manager.release_leader(view_id, session_id)
                     
                     logger.info(f"Session {session_id} on view {view_id} expired and removed by periodic cleanup")
 
@@ -309,14 +309,14 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         Explicitly terminate a session (useful for clean shutdowns)
         """
         view_id = str(view_id)
-        from ..datastore_state_manager import datastore_state_manager
+        from ..view_state_manager import view_state_manager
         
         # First, try to remove the session
         success = await self.remove_session(view_id, session_id)
         
         # Then, ensure the lock is also released from the datastore state manager
         if success:
-            await datastore_state_manager.unlock_for_session(view_id, session_id)
+            await view_state_manager.unlock_for_session(view_id, session_id)
             # Check if this was the last session for the view
             async with self._lock:
                 if view_id in self._sessions and not self._sessions[view_id]:

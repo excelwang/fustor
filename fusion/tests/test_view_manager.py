@@ -38,7 +38,7 @@ async def test_view_manager_initialization():
     with patch("fustor_fusion.config.views.views_config.get_by_datastore", return_value=[mock_config]), \
          patch("fustor_fusion.view_manager.manager._load_view_drivers", return_value={"mock": MockViewDriver}):
         
-        vm = ViewManager(datastore_id="1")
+        vm = ViewManager(view_id="1")
         await vm.initialize_providers()
         
         assert "test-view" in vm.providers

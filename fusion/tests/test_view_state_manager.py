@@ -1,11 +1,11 @@
 import pytest
 import asyncio
 from datetime import datetime
-from fustor_fusion.datastore_state_manager import DatastoreStateManager, DatastoreState
+from fustor_fusion.view_state_manager import ViewStateManager, ViewState
 
 @pytest.fixture
 def state_manager():
-    return DatastoreStateManager()
+    return ViewStateManager()
 
 @pytest.mark.asyncio
 async def test_initial_state(state_manager):

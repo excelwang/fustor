@@ -55,7 +55,7 @@ def mock_view_handler():
 @pytest.fixture
 def pipeline_config():
     return {
-        "datastore_id": 1,
+        "view_id": "1",
         "allow_concurrent_push": True,
         "queue_batch_size": 100,
     }
@@ -76,7 +76,7 @@ class TestFusionPipelineInit:
     def test_initial_state(self, fusion_pipeline):
         """Pipeline should start in STOPPED state."""
         assert fusion_pipeline.state == PipelineState.STOPPED
-        assert fusion_pipeline.datastore_id == "1"
+        assert fusion_pipeline.view_id == "1"
     
     def test_view_handlers_registered(self, fusion_pipeline, mock_view_handler):
         """View handlers should be registered."""
@@ -93,7 +93,7 @@ class TestFusionPipelineInit:
         """get_dto should return pipeline info."""
         dto = await fusion_pipeline.get_dto()
         assert dto["id"] == "test-pipeline"
-        assert dto["datastore_id"] == "1"
+        assert dto["view_id"] == "1"
         assert "mock-view" in dto["view_handlers"]
         assert "statistics" in dto
 

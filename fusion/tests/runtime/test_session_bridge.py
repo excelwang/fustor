@@ -17,7 +17,7 @@ from fustor_fusion.runtime import (
 def mock_pipeline():
     """Create a mock FusionPipeline."""
     pipeline = MagicMock(spec=FusionPipeline)
-    pipeline.datastore_id = "1"
+    pipeline.view_id = "1"
     pipeline._active_sessions = {}
     pipeline._leader_session = None
     
@@ -75,7 +75,7 @@ class TestPipelineSessionBridgeInit:
         
         assert bridge._pipeline is mock_pipeline
         assert bridge._session_manager is mock_session_manager
-        assert bridge._session_datastore_map == {}
+        assert bridge._session_view_map == {}
 
 
 class TestSessionCreation:
@@ -84,10 +84,10 @@ class TestSessionCreation:
     @pytest.mark.asyncio
     async def test_create_session(self, session_bridge, mock_pipeline, mock_session_manager):
         """create_session should create in both systems."""
-        # Wrap everything in a patch for datastore_state_manager to avoid side effects
-        with patch("fustor_fusion.datastore_state_manager.datastore_state_manager.try_become_leader", AsyncMock(return_value=True)), \
-             patch("fustor_fusion.datastore_state_manager.datastore_state_manager.set_authoritative_session", AsyncMock()), \
-             patch("fustor_fusion.datastore_state_manager.datastore_state_manager.lock_for_session", AsyncMock()):
+        # Wrap everything in a patch for view_state_manager to avoid side effects
+        with patch("fustor_fusion.view_state_manager.view_state_manager.try_become_leader", AsyncMock(return_value=True)), \
+             patch("fustor_fusion.view_state_manager.view_state_manager.set_authoritative_session", AsyncMock()), \
+             patch("fustor_fusion.view_state_manager.view_state_manager.lock_for_session", AsyncMock()):
             
             # Simulate pipeline setting role
             async def set_role(session_id, **kwargs):
@@ -157,8 +157,8 @@ class TestSessionClose:
     @pytest.mark.asyncio
     async def test_close_session(self, session_bridge, mock_pipeline, mock_session_manager):
         """close_session should close in both systems."""
-        with patch("fustor_fusion.datastore_state_manager.datastore_state_manager.unlock_for_session", AsyncMock()), \
-             patch("fustor_fusion.datastore_state_manager.datastore_state_manager.release_leader", AsyncMock()):
+        with patch("fustor_fusion.view_state_manager.view_state_manager.unlock_for_session", AsyncMock()), \
+             patch("fustor_fusion.view_state_manager.view_state_manager.release_leader", AsyncMock()):
             # First create a session
             async def set_role(session_id, **kwargs):
                 mock_pipeline._active_sessions[session_id] = {"role": "leader"}
@@ -167,7 +167,7 @@ class TestSessionClose:
             mock_pipeline.on_session_closed = AsyncMock()
             
             # Initialize map
-            session_bridge._session_datastore_map["sess-123"] = "1"
+            session_bridge._session_view_map["sess-123"] = "1"
             
             # Close session
             result = await session_bridge.close_session("sess-123")
@@ -203,7 +203,7 @@ class TestGetSessionInfo:
     @pytest.mark.asyncio
     async def test_get_session_info_fallback_to_legacy(self, session_bridge, mock_session_manager):
         """get_session_info should fallback to session manager."""
-        session_bridge._session_datastore_map["sess-1"] = "1"
+        session_bridge._session_view_map["sess-1"] = "1"
         mock_session_info = MagicMock()
         mock_session_info.session_id = "sess-1"
         mock_session_info.task_id = "old"

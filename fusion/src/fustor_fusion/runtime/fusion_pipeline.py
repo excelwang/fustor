@@ -282,7 +282,7 @@ class FusionPipeline(Pipeline):
         self.statistics["sessions_closed"] += 1
         
         from ..core.session_manager import session_manager
-        from ..datastore_state_manager import datastore_state_manager
+        from ..view_state_manager import view_state_manager
 
         if self._cached_leader_session == session_id:
             self._cached_leader_session = None
@@ -292,11 +292,11 @@ class FusionPipeline(Pipeline):
         # We query the session_manager (source of truth) for remaining sessions.
         remaining_sessions = await session_manager.get_datastore_sessions(self.view_id)
         if remaining_sessions:
-            current_leader = await datastore_state_manager.get_leader(self.view_id)
+            current_leader = await view_state_manager.get_leader(self.view_id)
             if not current_leader:
                 # No leader, try to elect from remaining
                 for sid in remaining_sessions.keys():
-                    if await datastore_state_manager.try_become_leader(self.view_id, sid):
+                    if await view_state_manager.try_become_leader(self.view_id, sid):
                         logger.info(f"New leader elected for view {self.view_id} after session close: {sid}")
                         self._cached_leader_session = sid
                         break
@@ -318,8 +318,8 @@ class FusionPipeline(Pipeline):
 
     async def get_session_role(self, session_id: str) -> str:
         """Get the role of a session (leader/follower)."""
-        from ..datastore_state_manager import datastore_state_manager
-        is_leader = await datastore_state_manager.is_leader(self.view_id, session_id)
+        from ..view_state_manager import view_state_manager
+        is_leader = await view_state_manager.is_leader(self.view_id, session_id)
         return "leader" if is_leader else "follower"
     
     async def _session_cleanup_loop(self) -> None:
@@ -376,10 +376,10 @@ class FusionPipeline(Pipeline):
         # Handle snapshot completion signal
         is_end = kwargs.get("is_end", False) or kwargs.get("is_snapshot_end", False)
         if source_type == "snapshot" and is_end:
-            from ..datastore_state_manager import datastore_state_manager
+            from ..view_state_manager import view_state_manager
             # Only leader can signal snapshot end
-            if await datastore_state_manager.is_leader(self.view_id, session_id):
-                await datastore_state_manager.set_snapshot_complete(self.view_id, session_id)
+            if await view_state_manager.is_leader(self.view_id, session_id):
+                await view_state_manager.set_snapshot_complete(self.view_id, session_id)
                 logger.info(f"Pipeline {self.id}: Received snapshot end signal from leader session {session_id}. Marking snapshot as complete.")
             else:
                 logger.warning(f"Pipeline {self.id}: Received snapshot end signal from non-leader session {session_id}. Ignored.")
@@ -414,10 +414,10 @@ class FusionPipeline(Pipeline):
     async def get_dto(self) -> Dict[str, Any]:
         """Get pipeline status as a dictionary."""
         from ..core.session_manager import session_manager
-        from ..datastore_state_manager import datastore_state_manager
+        from ..view_state_manager import view_state_manager
         
         sessions = await session_manager.get_datastore_sessions(self.view_id)
-        leader = await datastore_state_manager.get_leader(self.view_id)
+        leader = await view_state_manager.get_leader(self.view_id)
         
         async with self._lock:
             return {

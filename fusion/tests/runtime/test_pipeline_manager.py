@@ -62,7 +62,7 @@ class TestPipelineManager:
         pipe_cfg = MagicMock()
         pipe_cfg.enabled = True
         pipe_cfg.views = ["view1"]
-        pipe_cfg.extra = {"datastore_id": 1}
+        pipe_cfg.extra = {"view_id": "1"}
         pipe_cfg.allow_concurrent_push = True
         pipe_cfg.session_timeout_seconds = 30
         
@@ -79,7 +79,7 @@ class TestPipelineManager:
              await pipeline_manager.initialize_pipelines()
              
              assert "pipe-1" in pipeline_manager._pipelines
-             mock_get_vm.assert_called_with(1)
+             mock_get_vm.assert_called_with('1')
 
     @pytest.mark.asyncio
     async def test_callbacks(self, pipeline_manager):
