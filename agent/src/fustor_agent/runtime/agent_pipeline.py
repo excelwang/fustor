@@ -107,13 +107,37 @@ class AgentPipeline(Pipeline):
         
 
         
-        # Statistics
         self.statistics: Dict[str, Any] = {
             "events_pushed": 0,
             "last_pushed_event_id": None
         }
         self._consecutive_errors = 0
         self._last_heartbeat_at = 0.0  # Time of last successful role update (monotonic)
+
+    def _calculate_backoff(self, consecutive_errors: int) -> float:
+        """Standardized exponential backoff calculation."""
+        if consecutive_errors <= 0:
+            return 0.0
+        backoff = min(
+            self.error_retry_interval * (self.backoff_multiplier ** (consecutive_errors - 1)),
+            self.max_backoff_seconds
+        )
+        return backoff
+
+    def _handle_error(self, error: Exception, loop_name: str) -> float:
+        """Common error handling for loops: increment counter, alert if needed, return backoff."""
+        self._consecutive_errors += 1
+        backoff = self._calculate_backoff(self._consecutive_errors)
+        
+        if self._consecutive_errors >= self.max_consecutive_errors:
+            logger.warning(
+                f"Pipeline {self.id} {loop_name} loop reached threshold of {self._consecutive_errors} "
+                f"consecutive errors (Backoff: {backoff}s). Latest error: {error}"
+            )
+        else:
+            logger.error(f"Pipeline {self.id} {loop_name} loop error: {error}. Retrying in {backoff}s...")
+            
+        return backoff
     
     def _update_role_from_response(self, response: Dict[str, Any]) -> None:
         """Update role and heartbeat timer based on server response."""
@@ -281,18 +305,10 @@ class AgentPipeline(Pipeline):
                 continue
 
             except Exception as e:
-                self._consecutive_errors += 1
-                
-                # Exponential backoff
-                backoff = min(
-                    self.error_retry_interval * (self.backoff_multiplier ** (self._consecutive_errors - 1)),
-                    self.max_backoff_seconds
-                )
+                backoff = self._handle_error(e, "control")
                 
                 self._set_state(PipelineState.ERROR | PipelineState.RECONNECTING, 
                                 f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
-                
-                logger.error(f"Pipeline {self.id} control loop error: {e}. Retrying in {backoff}s...", exc_info=True)
                 
                 # If session failed, ensure it's cleared so we try to recreate it
                 if self.has_active_session():
@@ -364,13 +380,19 @@ class AgentPipeline(Pipeline):
                 response = await self.sender_handler.send_heartbeat(self.session_id)
                 self._update_role_from_response(response)
                 
+                # Reset error counter on success
+                if self._consecutive_errors > 0:
+                    logger.info(f"Pipeline {self.id} heartbeat recovered after {self._consecutive_errors} errors")
+                    self._consecutive_errors = 0
+                
             except SessionObsoletedError as e:
                 await self._handle_fatal_error(e)
                 break
             except Exception as e:
-                logger.warning(f"Pipeline {self.id} heartbeat error: {e}")
+                backoff = self._handle_error(e, "heartbeat")
                 # Don't kill the loop for transient heartbeat errors
-                await asyncio.sleep(self.heartbeat_interval_sec)
+                # But use backoff instead of just fixed interval if failing
+                await asyncio.sleep(max(self.heartbeat_interval_sec, backoff))
     
     
     async def _cleanup_leader_tasks(self) -> None:
@@ -501,9 +523,8 @@ class AgentPipeline(Pipeline):
                 await self._handle_fatal_error(e)
                 break
             except Exception as e:
-                logger.error(f"Audit loop error: {e}", exc_info=True)
-                # For generic errors, wait longer to avoid flooding
-                await asyncio.sleep(self.error_retry_interval * 10)
+                backoff = self._handle_error(e, "audit")
+                await asyncio.sleep(backoff)
     
     async def _run_audit_sync(self) -> None:
         """Execute audit synchronization."""
@@ -533,8 +554,8 @@ class AgentPipeline(Pipeline):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Sentinel check error: {e}", exc_info=True)
-                await asyncio.sleep(10)
+                backoff = self._handle_error(e, "sentinel")
+                await asyncio.sleep(backoff)
     
     async def _run_sentinel_check(self) -> None:
         """Execute sentinel check."""
