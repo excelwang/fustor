@@ -180,7 +180,7 @@ class App:
                     self.logger.warning(f"Unknown state part: {part}")
             persisted_bus_id = pipeline_state_data.get("bus_id")
 
-            if state in {PipelineState.MESSAGE_SYNC, PipelineState.RUNNING_CONF_OUTDATE, PipelineState.STOPPING}:
+            if state in {PipelineState.MESSAGE_PHASE, PipelineState.RUNNING_CONF_OUTDATE, PipelineState.STOPPING}:
                 self.logger.warning(f"Pipeline task '{pipeline_id}' was active on last shutdown. Recovering...")
                 
                 # Define async closure to capture pipeline_id

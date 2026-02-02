@@ -3,7 +3,7 @@ import pytest
 import asyncio
 from unittest.mock import MagicMock
 from fustor_agent.runtime.agent_pipeline import AgentPipeline
-from fustor_agent.runtime.pipeline.phases import run_audit_sync
+from fustor_agent.runtime.pipeline.phases import run_audit_phase
 from .mocks import MockSourceHandler, MockSenderHandler
 
 from fustor_core.pipeline import PipelineState
@@ -34,7 +34,7 @@ class TestAgentPipelineAudit:
     @pytest.mark.asyncio
     async def test_audit_sync_updates_context(self, agent_pipeline):
         """
-        Verify that run_audit_sync updates pipeline.audit_context from source iterator items,
+        Verify that run_audit_phase updates pipeline.audit_context from source iterator items,
         properly handling both Silent (None) entries and Active entries.
         """
         # Set state to RUNNING so loop continues
@@ -42,7 +42,7 @@ class TestAgentPipelineAudit:
         agent_pipeline.session_id = "sess-1"
         
         # Run audit sync directly
-        await run_audit_sync(agent_pipeline)
+        await run_audit_phase(agent_pipeline)
         
         # Verify context updates
         assert "/path/silent" in agent_pipeline.audit_context

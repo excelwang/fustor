@@ -12,8 +12,8 @@ from fustor_agent.runtime.agent_pipeline import AgentPipeline
 @pytest.fixture
 def agent_pipeline(mock_source, mock_sender, pipeline_config):
     return AgentPipeline(
-        pipeline_id="test-sync",
-        task_id="agent1:test-sync",
+        pipeline_id="test-pipeline",
+        task_id="agent1:test-pipeline",
         config=pipeline_config,
         source_handler=mock_source,
         sender_handler=mock_sender
@@ -36,8 +36,8 @@ class TestAgentPipelineInit:
     def test_dto(self, agent_pipeline):
         """get_dto should return pipeline info."""
         dto = agent_pipeline.get_dto()
-        assert dto.id == "test-sync"
-        assert dto.task_id == "agent1:test-sync"
+        assert dto.id == "test-pipeline"
+        assert dto.task_id == "agent1:test-pipeline"
         assert "STOPPED" in str(dto.state)
 
         assert dto.statistics is not None
@@ -73,5 +73,5 @@ class TestAgentPipelineStateManagement:
     def test_str_representation(self, agent_pipeline):
         """__str__ should return readable format."""
         s = str(agent_pipeline)
-        assert "test-sync" in s
+        assert "test-pipeline" in s
         assert "STOPPED" in s

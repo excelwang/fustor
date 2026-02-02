@@ -48,7 +48,7 @@ pushers:
       credential: "YOUR_API_KEY_HERE"
 ```
 
-### 3. 配置 Sync (同步任务)
+### 3. 配置 Pipeline (数据管道任务)
 
 将 Source 和 Pusher 绑定：
 

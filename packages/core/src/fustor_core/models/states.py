@@ -13,9 +13,9 @@ class PipelineState(Flag):
     """
     STOPPED = 0
     STARTING = auto()
-    SNAPSHOT_SYNC = auto()
-    MESSAGE_SYNC = auto()
-    AUDIT_SYNC = auto()
+    SNAPSHOT_PHASE = auto()
+    MESSAGE_PHASE = auto()
+    AUDIT_PHASE = auto()
     SENTINEL_SWEEP = auto()
     RUNNING_CONF_OUTDATE = auto()
     STOPPING = auto()

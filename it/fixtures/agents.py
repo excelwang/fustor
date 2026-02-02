@@ -39,7 +39,7 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
     Args:
         container_name: Docker container name
         api_key: API key for authentication
-        view_id: View ID for the sync
+        view_id: View ID for the pipeline
         mount_point: Path to the NFS mount point
     """
     fusion_endpoint = FUSION_ENDPOINT
@@ -83,17 +83,15 @@ fusion:
 """
     docker_manager.create_file_in_container(container_name, "/root/.fustor/senders-config.yaml", senders_config)
 
-    # 3. Syncs Config
-    docker_manager.exec_in_container(container_name, ["mkdir", "-p", "/root/.fustor/syncs-config"])
-    syncs_config = f"""
-id: "sync-task-1"
+    pipelines_config = f"""
+id: "pipeline-task-1"
 source: "shared-fs"
 sender: "fusion"
 disabled: false
 audit_interval_sec: {AUDIT_INTERVAL}
 sentinel_interval_sec: {SENTINEL_INTERVAL}
 """
-    docker_manager.create_file_in_container(container_name, "/root/.fustor/syncs-config/sync-task-1.yaml", syncs_config)
+    docker_manager.create_file_in_container(container_name, "/root/.fustor/pipelines-config/pipeline-task-1.yaml", pipelines_config)
     
     # 4. Kill existing agent if running and clean up pid/state files
     docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])

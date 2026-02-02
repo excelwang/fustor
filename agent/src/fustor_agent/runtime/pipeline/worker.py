@@ -6,7 +6,7 @@ from typing import Iterator, Any, AsyncIterator
 logger = logging.getLogger("fustor_agent.pipeline.worker")
 
 async def aiter_sync_wrapper(
-    sync_iter: Iterator[Any], 
+    phase_iter: Iterator[Any], 
     id_for_thread: str,
     queue_size: int = 1000
 ) -> AsyncIterator[Any]:
@@ -23,7 +23,7 @@ async def aiter_sync_wrapper(
     
     def _producer():
         try:
-            for item in sync_iter:
+            for item in phase_iter:
                 if stop_event.is_set():
                     break
                 # Blocking put via run_coroutine_threadsafe to respect backpressure

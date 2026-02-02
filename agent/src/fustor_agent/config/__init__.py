@@ -5,7 +5,7 @@ Configuration loaders for YAML-based configuration files.
 Config files:
 - senders-config.yaml: Sender definitions (HTTP/Fusion endpoints)
 - sources-config.yaml: Source definitions (file systems, databases)
-- syncs-config/: Pipeline task definitions
+- pipelines-config/: Pipeline task definitions
 """
 from .pipelines import PipelinesConfigLoader, AgentPipelineConfig, pipelines_config
 from .sources import SourcesConfigLoader, sources_config

@@ -15,8 +15,8 @@ class TestAgentPipelineLifecycle:
     @pytest.fixture
     def agent_pipeline(self, mock_source, mock_sender, pipeline_config):
         return AgentPipeline(
-            pipeline_id="test-sync",
-            task_id="agent:test-sync",
+            pipeline_id="test-pipeline",
+            task_id="agent:test-pipeline",
             config=pipeline_config,
             source_handler=mock_source,
             sender_handler=mock_sender

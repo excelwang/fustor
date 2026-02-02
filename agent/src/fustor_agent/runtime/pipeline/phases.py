@@ -12,8 +12,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("fustor_agent.pipeline.phases")
 
-async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
-    """Execute snapshot phasehronization for the given pipeline."""
+async def run_snapshot_phase(pipeline: "AgentPipeline") -> None:
+    """Execute snapshot phase for the given pipeline."""
     logger.info(f"Pipeline {pipeline.id}: Starting snapshot phase")
     
     try:
@@ -61,7 +61,7 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
         logger.error(f"Pipeline {pipeline.id} snapshot phase error: {e}", exc_info=True)
         raise
 
-async def run_driver_message_sync(pipeline: "AgentPipeline", start_position: int = -1) -> None:
+async def run_driver_message_phase(pipeline: "AgentPipeline", start_position: int = -1) -> None:
     """Execute message phase directly from driver."""
 
 
@@ -114,7 +114,7 @@ async def run_driver_message_sync(pipeline: "AgentPipeline", start_position: int
         # Signal stop to the underlying sync iterator
         stop_event.set()
 
-async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
+async def run_bus_message_phase(pipeline: "AgentPipeline") -> None:
     """Execute message phase reading from an internal event bus."""
     if not pipeline._bus:
         logger.error(f"Pipeline {pipeline.id}: Cannot run bus sync without a bus")
@@ -166,7 +166,7 @@ async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
         logger.error(f"Pipeline {pipeline.id} bus sync error: {e}", exc_info=True)
         raise
 
-async def run_audit_sync(pipeline: "AgentPipeline") -> None:
+async def run_audit_phase(pipeline: "AgentPipeline") -> None:
     """Execute a full audit phasehronization."""
     logger.info(f"Pipeline {pipeline.id}: Starting audit phase")
     old_state = pipeline.state

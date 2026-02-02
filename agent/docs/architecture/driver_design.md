@@ -19,13 +19,13 @@
 数据源驱动的核心职责是：
 
 1.  在**配置阶段**，通过一系列类方法与底层数据系统交互，执行连接测试、环境检查和权限设置。
-2.  在**运行阶段**，其实例由 `SyncInstance` 控制器创建和持有，负责按需提供“快照数据流”和“实时消息流”。
+2.  在**运行阶段**，其实例由 `AgentPipeline` 控制器创建和持有，负责按需提供“快照数据流”和“实时消息流”。
 
 一个完整的数据源驱动**类**必须实现以下方法：
 
 ### a. 核心运行时接口 (Runtime Interface)
 
-这些方法由 `SyncInstance` 或其下属服务（如 `EventBus`）调用，是数据流的源头。
+这些方法由 `AgentPipeline` 或其下属服务（如 `EventBus`）调用，是数据流的源头。
 
 *   `def __init__(self, config: SourceConfig):`
     *   **构造函数**: 每个驱动实例在创建时都会接收其对应的 `SourceConfig` 配置。
@@ -33,11 +33,11 @@
 *   `def get_snapshot_iterator(self, **kwargs) -> Iterator[EventBase]:`
     *   **阶段**: **补充性质的快照同步**。
     *   **职责**: 在被请求时，执行一次性的、有终点的批量历史数据同步。
-    *   **模型**: 这是一个标准的 Python **生成器 (Generator)**。`SyncInstance` 会在一个独立的后台任务中迭代此生成器。
+    *   **模型**: 这是一个标准的 Python **生成器 (Generator)**。`AgentPipeline` 会在一个独立的后台任务中迭代此生成器。
     *   **核心逻辑**: 与旧模型类似，驱动连接数据源，分批次拉取历史数据，并将每个批次封装在 `EventBase` 对象中 `yield` 出来。
 
 *   `def get_message_iterator(self, start_position: int = -1, **kwargs) -> Iterator[EventBase]:`
-    *   **阶段**: **实时消息同步**。
+    *   **阶段**: **实时消息阶段**。
     *   **职责**: 提供一个无终点的、持续的实时增量事件流。
     *   **模型**: 这是一个**“尽力而为”**的、可能阻塞的长轮询生成器。`EventBus` 会在后台线程中持续迭代它。
     *   **核心逻辑**:
@@ -74,7 +74,7 @@
     *   **构造函数**: 保持不变。
 
 *   `async def create_session(self, task_id: str) -> str:`
-    *   **职责**: 在同步任务启动时，向消费者请求创建一个新的同步会话。
+    *   **职责**: 在Pipeline 任务启动时，向消费者请求创建一个新的同步会话。
     *   **返回值**: 返回一个包含会话信息的字典，其中必须包含 `session_id`。
 
 *   `async def heartbeat(self, **kwargs) -> Dict:`
@@ -105,7 +105,7 @@
 ## 4. 文件系统驱动实现细节
 
 ### 4.1 共享实例模型
-为了优化资源使用，`FSDriver` 实现了一个共享实例模式。基于 `uri` 和 `credential` 的组合来缓存和复用驱动实例。这意味着对于指向同一路径且使用相同凭证的多个同步任务，它们将共享同一个底层的 `_WatchManager` 和 `inotify` 实例，从而显著减少了文件句柄和内存的消耗。
+为了优化资源使用，`FSDriver` 实现了一个共享实例模式。基于 `uri` 和 `credential` 的组合来缓存和复用驱动实例。这意味着对于指向同一路径且使用相同凭证的多个Pipeline 任务，它们将共享同一个底层的 `_WatchManager` 和 `inotify` 实例，从而显著减少了文件句柄和内存的消耗。
 
 ### 4.2 智能动态监控与LRU策略
 

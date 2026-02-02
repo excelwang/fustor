@@ -53,7 +53,7 @@ class PipelineManager:
 
     async def initialize_pipelines(self):
         """Initialize pipelines and receivers based on configuration."""
-        # Ensure receivers are loaded first (sync)
+        # Ensure receivers are loaded first
         if not self._receivers:
             self.load_receivers()
             

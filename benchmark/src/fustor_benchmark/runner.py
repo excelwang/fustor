@@ -262,14 +262,14 @@ class BenchmarkRunner:
             ingestion_end_time = time.time()
             total_ingestion_duration = ingestion_end_time - start_time
             
-            sync_duration = total_ingestion_duration - prescan_duration if prescan_duration else None
+            phase_duration = total_ingestion_duration - prescan_duration if prescan_duration else None
             
             click.echo(f"  [Fusion] Setup & Ingestion completed in {total_ingestion_duration:.2f}s.")
-            if sync_duration:
-                click.echo(f"  [Calculated] Snapshot Sync Duration (Net): {sync_duration:.2f}s")
+            if phase_duration:
+                click.echo(f"  [Calculated] Snapshot Phase Duration (Net): {phase_duration:.2f}s")
                 
             results["prescan"] = {"duration": prescan_duration}
-            results["snapshot_sync"] = {"duration": sync_duration, "total_ingestion": total_ingestion_duration}
+            results["snapshot_phase"] = {"duration": phase_duration, "total_ingestion": total_ingestion_duration}
             
             # MUST ensure we are Leader before proceeding to Phase 2/3
             if not self.services.wait_for_leader():
@@ -290,7 +290,7 @@ class BenchmarkRunner:
             # Wait for Audit Start
             audit_start_match = self.services.wait_for_log(
                 self.services.get_agent_log_path(), 
-                r"Audit sync started", 
+                r"Audit phase started", 
                 start_offset=log_offset, timeout=60
             )
             audit_start_time = time.time()
@@ -300,7 +300,7 @@ class BenchmarkRunner:
                 # Wait for Audit End
                 audit_end_match = self.services.wait_for_log(
                     self.services.get_agent_log_path(), 
-                    r"Audit sync completed", 
+                    r"Audit phase completed", 
                     start_offset=log_offset, timeout=120
                 )
                 audit_end_time = time.time()

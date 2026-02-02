@@ -1,5 +1,5 @@
-# Example: syncs-config/sync-research.yaml
-# Location: $FUSTOR_HOME/syncs-config/sync-research.yaml
+# Example: pipelines-config/sync-research.yaml
+# Location: $FUSTOR_HOME/pipelines-config/sync-research.yaml
 
 id: sync-research
 source: fs-research

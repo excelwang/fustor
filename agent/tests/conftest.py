@@ -13,20 +13,18 @@ from fustor_core.event import EventBase, InsertEvent
 def test_app_instance(tmp_path):
     config_dir = tmp_path / ".conf"
     config_dir.mkdir()
-    # ... (rest of the fixture is unchanged)
-    config_file = config_dir / "config.yaml"
     config_content = {
-        "sources": {
-            "test-test": {
-                "driver": "mysql",
-                "uri": "localhost:3306",
-                "credential": {"user": "fustor_agent", "passwd": ""},
-                "disabled": False,
-                "driver_params": {"stability_interval": 0.5}
+"sources": {
+    "test-test": {
+        "driver": "mysql",
+        "uri": "localhost:3306",
+        "credential": {"user": "fustor_agent", "passwd": ""},
+        "disabled": False,
+        "driver_params": {"stability_interval": 0.5}
             }
         },
-        "pushers": {},
-        "syncs": {},
+        "senders": {},
+        "pipelines": {},
     }
     with open(config_file, 'w') as f:
         yaml.dump(config_content, f)
@@ -37,7 +35,7 @@ def test_app_instance(tmp_path):
 @pytest_asyncio.fixture
 async def snapshot_phase_test_setup(test_app_instance: App, mocker):
     # ... (this fixture is unchanged)
-    sync_id = "test-snapshot-sync"
+    pipeline_id = "test-snapshot-sync"
     source_id = "test-snapshot-source"
     pusher_id = "test-snapshot-pusher"
 
@@ -78,7 +76,7 @@ async def snapshot_phase_test_setup(test_app_instance: App, mocker):
         driver="mock-driver", uri="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
     ))
     
-    await test_app_instance.sync_config_service.add_config(sync_id, PipelineConfig(
+    await test_app_instance.pipeline_config_service.add_config(pipeline_id, PipelineConfig(
         source=source_id,
         sender=pusher_id,
         disabled=False,
@@ -89,20 +87,20 @@ async def snapshot_phase_test_setup(test_app_instance: App, mocker):
 
     class Setup:
         def __init__(self):
-            self.sync_id = sync_id
+            self.pipeline_id = pipeline_id
             self.mock_pusher_driver = mock_pusher_driver
             self.spy_get_snapshot_iterator = spy_get_snapshot_iterator
             self.snapshot_data = snapshot_data
 
     yield Setup()
 
-    await test_app_instance.sync_config_service.delete_config(sync_id)
+    await test_app_instance.pipeline_config_service.delete_config(pipeline_id)
     await test_app_instance.source_config_service.delete_config(source_id)
     await test_app_instance.sender_config_service.delete_config(pusher_id)
 
 @pytest_asyncio.fixture
 async def message_phase_test_setup(test_app_instance: App, mocker):
-    sync_id = "test-message-sync"
+    pipeline_id = "test-message-sync"
     source_id = "test-message-source"
     pusher_id = "test-message-pusher"
     start_position = 99999
@@ -144,7 +142,7 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
         driver="mock-driver", uri="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
     ))
 
-    await test_app_instance.sync_config_service.add_config(sync_id, PipelineConfig(
+    await test_app_instance.pipeline_config_service.add_config(pipeline_id, PipelineConfig(
         source=source_id,
         sender=pusher_id,
         disabled=False,
@@ -155,7 +153,7 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
 
     class Setup:
         def __init__(self):
-            self.sync_id = sync_id
+            self.pipeline_id = pipeline_id
             self.start_position = start_position
             self.mock_pusher_driver = mock_pusher_driver
             self.spy_get_message_iterator = spy_get_message_iterator
@@ -164,6 +162,6 @@ async def message_phase_test_setup(test_app_instance: App, mocker):
 
     yield Setup()
 
-    await test_app_instance.sync_config_service.delete_config(sync_id)
+    await test_app_instance.pipeline_config_service.delete_config(pipeline_id)
     await test_app_instance.source_config_service.delete_config(source_id)
     await test_app_instance.sender_config_service.delete_config(pusher_id)

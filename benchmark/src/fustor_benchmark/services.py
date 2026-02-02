@@ -160,7 +160,7 @@ class ServiceManager:
             yaml.dump(senders_config, f)
 
         # 3. Pipelines Config
-        os.makedirs(os.path.join(self.env_dir, "agent-pipes-config"), exist_ok=True)
+        os.makedirs(os.path.join(self.env_dir, "pipelines-config"), exist_ok=True)
         pipe_config = {
             "pipeline_id": "bench-pipe",
             "source": "bench-fs",
@@ -169,7 +169,7 @@ class ServiceManager:
             "audit_interval_sec": kwargs.get("audit_interval", 0),
             "sentinel_interval_sec": kwargs.get("sentinel_interval", 0)
         }
-        with open(os.path.join(self.env_dir, "agent-pipes-config/bench-pipe.yaml"), "w") as f:
+        with open(os.path.join(self.env_dir, "pipelines-config/bench-pipe.yaml"), "w") as f:
             yaml.dump(pipe_config, f)
             
         cmd = [

@@ -51,7 +51,7 @@ Reliability also means data correctness. Fustor V2 uses:
 
 ## 4. Configuration Reference
 
-These properties can be set in your `agent-pipes-config/*.yaml`:
+These properties can be set in your `pipelines-config/*.yaml`:
 
 ```yaml
 id: my-pipeline

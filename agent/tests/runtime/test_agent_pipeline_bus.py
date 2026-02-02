@@ -11,7 +11,7 @@ from fustor_agent.runtime.agent_pipeline import AgentPipeline
 class TestAgentPipelineBus:
 
     @pytest.mark.asyncio
-    async def test_run_bus_message_sync_success(self, mock_source, mock_sender, pipeline_config):
+    async def test_run_bus_message_phase_success(self, mock_source, mock_sender, pipeline_config):
         """Pipeline should read from bus and commit successfully."""
         # Setup mock bus
         mock_bus = MagicMock()
@@ -39,7 +39,7 @@ class TestAgentPipelineBus:
         
         # Run bus message sync
         try:
-            await pipeline._run_bus_message_sync()
+            await pipeline._run_bus_message_phase()
         except asyncio.CancelledError:
             pass
             
@@ -56,7 +56,7 @@ class TestAgentPipelineBus:
         assert pipeline.statistics["events_pushed"] == 1
 
     @pytest.mark.asyncio
-    async def test_run_bus_message_sync_retry_on_failure(self, mock_source, mock_sender, pipeline_config):
+    async def test_run_bus_message_phase_retry_on_failure(self, mock_source, mock_sender, pipeline_config):
         """Pipeline should retry if sending bus events fails."""
         mock_bus = MagicMock()
         mock_bus.internal_bus = AsyncMock()
@@ -84,7 +84,7 @@ class TestAgentPipelineBus:
         
         # Run
         try:
-            await pipeline._run_bus_message_sync()
+            await pipeline._run_bus_message_phase()
         except asyncio.CancelledError:
             pass
             

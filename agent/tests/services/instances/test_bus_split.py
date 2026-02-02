@@ -46,11 +46,11 @@ async def test_bus_split_logic(event_bus_service, source_config):
     # 1. Create a bus and subscribe two consumers
     # S1 is the slow consumer, S2 is the fast one
     bus_runtime, _ = await event_bus_service.get_or_create_bus_for_subscriber(
-        source_id="test_source", source_config=source_config, sync_id="S1", required_position=100, fields_mapping=[]
+        source_id="test_source", source_config=source_config, pipeline_id="S1", required_position=100, fields_mapping=[]
     )
     
     await event_bus_service.get_or_create_bus_for_subscriber(
-        source_id="test_source", source_config=source_config, sync_id="S2", required_position=100, fields_mapping=[]
+        source_id="test_source", source_config=source_config, pipeline_id="S2", required_position=100, fields_mapping=[]
     )
     
     internal_bus = bus_runtime.internal_bus
@@ -83,7 +83,7 @@ async def test_bus_split_logic(event_bus_service, source_config):
     
     await event_bus_service.commit_and_handle_split(
         bus_id=bus_runtime.id,
-        sync_id="S2",
+        pipeline_id="S2",
         num_events=96,
         last_consumed_position=195,
         fields_mapping=[]

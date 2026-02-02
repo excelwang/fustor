@@ -21,7 +21,7 @@ class TestAgentRoleSwitch:
         
         # Start message sync but make it block
         sync_started = asyncio.Event()
-        async def mock_msg_sync():
+        async def mock_msg_phase():
             sync_started.set()
             try:
                 while True:
@@ -30,15 +30,15 @@ class TestAgentRoleSwitch:
                 # This is what we expect
                 raise
                 
-        pipeline._run_message_sync = mock_msg_sync
+        pipeline._run_message_phase = mock_msg_phase
         
         await pipeline.start()
         await sync_started.wait()
         
         # Verify it's in MESSAGE_PHASE
         assert pipeline.state & PipelineState.MESSAGE_PHASE
-        assert pipeline._message_sync_task is not None
-        assert not pipeline._message_sync_task.done()
+        assert pipeline._message_phase_task is not None
+        assert not pipeline._message_phase_task.done()
         
         # Change role via heartbeat
         mock_sender.role = "follower"
@@ -49,7 +49,7 @@ class TestAgentRoleSwitch:
         # Assertions
         assert pipeline.current_role == "follower"
         # Task should have been cancelled
-        assert pipeline._message_sync_task is None or pipeline._message_sync_task.cancelled() or pipeline._message_sync_task.done()
+        assert pipeline._message_phase_task is None or pipeline._message_phase_task.cancelled() or pipeline._message_phase_task.done()
         # State should reflect follower standby (PAUSED)
         assert pipeline.state & PipelineState.PAUSED
         
@@ -75,13 +75,13 @@ class TestAgentRoleSwitch:
         # Switch to leader
         mock_sender.role = "leader"
         
-        # Mock _run_message_sync to block so we can catch the state
+        # Mock _run_message_phase to block so we can catch the state
         sync_started = asyncio.Event()
-        async def mock_msg_sync():
+        async def mock_msg_phase():
             sync_started.set()
             while True:
                 await asyncio.sleep(0.1)
-        pipeline._run_message_sync = mock_msg_sync
+        pipeline._run_message_phase = mock_msg_phase
         
         # Wait for control loop to detect change and finish snapshot
         await sync_started.wait()

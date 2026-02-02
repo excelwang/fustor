@@ -141,7 +141,7 @@ class TestBaseConfigService:
 
         mock_instance = MagicMock()
         # --- REFACTORED: Use a valid v2 state ---
-        mock_instance.state = PipelineState.MESSAGE_SYNC
+        mock_instance.state = PipelineState.MESSAGE_PHASE
         mock_instance._set_state = MagicMock()
         mock_pipeline_instance_service.get_instance.return_value = mock_instance
 

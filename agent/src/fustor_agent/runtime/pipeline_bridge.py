@@ -74,7 +74,7 @@ class PipelineBridge:
         Args:
             pipeline_id: Unique identifier for this pipeline
             agent_id: The agent's ID
-            sync_config: Pipeline configuration
+            pipeline_config: Pipeline configuration
             source_config: Source configuration
             sender_config: Sender configuration  
             event_bus: Optional event bus
@@ -188,7 +188,7 @@ def create_pipeline_from_config(
     Args:
         pipeline_id: Pipeline ID
         agent_id: Agent ID
-        sync_config: Pipeline configuration
+        pipeline_config: Pipeline configuration
         source_config: Source configuration
         sender_config: Sender configuration
         sender_driver_service: Sender driver service

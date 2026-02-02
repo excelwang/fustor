@@ -29,8 +29,8 @@ def new_mock_bus():
 @pytest.fixture
 def agent_pipeline(mock_source, mock_sender, pipeline_config, mock_bus):
     return AgentPipeline(
-        pipeline_id="test-sync",
-        task_id="agent1:test-sync",
+        pipeline_id="test-pipeline",
+        task_id="agent1:test-pipeline",
         config=pipeline_config,
         source_handler=mock_source,
         sender_handler=mock_sender,
@@ -64,7 +64,7 @@ class TestRemapToNewBus:
         mock_task = MagicMock()
         mock_task.done.return_value = False
         mock_task.cancel = MagicMock()
-        agent_pipeline._message_sync_task = mock_task
+        agent_pipeline._message_phase_task = mock_task
         
         # Action
         await agent_pipeline.remap_to_new_bus(new_mock_bus, needed_position_lost=True)
@@ -104,8 +104,8 @@ class TestRemapToNewBus:
         """remap_to_new_bus should work when initial bus is None."""
         # Create pipeline without bus
         pipeline = AgentPipeline(
-            pipeline_id="test-sync-no-bus",
-            task_id="agent1:test-sync-no-bus",
+            pipeline_id="test-pipeline-no-bus",
+            task_id="agent1:test-pipeline-no-bus",
             config=pipeline_config,
             source_handler=mock_source,
             sender_handler=mock_sender,
@@ -127,7 +127,7 @@ class TestRemapToNewBus:
         mock_task = MagicMock()
         mock_task.done.return_value = True  # Already done
         mock_task.cancel = MagicMock()
-        agent_pipeline._message_sync_task = mock_task
+        agent_pipeline._message_phase_task = mock_task
         
         # Action
         await agent_pipeline.remap_to_new_bus(new_mock_bus, needed_position_lost=True)

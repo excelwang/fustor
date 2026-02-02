@@ -94,7 +94,7 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
                     reason = f"Dependency {self.config_type_capitalized} '{id}' configuration was {status}."
                     if self.config_type in ['source', 'sender']:
                         await self.pipeline_instance_service.mark_dependent_pipelines_outdated(self.config_type, id, reason, updates)
-                    elif self.config_type in ['pipeline', 'sync']: # Support both for type check
+                    elif self.config_type == 'pipeline':
                         instance = self.pipeline_instance_service.get_instance(id)
                         if instance and instance.state not in {PipelineState.STOPPED, PipelineState.ERROR}:
                             instance._set_state(PipelineState.RUNNING_CONF_OUTDATE, reason)
@@ -117,7 +117,7 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
 
         async with config_lock:
             # Stop the instance if it's a pipeline task itself being deleted.
-            if self.pipeline_instance_service and self.config_type in ['pipeline', 'sync']:
+            if self.pipeline_instance_service and self.config_type == 'pipeline':
                 await self.pipeline_instance_service.stop_one(id)
             
             conf = self._delete_config_from_app(id)

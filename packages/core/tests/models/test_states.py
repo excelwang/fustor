@@ -6,11 +6,11 @@ def test_event_bus_state_enum():
     assert EventBusState.PRODUCING.name == "PRODUCING"
     assert EventBusState.ERROR.name == "ERROR"
 
-def test_sync_state_enum():
+def test_pipeline_state_enum():
     assert PipelineState.STOPPED.name == "STOPPED"
     # --- REFACTORED: Test for new two-phase states instead of obsolete RUNNING state ---
-    assert PipelineState.SNAPSHOT_SYNC.name == "SNAPSHOT_SYNC"
-    assert PipelineState.MESSAGE_SYNC.name == "MESSAGE_SYNC"
+    assert PipelineState.SNAPSHOT_PHASE.name == "SNAPSHOT_PHASE"
+    assert PipelineState.MESSAGE_PHASE.name == "MESSAGE_PHASE"
     # --- END REFACTOR ---
     assert PipelineState.RUNNING_CONF_OUTDATE.name == "RUNNING_CONF_OUTDATE"
     assert PipelineState.STOPPING.name == "STOPPING"
@@ -30,7 +30,7 @@ def test_event_bus_instance_dto():
     assert dto.info == "Bus is actively producing events."
     assert dto.statistics == {"events_produced": 100, "consumers": 2}
 
-def test_sync_instance_dto():
+def test_pipeline_instance_dto():
     bus_dto = EventBusInstance(
         id="bus-456",
         source_name="another-source",
@@ -40,33 +40,33 @@ def test_sync_instance_dto():
     )
     # --- REFACTORED: Use one of the new valid states for the test ---
     dto = PipelineInstanceDTO(
-        id="sync-abc",
-        state=PipelineState.MESSAGE_SYNC,
-        info="Sync task is running normally.",
+        id="pipeline-abc",
+        state=PipelineState.MESSAGE_PHASE,
+        info="Pipeline task is running normally.",
         bus_info=bus_dto,
         bus_id="bus-456",
         statistics={"events_pushed": 50, "last_event_id": "xyz"}
     )
     # --- END REFACTOR ---
-    assert dto.id == "sync-abc"
-    assert dto.state == PipelineState.MESSAGE_SYNC
-    assert dto.info == "Sync task is running normally."
+    assert dto.id == "pipeline-abc"
+    assert dto.state == PipelineState.MESSAGE_PHASE
+    assert dto.info == "Pipeline task is running normally."
     assert dto.bus_info == bus_dto
     assert dto.bus_id == "bus-456"
     assert dto.statistics == {"events_pushed": 50, "last_event_id": "xyz"}
 
-def test_sync_instance_dto_no_bus_info():
+def test_pipeline_instance_dto_no_bus_info():
     dto = PipelineInstanceDTO(
-        id="sync-def",
+        id="pipeline-def",
         state=PipelineState.STOPPED,
-        info="Sync task is stopped.",
+        info="Pipeline task is stopped.",
         bus_info=None,
         bus_id=None,
         statistics={}
     )
-    assert dto.id == "sync-def"
+    assert dto.id == "pipeline-def"
     assert dto.state == PipelineState.STOPPED
-    assert dto.info == "Sync task is stopped."
+    assert dto.info == "Pipeline task is stopped."
     assert dto.bus_info is None
     assert dto.bus_id is None
     assert dto.statistics == {}

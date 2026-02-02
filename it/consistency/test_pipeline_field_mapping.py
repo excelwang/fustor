@@ -31,8 +31,8 @@ class TestPipelineFieldMapping:
         
         # 1. Update Agent Config to include fields_mapping
         # Map: file_path -> path, modified_time -> modified_time, is_dir -> is_dir, size -> wrong_size
-        sync_config = f"""
-id: "sync-task-1"
+        pipeline_config = f"""
+id: "pipeline-task-1"
 source: "shared-fs"
 sender: "fusion"
 disabled: false
@@ -48,8 +48,8 @@ fields_mapping:
 """
         docker_env.create_file_in_container(
             leader, 
-            "/root/.fustor/syncs-config/sync-task-1.yaml", 
-            sync_config
+            "/root/.fustor/pipelines-config/pipeline-task-1.yaml", 
+            pipeline_config
         )
         
         # 2. Restart Agent to apply config

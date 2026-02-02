@@ -55,8 +55,8 @@ class TestAgentErrorRecovery:
             mock_source, mock_sender
         )
         
-        # Mock _run_message_sync to simulate error after some time
-        original_msg_sync = pipeline._run_message_sync
+        # Mock _run_message_phase to simulate error after some time
+        original_msg_sync = pipeline._run_message_phase
         
         error_triggered = False
         async def mock_msg_sync():
@@ -69,7 +69,7 @@ class TestAgentErrorRecovery:
             while True:
                 await asyncio.sleep(0.1)
             
-        pipeline._run_message_sync = mock_msg_sync
+        pipeline._run_message_phase = mock_msg_sync
         
         # Start
         await pipeline.start()
@@ -111,7 +111,7 @@ class TestAgentErrorRecovery:
         # Manually run one audit sync
         # We need set_state to include RUNNING for it to work
         pipeline.state = PipelineState.RUNNING
-        await pipeline._run_audit_sync()
+        await pipeline._run_audit_phase()
         
         # Assertions:
         # 1. It should NOT throw AttributeError when trying to send "audit end" if session_id is None

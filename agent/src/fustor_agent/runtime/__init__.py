@@ -46,8 +46,8 @@ Example Usage:
 
     # Create and start pipeline
     pipeline = AgentPipeline(
-        pipeline_id="my-sync",
-        task_id="agent-1:my-sync",
+        pipeline_id="my-pipeline",
+        task_id="agent-1:my-pipeline",
         config={
             "batch_size": 100,
             "heartbeat_interval_sec": 10,
