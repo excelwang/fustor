@@ -59,7 +59,6 @@ async def test_view_driver_abc_initialization():
     driver = MockViewDriver(id="v1", view_id="10", config={"k": "v"})
     assert driver.id == "v1"
     assert driver.view_id == "10"
-    assert driver.datastore_id == "10" # Deprecated
     assert driver.config == {"k": "v"}
     
     await driver.initialize()
