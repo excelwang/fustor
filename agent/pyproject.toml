@@ -4,7 +4,7 @@ dynamic = ["version"]
 description = "realtime data sync agent for various data sources"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["click>=8.1.7", "pydantic>=2.11.7", "fustor-core", "fustor-source-fs", "fustor-sender-echo", "fustor-agent-sdk", "fustor-sender-http"]
+dependencies = ["click>=8.1.7", "pydantic>=2.11.7", "python-dotenv", "fustor-core", "fustor-source-fs", "fustor-sender-echo", "fustor-agent-sdk", "fustor-sender-http"]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"

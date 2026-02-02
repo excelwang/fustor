@@ -19,34 +19,17 @@ from utils import docker_manager
 
 logger = logging.getLogger("fustor_test")
 
-# Pipeline mode configuration
-USE_PIPELINE = os.getenv("FUSTOR_USE_PIPELINE", "false").lower() in ("true", "1", "yes")
-
-# Test timing
-AUDIT_INTERVAL = 5
-
-# Container names
-CONTAINER_CLIENT_A = "fustor-nfs-client-a"
-CONTAINER_CLIENT_B = "fustor-nfs-client-b"
-CONTAINER_CLIENT_C = "fustor-nfs-client-c"
-
-# Shared mount point
-MOUNT_POINT = "/mnt/shared"
+from .constants import (
+    CONTAINER_CLIENT_A, 
+    CONTAINER_CLIENT_B, 
+    CONTAINER_CLIENT_C, 
+    MOUNT_POINT, 
+    AUDIT_INTERVAL,
+    SENTINEL_INTERVAL
+)
 
 
-@pytest.fixture(scope="session")
-def use_pipeline():
-    """
-    Fixture that indicates if tests are running in Pipeline mode.
-    
-    Usage in tests:
-        def test_something(use_pipeline):
-            if use_pipeline:
-                # Pipeline-specific assertions
-            else:
-                # Legacy-specific assertions
-    """
-    return USE_PIPELINE
+
 
 
 def ensure_agent_running(container_name, api_key, datastore_id, mount_point=MOUNT_POINT):
@@ -59,10 +42,14 @@ def ensure_agent_running(container_name, api_key, datastore_id, mount_point=MOUN
         datastore_id: Datastore ID for the sync
         mount_point: Path to the NFS mount point
     """
-    fusion_endpoint = "http://fustor-fusion:18102"
+    fusion_endpoint = "http://fustor-fusion:8102"
     
     # Generate unique agent ID
     agent_id = f"{container_name.replace('fustor-nfs-', '')}-{os.urandom(2).hex()}"
+    
+    # Ensure config dir exists
+    docker_manager.exec_in_container(container_name, ["mkdir", "-p", "/root/.fustor"])
+
     docker_manager.create_file_in_container(
         container_name,
         "/root/.fustor/agent.id",
@@ -92,6 +79,7 @@ fusion:
   disabled: false
   driver_params:
     datastore_id: {datastore_id}
+    api_version: "pipe"
 """
     docker_manager.create_file_in_container(container_name, "/root/.fustor/senders-config.yaml", senders_config)
 
@@ -103,7 +91,7 @@ source: "shared-fs"
 sender: "fusion"
 disabled: false
 audit_interval_sec: {AUDIT_INTERVAL}
-sentinel_interval_sec: 1
+sentinel_interval_sec: {SENTINEL_INTERVAL}
 """
     docker_manager.create_file_in_container(container_name, "/root/.fustor/syncs-config/sync-task-1.yaml", syncs_config)
     
@@ -113,13 +101,9 @@ sentinel_interval_sec: 1
     docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent-state.json"])
     time.sleep(0.2)
     
-    # 5. Start new agent (with optional Pipeline mode)
-    env_prefix = ""
-    if USE_PIPELINE:
-        env_prefix = "FUSTOR_USE_PIPELINE=true "
-        logger.info(f"Starting agent in {container_name} with AgentPipeline mode")
-    else:
-        logger.info(f"Starting agent in {container_name} with legacy SyncInstance mode")
+    # 5. Start new agent (Always in Pipeline mode)
+    logger.info(f"Starting agent in {container_name} with AgentPipeline mode")
+    env_prefix = "FUSTOR_USE_PIPELINE=true "
     
     docker_manager.exec_in_container(
         container_name, 
@@ -173,7 +157,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
         leader = next((s for s in sessions if s.get("role") == "leader"), None)
         if leader:
             agent_id = leader.get("agent_id", "")
-            if "agent-a" in agent_id:
+            if "client-a" in agent_id:
                 logger.info(f"Agent A successfully became leader: {agent_id}")
                 break
             else:
@@ -204,7 +188,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
     start_wait = time.time()
     while time.time() - start_wait < 30:
         sessions = fusion_client.get_sessions()
-        agent_b = next((s for s in sessions if "agent-b" in s.get("agent_id", "")), None)
+        agent_b = next((s for s in sessions if "client-b" in s.get("agent_id", "")), None)
         if agent_b:
             logger.info(f"Agent B registered: {agent_b.get('agent_id')} (Role: {agent_b.get('role')})")
             break

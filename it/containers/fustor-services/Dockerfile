@@ -22,6 +22,7 @@ RUN pip install --no-cache-dir \
     /app/packages/fusion-sdk \
     /app/packages/schema-fs \
     /app/packages/view-fs \
+    /app/packages/receiver-http \
     /app/fusion
 
 

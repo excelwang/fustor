@@ -98,13 +98,37 @@ class FusionClient:
         resp.raise_for_status()
         return resp.json()
 
+    def get_sentinel_tasks(self) -> dict:
+        """Get sentinel tasks."""
+        resp = self.session.get(f"{self.base_url}/api/v1/pipe/consistency/sentinel/tasks")
+        resp.raise_for_status()
+        return resp.json()
+
+    def submit_sentinel_feedback(self, feedback: dict) -> dict:
+        """Submit sentinel feedback."""
+        resp = self.session.post(
+            f"{self.base_url}/api/v1/pipe/consistency/sentinel/feedback",
+            json=feedback
+        )
+        resp.raise_for_status()
+        return resp.json()
+
     # ============ Session API ============
 
     def get_sessions(self) -> list[dict]:
         """Get all active sessions."""
-        resp = self.session.get(f"{self.base_url}/api/v1/ingest/sessions/")
+        resp = self.session.get(f"{self.base_url}/api/v1/pipe/session/")
         resp.raise_for_status()
         return resp.json().get("active_sessions", [])
+
+    def terminate_session(self, session_id: str) -> dict:
+        """Terminate an active session."""
+        resp = self.session.delete(
+            f"{self.base_url}/api/v1/pipe/session/",
+            headers={"Session-ID": session_id}
+        )
+        resp.raise_for_status()
+        return resp.json()
 
     def get_leader_session(self) -> Optional[dict]:
         """Get the current leader session."""

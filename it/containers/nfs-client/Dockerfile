@@ -20,13 +20,14 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 
 # Install Fustor Agent and dependencies (all pip deps declared in package pyproject.toml)
 RUN pip install --no-cache-dir \
+    python-dotenv \
     /app/packages/core \
     /app/packages/agent-sdk \
     /app/packages/fusion-sdk \
     /app/packages/schema-fs \
     /app/packages/source-fs \
     /app/packages/sender-http \
-    /app/packages/pusher-fusion \
+    /app/packages/sender-echo \
     /app/agent
 
 

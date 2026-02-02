@@ -53,7 +53,9 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
 
         sync_config = self.sync_config_service.get_config(id)
         if not sync_config:
+            self.logger.error(f"Sync config '{id}' not found.")
             raise NotFoundError(f"Sync config '{id}' not found.")
+        self.logger.debug(f"Found sync config for {id}")
 
         if sync_config.disabled:
             self.logger.info(f"Sync instance '{id}' will not be started because its configuration is disabled.")
@@ -61,11 +63,15 @@ class SyncInstanceService(BaseInstanceService, SyncInstanceServiceInterface): # 
 
         source_config = self.source_config_service.get_config(sync_config.source)
         if not source_config:
+            self.logger.error(f"Source config for {id} not found")
             raise NotFoundError(f"Source config '{sync_config.source}' not found for sync '{id}'.")
+        self.logger.debug(f"Found source config for {id}")
         
         sender_config = self.sender_config_service.get_config(sync_config.sender)
         if not sender_config:
+            self.logger.error(f"Sender config for {id} not found")
             raise NotFoundError(f"Required Sender config '{sync_config.sender}' not found.")
+        self.logger.debug(f"Found sender config for {id}")
         
         self.logger.info(f"Attempting to start sync instance '{id}'...")
         try:

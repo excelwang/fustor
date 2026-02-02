@@ -14,6 +14,9 @@ dependencies = [
     "httpx",
     "orjson",
     "fustor-core",
+    "fustor-receiver-http",
+    "fustor-fusion-sdk",
+    "fustor-view-fs",
 ]
 [[project.authors]]
 name = "Huajin Wang"

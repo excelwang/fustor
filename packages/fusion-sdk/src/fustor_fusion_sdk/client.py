@@ -96,7 +96,7 @@ class FusionClient:
             logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
             return None
         except Exception as e:
-            logger.error(f"An error occurred: {e}")
+            logger.error(f"An error occurred connecting to {self.base_url}: {e!r}")
             return None
 
     async def get_sentinel_tasks(self) -> Dict[str, Any]:

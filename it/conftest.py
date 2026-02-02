@@ -35,32 +35,10 @@ if not logger.handlers:
     logger.setLevel(logging.INFO)
 
 # ============================================================================
-# Configuration
-# ============================================================================
-TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "600"))
+from fixtures.constants import TEST_TIMEOUT, CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C, MOUNT_POINT, AUDIT_INTERVAL
 
-# Pipeline mode: Set FUSTOR_USE_PIPELINE=true to test new architecture
-USE_PIPELINE = os.getenv("FUSTOR_USE_PIPELINE", "false").lower() in ("true", "1", "yes")
-
-# Timing Hierarchy (NFS actimeo=1 set in docker-compose.yml)
-ACTIMEO = 1 
-AUDIT_INTERVAL = 5
-
-# Container names
-CONTAINER_NFS_SERVER = "fustor-nfs-server"
-CONTAINER_FUSION = "fustor-fusion"
-CONTAINER_CLIENT_A = "fustor-nfs-client-a"
-CONTAINER_CLIENT_B = "fustor-nfs-client-b"
-CONTAINER_CLIENT_C = "fustor-nfs-client-c"
-
-# Shared mount point inside containers
-MOUNT_POINT = "/mnt/shared"
-
-# Log Pipeline mode status
-if USE_PIPELINE:
-    logger.info("🚀 Integration tests running in PIPELINE mode (AgentPipeline)")
-else:
-    logger.info("📦 Integration tests running in LEGACY mode (SyncInstance)")
+# Log architecture status
+logger.info("🚀 Integration tests running in V2 AgentPipeline mode")
 
 
 # ============================================================================
@@ -71,7 +49,7 @@ else:
 
 from fixtures.docker import docker_env, clean_shared_dir
 from fixtures.fusion import test_datastore, test_api_key, fusion_client
-from fixtures.agents import use_pipeline, setup_agents
+from fixtures.agents import setup_agents
 from fixtures.leadership import wait_for_audit, reset_leadership
 
 

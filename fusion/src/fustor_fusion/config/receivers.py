@@ -43,6 +43,7 @@ class ReceiverConfig(BaseModel):
     bind_host: str = "0.0.0.0"
     port: int = 8101
     session_timeout_seconds: int = 30
+    allow_concurrent_push: bool = False
     api_keys: List[ApiKeyMapping] = Field(default_factory=list)
     
     # Additional driver-specific configuration
@@ -211,6 +212,7 @@ class ReceiversConfigLoader:
                     "id": pipeline_id,
                     "receiver_id": receiver_id,
                     "session_timeout_seconds": receiver.session_timeout_seconds if receiver else 30,
+                    "allow_concurrent_push": receiver.allow_concurrent_push if receiver else False,
                 }
         return pipelines
     

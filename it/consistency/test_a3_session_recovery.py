@@ -1,0 +1,74 @@
+# it/consistency/test_a3_session_recovery.py
+"""
+Test A3: Session Recovery - Agent recovers from SessionObsoletedError (HTTP 419).
+
+验证 Agent 在会话过期或被强制终止后，能够检测到 419 错误并自动重新创建会话，恢复工作。
+"""
+import time
+import pytest
+import logging
+
+from ..utils import docker_manager
+
+logger = logging.getLogger(__name__)
+
+class TestSessionRecovery:
+    """Test Agent's ability to recover from lost sessions."""
+
+    def test_agent_recovers_after_session_terminated(
+        self,
+        setup_agents,
+        fusion_client
+    ):
+        """
+        Scenario:
+          1. Agent A is running as leader with an active session.
+          2. Fusion manually terminates Agent A's session.
+          3. Agent A's next heartbeat or ingestion should fail with 419.
+          4. Agent A should automatically re-create session and continue.
+        """
+        logger.info("Starting session recovery test")
+        
+        # 1. Get current leader session
+        sessions = fusion_client.get_sessions()
+        leader = next((s for s in sessions if "agent-a" in s.get("agent_id", "")), None)
+        assert leader is not None, "Agent A must be leader initially"
+        
+        old_session_id = leader["session_id"]
+        logger.info(f"Initial session ID: {old_session_id}")
+        
+        # 2. Terminate the session in Fusion
+        logger.info(f"Force terminating session {old_session_id}...")
+        fusion_client.terminate_session(old_session_id)
+        
+        # 3. Verify session is gone in Fusion
+        sessions_after = fusion_client.get_sessions()
+        assert old_session_id not in [s["session_id"] for s in sessions_after]
+        
+        # 4. Wait for Agent A to detect error and recover
+        # The heartbeat interval is usually 5s. Recovery should happen within reasonable time.
+        logger.info("Waiting for Agent A to recover and create new session...")
+        
+        start_wait = time.time()
+        timeout = 20
+        new_session_id = None
+        
+        while time.time() - start_wait < timeout:
+            sessions = fusion_client.get_sessions()
+            agent_a_sessions = [s for s in sessions if "agent-a" in s.get("agent_id", "")]
+            if agent_a_sessions:
+                new_session_id = agent_a_sessions[0]["session_id"]
+                if new_session_id != old_session_id:
+                    logger.info(f"Agent A recovered with new session ID: {new_session_id}")
+                    break
+            time.sleep(1)
+            
+        assert new_session_id is not None, "Agent A did not create a new session"
+        assert new_session_id != old_session_id, "Agent A should have a DIFFERENT session ID"
+        
+        # 5. Verify it still has leader role (or eventually regains it)
+        # In a single-agent scenario it should regain leader almost immediately
+        role = next(s["role"] for s in fusion_client.get_sessions() if s["session_id"] == new_session_id)
+        assert role == "leader", f"Recovered session should be leader, but got {role}"
+        
+        logger.info("✅ Session recovery verified successfully")

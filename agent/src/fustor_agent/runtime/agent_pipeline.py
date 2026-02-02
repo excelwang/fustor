@@ -589,7 +589,11 @@ class AgentPipeline(Pipeline):
                 audit_iter = self._aiter_sync(audit_iter)
             
             batch = []
-            async for event in audit_iter:
+            async for item in audit_iter:
+                if isinstance(item, tuple):
+                    event = item[0]
+                else:
+                    event = item
                 batch.append(event)
                 
                 if len(batch) >= self.batch_size:
@@ -644,16 +648,29 @@ class AgentPipeline(Pipeline):
         """Execute sentinel check."""
         logger.debug(f"Pipeline {self.id}: Running sentinel check")
         
-        # Get task batch from Fusion (would come from heartbeat response)
-        # For now, this is a placeholder
-        task_batch = {}
-        
-        if task_batch:
-            result = self.source_handler.perform_sentinel_check(task_batch)
-            if result:
-                await self.sender_handler.send_batch(
-                    self.session_id, [result], {"phase": "sentinel"}
-                )
+        try:
+            # 1. Fetch tasks from Fusion
+            task_batch = await self.sender_handler.get_sentinel_tasks()
+            
+            if not task_batch or not task_batch.get("paths"):
+                logger.debug(f"Pipeline {self.id}: No sentinel tasks available")
+                return
+            
+            logger.info(f"Pipeline {self.id}: Received {len(task_batch.get('paths', []))} sentinel tasks")
+            
+            # 2. Perform check via Source handler
+            results = self.source_handler.perform_sentinel_check(task_batch)
+            
+            if results:
+                # 3. Submit results back to Fusion
+                success = await self.sender_handler.submit_sentinel_results(results)
+                if success:
+                    logger.info(f"Pipeline {self.id}: Submitted sentinel results for {len(results.get('updates', []))} items")
+                else:
+                    logger.warning(f"Pipeline {self.id}: Failed to submit sentinel results")
+                    
+        except Exception as e:
+            logger.error(f"Pipeline {self.id}: Error during sentinel check: {e}", exc_info=True)
 
     async def trigger_audit(self) -> None:
 

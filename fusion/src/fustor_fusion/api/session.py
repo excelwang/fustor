@@ -62,12 +62,7 @@ async def _should_allow_new_session(
     logger.debug(f"Allow concurrent push: {allow_concurrent_push}")
 
     if allow_concurrent_push:
-        current_task_sessions = [
-            s_info for s_id, s_info in sessions.items()
-            if s_info.task_id == task_id
-        ]
-        logger.debug(f"Current sessions for task {task_id}: {len(current_task_sessions)}")
-        return len(current_task_sessions) == 0
+        return True
     else:
         locked_session_id = await datastore_state_manager.get_locked_session_id(datastore_id)
         logger.debug(f"Datastore {datastore_id} is locked by session: {locked_session_id}")

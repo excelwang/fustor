@@ -97,9 +97,24 @@ class DockerManager:
         workdir: Optional[str] = None,
         env: Optional[dict[str, str]] = None,
         capture_output: bool = True,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        max_attempts: int = 3,
+        delay: float = 1.0
     ) -> subprocess.CompletedProcess:
-        """Execute command in a running container."""
+        """
+        Execute command in a running container with automatic retry on failure.
+        
+        Args:
+            container: Target container name
+            command: Command to execute
+            workdir: Optional working directory
+            env: Optional environment variables
+            capture_output: Whether to capture stdout/stderr
+            timeout: Command timeout
+            max_attempts: Number of retry attempts (default 3)
+            delay: Initial delay between retries
+        """
+        last_exception = None
         cmd = ["docker", "exec"]
         if workdir:
             cmd.extend(["-w", workdir])
@@ -108,52 +123,35 @@ class DockerManager:
                 cmd.extend(["-e", f"{k}={v}"])
         cmd.append(container)
         cmd.extend(command)
-        return subprocess.run(cmd, capture_output=capture_output, text=True, timeout=timeout)
 
-    def exec_in_container_with_retry(
-        self,
-        container: str,
-        command: list[str],
-        max_attempts: int = 3,
-        delay: float = 1.0,
-        **kwargs
-    ) -> subprocess.CompletedProcess:
-        """
-        Execute command with automatic retry on failure.
-        
-        Args:
-            container: Target container name
-            command: Command to execute
-            max_attempts: Number of retry attempts
-            delay: Delay between retries (seconds)
-            **kwargs: Additional arguments passed to exec_in_container
-            
-        Returns:
-            CompletedProcess result
-        """
-        last_exception = None
+        current_delay = delay
         for attempt in range(1, max_attempts + 1):
             try:
-                result = self.exec_in_container(container, command, **kwargs)
-                if result.returncode == 0:
-                    return result
-                # Non-zero return might be intentional, so we don't retry
-                if attempt > 1:
-                    logger.info(f"Command succeeded on attempt {attempt}")
+                result = subprocess.run(cmd, capture_output=capture_output, text=True, timeout=timeout)
+                # Success if returncode is 0 OR if it's the first attempt and failed (intentional failure check)
+                # Note: We only retry if there was an EXCEPTION (like docker daemon issue)
+                # or if the command failed and it's a known transient issue.
+                # Actually, standard behavior is to only retry on exceptions.
                 return result
-            except Exception as e:
+            except (subprocess.SubprocessError, Exception) as e:
                 last_exception = e
                 if attempt < max_attempts:
                     logger.warning(
-                        f"exec_in_container failed (attempt {attempt}/{max_attempts}): {e}. "
-                        f"Retrying in {delay}s..."
+                        f"exec_in_container to {container} failed (attempt {attempt}/{max_attempts}): {e}. "
+                        f"Retrying in {current_delay}s..."
                     )
-                    time.sleep(delay)
-                    delay *= 2  # Exponential backoff
+                    time.sleep(current_delay)
+                    current_delay *= 2
+                else:
+                    logger.error(f"exec_in_container to {container} failed after {max_attempts} attempts: {e}")
         
         if last_exception:
             raise last_exception
-        raise RuntimeError("exec_in_container_with_retry failed unexpectedly")
+        raise RuntimeError("exec_in_container failed unexpectedly")
+
+    def exec_in_container_with_retry(self, *args, **kwargs) -> subprocess.CompletedProcess:
+        """Deprecated: Use exec_in_container directly which now includes retry logic."""
+        return self.exec_in_container(*args, **kwargs)
 
     def get_logs(self, container: str, tail: int = 100) -> str:
         """Get container logs."""

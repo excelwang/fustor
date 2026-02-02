@@ -15,18 +15,19 @@ if str(_it_dir) not in sys.path:
     sys.path.insert(0, str(_it_dir))
 
 from utils import docker_manager
+from .constants import (
+    CONTAINER_CLIENT_A,
+    CONTAINER_CLIENT_B,
+    CONTAINER_CLIENT_C,
+    CONTAINER_FUSION,
+    MOUNT_POINT,
+    SESSION_TIMEOUT
+)
 
 logger = logging.getLogger("fustor_test")
 
 # Container names
 CONTAINER_NFS_SERVER = "fustor-nfs-server"
-CONTAINER_FUSION = "fustor-fusion"
-CONTAINER_CLIENT_A = "fustor-nfs-client-a"
-CONTAINER_CLIENT_B = "fustor-nfs-client-b"
-CONTAINER_CLIENT_C = "fustor-nfs-client-c"
-
-# Shared mount point inside containers
-MOUNT_POINT = "/mnt/shared"
 
 
 @pytest.fixture(scope="session")
@@ -62,10 +63,14 @@ def docker_env():
     docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/views-config"])
     
     # 2. Inject Receivers Config (v2: renamed from 'datastores')
-    receivers_config = """
-integration-test-ds:
-  api_key: "test-api-key-123"
-  session_timeout_seconds: 3
+    receivers_config = f"""
+http-main:
+  driver: "http"
+  port: 8102
+  api_keys:
+    - key: "test-api-key-123"
+      pipeline_id: "integration-test-ds"
+  session_timeout_seconds: {SESSION_TIMEOUT}
   allow_concurrent_push: true
 """
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/receivers-config.yaml", receivers_config)

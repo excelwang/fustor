@@ -14,12 +14,15 @@ When reviewing refactored test code, follow these steps:
 3. **Performance**: Are there obvious inefficiencies?
 4. **Over-testing**: Are there redundant tests?
 5. **Test coverage**: Are there missing tests?
+6. **Test code pollution**: Does the test code pollute the business code? include twist the business logic to make it easier to test, or add extra methods to the business code to make it easier to test.
 
 ## How to use it
 1. 请深入理解当前分支的业务代码；
-2. 请深入理解一下原版(master分支)的测试代码；
-3. 请深入理解一下当前分支的测试代码；
-4. 比较两者，找出当前分支的缺陷和修正建议，梳理成完整的、具体的todo事项清单和开发建议。
+2. 请深入理解一下当前分支的测试代码；
+3. 检查一下当前分支的测试代码是否污染了最新的业务代码；
+4. 请深入理解一下原版(master分支)的测试代码；
+5. 比较两版测试代码，找出当前分支测试代码的缺陷和修正建议；
+6. 梳理成完整的、具体的todo事项清单和开发建议。
 
 ## How to provide feedback
 
