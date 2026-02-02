@@ -8,6 +8,8 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 import logging
 
+from ..event import EventBase
+
 logger = logging.getLogger(__name__)
 
 
@@ -85,7 +87,7 @@ class Sender(ABC):
     @abstractmethod
     async def send_events(
         self, 
-        events: List[Any], 
+        events: List[EventBase], 
         source_type: str = "message",
         is_end: bool = False
     ) -> Dict[str, Any]:

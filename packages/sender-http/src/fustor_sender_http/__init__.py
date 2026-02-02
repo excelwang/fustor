@@ -88,7 +88,7 @@ class HTTPSender(Sender):
     
     async def send_events(
         self, 
-        events: List[Any], 
+        events: List[EventBase], 
         source_type: str = "message",
         is_end: bool = False
     ) -> Dict[str, Any]:

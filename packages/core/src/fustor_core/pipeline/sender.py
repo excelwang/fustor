@@ -9,6 +9,7 @@ from abc import ABC, abstractmethod
 from typing import Any, Dict, Optional, List, Tuple
 import logging
 
+from ..event import EventBase
 from .handler import Handler
 
 logger = logging.getLogger(__name__)
@@ -64,7 +65,7 @@ class SenderHandler(Handler):
     async def send_batch(
         self, 
         session_id: str,
-        events: List[Any],
+        events: List[EventBase],
         batch_context: Optional[Dict[str, Any]] = None
     ) -> Tuple[bool, Dict[str, Any]]:
         """

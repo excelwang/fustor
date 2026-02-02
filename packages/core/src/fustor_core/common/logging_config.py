@@ -26,7 +26,8 @@ def setup_logging(
     log_file_path: str, # Now accepts full path
     base_logger_name: str,
     level: int = logging.INFO,
-    console_output: bool = True
+    console_output: bool = True,
+    additional_loggers: list[str] = None
 ):
     """
     通用日志配置函数。
@@ -84,20 +85,20 @@ def setup_logging(
         'handlers': {
             'file': {
                 'class': 'logging.handlers.RotatingFileHandler',
-                'level': logging.DEBUG,  # Set to DEBUG so it can catch DEBUG level logs
+                'level': logging.DEBUG,
                 'formatter': 'standard',
                 'filename': log_file_path,
                 'maxBytes': 10485760, # 10MB
                 'backupCount': 5,
                 'encoding': 'utf8',
-                'filters': ['uvicorn_access_filter']  # Add the custom filter
+                'filters': ['uvicorn_access_filter']
             },
             'console': {
                 'class': 'logging.StreamHandler',
-                'level': logging.DEBUG,  # Set to DEBUG for the same reason
+                'level': logging.DEBUG,
                 'formatter': 'color_console',
                 'stream': sys.stdout,
-                'filters': ['uvicorn_access_filter']  # Add the custom filter
+                'filters': ['uvicorn_access_filter']
             }
         },
         'filters': {
@@ -110,33 +111,9 @@ def setup_logging(
             'fustor': {
                 'handlers': ['file'],
                 'level': numeric_level,
-                'propagate': False
+                'propagate': True
             },
-            'fustor_core': {
-                'handlers': ['file'],
-                'level': numeric_level,
-                'propagate': False
-            },
-            'fustor_agent': {
-                'handlers': ['file'],
-                'level': numeric_level,
-                'propagate': False
-            },
-            'fustor_source_fs': {
-                'handlers': ['file'],
-                'level': numeric_level,
-                'propagate': False
-            },
-            'fustor_sender_http': {
-                'handlers': ['file'],
-                'level': numeric_level,
-                'propagate': False
-            },
-            'fustor_sender_echo': {
-                'handlers': ['file'],
-                'level': numeric_level,
-                'propagate': False
-            },
+            # Infrastructure loggers
             'uvicorn': {
                 'handlers': ['file'],
                 'level': numeric_level,
@@ -155,10 +132,28 @@ def setup_logging(
         },
         'root': {
             'handlers': ['file'],
-            'level': logging.ERROR, # Keep root at ERROR to avoid noise
-            'propagate': True, # Allow root to emit to its handlers for unhandled exceptions
+            'level': logging.ERROR,
+            'propagate': True,
         }
     }
+
+    # Add the base logger
+    if base_logger_name not in LOGGING_CONFIG['loggers']:
+        LOGGING_CONFIG['loggers'][base_logger_name] = {
+            'handlers': ['file'],
+            'level': numeric_level,
+            'propagate': False
+        }
+
+    # Add additional loggers
+    if additional_loggers:
+        for logger_name in additional_loggers:
+            if logger_name not in LOGGING_CONFIG['loggers']:
+                LOGGING_CONFIG['loggers'][logger_name] = {
+                    'handlers': ['file'],
+                    'level': numeric_level,
+                    'propagate': False
+                }
 
     if console_output:
         for logger_name in LOGGING_CONFIG['loggers']:

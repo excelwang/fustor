@@ -124,42 +124,53 @@ class ServiceManager:
         if os.path.exists(agent_pid):
             os.remove(agent_pid)
 
-        config = {
-            "sources": {
-                "bench-fs": {
-                    "driver": "fs",
-                    "uri": self.data_dir,
-                    "credential": {"key": "dummy"}, # Use valid-looking key for source
-                    "disabled": False,
-                    "is_transient": True,
+        # 1. Sources Config
+        sources_config = {
+            "bench-fs": {
+                "driver": "fs",
+                "uri": self.data_dir,
+                "credential": {"key": "dummy"}, 
+                "disabled": False,
+                "is_transient": True,
+                "driver_params": {
                     "max_queue_size": 100000,
                     "max_retries": 1,
-                    "driver_params": {"min_monitoring_window_days": 1}
+                    "min_monitoring_window_days": 1
                 }
-            },
-            "pushers": {
-                "bench-fusion": {
-                    "driver": "fusion",
-                    "endpoint": f"http://127.0.0.1:{self.fusion_port}",
-                    "credential": {"key": api_key},
-                    "disabled": False,
+            }
+        }
+        with open(os.path.join(self.env_dir, "sources-config.yaml"), "w") as f:
+            yaml.dump(sources_config, f)
+
+        # 2. Senders Config
+        senders_config = {
+            "bench-fusion": {
+                "driver": "http",
+                "endpoint": f"http://127.0.0.1:{self.fusion_port}",
+                "credential": {"key": api_key},
+                "disabled": False,
+                "config": {
                     "batch_size": 1000,
                     "max_retries": 10,
                     "retry_delay_sec": 5
                 }
-            },
-            "syncs": {
-                "bench-sync": {
-                    "source": "bench-fs",
-                    "pusher": "bench-fusion",
-                    "disabled": False,
-                    "audit_interval_sec": kwargs.get("audit_interval", 0),
-                    "sentinel_interval_sec": kwargs.get("sentinel_interval", 0)
-                }
             }
         }
-        with open(os.path.join(self.env_dir, "agent-config.yaml"), "w") as f:
-            yaml.dump(config, f)
+        with open(os.path.join(self.env_dir, "senders-config.yaml"), "w") as f:
+            yaml.dump(senders_config, f)
+
+        # 3. Pipelines Config
+        os.makedirs(os.path.join(self.env_dir, "agent-pipes-config"), exist_ok=True)
+        pipe_config = {
+            "pipeline_id": "bench-pipe",
+            "source": "bench-fs",
+            "sender": "bench-fusion",
+            "disabled": False,
+            "audit_interval_sec": kwargs.get("audit_interval", 0),
+            "sentinel_interval_sec": kwargs.get("sentinel_interval", 0)
+        }
+        with open(os.path.join(self.env_dir, "agent-pipes-config/bench-pipe.yaml"), "w") as f:
+            yaml.dump(pipe_config, f)
             
         cmd = [
             "fustor-agent", "start",
@@ -241,21 +252,21 @@ class ServiceManager:
             time.sleep(0.5)
         return None
 
-    def trigger_agent_audit(self, sync_id="bench-sync"):
+    def trigger_agent_audit(self, sync_id="bench-pipe"):
         """Triggers audit for a sync instance via Agent API."""
         url = f"http://localhost:{self.agent_port}/api/instances/syncs/{sync_id}/_actions/trigger_audit"
         res = requests.post(url)
         res.raise_for_status()
         return res.json()
 
-    def trigger_agent_sentinel(self, sync_id="bench-sync"):
+    def trigger_agent_sentinel(self, sync_id="bench-pipe"):
         """Triggers sentinel for a sync instance via Agent API."""
         url = f"http://localhost:{self.agent_port}/api/instances/syncs/{sync_id}/_actions/trigger_sentinel"
         res = requests.post(url)
         res.raise_for_status()
         return res.json()
 
-    def wait_for_leader(self, sync_id="bench-sync", timeout=30, start_offset=0):
+    def wait_for_leader(self, sync_id="bench-pipe", timeout=30, start_offset=0):
         click.echo(f"Waiting for {sync_id} to become LEADER...")
         pattern = rf"Assigned LEADER role for {sync_id}"
         return self.wait_for_log(self.get_agent_log_path(), pattern, start_offset=start_offset, timeout=timeout)
