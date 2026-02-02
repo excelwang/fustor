@@ -1,14 +1,13 @@
 # .github/workflows/integration-tests.yml
 # Integration test workflow for Fustor NFS multi-mount consistency tests
 # 
-# Runs in both Legacy (SyncInstance) and Pipeline (AgentPipeline) modes
-# to ensure behavioral consistency across architectures.
+# Runs integration tests for the Fusion Pipeline architecture.
 
 name: Integration Tests
 
 on:
   push:
-    branches: [main, develop, 'refactor/*']
+    branches: [main, develop, 'refactor/*', 'feature/*']
     paths:
       - 'agent/**'
       - 'fusion/**'
@@ -23,23 +22,13 @@ on:
       - 'packages/**'
       - 'it/**'
   workflow_dispatch:
-    inputs:
-      mode:
-        description: 'Test mode (legacy, pipeline, both)'
-        required: true
-        default: 'both'
-        type: choice
-        options:
-          - legacy
-          - pipeline
-          - both
 
 env:
   PYTHON_VERSION: '3.11'
   UV_CACHE_DIR: ~/.cache/uv
 
 jobs:
-  # Build step - shared across modes
+  # Build step
   build:
     name: Build Docker Images
     runs-on: ubuntu-latest
@@ -66,12 +55,11 @@ jobs:
           path: /tmp/it-images.tar
           retention-days: 1
 
-  # Legacy mode tests
-  test-legacy:
-    name: Test (Legacy Mode)
+  # Integration Tests
+  integration-test:
+    name: Run Integration Tests
     needs: build
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.mode != 'pipeline' }}
     
     steps:
       - name: Checkout
@@ -103,84 +91,9 @@ jobs:
           docker compose up -d --wait
           docker compose ps
 
-      - name: Run integration tests (Legacy)
+      - name: Run integration tests
         run: |
-          uv run pytest it/consistency/ -v --tb=short --junit-xml=test-results-legacy.xml
-        env:
-          FUSTOR_USE_PIPELINE: 'false'
-          FUSTOR_TEST_TIMEOUT: '600'
-
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: test-results-legacy
-          path: test-results-legacy.xml
-
-      - name: Collect logs on failure
-        if: failure()
-        run: |
-          cd it
-          docker compose logs > docker-compose-logs.txt
-          for container in fustor-fusion fustor-nfs-client-a fustor-nfs-client-b; do
-            docker logs $container > ${container}-logs.txt 2>&1 || true
-          done
-
-      - name: Upload failure logs
-        uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: failure-logs-legacy
-          path: |
-            it/docker-compose-logs.txt
-            it/*-logs.txt
-
-      - name: Cleanup
-        if: always()
-        run: |
-          cd it
-          docker compose down -v || true
-
-  # Pipeline mode tests
-  test-pipeline:
-    name: Test (Pipeline Mode)
-    needs: build
-    runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.mode != 'legacy' }}
-    
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Download Docker images
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-images
-          path: /tmp
-
-      - name: Load Docker images
-        run: docker load < /tmp/it-images.tar
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          version: "0.5.14"
-
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
-
-      - name: Install dependencies
-        run: uv sync --all-packages
-
-      - name: Start Docker Compose environment
-        run: |
-          cd it
-          docker compose up -d --wait
-          docker compose ps
-
-      - name: Run integration tests (Pipeline)
-        run: |
-          uv run pytest it/consistency/ -v --tb=short --junit-xml=test-results-pipeline.xml
+          uv run pytest it/consistency/ -v --tb=short --junit-xml=test-results.xml
         env:
           FUSTOR_USE_PIPELINE: 'true'
           FUSTOR_TEST_TIMEOUT: '600'
@@ -189,8 +102,8 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: test-results-pipeline
-          path: test-results-pipeline.xml
+          name: test-results
+          path: test-results.xml
 
       - name: Collect logs on failure
         if: failure()
@@ -205,7 +118,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: failure()
         with:
-          name: failure-logs-pipeline
+          name: failure-logs
           path: |
             it/docker-compose-logs.txt
             it/*-logs.txt
@@ -219,28 +132,36 @@ jobs:
   # Summary job
   summary:
     name: Test Summary
-    needs: [test-legacy, test-pipeline]
+    needs: [integration-test]
     runs-on: ubuntu-latest
     if: always()
     
     steps:
-      - name: Download all test results
+      - name: Download test results
         uses: actions/download-artifact@v4
         with:
-          pattern: test-results-*
-          merge-multiple: true
+          name: test-results
+          path: .
 
       - name: Test Summary
         run: |
           echo "## Integration Test Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          if [ -f test-results-legacy.xml ]; then
-            echo "### Legacy Mode" >> $GITHUB_STEP_SUMMARY
-            echo "✅ Legacy tests completed" >> $GITHUB_STEP_SUMMARY
-          fi
-          
-          if [ -f test-results-pipeline.xml ]; then
-            echo "### Pipeline Mode" >> $GITHUB_STEP_SUMMARY
-            echo "✅ Pipeline tests completed" >> $GITHUB_STEP_SUMMARY
+          if [ -f test-results.xml ]; then
+            # Extract test counts from XML (Simple grep, could be better)
+            TESTS=$(grep -oP 'tests="\K[0-9]+' test-results.xml | head -1 || echo "?")
+            FAILURES=$(grep -oP 'failures="\K[0-9]+' test-results.xml | head -1 || echo "?")
+            
+            echo "- Total Tests: $TESTS" >> $GITHUB_STEP_SUMMARY
+            echo "- Failures: $FAILURES" >> $GITHUB_STEP_SUMMARY
+            
+            if [ "$FAILURES" != "0" ] && [ "$FAILURES" != "?" ]; then
+               echo "❌ Integration tests failed" >> $GITHUB_STEP_SUMMARY
+               exit 1
+            else
+               echo "✅ Integration tests passed" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⚠️ No test results found" >> $GITHUB_STEP_SUMMARY
           fi

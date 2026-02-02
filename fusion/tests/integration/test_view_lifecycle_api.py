@@ -20,8 +20,9 @@ from fustor_fusion.datastore_state_manager import datastore_state_manager
 async def client():
     # Clear view managers before and after test
     view_managers.clear()
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
-        yield c
+    async with app.router.lifespan_context(app):
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            yield c
     view_managers.clear()
 
 @pytest.fixture
@@ -124,7 +125,7 @@ async def test_view_stop_terminates_session(client, view_config_file):
         # Manually create a session for this datastore
         session_id = str(os.urandom(8).hex())
         await session_manager.create_session_entry(
-            datastore_id=datastore_id,
+            view_id=datastore_id,
             session_id=session_id,
             task_id="test-task",
             client_ip="127.0.0.1"

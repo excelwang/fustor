@@ -15,8 +15,8 @@ async def mock_get_datastore_id():
 
 @pytest_asyncio.fixture
 async def client_override():
-    from fustor_fusion.auth.dependencies import get_datastore_id_from_api_key
-    app.dependency_overrides[get_datastore_id_from_api_key] = mock_get_datastore_id
+    from fustor_fusion.auth.dependencies import get_view_id_from_api_key
+    app.dependency_overrides[get_view_id_from_api_key] = mock_get_datastore_id
     
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         yield c

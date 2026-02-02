@@ -5,13 +5,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 # Assuming your main app structure
 from fustor_fusion.main import app
-from fustor_fusion.auth.dependencies import get_datastore_id_from_api_key
+from fustor_fusion.auth.dependencies import get_view_id_from_api_key
 from fustor_fusion.view_manager.manager import ViewManager
 
 # Override auth dependency
-app.dependency_overrides[get_datastore_id_from_api_key] = lambda: 1
+app.dependency_overrides[get_view_id_from_api_key] = lambda: 1
 
-client = TestClient(app)
+@pytest.fixture
+def client():
+    with TestClient(app) as c:
+        yield c
 
 @pytest.fixture
 def mock_view_manager():
@@ -22,7 +25,7 @@ def mock_view_manager():
 
 @pytest.mark.asyncio
 @pytest.mark.asyncio
-async def test_audit_start_endpoint(mock_view_manager):
+async def test_audit_start_endpoint(client, mock_view_manager):
     """Test that the audit start endpoint calls handle_audit_start on the provider."""
     mock_get, manager = mock_view_manager
     
@@ -38,7 +41,7 @@ async def test_audit_start_endpoint(mock_view_manager):
     provider.handle_audit_start.assert_called_once()
 
 @pytest.mark.asyncio
-async def test_audit_end_endpoint(mock_view_manager):
+async def test_audit_end_endpoint(client, mock_view_manager):
     """Test that the audit end endpoint calls handle_audit_end on the provider."""
     mock_get, manager = mock_view_manager
     
@@ -59,7 +62,7 @@ async def test_audit_end_endpoint(mock_view_manager):
     provider.handle_audit_end.assert_called_once()
 
 @pytest.mark.asyncio
-async def test_get_sentinel_tasks_with_suspects(mock_view_manager):
+async def test_get_sentinel_tasks_with_suspects(client, mock_view_manager):
     """Test that sentinel tasks are returned when suspects exist."""
     mock_get, manager = mock_view_manager
     
@@ -77,7 +80,7 @@ async def test_get_sentinel_tasks_with_suspects(mock_view_manager):
     assert "/file2.txt" in data["paths"]
 
 @pytest.mark.asyncio
-async def test_get_sentinel_tasks_empty(mock_view_manager):
+async def test_get_sentinel_tasks_empty(client, mock_view_manager):
     """Test that empty dict is returned when no suspects."""
     mock_get, manager = mock_view_manager
     
@@ -92,7 +95,7 @@ async def test_get_sentinel_tasks_empty(mock_view_manager):
     assert response.json() == {}
 
 @pytest.mark.asyncio
-async def test_submit_sentinel_feedback(mock_view_manager):
+async def test_submit_sentinel_feedback(client, mock_view_manager):
     """Test submitting sentinel feedback updates suspects."""
     mock_get, manager = mock_view_manager
     

@@ -128,7 +128,7 @@ async def stop_view(view_id: str):
         # No views left for this datastore, terminate sessions
         sessions = await session_manager.get_datastore_sessions(datastore_id)
         for session_id in list(sessions.keys()):
-            await session_manager.terminate_session(datastore_id, session_id)
+            await session_manager.terminate_session(view_id=datastore_id, session_id=session_id)
             logger.info(f"Terminated session {session_id} for datastore {datastore_id}")
         
         # Remove empty ViewManager

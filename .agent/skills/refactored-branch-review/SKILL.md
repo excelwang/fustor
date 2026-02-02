@@ -17,7 +17,7 @@ description: 详细评审当前的重构分支与原版分支(master)的差异�
 6. **Maintainability**: Is the code easy to understand and maintain?
 7. **Efficiency**: Is the code efficient in terms of time and space complexity?
 
-## How to use it
+## Step by Step to do the review
 
 1. 请深入理解一下master分支的原始代码（若已完成可以跳过）；
 2. 请深入理解一下最新的重构分支的重构文档（若已完成可以跳过）,作为后续代码评审的权威依据；

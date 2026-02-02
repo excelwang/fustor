@@ -35,11 +35,11 @@ async def lifespan(app: FastAPI):
     # NEW: Initialize the global task manager reference
     runtime_objects.task_manager = processing_manager
     
-    # V2: Initialize the Pipeline Manager
+    # Initialize the Pipeline Manager
     from .runtime.pipeline_manager import pipeline_manager as pm
     runtime_objects.pipeline_manager = pm
     
-    # NEW: Setup V2 API routers after pipeline_manager is available
+    # NEW: Setup Pipeline API routers after pipeline_manager is available
     from .api.pipe import setup_pipe_routers
     setup_pipe_routers()
     
@@ -109,8 +109,8 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error during view auto-start: {e}", exc_info=True)
 
-    # --- Register Routers (AFTER all V2 setup is complete) ---
-    # Registering inside lifespan ensures that setup_pipe_v2_routers has correctly 
+    # --- Register Routers (AFTER all pipeline setup is complete) ---
+    # Registering inside lifespan ensures that setup_pipe_routers has correctly 
     # populated pipe_router.
     
     # 1. Pipeline Domain (/api/v1/pipe) - Main API
@@ -128,7 +128,7 @@ async def lifespan(app: FastAPI):
     logger.info("Application shutdown initiated.")
     suspect_cleanup_task.cancel()
     
-    # V2: Stop clinical pipeline
+    # Stop clinical pipeline
     if runtime_objects.pipeline_manager:
         await runtime_objects.pipeline_manager.stop()
         
@@ -145,7 +145,7 @@ from .api.pipe import pipe_router, setup_pipe_routers
 from .api.management import router as management_router
 from .api.views import view_router
 
-# NOTE: Routers are now included inside lifespan() after V2 initialization.
+# NOTE: Routers are now included inside lifespan() after pipeline initialization.
 
 
 
