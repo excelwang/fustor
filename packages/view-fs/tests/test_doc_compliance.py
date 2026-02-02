@@ -20,7 +20,7 @@ class TestTombstoneTTLCleanup:
 
     @pytest.fixture
     def state(self):
-        return FSState(datastore_id=1)
+        return FSState(view_id=1)
 
     @pytest.fixture
     def tree_manager(self, state):
@@ -80,7 +80,7 @@ class TestBlindSpotSessionReset:
 
     @pytest.fixture
     def provider(self):
-        return FSViewProvider(datastore_id="1", view_id="test_view")
+        return FSViewProvider(id="test_view", view_id="1")
 
     @pytest.mark.asyncio
     async def test_blind_spot_additions_cleared_on_session_start(self, provider):

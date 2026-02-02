@@ -7,7 +7,7 @@ from fustor_core.event import UpdateEvent, MessageSource, DeleteEvent
 
 @pytest.fixture
 def parser():
-    return FSViewProvider(datastore_id="1", view_id="test_view")
+    return FSViewProvider(id="test_view", view_id="1")
 
 # ... (Previous tests unchanged) ...
 

@@ -9,7 +9,7 @@ from fustor_view_fs.provider import FSViewProvider
 @pytest.mark.asyncio
 async def test_reset_calls_state_reset():
     """Test that reset() correctly resets the FSState."""
-    provider = FSViewProvider(datastore_id="1", view_id="test_view", config={})
+    provider = FSViewProvider(id="test_view", view_id="1", config={})
     
     # Mock the state object
     provider.state = MagicMock()

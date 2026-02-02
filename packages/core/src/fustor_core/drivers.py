@@ -34,17 +34,17 @@ class ViewDriver(ABC):
     # Used by ViewManager to route events to the appropriate driver.
     target_schema: str = ""
     
-    def __init__(self, view_id: str, datastore_id: str, config: Dict[str, Any]):
+    def __init__(self, id: str, view_id: str, config: Dict[str, Any]):
         """
         Initialize the view driver.
         
         Args:
-            view_id: The unique ID assigned to this view instance.
-            datastore_id: The ID of the datastore this driver manages.
+            id: Unique identifier for this view instance.
+            view_id: identifier for the view group/datastore.
             config: Driver-specific configuration dictionary.
         """
+        self.id = id
         self.view_id = view_id
-        self.datastore_id = datastore_id
         self.config = config
 
     async def initialize(self):
@@ -52,6 +52,24 @@ class ViewDriver(ABC):
         Optional: Perform asynchronous initialization.
         """
         pass
+    
+    @property
+    def datastore_id(self) -> str:
+        """Deprecated alias for view_id."""
+        import warnings
+        warnings.warn("datastore_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
+        return self.view_id
+
+    @datastore_id.setter
+    def datastore_id(self, value: str):
+        self.view_id = str(value)
+
+    @property
+    def original_view_id(self) -> str:
+        """Deprecated alias for id (the instance ID)."""
+        import warnings
+        warnings.warn("view_id (as instance ID) is deprecated, use .id instead", DeprecationWarning, stacklevel=2)
+        return self.id
     
     @property
     def requires_full_reset_on_session_close(self) -> bool:

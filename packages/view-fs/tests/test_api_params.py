@@ -26,7 +26,7 @@ def app_client():
     router = create_fs_router(
         get_provider_func=get_provider,
         check_snapshot_func=mock_check_snapshot,
-        get_datastore_id_dep=mock_get_datastore_id
+        get_view_id_dep=mock_get_datastore_id
     )
     
     app = FastAPI()

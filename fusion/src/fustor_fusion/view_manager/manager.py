@@ -86,7 +86,7 @@ class ViewManager:
         available_drivers = _load_view_drivers()
         
         # Try loading from views_config loader
-        view_configs = views_config.get_by_datastore(self.view_id)
+        view_configs = views_config.get_by_view(self.view_id)
         
         if view_configs:
             self.logger.info(f"Using view configuration for view {self.view_id}: {[v.id for v in view_configs]}")
@@ -107,8 +107,8 @@ class ViewManager:
                 
                 try:
                     provider = driver_cls(
-                        view_id=view_name,
-                        datastore_id=self.view_id,
+                        id=view_name,
+                        view_id=self.view_id,
                         config=driver_params
                     )
                     await provider.initialize()
@@ -285,7 +285,7 @@ async def cleanup_all_expired_suspects():
         try:
             await manager.cleanup_expired_suspects()
         except Exception as e:
-            logger.error(f"Error during suspect cleanup for datastore {manager.datastore_id}: {e}")
+            logger.error(f"Error during suspect cleanup for view {manager.view_id}: {e}")
 
 
 async def process_event(event: EventBase, view_id: str) -> Dict[str, bool]:

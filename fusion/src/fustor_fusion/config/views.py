@@ -6,7 +6,8 @@ import yaml
 import logging
 from pathlib import Path
 from typing import Dict, Optional, List
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field, AliasChoices
+from typing import Dict, Optional, List, Any
 
 from fustor_core.common import get_fustor_home_dir
 from .validators import validate_url_safe_id
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 class ViewConfig(BaseModel):
     """Configuration for a single view."""
     id: str
-    datastore_id: str
+    view_id: str = Field(validation_alias=AliasChoices('view_id', 'datastore_id'))
     driver: str
     disabled: bool = False
     driver_params: dict = {}
@@ -31,14 +32,20 @@ class ViewConfig(BaseModel):
             raise ValueError("; ".join(errors))
         return v
 
-    @field_validator('datastore_id')
+    @field_validator('view_id', mode='before')
     @classmethod
-    def validate_datastore_id(cls, v: str) -> str:
-        """Validate that ID is URL-safe."""
-        errors = validate_url_safe_id(str(v), "datastore id")
+    def validate_view_id(cls, v: Any) -> str:
+        """Validate that ID is URL-safe and convert to string."""
+        s = str(v)
+        errors = validate_url_safe_id(s, "view group id")
         if errors:
             raise ValueError("; ".join(errors))
-        return str(v)
+        return s
+    
+    @property
+    def datastore_id(self) -> str:
+        """Deprecated alias for view_id."""
+        return self.view_id
 
 
 class ViewsConfigLoader:
@@ -128,11 +135,15 @@ class ViewsConfigLoader:
         self.ensure_loaded()
         return {k: v for k, v in self._views.items() if not v.disabled}
     
-    def get_by_datastore(self, datastore_id: str) -> List[ViewConfig]:
-        """Get all view configurations for a specific datastore."""
+    def get_by_view(self, view_id: str) -> List[ViewConfig]:
+        """Get all view configurations for a specific view group."""
         self.ensure_loaded()
-        ds_id_str = str(datastore_id)
-        return [v for v in self._views.values() if v.datastore_id == ds_id_str]
+        v_id_str = str(view_id)
+        return [v for v in self._views.values() if v.view_id == v_id_str]
+
+    # Legacy alias
+    def get_by_datastore(self, datastore_id: str) -> List[ViewConfig]:
+        return self.get_by_view(datastore_id)
     
     def reload(self) -> Dict[str, ViewConfig]:
         """Force reload all configurations."""

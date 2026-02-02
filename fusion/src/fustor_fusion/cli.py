@@ -250,25 +250,7 @@ def stop_view(view_id: str):
         click.echo(click.style(f"Error: {e}", fg="red"))
 
 
-@cli.command("create-api-key")
-@click.option("--datastore", "-d", required=True, type=int, help="Datastore ID")
-def create_api_key(datastore: int):
-    """Generate a new API key for a datastore and save to config."""
-    import secrets
-    from fustor_fusion.config import datastores_config
-    
-    # Generate API key
-    api_key = f"fk_{secrets.token_urlsafe(24)}"
-    
-    # Save to config
-    try:
-        datastores_config.save_api_key(datastore, api_key)
-        click.echo(click.style("API Key created successfully!", fg="green"))
-        click.echo(f"Datastore: {datastore}")
-        click.echo(f"API Key: {api_key}")
-        click.echo(click.style("Saved to datastores-config.yaml", fg="cyan"))
-    except Exception as e:
-        click.echo(click.style(f"Failed to save API key: {e}", fg="red"))
+# End of CLI
 
 
 # Define FUSION_LOG_FILE_NAME here as it's used in setup_logging

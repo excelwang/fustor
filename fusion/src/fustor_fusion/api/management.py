@@ -43,13 +43,13 @@ async def start_view(view_id: str):
             detail=f"View '{view_id}' is disabled in config"
         )
     
-    # Get or create ViewManager for this datastore
-    ds_id = config.datastore_id
-    if ds_id not in view_managers:
+    # Get or create ViewManager for this view group
+    v_group_id = config.view_id
+    if v_group_id not in view_managers:
         from ..view_manager.manager import ViewManager
-        view_managers[ds_id] = ViewManager(view_id=ds_id)
+        view_managers[v_group_id] = ViewManager(view_id=v_group_id)
     
-    vm = view_managers[ds_id]
+    vm = view_managers[v_group_id]
     
     # Check if view already running
     if view_id in vm.providers:
@@ -62,7 +62,7 @@ async def start_view(view_id: str):
         provider_class = load_view(config.driver)
         provider = provider_class(
             view_id=view_id,
-            datastore_id=ds_id,
+            datastore_id=v_group_id,
             config=config.driver_params
         )
         await provider.initialize()
@@ -70,9 +70,9 @@ async def start_view(view_id: str):
         logger.info(f"Registered view provider: {view_id}")
         
         # If active session exists, trigger on_session_start
-        sessions = await session_manager.get_view_sessions(ds_id)
+        sessions = await session_manager.get_view_sessions(v_group_id)
         if sessions:
-            session_id = list(sessions.keys())[0]
+            # session_id = list(sessions.keys())[0] # Not used
             await provider.on_session_start()
             logger.info(f"Triggered on_session_start for view {view_id}")
         
@@ -83,7 +83,7 @@ async def start_view(view_id: str):
             detail=f"Failed to start view: {e}"
         )
     
-    return {"status": "started", "view_id": view_id, "datastore_id": ds_id}
+    return {"status": "started", "view_id": view_id, "view_group_id": v_group_id, "datastore_id": v_group_id}
 
 
 @router.post("/views/{view_id}/stop")
@@ -99,19 +99,19 @@ async def stop_view(view_id: str):
     from ..core.session_manager import session_manager
     
     # Find which ViewManager has this view
-    ds_id = None
+    v_group_id = None
     for manager_id, vm in view_managers.items():
         if view_id in vm.providers:
-            ds_id = manager_id
+            v_group_id = manager_id
             break
     
-    if ds_id is None:
+    if v_group_id is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"View '{view_id}' is not running"
         )
     
-    vm = view_managers[ds_id]
+    vm = view_managers[v_group_id]
     
     # Unregister view
     try:
@@ -125,14 +125,14 @@ async def stop_view(view_id: str):
     remaining_views = len(vm.providers)
     
     if remaining_views == 0:
-        # No views left for this datastore, terminate sessions
-        sessions = await session_manager.get_view_sessions(ds_id)
+        # No views left for this view group, terminate sessions
+        sessions = await session_manager.get_view_sessions(v_group_id)
         for session_id in list(sessions.keys()):
-            await session_manager.terminate_session(view_id=ds_id, session_id=session_id)
-            logger.info(f"Terminated session {session_id} for datastore {ds_id}")
+            await session_manager.terminate_session(view_id=v_group_id, session_id=session_id)
+            logger.info(f"Terminated session {session_id} for view group {v_group_id}")
         
         # Remove empty ViewManager
-        del view_managers[ds_id]
+        del view_managers[v_group_id]
     
     # Check if any views left globally
     total_views = sum(len(vm.providers) for vm in view_managers.values())
@@ -151,7 +151,7 @@ async def list_views():
     from ..runtime_objects import view_managers
     
     result = {}
-    for ds_id, vm in view_managers.items():
-        result[ds_id] = list(vm.providers.keys())
+    for v_group_id, vm in view_managers.items():
+        result[v_group_id] = list(vm.providers.keys())
     
     return {"running_views": result}

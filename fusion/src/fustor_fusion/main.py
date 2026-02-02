@@ -84,26 +84,22 @@ async def lifespan(app: FastAPI):
         enabled_views = views_config.get_enabled()
         logger.info(f"Auto-starting {len(enabled_views)} enabled views...")
         
-        for view_id, config in enabled_views.items():
+        for view_instance_id, config in enabled_views.items():
             try:
-                datastore_id = config.datastore_id
+                v_group_id = config.view_id
                 
                 # Use the centralized cache to ensure consistency with API/Ingestion
-                vm = await get_cached_view_manager(datastore_id)
+                vm = await get_cached_view_manager(v_group_id)
                 
                 # Check if provider is already loaded (get_cached_view_manager initializes them)
-                if view_id in vm.providers:
-                    logger.info(f"View {view_id} already initialized by manager.")
+                if view_instance_id in vm.providers:
+                    logger.info(f"View {view_instance_id} already initialized by manager.")
                     continue
                 
-                # If not loaded (e.g. not in config but manually started? Unlikely if we read from config),
-                # force load. But get_cached_view_manager calls initialize_providers(), so strictly
-                # speaking we shouldn't need to do anything if it's in config.
-                
-                logger.info(f"Verified view {view_id} is active in manager for datastore {datastore_id}")
+                logger.info(f"Verified view {view_instance_id} is active in manager for group {v_group_id}")
                 
             except Exception as e:
-                logger.error(f"Failed to auto-start view {view_id}: {e}", exc_info=True)
+                logger.error(f"Failed to auto-start view {view_instance_id}: {e}", exc_info=True)
                 
     except Exception as e:
         logger.error(f"Error during view auto-start: {e}", exc_info=True)
