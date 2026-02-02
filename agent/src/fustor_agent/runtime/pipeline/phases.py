@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("fustor_agent.pipeline.phases")
 
-async def run_message_sync(pipeline: "AgentPipeline") -> None:
+async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
     """Execute snapshot sync phase for the given pipeline."""
     logger.info(f"Pipeline {pipeline.id}: Starting snapshot sync phase")
     
@@ -21,9 +21,9 @@ async def run_message_sync(pipeline: "AgentPipeline") -> None:
         snapshot_iter = pipeline.source_handler.get_snapshot_iterator()
         
         batch = []
-        # Support both synchronous and asynchronous iterators
+        # Support both sync and async iterators
         if not hasattr(snapshot_iter, "__aiter__"):
-            snapshot_iter = pipeline._aiter_sync_phase(snapshot_iter)
+            snapshot_iter = pipeline._aiter_sync(snapshot_iter)
 
         async for event in snapshot_iter:
             if not pipeline.is_running() and not (pipeline.state & PipelineState.RECONNECTING):

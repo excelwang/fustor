@@ -41,7 +41,7 @@ class TestAgentPipelineAudit:
         agent_pipeline._set_state(PipelineState.RUNNING, "Starting test")
         agent_pipeline.session_id = "sess-1"
         
-        # Run audit phase directly
+        # Run audit sync directly
         await run_audit_sync(agent_pipeline)
         
         # Verify context updates

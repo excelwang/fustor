@@ -31,7 +31,7 @@ Fustor 使用一个主目录来存放配置、日志和数据库。
 # 创建基础目录结构
 mkdir -p ~/.fustor/views-config
 touch ~/.fustor/receivers-config.yaml      # 创建接收端配置文件
-mkdir -p ~/.fustor/pipelines-config     # 设置 Pipeline 任务目录
+mkdir -p ~/.fustor/pipelines-config
 ```
 
 ---

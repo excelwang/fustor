@@ -62,7 +62,7 @@ class PipelinesConfigLoader:
     
     Directory structure:
     ```
-    pipelines-config/
+    agent-pipes-config/
       pipe-research.yaml
       pipe-archive.yaml
     ```
@@ -74,7 +74,7 @@ class PipelinesConfigLoader:
     def __init__(self, config_dir: Optional[Path] = None):
         if config_dir is None:
             home = get_fustor_home_dir()
-            config_dir = home / "pipelines-config"
+            config_dir = home / "agent-pipes-config"
             
         self.dir = Path(config_dir)
         self._pipelines: Dict[str, AgentPipelineConfig] = {}

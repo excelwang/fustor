@@ -132,7 +132,7 @@ class TestBaseConfigService:
         with pytest.raises(ConflictError) as excinfo:
             await base_config_service.delete_config("s1")
 
-        assert "used by the following sync tasks: pipeline1" in str(excinfo.value)
+        assert "used by the following pipeline tasks: pipeline1" in str(excinfo.value)
 
     @pytest.mark.asyncio
     async def test_update_config_pipeline_state_change(self, mock_app_config, mock_pipeline_instance_service, sample_pipeline_config):
