@@ -15,38 +15,45 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
     """Execute snapshot synchronization for the given pipeline."""
     logger.info(f"Pipeline {pipeline.id}: Starting snapshot sync")
     
-    # Get snapshot iterator from source
-    snapshot_iter = pipeline.source_handler.get_snapshot_iterator()
-    
-    batch = []
-    # Support both sync and async iterators
-    if not hasattr(snapshot_iter, "__aiter__"):
-        snapshot_iter = pipeline._aiter_sync(snapshot_iter)
+    try:
+        # Get snapshot iterator from source
+        snapshot_iter = pipeline.source_handler.get_snapshot_iterator()
+        
+        batch = []
+        # Support both sync and async iterators
+        if not hasattr(snapshot_iter, "__aiter__"):
+            snapshot_iter = pipeline._aiter_sync(snapshot_iter)
 
-    async for event in snapshot_iter:
-        if not pipeline.is_running() and not (pipeline.state & PipelineState.RECONNECTING):
-            break
-            
-        batch.append(event)
-        if len(batch) >= pipeline.batch_size:
+        async for event in snapshot_iter:
+            if not pipeline.is_running() and not (pipeline.state & PipelineState.RECONNECTING):
+                break
+                
+            batch.append(event)
+            if len(batch) >= pipeline.batch_size:
+                success, response = await pipeline.sender_handler.send_batch(
+                    pipeline.session_id, batch, {"phase": "snapshot"}
+                )
+                if success:
+                    pipeline._update_role_from_response(response)
+                    pipeline.statistics["events_pushed"] += len(batch)
+                batch = []
+                
+        # Send remaining events in batch
+        if batch and pipeline.has_active_session():
             success, response = await pipeline.sender_handler.send_batch(
-                pipeline.session_id, batch, {"phase": "snapshot"}
+                pipeline.session_id, batch, {"phase": "snapshot", "is_final": True}
             )
             if success:
                 pipeline._update_role_from_response(response)
                 pipeline.statistics["events_pushed"] += len(batch)
-            batch = []
-            
-    # Send remaining events in batch
-    if batch and pipeline.has_active_session():
-        success, response = await pipeline.sender_handler.send_batch(
-            pipeline.session_id, batch, {"phase": "snapshot", "is_final": True}
-        )
-        if success:
-            pipeline._update_role_from_response(response)
-            pipeline.statistics["events_pushed"] += len(batch)
-            
-    logger.info(f"Pipeline {pipeline.id}: Snapshot sync complete")
+                
+        logger.info(f"Pipeline {pipeline.id}: Snapshot sync complete")
+    except asyncio.CancelledError:
+        logger.info(f"Snapshot sync for {pipeline.id} cancelled")
+        raise
+    except Exception as e:
+        logger.error(f"Pipeline {pipeline.id} snapshot sync error: {e}", exc_info=True)
+        raise
 
 async def run_driver_message_sync(pipeline: "AgentPipeline") -> None:
     """Execute message sync directly from driver."""

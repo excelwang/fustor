@@ -58,7 +58,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
     async def keep_session_alive(self, view_id: str, session_id: str, 
                                client_ip: Optional[str] = None) -> Optional[SessionInfo]:
         """
-        更新现有会话的活跃时间并重置其清理任务任务。
+        更新现有会话的活跃时间并重置其清理任务。
         """
         view_id = str(view_id)
         async with self._lock:
@@ -77,7 +77,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             # Create a new cleanup task with the updated timeout
             timeout = session_info.session_timeout_seconds or self._default_session_timeout
             session_info.cleanup_task = asyncio.create_task(
-                self._schedule_session_cleanup(datastore_id, session_id, timeout)
+                self._schedule_session_cleanup(view_id, session_id, timeout)
             )
             return session_info
     async def _check_if_datastore_live(self, view_id: str) -> bool:
@@ -125,10 +125,10 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             
             # Execute removal
             async with self._lock:
-                if (datastore_id in self._sessions and 
-                    session_id in self._sessions[datastore_id]):
+                if (view_id in self._sessions and 
+                    session_id in self._sessions[view_id]):
                     
-                    session_info = self._sessions[datastore_id][session_id]
+                    session_info = self._sessions[view_id][session_id]
                     # Double check last_activity
                     if time.monotonic() - session_info.last_activity >= timeout_seconds:
                         del self._sessions[view_id][session_id]
@@ -164,48 +164,51 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             logger.error(f"Error in session {session_id} cleanup: {e}", exc_info=True)
             # Ensure session gets removed on error to prevent stuck sessions
             async with self._lock:
-                if (datastore_id in self._sessions and 
-                    session_id in self._sessions[datastore_id]):
-                    del self._sessions[datastore_id][session_id]
-                    if not self._sessions[datastore_id]:
-                        del self._sessions[datastore_id]
+                if (view_id in self._sessions and 
+                    session_id in self._sessions[view_id]):
+                    del self._sessions[view_id][session_id]
+                    if not self._sessions[view_id]:
+                        del self._sessions[view_id]
                     
                     # Release any associated lock in the datastore state manager
-                    await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+                    await datastore_state_manager.unlock_for_session(view_id, session_id)
                     # Release leader role if this session was the leader
-                    await datastore_state_manager.release_leader(datastore_id, session_id)
+                    await datastore_state_manager.release_leader(view_id, session_id)
 
     
-    async def get_session_info(self, datastore_id: int, session_id: str) -> Optional[SessionInfo]:
+    async def get_session_info(self, view_id: str, session_id: str) -> Optional[SessionInfo]:
         """
         获取session信息
         """
+        view_id = str(view_id)
         async with self._lock:
-            if datastore_id not in self._sessions:
+            if view_id not in self._sessions:
                 return None
             
-            return self._sessions[datastore_id].get(session_id)
+            return self._sessions[view_id].get(session_id)
     
-    async def get_datastore_sessions(self, datastore_id: int) -> Dict[str, SessionInfo]:
+    async def get_datastore_sessions(self, view_id: str) -> Dict[str, SessionInfo]:
         """
-        获取特定datastore的所有session信息
+        获取特定view的所有session信息
         """
+        view_id = str(view_id)
         async with self._lock:
-            return self._sessions.get(datastore_id, {}).copy()
+            return self._sessions.get(view_id, {}).copy()
     
-    async def remove_session(self, datastore_id: int, session_id: str) -> bool:
+    async def remove_session(self, view_id: str, session_id: str) -> bool:
         """
         移除一个session
         """
+        view_id = str(view_id)
         async with self._lock:
-            if datastore_id not in self._sessions:
+            if view_id not in self._sessions:
                 return False
             
-            if session_id not in self._sessions[datastore_id]:
+            if session_id not in self._sessions[view_id]:
                 return False
             
             # Cancel the cleanup task if it exists
-            session_info = self._sessions[datastore_id][session_id]
+            session_info = self._sessions[view_id][session_id]
             if session_info.cleanup_task:
                 session_info.cleanup_task.cancel()
                 try:
@@ -213,29 +216,29 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 except asyncio.CancelledError:
                     pass
             
-            del self._sessions[datastore_id][session_id]
+            del self._sessions[view_id][session_id]
             
-            # 如果datastore没有更多session了，删除该datastore的条目
-            if not self._sessions[datastore_id]:
-                del self._sessions[datastore_id]
+            # 如果view没有更多session了，删除该view的条目
+            if not self._sessions[view_id]:
+                del self._sessions[view_id]
                 
                 # Check for 'live' type and reset
                 from ..view_manager.manager import reset_views
                 
-                is_live = await self._check_if_datastore_live(datastore_id)
+                is_live = await self._check_if_datastore_live(view_id)
                 
                 if is_live:
-                    await reset_views(datastore_id)
+                    await reset_views(view_id)
                 else:
-                    await memory_event_queue.clear_datastore_data(datastore_id)
+                    await memory_event_queue.clear_datastore_data(view_id)
                     
-                logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain after removal.")
+                logger.info(f"Cleared all data for view {view_id} as no sessions remain after removal.")
             
             return True
 
     async def cleanup_expired_sessions(self):
         """
-        Clean up all expired sessions across all datastores
+        Clean up all expired sessions across all views
         """
         from ..datastore_state_manager import datastore_state_manager
         
@@ -243,16 +246,16 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             current_time = time.monotonic()
             expired_sessions = []
             
-            for datastore_id, datastore_sessions in self._sessions.items():
-                for session_id, session_info in datastore_sessions.items():
+            for view_id, view_sessions in self._sessions.items():
+                for session_id, session_info in view_sessions.items():
                     timeout = session_info.session_timeout_seconds or self._default_session_timeout
                     if current_time - session_info.last_activity >= timeout:
-                        expired_sessions.append((datastore_id, session_id, session_info.cleanup_task))
+                        expired_sessions.append((view_id, session_id, session_info.cleanup_task))
             
             # Remove expired sessions
-            for datastore_id, session_id, cleanup_task in expired_sessions:
-                if (datastore_id in self._sessions and 
-                    session_id in self._sessions[datastore_id]):
+            for view_id, session_id, cleanup_task in expired_sessions:
+                if (view_id in self._sessions and 
+                    session_id in self._sessions[view_id]):
                     
                     # Cancel the cleanup task
                     if cleanup_task:
@@ -263,72 +266,74 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                             pass
                     
                     # Remove the session
-                    del self._sessions[datastore_id][session_id]
+                    del self._sessions[view_id][session_id]
                     
-                    # If datastore has no more sessions, remove the datastore entry
-                    if not self._sessions[datastore_id]:
-                        del self._sessions[datastore_id]
+                    # If view has no more sessions, remove the view entry
+                    if not self._sessions[view_id]:
+                        del self._sessions[view_id]
                         
                         from ..view_manager.manager import reset_views
                         
-                        is_live = await self._check_if_datastore_live(datastore_id)
+                        is_live = await self._check_if_datastore_live(view_id)
                         
                         if is_live:
-                            await reset_views(datastore_id)
+                            await reset_views(view_id)
                         else:
-                            await memory_event_queue.clear_datastore_data(datastore_id)
+                            await memory_event_queue.clear_datastore_data(view_id)
                         
-                        logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain after cleanup.")
+                        logger.info(f"Cleared all data for view {view_id} as no sessions remain after cleanup.")
                     
                     # Release any associated lock in the datastore state manager
-                    await datastore_state_manager.unlock_for_session(datastore_id, session_id)
+                    await datastore_state_manager.unlock_for_session(view_id, session_id)
                     # Release leader role if this session was the leader
-                    await datastore_state_manager.release_leader(datastore_id, session_id)
+                    await datastore_state_manager.release_leader(view_id, session_id)
                     
-                    logger.info(f"Session {session_id} on datastore {datastore_id} expired and removed by periodic cleanup")
+                    logger.info(f"Session {session_id} on view {view_id} expired and removed by periodic cleanup")
 
 
-    async def terminate_session(self, datastore_id: int, session_id: str) -> bool:
+    async def terminate_session(self, view_id: str, session_id: str) -> bool:
         """
         Explicitly terminate a session (useful for clean shutdowns)
         """
+        view_id = str(view_id)
         from ..datastore_state_manager import datastore_state_manager
         
         # First, try to remove the session
-        success = await self.remove_session(datastore_id, session_id)
+        success = await self.remove_session(view_id, session_id)
         
         # Then, ensure the lock is also released from the datastore state manager
         if success:
-            await datastore_state_manager.unlock_for_session(datastore_id, session_id)
-            # Check if this was the last session for the datastore
+            await datastore_state_manager.unlock_for_session(view_id, session_id)
+            # Check if this was the last session for the view
             async with self._lock:
-                if datastore_id in self._sessions and not self._sessions[datastore_id]:
-                    del self._sessions[datastore_id] # Clean up the empty dict entry
-                    await memory_event_queue.clear_datastore_data(datastore_id)
-                    logger.info(f"Cleared all data for datastore {datastore_id} as no sessions remain after termination.")
+                if view_id in self._sessions and not self._sessions[view_id]:
+                    del self._sessions[view_id] # Clean up the empty dict entry
+                    await memory_event_queue.clear_datastore_data(view_id)
+                    logger.info(f"Cleared all data for view {view_id} as no sessions remain after termination.")
         
         return success
 
-    async def clear_all_sessions(self, datastore_id: int):
+    async def clear_all_sessions(self, view_id: str):
         """
-        Terminate all sessions for a specific datastore.
+        Terminate all sessions for a specific view.
         Used for full reset.
         """
+        view_id = str(view_id)
         async with self._lock:
-            if datastore_id not in self._sessions:
+            if view_id not in self._sessions:
                 return
             
             # Copy keys to avoid modification during iteration
-            session_ids = list(self._sessions[datastore_id].keys())
+            session_ids = list(self._sessions[view_id].keys())
         
         # Terminate each session (outside the lock to avoid deadlock if terminate_session locking)
         for sid in session_ids:
             try:
-                await self.terminate_session(datastore_id, sid)
+                await self.terminate_session(view_id, sid)
             except Exception as e:
                 logger.error(f"Failed to terminate session {sid} during clear_all: {e}")
         
-        logger.info(f"Terminated all {len(session_ids)} sessions for datastore {datastore_id} during reset.")
+        logger.info(f"Terminated all {len(session_ids)} sessions for view {view_id} during reset.")
 
     async def start_periodic_cleanup(self, interval_seconds: int = 60):
         """

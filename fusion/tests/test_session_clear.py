@@ -32,7 +32,7 @@ async def test_clear_all_sessions():
     await session_manager.cleanup_expired_sessions()
     datastore_state_manager._states.clear()
     
-    datastore_id = 7
+    datastore_id = "7"
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):

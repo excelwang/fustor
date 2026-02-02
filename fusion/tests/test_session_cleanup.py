@@ -48,7 +48,7 @@ async def test_last_session_cleanup_clears_all_datastore_data(
     all associated data in InMemoryEventQueue and DatastoreStateManager is cleared.
     """
     # Arrange
-    datastore_id = 123
+    datastore_id = "123"
     session_id_1 = "session-1"
     session_id_2 = "session-2"
     task_id_1 = "task-1"

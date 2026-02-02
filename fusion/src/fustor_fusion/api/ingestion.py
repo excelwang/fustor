@@ -9,7 +9,7 @@ import asyncio
 from typing import List, Dict, Any
 import time
 
-from ..auth.dependencies import get_datastore_id_from_api_key
+from ..auth.dependencies import get_view_id_from_api_key
 from ..runtime import datastore_event_manager
 from ..core.session_manager import session_manager
 from ..config import receivers_config
@@ -36,7 +36,7 @@ def _get_pipeline_config(pipeline_id: str) -> Dict[str, Any]:
     return {"allow_concurrent_push": False}
 
 
-@ingestion_router.get("/stats", summary="Get global ingestion statistics", dependencies=[Depends(get_datastore_id_from_api_key)])
+@ingestion_router.get("/stats", summary="Get global ingestion statistics", dependencies=[Depends(get_view_id_from_api_key)])
 async def get_global_stats():
     """
     Get aggregated statistics across all active datastores and sessions for the monitoring dashboard.
@@ -90,11 +90,11 @@ async def get_global_stats():
                 info = stats.get("oldest_item_info")
                 if info:
                     oldest_item_info = {
-                        "path": f"[{ds_id}] {info.get('path', 'unknown')}",
+                        "path": f"[{view_id}] {info.get('path', 'unknown')}",
                         "age_days": int(stale / 86400)
                     }
         except Exception as e:
-            logger.error(f"Failed to get stats for datastore {ds_id}: {e}")
+            logger.error(f"Failed to get stats for view {view_id}: {e}")
 
     return {
         "sources": list(sources_map.values()),
@@ -109,13 +109,13 @@ async def get_global_stats():
 @ingestion_router.get("/position", summary="Get latest checkpoint position")
 async def get_position(
     session_id: str = Query(..., description="Sync source unique ID"),
-    datastore_id=Depends(get_datastore_id_from_api_key),
+    view_id=Depends(get_view_id_from_api_key),
 ):
-    si = await session_manager.get_session_info(datastore_id, session_id)
+    si = await session_manager.get_session_info(view_id, session_id)
     if not si:
         raise HTTPException(status_code=404, detail="Session not found")
     
-    position_index = await get_position_from_queue(datastore_id, si.task_id)
+    position_index = await get_position_from_queue(view_id, si.task_id)
     
     if position_index is not None:
         return {"index": position_index}
@@ -139,31 +139,31 @@ class BatchIngestPayload(BaseModel):
 async def ingest_event_batch(
     payload: BatchIngestPayload,
     request: Request,
-    datastore_id=Depends(get_datastore_id_from_api_key),
+    view_id=Depends(get_view_id_from_api_key),
 ):
-    si = await session_manager.get_session_info(datastore_id, payload.session_id)
+    si = await session_manager.get_session_info(view_id, payload.session_id)
     if not si:
         raise HTTPException(status_code=404, detail="Session not found")
     await session_manager.keep_session_alive(
-        datastore_id, 
+        view_id, 
         payload.session_id,
         client_ip=request.client.host
     )
 
     # Check for outdated snapshot pushes
-    pipeline_config = _get_pipeline_config(str(datastore_id))
+    pipeline_config = _get_pipeline_config(str(view_id))
     allow_concurrent_push = pipeline_config.get("allow_concurrent_push", False)
     
     if allow_concurrent_push and payload.source_type == 'snapshot':
-        is_authoritative = await datastore_state_manager.is_authoritative_session(datastore_id, payload.session_id)
+        is_authoritative = await datastore_state_manager.is_authoritative_session(view_id, payload.session_id)
         if not is_authoritative:
-            logger.warning(f"Received snapshot push from outdated session '{payload.session_id}' for datastore {datastore_id}. Rejecting with 419.")
+            logger.warning(f"Received snapshot push from outdated session '{payload.session_id}' for view {view_id}. Rejecting with 419.")
             raise HTTPException(status_code=419, detail="A newer sync session has been started. This snapshot task is now obsolete and should stop.")
 
     # Handle snapshot end signal
     if payload.is_snapshot_end and payload.source_type != 'audit':
-        logger.info(f"Received end signal for source_type={payload.source_type} for datastore {datastore_id}")
-        await datastore_state_manager.set_snapshot_complete(datastore_id, payload.session_id)
+        logger.info(f"Received end signal for source_type={payload.source_type} for view {view_id}")
+        await datastore_state_manager.set_snapshot_complete(view_id, payload.session_id)
 
     try:
         if payload.events:
@@ -201,19 +201,19 @@ async def ingest_event_batch(
                     latest_index = max(latest_index, index)
 
             if latest_index > 0:
-                await update_position_in_queue(datastore_id, si.task_id, latest_index)
+                await update_position_in_queue(view_id, si.task_id, latest_index)
 
-            await add_events_batch_to_queue(datastore_id, event_objects_to_add, si.task_id)
+            await add_events_batch_to_queue(view_id, event_objects_to_add, si.task_id)
             
-            await processing_manager.ensure_processor(datastore_id)
+            await processing_manager.ensure_processor(view_id)
             
         try:
-            await datastore_event_manager.notify(datastore_id)
+            await datastore_event_manager.notify(view_id)
         except Exception as e:
-            logger.error(f"Failed to notify event manager for datastore {datastore_id}: {e}", exc_info=True)
+            logger.error(f"Failed to notify event manager for view {view_id}: {e}", exc_info=True)
 
         # NEW: Return role info to reduce heartbeat overhead
-        is_leader = await datastore_state_manager.is_leader(datastore_id, payload.session_id)
+        is_leader = await datastore_state_manager.is_leader(view_id, payload.session_id)
         return {
             "status": "ok", 
             "role": "leader" if is_leader else "follower",

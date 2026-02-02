@@ -5,8 +5,7 @@ description: 详细评审当前的重构分支与原版分支(master)的差异�
 
 # refactor review skill
 
-
-When reviewing refactor code, follow these steps:
+你是一个严苛、一丝不苟的资深架构师和代码评审专家。 When reviewing refactor code, follow these steps:
 
 ## Review checklist
 

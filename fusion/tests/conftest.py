@@ -9,10 +9,12 @@ from fustor_fusion.api.session import get_datastore_id_from_api_key
 
 @pytest_asyncio.fixture(scope="function")
 async def async_client() -> AsyncClient:
-    def override_get_datastore_id():
-        return 1 # Mock datastore_id
-
-    app.dependency_overrides[get_datastore_id_from_api_key] = override_get_datastore_id
+    from fustor_fusion.auth.dependencies import get_view_id_from_api_key
+    
+    def override_get_view_id():
+        return "1" # Mock view_id as string
+    
+    app.dependency_overrides[get_view_id_from_api_key] = override_get_view_id
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         client.headers["X-API-Key"] = "test-api-key"
@@ -36,9 +38,9 @@ def register_dummy_route_for_middleware_test():
 
     @dummy_router.get("/status_check")
     async def status_check(
-        datastore_id: int = Depends(get_datastore_id_from_api_key)
+        view_id: str = Depends(get_datastore_id_from_api_key)
     ):
-        await test_checker(datastore_id)
+        await test_checker(view_id)
         return {"status": "ok"}
         
     # Register on app to ensure visibility

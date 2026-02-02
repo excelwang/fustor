@@ -10,7 +10,7 @@ from importlib.metadata import entry_points
 import logging
 
 from ..view_manager.manager import get_cached_view_manager
-from ..auth.dependencies import get_datastore_id_from_api_key
+from ..auth.dependencies import get_view_id_from_api_key
 from ..datastore_state_manager import datastore_state_manager
 from ..in_memory_queue import memory_event_queue
 from ..processing_manager import processing_manager
@@ -21,14 +21,14 @@ logger = logging.getLogger(__name__)
 view_router = APIRouter(tags=["Data Views"])
 
 
-async def _check_core_readiness(datastore_id: int):
+async def _check_core_readiness(view_id: str):
     """Internal helper to check core system readiness (snapshot signal, queue, inflight)."""
-    is_signal_complete = await datastore_state_manager.is_snapshot_complete(datastore_id)
-    queue_size = memory_event_queue.get_queue_size(datastore_id)
-    inflight_count = processing_manager.get_inflight_count(datastore_id)
+    is_signal_complete = await datastore_state_manager.is_snapshot_complete(view_id)
+    queue_size = memory_event_queue.get_queue_size(view_id)
+    inflight_count = processing_manager.get_inflight_count(view_id)
     
     if not is_signal_complete or queue_size > 0 or inflight_count > 0:
-        detail = f"Datastore {datastore_id} not ready: snapshot_complete={is_signal_complete}, queue={queue_size}, inflight={inflight_count}. "
+        detail = f"View {view_id} not ready: snapshot_complete={is_signal_complete}, queue={queue_size}, inflight={inflight_count}. "
         if not is_signal_complete:
             detail += "Initial snapshot sync in progress. Waiting for end signal from authoritative agent."
         else:
@@ -46,14 +46,14 @@ def make_readiness_checker(lookup_key: str):
     1. Core System Readiness (Snapshot, Queue, Inflight)
     2. Live Session Requirement (if Provider is configured as Live)
     """
-    async def _check(datastore_id: int):
+    async def _check(view_id: str):
         # 1. Check core readiness
-        await _check_core_readiness(datastore_id)
+        await _check_core_readiness(view_id)
         
         # 2. Check "live" mode
         from ..core.session_manager import session_manager
         
-        manager = await get_cached_view_manager(datastore_id)
+        manager = await get_cached_view_manager(view_id)
         provider = manager.providers.get(lookup_key)
         
         # Determine if we need to enforce live session check
@@ -67,7 +67,7 @@ def make_readiness_checker(lookup_key: str):
                 is_live = provider.config.get("mode") == "live" or provider.config.get("is_live") is True
         
         if is_live:
-            sessions = await session_manager.get_datastore_sessions(datastore_id)
+            sessions = await session_manager.get_datastore_sessions(view_id)
             if not sessions:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -76,23 +76,23 @@ def make_readiness_checker(lookup_key: str):
     return _check
 
 
-async def check_snapshot_status(datastore_id: int):
+async def check_snapshot_status(view_id: str):
     """
     Generic core readiness check (Snapshot + Queue + Inflight).
     Usage: For generic endpoints that don't target a specific view driver.
     """
-    await _check_core_readiness(datastore_id)
+    await _check_core_readiness(view_id)
 
 
-async def get_view_provider(datastore_id: int, lookup_key: str):
+async def get_view_provider(view_id: str, lookup_key: str):
     """
     Helper to get a view provider for a specific key (instance name or driver name).
     
     Args:
-        datastore_id: The datastore ID
+        view_id: The view ID
         lookup_key: The key used to look up the provider in ViewManager
     """
-    manager = await get_cached_view_manager(datastore_id)
+    manager = await get_cached_view_manager(view_id)
     return manager.providers.get(lookup_key)
 
 
@@ -150,15 +150,15 @@ def register_view_driver_routes():
             if create_func:
                 try:
                     # Create context-bound provider getter and readiness checker
-                    async def get_provider_for_instance(datastore_id: int, _key=view_name):
-                        return await get_view_provider(datastore_id, _key)
+                    async def get_provider_for_instance(view_id: str, _key=view_name):
+                        return await get_view_provider(view_id, _key)
                     
                     checker = make_readiness_checker(view_name)
                     
                     router = create_func(
                         get_provider_func=get_provider_for_instance,
                         check_snapshot_func=checker,
-                        get_datastore_id_dep=get_datastore_id_from_api_key
+                        get_datastore_id_dep=get_view_id_from_api_key
                     )
                     
                     # Register with prefix matching the view_name (e.g., test-fs)
@@ -175,15 +175,15 @@ def register_view_driver_routes():
         for name, create_func in available_factories.items():
             try:
                 # Fallback uses driver name as the lookup key
-                async def get_provider_fallback(datastore_id: int, _key=name):
-                    return await get_view_provider(datastore_id, _key)
+                async def get_provider_fallback(view_id: str, _key=name):
+                    return await get_view_provider(view_id, _key)
                 
                 checker = make_readiness_checker(name)
                 
                 router = create_func(
                     get_provider_func=get_provider_fallback,
                     check_snapshot_func=checker,
-                    get_datastore_id_dep=get_datastore_id_from_api_key
+                    get_datastore_id_dep=get_view_id_from_api_key
                 )
                 
                 view_router.include_router(router, prefix=f"/{name}")

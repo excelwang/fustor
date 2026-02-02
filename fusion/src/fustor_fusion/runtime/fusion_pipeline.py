@@ -51,8 +51,8 @@ class FusionPipeline(Pipeline):
         from fustor_fusion.runtime import FusionPipeline
         
         pipeline = FusionPipeline(
-            pipeline_id="datastore-1",
-            config={"datastore_id": 1},
+            pipeline_id="view-1",
+            config={"view_id": "view-1"},
             view_handlers=[fs_view_handler, ...]
         )
         
@@ -76,9 +76,9 @@ class FusionPipeline(Pipeline):
         Initialize the FusionPipeline.
         
         Args:
-            pipeline_id: Unique identifier (typically datastore_id)
+            pipeline_id: Unique identifier (typically view_id)
             config: Configuration dict containing:
-                - datastore_id: int
+                - view_id: str
                 - allow_concurrent_push: bool
                 - queue_batch_size: int
             view_handlers: List of ViewHandler instances to dispatch events to
@@ -186,9 +186,10 @@ class FusionPipeline(Pipeline):
             if hasattr(handler, 'close'):
                 await handler.close()
         
-        # Clear sessions
-        self._active_sessions.clear()
-        self._leader_session = None
+        from ..core.session_manager import session_manager
+        
+        # Clear sessions for this view
+        await session_manager.clear_all_sessions(self.view_id)
         
         self._set_state(PipelineState.STOPPED, "Pipeline stopped")
         if self._cleanup_task:
@@ -246,106 +247,68 @@ class FusionPipeline(Pipeline):
         """
         Handle session creation.
         """
-        async with self._lock:
-            task_id = kwargs.get("task_id")
-            client_ip = kwargs.get("client_ip")
-            
-            # Determine role (leader/follower)
-            is_leader_hint = kwargs.get("is_leader")
-            role = "follower"
-            
-            if is_leader_hint is True:
-                self._leader_session = session_id
-                role = "leader"
-            elif is_leader_hint is False:
-                role = "follower"
-            elif not self._leader_session:
-                # Default FCFS election if no hint provided
-                self._leader_session = session_id
-                role = "leader"
-            
-            self._active_sessions[session_id] = {
-                "task_id": task_id,
-                "client_ip": client_ip,
-                "role": role,
-                "created_at": time.time(),
-                "last_activity": time.time(),
-                "timeout": kwargs.get("session_timeout_seconds", 30),
-            }
-            
-            self.statistics["sessions_created"] += 1
-            
-            # Notify view handlers of session start
-            for handler in self._view_handlers.values():
-                if hasattr(handler, 'on_session_start'):
-                    await handler.on_session_start()
-            
-            logger.info(f"Session {session_id} created with role={role}")
+        from ..core.session_manager import session_manager
+        
+        # Centralized session creation
+        await session_manager.create_session_entry(
+            view_id=self.view_id,
+            session_id=session_id,
+            task_id=kwargs.get("task_id"),
+            client_ip=kwargs.get("client_ip"),
+            allow_concurrent_push=kwargs.get("allow_concurrent_push", self.allow_concurrent_push),
+            session_timeout_seconds=kwargs.get("session_timeout_seconds", 30)
+        )
+        
+        # Notify view handlers of session start
+        for handler in self._view_handlers.values():
+            if hasattr(handler, 'on_session_start'):
+                await handler.on_session_start()
+        
+        logger.info(f"Session {session_id} created for view {self.view_id}")
     
     async def on_session_closed(self, session_id: str) -> None:
         """
         Handle session closure.
         """
-        async with self._lock:
-            if session_id in self._active_sessions:
-                del self._active_sessions[session_id]
-                
-                # If leader left, elect new leader
-                if session_id == self._leader_session:
-                    self._leader_session = None
-                    if self._active_sessions:
-                        new_leader = next(iter(self._active_sessions))
-                        self._leader_session = new_leader
-                        self._active_sessions[new_leader]["role"] = "leader"
-                        logger.info(f"New leader elected: {new_leader}")
-            
-            self.statistics["sessions_closed"] += 1
-            
-            # Notify view handlers of session close
-            for handler in self._view_handlers.values():
-                if hasattr(handler, 'on_session_close'):
-                    await handler.on_session_close()
-            
-            logger.info(f"Session {session_id} closed")
+        from ..core.session_manager import session_manager
+        
+        # Remove from central manager
+        await session_manager.remove_session(self.view_id, session_id)
+        
+        self.statistics["sessions_closed"] += 1
+        
+        # Notify view handlers of session close
+        for handler in self._view_handlers.values():
+            if hasattr(handler, 'on_session_close'):
+                await handler.on_session_close()
+        
+        logger.info(f"Session {session_id} closed for view {self.view_id}")
     
     async def keep_session_alive(self, session_id: str) -> bool:
         """Update last activity for a session."""
-        async with self._lock:
-            if session_id in self._active_sessions:
-                self._active_sessions[session_id]["last_activity"] = time.time()
-                return True
-            return False
+        from ..core.session_manager import session_manager
+        si = await session_manager.keep_session_alive(self.view_id, session_id)
+        return si is not None
 
     async def get_session_role(self, session_id: str) -> str:
         """Get the role of a session (leader/follower)."""
-        async with self._lock:
-            session = self._active_sessions.get(session_id)
-            return session.get("role", "unknown") if session else "unknown"
+        from ..datastore_state_manager import datastore_state_manager
+        is_leader = await datastore_state_manager.is_leader(self.view_id, session_id)
+        return "leader" if is_leader else "follower"
     
     async def _session_cleanup_loop(self) -> None:
-        """Periodic task to clean up expired sessions."""
-        while self.is_running():
-            try:
-                await asyncio.sleep(5)  # Check every 5 seconds
-                
-                now = time.time()
-                expired_sessions = []
-                
-                async with self._lock:
-                    for s_id, s_info in self._active_sessions.items():
-                        timeout = s_info.get("timeout", 30)
-                        if now - s_info["last_activity"] > timeout:
-                            expired_sessions.append(s_id)
-                
-                for s_id in expired_sessions:
-                    logger.warning(f"Session {s_id} timed out. Terminating.")
-                    await self.on_session_closed(s_id)
-                    
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"Error in session cleanup loop: {e}", exc_info=True)
-
+        """
+        Periodic task to clean up expired sessions.
+        Note: The global SessionManager handles its own cleanup, 
+        but we keep this for view-specific cleanup or monitoring if needed.
+        Currently just waits until cancelled.
+        """
+        try:
+            while self.is_running():
+                await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            pass
+    
     # --- Event Processing ---
     
     async def process_events(
@@ -412,15 +375,21 @@ class FusionPipeline(Pipeline):
     
     async def get_dto(self) -> Dict[str, Any]:
         """Get pipeline status as a dictionary."""
+        from ..core.session_manager import session_manager
+        from ..datastore_state_manager import datastore_state_manager
+        
+        sessions = await session_manager.get_datastore_sessions(self.view_id)
+        leader = await datastore_state_manager.get_leader(self.view_id)
+        
         async with self._lock:
             return {
                 "id": self.id,
-                "datastore_id": self.datastore_id,
+                "view_id": self.view_id,
                 "state": self.state.name if hasattr(self.state, 'name') else str(self.state),
                 "info": self.info,
                 "view_handlers": self.get_available_views(),
-                "active_sessions": len(self._active_sessions),
-                "leader_session": self._leader_session,
+                "active_sessions": len(sessions),
+                "leader_session": leader,
                 "statistics": self.statistics.copy(),
                 "queue_size": self._event_queue.qsize(),
             }
@@ -441,22 +410,35 @@ class FusionPipeline(Pipeline):
     
     async def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get information about a specific session."""
-        async with self._lock:
-            if session_id in self._active_sessions:
-                info = self._active_sessions[session_id].copy()
-                info["session_id"] = session_id
-                return info
-            return None
+        from ..core.session_manager import session_manager
+        si = await session_manager.get_session_info(self.view_id, session_id)
+        if si:
+            # Convert to dict for DTO
+            return {
+                "session_id": si.session_id,
+                "task_id": si.task_id,
+                "client_ip": si.client_ip,
+                "created_at": si.created_at,
+                "last_activity": si.last_activity,
+            }
+        return None
     
     async def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
         """Get all active sessions."""
-        async with self._lock:
-            return self._active_sessions.copy()
+        from ..core.session_manager import session_manager
+        si_map = await session_manager.get_datastore_sessions(self.view_id)
+        return {k: {"task_id": v.task_id} for k, v in si_map.items()}
         
     @property
     def leader_session(self) -> Optional[str]:
-        """Get the current leader session ID."""
-        return self._leader_session
+        """
+        Get the current leader session ID.
+        Note: This is async in implementation, so this property might be stale.
+        Prefer calling datastore_state_manager directly.
+        """
+        # We can't easily do async in property, return None or last known?
+        # For V2, we should probably remove this property from base class or make it a method.
+        return None
     
     def __str__(self) -> str:
         return f"FusionPipeline({self.id}, state={self.state.name})"

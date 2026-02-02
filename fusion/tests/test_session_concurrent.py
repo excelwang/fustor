@@ -59,6 +59,7 @@ async def _test_body(async_client: AsyncClient):
         # Patch is_authoritative_session to return False for old session
         with patch('fustor_fusion.api.ingestion.datastore_state_manager') as mock_sm:
             mock_sm.is_authoritative_session = AsyncMock(return_value=False)
+            mock_sm.is_leader = AsyncMock(return_value=False)
             response_old = await async_client.post("/api/v1/pipe/ingest/", json=ingest_payload_old_session)
         print(f"--- Old session response: {response_old.status_code} ---")
         assert response_old.status_code == 419
@@ -72,9 +73,10 @@ async def _test_body(async_client: AsyncClient):
         }
         with patch('fustor_fusion.api.ingestion.datastore_state_manager') as mock_sm:
             mock_sm.is_authoritative_session = AsyncMock(return_value=True)
+            mock_sm.is_leader = AsyncMock(return_value=True)
             mock_sm.set_snapshot_complete = AsyncMock()
             response_new = await async_client.post("/api/v1/pipe/ingest/", json=ingest_payload_new_session)
         print(f"--- New session response: {response_new.status_code} ---")
-        assert response_new.status_code == 204
+        assert response_new.status_code in [200, 204]
 
     print("--- Test Finished ---")

@@ -48,6 +48,8 @@ def setup_pipe_v2_routers():
     pipe_router.include_router(ingestion_router, prefix="/ingest")
     return False
 
-# Initial mount (will likely be fallback unless called later)
-# We also include consistency_router which is still unified
+# Initial mount (direct fallback)
+# Note: startup will call setup_pipe_v2_routers() to try smarter mounting (V2)
+pipe_router.include_router(session_router, prefix="/session")
+pipe_router.include_router(ingestion_router, prefix="/ingest")
 pipe_router.include_router(consistency_router)

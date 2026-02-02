@@ -47,36 +47,40 @@ def _get_session_config(pipeline_id: str) -> Dict[str, Any]:
 
 async def _should_allow_new_session(
     allow_concurrent_push: bool, 
-    datastore_id: int, 
+    view_id: str, 
     task_id: str, 
     session_id: str
 ) -> bool:
     """
     Determine if a new session should be allowed based on configuration and current active sessions.
     """
-    sessions = await session_manager.get_datastore_sessions(datastore_id)
+    view_id = str(view_id)
+    sessions = await session_manager.get_datastore_sessions(view_id)
     active_session_ids = set(sessions.keys())
-
-    logger.debug(f"Checking if new session {session_id} for task {task_id} should be allowed on datastore {datastore_id}")
-    logger.debug(f"Current active sessions: {list(active_session_ids)}")
-    logger.debug(f"Allow concurrent push: {allow_concurrent_push}")
+    
+    # NEW: Even if concurrent push is allowed, we don't allow duplicate task_id
+    # for different sessions. This prevents confusion in state management.
+    for si in sessions.values():
+        if si.task_id == task_id:
+            logger.warning(f"Task {task_id} already has an active session {si.session_id} on view {view_id}")
+            return False
 
     if allow_concurrent_push:
         return True
     else:
-        locked_session_id = await datastore_state_manager.get_locked_session_id(datastore_id)
-        logger.debug(f"Datastore {datastore_id} is locked by session: {locked_session_id}")
+        locked_session_id = await datastore_state_manager.get_locked_session_id(view_id)
+        logger.debug(f"View {view_id} is locked by session: {locked_session_id}")
 
         if not locked_session_id:
-            logger.debug(f"Datastore {datastore_id} is not locked. Allowing new session.")
+            logger.debug(f"View {view_id} is not locked. Allowing new session.")
             return True
 
         if locked_session_id not in active_session_ids:
-            logger.warning(f"Datastore {datastore_id} is locked by a stale session {locked_session_id} that is no longer active. Unlocking automatically.")
-            await datastore_state_manager.unlock_for_session(datastore_id, locked_session_id)
+            logger.warning(f"View {view_id} is locked by a stale session {locked_session_id} that is no longer active. Unlocking automatically.")
+            await datastore_state_manager.unlock_for_session(view_id, locked_session_id)
             return True
         else:
-            logger.warning(f"Datastore {datastore_id} is locked by an active session {locked_session_id}. Denying new session {session_id}.")
+            logger.warning(f"View {view_id} is locked by an active session {locked_session_id}. Denying new session {session_id}.")
             return False
 
 
@@ -84,16 +88,17 @@ async def _should_allow_new_session(
 async def create_session(
     payload: CreateSessionPayload,
     request: Request,
-    datastore_id: int = Depends(get_datastore_id_from_api_key),
+    view_id: str = Depends(get_datastore_id_from_api_key),
 ):
-    session_config = _get_session_config(str(datastore_id))
+    view_id = str(view_id)
+    session_config = _get_session_config(view_id)
     allow_concurrent_push = session_config["allow_concurrent_push"]
     session_timeout_seconds = session_config["session_timeout_seconds"]
     
     session_id = str(uuid.uuid4())
     
     should_allow = await _should_allow_new_session(
-        allow_concurrent_push, datastore_id, payload.task_id, session_id
+        allow_concurrent_push, view_id, payload.task_id, session_id
     )
     
     if not should_allow:
@@ -103,30 +108,30 @@ async def create_session(
         )
     
     # Leader/Follower election (First-Come-First-Serve)
-    is_leader = await datastore_state_manager.try_become_leader(datastore_id, session_id)
+    is_leader = await datastore_state_manager.try_become_leader(view_id, session_id)
     
     if is_leader:
-        await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
+        await datastore_state_manager.set_authoritative_session(view_id, session_id)
 
-    active_sessions = await session_manager.get_datastore_sessions(datastore_id)
+    active_sessions = await session_manager.get_datastore_sessions(view_id)
     if not active_sessions and allow_concurrent_push:
-        logger.info(f"Datastore {datastore_id} allows concurrent push and this is the first session. Resetting parser.")
+        logger.info(f"View {view_id} allows concurrent push and this is the first session. Resetting views.")
         try:
-            await reset_views(datastore_id)
-            logger.info(f"Successfully reset parser for datastore {datastore_id}.")
+            await reset_views(view_id)
+            logger.info(f"Successfully reset views for {view_id}.")
         except Exception as e:
-            logger.error(f"Exception during parser reset for datastore {datastore_id}: {e}", exc_info=True)
+            logger.error(f"Exception during views reset for {view_id}: {e}", exc_info=True)
 
     client_ip = request.client.host
     
     try:
-        await on_session_start(datastore_id)
-        logger.info(f"Triggered on_session_start for {session_id} on datastore {datastore_id}")
+        await on_session_start(view_id)
+        logger.info(f"Triggered on_session_start for {session_id} on view {view_id}")
     except Exception as e:
         logger.error(f"Failed to trigger on_session_start during session creation: {e}")
 
     await session_manager.create_session_entry(
-        datastore_id, 
+        view_id, 
         session_id, 
         task_id=payload.task_id,
         client_ip=client_ip,
@@ -135,7 +140,7 @@ async def create_session(
     )
     
     if not allow_concurrent_push:
-        await datastore_state_manager.lock_for_session(datastore_id, session_id)
+        await datastore_state_manager.lock_for_session(view_id, session_id)
     
     role = "leader" if is_leader else "follower"
     
@@ -151,10 +156,11 @@ async def create_session(
 @session_router.post("/heartbeat", tags=["Session Management"], summary="Session heartbeat keepalive")
 async def heartbeat(
     request: Request,
-    datastore_id: int = Depends(get_datastore_id_from_api_key),
+    view_id: str = Depends(get_datastore_id_from_api_key),
     session_id: str = Header(..., description="Session ID"),
 ):
-    si = await session_manager.get_session_info(datastore_id, session_id)
+    view_id = str(view_id)
+    si = await session_manager.get_session_info(view_id, session_id)
     
     if not si:
         raise HTTPException(
@@ -162,16 +168,16 @@ async def heartbeat(
             detail=f"Session {session_id} not found"
         )
     
-    is_locked_by_session = await datastore_state_manager.is_locked_by_session(datastore_id, session_id)
+    is_locked_by_session = await datastore_state_manager.is_locked_by_session(view_id, session_id)
     if not is_locked_by_session:
-        await datastore_state_manager.lock_for_session(datastore_id, session_id)
+        await datastore_state_manager.lock_for_session(view_id, session_id)
     
-    await session_manager.keep_session_alive(datastore_id, session_id, client_ip=request.client.host)
+    await session_manager.keep_session_alive(view_id, session_id, client_ip=request.client.host)
     
-    is_leader = await datastore_state_manager.try_become_leader(datastore_id, session_id)
+    is_leader = await datastore_state_manager.try_become_leader(view_id, session_id)
     
     if is_leader:
-        await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
+        await datastore_state_manager.set_authoritative_session(view_id, session_id)
         
     role = "leader" if is_leader else "follower"
 
@@ -185,10 +191,11 @@ async def heartbeat(
 
 @session_router.delete("/", tags=["Session Management"], summary="End session")
 async def end_session(
-    datastore_id: int = Depends(get_datastore_id_from_api_key),
+    view_id: str = Depends(get_datastore_id_from_api_key),
     session_id: str = Header(..., description="Session ID"),
 ):
-    success = await session_manager.terminate_session(datastore_id, session_id)
+    view_id = str(view_id)
+    success = await session_manager.terminate_session(view_id, session_id)
     
     if not success:
         # Session labels as "not found" but the goal of ending it is achieved
@@ -198,11 +205,11 @@ async def end_session(
             "message": f"Session {session_id} already terminated"
         }
     
-    await datastore_state_manager.unlock_for_session(datastore_id, session_id)
-    await datastore_state_manager.release_leader(datastore_id, session_id)
+    await datastore_state_manager.unlock_for_session(view_id, session_id)
+    await datastore_state_manager.release_leader(view_id, session_id)
     
     try:
-        await on_session_close(datastore_id)
+        await on_session_close(view_id)
     except Exception as e:
         logger.warning(f"Failed to notify view providers of session close: {e}")
     
@@ -214,9 +221,10 @@ async def end_session(
 
 @session_router.get("/", tags=["Session Management"], summary="List active sessions")
 async def list_sessions(
-    datastore_id: int = Depends(get_datastore_id_from_api_key),
+    view_id: str = Depends(get_datastore_id_from_api_key),
 ):
-    sessions = await session_manager.get_datastore_sessions(datastore_id)
+    view_id = str(view_id)
+    sessions = await session_manager.get_datastore_sessions(view_id)
     
     session_list = []
     for session_id, session_info in sessions.items():
@@ -231,7 +239,7 @@ async def list_sessions(
             "session_timeout_seconds": session_info.session_timeout_seconds
         }
         
-        is_leader = await datastore_state_manager.is_leader(datastore_id, session_id)
+        is_leader = await datastore_state_manager.is_leader(view_id, session_id)
         session_data["role"] = "leader" if is_leader else "follower"
         session_data["can_snapshot"] = is_leader
         session_data["can_audit"] = is_leader
@@ -240,7 +248,7 @@ async def list_sessions(
         session_list.append(session_data)
     
     return {
-        "datastore_id": datastore_id,
+        "view_id": view_id,
         "active_sessions": session_list,
         "count": len(session_list)
     }

@@ -37,7 +37,7 @@ async def test_session_creation_multiple_servers():
     await session_manager.cleanup_expired_sessions()
     datastore_state_manager._states.clear()
     
-    datastore_id = 1
+    datastore_id = "1"
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=1)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -76,7 +76,7 @@ async def test_session_creation_same_task_id():
     await session_manager.cleanup_expired_sessions()
     datastore_state_manager._states.clear()
     
-    datastore_id = 2
+    datastore_id = "2"
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -110,7 +110,7 @@ async def test_session_creation_different_task_id():
     await session_manager.cleanup_expired_sessions()
     datastore_state_manager._states.clear()
     
-    datastore_id = 3
+    datastore_id = "3"
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -144,7 +144,7 @@ async def test_concurrent_push_allowed():
     await session_manager.cleanup_expired_sessions()
     datastore_state_manager._states.clear()
     
-    datastore_id = 4
+    datastore_id = "4"
     config = make_session_config(allow_concurrent_push=True, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -178,7 +178,7 @@ async def test_same_task_id_with_concurrent_push():
     await session_manager.cleanup_expired_sessions()
     datastore_state_manager._states.clear()
     
-    datastore_id = 5
+    datastore_id = "5"
     config = make_session_config(allow_concurrent_push=True, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -212,7 +212,7 @@ async def test_stale_lock_handling():
     await session_manager.cleanup_expired_sessions()
     datastore_state_manager._states.clear()
     
-    datastore_id = 6
+    datastore_id = "6"
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
