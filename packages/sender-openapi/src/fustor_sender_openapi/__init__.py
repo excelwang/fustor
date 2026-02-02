@@ -28,10 +28,9 @@ class OpenApiDriver(Sender):
         super().__init__(sender_id, endpoint, credential, config)
         self.client = httpx.AsyncClient()
 
-    async def send_events(self, events: List[EventBase], source_type: str = "message", is_end: bool = False, **kwargs) -> Dict:
+    async def _send_events_impl(self, events: List[EventBase], source_type: str = "message", is_end: bool = False, **kwargs) -> Dict:
         """
-        Implementation of the Sender ABC method. Sends a batch of events to a single
-        batch endpoint using an envelope schema.
+        Implementation of OpenAPI sending.
         """
         session_id = self.session_id
 

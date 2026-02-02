@@ -4,11 +4,13 @@ Sender abstraction for Fustor.
 A Sender is responsible for transmitting events over a transport protocol
 (HTTP, gRPC, etc.) from Agent to Fusion.
 """
+import time
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional
 import logging
 
 from ..event import EventBase
+from ..common.metrics import get_metrics
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,7 @@ class Sender(ABC):
         self.config = config or {}
         self.session_id: Optional[str] = None
         self.logger = logging.getLogger(f"{__name__}.{sender_id}")
+        self.metrics = get_metrics()
     
     @abstractmethod
     async def connect(self) -> None:
@@ -84,7 +87,6 @@ class Sender(ABC):
         """
         raise NotImplementedError
     
-    @abstractmethod
     async def send_events(
         self, 
         events: List[EventBase], 
@@ -93,6 +95,7 @@ class Sender(ABC):
     ) -> Dict[str, Any]:
         """
         Send a batch of events to Fusion.
+        This is a template method that wraps the actual implementation with metrics.
         
         Args:
             events: List of events to send
@@ -101,6 +104,35 @@ class Sender(ABC):
             
         Returns:
             Response from receiver
+        """
+        start_time = time.perf_counter()
+        tags = {"sender_id": self.id, "source_type": source_type}
+        
+        try:
+            result = await self._send_events_impl(events, source_type, is_end)
+            
+            # Record success metrics
+            duration_ms = (time.perf_counter() - start_time) * 1000
+            self.metrics.histogram("fustor.core.sender.latency_ms", duration_ms, tags)
+            self.metrics.counter("fustor.core.sender.events_sent", len(events), {**tags, "success": "true"})
+            
+            return result
+        except Exception as e:
+            # Record error metrics
+            self.metrics.counter("fustor.core.sender.errors", 1, {**tags, "error_type": type(e).__name__})
+            self.metrics.counter("fustor.core.sender.events_sent", len(events), {**tags, "success": "false"})
+            raise
+    
+    @abstractmethod
+    async def _send_events_impl(
+        self, 
+        events: List[EventBase], 
+        source_type: str,
+        is_end: bool
+    ) -> Dict[str, Any]:
+        """
+        Actual implementation of sending events.
+        Must be implemented by concrete classes.
         """
         raise NotImplementedError
     

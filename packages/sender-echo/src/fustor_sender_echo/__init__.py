@@ -33,11 +33,11 @@ class EchoDriver(Sender):
         """Echo driver connection is a no-op."""
         self.logger.info(f"Echo Sender {self.id} ready.")
 
-    async def send_events(
+    async def _send_events_impl(
         self, events: List[Any], source_type: str = "realtime", is_end: bool = False
     ) -> Dict:
         """
-        Receives events, prints them along with control flags, and updates statistics.
+        Implementation of echo sending.
         """
         batch_rows = 0
         for event in events:

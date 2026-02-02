@@ -86,22 +86,15 @@ class HTTPSender(Sender):
             self.logger.error("Failed to create session.")
             raise RuntimeError("Failed to create session with Fusion service.")
     
-    async def send_events(
+    async def _send_events_impl(
         self, 
         events: List[EventBase], 
         source_type: str = "message",
         is_end: bool = False
     ) -> Dict[str, Any]:
         """
-        Send a batch of events to Fusion.
-        
-        Args:
-            events: List of EventBase objects to send
-            source_type: Type of events ('message', 'snapshot', 'audit')
-            is_end: Whether this is the last batch for this source_type
-            
-        Returns:
-            Response from Fusion
+        Implementation of sending events to Fusion.
+        Called by the base class template method.
         """
         if not self.session_id:
             self.logger.error("Cannot send events: session_id is not set.")
@@ -118,7 +111,7 @@ class HTTPSender(Sender):
                 event_dicts.append(dict(event))
         
         total_rows = sum(len(e.get("rows", [])) for e in event_dicts)
-        self.logger.info(f"[{source_type}] Attempting to push {len(events)} events ({total_rows} rows) to {self.endpoint}")
+        self.logger.debug(f"[{source_type}] Attempting to push {len(events)} events ({total_rows} rows) to {self.endpoint}")
         
         try:
             success = await self.client.push_events(
