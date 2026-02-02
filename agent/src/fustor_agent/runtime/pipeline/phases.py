@@ -119,7 +119,7 @@ async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
             events = await pipeline._bus.internal_bus.get_events_for(
                 pipeline.id, 
                 pipeline.batch_size, 
-                timeout=1.0
+                timeout=0.2  # 200ms poll timeout, matching Master version for low latency
             )
             
             if not events:
@@ -169,9 +169,20 @@ async def run_audit_sync(pipeline: "AgentPipeline") -> None:
         if not hasattr(audit_iter, "__aiter__"):
             audit_iter = pipeline._aiter_sync(audit_iter)
             
-        async for event in audit_iter:
+        async for item in audit_iter:
             if not pipeline.is_running():
                 break
+            
+            # FSDriver.get_audit_iterator returns Tuple[Optional[EventBase], Dict[str, float]]
+            # Unpack the tuple: event can be None (for silent dirs), mtime_cache_update is a dict
+            if isinstance(item, tuple) and len(item) == 2:
+                event, mtime_cache_update = item
+                if event is None:
+                    continue  # Skip None events (used for mtime cache updates only)
+            else:
+                # Handle case where iterator yields plain events (for other drivers)
+                event = item
+            
             batch.append(event)
             if len(batch) >= pipeline.batch_size:
                 await pipeline.sender_handler.send_batch(

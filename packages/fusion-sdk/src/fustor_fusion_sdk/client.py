@@ -137,7 +137,7 @@ class FusionClient:
                 "session_id": session_id,
                 "events": sanitized_events,
                 "source_type": sanitized_source_type,
-                "is_snapshot_end": is_snapshot_end
+                "is_end": is_snapshot_end  # Fixed: Receiver expects 'is_end', not 'is_snapshot_end'
             }
             response = await self.client.post(f"{self._events_path}/{session_id}/events", json=payload)
             response.raise_for_status()

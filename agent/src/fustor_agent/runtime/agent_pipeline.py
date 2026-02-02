@@ -412,9 +412,40 @@ class AgentPipeline(Pipeline):
         await run_snapshot_sync(self)
 
     async def _run_message_sync(self) -> None:
-        """Execute realtime message synchronization."""
+        """Execute realtime message synchronization.
+        
+        This method implements the Master-style high-throughput pattern:
+        1. If bus_service is available, dynamically create/reuse EventBus
+        2. If position is lost, trigger supplemental snapshot
+        3. Fall back to direct driver mode if no bus_service
+        """
         logger.info(f"Pipeline {self.id}: Starting message sync")
         
+        # Try to setup EventBus for high-throughput mode
+        if self._bus_service and not self._bus:
+            try:
+                # Get the last committed position from Fusion
+                start_position = self.statistics.get("last_pushed_event_id", 0) or 0
+                
+                self._bus, position_lost = await self._bus_service.get_or_create_bus_for_subscriber(
+                    source_id=self.config.get("source"),
+                    source_config=self.source_handler._config,
+                    sync_id=self.id,
+                    required_position=start_position,
+                    fields_mapping=self.config.get("fields_mapping", [])
+                )
+                
+                if position_lost:
+                    logger.warning(f"Pipeline {self.id}: Position lost, triggering supplemental snapshot")
+                    # Trigger supplemental snapshot in a separate task
+                    asyncio.create_task(self._run_snapshot_sync())
+                    
+                logger.info(f"Pipeline {self.id}: EventBus initialized for high-throughput mode")
+            except Exception as e:
+                logger.warning(f"Pipeline {self.id}: Failed to setup EventBus ({e}), falling back to driver mode")
+                self._bus = None
+        
+        # Choose sync mode based on bus availability
         if self._bus:
             await self._run_bus_message_sync()
         else:

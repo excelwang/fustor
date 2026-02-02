@@ -198,6 +198,96 @@ fusion/                              # fustor-fusion
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
+### 4.3 Agent 侧消息同步机制
+
+Agent Pipeline 使用 EventBus 实现高吞吐低延迟的消息同步。
+
+#### 4.3.1 架构图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                              Agent 消息同步架构                                       │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│   ┌──────────────┐         ┌─────────────────┐         ┌──────────────┐             │
+│   │  FS Watch    │────────▶│    EventBus     │────────▶│  Pipeline    │──▶ Fusion   │
+│   │   Thread     │  put()  │   (MemoryBus)   │get()    │  Consumer    │             │
+│   └──────────────┘         └─────────────────┘         └──────────────┘             │
+│         │                         │                                                  │
+│         │                    ┌────┴────┐                                             │
+│         │               subscriber1  subscriber2                                     │
+│       异步入队              (Pipeline-A)  (Pipeline-B)                                │
+│       (不阻塞)                                                                        │
+│                                                                                      │
+│   特性:                                                                              │
+│   1. 生产者-消费者完全解耦 (Source 产生事件不被推送阻塞)                                │
+│   2. 200ms 轮询超时 (低负载时延迟 ~0ms, 最坏 200ms)                                   │
+│   3. 批量获取已有事件 (有多少取多少, 不等待凑满 batch)                                  │
+│   4. 同源 Pipeline 共享 Bus (节省资源, 减少重复读取)                                   │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 4.3.2 EventBus 共享机制
+
+同源的多个 Pipeline 可共享同一个 EventBus：
+
+```
+Source Signature = (driver, uri, credential)
+
+Pipeline-A (source=fs-research) ──┐
+                                  ├──▶ EventBus-1 (signature=fs:/data/research)
+Pipeline-B (source=fs-research) ──┘
+
+Pipeline-C (source=fs-archive)  ────▶ EventBus-2 (signature=fs:/data/archive)
+```
+
+每个订阅者独立跟踪消费进度：
+- `last_consumed_index`: 已消费的最后一个事件索引
+- `low_watermark`: 所有订阅者中最慢的位置 (用于缓冲区清理)
+
+#### 4.3.3 EventBus 自动分裂
+
+当快慢消费者差距过大时，自动分裂：
+
+```
+分裂触发条件: 最快消费者领先最慢消费者 >= 95% 缓冲区容量
+
+分裂前:
+  EventBus-1 [容量 1000]
+    ├── Pipeline-A: index=900 (快)
+    └── Pipeline-B: index=50  (慢)
+    差距 = 850 events >= 95% × 1000 = 950? → 触发!
+
+分裂后:
+  EventBus-1 (保留) ── Pipeline-B (慢消费者)
+  EventBus-2 (新建) ── Pipeline-A (快消费者)
+```
+
+#### 4.3.4 消息同步模式选择
+
+```python
+# AgentPipeline._run_message_sync() 逻辑
+async def _run_message_sync(self):
+    # 优先尝试 Bus 模式 (高吞吐)
+    if self._bus_service and not self._bus:
+        self._bus, position_lost = await self._bus_service.get_or_create_bus_for_subscriber(...)
+        if position_lost:
+            # 位置丢失，触发补充快照
+            asyncio.create_task(self._run_snapshot_sync())
+    
+    # 选择同步模式
+    if self._bus:
+        await self._run_bus_message_sync()   # 高吞吐模式
+    else:
+        await self._run_driver_message_sync()  # 低延迟模式 (后备)
+```
+
+| 模式 | 适用场景 | 延迟 | 吞吐 | 资源共享 |
+|------|----------|------|------|----------|
+| **Bus 模式** | 多 Pipeline 同源, 高频事件 | ~200ms | 高 | ✅ 共享 |
+| **Driver 模式** | 单 Pipeline, 低频事件 | ~0ms | 中 | ❌ 独占 |
+
 ---
 
 ## 5. Session 设计

@@ -379,7 +379,7 @@ class FusionPipeline(Pipeline):
             from ..datastore_state_manager import datastore_state_manager
             # Only leader can signal snapshot end
             if await datastore_state_manager.is_leader(self.view_id, session_id):
-                await datastore_state_manager.set_snapshot_complete(self.view_id, True)
+                await datastore_state_manager.set_snapshot_complete(self.view_id, session_id)
                 logger.info(f"Pipeline {self.id}: Received snapshot end signal from leader session {session_id}. Marking snapshot as complete.")
             else:
                 logger.warning(f"Pipeline {self.id}: Received snapshot end signal from non-leader session {session_id}. Ignored.")
