@@ -77,7 +77,7 @@ def make_readiness_checker(lookup_key: str):
                 is_live = provider.config.get("mode") == "live" or provider.config.get("is_live") is True
         
         if is_live:
-            sessions = await session_manager.get_datastore_sessions(view_id)
+            sessions = await session_manager.get_view_sessions(view_id)
             if not sessions:
                 raise HTTPException(
                     status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -168,7 +168,7 @@ def register_view_driver_routes():
                     router = create_func(
                         get_provider_func=get_provider_for_instance,
                         check_snapshot_func=checker,
-                        get_datastore_id_dep=get_view_id_from_api_key
+                        get_view_id_dep=get_view_id_from_api_key
                     )
                     
                     # Register with prefix matching the view_name (e.g., test-fs)
@@ -193,7 +193,7 @@ def register_view_driver_routes():
                 router = create_func(
                     get_provider_func=get_provider_fallback,
                     check_snapshot_func=checker,
-                    get_datastore_id_dep=get_view_id_from_api_key
+                    get_view_id_dep=get_view_id_from_api_key
                 )
                 
                 view_router.include_router(router, prefix=f"/{name}")

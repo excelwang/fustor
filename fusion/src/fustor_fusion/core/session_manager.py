@@ -40,7 +40,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             
             session_info = SessionInfo(
                 session_id=session_id,
-                datastore_id=view_id, # Keep field name for now but use string
+                view_id=view_id, # Use view_id field
                 last_activity=now_monotonic,
                 created_at=now_epoch,
                 task_id=task_id,
@@ -80,7 +80,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 self._schedule_session_cleanup(view_id, session_id, timeout)
             )
             return session_info
-    async def _check_if_datastore_live(self, view_id: str) -> bool:
+    async def _check_if_view_live(self, view_id: str) -> bool:
         """
         Check if any view provider for the view requires full reset (Live mode).
         """
@@ -140,7 +140,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                             # NEW: Check if this is a 'live' datastore and clear data
                             from ..view_manager.manager import reset_views
                             
-                            is_live = await self._check_if_datastore_live(view_id)
+                            is_live = await self._check_if_view_live(view_id)
                             
                             if is_live:
                                 logger.info(f"View {view_id} is 'live' type. Resetting views as no sessions remain.")
@@ -187,13 +187,19 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             
             return self._sessions[view_id].get(session_id)
     
-    async def get_datastore_sessions(self, view_id: str) -> Dict[str, SessionInfo]:
+    async def get_view_sessions(self, view_id: str) -> Dict[str, SessionInfo]:
         """
         获取特定view的所有session信息
         """
         view_id = str(view_id)
         async with self._lock:
             return self._sessions.get(view_id, {}).copy()
+
+    async def get_datastore_sessions(self, datastore_id: str) -> Dict[str, SessionInfo]:
+        """Deprecated alias for get_view_sessions."""
+        import warnings
+        warnings.warn("get_datastore_sessions is deprecated, use get_view_sessions instead", DeprecationWarning, stacklevel=2)
+        return await self.get_view_sessions(datastore_id)
 
     async def get_all_active_sessions(self) -> Dict[str, Dict[str, SessionInfo]]:
         """获取所有活跃的session信息，返回 {view_id: {session_id: SessionInfo}}"""
@@ -231,7 +237,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 # Check for 'live' type and reset
                 from ..view_manager.manager import reset_views
                 
-                is_live = await self._check_if_datastore_live(view_id)
+                is_live = await self._check_if_view_live(view_id)
                 
                 if is_live:
                     await reset_views(view_id)
@@ -286,7 +292,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         
                         from ..view_manager.manager import reset_views
                         
-                        is_live = await self._check_if_datastore_live(view_id)
+                        is_live = await self._check_if_view_live(view_id)
                         
                         if is_live:
                             await reset_views(view_id)

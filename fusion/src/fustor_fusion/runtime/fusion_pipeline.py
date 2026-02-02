@@ -290,7 +290,7 @@ class FusionPipeline(Pipeline):
         # New Leader Election (Architecture V2)
         # If a session closes, we need to ensure there is a leader if sessions remain.
         # We query the session_manager (source of truth) for remaining sessions.
-        remaining_sessions = await session_manager.get_datastore_sessions(self.view_id)
+        remaining_sessions = await session_manager.get_view_sessions(self.view_id)
         if remaining_sessions:
             current_leader = await view_state_manager.get_leader(self.view_id)
             if not current_leader:
@@ -416,7 +416,7 @@ class FusionPipeline(Pipeline):
         from ..core.session_manager import session_manager
         from ..view_state_manager import view_state_manager
         
-        sessions = await session_manager.get_datastore_sessions(self.view_id)
+        sessions = await session_manager.get_view_sessions(self.view_id)
         leader = await view_state_manager.get_leader(self.view_id)
         
         async with self._lock:
@@ -465,7 +465,7 @@ class FusionPipeline(Pipeline):
     async def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
         """Get all active sessions."""
         from ..core.session_manager import session_manager
-        si_map = await session_manager.get_datastore_sessions(self.view_id)
+        si_map = await session_manager.get_view_sessions(self.view_id)
         return {k: {"task_id": v.task_id} for k, v in si_map.items()}
         
     @property

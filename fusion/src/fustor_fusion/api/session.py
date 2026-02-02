@@ -58,7 +58,7 @@ async def _should_allow_new_session(
     Determine if a new session should be allowed based on configuration and current active sessions.
     """
     view_id = str(view_id)
-    sessions = await session_manager.get_datastore_sessions(view_id)
+    sessions = await session_manager.get_view_sessions(view_id)
     active_session_ids = set(sessions.keys())
     
     # NEW: Even if concurrent push is allowed, we don't allow duplicate task_id
@@ -116,7 +116,7 @@ async def create_session(
     if is_leader:
         await view_state_manager.set_authoritative_session(view_id, session_id)
 
-    active_sessions = await session_manager.get_datastore_sessions(view_id)
+    active_sessions = await session_manager.get_view_sessions(view_id)
     if not active_sessions and allow_concurrent_push:
         logger.info(f"View {view_id} allows concurrent push and this is the first session. Resetting views.")
         try:
@@ -227,7 +227,7 @@ async def list_sessions(
     view_id: str = Depends(get_view_id_from_api_key),
 ):
     view_id = str(view_id)
-    sessions = await session_manager.get_datastore_sessions(view_id)
+    sessions = await session_manager.get_view_sessions(view_id)
     
     session_list = []
     for session_id, session_info in sessions.items():

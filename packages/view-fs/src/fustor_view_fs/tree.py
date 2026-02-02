@@ -13,7 +13,7 @@ class TreeManager:
     """
     def __init__(self, state: FSState):
         self.state = state
-        self.logger = logging.getLogger(f"fustor_view.fs.tree.{state.datastore_id}")
+        self.logger = logging.getLogger(f"fustor_view.fs.tree.{state.view_id}")
 
     async def update_node(self, payload: Dict[str, Any], path: str):
         """Update or create a node in the tree based on event payload."""

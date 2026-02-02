@@ -20,7 +20,7 @@ class FSArbitrator:
         self.state = state
         self.tree_manager = tree_manager
         self.hot_file_threshold = hot_file_threshold
-        self.logger = logging.getLogger(f"fustor_fusion.view_fs.arbitrator.{state.datastore_id}")
+        self.logger = logging.getLogger(f"fustor_fusion.view_fs.arbitrator.{state.view_id}")
         self.suspect_cleanup_interval = 0.5
 
     async def process_event(self, event: Any) -> bool:

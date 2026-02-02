@@ -5,7 +5,7 @@ import asyncio
 @dataclass
 class SessionInfo:
     session_id: str
-    datastore_id: int
+    view_id: str
     last_activity: float
     created_at: float
     task_id: Optional[str] = None
@@ -14,34 +14,49 @@ class SessionInfo:
     client_ip: Optional[str] = None
     cleanup_task: Optional[asyncio.Task] = None
 
+    @property
+    def datastore_id(self) -> str:
+        """Deprecated alias for view_id."""
+        import warnings
+        warnings.warn("datastore_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
+        return self.view_id
+
+    @datastore_id.setter
+    def datastore_id(self, value: str):
+        self.view_id = str(value) if value is not None else None
+
 class SessionManagerInterface(Protocol):
     """
     Interface for managing user sessions.
     """
-    async def create_session_entry(self, datastore_id: int, session_id: str, 
+    async def create_session_entry(self, view_id: str, session_id: str, 
                                  task_id: Optional[str] = None, 
                                  client_ip: Optional[str] = None,
                                  allow_concurrent_push: Optional[bool] = None,
                                  session_timeout_seconds: Optional[int] = None) -> SessionInfo:
         ...
 
-    async def keep_session_alive(self, datastore_id: int, session_id: str, 
+    async def keep_session_alive(self, view_id: str, session_id: str, 
                                client_ip: Optional[str] = None) -> Optional[SessionInfo]:
         ...
 
-    async def get_session_info(self, datastore_id: int, session_id: str) -> Optional[SessionInfo]:
+    async def get_session_info(self, view_id: str, session_id: str) -> Optional[SessionInfo]:
         ...
 
-    async def get_datastore_sessions(self, datastore_id: int) -> Dict[str, SessionInfo]:
+    async def get_view_sessions(self, view_id: str) -> Dict[str, SessionInfo]:
+        ...
+    
+    # Legacy alias
+    async def get_datastore_sessions(self, datastore_id: str) -> Dict[str, SessionInfo]:
         ...
 
-    async def remove_session(self, datastore_id: int, session_id: str) -> bool:
+    async def remove_session(self, view_id: str, session_id: str) -> bool:
         ...
 
     async def cleanup_expired_sessions(self):
         ...
 
-    async def terminate_session(self, datastore_id: int, session_id: str) -> bool:
+    async def terminate_session(self, view_id: str, session_id: str) -> bool:
         ...
 
     async def start_periodic_cleanup(self, interval_seconds: int = 60):
@@ -55,7 +70,7 @@ class ViewProvider(Protocol):
     Interface for a View Provider driver.
     Views expose datastore content via specific protocols (e.g. FUSE/NFS).
     """
-    def __init__(self, datastore_id: int, view_id: str, **kwargs):
+    def __init__(self, view_id: str, datastore_id: Optional[str] = None, **kwargs):
         ...
 
     async def initialize(self) -> None:

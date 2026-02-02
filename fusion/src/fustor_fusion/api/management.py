@@ -44,12 +44,12 @@ async def start_view(view_id: str):
         )
     
     # Get or create ViewManager for this datastore
-    datastore_id = config.datastore_id
-    if datastore_id not in view_managers:
+    ds_id = config.datastore_id
+    if ds_id not in view_managers:
         from ..view_manager.manager import ViewManager
-        view_managers[datastore_id] = ViewManager(view_id=datastore_id)
+        view_managers[ds_id] = ViewManager(view_id=ds_id)
     
-    vm = view_managers[datastore_id]
+    vm = view_managers[ds_id]
     
     # Check if view already running
     if view_id in vm.providers:
@@ -62,7 +62,7 @@ async def start_view(view_id: str):
         provider_class = load_view(config.driver)
         provider = provider_class(
             view_id=view_id,
-            datastore_id=datastore_id,
+            datastore_id=ds_id,
             config=config.driver_params
         )
         await provider.initialize()
@@ -70,7 +70,7 @@ async def start_view(view_id: str):
         logger.info(f"Registered view provider: {view_id}")
         
         # If active session exists, trigger on_session_start
-        sessions = await session_manager.get_datastore_sessions(datastore_id)
+        sessions = await session_manager.get_view_sessions(ds_id)
         if sessions:
             session_id = list(sessions.keys())[0]
             await provider.on_session_start()
@@ -83,7 +83,7 @@ async def start_view(view_id: str):
             detail=f"Failed to start view: {e}"
         )
     
-    return {"status": "started", "view_id": view_id, "datastore_id": datastore_id}
+    return {"status": "started", "view_id": view_id, "datastore_id": ds_id}
 
 
 @router.post("/views/{view_id}/stop")
@@ -99,19 +99,19 @@ async def stop_view(view_id: str):
     from ..core.session_manager import session_manager
     
     # Find which ViewManager has this view
-    datastore_id = None
-    for ds_id, vm in view_managers.items():
+    ds_id = None
+    for manager_id, vm in view_managers.items():
         if view_id in vm.providers:
-            datastore_id = ds_id
+            ds_id = manager_id
             break
     
-    if datastore_id is None:
+    if ds_id is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"View '{view_id}' is not running"
         )
     
-    vm = view_managers[datastore_id]
+    vm = view_managers[ds_id]
     
     # Unregister view
     try:
@@ -126,13 +126,13 @@ async def stop_view(view_id: str):
     
     if remaining_views == 0:
         # No views left for this datastore, terminate sessions
-        sessions = await session_manager.get_datastore_sessions(datastore_id)
+        sessions = await session_manager.get_view_sessions(ds_id)
         for session_id in list(sessions.keys()):
-            await session_manager.terminate_session(view_id=datastore_id, session_id=session_id)
-            logger.info(f"Terminated session {session_id} for datastore {datastore_id}")
+            await session_manager.terminate_session(view_id=ds_id, session_id=session_id)
+            logger.info(f"Terminated session {session_id} for datastore {ds_id}")
         
         # Remove empty ViewManager
-        del view_managers[datastore_id]
+        del view_managers[ds_id]
     
     # Check if any views left globally
     total_views = sum(len(vm.providers) for vm in view_managers.values())

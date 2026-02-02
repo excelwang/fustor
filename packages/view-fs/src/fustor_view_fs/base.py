@@ -17,7 +17,7 @@ class FSViewBase(ViewDriver):
     Provides shared state and concurrency primitives.
     """
     
-    def __init__(self, view_id: str, datastore_id: int, config: Optional[Dict[str, Any]] = None, hot_file_threshold: float = 30.0):
+    def __init__(self, view_id: str, datastore_id: Optional[str] = None, config: Optional[Dict[str, Any]] = None, hot_file_threshold: float = 30.0):
         # Allow config to override argument
         final_config = config or {}
         # Support both keys, prefer item
@@ -26,9 +26,9 @@ class FSViewBase(ViewDriver):
         # Ensure config has at least one valid key for upstream
         final_config.setdefault("hot_file_threshold", threshold)
         
-        super().__init__(view_id, datastore_id, final_config)
+        super().__init__(view_id, datastore_id or view_id, final_config)
         
-        self.logger = logging.getLogger(f"fustor_view.fs.{datastore_id}")
+        self.logger = logging.getLogger(f"fustor_view.fs.{view_id}")
         self.hot_file_threshold = float(threshold)
         
         # Concurrency management

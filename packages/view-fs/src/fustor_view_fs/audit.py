@@ -12,7 +12,7 @@ class AuditManager:
     def __init__(self, state: FSState, tree_manager: TreeManager):
         self.state = state
         self.tree_manager = tree_manager
-        self.logger = logging.getLogger(f"fustor_view.fs.audit.{state.datastore_id}")
+        self.logger = logging.getLogger(f"fustor_view.fs.audit.{state.view_id}")
 
     async def handle_start(self):
         """Prepares state for a new audit cycle."""

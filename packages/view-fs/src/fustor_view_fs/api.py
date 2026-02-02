@@ -19,14 +19,14 @@ class SuspectUpdateRequest(BaseModel):
     updates: List[Dict[str, Any]]  # List of {"path": str, "mtime": float}
 
 
-def create_fs_router(get_provider_func, check_snapshot_func, get_datastore_id_dep):
+def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
     """
     Factory function to create the FS router with proper dependencies.
     
     Args:
         get_provider_func: Async function to get the FSViewProvider for a datastore
         check_snapshot_func: Async function to check snapshot status (includes Core + Live logic)
-        get_datastore_id_dep: FastAPI dependency to get datastore_id from API key
+        get_view_id_dep: FastAPI dependency to get view_id from API key
 
     Returns:
         Configured FastAPI APIRouter
@@ -43,15 +43,15 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_datastore_id_de
         max_depth: Optional[int] = Query(None, description="最大递归深度 (1 表示仅当前目录及其直接子级)"),
         only_path: bool = Query(False, description="是否仅返回路径结构，排除元数据"),
         dry_run: bool = Query(False, description="压测模式：跳过逻辑处理以测量框架延迟"),
-        datastore_id: int = Depends(get_datastore_id_dep)
+        view_id: str = Depends(get_view_id_dep)
     ) -> Optional[Dict[str, Any]]:
         """获取指定路径起始的目录结构树。"""
-        await check_snapshot_func(datastore_id)
+        await check_snapshot_func(view_id)
         
         if dry_run:
-            return ORJSONResponse(content={"message": "dry-run", "datastore_id": datastore_id})
+            return ORJSONResponse(content={"message": "dry-run", "view_id": view_id})
 
-        provider = await get_provider_func(datastore_id)
+        provider = await get_provider_func(view_id)
         if not provider:
             return ORJSONResponse(content={"detail": "Provider not initialized"}, status_code=503)
         
@@ -65,22 +65,22 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_datastore_id_de
     @router.get("/search", summary="基于模式搜索文件")
     async def search_files_api(
         pattern: str = Query(..., description="要搜索的路径匹配模式 (例如: '*.log' 或 '/data/res*')"),
-        datastore_id: int = Depends(get_datastore_id_dep)
+        view_id: str = Depends(get_view_id_dep)
     ) -> list:
         """搜索匹配模式的文件。"""
-        await check_snapshot_func(datastore_id)
-        provider = await get_provider_func(datastore_id)
+        await check_snapshot_func(view_id)
+        provider = await get_provider_func(view_id)
         if not provider:
             return []
         return await provider.search_files(pattern)
 
     @router.get("/stats", summary="获取文件系统统计指标")
     async def get_directory_stats_api(
-        datastore_id: int = Depends(get_datastore_id_dep)
+        view_id: str = Depends(get_view_id_dep)
     ) -> Dict[str, Any]:
         """获取当前目录结构的统计信息。"""
-        await check_snapshot_func(datastore_id)
-        provider = await get_provider_func(datastore_id)
+        await check_snapshot_func(view_id)
+        provider = await get_provider_func(view_id)
         if not provider:
             return {"error": "Provider not initialized"}
         return await provider.get_directory_stats()
@@ -90,19 +90,19 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_datastore_id_de
         status_code=status.HTTP_204_NO_CONTENT
     )
     async def reset_directory_tree_api(
-        datastore_id: int = Depends(get_datastore_id_dep)
+        view_id: str = Depends(get_view_id_dep)
     ) -> None:
         """Reset the directory tree structure by clearing all entries for a specific datastore."""
-        provider = await get_provider_func(datastore_id)
+        provider = await get_provider_func(view_id)
         if provider:
             await provider.reset()
 
     @router.get("/suspect-list", summary="Get Suspect List for Sentinel Sweep")
     async def get_suspect_list_api(
-        datastore_id: int = Depends(get_datastore_id_dep)
+        view_id: str = Depends(get_view_id_dep)
     ) -> List[Dict[str, Any]]:
         """Get the current Suspect List for this datastore."""
-        provider = await get_provider_func(datastore_id)
+        provider = await get_provider_func(view_id)
         if not provider:
             return []
         suspect_list = await provider.get_suspect_list()
@@ -111,10 +111,10 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_datastore_id_de
     @router.put("/suspect-list", summary="Update Suspect List from Sentinel Sweep")
     async def update_suspect_list_api(
         request: SuspectUpdateRequest,
-        datastore_id: int = Depends(get_datastore_id_dep)
+        view_id: str = Depends(get_view_id_dep)
     ) -> Dict[str, Any]:
         """Update suspect files with their current mtimes from Agent's Sentinel Sweep."""
-        provider = await get_provider_func(datastore_id)
+        provider = await get_provider_func(view_id)
         if not provider:
             raise HTTPException(status_code=404, detail="View Provider not initialized")
         
@@ -126,14 +126,14 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_datastore_id_de
                 await provider.update_suspect(path, float(mtime))
                 updated_count += 1
         
-        return {"datastore_id": datastore_id, "updated_count": updated_count, "status": "ok"}
+        return {"view_id": view_id, "updated_count": updated_count, "status": "ok"}
 
     @router.get("/blind-spots", summary="Get Blind-spot Information")
     async def get_blind_spots_api(
-        datastore_id: int = Depends(get_datastore_id_dep)
+        view_id: str = Depends(get_view_id_dep)
     ) -> Dict[str, Any]:
         """Get the current Blind-spot List for this datastore."""
-        provider = await get_provider_func(datastore_id)
+        provider = await get_provider_func(view_id)
         if not provider:
             return {"error": "Provider not initialized"}
         return await provider.get_blind_spot_list()

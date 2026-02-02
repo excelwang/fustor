@@ -164,7 +164,7 @@ class PipelineManager:
             return SessionInfo(
                 session_id=session_id,
                 task_id=task_id,
-                pipeline_id=pipeline_id,
+                view_id=pipeline_id,
                 role=role,
                 created_at=time.time(),
                 last_heartbeat=time.time()

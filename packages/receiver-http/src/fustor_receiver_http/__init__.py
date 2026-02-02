@@ -56,10 +56,17 @@ class SessionInfo:
     """Information about an active session."""
     session_id: str
     task_id: str
-    pipeline_id: str
+    view_id: str
     role: str  # 'leader' or 'follower'
     created_at: float
     last_heartbeat: float
+
+    @property
+    def pipeline_id(self) -> str:
+        """Deprecated alias for view_id."""
+        import warnings
+        warnings.warn("pipeline_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
+        return self.view_id
 
 
 # Type aliases for callbacks
