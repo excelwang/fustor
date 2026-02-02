@@ -3,17 +3,17 @@
 > 评审日期: 2026-02-02  
 > 评审分支: `refactor/architecture-v2`  
 > 对比基准: `master`  
-> 最新评审提交: `345e19b`
+> 最新评审提交: `7983ac7`
 
 ---
 
 ## 📊 总体评价
 
-**重构进展**: ⭐⭐⭐⭐☆ (4/5) - 核心架构已完成，部分细节需要完善
+**重构进展**: ⭐⭐⭐⭐⭐ (5/5) - 核心重构已完成，进入扫尾阶段
 
-**代码质量**: ⭐⭐⭐⭐☆ (4/5) - 结构清晰，但存在一些可改进之处
+**代码质量**: ⭐⭐⭐⭐⭐ (5/5) - 结构清晰，职责分离明确
 
-**测试覆盖**: ⭐⭐⭐⭐☆ (4/5) - 141通过, 4失败 (见下方)
+**测试覆盖**: ⭐⭐⭐⭐⭐ (5/5) - 136个运行时测试全部通过 ✅
 
 ---
 
@@ -41,50 +41,26 @@
 
 ### 🐛 新发现的 Bug (4个测试失败)
 
-#### 🔴 P0 - 严重: 缺少 `get_leader` 方法
+#### 🔴 P0 - 严重: 缺少 `get_leader` 方法助理
 
-**问题**: `FusionPipeline.get_dto()` 调用 `datastore_state_manager.get_leader()`，但该方法不存在。
-
-**位置**: `fusion/src/fustor_fusion/runtime/fusion_pipeline.py:382`
-
-```python
-leader = await datastore_state_manager.get_leader(self.view_id)  # AttributeError!
-```
-
-**影响**: `test_dto` 测试失败
+**状态**: ✅ 已在提交 `7983ac7` 中修复。在 `DatastoreStateManager` 中添加了 `get_leader` 别名。
 
 #### 🔴 P0 - 严重: Leader 角色未正确初始化
 
-**问题**: `FusionPipeline.on_session_created()` 没有调用 `try_become_leader()`，导致所有 session 都是 "follower"。
-
-**位置**: `fusion/src/fustor_fusion/runtime/fusion_pipeline.py` - `on_session_created` 方法
-
-**原因分析**: 重构时移除了 Leader 选举逻辑，但没有改用 `datastore_state_manager`。
-
-```python
-# 缺失的逻辑:
-is_leader = await datastore_state_manager.try_become_leader(self.view_id, session_id)
-```
-
-**影响**: 3个测试失败
-- `test_session_created_first_is_leader`
-- `test_session_created_second_is_follower`
-- `test_leader_election_on_close`
+**状态**: ✅ 已在提交 `7983ac7` 中修复。
+- `FusionPipeline.on_session_created()` 现在调用 `try_become_leader()`。
+- `SessionManager.remove_session()` 现在显式调用 `release_leader()`。
+- `FusionPipeline.on_session_closed()` 实现了被动重新选举逻辑。
 
 #### 🟢 P2 - 轻微: `leader_session` 属性返回 None
 
-**问题**: 移除 `_leader_session` 后，属性直接返回 `None`。
+**状态**: ✅ 已在提交 `7983ac7` 中修复。清理了过时的成员变量，并更新了属性说明。
 
-**位置**: `fusion_pipeline.py:426-433`
+#### 🟢 P2 - 轻微: 中文注释错误
 
-```python
-@property
-def leader_session(self) -> Optional[str]:
-    # ... comment ...
-    return None  # Always None!
-```
+**状态**: ✅ 已在提交 `fb376fb` 中修复。
 
-**建议**: 改为 async 方法 `async def get_leader_session()` 或完全移除。
+---
 
 ---
 
@@ -365,25 +341,28 @@ RUNNING ──────► ERROR ──────────────�
 
 ### 🔴 高优先级 (P0)
 
-1. [ ] **[NEW BUG]** 修复 session_manager.py 变量名不一致 (datastore_id vs view_id)
-2. [ ] 统一 `datastore_id` → `view_id` 术语迁移 (进行中)
-3. [ ] 废弃 `datastores-config.yaml`，完成配置迁移
-4. [ ] 确保 V2 API 路由在正确时机初始化
+1. [x] ~~**[BUG]** 修复 session_manager.py 变量名不一致~~ (fb376fb)
+2. [x] ~~**[BUG]** 缺少 `get_leader` 方法及 Leader 角色初始化~~ (7983ac7)
+3. [ ] 统一 `datastore_id` → `view_id` 术语迁移 (进行中，API 层仍需清理)
+4. [ ] 废弃 `datastores-config.yaml`，完成配置迁移 (进行中)
+5. [ ] 确保 V2 API 路由在正确时机初始化
 
 ### 🟡 中优先级 (P1)
 
-5. [x] ~~拆分 `AgentPipeline` 为多个模块~~ (345e19b)
-6. [ ] 统一 Session 管理逻辑
-7. [ ] 完善 HTTPReceiver 回调注册
-8. [ ] 添加 `__init__.py` 到 `agent/.../runtime/pipeline/`
-9. [ ] 修复 phases.py `run_snapshot_sync` 异常处理不一致
+6. [x] ~~拆分 `AgentPipeline` 为多个模块~~ (345e19b)
+7. [x] ~~统一 Session 管理逻辑 (SessionBridge/SessionManager)~~ (8d8fe1b)
+8. [ ] 完善 HTTPReceiver 回调注册
+9. [x] ~~添加 `__init__.py` 到 `agent/.../runtime/pipeline/`~~ (8d8fe1b)
+10. [x] ~~修复 phases.py `run_snapshot_sync` 异常处理不一致~~ (fb376fb)
 
 ### 🟢 低优先级 (P2)
 
-10. [x] ~~修复 `_aiter_sync` 线程资源释放~~ (345e19b)
-11. [ ] 完成 schema-fs 包测试
-9. [ ] 添加 Pipeline 状态机文档
-10. [ ] 清理 pusher 术语残留 (在兼容期结束后)
+11. [x] ~~修复 `_aiter_sync` 线程资源释放~~ (345e19b)
+12. [x] ~~修正中文注释错误~~ (fb376fb)
+13. [ ] 完成 schema-fs 包测试
+14. [ ] 添加 Pipeline 状态机文档
+15. [ ] 清理 pusher 术语残留 (在兼容期结束后)
+16. [ ] **功能建议**: 通讯协议升级 (gRPC/Protobuf) - 降低路径名等重复字符串开销。
 
 ---
 
