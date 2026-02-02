@@ -42,19 +42,25 @@ class ServiceManager:
             f.write(f"FUSTOR_HOME={self.env_dir}\n")
             f.write(f"FUSTOR_LOG_LEVEL=DEBUG\n")
         
-        # Inject Datastores Config for Fusion
-        os.makedirs(os.path.join(self.env_dir, "datastores-config"), exist_ok=True)
+        # V2: Inject Receivers Config for Fusion (replacing datastores-config)
         self.api_key = "bench-api-key-123456"
-        ds_config = {
-            1: {
-                "name": "BenchmarkDS",
-                "api_key": self.api_key,
-                "session_timeout_seconds": 30,
-                "allow_concurrent_push": True
+        receivers_config = {
+            "receivers": {
+                "bench-http": {
+                    "driver": "http",
+                    "port": self.fusion_port,
+                    "host": "0.0.0.0",
+                    "api_keys": {
+                        self.api_key: {
+                            "role": "admin",
+                            "view_mappings": ["bench-view"]
+                        }
+                    }
+                }
             }
         }
-        with open(os.path.join(self.env_dir, "datastores-config.yaml"), "w") as f:
-            yaml.dump(ds_config, f)
+        with open(os.path.join(self.env_dir, "receivers-config.yaml"), "w") as f:
+            yaml.dump(receivers_config, f)
         
         # Inject View Config for Fusion
         os.makedirs(os.path.join(self.env_dir, "views-config"), exist_ok=True)

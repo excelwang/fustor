@@ -16,12 +16,19 @@ class FSArbitrator:
     Core arbitration logic for FS Views.
     Implements Smart Merge, Tombstone Protection, and Clock Synchronization.
     """
+    
+    # Heuristics and Constants
+    MS_THRESHOLD = 1e11              # If timestamp > 1e11, assume it's in milliseconds
+    FLOAT_EPSILON = 1e-6             # Tolerance for float equality comparisons
+    TOMBSTONE_EPSILON = 1e-5         # Buffer for tombstone expiration comparison
+    DEFAULT_CLEANUP_INTERVAL = 0.5   # Seconds between suspect list cleanups
+
     def __init__(self, state: FSState, tree_manager: TreeManager, hot_file_threshold: float):
         self.state = state
         self.tree_manager = tree_manager
         self.hot_file_threshold = hot_file_threshold
         self.logger = logging.getLogger(f"fustor_fusion.view_fs.arbitrator.{state.view_id}")
-        self.suspect_cleanup_interval = 0.5
+        self.suspect_cleanup_interval = self.DEFAULT_CLEANUP_INTERVAL
 
     async def process_event(self, event: Any) -> bool:
         """Process an event using Smart Merge logic."""
@@ -57,7 +64,7 @@ class FSArbitrator:
                  agent_time = float(event.timestamp)
             
             # Heuristic: Normalize milliseconds to seconds if needed
-            if agent_time and agent_time > 1e11:
+            if agent_time and agent_time > self.MS_THRESHOLD:
                 agent_time /= 1000.0
                  
 
@@ -111,7 +118,7 @@ class FSArbitrator:
             
             # Check if this is "New activity" after deletion
             event_ref_ts = (event.index / 1000.0) if event.index > 0 else mtime
-            if event_ref_ts > (tombstone_ts + 1e-5) or mtime > (tombstone_ts + 1e-5):
+            if event_ref_ts > (tombstone_ts + self.TOMBSTONE_EPSILON) or mtime > (tombstone_ts + self.TOMBSTONE_EPSILON):
                 self.logger.info(f"TOMBSTONE_CLEARED for {path}")
                 self.state.tombstone_list.pop(path, None)
             else:
@@ -166,7 +173,7 @@ class FSArbitrator:
             # Manage Suspect List (Hot Data)
             watermark = self.state.logical_clock.get_watermark()
             age = watermark - mtime
-            mtime_changed = (existing is None) or (abs(old_mtime - mtime) > 1e-6)
+            mtime_changed = (existing is None) or (abs(old_mtime - mtime) > self.FLOAT_EPSILON)
             
             self.logger.debug(f"DEBUG_ARB: NON_REALTIME {path} source={source} mtime_changed={mtime_changed} age={age:.1f}")
             
@@ -206,7 +213,7 @@ class FSArbitrator:
             if path not in self.state.suspect_list: continue
             
             curr_expiry, recorded_mtime = self.state.suspect_list[path]
-            if abs(curr_expiry - expires_at) > 1e-6: continue
+            if abs(curr_expiry - expires_at) > self.FLOAT_EPSILON: continue
             
             node = self.state.get_node(path)
             if not node:
@@ -214,7 +221,7 @@ class FSArbitrator:
                 continue
             
             # Stability Check: Has mtime changed since we added it to suspect list?
-            if abs(node.modified_time - recorded_mtime) > 1e-6:
+            if abs(node.modified_time - recorded_mtime) > self.FLOAT_EPSILON:
                 # Active! Renew TTL
                 new_expiry = now_mono + self.hot_file_threshold
                 self.state.suspect_list[path] = (new_expiry, node.modified_time)

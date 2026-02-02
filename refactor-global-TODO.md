@@ -1,23 +1,41 @@
-# Refactor Global TODO - architecture-v2
+# Refactor Global TODO
 
-## Phase 4: Polish and Integration (Current focus)
+Based on `refactored-branch-review.md`.
 
-- [ ] **Fix Functionality Regressions**
-    - [ ] Restore `fields_mapping` support in `run_driver_message_sync` [Source: review report]
-    - [ ] Consolidate `Mapper` logic to avoid duplication between Bus and Driver modes
-- [ ] **Address Performance/Robustness Suggestions**
-    - [ ] Refine mtime heuristic in `FSArbitrator` (remove magic numbers) [Source: review report]
-    - [ ] Add explicit time unit support in `fustor-schema-fs`
-- [ ] **Verification & Validation**
-    - [ ] Ensure all `it/consistency` tests pass with the new Pipeline architecture
-    - [ ] Add a specific integration test for `fields_mapping` in both Bus and Driver modes
-- [ ] **Documentation & Cleanup**
-    - [ ] Update READMEs in `agent/` and `fusion/` to reflect new config paths
-    - [ ] Remove any remaining "pusher"/"sync" legacy code in non-sdk packages
+## Status Overview
 
-## Recently Completed
-- [x] Architecture Review and Gap Analysis
-- [x] Core Pipeline implementation
-- [x] FS Consistency logic (FSArbitrator)
-- [x] Logical Clock (Robust Skew Mode)
-- [x] Base modules consolidation (fustor-core)
+| Step ID | Task Name | Status |
+|---------|-----------|--------|
+| step-01 | Fix EventMapper Security and Logic | [x] Done |
+| step-02 | Create Config Migration Guide | [x] Done |
+| step-03 | Document Reliability/Retry Mechanisms | [x] Done |
+| step-04 | Observability Interfaces | [x] Done |
+
+## Detailed Plan
+
+### Step 01: Fix EventMapper Security and Logic
+- **Goal**:
+    - Remove `exec` security vulnerability.
+    - Implement safe closure-based mapping logic.
+    - Add support for `hardcoded_value`.
+    - Add missing unit tests for `EventMapper`.
+- **Files**:
+    - `packages/core/src/fustor_core/pipeline/mapper.py`
+    - `packages/core/tests/pipeline/test_mapper.py` (New)
+
+### Step 02: Create Config Migration Guide
+- **Goal**:
+    - Document mapping from `datastores-config.yaml` to `views-config/*.yaml`.
+    - Ensure no legacy config code remains.
+- **Files**: `docs/migration-guide.md`
+
+### Step 03: Document Reliability/Retry Mechanisms
+- **Goal**:
+    - Explicitly document session and retry policies.
+    - Expose configurable timeouts if missing.
+- **Files**: `packages/core/src/fustor_core/pipeline/context.py` (or similar)
+
+### Step 04: Observability Interfaces
+- **Goal**:
+    - Add `Metrics` abstraction in Core.
+- **Files**: `packages/core/src/fustor_core/common/metrics.py`

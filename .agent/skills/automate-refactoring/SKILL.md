@@ -28,13 +28,13 @@ description: 自动化执行重构任务，遵循文档中的重构方案，持�
 
 ### 3. 逐步执行
 对于每个步骤：
-1. 制定大致的 `{step-id}-TODO.md` 任务清单
+1. 制定大致的 `{your-name}-{step-id}-TODO.md` 任务清单
 2. 执行代码修改
 3. 运行相关测试验证修改
 4. 确认运行效果符合预期
-6. 更新 `{step-id}-TODO.md` 标记已完成的任务
+5. 更新 `{your-name}-{step-id}-TODO.md` 标记已完成的任务
 6. 更新 `refactor-global-TODO.md`
-5. 提交更改（使用有意义的 commit message）
+7. 提交更改（使用有意义的 commit message）
 
 ### 4. 完成验证
 - 当认为重构任务已完成时，回顾重构方案文档

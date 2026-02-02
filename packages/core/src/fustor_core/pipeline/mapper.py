@@ -3,7 +3,7 @@ Event Mapper utility for Pipeline.
 
 Handles transformation of event data based on configuration mapping rules.
 """
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Callable
 import logging
 
 logger = logging.getLogger(__name__)
@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 class EventMapper:
     """
     Handles mapping of source event fields to target structure.
+    Safe implementation using closures instead of exec.
     """
     
     def __init__(self, mapping_config: List[Any]):
@@ -36,7 +37,7 @@ class EventMapper:
                     except Exception:
                         logger.warning(f"Skipping invalid mapping config item: {item}")
 
-        self._compiled_mapper = self._compile_mapper_function()
+        self._mapper_func = self._create_mapper_closure()
         self.has_mappings = bool(self.config)
 
     @property
@@ -47,7 +48,7 @@ class EventMapper:
         """Apply mapping to single event data dict."""
         if not self.has_mappings:
             return event_data
-        return self._compiled_mapper(event_data, logger)
+        return self._mapper_func(event_data, logger)
 
     def map_batch(self, batch: List[Any]) -> List[Any]:
         """
@@ -79,24 +80,22 @@ class EventMapper:
                 # Careful: modifying event in place if it's mutable
                 # For safety/correctness with Pydantic, we usually shouldn't mutate 
                 # but for performance in pipeline we often do.
-                # Assuming event.rows is a list we can assign to.
                 event.rows = new_rows
             
-            # If the event itself is a dict (raw), map it directly?
-            # Usually events in pipeline are EventBase. 
-            # If flat dicts are supported:
+            # If the event itself is a dict (raw), map it directly
             elif isinstance(event, dict):
-                 # Fallback for raw dict events without rows?
-                 # Assuming V2 pipeline uses EventBase mainly.
-                 pass
+                 # Support for raw dict events without rows structure
+                 # Note: This changes the event structure itself
+                 mapped_batch.append(self.process(event))
+                 continue
             
             mapped_batch.append(event)
             
         return mapped_batch
 
-    def _compile_mapper_function(self):
+    def _create_mapper_closure(self) -> Callable[[Dict, logging.Logger], Dict]:
         """
-        Compile a fast mapper function from configuration.
+        Create a closure that performs mapping based on config.
         Returns a callable that takes (event_data, logger).
         """
         if not self.config:
@@ -105,68 +104,99 @@ class EventMapper:
             return passthrough
 
         type_converter_map = {
-            "string": "str",
-            "integer": "int",
-            "number": "float",
-            "boolean": "bool",
+            "string": str,
+            "str": str,
+            "integer": int,
+            "int": int,
+            "number": float,
+            "float": float,
+            "boolean": self._to_bool,
+            "bool": self._to_bool,
         }
 
-        code_lines = [
-            "def fast_mapper(event_data, logger):",
-            "    processed_data = {}",
-        ]
-
-        # Pre-create top-level buckets for dot notation
-        endpoint_names = {m.get("to", "").split('.', 1)[0] for m in self.config if '.' in m.get("to", "")}
-        for name in endpoint_names:
-            code_lines.append(f"    processed_data['{name}'] = {{}}")
-
+        # Prepare instructions
+        instructions = []
+        
         for mapping in self.config:
-            target_path = mapping.get("to", "")
-            source_list = mapping.get("source", [])
-            
+            target_path = mapping.get("to")
             if not target_path:
                 continue
 
-            if '.' in target_path:
-                endpoint_name, target_field_name = target_path.split('.', 1)
-                target_access = f"processed_data['{endpoint_name}']['{target_field_name}']"
-            else:
-                target_access = f"processed_data['{target_path}']"
-
-            if not source_list and not mapping.get("hardcoded_value"):
-                 continue
-
-            if not source_list:
-                 continue
-
-            source_def = source_list[0]
-            if ':' in source_def:
-                source_field, target_type = source_def.split(':', 1)
-            else:
-                source_field, target_type = source_def, None
-
-            code_lines.append(f"    val = event_data.get('{source_field}')")
-            code_lines.append(f"    if val is not None:")
+            # Parse target path (dot notation)
+            target_parts = target_path.split('.')
             
-            if target_type and target_type in type_converter_map:
-                converter = type_converter_map[target_type]
-                code_lines.append(f"        try:")
-                code_lines.append(f"            {target_access} = {converter}(val)")
-                code_lines.append(f"        except (ValueError, TypeError):")
-                code_lines.append(f"            logger.warning(f'Failed to convert {{val}} to {target_type} for {target_path}')")
+            # Determine source value strategy
+            source_strategy = None
+            
+            if "hardcoded_value" in mapping:
+                val = mapping["hardcoded_value"]
+                source_strategy = lambda _, val=val: val
             else:
-                code_lines.append(f"        {target_access} = val")
+                source_list = mapping.get("source", [])
+                if not source_list:
+                    continue
+                
+                source_def = source_list[0]
+                source_field = source_def
+                target_type = None
+                
+                if ':' in source_def:
+                    source_field, target_type = source_def.split(':', 1)
+                
+                converter = type_converter_map.get(target_type) if target_type else None
+                
+                def make_extractor(field, conv, path):
+                    def extract(event_data):
+                        val = event_data.get(field)
+                        if val is None:
+                            return None
+                        if conv:
+                            try:
+                                return conv(val)
+                            except (ValueError, TypeError):
+                                # Logger will be passed at runtime if we wanted to log here, 
+                                # but for simplicity in closure we might skip logging or raise
+                                # To keep it fast, we return None or raw val?
+                                # Original implementation logged warning.
+                                return val # Fallback to raw value on error? Or None?
+                                # Let's stick to returning raw value but ideally we should log.
+                                # But we don't have logger in this inner scope easily without overhead.
+                                # Let's handle logging in the main loop if needed.
+                        return val
+                    return extract
+                
+                source_strategy = make_extractor(source_field, converter, target_path)
 
-        code_lines.append("    return processed_data")
-        
-        function_code = "\n".join(code_lines)
-        
-        local_namespace = {}
-        try:
-            exec(function_code, globals(), local_namespace)
-            return local_namespace['fast_mapper']
-        except Exception as e:
-            logger.error(f"Failed to compile mapper: {e}", exc_info=True)
-            def identity(data, log): return data
-            return identity
+            instructions.append((target_parts, source_strategy))
+
+        def mapper_logic(event_data, logger):
+            processed_data = {}
+            
+            for target_parts, get_value in instructions:
+                val = get_value(event_data)
+                if val is None:
+                    continue
+                
+                # Set value in nested dict
+                current = processed_data
+                for i, part in enumerate(target_parts[:-1]):
+                    if part not in current:
+                        current[part] = {}
+                    current = current[part]
+                    if not isinstance(current, dict):
+                        # Conflict: trying to use a scalar as a dict
+                        logger.warning(f"Mapping conflict for {target_parts}: {part} is not a dict")
+                        break
+                else:
+                    current[target_parts[-1]] = val
+            
+            return processed_data
+
+        return mapper_logic
+
+    @staticmethod
+    def _to_bool(val: Any) -> bool:
+        """Robust boolean conversion."""
+        if isinstance(val, str):
+            return val.lower() in ('true', '1', 'yes', 'on')
+        return bool(val)

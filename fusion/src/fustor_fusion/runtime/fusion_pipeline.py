@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, TYPE_CHECKING
 from fustor_core.pipeline import Pipeline, PipelineState
 from fustor_core.pipeline.handler import ViewHandler
 from fustor_core.event import EventBase
+from fustor_core.common.metrics import get_metrics
 
 if TYPE_CHECKING:
     from fustor_core.pipeline.context import PipelineContext
@@ -209,9 +210,14 @@ class FusionPipeline(Pipeline):
                     break
                 
                 # Process each event
+                t0 = time.time()
                 for event in event_batch:
                     await self._dispatch_to_handlers(event)
                     self.statistics["events_processed"] += 1
+                
+                duration = time.time() - t0
+                get_metrics().counter("fustor.fusion.events_processed", len(event_batch), {"pipeline": self.id})
+                get_metrics().histogram("fustor.fusion.processing_latency", duration, {"pipeline": self.id})
                 
                 self._event_queue.task_done()
                 
@@ -382,6 +388,8 @@ class FusionPipeline(Pipeline):
                     print(f"DEBUG_FUSION_EVENT: {event.event_type} table={event.table} first_row={event.rows[0]}")
         
         # Queue for processing
+        self.statistics["events_received"] += len(events)
+        get_metrics().counter("fustor.fusion.events_received", len(events), {"pipeline": self.id, "source": source_type})
         await self._event_queue.put(processed_events)
         
         # Handle snapshot completion signal

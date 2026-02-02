@@ -5,6 +5,7 @@ from typing import Any, List, Optional, Tuple, TYPE_CHECKING, Iterator
 
 from fustor_core.pipeline import PipelineState
 from fustor_core.exceptions import SessionObsoletedError
+from fustor_core.common.metrics import get_metrics
 
 if TYPE_CHECKING:
     from ..agent_pipeline import AgentPipeline
@@ -37,6 +38,7 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
                 if success:
                     pipeline._update_role_from_response(response)
                     pipeline.statistics["events_pushed"] += len(batch)
+                    get_metrics().counter("fustor.agent.events_pushed", len(batch), {"pipeline": pipeline.id, "phase": "snapshot"})
                     batch = []
                 else:
                     raise Exception("Snapshot batch send failed")
@@ -88,6 +90,7 @@ async def run_driver_message_sync(pipeline: "AgentPipeline") -> None:
                 if success:
                     pipeline._update_role_from_response(response)
                     pipeline.statistics["events_pushed"] += len(batch)
+                    get_metrics().counter("fustor.agent.events_pushed", len(batch), {"pipeline": pipeline.id, "phase": "realtime"})
                     batch = []
                 else:
                     raise Exception("Realtime batch send failed")
@@ -140,6 +143,7 @@ async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
             if success:
                 pipeline._update_role_from_response(response)
                 pipeline.statistics["events_pushed"] += len(events)
+                get_metrics().counter("fustor.agent.events_pushed", len(events), {"pipeline": pipeline.id, "phase": "realtime_bus"})
                 # Commit to bus
                 if pipeline._bus_service:
                     await pipeline._bus_service.commit_and_handle_split(
@@ -237,6 +241,7 @@ async def run_sentinel_check(pipeline: "AgentPipeline") -> None:
             success = await pipeline.sender_handler.submit_sentinel_results(results)
             if success:
                 logger.info(f"Pipeline {pipeline.id}: Submitted sentinel results for {len(results.get('updates', []))} items")
+                get_metrics().counter("fustor.agent.sentinel_checks", 1, {"pipeline": pipeline.id})
             else:
                 logger.warning(f"Pipeline {pipeline.id}: Failed to submit sentinel results")
                 

@@ -88,19 +88,19 @@ class AgentPipeline(Pipeline):
         self._sentinel_task: Optional[asyncio.Task] = None
         
         # Configuration
-        self.heartbeat_interval_sec = config.get("heartbeat_interval_sec", 10)
-        self.audit_interval_sec = config.get("audit_interval_sec", 600)
-        self.sentinel_interval_sec = config.get("sentinel_interval_sec", 120)
-        self.batch_size = config.get("batch_size", 100)
-        
-        # Timing and backoff configurations
-        self.control_loop_interval = config.get("control_loop_interval", 1.0)
-        self.follower_standby_interval = config.get("follower_standby_interval", 1.0)
-        self.role_check_interval = config.get("role_check_interval", 1.0)
-        self.error_retry_interval = config.get("error_retry_interval", 5.0)
-        self.max_consecutive_errors = config.get("max_consecutive_errors", 5)
-        self.backoff_multiplier = config.get("backoff_multiplier", 2)
-        self.max_backoff_seconds = config.get("max_backoff_seconds", 60)
+        self.heartbeat_interval_sec = config.get("heartbeat_interval_sec", 10) # Seconds between heartbeats
+        self.audit_interval_sec = config.get("audit_interval_sec", 600)       # Seconds between audit cycles (0 to disable)
+        self.sentinel_interval_sec = config.get("sentinel_interval_sec", 120) # Seconds between sentinel checks (0 to disable)
+        self.batch_size = config.get("batch_size", 100)                     # Events per push
+
+        # Timing and backoff configurations (Reliability)
+        self.control_loop_interval = config.get("control_loop_interval", 1.0) # Seconds between control loop iterations
+        self.follower_standby_interval = config.get("follower_standby_interval", 1.0) # Delay while in follower mode
+        self.role_check_interval = config.get("role_check_interval", 1.0)      # How often to check for role changes
+        self.error_retry_interval = config.get("error_retry_interval", 5.0)    # Initial backoff delay
+        self.max_consecutive_errors = config.get("max_consecutive_errors", 5)  # Threshold for warning
+        self.backoff_multiplier = config.get("backoff_multiplier", 2)          # Exponential backoff factor
+        self.max_backoff_seconds = config.get("max_backoff_seconds", 60)       # Max backoff delay cap
         
 
         

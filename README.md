@@ -30,7 +30,8 @@ Fustor 使用一个主目录来存放配置、日志和数据库。
 ```bash
 # 创建基础目录结构
 mkdir -p ~/.fustor/views-config
-mkdir -p ~/.fustor/syncs-config
+touch ~/.fustor/receivers-config.yaml      # 创建接收端配置文件
+mkdir -p ~/.fustor/agent-pipes-config     # 替代 syncs-config
 ```
 
 ---
@@ -38,34 +39,40 @@ mkdir -p ~/.fustor/syncs-config
 ### 3. 角色操作手册
 
 #### 👨‍🔧 Fusion Admin (融合服务管理员)
-**职责**: 配置数据存储库 (Datastore) 和视图 (View)，启动 Fusion 服务。
+**职责**: 配置接收端 (Receiver)、视图 (View) 和管道 (Pipeline)，启动 Fusion 服务。
 
 1.  **安装 Fusion**:
     ```bash
     pip install fustor-fusion
     ```
 
-2.  **配置 Datastore**:
-    在 `~/.fustor/datastores-config.yaml` 中定义存储库和 API Key：
+2.  **配置 Receiver**:
+    在 `~/.fustor/receivers-config.yaml` 中定义监听端口和 API Key：
     ```yaml
-    1:
-      name: research-data
-      api_key: fk_your_secure_api_key_123
-      session_timeout_seconds: 30
-      allow_concurrent_push: true
+    receivers:
+      default-http:
+        driver: http
+        port: 8102
+        api_keys:
+          your-secure-key-123:
+            role: admin
+            view_mappings: ["my-view"]
     ```
 
 3.  **配置 View**:
     在 `~/.fustor/views-config/my-view.yaml` 中定义数据展示方式：
     ```yaml
-    datastore_id: 1
+    id: my-view
     driver: fs
-    disabled: false
+    enabled: true
     driver_params:
-      uri: "/mnt/fusion-view"
+      root_path: "/mnt/fusion-view"
     ```
 
-4.  **启动 Fusion 服务**:
+4.  **配置 Pipeline**:
+    在 `~/.fustor/fusion-pipes-config/pipe-1.yaml` 中绑定 Receiver 与 View。
+
+5.  **启动 Fusion 服务**:
     ```bash
     fustor-fusion start -D
     ```
@@ -73,7 +80,7 @@ mkdir -p ~/.fustor/syncs-config
 ---
 
 #### 👷 Source Admin (数据源管理员)
-**职责**: 配置数据源，将数据推送给 Fusion。
+**职责**: 配置数据源和发送器 (Sender)，将数据推送给 Fusion。
 
 1.  **安装 Agent**:
     ```bash
@@ -81,7 +88,7 @@ mkdir -p ~/.fustor/syncs-config
     ```
 
 2.  **配置同步任务**:
-    在 `~/.fustor/syncs-config/sync-job.yaml` 中定义采集与推送逻辑。
+    在 `~/.fustor/agent-pipes-config/pipe-job.yaml` 中定义采集与推送逻辑。
 
 3.  **启动 Agent**:
     ```bash
