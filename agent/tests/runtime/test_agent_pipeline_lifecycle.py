@@ -54,7 +54,7 @@ class TestAgentPipelineLifecycle:
         
         assert mock_source.snapshot_calls > 0
         assert len(mock_sender.batches) >= 2
-        assert PipelineState.MESSAGE_PHASE in agent_pipeline.state
+        assert PipelineState.MESSAGE_SYNC in agent_pipeline.state
         
         await agent_pipeline.stop()
 
@@ -83,7 +83,7 @@ class TestAgentPipelineLifecycle:
         """Pipeline should transition to AUDIT_PHASE when audit is triggered."""
         agent_pipeline.current_role = "leader"
         agent_pipeline.session_id = "test-session"
-        agent_pipeline._set_state(PipelineState.RUNNING | PipelineState.MESSAGE_PHASE)
+        agent_pipeline._set_state(PipelineState.RUNNING | PipelineState.MESSAGE_SYNC)
         
         # Mock audit to take some time
         async def slow_audit():
@@ -100,15 +100,15 @@ class TestAgentPipelineLifecycle:
         
         # While audit is running, state should include AUDIT_PHASE
         assert PipelineState.AUDIT_PHASE in agent_pipeline.state
-        assert PipelineState.MESSAGE_PHASE in agent_pipeline.state
+        assert PipelineState.MESSAGE_SYNC in agent_pipeline.state
         
-        # After audit, it should return to MESSAGE_PHASE (implicit, but check no crash)
+        # After audit, it should return to MESSAGE_SYNC (implicit, but check no crash)
         await agent_pipeline.stop()
 
     @pytest.mark.asyncio
     async def test_stop_during_snapshot(self, agent_pipeline, mock_sender, mock_source):
 
-        """Test stopping the pipeline while it is in snapshot phase."""
+        """Test stopping the pipeline while it is in snapshot sync phase."""
         # Slow down snapshot iterator to simulate work
         async def slow_iter():
             for i in range(10):
@@ -120,7 +120,7 @@ class TestAgentPipelineLifecycle:
             await agent_pipeline.start()
             
             await asyncio.sleep(0.2)
-            assert PipelineState.SNAPSHOT_PHASE in agent_pipeline.state
+            assert PipelineState.SNAPSHOT_SYNC in agent_pipeline.state
             
             await agent_pipeline.stop()
             assert agent_pipeline.state == PipelineState.STOPPED

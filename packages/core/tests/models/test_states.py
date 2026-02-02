@@ -9,8 +9,8 @@ def test_event_bus_state_enum():
 def test_pipeline_state_enum():
     assert PipelineState.STOPPED.name == "STOPPED"
     # --- REFACTORED: Test for new two-phase states instead of obsolete RUNNING state ---
-    assert PipelineState.SNAPSHOT_PHASE.name == "SNAPSHOT_PHASE"
-    assert PipelineState.MESSAGE_PHASE.name == "MESSAGE_PHASE"
+    assert PipelineState.SNAPSHOT_SYNC.name == "SNAPSHOT_SYNC"
+    assert PipelineState.MESSAGE_SYNC.name == "MESSAGE_SYNC"
     # --- END REFACTOR ---
     assert PipelineState.RUNNING_CONF_OUTDATE.name == "RUNNING_CONF_OUTDATE"
     assert PipelineState.STOPPING.name == "STOPPING"
@@ -41,7 +41,7 @@ def test_pipeline_instance_dto():
     # --- REFACTORED: Use one of the new valid states for the test ---
     dto = PipelineInstanceDTO(
         id="pipeline-abc",
-        state=PipelineState.MESSAGE_PHASE,
+        state=PipelineState.MESSAGE_SYNC,
         info="Pipeline task is running normally.",
         bus_info=bus_dto,
         bus_id="bus-456",
@@ -49,7 +49,7 @@ def test_pipeline_instance_dto():
     )
     # --- END REFACTOR ---
     assert dto.id == "pipeline-abc"
-    assert dto.state == PipelineState.MESSAGE_PHASE
+    assert dto.state == PipelineState.MESSAGE_SYNC
     assert dto.info == "Pipeline task is running normally."
     assert dto.bus_info == bus_dto
     assert dto.bus_id == "bus-456"

@@ -1,9 +1,0 @@
-# Example: views-config/research-fs.yaml
-# Location: $FUSTOR_HOME/views-config/research-fs.yaml
-
-id: research-fs
-view_id: 1
-driver: fs
-disabled: false
-driver_params:
-  hot_file_threshold: 30

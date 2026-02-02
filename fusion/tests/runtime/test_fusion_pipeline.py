@@ -133,7 +133,7 @@ class TestFusionPipelineSession:
         await fusion_pipeline.start()
         
         # Use bridge to create session (handles election and backing store)
-        await bridge.create_session(task_id="agent:sync", session_id="sess-1")
+        await bridge.create_session(task_id="agent:pipeline", session_id="sess-1")
         
         assert await fusion_pipeline.get_session_role("sess-1") == "leader"
         assert mock_view_handler.session_starts == 1
@@ -148,8 +148,8 @@ class TestFusionPipelineSession:
         
         await fusion_pipeline.start()
         
-        await bridge.create_session(task_id="agent1:sync", session_id="sess-1")
-        await bridge.create_session(task_id="agent2:sync", session_id="sess-2")
+        await bridge.create_session(task_id="agent1:pipeline", session_id="sess-1")
+        await bridge.create_session(task_id="agent2:pipeline", session_id="sess-2")
         
         assert await fusion_pipeline.get_session_role("sess-1") == "leader"
         assert await fusion_pipeline.get_session_role("sess-2") == "follower"
@@ -164,8 +164,8 @@ class TestFusionPipelineSession:
         
         await fusion_pipeline.start()
         
-        await bridge.create_session(task_id="agent1:sync", session_id="sess-1")
-        await bridge.create_session(task_id="agent2:sync", session_id="sess-2")
+        await bridge.create_session(task_id="agent1:pipeline", session_id="sess-1")
+        await bridge.create_session(task_id="agent2:pipeline", session_id="sess-2")
         
         # Close via bridge (which calls pipeline.on_session_closed)
         await bridge.close_session("sess-1")

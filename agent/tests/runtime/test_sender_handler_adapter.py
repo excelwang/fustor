@@ -177,8 +177,8 @@ class TestSenderHandlerAdapterBatch:
     """Test batch sending."""
     
     @pytest.mark.asyncio
-    async def test_send_batch_message_phase(self, adapter, mock_sender):
-        """send_batch should map message phase correctly."""
+    async def test_send_batch_message_sync(self, adapter, mock_sender):
+        """send_batch should map message sync phase correctly."""
         await adapter.create_session("test", "fs")
         
         events = [{"id": 1}, {"id": 2}]
@@ -196,8 +196,8 @@ class TestSenderHandlerAdapterBatch:
         assert is_end is False
     
     @pytest.mark.asyncio
-    async def test_send_batch_snapshot_phase(self, adapter, mock_sender):
-        """send_batch should map snapshot phase correctly."""
+    async def test_send_batch_SNAPSHOT_SYNC(self, adapter, mock_sender):
+        """send_batch should map snapshot sync phase correctly."""
         await adapter.create_session("test", "fs")
         
         events = [{"id": 1}]
@@ -213,7 +213,7 @@ class TestSenderHandlerAdapterBatch:
         assert is_end is True
     
     @pytest.mark.asyncio
-    async def test_send_batch_audit_phase(self, adapter, mock_sender):
+    async def test_send_batch_audit_sync(self, adapter, mock_sender):
         """send_batch should map audit phase correctly."""
         await adapter.create_session("test", "fs")
         
@@ -229,7 +229,7 @@ class TestSenderHandlerAdapterBatch:
         assert source_type == "audit"
 
     @pytest.mark.asyncio
-    async def test_send_batch_error_propagation(self, adapter, mock_sender):
+    async def test_send_batch_error_sync(self, adapter, mock_sender):
         """send_batch should propagate generic exceptions."""
         mock_sender._send_events_impl = AsyncMock(side_effect=RuntimeError("Network failure"))
         

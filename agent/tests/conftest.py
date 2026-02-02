@@ -33,9 +33,9 @@ def test_app_instance(tmp_path):
     return app
 
 @pytest_asyncio.fixture
-async def snapshot_phase_test_setup(test_app_instance: App, mocker):
+async def snapshot_sync_test_setup(test_app_instance: App, mocker):
     # ... (this fixture is unchanged)
-    pipeline_id = "test-snapshot-sync"
+    pipeline_id = "test-snapshot-phase"
     source_id = "test-snapshot-source"
     pusher_id = "test-snapshot-pusher"
 
@@ -99,7 +99,7 @@ async def snapshot_phase_test_setup(test_app_instance: App, mocker):
     await test_app_instance.sender_config_service.delete_config(pusher_id)
 
 @pytest_asyncio.fixture
-async def message_phase_test_setup(test_app_instance: App, mocker):
+async def message_sync_test_setup(test_app_instance: App, mocker):
     pipeline_id = "test-message-sync"
     source_id = "test-message-source"
     pusher_id = "test-message-pusher"

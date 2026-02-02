@@ -70,7 +70,7 @@ sequenceDiagram
 
         alt 点位丢失 (needed_position_lost is true)
             Note over SI: 自主决策，并发启动快照
-            SI-->>SI: 异步启动 _run_snapshot_sync()
+            SI-->>SI: 异步启动 _run_message_sync()
         end
 
         Note over SI: 进入“消息阶段” (MESSAGE_SYNC) 阶段
@@ -95,8 +95,8 @@ sequenceDiagram
 2.  **建立会话与获取检查点**: `AgentPipeline` 启动后，首先调用 `pusher_driver.create_session()` 与消费端建立会话，然后使用返回的 `session_id` 调用 `get_latest_committed_index()` 获取上次的同步点位 `start_position`。
 3.  **启动心跳**: `AgentPipeline` 并发启动一个后台心跳任务 `_run_heartbeat_loop`，定期向消费端发送心跳以保持会话有效。
 4.  **请求总线与点位检查**: `AgentPipeline` 带着 `start_position` 调用 `EventBusService` 请求事件总线。`EventBusService` 在此过程中会检查源驱动是否能从该点位提供数据。如果不能，它会返回 `needed_position_lost=True`。
-5.  **自主触发并发快照**: 如果 `EventBusService` 返回 `needed_position_lost=True`，`AgentPipeline` 会立即使用 `asyncio.create_task()` **异步启动**一个 `_run_snapshot_sync` 任务进行数据回填，然后**不等待其完成**，继续执行下一步。
-6.  **执行消息阶段**: `AgentPipeline` 的主任务进入 `_run_message_sync` 方法，从 `EventBus` 获取从**最新可用点位**开始的实时事件流，并持续推送到消费端。
+5.  **自主触发并发快照**: 如果 `EventBusService` 返回 `needed_position_lost=True`，`AgentPipeline` 会立即使用 `asyncio.create_task()` **异步启动**一个 `_run_message_sync` 任务进行数据回填，然后**不等待其完成**，继续执行下一步。
+6.  **执行消息阶段**: `AgentPipeline` 的主任务进入 `_run_message_pipeline` 方法，从 `EventBus` 获取从**最新可用点位**开始的实时事件流，并持续推送到消费端。
 7.  **并发执行**: 实时消息阶段和后台快照回填两个任务并发执行，互不阻塞。
 
 ### B. 总线分裂与任务停止
@@ -120,7 +120,7 @@ graph TD
 
     subgraph Runtime Layer
         SI(AgentPipeline Controller)
-        EB(EventBus - for Message Phase)
+        EB(EventBus - for Message Sync Phase)
     end
 
     subgraph Drivers

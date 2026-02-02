@@ -10,19 +10,19 @@ Fustor Agent 的核心是基于 `asyncio` 构建的异步应用，它必须能�
 
 ## 2\. 底层并发模型：解耦阻塞式 I/O
 
-在 `EventBus` 和 `_run_snapshot_sync` 的内部，我们都采用了一种结合 `threading.Thread` 和线程安全队列 `queue.Queue` 的“生产者-消费者”模型，来将阻塞操作与主事件循环解耦。
+在 `EventBus` 和 `_run_message_sync` 的内部，我们都采用了一种结合 `threading.Thread` 和线程安全队列 `queue.Queue` 的“生产者-消费者”模型，来将阻塞操作与主事件循环解耦。
 
 ### 工作原理
 
 ```mermaid
 sequenceDiagram
     participant M as 主 asyncio 循环
-    participant P as 异步消费者 (e.g., _run_snapshot_sync)
+    participant P as 异步消费者 (e.g., _run_message_sync)
     participant T as _threaded_producer (独立线程)
     participant Q as queue.Queue (线程安全队列)
     participant D as Source Driver (阻塞)
 
-    M->>P: await _run_snapshot_sync()
+    M->>P: await _run_message_sync()
     P->>T: 启动 _threaded_producer 线程 
     T->>D: 调用 get_snapshot_iterator()
     Note right of D: 驱动开始监听数据源，<br>此处可能发生长时间阻塞。
@@ -54,7 +54,7 @@ sequenceDiagram
 sequenceDiagram
     participant Main as _run_message_sync (主循环)
     participant RDI as PusherDriver Instance
-    participant BG as _run_snapshot_sync (后台任务)
+    participant BG as _run_message_sync (后台任务)
     participant SDI as SourceDriver Instance
 
     Note over Main: 正常处理实时消息
@@ -62,7 +62,7 @@ sequenceDiagram
     RDI-->>-Main: 返回响应 (snapshot_needed=true)
 
     Note over Main: 检测到快照请求，且当前无快照运行
-    Main->>BG: asyncio.create_task(_run_snapshot_sync)
+    Main->>BG: asyncio.create_task(_run_message_sync)
 
     par 并发执行
         loop 实时消息处理 (不间断)
@@ -85,9 +85,9 @@ sequenceDiagram
 
 2.  **信号检测**: 在每次 `push` 实时数据后，主任务会检查来自远端消费者的响应，看是否包含 `snapshot_needed: true` 的请求。
 
-3.  **并发任务创建 (`asyncio.create_task`)**: 当收到快照请求，且当前没有其他快照在运行时（通过 `_is_snapshot_running` 标志判断），主任务会调用 `asyncio.create_task(self._run_snapshot_sync())`。这会**立即**创建一个新的 `Task` 并将其交给 `asyncio` 事件循环去调度，而主任务**不会等待**它，而是继续自己的循环，处理下一批实时消息。
+3.  **并发任务创建 (`asyncio.create_task`)**: 当收到快照请求，且当前没有其他快照在运行时（通过 `_is_snapshot_running` 标志判断），主任务会调用 `asyncio.create_task(self._run_message_sync())`。这会**立即**创建一个新的 `Task` 并将其交给 `asyncio` 事件循环去调度，而主任务**不会等待**它，而是继续自己的循环，处理下一批实时消息。
 
-4.  **后台任务 (`_run_snapshot_sync`)**: 这个 `async` 方法现在作为一个独立的、并发的后台任务运行。它内部依然使用第2节描述的“生产者-消费者”模型来拉取数据和推送数据。它的运行完全独立，不影响主任务。
+4.  **后台任务 (`_run_message_sync`)**: 这个 `aphase` 方法现在作为一个独立的、并发的后台任务运行。它内部依然使用第2节描述的“生产者-消费者”模型来拉取数据和推送数据。它的运行完全独立，不影响主任务。
 
 5.  **状态同步 (`_is_snapshot_running` 标志)**: 这个布尔标志起到了一个简单的互斥锁（Mutex）的作用，确保在任何时候，对于同一个 `AgentPipeline`，最多只有一个补充快照任务在运行。
 

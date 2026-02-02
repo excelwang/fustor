@@ -13,8 +13,8 @@ class PipelineState(Flag):
     """
     STOPPED = 0
     STARTING = auto()
-    SNAPSHOT_PHASE = auto()
-    MESSAGE_PHASE = auto()
+    SNAPSHOT_SYNC = auto()
+    MESSAGE_SYNC = auto()
     AUDIT_PHASE = auto()
     SENTINEL_SWEEP = auto()
     RUNNING_CONF_OUTDATE = auto()
@@ -44,6 +44,6 @@ class AgentState(BaseModel):
     agent_id: str = Field(..., description="The unique identifier for the agent.")
     pipeline_tasks: Dict[str, PipelineInstanceDTO] = Field(
         default_factory=dict, 
-        description="A dictionary of all pipeline tasks, keyed by their ID."
+        description="A dictionary of all sync tasks, keyed by their ID."
     )
     event_buses: Dict[str, EventBusInstance] = Field(default_factory=dict, description="A dictionary of all active event buses, keyed by their ID.")

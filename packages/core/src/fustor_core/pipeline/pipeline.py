@@ -28,9 +28,9 @@ class PipelineState(IntFlag):
     PAUSED = auto()
     ERROR = auto()
     CONF_OUTDATED = auto()  # Configuration has changed, needs restart
-    SNAPSHOT_PHASE = auto()  # Currently in snapshot phase phase
-    MESSAGE_PHASE = auto()   # Currently in message/realtime sync phase
-    AUDIT_PHASE = auto()     # Currently in audit phase phase
+    SNAPSHOT_SYNC = auto()  # Currently in snapshot sync phase
+    MESSAGE_SYNC = auto()   # Currently in message/realtime phase
+    AUDIT_PHASE = auto()     # Currently in audit phase
     RECONNECTING = auto()    # Currently attempting to reconnect
     DRAINING = auto()        # Draining queues before stopping
     STOPPING = auto()        # Gracefully stopping
@@ -140,8 +140,8 @@ class Pipeline(ABC):
     def is_running(self) -> bool:
         """Check if pipeline is in a running state."""
         return bool(self.state & (PipelineState.RUNNING | 
-                                  PipelineState.SNAPSHOT_PHASE | 
-                                  PipelineState.MESSAGE_PHASE | 
+                                  PipelineState.SNAPSHOT_SYNC | 
+                                  PipelineState.MESSAGE_SYNC | 
                                   PipelineState.AUDIT_PHASE))
     
     def has_active_session(self) -> bool:

@@ -110,7 +110,7 @@ class TestBlindSpotFileDeletion:
         # Step 4: Use marker to ensure audit cycle ran
         marker_file = f"{MOUNT_POINT}/audit_marker_b2_list_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(2) # Wait for event propagation before polling tree
+        time.sleep(2) # Wait for event sync before polling tree
         assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
         
         # Check blind-spot list for deletion record

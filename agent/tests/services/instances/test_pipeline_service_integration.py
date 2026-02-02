@@ -106,9 +106,9 @@ async def test_pipeline_instance_service_integration(integration_configs, tmp_pa
             assert isinstance(instance, AgentPipeline)
             
             # Check logs for pipeline activity
-            # AgentPipeline logs "Starting snapshot sync..."
+            # AgentPipeline logs "Starting snapshot sync phase..."
             assert "Using AgentPipeline" in caplog.text
-            assert "Snapshot phase complete" in caplog.text or "Starting message phase" in caplog.text
+            assert "Snapshot sync phase complete" in caplog.text or "Starting message sync phase" in caplog.text
 
             await service.stop_one("test_pipeline")
             assert service.get_instance("test_pipeline") is None

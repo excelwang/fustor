@@ -12,18 +12,18 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger("fustor_agent.pipeline.phases")
 
-async def run_snapshot_phase(pipeline: "AgentPipeline") -> None:
-    """Execute snapshot phase for the given pipeline."""
-    logger.info(f"Pipeline {pipeline.id}: Starting snapshot phase")
+async def run_message_sync(pipeline: "AgentPipeline") -> None:
+    """Execute snapshot sync phase for the given pipeline."""
+    logger.info(f"Pipeline {pipeline.id}: Starting snapshot sync phase")
     
     try:
         # Get snapshot iterator from source
         snapshot_iter = pipeline.source_handler.get_snapshot_iterator()
         
         batch = []
-        # Support both sync and async iterators
+        # Support both synchronous and asynchronous iterators
         if not hasattr(snapshot_iter, "__aiter__"):
-            snapshot_iter = pipeline._aiter_sync(snapshot_iter)
+            snapshot_iter = pipeline._aiter_sync_phase(snapshot_iter)
 
         async for event in snapshot_iter:
             if not pipeline.is_running() and not (pipeline.state & PipelineState.RECONNECTING):
@@ -53,16 +53,16 @@ async def run_snapshot_phase(pipeline: "AgentPipeline") -> None:
                 pipeline._update_role_from_response(response)
                 pipeline.statistics["events_pushed"] += len(batch)
                 
-        logger.info(f"Pipeline {pipeline.id}: Snapshot phase complete")
+        logger.info(f"Pipeline {pipeline.id}: Snapshot sync phase complete")
     except asyncio.CancelledError:
-        logger.info(f"Snapshot phase for {pipeline.id} cancelled")
+        logger.info(f"Snapshot sync phase for {pipeline.id} cancelled")
         raise
     except Exception as e:
-        logger.error(f"Pipeline {pipeline.id} snapshot phase error: {e}", exc_info=True)
+        logger.error(f"Pipeline {pipeline.id} snapshot sync phase error: {e}", exc_info=True)
         raise
 
-async def run_driver_message_phase(pipeline: "AgentPipeline", start_position: int = -1) -> None:
-    """Execute message phase directly from driver."""
+async def run_driver_message_sync(pipeline: "AgentPipeline", start_position: int = -1) -> None:
+    """Execute message sync phase directly from driver."""
 
 
     # Pass a stop event if possible for better cleanup
@@ -75,7 +75,7 @@ async def run_driver_message_phase(pipeline: "AgentPipeline", start_position: in
     try:
         batch = []
         if not hasattr(msg_iter, "__aiter__"):
-            msg_iter = pipeline._aiter_sync(msg_iter)
+            msg_iter = pipeline._aiter_sync_phase(msg_iter)
 
         async for event in msg_iter:
             if not pipeline.is_running() and not (pipeline.state & PipelineState.RECONNECTING):
@@ -95,7 +95,7 @@ async def run_driver_message_phase(pipeline: "AgentPipeline", start_position: in
                 else:
                     raise Exception("Realtime batch send failed")
     except asyncio.CancelledError:
-        logger.info(f"Driver message phase for {pipeline.id} cancelled")
+        logger.info(f"Driver message sync phase for {pipeline.id} cancelled")
         raise
     finally:
         # Send remaining events in batch
@@ -111,16 +111,16 @@ async def run_driver_message_phase(pipeline: "AgentPipeline", start_position: in
             except Exception as e:
                 logger.warning(f"Failed to push final message batch: {e}")
         
-        # Signal stop to the underlying sync iterator
+        # Signal stop to the underlying iterator
         stop_event.set()
 
-async def run_bus_message_phase(pipeline: "AgentPipeline") -> None:
-    """Execute message phase reading from an internal event bus."""
+async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
+    """Execute message sync phase reading from an internal event bus."""
     if not pipeline._bus:
-        logger.error(f"Pipeline {pipeline.id}: Cannot run bus sync without a bus")
+        logger.error(f"Pipeline {pipeline.id}: Cannot run bus message sync phase without a bus")
         return
         
-    logger.info(f"Pipeline {pipeline.id}: Starting bus message phase from bus '{pipeline._bus.id}'")
+    logger.info(f"Pipeline {pipeline.id}: Starting bus message sync phase from bus '{pipeline._bus.id}'")
     
     try:
         while pipeline.is_running() or (pipeline.state & PipelineState.RECONNECTING):
@@ -134,7 +134,7 @@ async def run_bus_message_phase(pipeline: "AgentPipeline") -> None:
             if not events:
                 continue
                 
-            # 2. Sync send to fusion
+            # 2. Send to fusion
             events = pipeline.map_batch(events)
             success, response = await pipeline.sender_handler.send_batch(
                 pipeline.session_id, events, {"phase": "realtime"}
@@ -160,14 +160,14 @@ async def run_bus_message_phase(pipeline: "AgentPipeline") -> None:
                 await asyncio.sleep(1.0) # Wait before retry
                 
     except asyncio.CancelledError:
-        logger.info(f"Bus message phase for {pipeline.id} cancelled")
+        logger.info(f"Bus message sync phase for {pipeline.id} cancelled")
         raise
     except Exception as e:
-        logger.error(f"Pipeline {pipeline.id} bus sync error: {e}", exc_info=True)
+        logger.error(f"Pipeline {pipeline.id} bus phase error: {e}", exc_info=True)
         raise
 
-async def run_audit_phase(pipeline: "AgentPipeline") -> None:
-    """Execute a full audit phasehronization."""
+async def run_audit_sync(pipeline: "AgentPipeline") -> None:
+    """Execute a full audit synchronization."""
     logger.info(f"Pipeline {pipeline.id}: Starting audit phase")
     old_state = pipeline.state
     pipeline._set_state(old_state | PipelineState.AUDIT_PHASE)
@@ -178,7 +178,7 @@ async def run_audit_phase(pipeline: "AgentPipeline") -> None:
         
         batch = []
         if not hasattr(audit_iter, "__aiter__"):
-            audit_iter = pipeline._aiter_sync(audit_iter)
+            audit_iter = pipeline._aiter_sync_phase(audit_iter)
             
         async for item in audit_iter:
             if not pipeline.is_running():

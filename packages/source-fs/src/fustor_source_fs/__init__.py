@@ -225,7 +225,7 @@ class FSDriver(SourceDriver):
 
     def get_snapshot_iterator(self, **kwargs) -> Iterator[EventBase]:
         """
-        Parallel Snapshot Scan Phase.
+        Parallel Snapshot Sync Phase.
         """
         stream_id = f"snapshot-fs-{uuid.uuid4().hex[:6]}"
         logger.info(f"[{stream_id}] Starting Parallel Snapshot Scan: {self.uri}")

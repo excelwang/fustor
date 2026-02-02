@@ -1,7 +1,7 @@
-# Example: pipelines-config/sync-research.yaml
-# Location: $FUSTOR_HOME/pipelines-config/sync-research.yaml
+# Example: pipelines-config/research.yaml
+# Location: $FUSTOR_HOME/pipelines-config/research.yaml
 
-id: sync-research
+id: pipe-research
 source: fs-research
 sender: fusion-main
 disabled: false

@@ -68,7 +68,7 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
     async def cleanup_obsolete_configs(self) -> List[str]:
         """
         Finds and deletes all Source configurations that are both disabled and
-        not used by any pipeline tasks.
+        not used by any sync tasks.
 
         Returns:
             A list of the configuration IDs that were deleted.

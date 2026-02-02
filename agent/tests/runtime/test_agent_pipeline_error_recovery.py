@@ -39,7 +39,7 @@ class TestAgentErrorRecovery:
             # Should eventually succeed
             assert mock_sender.create_session.call_count >= 3
             assert pipeline.session_id == "valid-session"
-            # It should be in RUNNING | MESSAGE_PHASE now
+            # It should be in RUNNING | MESSAGE_SYNC now
             assert pipeline.is_running()
         finally:
             await pipeline.stop()
@@ -55,11 +55,11 @@ class TestAgentErrorRecovery:
             mock_source, mock_sender
         )
         
-        # Mock _run_message_phase to simulate error after some time
-        original_msg_sync = pipeline._run_message_phase
+        # Mock _run_message_sync to simulate error after some time
+        original_msg_sync_phase = pipeline._run_message_sync
         
         error_triggered = False
-        async def mock_msg_sync():
+        async def mock_msg_sync_phase():
             nonlocal error_triggered
             if not error_triggered:
                 await asyncio.sleep(0.05)
@@ -69,7 +69,7 @@ class TestAgentErrorRecovery:
             while True:
                 await asyncio.sleep(0.1)
             
-        pipeline._run_message_phase = mock_msg_sync
+        pipeline._run_message_sync = mock_msg_sync_phase
         
         # Start
         await pipeline.start()
@@ -89,7 +89,7 @@ class TestAgentErrorRecovery:
 
     @pytest.mark.asyncio
     async def test_audit_sync_with_session_loss(self, mock_source, mock_sender, pipeline_config):
-        """Audit sync should handle session being cleared during execution."""
+        """Audit phase should handle session being cleared during execution."""
         pipeline = AgentPipeline(
             "test-id", "agent:test-id", pipeline_config,
             mock_source, mock_sender
@@ -108,10 +108,10 @@ class TestAgentErrorRecovery:
             
         mock_sender.send_batch = mock_send_batch
         
-        # Manually run one audit sync
+        # Manually run one audit phase
         # We need set_state to include RUNNING for it to work
         pipeline.state = PipelineState.RUNNING
-        await pipeline._run_audit_phase()
+        await pipeline._run_audit_sync()
         
         # Assertions:
         # 1. It should NOT throw AttributeError when trying to send "audit end" if session_id is None

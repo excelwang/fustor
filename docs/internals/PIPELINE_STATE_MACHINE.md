@@ -1,6 +1,6 @@
 # Fustor Pipeline State Machine
 
-The Fustor Pipeline uses an `IntFlag` bitmask to represent its current state. This allows for composite states where multiple flags can be active simultaneously (e.g., `RUNNING | SNAPSHOT_PHASE`).
+The Fustor Pipeline uses an `IntFlag` bitmask to represent its current state. This allows for composite states where multiple flags can be active simultaneously (e.g., `RUNNING | SNAPSHOT_SYNC`).
 
 ## State Flags (`fustor_core.pipeline.PipelineState`)
 
@@ -12,8 +12,8 @@ The Fustor Pipeline uses an `IntFlag` bitmask to represent its current state. Th
 | `PAUSED` | 4 | Pipeline is temporarily suspended. |
 | `ERROR` | 8 | Pipeline encountered a fatal error and reached a terminal state. |
 | `CONF_OUTDATED` | 16 | Configuration changed while pipeline was running. |
-| `SNAPSHOT_PHASE` | 32 | Currently executing full snapshot synchronization. |
-| `MESSAGE_PHASE` | 64 | Currently executing realtime message synchronization. |
+| `SNAPSHOT_SYNC` | 32 | Currently executing full snapshot synchronization. |
+| `MESSAGE_SYNC` | 64 | Currently executing realtime message synchronization. |
 | `AUDIT_PHASE` | 128 | Currently executing periodic audit check. |
 | `RECONNECTING` | 256 | Attempting to re-establish session after failure. |
 | `DRAINING` | 512 | Processing remaining queued items before stopping. |
@@ -22,8 +22,8 @@ The Fustor Pipeline uses an `IntFlag` bitmask to represent its current state. Th
 ## Common State Combinations
 
 - **`INITIALIZING`**: Startup phase.
-- **`RUNNING | SNAPSHOT_PHASE`**: Initial sync of all data.
-- **`RUNNING | MESSAGE_PHASE`**: Processing live events.
+- **`RUNNING | SNAPSHOT_SYNC`**: Initial phase of all data.
+- **`RUNNING | MESSAGE_SYNC`**: Processing live events.
 - **`RUNNING | AUDIT_PHASE`**: Running background consistency check.
 - **`RUNNING | RECONNECTING`**: Session lost, but still trying to recover without full restart.
 - **`ERROR`**: Fatal failure, manual intervention or full restart required.
@@ -31,8 +31,8 @@ The Fustor Pipeline uses an `IntFlag` bitmask to represent its current state. Th
 ## State Transitions (Agent)
 
 1. **Start**: `STOPPED` -> `INITIALIZING` -> `RUNNING`
-2. **Sync Flow**: `RUNNING` -> `RUNNING | SNAPSHOT_PHASE` -> `RUNNING | MESSAGE_PHASE`
-3. **Audit**: `RUNNING | MESSAGE_PHASE` -> `RUNNING | MESSAGE_PHASE | AUDIT_PHASE` -> `RUNNING | MESSAGE_PHASE`
+2. **Pipeline Flow**: `RUNNING` -> `RUNNING | SNAPSHOT_SYNC` -> `RUNNING | MESSAGE_SYNC`
+3. **Audit**: `RUNNING | MESSAGE_SYNC` -> `RUNNING | MESSAGE_SYNC | AUDIT_PHASE` -> `RUNNING | MESSAGE_SYNC`
 4. **Error Recovery**: `RUNNING | ...` -> `RUNNING | RECONNECTING` -> `RUNNING | ...` (if successful) or `ERROR` (if failed max retries)
 5. **Stop**: `RUNNING | ...` -> `STOPPING` -> `DRAINING` -> `STOPPED`
 

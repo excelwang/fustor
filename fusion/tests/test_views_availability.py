@@ -33,10 +33,10 @@ async def test_api_unavailable_initially(client):
     # Use generic status check endpoint
     response = await client.get("/api/v1/views/test/status_check")
     assert response.status_code == 503
-    assert "Initial snapshot phase in progress" in response.json()["detail"]
+    assert "Initial snapshot sync phase in progress" in response.json()["detail"]
 
 @pytest.mark.asyncio
-async def test_api_unavailable_during_sync(client):
+async def test_api_unavailable_during_sync_phase(client):
     """验证同步进行中（有权威但未完成）返回 503"""
     await view_state_manager.set_authoritative_session(1, "session-1")
     
@@ -44,7 +44,7 @@ async def test_api_unavailable_during_sync(client):
     assert response.status_code == 503
 
 @pytest.mark.asyncio
-async def test_api_available_after_sync_complete(client):
+async def test_api_available_after_sync_phase_complete(client):
     """验证同步完成后接口正常工作"""
     session_id = "session-1"
     await view_state_manager.set_authoritative_session(1, session_id)

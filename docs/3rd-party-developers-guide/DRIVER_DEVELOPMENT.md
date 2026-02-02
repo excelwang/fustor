@@ -31,7 +31,7 @@
 
 ---
 
-## 2. Audit Sync 接口
+## 2. Audit Sync Phase 接口
 
 支持 Audit 的 SourceDriver 需要实现以下接口：
 

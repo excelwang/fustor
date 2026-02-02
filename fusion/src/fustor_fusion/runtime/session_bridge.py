@@ -31,7 +31,7 @@ Usage:
     bridge = PipelineSessionBridge(pipeline, session_manager)
     
     # Create session goes through both systems
-    session_id = await bridge.create_session(task_id="agent:sync", ...)
+    session_id = await bridge.create_session(task_id="agent:pipeline", ...)
 """
 import asyncio
 import logging

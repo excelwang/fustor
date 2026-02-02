@@ -105,7 +105,7 @@ class TestClockSkewTolerance:
         logger.info(f"Audit discovered file flags: {flags}")
         assert flags["integrity_suspect"] is True, "New file discovered via Audit should be suspect"
 
-    def test_realtime_sync_from_past_agent(
+    def test_realtime_sync_phase_from_past_agent(
         self,
         docker_env,
         fusion_client,

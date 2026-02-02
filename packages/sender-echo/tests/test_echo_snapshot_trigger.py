@@ -1,7 +1,7 @@
 """
 Test cases to verify that the echo sender can trigger snapshot sync.
 This test simulates the scenario where the echo sender returns snapshot_needed=True
-for echo tasks, which should trigger the _run_snapshot_sync method in the pipeline instance.
+for echo tasks, which should trigger the _run_message_sync method in the pipeline instance.
 """
 import pytest
 import asyncio

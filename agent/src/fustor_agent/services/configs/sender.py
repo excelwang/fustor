@@ -37,7 +37,7 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
     async def cleanup_obsolete_configs(self) -> List[str]:
         """
         Finds and deletes all Sender configurations that are both disabled and
-        not used by any pipeline tasks.
+        not used by any sync tasks.
 
         Returns:
             A list of the configuration IDs that were deleted.

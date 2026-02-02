@@ -5,7 +5,7 @@ from typing import Iterator, Any, AsyncIterator
 
 logger = logging.getLogger("fustor_agent.pipeline.worker")
 
-async def aiter_sync_wrapper(
+async def aiter_sync_phase_wrapper(
     phase_iter: Iterator[Any], 
     id_for_thread: str,
     queue_size: int = 1000

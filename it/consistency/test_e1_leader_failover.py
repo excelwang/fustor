@@ -123,7 +123,7 @@ class TestLeaderFailover:
             time.sleep(15)
 
             # Wait for Snapshot (Readiness) restoration
-            # New leader must complete initial snapshot sync
+            # New leader must complete initial snapshot sync phase
             start_wait = time.time()
             ready = False
             while time.time() - start_wait < 60:

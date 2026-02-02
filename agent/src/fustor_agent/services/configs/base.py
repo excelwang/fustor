@@ -102,7 +102,7 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
 
     async def delete_config(self, id: str) -> T:
         """Deletes a configuration item after checking for dependencies."""
-        # Check for dependent pipeline tasks before deleting.
+        # Check for dependent sync tasks before deleting.
         dependent_pipelines = [
             pipeline_id for pipeline_id, pipeline_config in self.app_config.get_pipelines().items()
             if (self.config_type == 'source' and pipeline_config.source == id) or \
@@ -111,12 +111,12 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
 
         if dependent_pipelines:
             raise ConflictError(
-                f"{self.config_type_capitalized} '{id}' cannot be deleted because it is used by the following pipeline tasks: {', '.join(dependent_pipelines)}. "
+                f"{self.config_type_capitalized} '{id}' cannot be deleted because it is used by the following sync tasks: {', '.join(dependent_pipelines)}. "
                 f"Please delete these tasks first."
             )
 
         async with config_lock:
-            # Stop the instance if it's a pipeline task itself being deleted.
+            # Stop the instance if it's a sync task itself being deleted.
             if self.pipeline_instance_service and self.config_type == 'pipeline':
                 await self.pipeline_instance_service.stop_one(id)
             

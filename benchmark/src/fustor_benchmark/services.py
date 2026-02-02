@@ -253,14 +253,14 @@ class ServiceManager:
         return None
 
     def trigger_agent_audit(self, pipeline_id="bench-pipe"):
-        """Triggers audit for a sync instance via Agent API."""
+        """Triggers audit for a pipeline instance via Agent API."""
         url = f"http://localhost:{self.agent_port}/api/instances/pipelines/{pipeline_id}/_actions/trigger_audit"
         res = requests.post(url)
         res.raise_for_status()
         return res.json()
 
     def trigger_agent_sentinel(self, pipeline_id="bench-pipe"):
-        """Triggers sentinel for a sync instance via Agent API."""
+        """Triggers sentinel for a pipeline instance via Agent API."""
         url = f"http://localhost:{self.agent_port}/api/instances/pipelines/{pipeline_id}/_actions/trigger_sentinel"
         res = requests.post(url)
         res.raise_for_status()

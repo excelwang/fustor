@@ -59,12 +59,12 @@ class TestRemapToNewBus:
     async def test_remap_with_position_loss_cancels_message_sync(
         self, agent_pipeline, new_mock_bus
     ):
-        """remap_to_new_bus should cancel message sync when position is lost."""
-        # Setup: create a mock message sync task
+        """remap_to_new_bus should cancel message sync phase when position is lost."""
+        # Setup: create a mock message sync phase task
         mock_task = MagicMock()
         mock_task.done.return_value = False
         mock_task.cancel = MagicMock()
-        agent_pipeline._message_phase_task = mock_task
+        agent_pipeline._message_sync_task = mock_task
         
         # Action
         await agent_pipeline.remap_to_new_bus(new_mock_bus, needed_position_lost=True)
@@ -82,7 +82,7 @@ class TestRemapToNewBus:
         
         # Assert
         assert agent_pipeline.state & PipelineState.RECONNECTING
-        assert "resync" in agent_pipeline.info.lower()
+        assert "re-sync" in agent_pipeline.info.lower()
 
     @pytest.mark.asyncio
     async def test_remap_without_position_loss_preserves_state(
@@ -90,7 +90,7 @@ class TestRemapToNewBus:
     ):
         """remap_to_new_bus should not change state when no position lost."""
         # Setup
-        agent_pipeline._set_state(PipelineState.RUNNING | PipelineState.MESSAGE_PHASE)
+        agent_pipeline._set_state(PipelineState.RUNNING | PipelineState.MESSAGE_SYNC)
         original_state = agent_pipeline.state
         
         # Action
@@ -123,11 +123,11 @@ class TestRemapToNewBus:
         self, agent_pipeline, new_mock_bus
     ):
         """remap_to_new_bus should not call cancel on completed task."""
-        # Setup: create a mock message sync task that is already done
+        # Setup: create a mock message sync phase task that is already done
         mock_task = MagicMock()
         mock_task.done.return_value = True  # Already done
         mock_task.cancel = MagicMock()
-        agent_pipeline._message_phase_task = mock_task
+        agent_pipeline._message_sync_task = mock_task
         
         # Action
         await agent_pipeline.remap_to_new_bus(new_mock_bus, needed_position_lost=True)

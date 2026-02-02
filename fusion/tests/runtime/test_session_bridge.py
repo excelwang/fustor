@@ -96,7 +96,7 @@ class TestSessionCreation:
             mock_pipeline.on_session_created = set_role
             
             result = await session_bridge.create_session(
-                task_id="agent-1:sync-1",
+                task_id="agent-1:pipeline-1",
                 client_ip="192.168.1.1",
                 session_timeout_seconds=60
             )
@@ -105,7 +105,7 @@ class TestSessionCreation:
             mock_session_manager.create_session_entry.assert_called_once()
             call_args = mock_session_manager.create_session_entry.call_args
             assert call_args.kwargs["view_id"] == "1"
-            assert call_args.kwargs["task_id"] == "agent-1:sync-1"
+            assert call_args.kwargs["task_id"] == "agent-1:pipeline-1"
             assert call_args.kwargs["client_ip"] == "192.168.1.1"
             
             # Verify result
@@ -120,7 +120,7 @@ class TestSessionCreation:
         
         mock_pipeline.on_session_created = set_role
         
-        result = await session_bridge.create_session(task_id="agent-1:sync-1")
+        result = await session_bridge.create_session(task_id="agent-1:pipeline-1")
         
         assert result["role"] == "follower"
 

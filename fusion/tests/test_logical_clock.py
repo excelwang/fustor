@@ -164,7 +164,7 @@ class TestLogicalClockThreadSafety:
         with patch('time.time', return_value=t_start):
             clock = LogicalClock()
 
-        # Phase 1: Establish Skew
+        # Sync Phase 1: Establish Skew
         # Agent physical clock: 10500
         # NFS mtime being written: 10400
         # Skew = 100s (Agent - NFS)

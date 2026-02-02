@@ -40,7 +40,7 @@ async def _check_core_readiness(view_id: str):
     if not is_signal_complete or queue_size > 0:
         detail = f"View {view_id} not ready: snapshot_complete={is_signal_complete}, queue={queue_size}. "
         if not is_signal_complete:
-            detail += "Initial snapshot phase in progress. Waiting for end signal from authoritative agent."
+            detail += "Initial snapshot sync phase in progress. Waiting for end signal from authoritative agent."
         else:
             detail += "Events still processing in queue."
             

@@ -64,11 +64,11 @@ class TestAgentPipelineStateManagement:
     def test_composite_state(self, agent_pipeline):
         """Pipeline should support composite states."""
         agent_pipeline._set_state(
-            PipelineState.RUNNING | PipelineState.SNAPSHOT_PHASE
+            PipelineState.RUNNING | PipelineState.SNAPSHOT_SYNC
         )
         
         assert agent_pipeline.is_running()
-        assert PipelineState.SNAPSHOT_PHASE in agent_pipeline.state
+        assert PipelineState.SNAPSHOT_SYNC in agent_pipeline.state
     
     def test_str_representation(self, agent_pipeline):
         """__str__ should return readable format."""

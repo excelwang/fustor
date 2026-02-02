@@ -137,7 +137,7 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
 
         self.logger.info(f"Attempting to stop {instance}...")
         try:
-            # The instance's bus might not exist if stopped during snapshot phase
+            # The instance's bus might not exist if stopped during snapshot sync phase
             bus_id = instance.bus.id if instance.bus else None
             
             await instance.stop()
@@ -156,7 +156,7 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
             return
 
         old_bus_id = pipeline_instance.bus.id if pipeline_instance.bus else None
-        self.logger.info(f"Remapping pipeline task '{pipeline_id}' to new bus '{new_bus.id}'...")
+        self.logger.info(f"Remapping sync task '{pipeline_id}' to new bus '{new_bus.id}'...")
         
         # Call the instance's remap method, which also handles the signal
         await pipeline_instance.remap_to_new_bus(new_bus, needed_position_lost)
@@ -195,7 +195,7 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
         if not all_pipeline_configs:
             return
 
-        self.logger.info(f"Attempting to auto-start all enabled pipeline tasks...")
+        self.logger.info(f"Attempting to auto-start all enabled sync tasks...")
         start_tasks = [
             self.start_one(id)
             for id, cfg in all_pipeline_configs.items() if not cfg.disabled
@@ -216,7 +216,7 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
         if not outdated_pipelines:
             return 0
             
-        self.logger.info(f"Found {len(outdated_pipelines)} outdated pipeline tasks to restart.")
+        self.logger.info(f"Found {len(outdated_pipelines)} outdated sync tasks to restart.")
         
         for pipeline in outdated_pipelines:
             await self.stop_one(pipeline.id) 

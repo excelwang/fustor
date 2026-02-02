@@ -146,7 +146,7 @@ class TestPipelineBridgeCreatePipeline:
     def test_pipeline_config_from_pipeline_config(
         self, pipeline_bridge, mock_pipeline_config, mock_source_config, mock_sender_config
     ):
-        """Pipeline config should come from sync config."""
+        """Pipeline config should come from pipeline config."""
         pipeline = pipeline_bridge.create_pipeline(
             pipeline_id="test-pipeline",
             agent_id="agent-1",

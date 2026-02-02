@@ -140,7 +140,7 @@ class MysqlDriver(SourceDriver):
         except Exception as e:
             if snapshot_conn:
                 snapshot_conn.rollback()
-            logger.error(f"[{stream_id}] Snapshot phase failed, transaction rolled back: {e}", exc_info=True)
+            logger.error(f"[{stream_id}] Snapshot sync phase failed, transaction rolled back: {e}", exc_info=True)
             raise
         finally:
             if snapshot_conn:

@@ -98,8 +98,8 @@ async def test_audit_loop_uses_backoff(mock_source, mock_sender, reliability_con
     pipeline.current_role = "leader"
     pipeline._set_state(PipelineState.RUNNING)
     
-    # We need to mock _run_audit_phase to avoid side effects
-    mocker.patch.object(pipeline, "_run_audit_phase", AsyncMock())
+    # We need to mock _run_audit_sync to avoid side effects
+    mocker.patch.object(pipeline, "_run_audit_sync", AsyncMock())
     
     # Mock sleep to fail the task execution or just skip waiting
     # We force an error in sleep or by some other means

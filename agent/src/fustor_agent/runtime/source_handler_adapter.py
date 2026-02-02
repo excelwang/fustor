@@ -91,7 +91,7 @@ class SourceHandlerAdapter(SourceHandler):
                 await self._driver.connect()
             
             # Perform Schema Discovery if required by the driver (V2 Reliability)
-            # This ensures we have a valid connection and matching schema before sync starts
+            # This ensures we have a valid connection and matching schema before pipeline starts
             if getattr(self._driver, 'require_schema_discovery', True):
                 if hasattr(self._driver, 'get_available_fields'):
                     logger.info(f"SourceHandlerAdapter {self.id}: Performing schema discovery")

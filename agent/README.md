@@ -16,7 +16,7 @@ Fustor Agent 使用一个主目录来存放配置和状态。
 *   **默认路径**: `~/.fustor`
 *   **自定义路径**: 设置 `FUSTOR_HOME` 环境变量。
 
-Agent 的核心配置文件位于 Fustor 主目录下的 `agent-config.yaml`。你需要定义 `sources` (数据源)、`pushers` (推送目标) 和 `syncs` (同步任务)。
+Agent 的核心配置文件位于 Fustor 主目录下的 `agent-config.yaml`。你需要定义 `sources` (数据源)、`pushers` (推送目标) 和 `pipelines` (同步任务)。
 
 ### 1. 配置 Source (数据源)
 
@@ -53,8 +53,8 @@ pushers:
 将 Source 和 Pusher 绑定：
 
 ```yaml
-syncs:
-  - id: "sync-files-to-fusion"
+pipelines:
+  - id: "phase-files-to-fusion"
     source_id: "my-local-files"
     pusher_id: "to-fusion"
     enabled: true              # 设置为 true 以自动启动
@@ -72,7 +72,7 @@ Agent 遵循 **"瘦 Agent 感知 + 胖 Fusion 裁决"** 架构。
 
 ### Leader/Follower 模式
 
-| 角色 | Realtime Sync | Snapshot Sync | Audit Sync | Sentinel Sweep |
+| 角色 | Realtime Sync Phase | Snapshot Sync Phase | Audit Sync Phase | Sentinel Sweep |
 |------|---------------|---------------|------------|----------------|
 | **Leader** | ✅ | ✅ | ✅ | ✅ |
 | **Follower** | ✅ | ❌ | ❌ | ❌ |

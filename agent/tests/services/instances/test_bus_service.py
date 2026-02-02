@@ -36,7 +36,7 @@ def event_bus_service(source_config, mock_source_driver_service):
         source_driver_service=mock_source_driver_service
     )
     # Mock the dependency that is set via set_dependencies
-    service.sync_instance_service = AsyncMock()
+    service.pipeline_instance_service = AsyncMock()
     return service
 
 @pytest.mark.asyncio
@@ -45,7 +45,7 @@ async def test_get_or_create_bus_reuses_existing(event_bus_service, source_confi
     # First call creates the bus. The real producer loop will run but will finish
     # quickly because the mock driver's iterator is empty.
     bus1, lost1 = await event_bus_service.get_or_create_bus_for_subscriber(
-        source_id="test_source", source_config=source_config, pipeline_id="sync1", required_position=0, fields_mapping=[]
+        source_id="test_source", source_config=source_config, pipeline_id="pipeline1", required_position=0, fields_mapping=[]
     )
 
     # Mock the internal bus method for the check
@@ -53,7 +53,7 @@ async def test_get_or_create_bus_reuses_existing(event_bus_service, source_confi
 
     # Second call should reuse the existing bus.
     bus2, lost2 = await event_bus_service.get_or_create_bus_for_subscriber(
-        source_id="test_source", source_config=source_config, pipeline_id="sync2", required_position=0, fields_mapping=[]
+        source_id="test_source", source_config=source_config, pipeline_id="pipeline2", required_position=0, fields_mapping=[]
     )
 
     assert bus2 is bus1

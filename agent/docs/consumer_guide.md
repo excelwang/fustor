@@ -18,7 +18,7 @@ Fustor Agent 的 `pusher_openapi` 驱动与 Consumer 之间的所有数据推送
 {
   "agent_id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
   "task_id": "your_task_id",
-  "snapshot_phase_suggested": false,
+  "snapshot_sync_suggested": false,
   "is_snapshot_end": false,
   "events": [
     { "field1": "value1", "field2": 123 },
@@ -35,7 +35,7 @@ Fustor Agent 的 `pusher_openapi` 驱动与 Consumer 之间的所有数据推送
 
 *   `events` (`Array<Object>`): **必需**。一个事件数据对象的数组。每个对象就是一条需要被处理的数据记录。
 
-*   `snapshot_phase_suggested` (`boolean`): **必需**。一个“建议”标志。当 Fustor Agent 的源驱动发生回退（例如，无法从请求的点位开始）时，此标志会被设为 `true`。这是一个明确的信号，**建议**您的 Consumer 应用请求一次快照同步。
+*   `snapshot_sync_suggested` (`boolean`): **必需**。一个“建议”标志。当 Fustor Agent 的源驱动发生回退（例如，无法从请求的点位开始）时，此标志会被设为 `true`。这是一个明确的信号，**建议**您的 Consumer 应用请求一次快照同步。
 
 *   `is_snapshot_end` (`boolean`): **必需**。一个“快照结束”标志。当一个后台的补充快照任务完成时，Fustor Agent会发送一个不包含 `events` 的请求，并将此标志设为 `true`。
 
@@ -52,7 +52,7 @@ Fustor Agent 的 `pusher_openapi` 驱动与 Consumer 之间的所有数据推送
 #### 字段详解
 
 *   `snapshot_needed` (`boolean`): **必需**。这是 Consumer 向 Fustor Agent 发起快照请求的**唯一途径**。
-    *   当您的应用逻辑决定需要一次全量数据回填时（例如，在收到 `snapshot_phase_suggested: true` 的建议后），就在响应中将此字段设为 `true`。
+    *   当您的应用逻辑决定需要一次全量数据回填时（例如，在收到 `snapshot_sync_suggested: true` 的建议后），就在响应中将此字段设为 `true`。
     *   在其他所有正常情况下，都应将其设为 `false`。
 
 ---
@@ -101,7 +101,7 @@ Fustor Agent 的 `pusher_openapi` 驱动与 Consumer 之间的所有数据推送
 
 1.  **启动**: Fustor Agent (Agent ID: `agent-A`) 启动一个新任务 (`task-1`)，首先调用 `GET /pipeline-status?agent_id=agent-A&task_id=task-1`，得到 `0`。
 2.  **消息阶段**: Fustor Agent 开始向 `POST /ingest-batch` 推送包含 `agent_id: "agent-A"` 和 `task_id: "task-1"` 的实时事件。
-3.  **源端回退**: Fustor Agent 的源驱动发现请求的点位丢失，通过信号链，最终导致 Fustor Agent 在一次 `push` 请求中发送了 `snapshot_phase_suggested: true`。
+3.  **源端回退**: Fustor Agent 的源驱动发现请求的点位丢失，通过信号链，最终导致 Fustor Agent 在一次 `push` 请求中发送了 `snapshot_sync_suggested: true`。
 4.  **请求快照**: 您的 Consumer 服务收到了这个“建议”，决定需要回填历史数据。于是在这次 `push` 请求的响应中，返回 `{"snapshot_needed": true}`。
 5.  **并发执行**: Fustor Agent 收到这个请求后，在后台异步启动一个快照任务。此时，您的 Consumer 会**同时**收到来自 `agent-A` 的两路数据流：一路是仍在继续的实时事件，另一路是来自后台快照任务的历史数据。
 6.  **合并数据**: 您的服务需要能正确处理这两路并发的数据流，利用 `UPSERT` 实现去重和合并。
