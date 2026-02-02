@@ -15,6 +15,9 @@ import logging
 logger = logging.getLogger("fustor_test")
 
 
+MOUNT_POINT = "/mnt/shared"
+
+
 class TestPipelineBasicOperations:
     """Test basic file operations in AgentPipeline mode."""
     
@@ -36,7 +39,7 @@ class TestPipelineBasicOperations:
         # Create a unique test file
         timestamp = int(time.time() * 1000)
         file_name = f"pipeline_test_{timestamp}.txt"
-        test_file = f"/mnt/shared/{file_name}"
+        test_file = f"{MOUNT_POINT}/{file_name}"
         
         # Create file from leader container
         docker_env.exec_in_container(
@@ -45,14 +48,12 @@ class TestPipelineBasicOperations:
         )
         logger.info(f"Created test file: {test_file}")
         
-        # Wait for sync to occur and verify file appears in Fusion tree
-        found = fusion_client.wait_for_file_in_tree(
-            file_path=f"/{file_name}",
-            timeout=10
-        )
+        # Wait for Fusion to detect it
+        # Note: Paths in Fusion tree are absolute as seen by the Agent
+        success = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        assert success, f"File {file_name} not found in tree after sync at {test_file}"
         
-        assert found, f"File {file_name} not found in tree after sync"
-        logger.info(f"✅ File creation detected")
+        logger.info("File created and detected successfully")
     
     def test_file_modify_detected(
         self, 
@@ -72,7 +73,7 @@ class TestPipelineBasicOperations:
         # Create initial file
         timestamp = int(time.time() * 1000)
         file_name = f"modify_test_{timestamp}.txt"
-        test_file = f"/mnt/shared/{file_name}"
+        test_file = f"{MOUNT_POINT}/{file_name}"
         
         docker_env.exec_in_container(
             leader,
@@ -80,7 +81,7 @@ class TestPipelineBasicOperations:
         )
         
         # Wait for initial sync
-        fusion_client.wait_for_file_in_tree(file_path=f"/{file_name}")
+        assert fusion_client.wait_for_file_in_tree(test_file), f"Initial file {test_file} not detected"
         
         # Modify file
         docker_env.exec_in_container(
@@ -90,12 +91,11 @@ class TestPipelineBasicOperations:
         logger.info(f"Modified test file: {test_file}")
         
         # Wait for sync and verify
-        # Note: In a real test we'd check mtime or content hash if available in API
-        # For now we just check it's still there after some time
+        # Note: In V2, we check it's still there and potentially mtime
         time.sleep(2)
-        found = fusion_client.wait_for_file_in_tree(file_path=f"/{file_name}", timeout=5)
+        found = fusion_client.wait_for_file_in_tree(file_path=test_file, timeout=10)
         
-        assert found, f"File {file_name} not found after modification"
+        assert found, f"File {file_name} not found after modification at {test_file}"
         logger.info(f"✅ File modification detected")
     
     def test_file_delete_detected(
@@ -116,7 +116,7 @@ class TestPipelineBasicOperations:
         # Create file first
         timestamp = int(time.time() * 1000)
         file_name = f"delete_test_{timestamp}.txt"
-        test_file = f"/mnt/shared/{file_name}"
+        test_file = f"{MOUNT_POINT}/{file_name}"
         
         docker_env.exec_in_container(
             leader,
@@ -124,7 +124,7 @@ class TestPipelineBasicOperations:
         )
         
         # Wait for initial sync
-        fusion_client.wait_for_file_in_tree(file_path=f"/{file_name}")
+        assert fusion_client.wait_for_file_in_tree(file_path=test_file, timeout=10)
         
         # Delete file
         docker_env.exec_in_container(
@@ -138,10 +138,11 @@ class TestPipelineBasicOperations:
         
         # Verify file is removed from tree
         removed = fusion_client.wait_for_file_not_in_tree(
-            file_path=f"/{file_name}",
-            timeout=10
+            file_path=test_file,
+            timeout=15
         )
         
-        assert removed, f"File {file_name} still in tree after deletion"
+        assert removed, f"File {file_name} still in tree after deletion at {test_file}"
         logger.info(f"✅ File deletion detected")
+
 

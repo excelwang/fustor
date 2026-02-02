@@ -47,7 +47,7 @@ def fusion_client(docker_env, test_api_key) -> FusionClient:
     
     Waits for Fusion to become ready and sync its configuration cache.
     """
-    client = FusionClient(base_url="http://localhost:18102", view_id="test-fs")
+    client = FusionClient(base_url="http://localhost:18102", view_id="integration-test-ds")
     client.set_api_key(test_api_key["key"])
     
     # Wait for Fusion to be ready to accept requests

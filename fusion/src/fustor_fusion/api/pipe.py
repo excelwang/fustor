@@ -12,7 +12,8 @@ API Structure:
 - /api/v1/pipe/consistency - Consistency checks (signals)
 """
 import logging
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
+from .. import runtime_objects
 
 logger = logging.getLogger(__name__)
 
@@ -30,8 +31,6 @@ def setup_pipe_routers():
     
     This is called during application lifespan startup.
     """
-    from .. import runtime_objects
-    
     # 1. Clear existing routes to avoid duplicates if called multiple times (e.g. during tests)
     pipe_router.routes = []
     
@@ -58,7 +57,23 @@ def setup_pipe_routers():
     # Consistency router is common for both or handles its own delegation
     pipe_router.include_router(consistency_router)
     
-    # Add unified session listing for IT tests
+    # 2. Add Management endpoints for debugging/monitoring
+    @pipe_router.get("/pipelines", tags=["Pipeline Management"])
+    async def list_pipelines():
+        """List all managed pipelines."""
+        pipelines = runtime_objects.pipeline_manager.get_pipelines()
+        return {pid: await p.get_dto() for pid, p in pipelines.items()}
+
+    @pipe_router.get("/pipelines/{pipeline_id}", tags=["Pipeline Management"])
+    async def get_pipeline_info(pipeline_id: str):
+        """Get detailed information about a specific pipeline."""
+        pipeline = runtime_objects.pipeline_manager.get_pipeline(pipeline_id)
+        if not pipeline:
+            raise HTTPException(status_code=404, detail="Pipeline not found")
+        return await pipeline.get_dto()
+    
+    # ... existing session listing ...
+
     @pipe_router.get("/session/", tags=["Pipeline"])
     async def list_active_sessions():
         """

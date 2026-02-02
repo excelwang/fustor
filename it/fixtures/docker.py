@@ -77,7 +77,7 @@ http-main:
     
     # 3. Inject View Config
     view_config = """
-id: "test-fs"
+id: "integration-test-ds"
 datastore_id: "integration-test-ds"
 driver: "fs"
 disabled: false
@@ -85,15 +85,16 @@ driver_params:
   uri: "/mnt/shared-view"
   hot_file_threshold: 10.0
 """
-    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/test-fs.yaml", view_config)
+    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/integration-test-ds.yaml", view_config)
     
     # 4. Inject Fusion Pipeline Config (V2 binding)
     pipeline_config = f"""
 id: "integration-test-ds"
 receiver: "http-main"
 views:
-  - "test-fs"
+  - "integration-test-ds"
 enabled: true
+
 session_timeout_seconds: {SESSION_TIMEOUT}
 allow_concurrent_push: true
 extra:
