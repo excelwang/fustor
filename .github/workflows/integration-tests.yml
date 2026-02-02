@@ -142,6 +142,7 @@ jobs:
         with:
           name: test-results
           path: .
+        continue-on-error: true
 
       - name: Test Summary
         run: |
