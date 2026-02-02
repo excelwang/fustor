@@ -13,11 +13,82 @@
 
 **代码质量**: ⭐⭐⭐⭐☆ (4/5) - 结构清晰，但存在一些可改进之处
 
-**测试覆盖**: ⭐⭐⭐⭐⭐ (5/5) - 136个运行时测试全部通过
+**测试覆盖**: ⭐⭐⭐⭐☆ (4/5) - 141通过, 4失败 (见下方)
 
 ---
 
-## 🆕 最新提交评审 (345e19b)
+## 🆕 最新提交评审 (fb376fb + 8d8fe1b)
+
+### 提交概述
+- `fb376fb`: `refactor: Enhance snapshot synchronization with robust error handling and rename session manager's datastore ID to view ID.`
+- `8d8fe1b`: `refactor(terminology): complete migration from datastore_id to view_id, unify session management, and add deprecation warnings for legacy configs`
+
+### ✅ 已解决的问题
+
+| 原问题 | 状态 | 修复提交 |
+|--------|------|---------|
+| session_manager.py 变量名不一致 | ✅ 已修复 | fb376fb |
+| 缺少 `__init__.py` | ✅ 已修复 | 8d8fe1b |
+| phases.py 异常处理不一致 | ✅ 已修复 | fb376fb |
+| FusionPipeline 重复 Session 管理 | ✅ 已修复 | 8d8fe1b (委托给 SessionManager) |
+| 缺少废弃配置警告 | ✅ 已修复 | 8d8fe1b |
+
+### 亮点 👍
+
+1. **Session 管理统一化** - `FusionPipeline` 现在委托给 `SessionManager`，不再维护内部 `_active_sessions`
+2. **废弃配置警告** - 添加了 `check_deprecated_configs()` 检查旧配置文件
+3. **pipe.py 路由初始化** - 立即初始化 fallback 路由，避免初始化时序问题
+
+### 🐛 新发现的 Bug (4个测试失败)
+
+#### 🔴 P0 - 严重: 缺少 `get_leader` 方法
+
+**问题**: `FusionPipeline.get_dto()` 调用 `datastore_state_manager.get_leader()`，但该方法不存在。
+
+**位置**: `fusion/src/fustor_fusion/runtime/fusion_pipeline.py:382`
+
+```python
+leader = await datastore_state_manager.get_leader(self.view_id)  # AttributeError!
+```
+
+**影响**: `test_dto` 测试失败
+
+#### 🔴 P0 - 严重: Leader 角色未正确初始化
+
+**问题**: `FusionPipeline.on_session_created()` 没有调用 `try_become_leader()`，导致所有 session 都是 "follower"。
+
+**位置**: `fusion/src/fustor_fusion/runtime/fusion_pipeline.py` - `on_session_created` 方法
+
+**原因分析**: 重构时移除了 Leader 选举逻辑，但没有改用 `datastore_state_manager`。
+
+```python
+# 缺失的逻辑:
+is_leader = await datastore_state_manager.try_become_leader(self.view_id, session_id)
+```
+
+**影响**: 3个测试失败
+- `test_session_created_first_is_leader`
+- `test_session_created_second_is_follower`
+- `test_leader_election_on_close`
+
+#### 🟢 P2 - 轻微: `leader_session` 属性返回 None
+
+**问题**: 移除 `_leader_session` 后，属性直接返回 `None`。
+
+**位置**: `fusion_pipeline.py:426-433`
+
+```python
+@property
+def leader_session(self) -> Optional[str]:
+    # ... comment ...
+    return None  # Always None!
+```
+
+**建议**: 改为 async 方法 `async def get_leader_session()` 或完全移除。
+
+---
+
+## 📊 历史提交评审 (345e19b)
 
 ### 提交概述
 `feat: Implement agent pipeline synchronization phases with sync-to-async iterator wrapper and update session ID types.`
@@ -28,42 +99,7 @@
 |--------|------|------|
 | AgentPipeline 文件过大 (803行) | ✅ 已修复 | 拆分为 phases.py (214行) + worker.py (66行) |
 | `_aiter_sync` 线程泄漏 | ✅ 已修复 | worker.py 添加 `thread.join(timeout=0.5)` |
-| view_id 术语迁移 | 🔄 进行中 | SessionManager 已开始迁移 |
-
-### 🐛 新发现的 Bug
-
-#### 🔴 P0 - 严重: session_manager.py 变量名不一致
-
-**问题**: 重命名 `datastore_id` → `view_id` 时，部分位置遗漏未改。
-
-**影响**: 运行时会抛出 `NameError: name 'datastore_id' is not defined`
-
-**位置**:
-```
-fusion/src/fustor_fusion/core/session_manager.py:
-  - 第80行: _schedule_session_cleanup(datastore_id, ...) 应为 view_id
-  - 第128行: if (datastore_id in self._sessions ...) 应为 view_id
-  - 第129行: session_id in self._sessions[datastore_id] 应为 view_id
-  - 第131行: self._sessions[datastore_id][session_id] 应为 view_id
-```
-
-#### 🟡 P1 - 中等: 缺少 `__init__.py`
-
-**位置**: `agent/src/fustor_agent/runtime/pipeline/`
-
-**问题**: 新创建的子包缺少 `__init__.py`，虽然隐式命名空间包可工作，但不符合项目一致性。
-
-#### 🟡 P1 - 中等: phases.py 异常处理不一致
-
-**位置**: `phases.py:14-49` (`run_snapshot_sync`)
-
-**问题**: 该函数没有 `try/except CancelledError` 保护，与其他阶段函数不一致。
-
-#### 🟢 P2 - 轻微: 中文注释错误
-
-**位置**: `session_manager.py:61`
-
-**问题**: `更新现有会话的活跃时间并重置其清理任务任务。` - "任务"重复
+| view_id 术语迁移 | ✅ 已完成 | fb376fb + 8d8fe1b |
 
 ---
 
