@@ -5,6 +5,11 @@
 **对比分支:** `master`  
 **评审角色:** 高级开发者对初级开发者进行代码审查
 
+> ⚠️ **重要提醒：Legacy 代码必须彻底删除**
+> 
+> 本次重构的一个核心目标是**彻底移除 Legacy 模式代码**，而不是简单地"标记为 deprecated"。
+> 请特别关注 [附录 C](#附录-clegacy-模块删除清单) 中的删除清单。
+
 ---
 
 ## 一、总体评估
@@ -104,7 +109,7 @@ REQUIRED_FIELDS = ["path", "file_name", "size", "modified_time", "is_directory"]
 
 ## 三、需要改进的问题
 
-### 3.1 ⚠️ 【严重】遗留代码未清理
+### 3.1 🚨 【严重】Legacy 代码必须彻底移除
 
 #### 问题描述
 
@@ -117,13 +122,14 @@ from .in_memory_queue import memory_event_queue
 from .processing_manager import processing_manager
 ```
 
-这些模块属于 Legacy 模式，应该在 Pipeline 模式完成后被移除或标记为 deprecated。
+这些模块属于 Legacy 模式，**必须在 V2 架构稳定后彻底移除**。Legacy 代码的存在会：
+- 增加维护负担和认知成本
+- 导致新开发者混淆
+- 可能引入隐蔽的 bug 和安全风险
 
-#### 建议修复
+#### 强制要求
 
-1. 在这些 import 上添加 `# LEGACY: TODO remove after full V2 migration` 注释
-2. 创建 issue 跟踪清理任务
-3. 如果 Legacy 模式仍需支持，考虑将其移入 `legacy/` 子目录
+**不接受 "标记为 deprecated" 的折中方案。所有 Legacy 代码必须彻底删除。**
 
 ### 3.2 ⚠️ 【中等】AgentPipeline 中的硬编码时间常量
 
@@ -302,9 +308,14 @@ def leader_session(self) -> Optional[str]:
 
 ## 五、TODO 清单
 
-### 5.1 高优先级
+### 5.1 高优先级（必须在合并前完成）
 
-- [ ] **清理 Legacy 代码**: 标记或移除 `fusion/src/fustor_fusion/` 中的 `queue_integration`、`in_memory_queue`、`processing_manager`
+- [ ] **彻底删除 Legacy 代码**: 完全移除以下文件和相关引用：
+  - `fusion/src/fustor_fusion/queue_integration.py` ❌ 删除
+  - `fusion/src/fustor_fusion/in_memory_queue.py` ❌ 删除
+  - `fusion/src/fustor_fusion/processing_manager.py` ❌ 删除
+  - `fusion/src/fustor_fusion/datastore_event_manager.py` ❌ 删除
+  - 更新 `main.py` 移除所有 Legacy import
 - [ ] **修复 phases.py 批次发送失败处理**: 确保失败时不丢失数据
 - [ ] **datastore_id 废弃警告**: 在 `FusionPipeline.datastore_id` 添加 DeprecationWarning
 
@@ -407,19 +418,47 @@ Fusion tests: 94 passed
 
 ---
 
-## 附录 C：Legacy 模块清单
+## 附录 C：Legacy 模块删除清单
 
-以下模块属于 Legacy 模式，建议在完成迁移后移除：
+以下模块属于 Legacy 模式，**必须彻底删除**：
 
+### C.1 必须删除的文件
+
+| 文件路径 | 说明 | 删除优先级 |
+|----------|------|------------|
+| `fusion/src/fustor_fusion/in_memory_queue.py` | Legacy 内存队列实现 | 🔴 高 |
+| `fusion/src/fustor_fusion/queue_integration.py` | Legacy 队列适配层 | 🔴 高 |
+| `fusion/src/fustor_fusion/processing_manager.py` | Legacy 处理任务管理 | 🔴 高 |
+| `fusion/src/fustor_fusion/datastore_event_manager.py` | Legacy 事件管理 | 🔴 高 |
+
+### C.2 需要修改的文件
+
+| 文件路径 | 修改内容 |
+|----------|----------|
+| `fusion/src/fustor_fusion/main.py` | 移除 Legacy import (L17-20) |
+| `fusion/src/fustor_fusion/main.py` | 移除 `processing_manager.sync_tasks()` 调用 |
+| `fusion/src/fustor_fusion/main.py` | 移除 `processing_manager.stop_all()` 调用 |
+
+### C.3 术语清理
+
+删除上述 Legacy 文件后，`datastore_id` 术语的引用将从 **162+** 处减少至约 **20** 处（主要在向后兼容别名和测试中）。
+
+### C.4 删除步骤
+
+```bash
+# 1. 删除 Legacy 文件
+rm fusion/src/fustor_fusion/in_memory_queue.py
+rm fusion/src/fustor_fusion/queue_integration.py
+rm fusion/src/fustor_fusion/processing_manager.py
+rm fusion/src/fustor_fusion/datastore_event_manager.py
+
+# 2. 更新 main.py 移除 Legacy 引用
+# 3. 运行测试确保无回归
+uv run pytest fusion/tests/ -v
+
+# 4. 搜索残留引用
+grep -r "queue_integration\|in_memory_queue\|processing_manager\|datastore_event_manager" fusion/
 ```
-fusion/src/fustor_fusion/
-├── in_memory_queue.py      # Legacy: 内存队列实现
-├── queue_integration.py     # Legacy: 队列适配层
-├── processing_manager.py    # Legacy: 处理任务管理
-└── datastore_event_manager.py  # Legacy: 事件管理
-```
-
-这些模块仍使用 `datastore_id` 术语，共有 **162+** 处引用。
 
 ---
 
