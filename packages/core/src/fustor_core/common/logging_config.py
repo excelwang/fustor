@@ -107,7 +107,32 @@ def setup_logging(
             }
         },
         'loggers': {
-            base_logger_name: {
+            'fustor': {
+                'handlers': ['file'],
+                'level': numeric_level,
+                'propagate': False
+            },
+            'fustor_core': {
+                'handlers': ['file'],
+                'level': numeric_level,
+                'propagate': False
+            },
+            'fustor_agent': {
+                'handlers': ['file'],
+                'level': numeric_level,
+                'propagate': False
+            },
+            'fustor_source_fs': {
+                'handlers': ['file'],
+                'level': numeric_level,
+                'propagate': False
+            },
+            'fustor_sender_http': {
+                'handlers': ['file'],
+                'level': numeric_level,
+                'propagate': False
+            },
+            'fustor_sender_echo': {
                 'handlers': ['file'],
                 'level': numeric_level,
                 'propagate': False
@@ -124,7 +149,7 @@ def setup_logging(
             },
             'uvicorn.access': {
                 'handlers': ['file'],
-                'level': logging.INFO,  # Standard level for access logs
+                'level': logging.INFO,
                 'propagate': False
             }
         },
@@ -136,10 +161,8 @@ def setup_logging(
     }
 
     if console_output:
-        LOGGING_CONFIG['loggers'][base_logger_name]['handlers'].append('console')
-        LOGGING_CONFIG['loggers']['uvicorn']['handlers'].append('console')
-        LOGGING_CONFIG['loggers']['uvicorn.error']['handlers'].append('console')
-        LOGGING_CONFIG['loggers']['uvicorn.access']['handlers'].append('console')
+        for logger_name in LOGGING_CONFIG['loggers']:
+             LOGGING_CONFIG['loggers'][logger_name]['handlers'].append('console')
         LOGGING_CONFIG['root']['handlers'].append('console')
 
     logging.config.dictConfig(LOGGING_CONFIG)

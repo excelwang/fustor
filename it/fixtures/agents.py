@@ -107,7 +107,8 @@ sentinel_interval_sec: {SENTINEL_INTERVAL}
     
     docker_manager.exec_in_container(
         container_name, 
-        ["sh", "-c", f"{env_prefix}nohup fustor-agent start -V > /data/agent/console.log 2>&1 &"]
+        ["sh", "-c", f"{env_prefix}fustor-agent start -V > /proc/1/fd/1 2>&1"],
+        detached=True
     )
 
 
@@ -144,7 +145,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
 
     # Start Agent A first
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_A}...")
-    ensure_agent_running(CONTAINER_CLIENT_A, api_key, datastore_id)
+    ensure_agent_running(CONTAINER_CLIENT_A, api_key, view_id)
     
     # Wait for A to become Leader
     logger.info("Waiting for Agent A to register and become Leader...")
@@ -178,7 +179,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
 
     # Start Agent B as Follower
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_B}...")
-    ensure_agent_running(CONTAINER_CLIENT_B, api_key, datastore_id)
+    ensure_agent_running(CONTAINER_CLIENT_B, api_key, view_id)
     
     # Wait for Agent B to register
     logger.info("Waiting for Agent B to register as Follower...")
@@ -196,7 +197,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
 
     return {
         "api_key": api_key,
-        "datastore_id": datastore_id,
+        "view_id": view_id,
         "containers": {
             "leader": CONTAINER_CLIENT_A,
             "follower": CONTAINER_CLIENT_B,

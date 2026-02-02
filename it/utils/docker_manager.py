@@ -99,7 +99,8 @@ class DockerManager:
         capture_output: bool = True,
         timeout: Optional[int] = None,
         max_attempts: int = 3,
-        delay: float = 1.0
+        delay: float = 1.0,
+        detached: bool = False
     ) -> subprocess.CompletedProcess:
         """
         Execute command in a running container with automatic retry on failure.
@@ -116,6 +117,8 @@ class DockerManager:
         """
         last_exception = None
         cmd = ["docker", "exec"]
+        if detached:
+            cmd.append("-d")
         if workdir:
             cmd.extend(["-w", workdir])
         if env:

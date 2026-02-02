@@ -124,7 +124,7 @@ class PipelineBridge:
             id=sync_config.source,
             config=source_config
         )
-        source_handler = SourceHandlerAdapter(source_driver)
+        source_handler = SourceHandlerAdapter(source_driver, config=source_config)
         
         # Create sender handler via adapter
         sender_driver_class = self._sender_driver_service._get_driver_by_type(
@@ -138,7 +138,7 @@ class PipelineBridge:
         )
 
 
-        sender_handler = SenderHandlerAdapter(sender_driver)
+        sender_handler = SenderHandlerAdapter(sender_driver, config=sender_config)
         
         # Build pipeline config from sync config
         pipeline_config = self._build_pipeline_config(sync_config)
@@ -184,6 +184,7 @@ class PipelineBridge:
             "audit_interval_sec": getattr(sync_config, 'audit_interval_sec', 600),
             "sentinel_interval_sec": getattr(sync_config, 'sentinel_interval_sec', 120),
             "session_timeout_seconds": getattr(sync_config, 'session_timeout_seconds', 30),
+            "fields_mapping": getattr(sync_config, 'fields_mapping', []),
         }
         return config
 

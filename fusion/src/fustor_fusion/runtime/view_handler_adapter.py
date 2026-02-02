@@ -215,7 +215,10 @@ class ViewManagerAdapter(ViewHandler):
         
         results = await self._manager.process_event(event)
         # Return True if any provider processed successfully
-        return any(r.get("success", False) for r in results.values())
+        return any(
+            (r if isinstance(r, bool) else r.get("success", False))
+            for r in results.values()
+        )
     
     async def get_data_view(self, **kwargs) -> Any:
         """

@@ -44,12 +44,11 @@ pushers:
       datastore_id: "${DATASTORE_ID}"
 EOF
 
-    # Start agent in background
-    fustor-agent start --config /data/agent/config.yaml &
-    AGENT_PID=$!
-    echo "Agent started with PID ${AGENT_PID}"
+    # Start agent in foreground
+    echo "Starting Fustor Agent (${AGENT_ID}) in foreground..."
+    exec fustor-agent start --config /data/agent/config.yaml
 fi
 
-# Keep container running
+# Keep container running if Agent was not started
 echo "Container ready. Entering idle loop..."
-tail -f /dev/null
+exec tail -f /dev/null

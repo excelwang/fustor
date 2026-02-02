@@ -233,6 +233,9 @@ class FusionPipeline(Pipeline):
                         self.statistics["errors"] += 1
                         logger.warning(f"Handler {handler_id} returned False for event processing")
             except Exception as e:
+                import traceback
+                print(f"DEBUG_HANDLER_ERROR in {handler_id} for event {event.event_type} {event.table}")
+                traceback.print_exc()
                 logger.error(f"Error in handler {handler_id}: {e}", exc_info=True)
                 self.statistics["errors"] += 1
                 
@@ -361,14 +364,22 @@ class FusionPipeline(Pipeline):
         
         async with self._lock:
             self.statistics["events_received"] += len(events)
+            print(f"DEBUG_FUSION_PIPE: Received {len(events)} events from {session_id} (source={source_type})")
         
         # Convert dict events to EventBase if needed
         processed_events = []
         for event in events:
             if isinstance(event, dict):
-                processed_events.append(EventBase.model_validate(event))
+                ev = EventBase.model_validate(event)
+                processed_events.append(ev)
+                if ev.rows:
+                    print(f"DEBUG_FUSION_EVENT: {ev.event_type} table={ev.table} first_row={ev.rows[0]}")
+                else:
+                    print(f"DEBUG_FUSION_EVENT: {ev.event_type} table={ev.table} (empty rows)")
             else:
                 processed_events.append(event)
+                if hasattr(event, "rows") and event.rows:
+                    print(f"DEBUG_FUSION_EVENT: {event.event_type} table={event.table} first_row={event.rows[0]}")
         
         # Queue for processing
         await self._event_queue.put(processed_events)

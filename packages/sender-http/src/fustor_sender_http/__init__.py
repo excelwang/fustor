@@ -118,6 +118,7 @@ class HTTPSender(Sender):
                 event_dicts.append(dict(event))
         
         total_rows = sum(len(e.get("rows", [])) for e in event_dicts)
+        self.logger.info(f"[{source_type}] Attempting to push {len(events)} events ({total_rows} rows) to {self.endpoint}")
         
         try:
             success = await self.client.push_events(
