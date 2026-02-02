@@ -38,16 +38,7 @@ class AgentPipeline(Pipeline):
     This is designed to eventually replace SyncInstance.
     """
     
-    # Class-level timing constants (all in seconds)
-    CONTROL_LOOP_INTERVAL = 1.0       # Wait time between control loop iterations
-    FOLLOWER_STANDBY_INTERVAL = 1.0    # Wait time for follower before checking role again
-    ROLE_CHECK_INTERVAL = 1.0         # Interval to check for role changes when none assigned
-    
-    # Error recovery and exponential backoff
-    ERROR_RETRY_INTERVAL = 5.0        # Initial retry delay after an error
-    MAX_CONSECUTIVE_ERRORS = 5        # Errors before considering pipeline in serious trouble
-    BACKOFF_MULTIPLIER = 2            # Multiplier for exponential backoff (e.g., 5s, 10s, 20s...)
-    MAX_BACKOFF_SECONDS = 60          # Maximum delay between retry attempts
+
     
     def __init__(
         self,
@@ -97,6 +88,15 @@ class AgentPipeline(Pipeline):
         self.audit_interval_sec = config.get("audit_interval_sec", 600)
         self.sentinel_interval_sec = config.get("sentinel_interval_sec", 120)
         self.batch_size = config.get("batch_size", 100)
+        
+        # Timing and backoff configurations
+        self.control_loop_interval = config.get("control_loop_interval", 1.0)
+        self.follower_standby_interval = config.get("follower_standby_interval", 1.0)
+        self.role_check_interval = config.get("role_check_interval", 1.0)
+        self.error_retry_interval = config.get("error_retry_interval", 5.0)
+        self.max_consecutive_errors = config.get("max_consecutive_errors", 5)
+        self.backoff_multiplier = config.get("backoff_multiplier", 2)
+        self.max_backoff_seconds = config.get("max_backoff_seconds", 60)
         
 
         
@@ -240,7 +240,7 @@ class AgentPipeline(Pipeline):
 
                 # Wait until we have a role
                 if not self.current_role:
-                    await asyncio.sleep(self.ROLE_CHECK_INTERVAL)
+                    await asyncio.sleep(self.role_check_interval)
                     continue
                 
                 if self.current_role == "leader":
@@ -248,11 +248,11 @@ class AgentPipeline(Pipeline):
                     # If leader sequence finishes (e.g. source exhausted), 
                     # wait a bit before checking again to avoid busy loop
                     if self.has_active_session():
-                        await asyncio.sleep(self.CONTROL_LOOP_INTERVAL)
+                        await asyncio.sleep(self.control_loop_interval)
                 else:
                     # Follower: just wait and maintain heartbeat
                     self._set_state(PipelineState.PAUSED, "Follower mode - standby")
-                    await asyncio.sleep(self.FOLLOWER_STANDBY_INTERVAL)
+                    await asyncio.sleep(self.follower_standby_interval)
                 
                 # Reset error counter on successful iteration or state achievement
                 if self._consecutive_errors > 0:
@@ -277,8 +277,8 @@ class AgentPipeline(Pipeline):
                 
                 # Exponential backoff
                 backoff = min(
-                    self.ERROR_RETRY_INTERVAL * (self.BACKOFF_MULTIPLIER ** (self._consecutive_errors - 1)),
-                    self.MAX_BACKOFF_SECONDS
+                    self.error_retry_interval * (self.backoff_multiplier ** (self._consecutive_errors - 1)),
+                    self.max_backoff_seconds
                 )
                 
                 self._set_state(PipelineState.ERROR | PipelineState.RECONNECTING, 
@@ -435,7 +435,7 @@ class AgentPipeline(Pipeline):
         while self.is_running():
             # Check role at start of loop
             if self.current_role != "leader":
-                await asyncio.sleep(self.ROLE_CHECK_INTERVAL)
+                await asyncio.sleep(self.role_check_interval)
                 continue
 
             try:
@@ -458,7 +458,7 @@ class AgentPipeline(Pipeline):
             except Exception as e:
                 logger.error(f"Audit loop error: {e}", exc_info=True)
                 # For generic errors, wait longer to avoid flooding
-                await asyncio.sleep(self.ERROR_RETRY_INTERVAL * 10)
+                await asyncio.sleep(self.error_retry_interval * 10)
     
     async def _run_audit_sync(self) -> None:
         """Execute audit synchronization."""
@@ -470,7 +470,7 @@ class AgentPipeline(Pipeline):
         while self.is_running():
             # Check role at start of loop
             if self.current_role != "leader":
-                await asyncio.sleep(self.ROLE_CHECK_INTERVAL)
+                await asyncio.sleep(self.role_check_interval)
                 continue
 
             try:

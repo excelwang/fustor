@@ -27,32 +27,8 @@ def pipeline_config():
         "heartbeat_interval_sec": 0.01,
         "audit_interval_sec": 0.05,
         "sentinel_interval_sec": 0,
+        "control_loop_interval": 0.01,
+        "role_check_interval": 0.01,
+        "follower_standby_interval": 0.01,
+        "error_retry_interval": 0.01,
     }
-
-@pytest.fixture(autouse=True)
-def fast_pipeline_intervals():
-    """
-    Fixture to speed up tests by shortening intervals in AgentPipeline.
-    Automatically resets them after each test.
-    """
-    from fustor_agent.runtime.agent_pipeline import AgentPipeline
-    
-    # Save original values
-    orig_control = AgentPipeline.CONTROL_LOOP_INTERVAL
-    orig_role = AgentPipeline.ROLE_CHECK_INTERVAL
-    orig_follower = AgentPipeline.FOLLOWER_STANDBY_INTERVAL
-    orig_error = AgentPipeline.ERROR_RETRY_INTERVAL
-    
-    # Set fast values
-    AgentPipeline.CONTROL_LOOP_INTERVAL = 0.01
-    AgentPipeline.ROLE_CHECK_INTERVAL = 0.01
-    AgentPipeline.FOLLOWER_STANDBY_INTERVAL = 0.01
-    AgentPipeline.ERROR_RETRY_INTERVAL = 0.01
-    
-    yield
-    
-    # Restore original values
-    AgentPipeline.CONTROL_LOOP_INTERVAL = orig_control
-    AgentPipeline.ROLE_CHECK_INTERVAL = orig_role
-    AgentPipeline.FOLLOWER_STANDBY_INTERVAL = orig_follower
-    AgentPipeline.ERROR_RETRY_INTERVAL = orig_error

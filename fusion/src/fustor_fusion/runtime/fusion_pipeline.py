@@ -114,6 +114,7 @@ class FusionPipeline(Pipeline):
             "sessions_closed": 0,
             "errors": 0,
         }
+        self._cached_leader_session: Optional[str] = None
     
     def register_view_handler(self, handler: ViewHandler) -> None:
         """
@@ -267,6 +268,9 @@ class FusionPipeline(Pipeline):
             if hasattr(handler, 'on_session_start'):
                 await handler.on_session_start()
         
+        if is_leader:
+            self._cached_leader_session = session_id
+            
         logger.info(f"Session {session_id} created for view {self.view_id} (role={'leader' if is_leader else 'follower'})")
     
     async def on_session_closed(self, session_id: str) -> None:
@@ -280,6 +284,9 @@ class FusionPipeline(Pipeline):
         from ..core.session_manager import session_manager
         from ..datastore_state_manager import datastore_state_manager
 
+        if self._cached_leader_session == session_id:
+            self._cached_leader_session = None
+
         # New Leader Election (Architecture V2)
         # If a session closes, we need to ensure there is a leader if sessions remain.
         # We query the session_manager (source of truth) for remaining sessions.
@@ -291,7 +298,10 @@ class FusionPipeline(Pipeline):
                 for sid in remaining_sessions.keys():
                     if await datastore_state_manager.try_become_leader(self.view_id, sid):
                         logger.info(f"New leader elected for view {self.view_id} after session close: {sid}")
+                        self._cached_leader_session = sid
                         break
+            else:
+                self._cached_leader_session = current_leader
         
         # Notify view handlers of session close
         for handler in self._view_handlers.values():
@@ -450,13 +460,9 @@ class FusionPipeline(Pipeline):
     def leader_session(self) -> Optional[str]:
         """
         Get the current leader session ID.
-        Note: This is now a 'best effort' getter as the source of truth is async.
-        For accurate results, use async get_dto() or datastore_state_manager.
+        Note: This is a cached value. For accurate result, use async get_dto().
         """
-        # We don't have a sync way to get the leader from the async manager.
-        # But we can check our known sessions to see if any are leader if we really needed to.
-        # For now, we accept it might return None if accessed synchronously.
-        return None
+        return self._cached_leader_session
     
     def __str__(self) -> str:
         return f"FusionPipeline({self.id}, state={self.state.name})"
