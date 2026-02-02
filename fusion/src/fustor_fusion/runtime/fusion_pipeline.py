@@ -88,7 +88,8 @@ class FusionPipeline(Pipeline):
         
         # Consistent terminology: view_id is the primary identifier
         self.view_id = str(config.get("view_id", config.get("datastore_id", pipeline_id)))
-        self.datastore_id = self.view_id # Alias for backward compatibility
+        # self.datastore_id is now a property
+
         
         self.allow_concurrent_push = config.get("allow_concurrent_push", True)
         self.queue_batch_size = config.get("queue_batch_size", 100)
@@ -459,3 +460,11 @@ class FusionPipeline(Pipeline):
     
     def __str__(self) -> str:
         return f"FusionPipeline({self.id}, state={self.state.name})"
+
+    @property
+    def datastore_id(self) -> str:
+        """Deprecated alias for view_id."""
+        import warnings
+        warnings.warn("datastore_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
+        return self.view_id
+

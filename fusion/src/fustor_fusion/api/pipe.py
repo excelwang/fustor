@@ -18,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 # Re-export existing routers with new paths
 from .session import session_router
-from .ingestion import ingestion_router
 from .consistency import consistency_router
 
 # Create unified pipe router
@@ -54,7 +53,7 @@ def setup_pipe_routers():
         logger.warning("HTTPReceiver not found, falling back to legacy routers")
         # Fallback to legacy
         pipe_router.include_router(session_router, prefix="/session")
-        pipe_router.include_router(ingestion_router, prefix="/ingest")
+        # pipe_router.include_router(ingestion_router, prefix="/ingest") # Legacy removed
     
     # Consistency router is common for both or handles its own delegation
     pipe_router.include_router(consistency_router)

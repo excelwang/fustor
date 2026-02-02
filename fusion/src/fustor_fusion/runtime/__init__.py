@@ -56,7 +56,7 @@ from .session_bridge import (
     create_session_bridge,
 )
 
-from .datastore_event_manager import DatastoreEventManager, datastore_event_manager
+
 
 __all__ = [
     # Pipeline
@@ -72,7 +72,5 @@ __all__ = [
     "PipelineSessionBridge",
     "create_session_bridge",
     
-    # Event Manager
-    "DatastoreEventManager",
-    "datastore_event_manager",
+
 ]

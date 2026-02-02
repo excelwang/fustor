@@ -9,8 +9,7 @@ from typing import Dict, Any, List
 
 from ..auth.dependencies import get_view_id_from_api_key
 from ..view_manager.manager import get_cached_view_manager
-from ..in_memory_queue import memory_event_queue
-from ..processing_manager import processing_manager
+from .. import runtime_objects
 
 logger = logging.getLogger(__name__)
 
@@ -61,19 +60,36 @@ async def signal_audit_end(
     wait_interval = 0.1
     elapsed = 0.0
     
+
     while elapsed < max_wait:
-        queue_size = memory_event_queue.get_queue_size(view_id)
-        inflight = processing_manager.get_inflight_count(view_id)
-        if queue_size == 0 and inflight == 0:
+        queue_size = 0
+        pm = runtime_objects.pipeline_manager
+        if pm:
+            pipelines = pm.get_pipelines()
+            for p in pipelines.values():
+                 if hasattr(p, 'view_id') and p.view_id == view_id:
+                     dto = await p.get_dto()
+                     queue_size += dto.get('queue_size', 0)
+        
+        if queue_size == 0:
             await asyncio.sleep(wait_interval)
-            if memory_event_queue.get_queue_size(view_id) == 0 and processing_manager.get_inflight_count(view_id) == 0:
+            # Check again to ensure stability
+            recheck_queue = 0
+            if pm:
+                pipelines = pm.get_pipelines()
+                for p in pipelines.values():
+                     if hasattr(p, 'view_id') and p.view_id == view_id:
+                         dto = await p.get_dto()
+                         recheck_queue += dto.get('queue_size', 0)
+            
+            if recheck_queue == 0:
                 break
         
         await asyncio.sleep(wait_interval)
         elapsed += wait_interval
     
     if elapsed >= max_wait:
-        logger.warning(f"Audit end signal timeout waiting for queue drain: queue={queue_size}, inflight={inflight}")
+        logger.warning(f"Audit end signal timeout waiting for queue drain: queue={queue_size}")
     else:
         logger.info(f"Queue drained for audit end (waited {elapsed:.2f}s), proceeding with missing item detection")
 

@@ -130,6 +130,10 @@ class PipelineManager:
         """Get pipeline by ID."""
         return self._pipelines.get(pipeline_id)
 
+    def get_pipelines(self) -> Dict[str, FusionPipeline]:
+        """Get all pipelines."""
+        return self._pipelines.copy()
+
     # --- Receiver Callbacks ---
 
     async def _on_session_created(

@@ -9,7 +9,7 @@ from fustor_fusion.auth.dependencies import get_view_id_from_api_key
 from fustor_fusion.view_manager.manager import ViewManager
 
 # Override auth dependency
-app.dependency_overrides[get_view_id_from_api_key] = lambda: 1
+app.dependency_overrides[get_view_id_from_api_key] = lambda: "1"
 
 @pytest.fixture
 def client():
@@ -50,10 +50,16 @@ async def test_audit_end_endpoint(client, mock_view_manager):
     manager.get_provider.return_value = provider
     
     # Patch queue / processing manager to simulate drained queue
-    with patch("fustor_fusion.api.consistency.memory_event_queue") as mock_queue, \
-         patch("fustor_fusion.api.consistency.processing_manager") as mock_pm:
-        mock_queue.get_queue_size.return_value = 0
-        mock_pm.get_inflight_count.return_value = 0
+    # Patch runtime_objects to simulate drained queue via pipeline manager
+    with patch("fustor_fusion.api.consistency.runtime_objects") as mock_ro:
+        mock_pm = MagicMock()
+        mock_ro.pipeline_manager = mock_pm
+        
+        mock_pipeline = AsyncMock()
+        mock_pipeline.view_id = "1"
+        mock_pipeline.get_dto.return_value = {"queue_size": 0}
+        
+        mock_pm.get_pipelines.return_value = {'pipe1': mock_pipeline}
         
         response = client.post("/api/v1/pipe/consistency/audit/end")
     

@@ -12,8 +12,7 @@ import logging
 from ..view_manager.manager import get_cached_view_manager
 from ..auth.dependencies import get_view_id_from_api_key
 from ..datastore_state_manager import datastore_state_manager
-from ..in_memory_queue import memory_event_queue
-from ..processing_manager import processing_manager
+from .. import runtime_objects
 from ..config.views import views_config
 
 logger = logging.getLogger(__name__)
@@ -24,15 +23,26 @@ view_router = APIRouter(tags=["Data Views"])
 async def _check_core_readiness(view_id: str):
     """Internal helper to check core system readiness (snapshot signal, queue, inflight)."""
     is_signal_complete = await datastore_state_manager.is_snapshot_complete(view_id)
-    queue_size = memory_event_queue.get_queue_size(view_id)
-    inflight_count = processing_manager.get_inflight_count(view_id)
     
-    if not is_signal_complete or queue_size > 0 or inflight_count > 0:
-        detail = f"View {view_id} not ready: snapshot_complete={is_signal_complete}, queue={queue_size}, inflight={inflight_count}. "
+    queue_size = 0
+    pm = runtime_objects.pipeline_manager
+    if pm:
+        pipelines = pm.get_pipelines()
+        for p in pipelines.values():
+             if hasattr(p, 'view_id') and p.view_id == view_id:
+                 # Check queue size of feeding pipelines
+                 dto = await p.get_dto()
+                 queue_size += dto.get('queue_size', 0)
+
+    # In V2, queue_size covers pending work. Inflight is considered 0 if queue is empty as processing is serial.
+    inflight_count = 0 
+    
+    if not is_signal_complete or queue_size > 0:
+        detail = f"View {view_id} not ready: snapshot_complete={is_signal_complete}, queue={queue_size}. "
         if not is_signal_complete:
             detail += "Initial snapshot sync in progress. Waiting for end signal from authoritative agent."
         else:
-            detail += "Events still processing in queue/inflight."
+            detail += "Events still processing in queue."
             
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

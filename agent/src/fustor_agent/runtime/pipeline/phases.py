@@ -36,7 +36,9 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
                 if success:
                     pipeline._update_role_from_response(response)
                     pipeline.statistics["events_pushed"] += len(batch)
-                batch = []
+                    batch = []
+                else:
+                    raise Exception("Snapshot batch send failed")
                 
         # Send remaining events in batch
         if batch and pipeline.has_active_session():
@@ -81,7 +83,9 @@ async def run_driver_message_sync(pipeline: "AgentPipeline") -> None:
                 if success:
                     pipeline._update_role_from_response(response)
                     pipeline.statistics["events_pushed"] += len(batch)
-                batch = []
+                    batch = []
+                else:
+                    raise Exception("Realtime batch send failed")
     except asyncio.CancelledError:
         logger.info(f"Driver message sync for {pipeline.id} cancelled")
         raise

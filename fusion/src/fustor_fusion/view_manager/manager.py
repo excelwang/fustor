@@ -13,7 +13,7 @@ from ..config import views_config
 import logging
 import asyncio
 from fustor_core.event import EventBase
-from ..in_memory_queue import memory_event_queue
+
 
 logger = logging.getLogger(__name__)
 
@@ -240,7 +240,6 @@ async def reset_views(datastore_id: str) -> bool:
             if ds_id_str in _view_manager_cache:
                 del _view_manager_cache[ds_id_str]
         
-        await memory_event_queue.clear_datastore_data(ds_id_str)
         return True
     except Exception as e:
         logger.error(f"Failed to reset views for datastore {ds_id_str}: {e}", exc_info=True)

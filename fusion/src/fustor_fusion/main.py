@@ -14,9 +14,6 @@ logger = logging.getLogger(__name__)
 from .config import receivers_config
 from .core.session_manager import session_manager
 from .datastore_state_manager import datastore_state_manager
-from .queue_integration import queue_based_ingestor, get_events_from_queue
-from .in_memory_queue import memory_event_queue
-from .processing_manager import processing_manager
 from . import runtime_objects
 from fustor_core.event import EventBase
 
@@ -33,7 +30,8 @@ async def lifespan(app: FastAPI):
     logger.info("Application startup initiated.")
     
     # NEW: Initialize the global task manager reference
-    runtime_objects.task_manager = processing_manager
+    # NEW: Initialize the global task manager reference
+    # runtime_objects.task_manager = processing_manager # Deprecated: Legacy queue removed
     
     # Initialize the Pipeline Manager
     from .runtime.pipeline_manager import pipeline_manager as pm
@@ -50,7 +48,6 @@ async def lifespan(app: FastAPI):
     # Perform initial configuration load and start processors
     try:
         receivers_config.reload()
-        await processing_manager.sync_tasks(receivers_config.get_active_pipelines())
     except Exception as e:
         logger.error(f"Initial configuration load failed: {e}. Aborting startup.")
         raise
@@ -132,7 +129,6 @@ async def lifespan(app: FastAPI):
     if runtime_objects.pipeline_manager:
         await runtime_objects.pipeline_manager.stop()
         
-    await processing_manager.stop_all()
     await session_manager.stop_periodic_cleanup()
     logger.info("Application shutdown complete.")
 

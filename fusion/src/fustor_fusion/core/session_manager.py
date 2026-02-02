@@ -3,7 +3,7 @@ import time
 from typing import Dict, Optional
 import logging
 from fustor_fusion_sdk.interfaces import SessionManagerInterface, SessionInfo # Import the interface and SessionInfo
-from ..in_memory_queue import memory_event_queue
+from fustor_fusion_sdk.interfaces import SessionManagerInterface, SessionInfo # Import the interface and SessionInfo
 
 logger = logging.getLogger(__name__)
 
@@ -146,8 +146,8 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                                 logger.info(f"View {view_id} is 'live' type. Resetting views as no sessions remain.")
                                 await reset_views(view_id)
                             else:
-                                from ..in_memory_queue import memory_event_queue
-                                await memory_event_queue.clear_datastore_data(view_id)
+                                # Legacy queue cleanup removed
+                                pass
                             
                             logger.info(f"Cleared all session-associated data for view {view_id}.")
                         
@@ -230,7 +230,8 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 if is_live:
                     await reset_views(view_id)
                 else:
-                    await memory_event_queue.clear_datastore_data(view_id)
+                    # Legacy queue cleanup removed
+                    pass
                     
                 logger.info(f"Cleared all data for view {view_id} as no sessions remain after removal.")
             
@@ -284,7 +285,8 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                         if is_live:
                             await reset_views(view_id)
                         else:
-                            await memory_event_queue.clear_datastore_data(view_id)
+                            # Legacy queue cleanup removed
+                            pass
                         
                         logger.info(f"Cleared all data for view {view_id} as no sessions remain after cleanup.")
                     
@@ -313,7 +315,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             async with self._lock:
                 if view_id in self._sessions and not self._sessions[view_id]:
                     del self._sessions[view_id] # Clean up the empty dict entry
-                    await memory_event_queue.clear_datastore_data(view_id)
+                    # Legacy queue cleanup removed
                     logger.info(f"Cleared all data for view {view_id} as no sessions remain after termination.")
         
         return success
