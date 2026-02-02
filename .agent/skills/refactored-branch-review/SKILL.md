@@ -29,4 +29,4 @@ description: 详细评审当前的重构分支与原版分支(master)的差异�
 - Be specific about what needs to change
 - Explain why, not just what
 - Suggest alternatives when possible
-- generate a refactored-branch-review artifact in markdown format in chinese
+- generate a refactored-branch-review artifact in md format in chinese, the artifact should contain a huge table with 6 columns: "ID", "design item", "item description", "master impl", "refactor impl", "suggestion"
