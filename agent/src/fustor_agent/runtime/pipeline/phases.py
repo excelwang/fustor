@@ -200,6 +200,7 @@ async def run_audit_sync(pipeline: "AgentPipeline") -> None:
                 await pipeline.sender_handler.send_batch(
                     pipeline.session_id, batch, {"phase": "audit"}
                 )
+                get_metrics().counter("fustor.agent.events_pushed", len(batch), {"pipeline": pipeline.id, "phase": "audit"})
                 batch = []
         
         if batch:

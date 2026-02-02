@@ -15,7 +15,9 @@ from fustor_core.pipeline.handler import SourceHandler
 from fustor_core.pipeline.sender import SenderHandler
 from fustor_core.models.states import PipelineInstanceDTO
 from fustor_core.exceptions import SessionObsoletedError
+from fustor_core.exceptions import SessionObsoletedError
 from fustor_core.pipeline.mapper import EventMapper
+from fustor_core.common.metrics import get_metrics
 
 if TYPE_CHECKING:
     from fustor_core.pipeline import PipelineContext
@@ -99,8 +101,9 @@ class AgentPipeline(Pipeline):
         self.role_check_interval = config.get("role_check_interval", 1.0)      # How often to check for role changes
         self.error_retry_interval = config.get("error_retry_interval", 5.0)    # Initial backoff delay
         self.max_consecutive_errors = config.get("max_consecutive_errors", 5)  # Threshold for warning
-        self.backoff_multiplier = config.get("backoff_multiplier", 2)          # Exponential backoff factor
-        self.max_backoff_seconds = config.get("max_backoff_seconds", 60)       # Max backoff delay cap
+        self.backoff_multiplier = config.get("backoff_multiplier", 2.0)        # Exponential backoff factor
+        self.max_backoff_seconds = config.get("max_backoff_seconds", 60.0)     # Max backoff delay cap
+        self.session_timeout_seconds = config.get("session_timeout_seconds", 30) # Session expiration timeout
         
 
         
@@ -116,6 +119,7 @@ class AgentPipeline(Pipeline):
         """Update role and heartbeat timer based on server response."""
         new_role = response.get("role")
         if new_role:
+            get_metrics().gauge("fustor.agent.role", 1 if new_role == "leader" else 0, {"pipeline": self.id, "role": new_role})
             # This is a bit tricky since it's async, but role change handled elsewhere
             # We use a synchronous partial update here, role change logic remains in specialized handlers
             asyncio.create_task(self._handle_role_change(new_role))
