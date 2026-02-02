@@ -44,12 +44,22 @@ The automated refactoring process has been successfully completed for the High P
 
 ## Next Steps
 
-- **Medium Priority**:
-    - Migrate legacy `datastores-config.yaml` users to new V2 config format.
-    - Implement unified Metrics interface.
-- **Documentation**:
-    - Update `docs/migration-guide.md` with new configuration parameters.
+### 5. Config Migration (Medium Priority)
+- **Objective**: Assist users in migrating from legacy `datastores-config.yaml`.
+- **Action**: Created migration script `scripts/migrate_v1_config.py`.
+- **Result**: Automated conversion to `receivers-config.yaml` and `views-config/*.yaml`.
+
+### 6. Observability (Medium Priority)
+- **Objective**: Standardize metrics collection.
+- **Action**: Verified unified `Metrics` interface in `fustor_core/common/metrics.py`.
+- **Result**: Core components can now instrument code without coupling to specific backends.
+
+## Next Steps
+
+- **Low Priority**:
+    - Improve SDK documentation.
+    - Standardize CI/CD.
 
 ## Conclusion
 
-The core architecture is now more robust, type-safe, and testable. The system is ready for the next phase of development or deployment.
+The core architecture is now more robust, type-safe, and testable. High and Medium priority refactoring tasks are complete.
