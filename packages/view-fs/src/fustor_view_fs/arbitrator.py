@@ -87,7 +87,7 @@ class FSArbitrator:
         return True
 
     async def _handle_delete(self, path: str, is_realtime: bool, mtime: Optional[float]):
-        self.logger.debug(f"DEBUG_ARB: DELETE_EVENT for {path} realtime={is_realtime}")
+        self.logger.debug(f"DELETE_EVENT for {path} realtime={is_realtime}")
         if is_realtime:
             await self.tree_manager.delete_node(path)
             
@@ -103,12 +103,12 @@ class FSArbitrator:
         else:
             # Audit/Snapshot delete logic
             if path in self.state.tombstone_list:
-                self.logger.debug(f"DEBUG_ARB: AUDIT_DELETE_BLOCKED_BY_TOMBSTONE for {path}")
+                self.logger.debug(f"AUDIT_DELETE_BLOCKED_BY_TOMBSTONE for {path}")
             else:
                 await self.tree_manager.delete_node(path)
                 self.state.blind_spot_deletions.add(path)
                 self.state.blind_spot_additions.discard(path)
-        self.logger.debug(f"DEBUG_ARB: DELETE_DONE for {path}")
+        self.logger.debug(f"DELETE_DONE for {path}")
 
     async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float):
         # 1. Tombstone Protection
@@ -162,20 +162,20 @@ class FSArbitrator:
 
         # 3. Blind Spot and Suspect Management
         if is_realtime:
-            self.logger.debug(f"DEBUG_ARB: REALTIME_EVENT for {path}. Current blind_spot_additions: {path in self.state.blind_spot_additions}")
+            self.logger.debug(f"REALTIME_EVENT for {path}. Current blind_spot_additions: {path in self.state.blind_spot_additions}")
             self.state.suspect_list.pop(path, None)
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
             node.integrity_suspect = False
             node.known_by_agent = True
-            self.logger.debug(f"DEBUG_ARB: REALTIME_DONE for {path}. Now agent_known={node.known_by_agent}, missing={path in self.state.blind_spot_additions}")
+            self.logger.debug(f"REALTIME_DONE for {path}. Now agent_known={node.known_by_agent}, missing={path in self.state.blind_spot_additions}")
         else:
             # Manage Suspect List (Hot Data)
             watermark = self.state.logical_clock.get_watermark()
             age = watermark - mtime
             mtime_changed = (existing is None) or (abs(old_mtime - mtime) > self.FLOAT_EPSILON)
             
-            self.logger.debug(f"DEBUG_ARB: NON_REALTIME {path} source={source} mtime_changed={mtime_changed} age={age:.1f}")
+            self.logger.debug(f"NON_REALTIME {path} source={source} mtime_changed={mtime_changed} age={age:.1f}")
             
             if mtime_changed:
                 if is_audit:
