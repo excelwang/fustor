@@ -247,7 +247,8 @@ class AgentPipeline(Pipeline):
                     await self._run_leader_sequence()
                     # If leader sequence finishes (e.g. source exhausted), 
                     # wait a bit before checking again to avoid busy loop
-                    await asyncio.sleep(self.CONTROL_LOOP_INTERVAL)
+                    if self.has_active_session():
+                        await asyncio.sleep(self.CONTROL_LOOP_INTERVAL)
                 else:
                     # Follower: just wait and maintain heartbeat
                     self._set_state(PipelineState.PAUSED, "Follower mode - standby")
@@ -306,6 +307,8 @@ class AgentPipeline(Pipeline):
         try:
             self._snapshot_task = asyncio.current_task()
             await self._run_snapshot_sync()
+        except SessionObsoletedError:
+            raise
         except Exception as e:
             self._set_state(PipelineState.ERROR, f"Snapshot sync failed: {e}")
             return
@@ -388,87 +391,25 @@ class AgentPipeline(Pipeline):
             if self.has_active_session():
                 await self._cleanup_leader_tasks()
                 await self.on_session_closed(self.session_id)
+            
+            # Explicitly cancel message sync task to break leader sequence if active
+            if self._message_sync_task and not self._message_sync_task.done():
+                self._message_sync_task.cancel()
         else:
             logger.error(f"Pipeline {self.id} fatal background error: {error}", exc_info=True)
             self._set_state(PipelineState.ERROR, str(error))
     async def _aiter_sync(self, sync_iter: Iterator[Any], queue_size: int = 1000):
         """
         Safely and efficiently wrap a synchronous iterator into an async generator.
-        
-        This implementation runs the synchronous iterator in a dedicated background
-        thread and communicates items back via an asyncio.Queue, avoiding the overhead
-        of creating a new thread/Future for every single item.
         """
-        queue = asyncio.Queue(maxsize=queue_size)
-        loop = asyncio.get_event_loop()
-        stop_event = threading.Event()
-        
-        def _producer():
-            try:
-                for item in sync_iter:
-                    if stop_event.is_set():
-                        break
-                    # Blocking put via run_coroutine_threadsafe to respect backpressure
-                    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
-                    future.result() # Wait for the queue to have space
-            except Exception as e:
-                asyncio.run_coroutine_threadsafe(queue.put(e), loop)
-            finally:
-                asyncio.run_coroutine_threadsafe(queue.put(StopAsyncIteration), loop)
-
-        # Start producer thread
-        thread = threading.Thread(target=_producer, name=f"PipelineSource-Producer-{self.id}", daemon=True)
-        thread.start()
-
-        try:
-            while True:
-                item = await queue.get()
-                if item is StopAsyncIteration:
-                    break
-                if isinstance(item, Exception):
-                    raise item
-                yield item
-                queue.task_done()
-        finally:
-            stop_event.set()
-            # We don't block on thread join here to keep the async side responsive,
-            # but the thread will exit shortly after seeing the stop_event or finding the queue closed.
+        from .pipeline.worker import aiter_sync_wrapper
+        async for item in aiter_sync_wrapper(sync_iter, self.id, queue_size):
+            yield item
 
     async def _run_snapshot_sync(self) -> None:
         """Execute snapshot synchronization."""
-        logger.info(f"Pipeline {self.id}: Starting snapshot sync")
-        
-        # Get snapshot iterator from source
-        snapshot_iter = self.source_handler.get_snapshot_iterator()
-        
-        batch = []
-        # Support both sync and async iterators
-        if not hasattr(snapshot_iter, "__aiter__"):
-            snapshot_iter = self._aiter_sync(snapshot_iter)
-
-        async for event in snapshot_iter:
-            batch.append(event)
-            if len(batch) >= self.batch_size:
-                success, response = await self.sender_handler.send_batch(
-                    self.session_id, batch, {"phase": "snapshot"}
-                )
-                if not success: 
-                    raise RuntimeError("Snapshot batch send failed")
-                self._update_role_from_response(response)
-                self.statistics["events_pushed"] += len(batch)
-                batch = []
-        
-        # Send remaining events
-        if batch:
-            success, response = await self.sender_handler.send_batch(
-                self.session_id, batch, {"phase": "snapshot", "is_final": True}
-            )
-            if not success:
-                raise RuntimeError("Final snapshot batch send failed")
-            self._update_role_from_response(response)
-            self.statistics["events_pushed"] += len(batch)
-        
-        logger.info(f"Pipeline {self.id}: Snapshot sync complete")
+        from .pipeline.phases import run_snapshot_sync
+        await run_snapshot_sync(self)
 
     async def _run_message_sync(self) -> None:
         """Execute realtime message synchronization."""
@@ -480,94 +421,14 @@ class AgentPipeline(Pipeline):
             await self._run_driver_message_sync()
 
     async def _run_bus_message_sync(self) -> None:
-        """Execute message sync using EventBus."""
-        logger.info(f"Pipeline {self.id}: Reading from EventBus {self._bus.id}")
-        
-        try:
-            while self.is_running():
-                # Get events from bus
-                events = await self._bus.internal_bus.get_events_for(
-                    self.id, batch_size=self.batch_size, timeout=1.0
-                )
-                
-                if not events:
-                    continue
-                
-                # Send to Fusion
-                success, response = await self.sender_handler.send_batch(
-                    self.session_id, events, {"phase": "realtime"}
-                )
-                
-                if success:
-                    self._update_role_from_response(response)
-                    self.statistics["events_pushed"] += len(events)
-                    # Commit to bus
-                    if self._bus_service:
-                        await self._bus_service.commit_and_handle_split(
-                            self._bus.id, 
-                            self.id, 
-                            len(events), 
-                            events[-1].index,
-                            self.config.get("fields_mapping", [])
-                        )
-                    else:
-                        await self._bus.internal_bus.commit(self.id, len(events), events[-1].index)
-                else:
-                    logger.warning(f"Pipeline {self.id}: Failed to send bus events")
-                    await asyncio.sleep(1.0) # Wait before retry
-                    
-        except asyncio.CancelledError:
-            logger.info(f"Bus message sync for {self.id} cancelled")
-            raise
-        except Exception as e:
-            logger.error(f"Pipeline {self.id} bus sync error: {e}", exc_info=True)
-            raise
+        """Execute message sync reading from an internal event bus."""
+        from .pipeline.phases import run_bus_message_sync
+        await run_bus_message_sync(self)
 
     async def _run_driver_message_sync(self) -> None:
         """Execute message sync directly from driver."""
-        # Pass a stop event if possible for better cleanup
-        stop_event = threading.Event()
-        msg_iter = self.source_handler.get_message_iterator(
-            start_position=-1, 
-            stop_event=stop_event
-        )
-        
-        try:
-            batch = []
-            if not hasattr(msg_iter, "__aiter__"):
-                msg_iter = self._aiter_sync(msg_iter)
-
-            async for event in msg_iter:
-                if not self.is_running() and not (self.state & PipelineState.RECONNECTING):
-                    break
-                    
-                batch.append(event)
-                if len(batch) >= self.batch_size:
-                    success, response = await self.sender_handler.send_batch(
-                        self.session_id, batch, {"phase": "realtime"}
-                    )
-                    if success:
-                        self._update_role_from_response(response)
-                        self.statistics["events_pushed"] += len(batch)
-                    batch = []
-        except asyncio.CancelledError:
-            logger.info(f"Driver message sync for {self.id} cancelled")
-            raise
-        finally:
-            # Send remaining events in batch
-            if batch and self.has_active_session():
-                try:
-                    success, response = await self.sender_handler.send_batch(
-                        self.session_id, batch, {"phase": "realtime", "is_final": True}
-                    )
-                    if success:
-                        self._update_role_from_response(response)
-                        self.statistics["events_pushed"] += len(batch)
-                except Exception as e:
-                    logger.warning(f"Failed to push final message batch: {e}")
-            
-            # Signal stop to the underlying sync iterator
-            stop_event.set()
+        from .pipeline.phases import run_driver_message_sync
+        await run_driver_message_sync(self)
 
     async def _run_audit_loop(self) -> None:
         """Periodically run audit sync."""
@@ -601,52 +462,8 @@ class AgentPipeline(Pipeline):
     
     async def _run_audit_sync(self) -> None:
         """Execute audit synchronization."""
-        logger.debug(f"Pipeline {self.id}: Running audit sync")
-        
-        old_state = self.state
-        self._set_state(self.state | PipelineState.AUDIT_PHASE)
-        
-        try:
-            # Signal audit start
-            await self.sender_handler.send_batch(
-                self.session_id, [], {"phase": "audit", "is_start": True}
-            )
-            
-            audit_iter = self.source_handler.get_audit_iterator()
-            if not hasattr(audit_iter, "__aiter__"):
-                audit_iter = self._aiter_sync(audit_iter)
-            
-            batch = []
-            async for item in audit_iter:
-                # The iterator may return a tuple (event, metadata) from some sources
-                # or just the event object. We normalize it here.
-                if isinstance(item, tuple):
-                    event = item[0]
-                else:
-                    event = item
-                batch.append(event)
-                
-                if len(batch) >= self.batch_size:
-                    await self.sender_handler.send_batch(
-                        self.session_id, batch, {"phase": "audit"}
-                    )
-                    batch = []
-            
-            if batch:
-                await self.sender_handler.send_batch(
-                    self.session_id, batch, {"phase": "audit"}
-                )
-        finally:
-            # Always send audit end signal to ensure Fusion calls handle_audit_end()
-            if self.has_active_session():
-                try:
-                    await self.sender_handler.send_batch(
-                        self.session_id, [], {"phase": "audit", "is_final": True}
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to send audit end signal: {e}")
-            # Clear audit phase flag
-            self._set_state(old_state & ~PipelineState.AUDIT_PHASE)
+        from .pipeline.phases import run_audit_sync
+        await run_audit_sync(self)
     
     async def _run_sentinel_loop(self) -> None:
         """Periodically run sentinel checks."""
@@ -676,31 +493,8 @@ class AgentPipeline(Pipeline):
     
     async def _run_sentinel_check(self) -> None:
         """Execute sentinel check."""
-        logger.debug(f"Pipeline {self.id}: Running sentinel check")
-        
-        try:
-            # 1. Fetch tasks from Fusion
-            task_batch = await self.sender_handler.get_sentinel_tasks()
-            
-            if not task_batch or not task_batch.get("paths"):
-                logger.debug(f"Pipeline {self.id}: No sentinel tasks available")
-                return
-            
-            logger.info(f"Pipeline {self.id}: Received {len(task_batch.get('paths', []))} sentinel tasks")
-            
-            # 2. Perform check via Source handler
-            results = self.source_handler.perform_sentinel_check(task_batch)
-            
-            if results:
-                # 3. Submit results back to Fusion
-                success = await self.sender_handler.submit_sentinel_results(results)
-                if success:
-                    logger.info(f"Pipeline {self.id}: Submitted sentinel results for {len(results.get('updates', []))} items")
-                else:
-                    logger.warning(f"Pipeline {self.id}: Failed to submit sentinel results")
-                    
-        except Exception as e:
-            logger.error(f"Pipeline {self.id}: Error during sentinel check: {e}", exc_info=True)
+        from .pipeline.phases import run_sentinel_check
+        await run_sentinel_check(self)
 
     async def trigger_audit(self) -> None:
 

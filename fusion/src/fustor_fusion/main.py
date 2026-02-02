@@ -39,6 +39,10 @@ async def lifespan(app: FastAPI):
     from .runtime.pipeline_manager import pipeline_manager as pm
     runtime_objects.pipeline_manager = pm
     
+    # NEW: Setup V2 API routers after pipeline_manager is available
+    from .api.pipe import setup_pipe_v2_routers
+    setup_pipe_v2_routers()
+    
     # Initialize pipelines (Async)
     await pm.initialize_pipelines()
     await pm.start()
@@ -128,18 +132,9 @@ from .api.management import router as management_router
 
 # 1. V2 Setup - MUST be done BEFORE including pipe_router in api_v1
 # because FastAPI's include_router copies routes at call time
-from .runtime.pipeline_manager import pipeline_manager as pm
-
-try:
-    pm.load_receivers()
-    setup_pipe_v2_routers()
-except Exception as e:
-    # Log but don't crash module load, let lifespan handle critical failures
-    logging.getLogger(__name__).error(f"Failed to setup V2 receivers: {e}")
 
 # Core versioned router
 api_v1 = APIRouter()
-
 # 2. Pipeline Domain (/api/v1/pipe) - Main API
 api_v1.include_router(pipe_router, prefix="/pipe")
 

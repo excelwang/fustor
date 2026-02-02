@@ -104,7 +104,7 @@ class TestSessionCreation:
             # Verify session manager was called
             mock_session_manager.create_session_entry.assert_called_once()
             call_args = mock_session_manager.create_session_entry.call_args
-            assert call_args.kwargs["datastore_id"] == 1
+            assert call_args.kwargs["view_id"] == "1"
             assert call_args.kwargs["task_id"] == "agent-1:sync-1"
             assert call_args.kwargs["client_ip"] == "192.168.1.1"
             
@@ -167,14 +167,14 @@ class TestSessionClose:
             mock_pipeline.on_session_closed = AsyncMock()
             
             # Initialize map
-            session_bridge._session_datastore_map["sess-123"] = 1
+            session_bridge._session_datastore_map["sess-123"] = "1"
             
             # Close session
             result = await session_bridge.close_session("sess-123")
             
             # Verify session manager was called (terminate_session is used now)
             mock_session_manager.terminate_session.assert_called_once_with(
-                datastore_id=1,
+                datastore_id="1",
                 session_id="sess-123"
             )
             
@@ -203,7 +203,7 @@ class TestGetSessionInfo:
     @pytest.mark.asyncio
     async def test_get_session_info_fallback_to_legacy(self, session_bridge, mock_session_manager):
         """get_session_info should fallback to session manager."""
-        session_bridge._session_datastore_map["sess-1"] = 1
+        session_bridge._session_datastore_map["sess-1"] = "1"
         mock_session_info = MagicMock()
         mock_session_info.session_id = "sess-1"
         mock_session_info.task_id = "old"
@@ -215,7 +215,7 @@ class TestGetSessionInfo:
         
         assert info["task_id"] == "old"
         assert info["session_id"] == "sess-1"
-        mock_session_manager.get_session_info.assert_called_once_with(1, "sess-1")
+        mock_session_manager.get_session_info.assert_called_once_with("1", "sess-1")
     
     @pytest.mark.asyncio
     async def test_get_session_info_not_found(self, session_bridge):

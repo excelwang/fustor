@@ -61,20 +61,21 @@ class PipelineManager:
                 
                 # Load ViewHandlers
                 view_handlers = []
-                for view_id in p_cfg.views:
+                # ViewHandlers are associated with a view_id
+                for v_id in p_cfg.views:
                     try:
-                        # We use datastore_id from extra or default to pipeline_id
-                        datastore_id = p_cfg.extra.get("datastore_id", p_id)
-                        vm = await get_cached_view_manager(datastore_id)
+                        # We use view_id from extra or default to pipeline_id
+                        view_id = p_cfg.extra.get("view_id", p_cfg.extra.get("datastore_id", p_id))
+                        vm = await get_cached_view_manager(view_id)
                         handler = create_view_handler_from_manager(vm)
                         view_handlers.append(handler)
                     except Exception as e:
-                        logger.error(f"Failed to load view {view_id} for pipeline {p_id}: {e}")
+                        logger.error(f"Failed to load view {v_id} for pipeline {p_id}: {e}")
                 
                 pipeline = FusionPipeline(
                     pipeline_id=p_id,
                     config={
-                        "datastore_id": p_cfg.extra.get("datastore_id", p_id),
+                        "view_id": p_cfg.extra.get("view_id", p_cfg.extra.get("datastore_id", p_id)),
                         "allow_concurrent_push": p_cfg.allow_concurrent_push,
                         "session_timeout_seconds": p_cfg.session_timeout_seconds
                     },

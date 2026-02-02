@@ -86,7 +86,10 @@ class FusionPipeline(Pipeline):
         """
         super().__init__(pipeline_id, config, context)
         
-        self.datastore_id = str(config.get("datastore_id", pipeline_id))
+        # Consistent terminology: view_id is the primary identifier
+        self.view_id = str(config.get("view_id", config.get("datastore_id", pipeline_id)))
+        self.datastore_id = self.view_id # Alias for backward compatibility
+        
         self.allow_concurrent_push = config.get("allow_concurrent_push", True)
         self.queue_batch_size = config.get("queue_batch_size", 100)
         
@@ -95,7 +98,7 @@ class FusionPipeline(Pipeline):
         for handler in (view_handlers or []):
             self.register_view_handler(handler)
         
-        # Session tracking
+        # Session tracking (consolidated via SessionManager in most setups)
         self._active_sessions: Dict[str, Dict[str, Any]] = {}
         self._leader_session: Optional[str] = None
         self._lock = asyncio.Lock()  # Lock for thread-safe session management

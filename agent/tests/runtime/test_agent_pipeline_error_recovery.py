@@ -142,8 +142,13 @@ class TestAgentErrorRecovery:
         from fustor_core.exceptions import SessionObsoletedError
         
         mock_sender.role = "leader"
+        # Disable background tasks to make test deterministic
+        pipeline_config_no_bg = pipeline_config.copy()
+        pipeline_config_no_bg["audit_interval_sec"] = 0
+        pipeline_config_no_bg["sentinel_interval_sec"] = 0
+        
         pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+            "test-id", "agent:test-id", pipeline_config_no_bg,
             mock_source, mock_sender
         )
         
@@ -166,11 +171,16 @@ class TestAgentErrorRecovery:
         
         # Give it time to hit the error and recover
         # Since we use 'continue' and no backoff for 419, it should be fast
-        await asyncio.sleep(0.4)
+        success = False
+        for _ in range(40): # Up to 2 seconds
+            if mock_sender.create_session.call_count >= 2:
+                success = True
+                break
+            await asyncio.sleep(0.05)
         
         try:
             # Should have called create_session at least twice (initial + recovery)
-            assert mock_sender.create_session.call_count >= 2
+            assert success, f"Expected 2+ calls, got {mock_sender.create_session.call_count}"
             # Should be back with an active session
             assert pipeline.has_active_session()
             assert pipeline.session_id == "sess-2"

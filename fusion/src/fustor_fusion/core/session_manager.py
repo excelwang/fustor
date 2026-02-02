@@ -12,14 +12,14 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
     内存中的session管理器，用于跟踪所有活跃的session
     """
     def __init__(self, default_session_timeout: int = 30):
-        # {datastore_id: {session_id: SessionInfo}}
-        self._sessions: Dict[int, Dict[str, SessionInfo]] = {}
+        # {view_id: {session_id: SessionInfo}}
+        self._sessions: Dict[str, Dict[str, SessionInfo]] = {}
         self._lock = asyncio.Lock()
         # Use configured timeout if not provided
         self._default_session_timeout = default_session_timeout
         self._periodic_cleanup_task: Optional[asyncio.Task] = None
     
-    async def create_session_entry(self, datastore_id: int, session_id: str, 
+    async def create_session_entry(self, view_id: str, session_id: str, 
                                  task_id: Optional[str] = None, 
                                  client_ip: Optional[str] = None,
                                  allow_concurrent_push: Optional[bool] = None,
@@ -27,18 +27,20 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
         """
         创建新的会话条目并启动其清理任务。
         """
+        # Backward compatibility: handle both string and legacy integer
+        view_id = str(view_id)
         timeout = session_timeout_seconds or self._default_session_timeout
         
         async with self._lock:
-            if datastore_id not in self._sessions:
-                self._sessions[datastore_id] = {}
+            if view_id not in self._sessions:
+                self._sessions[view_id] = {}
             
             now_monotonic = time.monotonic()
             now_epoch = time.time()
             
             session_info = SessionInfo(
                 session_id=session_id,
-                datastore_id=datastore_id,
+                datastore_id=view_id, # Keep field name for now but use string
                 last_activity=now_monotonic,
                 created_at=now_epoch,
                 task_id=task_id,
@@ -46,23 +48,24 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 session_timeout_seconds = session_timeout_seconds,
                 client_ip=client_ip
             )
-            self._sessions[datastore_id][session_id] = session_info
+            self._sessions[view_id][session_id] = session_info
             # Create a new cleanup task for this session
             session_info.cleanup_task = asyncio.create_task(
-                self._schedule_session_cleanup(datastore_id, session_id, timeout)
+                self._schedule_session_cleanup(view_id, session_id, timeout)
             )
             return session_info
 
-    async def keep_session_alive(self, datastore_id: int, session_id: str, 
+    async def keep_session_alive(self, view_id: str, session_id: str, 
                                client_ip: Optional[str] = None) -> Optional[SessionInfo]:
         """
-        更新现有会话的活跃时间并重置其清理任务。
+        更新现有会话的活跃时间并重置其清理任务任务。
         """
+        view_id = str(view_id)
         async with self._lock:
-            if datastore_id not in self._sessions or session_id not in self._sessions[datastore_id]:
+            if view_id not in self._sessions or session_id not in self._sessions[view_id]:
                 return None # Session not found
             
-            session_info = self._sessions[datastore_id][session_id]
+            session_info = self._sessions[view_id][session_id]
             session_info.last_activity = time.monotonic()
             if client_ip:
                 session_info.client_ip = client_ip
@@ -77,13 +80,13 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 self._schedule_session_cleanup(datastore_id, session_id, timeout)
             )
             return session_info
-    async def _check_if_datastore_live(self, datastore_id: int) -> bool:
+    async def _check_if_datastore_live(self, view_id: str) -> bool:
         """
-        Check if any view provider for the datastore requires full reset (Live mode).
+        Check if any view provider for the view requires full reset (Live mode).
         """
         from ..view_manager.manager import get_cached_view_manager
         try:
-            manager = await get_cached_view_manager(datastore_id)
+            manager = await get_cached_view_manager(view_id)
             if not manager or not manager.providers:
                 return False
                 
@@ -92,24 +95,25 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                 if getattr(provider, "requires_full_reset_on_session_close", False):
                     return True
         except Exception as e:
-            logger.warning(f"Failed to check live status for datastore {datastore_id}: {e}")
+            logger.warning(f"Failed to check live status for view {view_id}: {e}")
         return False
 
-    async def _schedule_session_cleanup(self, datastore_id: int, session_id: str, timeout_seconds: int):
+    async def _schedule_session_cleanup(self, view_id: str, session_id: str, timeout_seconds: int):
         """
         Schedule cleanup for a single session after timeout.
         """
+        view_id = str(view_id)
         from ..datastore_state_manager import datastore_state_manager
         
         try:
             while True:
                 # Calculate how much longer we need to wait
                 async with self._lock:
-                    if (datastore_id not in self._sessions or 
-                        session_id not in self._sessions[datastore_id]):
+                    if (view_id not in self._sessions or 
+                        session_id not in self._sessions[view_id]):
                         return # Session already gone
                     
-                    session_info = self._sessions[datastore_id][session_id]
+                    session_info = self._sessions[view_id][session_id]
                     elapsed = time.monotonic() - session_info.last_activity
                     remaining = timeout_seconds - elapsed
                     
@@ -127,32 +131,32 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
                     session_info = self._sessions[datastore_id][session_id]
                     # Double check last_activity
                     if time.monotonic() - session_info.last_activity >= timeout_seconds:
-                        del self._sessions[datastore_id][session_id]
+                        del self._sessions[view_id][session_id]
                         
                         # Clean up empty datastore entries
-                        if not self._sessions[datastore_id]:
-                            del self._sessions[datastore_id]
+                        if not self._sessions[view_id]:
+                            del self._sessions[view_id]
                             
                             # NEW: Check if this is a 'live' datastore and clear data
                             from ..view_manager.manager import reset_views
                             
-                            is_live = await self._check_if_datastore_live(datastore_id)
+                            is_live = await self._check_if_datastore_live(view_id)
                             
                             if is_live:
-                                logger.info(f"Datastore {datastore_id} is 'live' type. Resetting views as no sessions remain.")
-                                await reset_views(datastore_id)
+                                logger.info(f"View {view_id} is 'live' type. Resetting views as no sessions remain.")
+                                await reset_views(view_id)
                             else:
                                 from ..in_memory_queue import memory_event_queue
-                                await memory_event_queue.clear_datastore_data(datastore_id)
+                                await memory_event_queue.clear_datastore_data(view_id)
                             
-                            logger.info(f"Cleared all session-associated data for datastore {datastore_id}.")
+                            logger.info(f"Cleared all session-associated data for view {view_id}.")
                         
                         # Release any associated lock and leader role
                         from ..datastore_state_manager import datastore_state_manager
-                        await datastore_state_manager.unlock_for_session(datastore_id, session_id)
-                        await datastore_state_manager.release_leader(datastore_id, session_id)
+                        await datastore_state_manager.unlock_for_session(view_id, session_id)
+                        await datastore_state_manager.release_leader(view_id, session_id)
                         
-                        logger.info(f"Session {session_id} on datastore {datastore_id} expired and removed")
+                        logger.info(f"Session {session_id} on view {view_id} expired and removed")
         except asyncio.CancelledError:
             # Task was cancelled, which is fine
             pass

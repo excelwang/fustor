@@ -69,8 +69,8 @@ class PipelineSessionBridge:
         self._pipeline = pipeline
         self._session_manager = session_manager
         
-        # Map session_id -> datastore_id (for legacy compatibility)
-        self._session_datastore_map: Dict[str, int] = {}
+        # Map session_id -> view_id (for legacy compatibility)
+        self._session_datastore_map: Dict[str, str] = {}
     
     async def create_session(
         self,
@@ -97,20 +97,22 @@ class PipelineSessionBridge:
         import time
         
         session_id = session_id or str(uuid.uuid4())
-        datastore_id = int(self._pipeline.datastore_id)
+        # Support both new string view_id and legacy integer datastore_id
+        view_id = str(self._pipeline.datastore_id)
         
         from fustor_fusion.datastore_state_manager import datastore_state_manager
         
         # Leader/Follower election (First-Come-First-Serve)
-        is_leader = await datastore_state_manager.try_become_leader(datastore_id, session_id)
+        # Note: datastore_state_manager should handle string IDs too
+        is_leader = await datastore_state_manager.try_become_leader(view_id, session_id)
         if is_leader:
-            await datastore_state_manager.set_authoritative_session(datastore_id, session_id)
+            await datastore_state_manager.set_authoritative_session(view_id, session_id)
             if not allow_concurrent_push:
-                await datastore_state_manager.lock_for_session(datastore_id, session_id)
+                await datastore_state_manager.lock_for_session(view_id, session_id)
         
         # Create in legacy SessionManager
         await self._session_manager.create_session_entry(
-            datastore_id=datastore_id,
+            view_id=view_id,
             session_id=session_id,
             task_id=task_id,
             client_ip=client_ip,
@@ -128,7 +130,7 @@ class PipelineSessionBridge:
         )
         
         # Track mapping
-        self._session_datastore_map[session_id] = datastore_id
+        self._session_datastore_map[session_id] = view_id
         
         # Get role from pipeline
         role = await self._pipeline.get_session_role(session_id)
