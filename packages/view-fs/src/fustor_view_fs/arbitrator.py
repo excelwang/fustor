@@ -18,7 +18,6 @@ class FSArbitrator:
     """
     
     # Heuristics and Constants
-    MS_THRESHOLD = 1e11              # If timestamp > 1e11, assume it's in milliseconds
     FLOAT_EPSILON = 1e-6             # Tolerance for float equality comparisons
     TOMBSTONE_EPSILON = 1e-5         # Buffer for tombstone expiration comparison
     DEFAULT_CLEANUP_INTERVAL = 0.5   # Seconds between suspect list cleanups
@@ -58,15 +57,13 @@ class FSArbitrator:
             # Extract Agent Time for Robust Clock
             agent_time = None
             
-            if hasattr(event, 'index'):
-                 agent_time = float(event.index)
+            if hasattr(event, 'index') and event.index > 0:
+                 # Wire format 'index' is MILLISECONDS (int) per schema convention
+                 agent_time = float(event.index) / 1000.0
             elif hasattr(event, 'timestamp'):
                  agent_time = float(event.timestamp)
-            
-            # Heuristic: Normalize milliseconds to seconds if needed
-            if agent_time and agent_time > self.MS_THRESHOLD:
-                agent_time /= 1000.0
-                 
+                 # Fallback heuristic for generic timestamps
+                 if agent_time > 1e11: agent_time /= 1000.0
 
             self.state.logical_clock.update(mtime, agent_time=agent_time, can_sample_skew=is_realtime)
             
@@ -124,7 +121,8 @@ class FSArbitrator:
             is_realtime = (source == MessageSource.REALTIME)
             
             # Check if this is "New activity" after deletion
-            event_ref_ts = (event.index / 1000.0) if event.index > 0 else mtime
+            # Enforce Seconds: Don't divide index by 1000.0
+            event_ref_ts = float(event.index) if event.index > 0 else mtime
             if event_ref_ts > (tombstone_ts + self.TOMBSTONE_EPSILON) or mtime > (tombstone_ts + self.TOMBSTONE_EPSILON):
                 self.logger.info(f"TOMBSTONE_CLEARED for {path}")
                 self.state.tombstone_list.pop(path, None)

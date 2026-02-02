@@ -15,6 +15,7 @@ When reviewing refactored test code, follow these steps:
 4. **Over-testing**: Are there redundant tests?
 5. **Test coverage**: Are there missing tests?
 6. **Test code pollution**: Does the test code pollute the business code? include twist the business logic to make it easier to test, or add extra methods to the business code to make it easier to test.
+7. **Timeout**: Are there tests using sleep that are taking too long to run? use wait for some marks appear instead of sleep instantly. 
 
 ## How to use it
 1. 请深入理解当前分支的业务代码；

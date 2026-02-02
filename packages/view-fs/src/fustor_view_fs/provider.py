@@ -115,14 +115,16 @@ class FSViewProvider(FSViewBase):
             if abs(old_mtime - mtime) > 1e-6:
                 if (watermark - mtime) < self.hot_file_threshold:
                     node.integrity_suspect = True
-                    if path not in self.state.suspect_list:
-                         expiry = time.monotonic() + self.hot_file_threshold
-                         self.state.suspect_list[path] = (expiry, mtime)
-                         heapq.heappush(self.state.suspect_heap, (expiry, path))
+                    # Renew TTL and update baseline mtime
+                    expiry = time.monotonic() + self.hot_file_threshold
+                    self.state.suspect_list[path] = (expiry, mtime)
+                    heapq.heappush(self.state.suspect_heap, (expiry, path))
+                    self.logger.debug(f"Suspect UPDATED (mtime changed): {path} new_mtime={mtime}")
                 else:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)
             else:
+                # mtime stable
                 if (watermark - mtime) >= self.hot_file_threshold:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)

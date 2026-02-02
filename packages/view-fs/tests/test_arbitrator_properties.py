@@ -54,16 +54,39 @@ async def test_arbitrator_convergence(arbitrator, fs_state):
     oracle = {}
     
     for evt_data in events:
-        path = evt_data['rows'][0]['path']
-        mtime = evt_data['rows'][0]['modified_time']
         source = evt_data['message_source']
         is_delete = (evt_data['event_type'] == EventType.DELETE)
         
-        # Update oracle only on Realtime
-        if source == MessageSource.REALTIME:
-            if path not in oracle or mtime >= oracle[path]['mtime']:
+        # Oracle must process ALL rows, just like the Arbitrator
+        for row in evt_data['rows']:
+            path = row['path']
+            mtime = row['modified_time']
+            
+            # Update oracle logic to mirror System Behavior:
+            # 1. Realtime events are applied blindly (Stream of Truth).
+            # 2. Non-Realtime events satisfy Smart Merge (mtime check).
+            
+            current = oracle.get(path, {'mtime': 0.0, 'deleted': True})
+            
+            should_apply = False
+            if source == MessageSource.REALTIME:
+                should_apply = True
+            else:
+                # Audit/Snapshot Logic
+                if is_delete:
+                    # Delete accepts ties (>=)
+                    if mtime >= current['mtime'] - 1e-6:
+                        should_apply = True
+                else:
+                    # Upsert rejects ties strictly (>)
+                    if mtime > current['mtime'] + 1e-6:
+                        should_apply = True
+                        
+            if should_apply:
                 oracle[path] = {'mtime': mtime, 'deleted': is_delete}
-        
+            
+        # Convert dict to MockEvent
+            
         # Convert dict to MockEvent
         mock_evt = MockEvent(
             evt_data['event_type'],

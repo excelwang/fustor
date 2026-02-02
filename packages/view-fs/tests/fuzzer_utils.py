@@ -62,9 +62,13 @@ class EventFuzzer:
                     "size": self.rng.randint(0, 10000)
                 })
             
-            # Event logical time (index) - usually based on the latest row in the batch
-            # or the time the batch was collected.
-            event_time = self.current_time + self.rng.uniform(0.0, 0.5)
+            # Event logical time (index)
+            # If stale, we simulate "Late Arrival" by backdating the index to match mtime
+            # This ensures that "Stale Content" appears as "Old Event" to the Arbitrator's Tombstone logic.
+            if is_stale:
+                event_time = rows[0]["modified_time"] + 0.1
+            else:
+                event_time = self.current_time + self.rng.uniform(0.0, 0.5)
             
             event = {
                 "event_type": evt_type,

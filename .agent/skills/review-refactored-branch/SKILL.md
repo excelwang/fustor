@@ -19,10 +19,10 @@ description: 详细评审当前的重构分支与原版分支(master)的差异�
 
 ## Step by Step to do the review and make sure you follow the step orders strictly
 
-1. git checkout master，切换到master分支，请深入理解一下master分支的原始代码（若已完成可以跳过）；
-2. git checkout <refactor-branch>, 切换到最新的重构分支，请深入理解一下最新的重构分支的 `specifications/` 目录下的**所有**文档（若已完成可以跳过）,作为后续代码评审的权威依据；
-3. 评审一下最新的重构分支的代码实现；
-4. 这些更改是由一个新手程序员开发的，请帮忙指出其开发的缺陷和修正建议（在尽量优雅的同时注意不要过度设计），梳理成完整的、具体的todo事项清单和开发建议。
+1. git checkout <refactor-branch>, 切换到最新的重构分支，请深入理解一下最新的重构分支的 `specifications/` 目录下的**所有**文档（若已完成可以跳过）,作为后续代码评审的权威依据；
+2. git checkout master，切换到master分支，请深入理解一下master分支的全部业务代码（若已完成可以跳过）,不包括测试代码、前端代码、文档等；
+3. git checkout <refactor-branch>, 切换到最新的重构分支，评审一下最新的全部业务代码，不包括测试代码、前端代码、文档等；
+4. 这些更改是由一个新手程序员开发的，请帮忙指出其开发的缺陷和修正建议（在尽量优雅的同时注意不要过度设计），梳理成完整的、具体的todo事项清单和开发建议，生成一个review artifact，包含两个十分全面且 巨大的表格，一个有6列："ID", "design item", "item description", "master impl", "refactor impl", "suggestion"。另一个表格是master branch中未记录的功能，有5列："ID", "functionality", "master impl", "refactor impl", "suggestion"
 
 ## How to provide feedback
 

@@ -370,7 +370,7 @@ class FusionPipeline(Pipeline):
         
         async with self._lock:
             self.statistics["events_received"] += len(events)
-            print(f"DEBUG_FUSION_PIPE: Received {len(events)} events from {session_id} (source={source_type})")
+            logger.debug(f"Pipeline {self.id}: Received {len(events)} events from {session_id} (source={source_type})")
         
         # Convert dict events to EventBase if needed
         processed_events = []
@@ -378,14 +378,8 @@ class FusionPipeline(Pipeline):
             if isinstance(event, dict):
                 ev = EventBase.model_validate(event)
                 processed_events.append(ev)
-                if ev.rows:
-                    print(f"DEBUG_FUSION_EVENT: {ev.event_type} table={ev.table} first_row={ev.rows[0]}")
-                else:
-                    print(f"DEBUG_FUSION_EVENT: {ev.event_type} table={ev.table} (empty rows)")
             else:
                 processed_events.append(event)
-                if hasattr(event, "rows") and event.rows:
-                    print(f"DEBUG_FUSION_EVENT: {event.event_type} table={event.table} first_row={event.rows[0]}")
         
         # Queue for processing
         self.statistics["events_received"] += len(events)
