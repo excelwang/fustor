@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 import asyncio
 
 from fustor_fusion.main import app
-from fustor_fusion.api.session import get_datastore_id_from_api_key
+from fustor_fusion.api.session import get_view_id_from_api_key as get_datastore_id_from_api_key  # Using view_id internally
 
 @pytest_asyncio.fixture(scope="function")
 async def async_client() -> AsyncClient:
@@ -25,7 +25,7 @@ def register_dummy_route_for_middleware_test():
     """Register a dummy route that uses check_snapshot_status for middleware testing"""
     from fastapi import APIRouter, Depends
     from fustor_fusion.api.views import check_snapshot_status, view_router
-    from fustor_fusion.auth.dependencies import get_datastore_id_from_api_key
+    from fustor_fusion.auth.dependencies import get_view_id_from_api_key as get_datastore_id_from_api_key
     
     # Define a simple router that explicitly uses the middleware we want to test
     dummy_router = APIRouter()

@@ -11,8 +11,7 @@ import uuid
 
 from ..auth.dependencies import get_view_id_from_api_key
 
-# Alias for backward compatibility
-get_datastore_id_from_api_key = get_view_id_from_api_key
+# Note: get_datastore_id_from_api_key was removed. Use get_view_id_from_api_key.
 
 from ..config import receivers_config
 from ..core.session_manager import session_manager

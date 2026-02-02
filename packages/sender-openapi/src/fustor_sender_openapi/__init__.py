@@ -6,179 +6,34 @@ import logging
 from typing import List, Dict, Any, Tuple
 from urllib.parse import urljoin
 
-from fustor_core.drivers import PusherDriver
+from fustor_core.transport import Sender
 from fustor_core.exceptions import DriverError, SessionObsoletedError
-from fustor_core.models.config import SenderConfig, PasswdCredential, ApiKeyCredential
+from fustor_core.models.config import SenderConfig
 from fustor_core.event import EventBase
 from fustor_core.utils.retry import retry
 
 logger = logging.getLogger("fustor_agent.driver.openapi")
 
-# Note: We keep the name but it now inherits from core exception
-# for better catch-ability in the pipeline.
-# The local definition is kept for backward compatibility if needed, 
-# but it's better to use the core one.
-
 
 # Module-level cache for OpenAPI specifications to improve performance
 _spec_cache = {}
 
-class OpenApiDriver(PusherDriver):
+class OpenApiDriver(Sender):
     """
-    A class-based driver for OpenAPI endpoints that conforms to the PusherDriver ABC.
+    A class-based driver for OpenAPI endpoints that conforms to the Sender ABC.
     """
 
-    def __init__(self, id: str, config: SenderConfig):
+    def __init__(self, sender_id: str, endpoint: str, credential: Dict[str, Any], config: Optional[Dict[str, Any]] = None):
         """Initializes the driver with its specific configuration and a persistent HTTP client."""
-        super().__init__(id, config)
-        self.endpoint = self.config.endpoint
-        self.credential = self.config.credential
+        super().__init__(sender_id, endpoint, credential, config)
         self.client = httpx.AsyncClient()
 
-    async def close(self):
-        """Gracefully closes the persistent HTTP client."""
-        await self.client.aclose()
-
-    @staticmethod
-    async def _get_spec(client: httpx.AsyncClient, spec_url: str) -> Dict[str, Any]:
+    async def send_events(self, events: List[EventBase], source_type: str = "message", is_end: bool = False, **kwargs) -> Dict:
         """
-        Static helper method to fetch and parse an OpenAPI specification.
-        Uses the module-level cache.
-        """
-        if spec_url in _spec_cache:
-            logger.debug(f"Using cached spec for {spec_url}")
-            return _spec_cache[spec_url][0] # Return only the spec, not the post_endpoints
-
-        logger.debug(f"Attempting to fetch OpenAPI spec from: {spec_url}")
-        try:
-            resp = await client.get(spec_url)
-            resp.raise_for_status()
-            spec = resp.json()
-            logger.debug(f"Successfully fetched spec from {spec_url}.")
-            # Cache the spec, even if post_endpoints are not extracted yet
-            _spec_cache[spec_url] = (spec, []) # Store as (spec, post_endpoints)
-            return spec
-        except (httpx.RequestError, ValueError) as e:
-            logger.error(f"Failed to get or parse OpenAPI schema from {spec_url}: {e}")
-            raise DriverError(f"无法获取或解析位于 {spec_url} 的 OpenAPI 规范。")
-
-    @staticmethod
-    async def _get_all_post_endpoints_details(client: httpx.AsyncClient, spec_url: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
-        """
-        Static helper method to parse a spec and extract details of all POST endpoints.
-        Uses the module-level cache.
-        """
-        if spec_url in _spec_cache:
-            logger.debug(f"Using cached spec for {spec_url}")
-            return _spec_cache[spec_url]
-
-        spec = await OpenApiDriver._get_spec(client, spec_url)
-        post_endpoints = []
-        for path, path_item in spec.get("paths", {}).items():
-            if "post" in path_item:
-                operation = path_item["post"]
-                if "requestBody" in operation and "application/json" in operation["requestBody"]["content"]:
-                    schema_ref_obj = operation["requestBody"]["content"]["application/json"]["schema"]
-                    resolved_schema = schema_ref_obj
-                    # Resolve $ref if present
-                    if "$ref" in schema_ref_obj:
-                        ref_path = schema_ref_obj["$ref"].split('/')
-                        current_schema = spec
-                        for part in ref_path[1:]:
-                            current_schema = current_schema.get(part, {})
-                        resolved_schema = current_schema
-                    post_endpoints.append({"path": path, "schema": resolved_schema})
-        
-        if not post_endpoints:
-            raise ValueError("No suitable POST endpoint with a requestBody found in the OpenAPI spec.")
-
-        result = (spec, post_endpoints)
-        _spec_cache[spec_url] = result
-        logger.info(f"Fetched and cached spec details for {spec_url}")
-        
-        return result
-
-    @retry(max_retries_attr='max_retries', delay_sec_attr='retry_delay_sec')
-    async def get_latest_committed_index(self, **kwargs) -> int:
-        """
-        Implementation of the ABC method. Gets the last successfully processed index from the pusher.
-        """
-        session_id = kwargs.get("session_id")
-
-        spec = await self._get_spec(self.client, self.endpoint)
-        
-        status_path = None
-        servers = spec.get("servers", [])
-        if servers and isinstance(servers, list) and len(servers) > 0:
-            first_server = servers[0]
-            if isinstance(first_server, dict):
-                status_path = first_server.get("x-fustor_agent-status-endpoint")
-        
-        # If x-fustor_agent-status-endpoint is not defined in OpenAPI spec, extract the path from available endpoints
-        if not status_path:
-            # Look for endpoints that might be appropriate for status/checkpoint functionality
-            paths = spec.get("paths", {})
-            for path in paths:
-                if "position" in path.lower():
-                    # Check if this path supports GET and has parameters that include task_id or session_id
-                    path_details = paths[path]
-                    if "get" in path_details:
-                        status_path = path
-                        break
-            
-            # If still no appropriate path found, use a default
-            if not status_path:
-                logger.debug(f"Pusher endpoint {self.endpoint} spec does not define 'x-fustor_agent-status-endpoint' and no suitable status endpoint found in spec. Using default path '/checkpoint'.")
-                status_path = "/checkpoint"
-            else:
-                logger.debug(f"Pusher endpoint {self.endpoint} spec does not define 'x-fustor_agent-status-endpoint', using discovered path '{status_path}' from available endpoints.")
-            
-            # For default path, we use the original endpoint URL as base
-            status_url = urljoin(self.endpoint, status_path.lstrip('/'))
-        else:
-            server_url = spec.get("servers", [{}])[0].get("url", "")
-            base_url = urljoin(self.endpoint, server_url)
-            status_url = urljoin(base_url, status_path)
-
-        headers = {}
-        if hasattr(self.credential, 'to_base_64') and callable(self.credential.to_base_64):
-            headers['Authorization'] = f"Basic {self.credential.to_base_64()}"
-        elif hasattr(self.credential, 'key'):
-            headers['Authorization'] = f"Bearer {self.credential.key}"
-            headers['x-api-key'] = self.credential.key  # Ensure x-api-key header is present for generic compatibility
-        
-        try:
-            params = {"session_id": session_id}
-            logger.info(f"Querying latest index for task '{self.id}': GET {status_url}")
-            resp = await self.client.get(status_url, headers=headers, params=params, timeout=10)
-            
-            if resp.status_code == 404:
-                logger.warning(f"Checkpoint for task '{self.id}' not found (404). Will start from beginning.")
-                return -1
-
-            resp.raise_for_status()
-            result = resp.json()
-            
-            index = result if isinstance(result, int) else result.get("index")
-            if isinstance(index, int):
-                logger.info(f"Got starting index for task '{self.id}': {index}")
-                return index
-            else:
-                logger.error(f"Pusher status endpoint returned invalid format: {result}")
-                raise DriverError("Pusher status endpoint returned invalid format.")
-
-        except httpx.RequestError as e:
-            logger.error(f"Network error while querying for index: {e}", exc_info=True)
-            raise DriverError(f"Could not connect to pusher status endpoint: {status_url}")
-
-    @retry(max_retries_attr='max_retries', delay_sec_attr='retry_delay_sec', exceptions=(DriverError,))
-    async def push(self, events: List[EventBase], **kwargs) -> Dict:
-        """
-        Implementation of the ABC method. Pushes a batch of events to a single
+        Implementation of the Sender ABC method. Sends a batch of events to a single
         batch endpoint using an envelope schema.
         """
-        session_id = kwargs.get("session_id")
-        source_type = kwargs.get("source_type", "message")
+        session_id = self.session_id
 
         envelope = {
             "session_id": session_id,
@@ -186,7 +41,8 @@ class OpenApiDriver(PusherDriver):
             "source_type": source_type
         }
 
-        logger.info(f"Pushing batch of {len(events)} events for pusher '{self.id}' (session: {session_id or 'N/A'}).")
+        logger.info(f"Sending batch of {len(events)} events for sender '{self.id}' (session: {session_id or 'N/A'}, phase: {source_type}).")
+
 
         spec, _ = await self._get_all_post_endpoints_details(self.client, self.endpoint)
 
@@ -273,16 +129,103 @@ class OpenApiDriver(PusherDriver):
             logger.error(f"Network error pushing batch to {target_url}: {e}")
             raise DriverError(f"Network error while pushing to pusher.")
 
+    async def connect(self) -> None:
+        """Establish connection (for HTTP, this is a no-op as we use stateless requests)."""
+        logger.debug(f"OpenAPI Sender {self.id} ready.")
+
     @retry(max_retries_attr='max_retries', delay_sec_attr='retry_delay_sec')
-    async def heartbeat(self, **kwargs) -> Dict:
+    async def create_session(
+        self, 
+        task_id: str, 
+        source_type: Optional[str] = None,
+        session_timeout_seconds: Optional[int] = None
+    ) -> Dict[str, Any]:
         """
-        Sends a heartbeat to maintain session state with the pusher endpoint.
-        The `kwargs` will contain `session_id`.
+        Creates a new session with the sender endpoint.
+        Returns the full session creation response dictionary.
         """
-        session_id = kwargs.get("session_id")
+        
+        # Get the OpenAPI spec to find the session endpoint
+        spec = await self._get_spec(self.client, self.endpoint)
+        
+        # Look for the open session endpoint in the OpenAPI spec
+        session_path = None
+        servers = spec.get("servers", [])
+        if servers and isinstance(servers, list) and len(servers) > 0:
+            first_server = servers[0]
+            if isinstance(first_server, dict):
+                session_path = first_server.get("x-fustor_agent-open-session-endpoint")
+        
+        if not session_path:
+            # Look for endpoints that might be appropriate for session creation
+            paths = spec.get("paths", {})
+            for path in paths:
+                if "session" in path.lower():
+                    path_details = paths[path]
+                    if "post" in path_details:
+                        session_path = path
+                        break
+            
+            # If still no session path found, use a default
+            if not session_path:
+                logger.debug(f"Sender endpoint {self.endpoint} spec does not define 'x-fustor_agent-open-session-endpoint' and no suitable session endpoint found in spec. Using default path '/events/session'.")
+                session_path = "/events/session"
+            else:
+                logger.debug(f"Sender endpoint {self.endpoint} spec does not define 'x-fustor_agent-open-session-endpoint', using discovered path '{session_path}' from available endpoints.")
+        
+        # Construct the session endpoint URL
+        server_url = spec.get("servers", [{}])[0].get("url", "")
+        base_url = urljoin(self.endpoint, server_url)
+        session_url = urljoin(base_url, session_path)
+        
+        headers = {"Content-Type": "application/json"}
+        if hasattr(self.credential, 'to_base_64') and callable(self.credential.to_base_64):
+            headers['Authorization'] = f"Basic {self.credential.to_base_64()}"
+        elif hasattr(self.credential, 'key'):
+            headers['x-api-key'] = self.credential.key
+
+        body = {
+            "task_id": task_id,
+            "source_type": source_type
+        }
+        if session_timeout_seconds is not None:
+             body["session_timeout_seconds"] = session_timeout_seconds
+
+        try:
+            response = await self.client.post(
+                session_url,
+                json=body,
+                headers=headers,
+                timeout=10.0  # Session creation might take a bit longer
+            )
+            
+            response.raise_for_status()
+            
+            # Parse the response to get the session ID
+            response_data = response.json()
+            if "session_id" in response_data:
+                self.session_id = response_data["session_id"]
+                logger.info(f"Successfully created session {self.session_id} for task: {task_id}")
+                return response_data
+            else:
+                raise DriverError(f"Session creation response missing session_id: {response_data}")
+                
+        except httpx.HTTPStatusError as e:
+            logger.error(f"Failed to create session: {e.response.status_code}, Response: {e.response.text}")
+            raise DriverError(f"HTTP Error {e.response.status_code} while creating session.")
+        except httpx.RequestError as e:
+            logger.error(f"Network error creating session: {e}")
+            raise DriverError(f"Network error while creating session.")
+
+    @retry(max_retries_attr='max_retries', delay_sec_attr='retry_delay_sec')
+    async def heartbeat(self) -> Dict[str, Any]:
+        """
+        Sends a heartbeat to maintain session state with the sender endpoint.
+        """
+        session_id = self.session_id
         
         if not session_id:
-            raise DriverError("Session ID is required for heartbeat")
+            raise DriverError("Session ID is required for heartbeat, but session is not created.")
             
         # 从规范中获取心跳端点
         spec = await self._get_spec(self.client, self.endpoint)
@@ -322,7 +265,7 @@ class OpenApiDriver(PusherDriver):
                 base_url = spec.get("servers", [{}])[0].get("url", "/")
                 heartbeat_url = urljoin(self.endpoint, f"{base_url.rstrip('/')}/events/heartbeat")
             else:
-                logger.debug(f"Pusher endpoint {self.endpoint} spec does not define 'x-fustor_agent-heartbeat-endpoint', using discovered path '{heartbeat_path}' from available endpoints.")
+                logger.debug(f"Sender endpoint {self.endpoint} spec does not define 'x-fustor_agent-heartbeat-endpoint', using discovered path '{heartbeat_path}' from available endpoints.")
                 server_url = spec.get("servers", [{}])[0].get("url", "")
                 base_url = urljoin(self.endpoint, server_url)
                 heartbeat_url = urljoin(base_url, heartbeat_path)
@@ -363,78 +306,6 @@ class OpenApiDriver(PusherDriver):
             logger.warning(f"Network error during heartbeat: {e}")
             raise DriverError(f"Heartbeat network error: {e}")
 
-    @retry(max_retries_attr='max_retries', delay_sec_attr='retry_delay_sec')
-    async def create_session(self, task_id: str) -> Dict[str, Any]:
-        """
-        Creates a new session with the pusher endpoint.
-        Returns the full session creation response dictionary.
-        """
-        
-        # Get the OpenAPI spec to find the session endpoint
-        spec = await self._get_spec(self.client, self.endpoint)
-        
-        # Look for the open session endpoint in the OpenAPI spec
-        session_path = None
-        servers = spec.get("servers", [])
-        if servers and isinstance(servers, list) and len(servers) > 0:
-            first_server = servers[0]
-            if isinstance(first_server, dict):
-                session_path = first_server.get("x-fustor_agent-open-session-endpoint")
-        
-        if not session_path:
-            # Look for endpoints that might be appropriate for session creation
-            paths = spec.get("paths", {})
-            for path in paths:
-                if "session" in path.lower():
-                    path_details = paths[path]
-                    if "post" in path_details:
-                        session_path = path
-                        break
-            
-            # If still no session path found, use a default
-            if not session_path:
-                logger.debug(f"Pusher endpoint {self.endpoint} spec does not define 'x-fustor_agent-open-session-endpoint' and no suitable session endpoint found in spec. Using default path '/events/session'.")
-                session_path = "/events/session"
-            else:
-                logger.debug(f"Pusher endpoint {self.endpoint} spec does not define 'x-fustor_agent-open-session-endpoint', using discovered path '{session_path}' from available endpoints.")
-        
-        # Construct the session endpoint URL
-        server_url = spec.get("servers", [{}])[0].get("url", "")
-        base_url = urljoin(self.endpoint, server_url)
-        session_url = urljoin(base_url, session_path)
-        
-        headers = {"Content-Type": "application/json"}
-        if hasattr(self.credential, 'to_base_64') and callable(self.credential.to_base_64):
-            headers['Authorization'] = f"Basic {self.credential.to_base_64()}"
-        elif hasattr(self.credential, 'key'):
-            headers['x-api-key'] = self.credential.key
-
-        try:
-            response = await self.client.post(
-                session_url,
-                json={
-                    "task_id": task_id
-                },
-                headers=headers,
-                timeout=10.0  # Session creation might take a bit longer
-            )
-            
-            response.raise_for_status()
-            
-            # Parse the response to get the session ID
-            response_data = response.json()
-            if "session_id" in response_data:
-                logger.info(f"Successfully created session {response_data['session_id']} for task: {task_id}")
-                return response_data
-            else:
-                raise DriverError(f"Session creation response missing session_id: {response_data}")
-                
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Failed to create session: {e.response.status_code}, Response: {e.response.text}")
-            raise DriverError(f"HTTP Error {e.response.status_code} while creating session.")
-        except httpx.RequestError as e:
-            logger.error(f"Network error creating session: {e}")
-            raise DriverError(f"Network error while creating session.")
     
     @classmethod
     async def get_needed_fields(cls, **kwargs) -> Dict[str, Any]:

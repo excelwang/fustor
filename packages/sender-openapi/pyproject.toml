@@ -24,10 +24,8 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-open
 license = "MIT"
 
 [project.entry-points."fustor_agent.drivers.senders"]
-openapi = "fustor_pusher_openapi:OpenApiDriver"
+openapi = "fustor_sender_openapi:OpenApiDriver"
 
-[project.entry-points."fustor_agent.drivers.pushers"]
-openapi = "fustor_pusher_openapi:OpenApiDriver"
 
 
 [tool.setuptools.packages.find]

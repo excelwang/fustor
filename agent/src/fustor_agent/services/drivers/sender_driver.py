@@ -39,8 +39,7 @@ class SenderDriverService(SenderDriverServiceInterface):
         # Try various entry point groups for compatibility
         groups = [
             "fustor_agent.senders",
-            "fustor_agent.drivers.senders",
-            "fustor_agent.drivers.pushers"
+            "fustor_agent.drivers.senders"
         ]
         for group in groups:
             try:
