@@ -21,7 +21,7 @@ FUSION_ENDPOINT = f"http://{FUSION_HOST}:{FUSION_PORT}"
 # Test timing configurations
 AUDIT_INTERVAL = 5  # seconds
 SENTINEL_INTERVAL = 1  # seconds
-SESSION_TIMEOUT = 30  # seconds (used in docker-compose configs as well)
+SESSION_TIMEOUT = 5   # seconds (used in docker-compose configs as well)
 HEARTBEAT_INTERVAL = 1 # seconds
 
 # Orchestration timeouts

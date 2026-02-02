@@ -91,95 +91,37 @@ AgentPipeline
 
 ### ⚠️ 严重问题
 
-#### 问题 S1: 测试污染业务代码 - Delete Session 返回 419 **最严重**
+#### 问题 S1: 测试污染业务代码 - Delete Session 返回 419 (已修复 ✅)
 
-**位置**: `fusion/src/fustor_fusion/api/session.py`, Line 193-197
+**位置**: `fusion/src/fustor_fusion/api/session.py`
 
-**变更**:
-```python
-# Before (正确)
-if not success:
-    raise HTTPException(
-        status_code=status.HTTP_404_NOT_FOUND, 
-        detail=f"Session {session_id} not found"
-    )
-
-# After (错误)
-if not success:
-    raise HTTPException(
-        status_code=419,  # Session Obsoleted
-        detail=f"Session {session_id} not found"
-    )
-```
-
-**问题本质**: 这是典型的 **测试污染业务代码**：
-1. 新手程序员看到 Heartbeat 改成了 419
-2. 为了"一致性"或让测试通过，机械地把 Delete Session 也改成了 419
-3. 但没有理解两个 API 的**语义差异**
-
-**为什么这是错误的**:
-
-| API | Session 不存在时 | 正确返回码 | 原因 |
-|-----|-----------------|-----------|------|
-| Heartbeat | 需要重新创建 Session | **419** | Agent 需要恢复 |
-| Push Events | 需要重新创建 Session | **419** | Agent 需要恢复 |
-| **Delete Session** | 目标已达成 | **404** 或 **200** | Agent 本意是退出，不需要恢复 |
-
-**建议修复**: 恢复原来的 404 返回码或直接视为成功。
+**现状**: 已改为返回 200 OK (幂等处理)，彻底解决了测试污染问题。
 
 ---
 
-#### 问题 S2: Session API 条件逻辑变更
+#### 问题 S2: Session API 条件逻辑变更 (已确认为正确 ✅)
 
-**位置**: `fusion/src/fustor_fusion/api/session.py`, Line 64-65
+**位置**: `fusion/src/fustor_fusion/api/session.py`
 
-**变更**:
-```python
-# Before
-if allow_concurrent_push:
-    current_task_sessions = [...]
-    return len(current_task_sessions) == 0
-    
-# After  
-if allow_concurrent_push:
-    return True  # 直接返回 True！
-```
-
-**问题**: 移除了 "同一 task_id 不能有多个并发 session" 的检查逻辑。
-
-**建议**: 确认这是有意为之还是误删，如果有意为之需要添加注释说明原因。
+**结论**: 经分析，此变更为 **正确** 的修复。
+- **原因**: 为了支持多 Agent 并发推送，`allow_concurrent_push=True` 时不应限制单一 Task Session。
+- **验证**: 此逻辑允许不同 Agent 持有不同 Session 但相同 Task ID 进行工作，符合 V2 设计目标。
 
 ---
 
 ### 🟡 中等问题
 
-#### 问题 M1: 拼写错误 `"obeselete"`
-
-**位置**: `packages/sender-http/src/fustor_sender_http/__init__.py`, Line 131, 167
-
-**问题代码**:
-```python
-raise SessionObsoletedError(f"Session {self.session_id} is obeselete (419)")
-#                                                           ^^^^^^^^^ 拼写错误
-```
-
-**建议**: 改为 `obsolete`
+#### 问题 M1: 拼写错误 `"obeselete"` (已修复 ✅)
 
 ---
 
-#### 问题 M2: Agent 配置硬编码端口号
+#### 问题 M2: Agent 配置硬编码端口号 (已修复 ✅)
 
-**位置**: `it/fixtures/agents.py`, Line 45
-
-```python
-fusion_endpoint = "http://fustor-fusion:8102"  # 硬编码
-```
-
-**建议**: 在 `constants.py` 中添加 `FUSION_PORT = 8102`
+**现状**: 已在 `constants.py` 中定义 `FUSION_ENDPOINT` 并统一引用。
 
 ---
 
-#### 问题 M3: Session Recovery 测试断言放宽可能过度
+#### 问题 M3: Session Recovery 测试断言放宽可能过度 (已添加注释 ✅)
 
 **位置**: `it/consistency/test_a3_session_recovery.py`, Line 70-71
 
@@ -196,25 +138,15 @@ assert role in ["leader", "follower"], ...
 
 ---
 
-#### 问题 M4: WatchManager 锁使用不一致
+#### 问题 M4: WatchManager 锁使用不一致 (已修复 ✅)
 
-**位置**: `packages/source-fs/src/fustor_source_fs/components.py`
-
-- `start()` 使用了 `with self._lock:`
-- `stop()` 没有使用锁
-- `_ensure_inotify()` 非线程安全
-
-**建议**: 统一使用锁保护，使用 double-checked locking
+**现状**: 已添加锁保护和双重检查锁定。
 
 ---
 
-#### 问题 M5: Sentinel 测试断言不够精确
+#### 问题 M5: Sentinel 测试断言不够精确 (已修复 ✅)
 
-**位置**: `it/consistency/test_c5_sentinel_sweep.py`, Line 60-75
-
-**问题**: 通过检查 `tasks.get("paths")` 为空来判断完成，可能产生假阳性。
-
-**建议**: 添加对 API 返回状态的显式检查
+**现状**: 已改为使用 `wait_for_flag` 验证 `integrity_suspect` 状态。
 
 ---
 

@@ -50,40 +50,27 @@ class TestSentinelSweep:
         
         # 2. Trigger Audit to discover suspects
         logger.info("Triggering audit to discover suspects...")
-        wait_for_audit()
+        wait_for_audit(12)  # Wait longer for audit to ensure it completes
         
         # 3. Verify they are in suspect list initially
         suspect_list = fusion_client.get_suspect_list()
         suspect_paths = [item.get("path") for item in suspect_list]
+        logger.info(f"Suspect list: {suspect_paths}")
+        
         for f in test_files:
             assert f in suspect_paths, f"File {f} must be suspect initially"
             
         logger.info(f"Found {len(suspect_list)} items in suspect list. Waiting for Sentinel to process...")
 
         # 4. Wait for Sentinel to automatically process them
-        # Sentinel interval is set to 1s in syncs-config.
-        # It should pick them up within a few seconds.
-        start_wait = time.time()
-        max_wait = 20
-        processed_all = False
-        
-        while time.time() - start_wait < max_wait:
-            # How to check if processed? 
-            # In our current implementation, suspect-list is updated.
-            # We can check if tasks list becomes empty OR if we can see the mtime updated.
-            tasks = fusion_client.get_sentinel_tasks()
-            if not tasks or not tasks.get("paths"):
-                # If no more tasks, it might have processed them all?
-                # Actually, suspect_list might still show them but with updated mtime.
-                # A better way is to check the agent logs or see if the feedback API was called.
-                # Since we can't easily see internal Fusion state without more APIs, 
-                # let's check if they still APPEAR in tasks.
-                processed_all = True
-                break
-            time.sleep(1)
-        
-        assert processed_all, "Sentinel did not process tasks within timeout"
-        logger.info("✅ Sentinel automatically processed all tasks")
+        logger.info("Waiting for Sentinel to clear suspect flags...")
+        for f in test_files:
+            # We wait for integrity_suspect flag to become False
+            # Fusion should auto-verify via Sentinel/Feedback loop
+            success = fusion_client.wait_for_flag(f, "integrity_suspect", False, timeout=20)
+            assert success, f"File {f} should have its suspect flag cleared by Sentinel"
+            
+        logger.info("✅ All suspect flags cleared automatically")
 
     def test_follower_does_not_perform_sentinel(
         self,

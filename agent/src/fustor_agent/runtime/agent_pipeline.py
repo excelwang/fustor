@@ -106,6 +106,17 @@ class AgentPipeline(Pipeline):
             "last_pushed_event_id": None
         }
         self._consecutive_errors = 0
+        self._last_heartbeat_at = 0.0  # Time of last successful role update (monotonic)
+    
+    def _update_role_from_response(self, response: Dict[str, Any]) -> None:
+        """Update role and heartbeat timer based on server response."""
+        new_role = response.get("role")
+        if new_role:
+            # This is a bit tricky since it's async, but role change handled elsewhere
+            # We use a synchronous partial update here, role change logic remains in specialized handlers
+            asyncio.create_task(self._handle_role_change(new_role))
+        
+        self._last_heartbeat_at = asyncio.get_event_loop().time()
     
     async def start(self) -> None:
         """
@@ -181,6 +192,12 @@ class AgentPipeline(Pipeline):
         """Handle session creation."""
         self.session_id = session_id
         self.current_role = kwargs.get("role", "follower")
+        
+        # Use suggested heartbeat interval from server if available
+        suggested_interval = kwargs.get("suggested_heartbeat_interval_seconds")
+        if suggested_interval:
+            self.heartbeat_interval_sec = suggested_interval
+            logger.info(f"Pipeline {self.id}: Using server-suggested heartbeat interval: {suggested_interval}s")
         
         logger.info(f"Pipeline {self.id}: Session {session_id} created, role={self.current_role}")
         
@@ -324,11 +341,17 @@ class AgentPipeline(Pipeline):
         """Maintain session through periodic heartbeats."""
         while self.has_active_session():
             try:
-                response = await self.sender_handler.send_heartbeat(self.session_id)
+                loop = asyncio.get_event_loop()
+                now = loop.time()
                 
-                new_role = response.get("role", self.current_role)
-                if new_role != self.current_role:
-                    await self._handle_role_change(new_role)
+                # Adaptive heartbeat: skip if we recently got a role update from data push
+                elapsed = now - self._last_heartbeat_at
+                if elapsed < self.heartbeat_interval_sec:
+                    await asyncio.sleep(min(1.0, self.heartbeat_interval_sec - elapsed))
+                    continue
+
+                response = await self.sender_handler.send_heartbeat(self.session_id)
+                self._update_role_from_response(response)
                 
             except SessionObsoletedError as e:
                 await self._handle_fatal_error(e)
@@ -336,8 +359,8 @@ class AgentPipeline(Pipeline):
             except Exception as e:
                 logger.warning(f"Pipeline {self.id} heartbeat error: {e}")
                 # Don't kill the loop for transient heartbeat errors
-            
-            await asyncio.sleep(self.heartbeat_interval_sec)
+                await asyncio.sleep(self.heartbeat_interval_sec)
+    
     
     async def _cleanup_leader_tasks(self) -> None:
         """Cancel all active leader-specific tasks."""
@@ -426,21 +449,23 @@ class AgentPipeline(Pipeline):
         async for event in snapshot_iter:
             batch.append(event)
             if len(batch) >= self.batch_size:
-                success, _ = await self.sender_handler.send_batch(
+                success, response = await self.sender_handler.send_batch(
                     self.session_id, batch, {"phase": "snapshot"}
                 )
                 if not success: 
                     raise RuntimeError("Snapshot batch send failed")
+                self._update_role_from_response(response)
                 self.statistics["events_pushed"] += len(batch)
                 batch = []
         
         # Send remaining events
         if batch:
-            success, _ = await self.sender_handler.send_batch(
+            success, response = await self.sender_handler.send_batch(
                 self.session_id, batch, {"phase": "snapshot", "is_final": True}
             )
             if not success:
                 raise RuntimeError("Final snapshot batch send failed")
+            self._update_role_from_response(response)
             self.statistics["events_pushed"] += len(batch)
         
         logger.info(f"Pipeline {self.id}: Snapshot sync complete")
@@ -469,11 +494,12 @@ class AgentPipeline(Pipeline):
                     continue
                 
                 # Send to Fusion
-                success, _ = await self.sender_handler.send_batch(
+                success, response = await self.sender_handler.send_batch(
                     self.session_id, events, {"phase": "realtime"}
                 )
                 
                 if success:
+                    self._update_role_from_response(response)
                     self.statistics["events_pushed"] += len(events)
                     # Commit to bus
                     if self._bus_service:
@@ -517,10 +543,11 @@ class AgentPipeline(Pipeline):
                     
                 batch.append(event)
                 if len(batch) >= self.batch_size:
-                    success, _ = await self.sender_handler.send_batch(
+                    success, response = await self.sender_handler.send_batch(
                         self.session_id, batch, {"phase": "realtime"}
                     )
                     if success:
+                        self._update_role_from_response(response)
                         self.statistics["events_pushed"] += len(batch)
                     batch = []
         except asyncio.CancelledError:
@@ -530,10 +557,11 @@ class AgentPipeline(Pipeline):
             # Send remaining events in batch
             if batch and self.has_active_session():
                 try:
-                    success, _ = await self.sender_handler.send_batch(
+                    success, response = await self.sender_handler.send_batch(
                         self.session_id, batch, {"phase": "realtime", "is_final": True}
                     )
                     if success:
+                        self._update_role_from_response(response)
                         self.statistics["events_pushed"] += len(batch)
                 except Exception as e:
                     logger.warning(f"Failed to push final message batch: {e}")
@@ -590,6 +618,8 @@ class AgentPipeline(Pipeline):
             
             batch = []
             async for item in audit_iter:
+                # The iterator may return a tuple (event, metadata) from some sources
+                # or just the event object. We normalize it here.
                 if isinstance(item, tuple):
                     event = item[0]
                 else:

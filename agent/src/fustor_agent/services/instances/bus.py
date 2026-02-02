@@ -215,14 +215,18 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
         source_config: SourceConfig, 
         sync_id: str,
         required_position: int,
-        fields_mapping: List[FieldMapping]
+        fields_mapping: List[FieldMapping],
+        force_new: bool = False
     ) -> Tuple[EventBusInstanceRuntime, bool]: # Updated return type
         source_signature = self._generate_source_signature(source_config)
         
         async with self._bus_creation_locks[str(source_signature)]:
             bus_runtime = self.bus_by_signature.get(source_signature)
 
-            if bus_runtime and bus_runtime.state == EventBusState.ERROR:
+            if force_new:
+                logger.info(f"Forcing creation of a new bus for signature {source_signature} due to split.")
+                bus_runtime = None
+            elif bus_runtime and bus_runtime.state == EventBusState.ERROR:
                 logger.warning(f"Removed failed EventBus '{bus_runtime.id}' for source '{source_id}'. Creating a new one.")
                 self.pool.pop(bus_runtime.id, None)
                 bus_runtime = None
@@ -310,7 +314,8 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
                 source_config=source_config,
                 sync_id=task_to_split_id,
                 required_position=last_consumed_position,
-                fields_mapping=fields_mapping
+                fields_mapping=fields_mapping,
+                force_new=True
             )
             
             # The remapping sync instance needs to know about the signal too

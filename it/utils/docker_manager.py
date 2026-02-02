@@ -149,9 +149,7 @@ class DockerManager:
             raise last_exception
         raise RuntimeError("exec_in_container failed unexpectedly")
 
-    def exec_in_container_with_retry(self, *args, **kwargs) -> subprocess.CompletedProcess:
-        """Deprecated: Use exec_in_container directly which now includes retry logic."""
-        return self.exec_in_container(*args, **kwargs)
+
 
     def get_logs(self, container: str, tail: int = 100) -> str:
         """Get container logs."""

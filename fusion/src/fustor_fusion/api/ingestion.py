@@ -134,8 +134,7 @@ class BatchIngestPayload(BaseModel):
 @ingestion_router.post(
     "/",
     summary="Receive batch events",
-    description="This endpoint receives batch events from clients.",
-    status_code=status.HTTP_204_NO_CONTENT
+    description="This endpoint receives batch events from clients."
 )
 async def ingest_event_batch(
     payload: BatchIngestPayload,
@@ -213,6 +212,16 @@ async def ingest_event_batch(
         except Exception as e:
             logger.error(f"Failed to notify event manager for datastore {datastore_id}: {e}", exc_info=True)
 
+        # NEW: Return role info to reduce heartbeat overhead
+        is_leader = await datastore_state_manager.is_leader(datastore_id, payload.session_id)
+        return {
+            "status": "ok", 
+            "role": "leader" if is_leader else "follower",
+            "is_leader": is_leader
+        }
+
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to process batch events (task: {si.task_id}): {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Failed to push batch events: {str(e)}")

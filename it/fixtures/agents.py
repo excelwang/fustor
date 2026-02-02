@@ -129,7 +129,10 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_datastore):
     logger.info("Cleaning up existing agents preventing stale leadership...")
     for container in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]:
         try:
-            docker_manager.exec_in_container(container, ["pkill", "-f", "fustor-agent"])
+            # First, ensure processes are running so they can receive signals, 
+            # then kill them forcefully.
+            docker_manager.exec_in_container(container, ["sh", "-c", "pkill -CONT -f fustor-agent || true"])
+            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"])
         except Exception:
             pass
 

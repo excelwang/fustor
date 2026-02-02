@@ -67,6 +67,9 @@ class TestSessionRecovery:
         assert new_session_id != old_session_id, "Agent A should have a DIFFERENT session ID"
         
         # 5. Verify it has a valid role
+        # We allow both Leader and Follower roles here because in a race condition 
+        # or multi-agent test environment, the recovered agent might not immediately 
+        # regain leadership if another agent is present or election is in progress.
         role = next(s["role"] for s in fusion_client.get_sessions() if s["session_id"] == new_session_id)
         assert role in ["leader", "follower"], f"Recovered session should have a valid role, but got {role}"
         

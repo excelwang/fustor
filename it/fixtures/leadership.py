@@ -57,9 +57,9 @@ def reset_leadership(fusion_client, setup_agents, docker_env):
     leader = next((s for s in sessions if s.get("role") == "leader"), None)
     
     is_clean = False
-    if leader and "agent-a" in leader.get("agent_id", ""):
+    if leader and "client-a" in leader.get("agent_id", ""):
         # Agent A is leader. Check Agent B presence.
-        agent_b = next((s for s in sessions if "agent-b" in s.get("agent_id", "")), None)
+        agent_b = next((s for s in sessions if "client-b" in s.get("agent_id", "")), None)
         if agent_b:
             is_clean = True
             
@@ -72,7 +72,8 @@ def reset_leadership(fusion_client, setup_agents, docker_env):
     # Force reset: Stop everyone
     for container in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B]:
         try:
-            docker_manager.exec_in_container(container, ["pkill", "-f", "fustor-agent"])
+            docker_manager.exec_in_container(container, ["sh", "-c", "pkill -CONT -f fustor-agent || true"])
+            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"])
         except Exception:
             pass
 
@@ -94,7 +95,7 @@ def reset_leadership(fusion_client, setup_agents, docker_env):
     while time.time() - start_wait < 30:
         sessions = fusion_client.get_sessions()
         leader = next((s for s in sessions if s.get("role") == "leader"), None)
-        if leader and "agent-a" in leader.get("agent_id", ""):
+        if leader and "client-a" in leader.get("agent_id", ""):
             break
         time.sleep(0.5)
         

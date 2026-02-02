@@ -43,7 +43,7 @@ class TestFollowerIOIsolation:
         
         assert follower_session is not None, "Agent B session not found"
         assert follower_session.get("role") == "follower", \
-            f"Expected agent-b to be follower, got {follower_session.get('role')}"
+            f"Expected client-b to be follower, got {follower_session.get('role')}"
         
         # Verify follower capabilities are restricted
         assert follower_session.get("can_snapshot") is False, \
