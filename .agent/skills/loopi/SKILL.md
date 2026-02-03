@@ -11,14 +11,14 @@ description: 实现“编码-测试-评审”的自动化闭环。严格遵循 S
 
 ## 1. 核心逻辑 (The Loop)
 
-这是一个死循环，直到 `cre` 说 "PASS"。
+这是一个死循环，直到 `code-review-expert` 说 "PASS"。
 
 ```mermaid
 graph TD
     A[Start] --> B(Alignment Check)
     B --> C{Coding Phase}
     C --> D(Testing Phase)
-    D --> E(Call Skill: cre)
+    D --> E(Call Skill: code-review-expert)
     E --> F{Review Passed?}
     F -- No (Fail) --> G[Analyze Fix Plan]
     G --> C
@@ -37,7 +37,7 @@ graph TD
    2. **如果不存在**：立即调用 `soarch`，通过**逆向工程** (Reverse Engineering) 阅读现有代码和需求，补全 Spec。
    3. **如果存在**：阅读 Spec 和当前代码，建立基准认知。
 - **Step 1: Baseline Review (基线审查)**
-   - 在修改任何代码前，先运行一次 `cre` (Mode B)。
+   - 在修改任何代码前，先运行一次 `code-review-expert` (Mode B)。
    - 目的：明确当前代码与 Spec 的差距，生成初始的任务清单。
 
 ## 3. 详细执行步骤 (Loop Execution)
@@ -61,7 +61,7 @@ graph TD
   3. **Mode A (Feature/Bugfix)**: 如果分支名匹配 `feature/*`, `feat/*`, `fix/*` (非 legacy)。
      - 重点：与 Spec 进行 Design Compliance 对比。
   4. **Mode C (Test Only)**: 如果仅修改了 `tests/` 或 `it/` 目录下的文件。
-- **Action**: 主动调用 `cre` skill，传入上述 Diff 内容。
+- **Action**: 主动调用 `code-review-expert` skill，传入上述 Diff 内容。
 
 ### Step 4: Decision (判决)
 阅读 Review 输出的两个表格：
