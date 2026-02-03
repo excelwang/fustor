@@ -166,7 +166,7 @@ class PipelineBridge:
             "heartbeat_interval_sec": getattr(pipeline_config, 'heartbeat_interval_sec', 10),
             "audit_interval_sec": getattr(pipeline_config, 'audit_interval_sec', 600),
             "sentinel_interval_sec": getattr(pipeline_config, 'sentinel_interval_sec', 120),
-            "session_timeout_seconds": getattr(pipeline_config, 'session_timeout_seconds', 30),
+            "session_timeout_seconds": None, # Force usage of Fusion's suggested timeout
             "fields_mapping": getattr(pipeline_config, 'fields_mapping', []),
         }
         return config

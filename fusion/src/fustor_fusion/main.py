@@ -79,8 +79,16 @@ async def lifespan(app: FastAPI):
             
     suspect_cleanup_task = asyncio.create_task(periodic_suspect_cleanup())
     
-    # Start periodic session cleanup (Every 5 seconds for fast failover)
-    await session_manager.start_periodic_cleanup(5)
+    # Start periodic session cleanup
+    # Derive interval from configured timeouts (approx 1/5 of min timeout, min 1s)
+    min_timeout = 30
+    all_receivers = receivers_config.get_all()
+    if all_receivers:
+        min_timeout = min(r.session_timeout_seconds for r in all_receivers.values())
+    
+    cleanup_interval = max(1, min_timeout // 5)
+    logger.info(f"Starting session cleanup (Interval: {cleanup_interval}s, Min Timeout: {min_timeout}s)")
+    await session_manager.start_periodic_cleanup(cleanup_interval)
 
     # NEW: Auto-start enabled views from YAML
     try:

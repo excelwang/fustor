@@ -101,7 +101,6 @@ class AgentPipeline(Pipeline):
         self.backoff_multiplier = config.get("backoff_multiplier", 2.0)        # Exponential backoff factor
         self.max_backoff_seconds = config.get("max_backoff_seconds", 60.0)     # Max backoff delay cap
         self.session_timeout_seconds = config.get("session_timeout_seconds") # Session expiration timeout (optional)
-        print(f"DEBUG_PRINT: AgentPipeline {id(self)} init task_id={task_id} timeout={self.session_timeout_seconds}")
         
 
         

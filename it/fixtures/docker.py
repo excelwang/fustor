@@ -127,6 +127,8 @@ disabled: false
 driver_params:
   uri: "/mnt/shared-view"
   hot_file_threshold: {HOT_FILE_THRESHOLD}
+  consistency:
+    tombstone_ttl_seconds: 5
 """
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/integration-test-ds.yaml", view_config)
     

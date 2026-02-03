@@ -39,7 +39,7 @@ AGENT_READY_TIMEOUT = 45
 AGENT_B_READY_TIMEOUT = 60 # Agent B usually takes longer due to follower sync
 VIEW_READY_TIMEOUT = 45
 AUDIT_WAIT_TIMEOUT = 45    # How long to wait for an audit cycle to complete
-SESSION_VANISH_TIMEOUT = 6 # How long to wait for stale sessions to expire (SESSION_TIMEOUT + 1s)
+SESSION_VANISH_TIMEOUT = 12 # How long to wait for stale sessions to expire (SESSION_TIMEOUT + 8s)
 
 # --- Standard API Wait Timeouts ---
 SHORT_TIMEOUT = 10         # Quick checks (file creation)
