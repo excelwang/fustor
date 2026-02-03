@@ -56,7 +56,8 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             return session_info
 
     async def keep_session_alive(self, view_id: str, session_id: str, 
-                               client_ip: Optional[str] = None) -> Optional[SessionInfo]:
+                               client_ip: Optional[str] = None,
+                               can_realtime: bool = False) -> Optional[SessionInfo]:
         """
         更新现有会话的活跃时间并重置其清理任务。
         """
@@ -67,6 +68,7 @@ class SessionManager(SessionManagerInterface): # Inherit from the interface
             
             session_info = self._sessions[view_id][session_id]
             session_info.last_activity = time.monotonic()
+            session_info.can_realtime = can_realtime
             if client_ip:
                 session_info.client_ip = client_ip
 

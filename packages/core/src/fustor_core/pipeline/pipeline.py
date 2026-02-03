@@ -140,6 +140,7 @@ class Pipeline(ABC):
     def is_running(self) -> bool:
         """Check if pipeline is in a running state."""
         return bool(self.state & (PipelineState.RUNNING | 
+                                  PipelineState.PAUSED |
                                   PipelineState.SNAPSHOT_SYNC | 
                                   PipelineState.MESSAGE_SYNC | 
                                   PipelineState.AUDIT_PHASE))

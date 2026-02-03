@@ -185,12 +185,12 @@ class PipelineManager:
         logger.warning(f"Session {session_id} not found in any pipeline mapping")
         return False
 
-    async def _on_heartbeat(self, session_id: str) -> Dict[str, Any]:
+    async def _on_heartbeat(self, session_id: str, can_realtime: bool = False) -> Dict[str, Any]:
         pipeline_id = self._session_to_pipeline.get(session_id)
         if pipeline_id:
             bridge = self._bridges.get(pipeline_id)
             if bridge:
-                return await bridge.keep_alive(session_id)
+                return await bridge.keep_alive(session_id, can_realtime=can_realtime)
             
             # Fallback (though ideally bridge is always present now)
             pipeline = self._pipelines.get(pipeline_id)

@@ -245,7 +245,7 @@ async def list_sessions(
         session_data["role"] = "leader" if is_leader else "follower"
         session_data["can_snapshot"] = is_leader
         session_data["can_audit"] = is_leader
-        session_data["can_realtime"] = True
+        session_data["can_realtime"] = session_info.can_realtime
         session_data["can_send"] = True
         
         session_list.append(session_data)

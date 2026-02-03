@@ -94,7 +94,7 @@ def setup_pipe_routers():
                     "role": "leader" if is_leader else "follower",
                     "can_snapshot": is_leader,
                     "can_audit": is_leader,
-                    "can_realtime": True,
+                    "can_realtime": si.can_realtime,
                     "can_send": True
                 })
         

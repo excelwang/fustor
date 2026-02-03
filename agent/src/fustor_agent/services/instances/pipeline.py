@@ -92,17 +92,18 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
             if not is_transient:
                 try:
                     # We assume start from position 0 for new pipelines (or from saved state TBD)
-                    # Mapping comes from source_config or pipeline_config? 
+                    # In V2, we use a unique task_id (agent_id:pipeline_id) for bus subscription
+                    task_id = f"{self.agent_id}:{id}"
                     field_mappings = getattr(pipeline_config, "fields_mapping", [])
                     
                     event_bus, _ = await self.bus_service.get_or_create_bus_for_subscriber(
                         source_id=pipeline_config.source,
                         source_config=source_config,
-                        pipeline_id=id,
+                        pipeline_id=task_id,
                         required_position=0, 
                         fields_mapping=field_mappings
                     )
-                    self.logger.info(f"Subscribed to EventBus {event_bus.id} for pipeline '{id}'")
+                    self.logger.info(f"Subscribed to EventBus {event_bus.id} for pipeline '{task_id}'")
                 except Exception as e:
                     self.logger.warning(f"Failed to acquire EventBus for '{id}': {e}. Falling back to direct driver.")
 

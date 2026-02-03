@@ -5,6 +5,32 @@ import time
 from typing import Any, Optional
 import requests
 
+# Import it directory to sys.path if needed for imports
+import os
+import sys
+from pathlib import Path
+
+_utils_dir = Path(__file__).parent
+_it_dir = _utils_dir.parent
+if str(_it_dir) not in sys.path:
+    sys.path.insert(0, str(_it_dir))
+
+try:
+    from fixtures.constants import (
+        AGENT_READY_TIMEOUT,
+        VIEW_READY_TIMEOUT,
+        AUDIT_WAIT_TIMEOUT,
+        POLL_INTERVAL,
+        FAST_POLL_INTERVAL
+    )
+except ImportError:
+    # Fallback to defaults if constants not available
+    AGENT_READY_TIMEOUT = 30
+    VIEW_READY_TIMEOUT = 30
+    AUDIT_WAIT_TIMEOUT = 45
+    POLL_INTERVAL = 0.5
+    FAST_POLL_INTERVAL = 0.1
+
 
 class FusionClient:
     """HTTP client for Fusion API."""
@@ -194,7 +220,7 @@ class FusionClient:
         self,
         path: str,
         timeout: float = 30,
-        interval: float = 0.1,
+        interval: float = FAST_POLL_INTERVAL,
         should_exist: bool = True
     ) -> bool:
         """Wait for file to appear/disappear in Fusion tree."""
@@ -216,7 +242,7 @@ class FusionClient:
         file_path: str,
         root_path: str = "/",
         timeout: float = 30,
-        interval: float = 0.1
+        interval: float = FAST_POLL_INTERVAL
     ) -> Optional[dict]:
         """Wait for a specific file to appear in tree."""
         start = time.time()
@@ -246,7 +272,7 @@ class FusionClient:
         file_path: str,
         root_path: str = "/",
         timeout: float = 30,
-        interval: float = 0.5
+        interval: float = POLL_INTERVAL
     ) -> bool:
         """Wait for a specific file to disappear from tree."""
         start = time.time()
@@ -307,7 +333,7 @@ class FusionClient:
             time.sleep(interval)
         return False
 
-    def wait_for_audit(self, timeout: float = 30, interval: float = 0.5) -> bool:
+    def wait_for_audit(self, timeout: float = AUDIT_WAIT_TIMEOUT, interval: float = POLL_INTERVAL) -> bool:
         """Wait for an audit cycle to complete."""
         try:
             initial_stats = self.get_stats()
@@ -327,7 +353,7 @@ class FusionClient:
             time.sleep(interval)
         return False
 
-    def wait_for_view_ready(self, timeout: float = 60, interval: float = 0.5) -> bool:
+    def wait_for_view_ready(self, timeout: float = VIEW_READY_TIMEOUT, interval: float = POLL_INTERVAL) -> bool:
         """Wait for view initial snapshot to complete and queue to drain."""
         start = time.time()
         while time.time() - start < timeout:
@@ -344,7 +370,7 @@ class FusionClient:
                 time.sleep(interval)
         return False
 
-    def wait_for_agent_ready(self, agent_id: str, timeout: float = 60, interval: float = 0.5) -> bool:
+    def wait_for_agent_ready(self, agent_id: str, timeout: float = AGENT_READY_TIMEOUT, interval: float = POLL_INTERVAL) -> bool:
         """Wait for an agent to be registered and reporting can_realtime=True."""
         start = time.time()
         while time.time() - start < timeout:

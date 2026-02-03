@@ -66,5 +66,7 @@ class FSViewQuery:
              "oldest_item_path": oldest_dir["path"] if oldest_dir else None,
              "has_blind_spot": (len(self.state.blind_spot_additions) + len(self.state.blind_spot_deletions)) > 0,
              "suspect_file_count": suspect_count,
-             "logical_now": logical_now
+             "logical_now": logical_now,
+             "last_audit_finished_at": self.state.last_audit_finished_at,
+             "audit_cycle_count": self.state.audit_cycle_count
         }

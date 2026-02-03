@@ -118,13 +118,13 @@ class SenderHandlerAdapter(SenderHandler):
         
         return session_id, metadata
     
-    async def send_heartbeat(self, session_id: str) -> Dict[str, Any]:
+    async def send_heartbeat(self, session_id: str, **kwargs) -> Dict[str, Any]:
         """
         Send a heartbeat to keep the session alive.
         
         Delegates to the underlying Sender's heartbeat method.
         """
-        response = await self._sender.heartbeat()
+        response = await self._sender.heartbeat(**kwargs)
         
         return {
             "role": response.get("role", response.get("current_role")),

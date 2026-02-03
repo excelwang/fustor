@@ -53,7 +53,7 @@ uv run pytest it/consistency/test_a1_leader_election_first.py -v
 
 ### 2. 自动环境管理 (重要)
 
-本框架引入了**智能环境复用机制**，无需手动设置 `FUSTOR_REUSE_ENV`：
+本框架引入了**智能环境复用机制**
 - **自动检测**: 每次启动测试时，系统会计算 `docker-compose.yml`、`Dockerfile` 以及所有 `pyproject.toml` 的哈希值。
 - **智能复用**: 如果配置和依赖未发生变化，系统将直接复用运行中的容器，仅重启 Fusion 以应用最新配置（启动时间 ~5s）。
 - **自动重建**: 如果检测到任何影响环境的变更，系统会自动执行 `docker-compose up --build` 进行冷启动。

@@ -7,6 +7,14 @@ from typing import Optional
 
 import sys
 import logging
+import sys
+
+# Configure basic logging for the entire application
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    stream=sys.stdout
+)
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +108,10 @@ async def lifespan(app: FastAPI):
                 
             except Exception as e:
                 logger.error(f"Failed to auto-start view {view_instance_id}: {e}", exc_info=True)
+        
+        # After starting views, re-setup API routers to ensure prefixes are correct
+        from .api.views import setup_view_routers
+        setup_view_routers()
                 
     except Exception as e:
         logger.error(f"Error during view auto-start: {e}", exc_info=True)

@@ -111,6 +111,8 @@ class AgentPipeline(Pipeline):
         self.audit_context: Dict[str, Any] = {} # D-05: Incremental audit state (mtime cache)
         self._consecutive_errors = 0
         self._last_heartbeat_at = 0.0  # Time of last successful role update (monotonic)
+        self.is_realtime_ready = False  # Track if realtime is officially active (post-prescan)
+        self._initial_snapshot_done = False # Track if initial snapshot complete
 
     def _calculate_backoff(self, consecutive_errors: int) -> float:
         """Standardized exponential backoff calculation."""
@@ -140,11 +142,13 @@ class AgentPipeline(Pipeline):
     def _update_role_from_response(self, response: Dict[str, Any]) -> None:
         """Update role and heartbeat timer based on server response."""
         new_role = response.get("role")
-        if new_role:
+        if new_role and new_role != self.current_role:
             get_metrics().gauge("fustor.agent.role", 1 if new_role == "leader" else 0, {"pipeline": self.id, "role": new_role})
-            # This is a bit tricky since it's async, but role change handled elsewhere
-            # We use a synchronous partial update here, role change logic remains in specialized handlers
+            # Role changed - trigger async handler
             asyncio.create_task(self._handle_role_change(new_role))
+        elif new_role:
+             # Just update metrics for current role
+             get_metrics().gauge("fustor.agent.role", 1 if new_role == "leader" else 0, {"pipeline": self.id, "role": new_role})
         
         self._last_heartbeat_at = asyncio.get_event_loop().time()
     
@@ -239,6 +243,8 @@ class AgentPipeline(Pipeline):
         logger.info(f"Pipeline {self.id}: Session {session_id} closed")
         self.session_id = None
         self.current_role = None
+        self.is_realtime_ready = False
+        self._initial_snapshot_done = False
     
     async def _run_control_loop(self) -> None:
         """
@@ -341,14 +347,16 @@ class AgentPipeline(Pipeline):
         """
         Run the leader-specific sequence: Snapshot and background Audit/Sentinel.
         """
-        # Sync Phase 1: Snapshot sync phase
-        if self._snapshot_task is None or self._snapshot_task.done():
-            self._set_state(PipelineState.RUNNING | PipelineState.SNAPSHOT_SYNC, "Starting snapshot sync phase...")
+        # Sync Phase 1: Initial Snapshot sync phase
+        if not self._initial_snapshot_done and (self._snapshot_task is None or self._snapshot_task.done()):
+            self._set_state(PipelineState.RUNNING | PipelineState.SNAPSHOT_SYNC, "Starting initial snapshot sync phase...")
             try:
                 # Start Snapshot in a background task so it can be safely cancelled 
                 # without killing the main control loop.
                 self._snapshot_task = asyncio.create_task(self._run_snapshot_sync())
                 await self._snapshot_task
+                self._initial_snapshot_done = True
+                logger.info(f"Pipeline {self.id}: Initial snapshot sync phase complete")
             except asyncio.CancelledError:
                 logger.info(f"Pipeline {self.id}: Snapshot sync phase task cancelled")
             except SessionObsoletedError:
@@ -379,7 +387,10 @@ class AgentPipeline(Pipeline):
                     await asyncio.sleep(min(1.0, self.heartbeat_interval_sec - elapsed))
                     continue
 
-                response = await self.sender_handler.send_heartbeat(self.session_id)
+                # Check if message sync is running and post-prescan (driver ready)
+                can_realtime = self.is_realtime_ready
+
+                response = await self.sender_handler.send_heartbeat(self.session_id, can_realtime=can_realtime)
                 self._update_role_from_response(response)
                 
                 # Reset error counter on success

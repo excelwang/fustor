@@ -82,5 +82,7 @@ class AuditManager:
                 self.state.blind_spot_additions.discard(path)
         
         self.logger.info(f"Audit ended. Tombstones cleaned: {cleaned}, Missing items deleted: {missing_count}")
+        self.state.last_audit_finished_at = now_physical
+        self.state.audit_cycle_count += 1
         self.state.last_audit_start = None
         self.state.audit_seen_paths.clear()

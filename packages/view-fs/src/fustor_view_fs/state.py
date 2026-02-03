@@ -29,6 +29,8 @@ class FSState:
         self.suspect_heap: List[Tuple[float, str]] = [] # (expiry_monotonic, path)
         
         self.last_audit_start: Optional[float] = None
+        self.last_audit_finished_at: float = 0.0
+        self.audit_cycle_count: int = 0
         self.audit_seen_paths: Set[str] = set()
         
         self.blind_spot_deletions: Set[str] = set()
@@ -54,6 +56,8 @@ class FSState:
         self.suspect_list.clear()
         self.suspect_heap.clear()
         self.last_audit_start = None
+        self.last_audit_finished_at = 0.0
+        self.audit_cycle_count = 0
         self.audit_seen_paths.clear()
         self.blind_spot_deletions.clear()
         self.blind_spot_additions.clear()

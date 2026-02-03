@@ -49,7 +49,7 @@ class SenderHandler(Handler):
         raise NotImplementedError
     
     @abstractmethod
-    async def send_heartbeat(self, session_id: str) -> Dict[str, Any]:
+    async def send_heartbeat(self, session_id: str, **kwargs) -> Dict[str, Any]:
         """
         Send a heartbeat to keep the session alive.
         

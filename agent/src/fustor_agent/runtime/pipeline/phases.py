@@ -78,6 +78,8 @@ async def run_driver_message_sync(pipeline: "AgentPipeline", start_position: int
             msg_iter = pipeline._aiter_sync_phase(msg_iter)
 
         async for event in msg_iter:
+            # First item received = Prescan complete and watching active
+            pipeline.is_realtime_ready = True
             if not pipeline.is_running() and not (pipeline.state & PipelineState.RECONNECTING):
                 break
                 
@@ -132,7 +134,11 @@ async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
             )
             
             if not events:
+                # Even if no events, we mark ready after first successful poll
+                pipeline.is_realtime_ready = True
                 continue
+            
+            pipeline.is_realtime_ready = True
                 
             # 2. Send to fusion
             events = pipeline.map_batch(events)

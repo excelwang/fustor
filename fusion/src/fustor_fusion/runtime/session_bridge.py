@@ -143,7 +143,8 @@ class PipelineSessionBridge:
     async def keep_alive(
         self,
         session_id: str,
-        client_ip: Optional[str] = None
+        client_ip: Optional[str] = None,
+        can_realtime: bool = False
     ) -> Dict[str, Any]:
         """
         Keep session alive (heartbeat).
@@ -162,7 +163,8 @@ class PipelineSessionBridge:
             await self._session_manager.keep_session_alive(
                 view_id=view_id,
                 session_id=session_id,
-                client_ip=client_ip
+                client_ip=client_ip,
+                can_realtime=can_realtime
             )
         
         # Get role from pipeline

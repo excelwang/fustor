@@ -84,8 +84,7 @@ def reset_fusion_state(fusion_client):
     except Exception as e:
         logger.debug(f"Fusion reset failed: {e}")
     
-    # 3. Small buffer to let Fusion processes settle
-    time.sleep(1)
+    # 3. Small buffer removed, reset() is comprehensive
     yield
 
 

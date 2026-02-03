@@ -44,12 +44,9 @@ async def start_view(view_id: str):
         )
     
     # Get or create ViewManager for this view group
+    from ..view_manager.manager import get_cached_view_manager
     v_group_id = config.view_id
-    if v_group_id not in view_managers:
-        from ..view_manager.manager import ViewManager
-        view_managers[v_group_id] = ViewManager(view_id=v_group_id)
-    
-    vm = view_managers[v_group_id]
+    vm = await get_cached_view_manager(v_group_id)
     
     # Check if view already running
     if view_id in vm.providers:

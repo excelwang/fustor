@@ -19,7 +19,9 @@ logger = logging.getLogger(__name__)
 
 
 # --- Global Cache for View Managers ---
-_view_manager_cache: Dict[str, 'ViewManager'] = {}
+# Use the unified registry in runtime_objects to ensure consistency between 
+# pipelines, API endpoints, and management commands.
+from .. import runtime_objects
 _cache_lock = asyncio.Lock()
 
 # --- Cached loaded drivers ---
@@ -229,18 +231,23 @@ class ViewManager:
                          
         return aggregated
 
+    async def reset(self):
+        """Reset all providers."""
+        for provider in self.providers.values():
+            if hasattr(provider, 'reset'):
+                await provider.reset()
+
 async def reset_views(view_id: str) -> bool:
     """
-    Reset all views by clearing cached manager and data for a specific view.
+    Reset all views by calling reset() on the cached manager.
     """
     v_id_str = str(view_id)
     logger.info(f"Resetting views for view {v_id_str}")
     try:
-        async with _cache_lock:
-            if v_id_str in _view_manager_cache:
-                del _view_manager_cache[v_id_str]
+        manager = runtime_objects.view_managers.get(v_id_str)
+        if manager:
+            await manager.reset()
         
-        # await memory_event_queue.clear_view_data(v_id_str)
         return True
     except Exception as e:
         logger.error(f"Failed to reset views for view {v_id_str}: {e}", exc_info=True)
@@ -255,23 +262,23 @@ async def get_cached_view_manager(view_id: str) -> 'ViewManager':
     If not in cache, it creates, initializes, and caches one.
     """
     v_id_str = str(view_id)
-    if v_id_str in _view_manager_cache:
-        return _view_manager_cache[v_id_str]
+    if v_id_str in runtime_objects.view_managers:
+        return runtime_objects.view_managers[v_id_str]
 
     async with _cache_lock:
-        if v_id_str in _view_manager_cache:
-            return _view_manager_cache[v_id_str]
+        if v_id_str in runtime_objects.view_managers:
+            return runtime_objects.view_managers[v_id_str]
         
         logger.info(f"Creating new view manager for view {v_id_str}")
         new_manager = ViewManager(view_id=v_id_str)
         await new_manager.initialize_providers()
-        _view_manager_cache[v_id_str] = new_manager
+        runtime_objects.view_managers[v_id_str] = new_manager
         return new_manager
 
 
 async def cleanup_all_expired_suspects():
     """Iterate through all cached managers and cleanup suspects."""
-    for manager in list(_view_manager_cache.values()):
+    for manager in list(runtime_objects.view_managers.values()):
         try:
             await manager.cleanup_expired_suspects()
         except Exception as e:

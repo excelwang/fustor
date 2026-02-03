@@ -1,4 +1,4 @@
-# Fustor Configuration Guide (V2)
+# Fustor Configuration Guide
 
 Fustor uses a decentralized, YAML-based configuration architecture. All configurations are stored in the `$FUSTOR_HOME` directory (defaults to `~/.fustor`).
 
