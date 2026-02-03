@@ -1,5 +1,5 @@
 ---
-name: cre
+name: Code Review Expert
 description: 统一的代码评审专家，支持新功能审查、重构对齐审查和测试代码审查。
 ---
 

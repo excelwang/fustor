@@ -73,8 +73,29 @@ graph TD
    - 回到 Step 2。
 3. **Case 3: Tables clean / Review OK** -> **COMMIT & STOP**。
 
-## 3. 防死循环机制
-- 在内存中记录迭代次数 `Iteration_Count`。
-- 如果 `Iteration_Count >= 3` 且 Review 仍未通过：
-  - **Stop**。
-  - 向用户报错："无法满足设计要求，设计可能存在逻辑漏洞或实现难度过大，请人工介入。"
+## 4. 状态持久化 (Task Persistence)
+
+为了支持断点续做，必须在关键节点（调用专家前后、流程结束时）更新 `.agent/current_task.md`。
+**原则**: 只记录当前最新快照，不记流水账，节省 Token。
+
+**Trigger Points**:
+1. 调用 `soarch`, `tester`, `code-review-expert` **之前**。
+2. 收到专家反馈 **之后**。
+3. 流程 **结束时**。
+
+**File Template**:
+```markdown
+# Current Task: [Task Description]
+> Last Update: 202X-XX-XX HH:MM
+> Global Status: Coding | Reviewing | Fixing
+
+## Current Focus
+- Branch: refactor/xxx
+- Spec: specs/yyy.md
+
+## Latest Checkpoint
+- [x] Spec Created
+- [ ] Coding (Sub-task: A, B Done)
+- [ ] Test Verification (Pending)
+- [ ] Review Status (Last: FAIL - 3 issues remaining)
+```
