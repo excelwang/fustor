@@ -60,7 +60,7 @@ description: 统一的代码评审专家，支持新功能审查、重构对齐�
 | Impacted Domain | Selected Test Suite | Rationale |
 | :--- | :--- | :--- |
 | Consistency | `it/consistency/` | Modified sync logic |
-| **Contract** | `it/specs/task_001.py` | **Must Pass** |
+| **Contract** | `it/specs/ticket_001.py` | **Must Pass** |
 
 无论使用哪种模式，最终输出必须包含一个 **Review Artifact (Markdown Report)**...
 ### Table 1: Detailed Findings & Consistency Matrix

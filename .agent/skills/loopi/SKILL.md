@@ -25,62 +25,62 @@ graph TD
     F -- Yes (Pass) --> H[Stop]
 ```
 
-## 2. Session Manager (Identity & Resume)
+## 2. Workstream Manager (Identity & Resume)
 
 在开始任何工作前，必须先确定"我是谁"。
 
-### Step 0: Session Identification
+### Step 0: Workstream Identification
 **Action**:
-1. 读取 `.agent/sessions/active/` 目录下的所有 JSON 文件。
-2. **List & Ask**: 向用户展示当前活跃的 Session 列表。
-   - Option [R]: **Resume** <Session_ID>
-   - Option [N]: **New Session** (创建一个新会话)
+1. 读取 `.agent/workstreams/active/` 目录下的所有 JSON 文件。
+2. **List & Ask**: 向用户展示当前活跃的 Workstream 列表。
+   - Option [R]: **Resume** <Workstream_ID>
+   - Option [N]: **New Workstream** (创建一个新 Workstream)
      > **Smart Recommendation (Context Affinity)**:
-     > 如果刚完成任务或有遗留上下文，优先推荐亲和度高的任务：
+     > 如果刚完成 Ticket 或有遗留上下文，优先推荐亲和度高的 Ticket：
      > - **Score Rule**: 
-     >   - `+20` Same Parent Task/Sequence
+     >   - `+20` Same Parent Ticket/Sequence
      >   - `+10` Same Domain Spec
      >   - `+5`  Overlapping File Paths
-     > - **Display**: "[HIGH AFFINITY] Task_002 (Reuses loaded context)"
-   - Option [C]: **Clear/Wipe** (强制清除某些过期的僵尸 Session)
+     > - **Display**: "[HIGH AFFINITY] Ticket_002 (Reuses loaded context)"
+   - Option [C]: **Clear/Wipe** (强制清除某些过期的僵尸 Workstream)
 
 ### Step 1: Initialization
 - **If Resume**:
-  - 读取选定 Session 的 JSON 文件。
+  - 读取选定 Workstream 的 JSON 文件。
   - 恢复 `Base Commit` 和 `Iteration Count`。
-  - 读取 `.agent/current_task.md` (Context Resume)。
-- **If New Session**:
-  - 生成新的 Session ID。
+  - 读取 `.agent/current_ticket.md` (Context Resume)。
+- **If New Workstream**:
+  - 生成新的 Workstream ID。
   - **Atomic Claim (抢占逻辑)**:
     1. 用户选择 `backlog/` 下的任务。
-    2. 执行 `mv .agent/tasks/backlog/TASK_ID.md .agent/tasks/active/TASK_ID.md`。
+    2. 执行 `mv .agent/tickets/backlog/TICKET_ID.md .agent/tickets/active/TICKET_ID.md`。
     3. **Check**: 如果 `mv` 失败（文件不存在），说明被抢占 -> **Retry**。
-    4. **Lock**: 成功后，创建 `.agent/sessions/active/{session_id}.json` 记录 Claim。
-    5. 初始化 `.agent/current_task.md`。
+    4. **Lock**: 成功后，创建 `.agent/workstreams/active/{workstream_id}.json` 记录 Claim。
+    5. 初始化 `.agent/current_ticket.md`。
   - **Git Flow**:
     1. `git fetch origin master`
-    2. `git checkout -b feature/task_[ID] origin/master`
-    3. **Rule**: 每个 Session 必须在独立分支工作，严禁直接在 master 上 commit。
+    2. `git checkout -b feature/ticket_[ID] origin/master`
+    3. **Rule**: 每个 Workstream 必须在独立分支工作，严禁直接在 master 上 commit。
 
-### Step 2: Task Alignment (归位)
+### Step 2: Ticket Alignment (归位)
 ...
-**Constraint**: `loopi` 在 Coding 阶段 **严禁修改** `active/` 下的 Task 原件。所有进度记录在 `.agent/current_task.md` 中。Task 原件仅可由 `soarch` (Split) 或 `cre` (Feedback) 修改。
+**Constraint**: `loopi` 在 Coding 阶段 **严禁修改** `active/` 下的 Ticket 原件。所有进度记录在 `.agent/current_ticket.md` 中。Ticket 原件仅可由 `soarch` (Split) 或 `cre` (Feedback) 修改。
 
 
 
 **Case A: 全新开发**
-- 前置：必须先运行 `soarch` 输出 Task 文档至 `.agent/tasks/backlog/`。
-- 启动：认领 Task，移动至 `.agent/tasks/active/`，直接进入 Coding Phase。
+- 前置：必须先运行 `soarch` 输出 Ticket 文档至 `.agent/tickets/backlog/`。
+- 启动：认领 Ticket，移动至 `.agent/tickets/active/`，直接进入 Coding Phase。
 
 **Case B: 既有代码接手 (Refactoring/Continuing)**
-- **Step 0: Task Alignment (归位)**
-   1. 检查 `.agent/tasks/` 下是否存在对应的 `TASK_[ID].md`。
-   2. **如果不存在**：调用 `soarch`，逆向生成 Task 文档。
-   3. **如果存在**：阅读 Task 和引用的 Spec，建立基准认知。
+- **Step 0: Ticket Alignment (归位)**
+   1. 检查 `.agent/tickets/` 下是否存在对应的 `TICKET_[ID].md`。
+   2. **如果不存在**：调用 `soarch`，逆向生成 Ticket 文档。
+   3. **如果存在**：阅读 Ticket 和引用的 Spec，建立基准认知。
 - **Step 1: Baseline Review (基线审查)**
    - 运行 `cre` (Mode B) 对比代码与 Domain Spec。
 
-### Step 1.5: Task Refinement (动态调整)
+### Step 1.5: Ticket Refinement (动态调整)
 如果在编码过程中发现任务过大或被阻塞：
 - **Action**: 调用 `soarch` REQUEST_SPLIT。
 - **Result**: 当前任务 Paused，拆分为新的小任务。重新开始 Step 0。
@@ -91,14 +91,14 @@ graph TD
 - **Commit Strategy (提交粒度)**:
   - 遵循 **"逻辑完整性 (Logical Completeness)"** 原则。
   - 不要改一行就提交，也不要等完全部做完才提交。
-  - **Action**: 每完成一个独立的子任务（Sub-task，如"定义数据结构"、"实现核心算法"、"完成单测"）后，**必须调用 `tester` skill 执行验证**。测试通过后，**立即执行 `git commit`**。这作为 Checkpoint，防止后续搞砸。
+  - **Action**: 每完成一个独立的子任务（Sub-ticket，如"定义数据结构"、"实现核心算法"、"完成单测"）后，**必须调用 `tester` skill 执行验证**。测试通过后，**立即执行 `git commit`**。这作为 Checkpoint，防止后续搞砸。
   - **Loop Condition**: 如果当前 Spec Step 或功能模块尚未全部完成，继续执行 Step 2，积攒更多的 Commits。仅当一个完整的 Feature 或 Step 完成时，才进入 Step 3。
 
 ### Step 3: Self-Review (批量审查)
 - **Review Scope (审查范围 - Isolation Check)**:
   - 必须只审查 **My Delta (我的增量)**。
   - Command: `git diff origin/master...HEAD`
-  - **Why**: 防止审查到其他 Session 已经 Merge 但我还没 Rebase 的代码，避免重复 Review。
+  - **Why**: 防止审查到其他 Workstream 已经 Merge 但我还没 Rebase 的代码，避免重复 Review。
 - **Auto-Select Mode (智能模式选择)**:
   1. 执行 `git branch --show-current` 获取当前分支名。
   2. **Mode B (Refactor/Migration)**: 如果分支名匹配 `refactor/*`, `migration/*` 或 `fix/legacy-*`。
@@ -125,9 +125,9 @@ graph TD
    - **Check**: 解决冲突后的逻辑是否破坏了 Feature？(Lightweight Review)。
 3. **Merge**: `git push origin feature/xxx` -> Create/Merge PR.
 
-## 4. 状态持久化 (Task Persistence)
+## 4. 状态持久化 (Ticket Persistence)
 
-为了支持断点续做，必须在关键节点（调用专家前后、流程结束时）更新 `.agent/current_task.md`。
+为了支持断点续做，必须在关键节点（调用专家前后、流程结束时）更新 `.agent/current_ticket.md`。
 **原则**: 只记录当前最新快照，不记流水账，节省 Token。
 
 **Trigger Points**:
@@ -137,7 +137,7 @@ graph TD
 
 **File Template**:
 ```markdown
-# Current Task: [Task Description]
+# Current Ticket: [Ticket Description]
 > Last Update: 202X-XX-XX HH:MM
 > Global Status: Coding | Reviewing | Fixing
 
@@ -148,7 +148,7 @@ graph TD
 
 ## Latest Checkpoint
 - [x] Spec Created
-- [ ] Coding (Sub-task: A, B Done)
+- [ ] Coding (Sub-ticket: A, B Done)
 - [ ] Test Verification (Pending)
 - [ ] Review Status (Last: FAIL - 3 issues remaining)
 ```
