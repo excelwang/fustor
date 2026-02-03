@@ -65,7 +65,7 @@ class MockSenderHandler(SenderHandler):
         self.session_created = True
         return self.session_id, {"role": self.role}
     
-    async def send_heartbeat(self, session_id: str) -> Dict[str, Any]:
+    async def send_heartbeat(self, session_id: str, **kwargs) -> Dict[str, Any]:
         self.heartbeat_calls += 1
         return {"role": self.role, "session_id": session_id}
     
