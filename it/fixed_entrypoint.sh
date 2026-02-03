@@ -35,12 +35,13 @@ sources:
       scan_interval: 60
       audit_interval: 300
 
-pushers:
+senders:
   fusion:
     driver: "fusion"
     config:
       endpoint: "${FUSION_ENDPOINT}"
-      api_key: "${API_KEY}"
+      credential:
+        key: "${API_KEY}"
       view_id: "${VIEW_ID}"
 EOF
 
