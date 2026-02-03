@@ -155,12 +155,15 @@ class HTTPSender(Sender):
         try:
             result = await self.client.send_heartbeat(self.session_id)
             
-            if result:
+            if result and result.get("status") == "ok":
                 self.logger.debug("Heartbeat sent successfully.")
                 return result
             else:
-                self.logger.error("Failed to send heartbeat.")
-                return {"status": "error", "message": "Heartbeat failed"}
+                msg = result.get("message") if result else "Unknown error"
+                self.logger.warning(f"Heartbeat failed: {msg}")
+                if result and result.get("message") == "Session not found":
+                     raise SessionObsoletedError(f"Session {self.session_id} not found on server")
+                return {"status": "error", "message": msg}
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 419:
                 raise SessionObsoletedError(f"Session {self.session_id} is obsolete (419)")

@@ -60,12 +60,32 @@ from fixtures.leadership import wait_for_audit, reset_leadership
 @pytest.fixture(autouse=True)
 def reset_fusion_state(fusion_client):
     """
-    Reset Fusion parser state before each test case to ensure isolation.
+    Aggressively reset environment before each test:
+    1. Kill all agents in containers
+    2. Clean up agent pid/state files
+    3. Reset Fusion state via API
     """
+    containers = [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]
+    
+    # 1. Kill agents and clean up local state
+    for container in containers:
+        try:
+            # Force kill any running agents
+            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"])
+            # Remove state files
+            docker_manager.exec_in_container(container, ["rm", "-f", "/root/.fustor/agent.pid"])
+            docker_manager.exec_in_container(container, ["rm", "-f", "/root/.fustor/agent-state.json"])
+        except Exception:
+            pass
+
+    # 2. Reset Fusion state
     try:
         fusion_client.reset()
     except Exception as e:
-        logger.debug(f"Fusion reset skipped or failed: {e}")
+        logger.debug(f"Fusion reset failed: {e}")
+    
+    # 3. Small buffer to let Fusion processes settle
+    time.sleep(1)
     yield
 
 

@@ -26,7 +26,9 @@ from .constants import (
     MOUNT_POINT, 
     AUDIT_INTERVAL,
     SENTINEL_INTERVAL,
-    FUSION_ENDPOINT
+    SENTINEL_INTERVAL,
+    FUSION_ENDPOINT,
+    HEARTBEAT_INTERVAL
 )
 
 
@@ -73,7 +75,7 @@ shared-fs:
     senders_config = f"""
 fusion:
   driver: "fusion"
-  endpoint: "{fusion_endpoint}"
+  uri: "{fusion_endpoint}"
   credential:
     key: "{api_key}"
   disabled: false
@@ -83,6 +85,10 @@ fusion:
 """
     docker_manager.create_file_in_container(container_name, "/root/.fustor/senders-config.yaml", senders_config)
 
+    # 3. Pipelines Config
+    pipes_dir = "/root/.fustor/agent-pipes-config"
+    docker_manager.exec_in_container(container_name, ["mkdir", "-p", pipes_dir])
+    
     pipelines_config = f"""
 id: "pipeline-task-1"
 source: "shared-fs"
@@ -90,8 +96,9 @@ sender: "fusion"
 disabled: false
 audit_interval_sec: {AUDIT_INTERVAL}
 sentinel_interval_sec: {SENTINEL_INTERVAL}
+heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
 """
-    docker_manager.create_file_in_container(container_name, "/root/.fustor/pipelines-config/pipeline-task-1.yaml", pipelines_config)
+    docker_manager.create_file_in_container(container_name, f"{pipes_dir}/pipeline-task-1.yaml", pipelines_config)
     
     # 4. Kill existing agent if running and clean up pid/state files
     docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])
@@ -110,7 +117,7 @@ sentinel_interval_sec: {SENTINEL_INTERVAL}
     )
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     """
     Ensure agents are running and healthy.
@@ -118,30 +125,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     view_id = test_view["id"]
     api_key = test_api_key["key"]
     
-    # Clean Slate: Stop all agents first
-    logger.info("Cleaning up existing agents preventing stale leadership...")
-    for container in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]:
-        try:
-            # First, ensure processes are running so they can receive signals, 
-            # then kill them forcefully.
-            docker_manager.exec_in_container(container, ["sh", "-c", "pkill -CONT -f fustor-agent || true"])
-            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"])
-        except Exception:
-            pass
-
-    # Wait for Fusion sessions to expire (max 5s to safely cover 3s timeout)
-    logger.info("Waiting for stale sessions to expire (max 5s)...")
-    start_cleanup = time.time()
-    while time.time() - start_cleanup < 5:
-        sessions = fusion_client.get_sessions()
-        if not sessions:
-            logger.info("All sessions cleared.")
-            break
-        time.sleep(0.5)
-    else:
-        logger.warning(f"Some sessions still active after cleanup: {fusion_client.get_sessions()}")
-
-    # Start Agent A first
+    # Start Agent A first (Cleanup handled by conftest.py)
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_A}...")
     ensure_agent_running(CONTAINER_CLIENT_A, api_key, view_id)
     

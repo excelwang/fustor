@@ -287,14 +287,18 @@ class AgentPipeline(Pipeline):
                     await asyncio.sleep(self.role_check_interval)
                     continue
                 
+                # Start Message Sync if not already running (for both Leader and Follower)
+                if self._message_sync_task is None or self._message_sync_task.done():
+                    logger.info(f"Pipeline {self.id}: Starting message sync phase (Role: {self.current_role})")
+                    self._message_sync_task = asyncio.create_task(self._run_message_sync())
+
                 if self.current_role == "leader":
+                    # Run leader-specific tasks (Snapshot, Audit, Sentinel)
+                    # Note: We don't block on _message_sync_task here anymore
                     await self._run_leader_sequence()
-                    # If leader sequence finishes (e.g. source exhausted), 
-                    # wait a bit before checking again to avoid busy loop
-                    if self.has_active_session():
-                        await asyncio.sleep(self.control_loop_interval)
+                    await asyncio.sleep(self.control_loop_interval)
                 else:
-                    # Follower: just wait and maintain heartbeat
+                    # Follower: standby
                     self._set_state(PipelineState.PAUSED, "Follower mode - standby")
                     await asyncio.sleep(self.follower_standby_interval)
                 
@@ -310,7 +314,7 @@ class AgentPipeline(Pipeline):
                 logger.warning(f"Pipeline {self.id} session is obsolete: {e}. Reconnecting immediately.")
                 # Clear session so we recreate it in the next iteration
                 if self.has_active_session():
-                    await self._cleanup_leader_tasks()
+                    await self._cancel_all_tasks()
                     await self.on_session_closed(self.session_id)
                 
                 # No backoff for obsolete session, just restart the loop
@@ -325,7 +329,7 @@ class AgentPipeline(Pipeline):
                 # If session failed, ensure it's cleared so we try to recreate it
                 if self.has_active_session():
                     try:
-                        await self._cleanup_leader_tasks()
+                        await self._cancel_all_tasks()
                         await self.on_session_closed(self.session_id)
                     except Exception as e2:
                         logger.debug(f"Error during cleanup after session loss: {e2}")
@@ -335,46 +339,32 @@ class AgentPipeline(Pipeline):
     
     async def _run_leader_sequence(self) -> None:
         """
-        Run the leader sequence: Snapshot -> Message Sync Phase + Audit/Sentinel loops.
+        Run the leader-specific sequence: Snapshot and background Audit/Sentinel.
         """
         # Sync Phase 1: Snapshot sync phase
-        self._set_state(PipelineState.RUNNING | PipelineState.SNAPSHOT_SYNC, "Starting snapshot sync phase...")
+        if self._snapshot_task is None or self._snapshot_task.done():
+            self._set_state(PipelineState.RUNNING | PipelineState.SNAPSHOT_SYNC, "Starting snapshot sync phase...")
+            try:
+                # Start Snapshot in a background task so it can be safely cancelled 
+                # without killing the main control loop.
+                self._snapshot_task = asyncio.create_task(self._run_snapshot_sync())
+                await self._snapshot_task
+            except asyncio.CancelledError:
+                logger.info(f"Pipeline {self.id}: Snapshot sync phase task cancelled")
+            except SessionObsoletedError:
+                raise
+            except Exception as e:
+                self._set_state(PipelineState.ERROR, f"Snapshot sync phase failed: {e}")
+                return
+            finally:
+                self._snapshot_task = None
         
-        try:
-            self._snapshot_task = asyncio.current_task()
-            await self._run_snapshot_sync()
-        except SessionObsoletedError:
-            raise
-        except Exception as e:
-            self._set_state(PipelineState.ERROR, f"Snapshot sync phase failed: {e}")
-            return
-        finally:
-            self._snapshot_task = None
-        
-        # Sync Phase 2: Message phase + background tasks
-        self._set_state(PipelineState.RUNNING | PipelineState.MESSAGE_SYNC, "Starting message sync phase...")
-        
-        # Start audit and sentinel loops
-        if self.audit_interval_sec > 0:
+        # Background Leader Tasks: Audit and Sentinel
+        if self.audit_interval_sec > 0 and (self._audit_task is None or self._audit_task.done()):
             self._audit_task = asyncio.create_task(self._run_audit_loop())
-        if self.sentinel_interval_sec > 0:
+            
+        if self.sentinel_interval_sec > 0 and (self._sentinel_task is None or self._sentinel_task.done()):
             self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
-        
-        # Run message sync phase (this blocks until we lose leader role)
-        try:
-            # We wrap message sync phase in a task so it can be cancelled by role change
-            self._message_sync_task = asyncio.create_task(self._run_message_sync())
-            await self._message_sync_task
-        except asyncio.CancelledError:
-            if self._message_sync_task and not self._message_sync_task.done():
-                self._message_sync_task.cancel()
-                try:
-                    await self._message_sync_task
-                except asyncio.CancelledError:
-                    pass
-            logger.info(f"Pipeline {self.id}: Message phase task cancelled")
-        finally:
-            self._message_sync_task = None
     
     async def _run_heartbeat_loop(self) -> None:
         """Maintain session through periodic heartbeats."""
@@ -407,12 +397,18 @@ class AgentPipeline(Pipeline):
                 await asyncio.sleep(max(self.heartbeat_interval_sec, backoff))
     
     
-    async def _cleanup_leader_tasks(self) -> None:
-        """Cancel all active leader-specific tasks."""
+    async def _cancel_leader_tasks(self) -> None:
+        """Cancel leader-specific tasks: Snapshot, Audit, Sentinel."""
         current = asyncio.current_task()
-        for task in [self._audit_task, self._sentinel_task, self._message_sync_task, self._snapshot_task]:
+        for task in [self._audit_task, self._sentinel_task, self._snapshot_task]:
             if task and task != current and not task.done():
                 task.cancel()
+
+    async def _cancel_all_tasks(self) -> None:
+        """Cancel all pipeline tasks (usually on session loss or stop)."""
+        await self._cancel_leader_tasks()
+        if self._message_sync_task and not self._message_sync_task.done():
+            self._message_sync_task.cancel()
                 
     async def _handle_role_change(self, new_role: str) -> None:
         """Handle role change from heartbeat response."""
@@ -423,7 +419,7 @@ class AgentPipeline(Pipeline):
         
         if (new_role == "follower" or new_role is None) and old_role == "leader":
             # Lost leadership - cancel leader tasks
-            await self._cleanup_leader_tasks()
+            await self._cancel_leader_tasks()
 
     async def _handle_fatal_error(self, error: Exception) -> None:
         """Handle fatal errors from background tasks."""
@@ -431,12 +427,8 @@ class AgentPipeline(Pipeline):
             logger.warning(f"Pipeline {self.id} detected obsolete session: {error}")
             # Reset session_id so the control loop knows to reconnect
             if self.has_active_session():
-                await self._cleanup_leader_tasks()
+                await self._cancel_all_tasks()
                 await self.on_session_closed(self.session_id)
-            
-            # Explicitly cancel message sync phase task to break leader sequence if active
-            if self._message_sync_task and not self._message_sync_task.done():
-                self._message_sync_task.cancel()
         else:
             logger.error(f"Pipeline {self.id} fatal background error: {error}", exc_info=True)
             self._set_state(PipelineState.ERROR, str(error))
@@ -486,9 +478,11 @@ class AgentPipeline(Pipeline):
                 )
                 
                 if position_lost:
-                    logger.warning(f"Pipeline {self.id}: Position lost, triggering supplemental snapshot")
-                    # Trigger supplemental snapshot in a separate task
-                    asyncio.create_task(self._run_message_sync())
+                    logger.warning(f"Pipeline {self.id}: Position lost.")
+                    # Trigger supplemental snapshot only if we are leader
+                    if self.current_role == "leader":
+                        logger.info(f"Pipeline {self.id}: Triggering supplemental snapshot...")
+                        asyncio.create_task(self._run_snapshot_sync())
                     
                 logger.info(f"Pipeline {self.id}: EventBus initialized for high-throughput mode")
             except Exception as e:

@@ -91,7 +91,11 @@ def setup_pipe_routers():
                     "task_id": si.task_id,
                     "agent_id": si.task_id, # IT tests expect agent_id
                     "view_id": view_id,
-                    "role": "leader" if is_leader else "follower"
+                    "role": "leader" if is_leader else "follower",
+                    "can_snapshot": is_leader,
+                    "can_audit": is_leader,
+                    "can_realtime": True,
+                    "can_send": True
                 })
         
         return {"active_sessions": all_sessions, "count": len(all_sessions)}

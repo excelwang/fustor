@@ -105,8 +105,10 @@ extra:
 
     # 5. Reload Fusion
 
-    docker_manager.restart_container(CONTAINER_FUSION)
-    docker_manager.wait_for_health(CONTAINER_FUSION)
+    logger.info("Restarting all containers to ensure fresh state...")
+    for container in [CONTAINER_FUSION, CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]:
+        docker_manager.restart_container(container)
+        docker_manager.wait_for_health(container)
     
     # 5. Log Environment Skew
     logger.info("Clock skew environment active: A:+2h, B:-1h, Fusion/NFS/Host:0")

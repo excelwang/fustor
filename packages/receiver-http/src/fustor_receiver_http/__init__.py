@@ -239,7 +239,7 @@ class HTTPReceiver(Receiver):
                 try:
                     result = await receiver._on_heartbeat(session_id)
                     return HeartbeatResponse(
-                        status="ok",
+                        status=result.get("status", "ok"),
                         role=result.get("role"),
                         message=result.get("message")
                     )

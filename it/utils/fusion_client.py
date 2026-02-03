@@ -69,8 +69,8 @@ class FusionClient:
         return resp.json()
 
     def reset(self) -> None:
-        """Reset Fusion state for current view."""
-        resp = self.session.delete(f"{self.base_url}/api/v1/views/{self.view_id}/reset")
+        """Reset Fusion state for current view (comprehensive)."""
+        resp = self.session.post(f"{self.base_url}/api/v1/pipe/consistency/reset")
         resp.raise_for_status()
 
 
