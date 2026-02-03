@@ -47,10 +47,22 @@ description: 统一的代码评审专家，支持新功能审查、重构对齐�
    - **Test Parity (Regression)**: 对比 Master 分支，确保没有意外删除原有的有效测试用例（Test Case Regression）。
    - **Determinism**: 严禁使用 hardcoded `sleep()` 或盲目等待。必须建议使用 **带循环检测条件的等待** (conditional waiting with loop detection, e.g., `wait_for_condition(lambda: check(), timeout=5)`)。
 
+4. **Contract Test Integrity**:
+   - 检查 `it/specs/` 下的契约测试是否被修改？
+   - **Verdict**:
+     - 允许：仅填充 `pass` -> `assert ...`。
+     - **REJECT**: 如果修改了 Docstring 或弱化了断言条件。
+
 ## 3. Feedback Format (Standardized Artifact)
 
-无论使用哪种模式，最终输出必须包含一个 **Review Artifact (Markdown Report)**，其中**必须包含**以下两个标准表格：
+### Special Table: Test Scope & Impact
+必须在报告最前方展示：
+| Impacted Domain | Selected Test Suite | Rationale |
+| :--- | :--- | :--- |
+| Consistency | `it/consistency/` | Modified sync logic |
+| **Contract** | `it/specs/task_001.py` | **Must Pass** |
 
+无论使用哪种模式，最终输出必须包含一个 **Review Artifact (Markdown Report)**...
 ### Table 1: Detailed Findings & Consistency Matrix
 用于列出所有设计、逻辑或质量问题。
 *   **Columns**: 

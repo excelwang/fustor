@@ -76,6 +76,19 @@ description: 负责需求分析与技术方案设计，输出标准化的技术�
   2. 创建两个新的子任务 Task A & Task B。
   3. 更新原 Task 引用这些子任务。
 
+### 4.3 测试分层策略 (Test Strategy)
+为了明确“契约”与“实现”的边界，测试分为两类：
+
+1.  **Contract Tests (契约测试)**:
+    - **Source**: 由 `soarch` 定义，对应 Spec 验收标准。
+    - **Path**: `it/specs/{domain}/{task_id}_contract.py`
+    - **Rule**: 开发阶段 **只允许** 填充实现逻辑，**严禁** 修改测试意图或断言标准。这是 Review 的红线。
+
+2.  **Unit Tests (单元测试)**:
+    - **Source**: 由 `loopi` (Dev) 自主编写，辅助内部逻辑验证。
+    - **Path**: `tests/unit/{module}/`
+    - **Rule**: 开发者拥有完全控制权。
+
 ## 5. 任务文档模板 (Task Template)
 
 ```markdown
@@ -92,9 +105,10 @@ description: 负责需求分析与技术方案设计，输出标准化的技术�
 - [ ] Spec: `specs/10-DOMAIN_XXX.md`
 - [ ] Prerequisites: Task ID [If Any]
 
-## 3. Scope (范围)
+## 3. Scope & Deliverables (范围与交付物)
 - [ ] Logic: `src/core/pipeline.py`
-- [ ] Test: `it/consistency/`
+- [ ] **Contract Test**: `it/specs/consistency/task_001_contract.py` (Skeleton Created)
+- [ ] Unit Test: `tests/unit/core/test_pipeline.py` (Optional)
 
 ## 4. Work Breakdown (执行步骤)
 按依赖顺序拆解为原子步骤（对应 Atomic Commits）：
