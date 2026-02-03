@@ -12,6 +12,7 @@ description: 统一的代码评审专家，支持新功能审查、重构对齐�
 - **Correctness**: 代码是否完全实现了文档/需求的设计？
 - **Edge Cases**: 异常处理是否完备？（空值、网络超时、并发冲突）
 - **Style**: 命名和结构是否符合项目规范？
+- **Compatibility**: **Skip** (默认不检查后向兼容性)，除非 Spec 中有明确的 "Compatibility Requirement"。
 - **Security**: 是否引入了注入风险或凭证泄露？
 - **Performance**: 是否存在明显的 O(N^2) 或不必要的 I/O？
 - **Log Spam**: 是否存在过多的日志输出？

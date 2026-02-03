@@ -17,8 +17,9 @@ description: 负责需求分析与技术方案设计，输出标准化的技术�
 
 ### Phase 1: Discuss (探讨)
 - 询问用户："这一变更的核心目标是什么？"
-- 识别潜在的风险点、兼容性问题和性能瓶颈。
-- **Stop & Ask**: 如果发现现有架构无法优雅支持新需求，立即向用户提出重构建议，而不是打补丁。
+- **Default Principle**: 默认 **不考虑** 后向兼容性 (No Backward Compatibility)，除非用户显式要求 "Must be compatible with version X".
+- **Risk Assessment**: 识别潜在的风险点和性能瓶颈。
+- **Stop & Ask**: 如果发现现有架构无法优雅支持新需求，立即向用户提出重构建议。
 
 ### Phase 2: Design (设计)
 在编写代码之前，**必须**先产出设计文档。
