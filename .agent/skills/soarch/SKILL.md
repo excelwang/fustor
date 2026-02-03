@@ -30,10 +30,17 @@ description: 负责需求分析与技术方案设计，输出标准化的技术�
 为了区分“法典”与“工单”，我们将文档分为两类：
 
 ### A. Specifications (法典) - `specs/`
-> **Source of Truth**. 只有 Level 1 & 2 属于这里。
-- **Level 1**: Macro Architecture (`01-ARCHITECTURE.md`)
-- **Level 2**: Domain Specs (`10-DOMAIN_[NAME].md`)
-- **Rule**: 一旦 Review 通过，spec 应当被视为系统的当前“法律”。代码必须符合 Spec。
+> **Source of Truth**. 只有 Level 0/1/2 属于这里。
+
+- **Level 0: Terminology (`00-GLOSSARY.md`)**
+  - **Content**: Ubiquitous Language (统一语言)。定义核心概念与术语。
+  - **Enforcement**: 任何其他 Spec 或 Code 的命名必须严格遵循此文件。Review Gate 第一步。
+
+- **Level 1: Macro Architecture (`01-ARCHITECTURE.md`)**
+  - 全局概念、核心组件图、系统边界。
+
+- **Level 2: Domain Specs (`10-DOMAIN_[NAME].md`)**
+  - 核心模块的详细设计（数据结构、状态机、不变量）。
 
 ### B. Tasks (工单) - `.agent/tasks/backlog/`
 > **Workload**. Level 3 移动至此。它们是实现 Spec 的过程性文件。
