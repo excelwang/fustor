@@ -25,6 +25,8 @@ class FSState:
         # - logical_timestamp: 用于转世判定 (mtime comparison)
         # - physical_timestamp: 用于 TTL 清理 (1 hour expiry)
         self.tombstone_list: Dict[str, Tuple[float, float]] = {}
+        
+        self.tombstone_ttl_seconds = float(self.config.get("consistency", {}).get("tombstone_ttl_seconds", 3600.0))
         self.suspect_list: Dict[str, Tuple[float, float]] = {} # Path -> (expiry_monotonic, recorded_mtime)
         self.suspect_heap: List[Tuple[float, str]] = [] # (expiry_monotonic, path)
         

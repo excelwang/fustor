@@ -1,0 +1,7 @@
+id: integration-test-ds
+view_id: integration-test-ds
+driver: fs
+disabled: false
+driver_params:
+  consistency:
+    tombstone_ttl_seconds: 5

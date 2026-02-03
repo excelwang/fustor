@@ -37,15 +37,12 @@ services:
       FUSTOR_FUSION_HOST: "0.0.0.0"
       FUSTOR_FUSION_PORT: "8102"
       FUSTOR_FUSION_DATA_DIR: "/data/fusion"
-      # Faster cache sync for integration tests (reloads YAML)
-      FUSTOR_FUSION_API_KEY_CACHE_SYNC_INTERVAL_SECONDS: "1"
-      # Accelerate failover tests
-      FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS: "4"
       FUSTOR_LOG_LEVEL: "DEBUG"
       # Use home directory for config
       FUSTOR_HOME: "/root/.fustor"
     volumes:
       - fusion-data:/data/fusion
+      - ./config/views-config:/root/.fustor/views-config
       - ../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
       - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
       - ../packages/fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk

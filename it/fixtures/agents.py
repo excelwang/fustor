@@ -102,6 +102,7 @@ disabled: false
 audit_interval_sec: {AUDIT_INTERVAL}
 sentinel_interval_sec: {SENTINEL_INTERVAL}
 heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
+session_timeout_seconds: {SESSION_TIMEOUT}
 """
     docker_manager.create_file_in_container(container_name, f"{pipes_dir}/pipeline-task-1.yaml", pipelines_config)
     

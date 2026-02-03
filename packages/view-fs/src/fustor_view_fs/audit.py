@@ -35,11 +35,11 @@ class AuditManager:
         if self.state.last_audit_start is None:
             return
 
-        # 1. Tombstone Cleanup (Rule: 1 hour physical TTL)
+        # 1. Tombstone Cleanup (Rule: 1 hour physical TTL by default, configurable)
         # Reference: CONSISTENCY_DESIGN.md §4.2 & §6.3
-        # We keep tombstones for 1 hour to protect against NFS cache "Resurrection"
-        # of deleted files during subsequent audit cycles.
-        cutoff_time = time.time() - 3600
+        # We keep tombstones to protect against NFS cache "Resurrection"
+        tombstone_ttl = getattr(self.state, 'tombstone_ttl_seconds', 3600.0)
+        cutoff_time = time.time() - tombstone_ttl
         before = len(self.state.tombstone_list)
         
         self.state.tombstone_list = {
