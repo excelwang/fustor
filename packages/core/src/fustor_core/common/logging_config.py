@@ -113,6 +113,21 @@ def setup_logging(
                 'level': numeric_level,
                 'propagate': True
             },
+            'fustor_core': {
+                'handlers': ['file'],
+                'level': numeric_level,
+                'propagate': True
+            },
+            'fustor_agent': {
+                'handlers': ['file'],
+                'level': numeric_level,
+                'propagate': True
+            },
+            'fustor_source_fs': {
+                'handlers': ['file'],
+                'level': numeric_level,
+                'propagate': True
+            },
             # Infrastructure loggers
             'uvicorn': {
                 'handlers': ['file'],

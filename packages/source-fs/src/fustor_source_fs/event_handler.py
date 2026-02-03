@@ -20,15 +20,8 @@ def get_file_metadata(path: str, root_path: str = None, stat_info: Optional[os.s
         
         is_dir = stat.S_ISDIR(stat_info.st_mode)
         
-        # Calculate relative path if root_path is provided
-        reported_path = path
-        if root_path:
-            reported_path = os.path.relpath(path, root_path)
-            if reported_path == ".":
-                reported_path = ""
-        
         return {
-            "file_path": reported_path,
+            "file_path": path,
             "size": stat_info.st_size,
             "modified_time": stat_info.st_mtime,
             "created_time": stat_info.st_ctime,
@@ -95,7 +88,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 self.event_queue.put(delete_event)
                 
                 # Generate UpdateEvent for the new path
-                metadata = get_file_metadata(add_path, root_path=self.watch_manager.root_path)
+                metadata = get_file_metadata(add_path)
                 if metadata:
                     update_event = UpdateEvent(
                         event_schema=self.watch_manager.root_path,
@@ -121,7 +114,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 )
                 self.event_queue.put(delete_event)
                 # Generate UpdateEvent for the new path
-                metadata = get_file_metadata(subdir_add_path, root_path=self.watch_manager.root_path)
+                metadata = get_file_metadata(subdir_add_path)
                 if metadata:
                     update_event = UpdateEvent(
                         event_schema=self.watch_manager.root_path,
@@ -207,7 +200,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 self.watch_manager.unschedule_recursive(event.src_path)
             else:
                 # For files, create update event for new location
-                metadata = get_file_metadata(event.dest_path, root_path=self.watch_manager.root_path)
+                metadata = get_file_metadata(event.dest_path)
                 if metadata:
                     update_event = UpdateEvent(
                         event_schema=self.watch_manager.root_path,

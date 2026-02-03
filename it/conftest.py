@@ -99,7 +99,14 @@ def reset_fusion_state(fusion_client):
     except Exception as e:
         logger.debug(f"Fusion reset failed: {e}")
     
-    # 3. Small buffer removed, reset() is comprehensive
+    # 4. Clear logs
+    for container in containers + [CONTAINER_FUSION]:
+        try:
+            log_path = "/root/.fustor/agent.log" if "client" in container else "/root/.fustor/fusion.log"
+            docker_manager.exec_in_container(container, ["sh", "-c", f"> {log_path}"], timeout=5)
+        except Exception:
+            pass
+
     yield
 
 

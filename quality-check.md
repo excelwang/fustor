@@ -6,3 +6,4 @@
   - [ ] Tests only
   - [ ] legacy
   - [ ] direct driver mode
+  - [ ] packages/core/src/fustor_core/common/logging_config.py 不能有下游包名
