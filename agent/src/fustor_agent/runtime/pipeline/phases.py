@@ -23,7 +23,7 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
         batch = []
         # Support both sync and async iterators
         if not hasattr(snapshot_iter, "__aiter__"):
-            snapshot_iter = pipeline._aiter_sync(snapshot_iter)
+            snapshot_iter = pipeline._aiter_sync_phase(snapshot_iter)
 
         async for event in snapshot_iter:
             if not pipeline.is_running() and not (pipeline.state & PipelineState.RECONNECTING):

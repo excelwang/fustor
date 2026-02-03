@@ -79,7 +79,7 @@ class Pipeline(ABC):
         return f"Pipeline({self.id}, state={self.state.name})"
     
     def _set_state(self, new_state: PipelineState, info: Optional[str] = None):
-        """Update pipeline state with optional info message."""
+        """Update pipelinestate with optional info message."""
         old_state = self.state
         self.state = new_state
         if info:

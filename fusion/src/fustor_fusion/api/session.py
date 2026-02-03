@@ -1,6 +1,6 @@
 # fusion/src/fustor_fusion/api/session.py
 """
-Session management API for creating, maintaining, and closing pipeline sessions.
+Session management API for creating, maintaining, and closing pipelinesessions.
 """
 from fastapi import APIRouter, Depends, status, HTTPException, Header, Query, Request
 from pydantic import BaseModel
@@ -86,7 +86,7 @@ async def _should_allow_new_session(
             return False
 
 
-@session_router.post("/", summary="Create new pipeline session")
+@session_router.post("/", summary="Create new pipelinesession")
 async def create_session(
     payload: CreateSessionPayload,
     request: Request,

@@ -120,7 +120,7 @@ class PipelineSessionBridge:
         )
         
         # Create in Pipeline
-        # Pass is_leader hint if the pipeline supports it
+        # Pass is_leader hint if the pipelinesupports it
         await self._pipeline.on_session_created(
             session_id=session_id,
             task_id=task_id,

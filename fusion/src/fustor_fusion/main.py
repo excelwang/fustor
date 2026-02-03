@@ -104,7 +104,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error during view auto-start: {e}", exc_info=True)
 
-    # --- Register Routers (AFTER all pipeline setup is complete) ---
+    # --- Register Routers (AFTER all pipelinesetup is complete) ---
     # Registering inside lifespan ensures that setup_pipe_routers has correctly 
     # populated pipe_router.
     

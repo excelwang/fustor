@@ -196,7 +196,7 @@ class ReceiversConfigLoader:
         """
         Get all active pipeline IDs from configured API keys.
         
-        This returns a dict compatible with processing_manager.pipeline s().
+        This returns a dict compatible with processing_manager.pipelines().
         
         Returns:
             Dict mapping pipeline_id to configuration info

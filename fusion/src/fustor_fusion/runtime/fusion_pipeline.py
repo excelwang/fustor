@@ -97,7 +97,7 @@ class FusionPipeline(Pipeline):
         for handler in (view_handlers or []):
             self.register_view_handler(handler)
         # Session tracking - handled centrally via PipelineManager/SessionManager
-        self._lock = asyncio.Lock()  # Generic lock for pipeline state
+        self._lock = asyncio.Lock()  # Generic lock for pipelinestate
         
         # Processing task
         self._processing_task: Optional[asyncio.Task] = None
@@ -422,7 +422,7 @@ class FusionPipeline(Pipeline):
     # --- DTO & Stats ---
     
     async def get_dto(self) -> Dict[str, Any]:
-        """Get pipeline status as a dictionary."""
+        """Get pipelinestatus as a dictionary."""
         from ..core.session_manager import session_manager
         from ..view_state_manager import view_state_manager
         

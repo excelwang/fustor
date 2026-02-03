@@ -57,7 +57,7 @@ class TestAgentRoleSwitch:
 
     @pytest.mark.asyncio
     async def test_follower_to_leader_starts_sync(self, mock_source, mock_sender, pipeline_config):
-        """When role changes from follower to leader, pipeline sequence should start."""
+        """When role changes from follower to leader, pipelinesequence should start."""
         mock_sender.role = "follower"
         
         pipeline = AgentPipeline(

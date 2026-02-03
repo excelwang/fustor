@@ -242,7 +242,7 @@ class AgentPipeline(Pipeline):
     
     async def _run_control_loop(self) -> None:
         """
-        Main control loop that manages pipeline state transitions.
+        Main control loop that manages pipelinestate transitions.
         
         State machine:
         1. Wait for LEADER role
@@ -604,7 +604,7 @@ class AgentPipeline(Pipeline):
         
         Args:
             new_bus: The new bus instance to use
-            needed_position_lost: If True, pipeline should trigger re-sync
+            needed_position_lost: If True, pipelineshould trigger re-sync
                                   because the required position is no longer
                                   available in the new bus
         """

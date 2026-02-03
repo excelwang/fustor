@@ -89,7 +89,7 @@ class TestSessionCreation:
              patch("fustor_fusion.view_state_manager.view_state_manager.set_authoritative_session", AsyncMock()), \
              patch("fustor_fusion.view_state_manager.view_state_manager.lock_for_session", AsyncMock()):
             
-            # Simulate pipeline setting role
+            # Simulate pipelinesetting role
             async def set_role(session_id, **kwargs):
                 mock_pipeline._active_sessions[session_id] = {"role": "leader"}
             

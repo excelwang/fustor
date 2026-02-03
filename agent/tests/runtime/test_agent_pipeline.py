@@ -52,7 +52,7 @@ class TestAgentPipelineInit:
 
 
 class TestAgentPipelineStateManagement:
-    """Test pipeline state transitions."""
+    """Test pipelinestate transitions."""
     
     def test_set_state(self, agent_pipeline):
         """_set_state should update state and info."""

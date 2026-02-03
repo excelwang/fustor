@@ -115,7 +115,7 @@ class TestPipelineBridgeCreatePipeline:
     def test_create_pipeline_returns_agent_pipeline(
         self, pipeline_bridge, mock_pipeline_config, mock_source_config, mock_sender_config
     ):
-        """create_pipeline should return AgentPipeline instance."""
+        """create_pipelineshould return AgentPipeline instance."""
         pipeline = pipeline_bridge.create_pipeline(
             pipeline_id="test-pipeline",
             agent_id="agent-1",

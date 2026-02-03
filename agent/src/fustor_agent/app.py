@@ -100,7 +100,7 @@ class App:
                 "Please run 'fustor_agent discover-schema --source-id <id> --admin-user <user> --admin-password <password>' for each to re-enable."
             )
 
-        self.logger.info("Attempting to automatically start enabled pipeline s...")
+        self.logger.info("Attempting to automatically start enabled pipelines...")
         await self.pipeline_instance_service.start_all_enabled()
 
     async def _load_and_recover_states(self):
@@ -127,7 +127,7 @@ class App:
             return
 
         bus_states = saved_states.get("event_buses", {})
-        pipeline_states = saved_states.get("pipeline s", {})
+        pipeline_states = saved_states.get("pipelines", {})
 
         # 1. Recover EventBusInstances first
         recovered_buses: Dict[str, EventBusInstanceRuntime] = {}
@@ -162,7 +162,7 @@ class App:
         if not pipeline_states:
             return
 
-        self.logger.info(f"Found {len(pipeline_states)} pipeline s to recover.")
+        self.logger.info(f"Found {len(pipeline_states)} pipelines to recover.")
         recovery_tasks = []
         for pipeline_id, pipeline_state_data in pipeline_states.items():
             pipeline_conf = self.pipeline_config_service.get_config(pipeline_id)
@@ -209,7 +209,7 @@ class App:
         """
         self.logger.info("Applying pending configuration changes...")
         restarted_count = await self.pipeline_instance_service.restart_outdated_pipelines()
-        self.logger.info(f"Successfully applied changes by restarting {restarted_count} pipeline s.")
+        self.logger.info(f"Successfully applied changes by restarting {restarted_count} pipelines.")
 
     import shutil # Add this import at the top of the file
 
@@ -231,7 +231,7 @@ class App:
 
         current_states = {
             "event_buses": {bus['id']: bus for bus in bus_dtos},
-            "pipeline s": {p['id']: p for p in pipeline_dtos},
+            "pipelines": {p['id']: p for p in pipeline_dtos},
         }
         
         temp_file_path = None
