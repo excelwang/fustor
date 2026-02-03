@@ -41,12 +41,12 @@ await sender.close()
 
 This package registers itself as:
 - `fustor.senders:http` - New sender registry
-- `fustor_agent.drivers.pushers:fusion` - Legacy pusher registry (backward compat)
+- `fustor_agent.drivers.senders:fusion` - Legacy sender registry (backward compat)
 
-## Migration from fustor-pusher-fusion
+## Migration from fustor-sender-fusion
 
-The `fustor-pusher-fusion` package is deprecated. To migrate:
+The `fustor-sender-fusion` package is deprecated. To migrate:
 
-1. Replace `from fustor_pusher_fusion import FusionDriver` with `from fustor_sender_http import HTTPSender`
-2. Update configuration to use `sender` instead of `pusher` terminology
+1. Replace `from fustor_sender_fusion import FusionDriver` with `from fustor_sender_http import HTTPSender`
+2. Update configuration to use `sender` instead of `sender` terminology
 3. The `HTTPSender` class implements the new `Sender` interface but maintains API compatibility

@@ -1,5 +1,5 @@
 """
-Fuagent pusher driver for OpenAPI endpoints. (Class-based refactoring)
+Fuagent sender driver for OpenAPI endpoints. (Class-based refactoring)
 """
 import httpx
 import logging
@@ -123,10 +123,10 @@ class OpenApiDriver(Sender):
                 raise SessionObsoletedError(f"Session is obsolete, received 419 status from {target_url}")
             
             logger.error(f"Failed to push batch to {target_url}. Status: {e.response.status_code}, Response: {e.response.text}")
-            raise DriverError(f"HTTP Error {e.response.status_code} while pushing to pusher.")
+            raise DriverError(f"HTTP Error {e.response.status_code} while pushing to sender.")
         except httpx.RequestError as e:
             logger.error(f"Network error pushing batch to {target_url}: {e}")
-            raise DriverError(f"Network error while pushing to pusher.")
+            raise DriverError(f"Network error while pushing to sender.")
 
     async def connect(self) -> None:
         """Establish connection (for HTTP, this is a no-op as we use stateless requests)."""
@@ -309,7 +309,7 @@ class OpenApiDriver(Sender):
     @classmethod
     async def get_needed_fields(cls, **kwargs) -> Dict[str, Any]:
         """
-        Implementation of the ABC method. Declares the data fields required by this pusher.
+        Implementation of the ABC method. Declares the data fields required by this sender.
         """
         endpoint = kwargs.get("endpoint")
         if not endpoint:
