@@ -47,17 +47,18 @@ All skills follow the [Agent Skills Specification](https://agentskills.io).
 
 ```text
 .agent/
-├── skills/
+├── skills/ (Submodule: agentic-cortex-skills)
 │   ├── cortex/               # Unified Entrypoint
 │   ├── architectural-design/ # Legislative Skill
 │   ├── code-implementation/  # Executive Skill
 │   ├── code-review/          # Judiciary Skill
 │   └── system-diagnosis/     # Diagnostician Skill
+├── rules/                    # Project-specific rules
 ├── tickets/                  # Work Orders (L3 Tasks)
 │   ├── backlog/              # Pending tasks
 │   ├── active/               # In-progress tasks
 │   └── done/                 # Completed tasks
-└── workstreams/              # Session Management
+└── workstreams/              # Workstream Management
     └── active/               # Active workstream state
 ```
 
