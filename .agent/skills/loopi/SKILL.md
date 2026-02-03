@@ -25,20 +25,30 @@ graph TD
     F -- Yes (Pass) --> H[Stop]
 ```
 
-## 2. 启动条件与初始化 (Entry & Init)
+## 2. Session Manager (Identity & Resume)
 
-**Case A: 全新开发**
-- 前置：必须先运行 `soarch` 产出 Spec。
-- 启动：直接进入 Coding Phase。
+在开始任何工作前，必须先确定"我是谁"。
 
-**Case B: 既有代码接手 (Refactoring/Continuing)**
-- **Step 0: Spec Alignment (归位)**
-   1. 检查是否存在对应的 `specs/xxx.md`。
-   2. **如果不存在**：立即调用 `soarch`，通过**逆向工程** (Reverse Engineering) 阅读现有代码和需求，补全 Spec。
-   3. **如果存在**：阅读 Spec 和当前代码，建立基准认知。
-- **Step 1: Baseline Review (基线审查)**
-   - 在修改任何代码前，先运行一次 `code-review-expert` (Mode B)。
-   - 目的：明确当前代码与 Spec 的差距，生成初始的任务清单。
+### Step 0: Session Identification
+**Action**:
+1. 读取 `.agent/sessions/active/` 目录下的所有 JSON 文件。
+2. **List & Ask**: 向用户展示当前活跃的 Session 列表（包括 Task、Owner、Last Update）。
+   - Option [R]: **Resume** <Session_ID> (继续之前的任务，加载 Context)
+   - Option [N]: **New Session** (创建一个新会话，认领新任务)
+   - Option [C]: **Clear/Wipe** (强制清除某些过期的僵尸 Session)
+
+### Step 1: Initialization
+- **If Resume**:
+  - 读取选定 Session 的 JSON 文件。
+  - 恢复 `Base Commit` 和 `Iteration Count`。
+  - 读取 `.agent/tasks/active_task.md` (如果存在且匹配)。
+- **If New Session**:
+  - 生成新的 Session ID (e.g., `sess_{timestamp}_{random}`).
+  - 创建 `.agent/sessions/active/{session_id}.json`，状态标记为 `Created`。
+  - 询问用户要认领哪个 Task (Spec)。
+
+### Step 2: Spec Alignment (归位)
+... (保留原逻辑)
 
 ## 3. 详细执行步骤 (Loop Execution)
 
