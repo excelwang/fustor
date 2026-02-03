@@ -115,6 +115,12 @@ class AgentPipeline(Pipeline):
         self.is_realtime_ready = False  # Track if realtime is officially active (post-prescan)
         self._initial_snapshot_done = False # Track if initial snapshot complete
 
+    def _set_state(self, new_state: PipelineState, info: Optional[str] = None):
+        """Update pipelinestate only if it actually changed."""
+        if self.state == new_state and self.info == info:
+            return
+        super()._set_state(new_state, info)
+
     def _calculate_backoff(self, consecutive_errors: int) -> float:
         """Standardized exponential backoff calculation."""
         if consecutive_errors <= 0:
@@ -140,13 +146,13 @@ class AgentPipeline(Pipeline):
             
         return backoff
     
-    def _update_role_from_response(self, response: Dict[str, Any]) -> None:
+    async def _update_role_from_response(self, response: Dict[str, Any]) -> None:
         """Update role and heartbeat timer based on server response."""
         new_role = response.get("role")
         if new_role and new_role != self.current_role:
             get_metrics().gauge("fustor.agent.role", 1 if new_role == "leader" else 0, {"pipeline": self.id, "role": new_role})
-            # Role changed - trigger async handler
-            asyncio.create_task(self._handle_role_change(new_role))
+            # Role changed - handle synchronously
+            await self._handle_role_change(new_role)
         elif new_role:
              # Just update metrics for current role
              get_metrics().gauge("fustor.agent.role", 1 if new_role == "leader" else 0, {"pipeline": self.id, "role": new_role})
@@ -232,6 +238,14 @@ class AgentPipeline(Pipeline):
         suggested_interval = kwargs.get("suggested_heartbeat_interval_seconds")
         if suggested_interval:
             self.heartbeat_interval_sec = suggested_interval
+            
+        # Reset state flags for new session
+        self._initial_snapshot_done = False
+        self.is_realtime_ready = False
+        
+        # Start heartbeat loop if not active
+        if self._heartbeat_task is None or self._heartbeat_task.done():
+            self._heartbeat_task = asyncio.create_task(self._run_heartbeat_loop())
             logger.info(f"Pipeline {self.id}: Using server-suggested heartbeat interval: {suggested_interval}s")
         
         logger.info(f"Pipeline {self.id}: Session {session_id} created, role={self.current_role}")
@@ -308,7 +322,9 @@ class AgentPipeline(Pipeline):
                     await asyncio.sleep(self.control_loop_interval)
                 else:
                     # Follower: standby
-                    self._set_state(PipelineState.PAUSED, "Follower mode - standby")
+                    # Ensure we are RUNNING but also mark as PAUSED (follower standby)
+                    # We keep MESSAGE_SYNC flag if it's there
+                    self._set_state((self.state | PipelineState.RUNNING | PipelineState.PAUSED) & ~PipelineState.SNAPSHOT_SYNC, "Follower mode - standby")
                     await asyncio.sleep(self.follower_standby_interval)
                 
                 # Reset error counter on successful iteration or state achievement
@@ -394,7 +410,7 @@ class AgentPipeline(Pipeline):
                 can_realtime = self.is_realtime_ready
 
                 response = await self.sender_handler.send_heartbeat(self.session_id, can_realtime=can_realtime)
-                self._update_role_from_response(response)
+                await self._update_role_from_response(response)
                 
                 # Reset error counter on success
                 if self._consecutive_errors > 0:
@@ -413,16 +429,27 @@ class AgentPipeline(Pipeline):
     
     async def _cancel_leader_tasks(self) -> None:
         """Cancel leader-specific tasks: Snapshot, Audit, Sentinel."""
+        tasks = []
         current = asyncio.current_task()
         for task in [self._audit_task, self._sentinel_task, self._snapshot_task]:
             if task and task != current and not task.done():
                 task.cancel()
+                tasks.append(task)
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _cancel_all_tasks(self) -> None:
         """Cancel all pipeline tasks (usually on session loss or stop)."""
-        await self._cancel_leader_tasks()
-        if self._message_sync_task and not self._message_sync_task.done():
-            self._message_sync_task.cancel()
+        tasks = []
+        current = asyncio.current_task()
+        for task in [self._audit_task, self._sentinel_task, self._snapshot_task, self._message_sync_task]:
+            if task and task != current and not task.done():
+                task.cancel()
+                tasks.append(task)
+        
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
                 
     async def _handle_role_change(self, new_role: str) -> None:
         """Handle role change from heartbeat response."""
@@ -442,13 +469,17 @@ class AgentPipeline(Pipeline):
 
     async def _handle_fatal_error(self, error: Exception) -> None:
         """Handle fatal errors from background tasks."""
-        if isinstance(error, SessionObsoletedError):
-            logger.warning(f"Pipeline {self.id} detected obsolete session: {error}")
-            # Reset session_id so the control loop knows to reconnect
-            if self.has_active_session():
-                await self._cancel_all_tasks()
-                await self.on_session_closed(self.session_id)
-        else:
+        if isinstance(error, asyncio.CancelledError):
+            return
+            
+        logger.warning(f"Pipeline {self.id} detected fatal error: {error}. Clearing session and reconnecting.")
+        
+        # Reset session so the control loop knows to reconnect
+        if self.has_active_session():
+            await self._cancel_all_tasks()
+            await self.on_session_closed(self.session_id)
+            
+        if not isinstance(error, SessionObsoletedError):
             logger.error(f"Pipeline {self.id} fatal background error: {error}", exc_info=True)
             self._set_state(PipelineState.ERROR, str(error))
     async def _aiter_sync_phase(self, phase_iter: Iterator[Any], queue_size: Optional[int] = None):
@@ -472,47 +503,46 @@ class AgentPipeline(Pipeline):
         await run_snapshot_sync(self)
 
     async def _run_message_sync(self) -> None:
-        """Execute realtime message sync phase.
-        
-        This method implements the Master-style high-throughput pattern:
-        1. If bus_service is available, dynamically create/reuse EventBus
-        2. If position is lost, trigger supplemental snapshot
-        3. Fall back to direct driver mode if no bus_service
-        """
+        """Execute realtime message sync phase."""
         logger.info(f"Pipeline {self.id}: Starting message sync phase")
+        self._set_state(self.state | PipelineState.MESSAGE_SYNC)
         
-        # Try to setup EventBus for high-throughput mode
-        # Determine start position for resume (D-04/D-06)
-        start_position = self.statistics.get("last_pushed_event_id", 0) or 0
-        
-        # Try to setup EventBus for high-throughput mode
-        if self._bus_service and not self._bus:
-            try:
-                self._bus, position_lost = await self._bus_service.get_or_create_bus_for_subscriber(
-                    source_id=self.config.get("source"),
-                    source_config=self.source_handler.config,
-                    pipeline_id=self.id,
-                    required_position=start_position,
-                    fields_mapping=self.config.get("fields_mapping", [])
-                )
-                
-                if position_lost:
-                    logger.warning(f"Pipeline {self.id}: Position lost.")
-                    # Trigger supplemental snapshot only if we are leader
-                    if self.current_role == "leader":
-                        logger.info(f"Pipeline {self.id}: Triggering supplemental snapshot...")
-                        asyncio.create_task(self._run_snapshot_sync())
+        try:
+            # Determine start position for resume (D-04/D-06)
+            start_position = self.statistics.get("last_pushed_event_id", 0) or 0
+            
+            # Try to setup EventBus for high-throughput mode
+            if self._bus_service and not self._bus:
+                try:
+                    self._bus, position_lost = await self._bus_service.get_or_create_bus_for_subscriber(
+                        source_id=self.config.get("source"),
+                        source_config=self.source_handler.config,
+                        pipeline_id=self.id,
+                        required_position=start_position,
+                        fields_mapping=self.config.get("fields_mapping", [])
+                    )
                     
-                logger.info(f"Pipeline {self.id}: EventBus initialized for high-throughput mode")
-            except Exception as e:
-                logger.warning(f"Pipeline {self.id}: Failed to setup EventBus ({e}), falling back to driver mode")
-                self._bus = None
-        
-        # Choose pipeline mode based on bus availability
-        if self._bus:
-            await self._run_bus_message_sync()
-        else:
-            await self._run_driver_message_sync(start_position)
+                    if position_lost:
+                        logger.warning(f"Pipeline {self.id}: Position lost.")
+                        # Trigger supplemental snapshot only if we are leader
+                        if self.current_role == "leader":
+                            logger.info(f"Pipeline {self.id}: Triggering supplemental snapshot...")
+                            asyncio.create_task(self._run_snapshot_sync())
+                        
+                    logger.info(f"Pipeline {self.id}: EventBus initialized for high-throughput mode")
+                except Exception as e:
+                    logger.warning(f"Pipeline {self.id}: Failed to setup EventBus ({e}), falling back to driver mode")
+                    self._bus = None
+            
+            # Choose pipeline mode based on bus availability
+            if self._bus:
+                await self._run_bus_message_sync()
+            else:
+                await self._run_driver_message_sync(start_position)
+        except Exception as e:
+            await self._handle_fatal_error(e)
+        finally:
+            self._set_state(self.state & ~PipelineState.MESSAGE_SYNC)
 
     async def _run_bus_message_sync(self) -> None:
         """Execute message sync phase reading from an internal event bus."""

@@ -61,10 +61,12 @@ class TestAgentErrorRecovery:
         error_triggered = False
         async def mock_msg_sync_phase():
             nonlocal error_triggered
+            pipeline._set_state(pipeline.state | PipelineState.MESSAGE_SYNC)
             if not error_triggered:
                 await asyncio.sleep(0.05)
                 error_triggered = True
-                raise RuntimeError("Session lost")
+                await pipeline._handle_fatal_error(RuntimeError("Session lost"))
+                return
             # Success on retry
             while True:
                 await asyncio.sleep(0.1)

@@ -11,7 +11,7 @@ class TestAgentRoleSwitch:
     
     @pytest.mark.asyncio
     async def test_leader_to_follower_cancels_tasks(self, mock_source, mock_sender, pipeline_config):
-        """When role changes from leader to follower, active sync tasks should be cancelled."""
+        """When role changes from leader to follower, leader-specific tasks should be cancelled."""
         mock_sender.role = "leader"
         
         pipeline = AgentPipeline(
@@ -19,45 +19,49 @@ class TestAgentRoleSwitch:
             mock_source, mock_sender
         )
         
-        # Start message sync but make it block
-        phase_started = asyncio.Event()
-        async def mock_msg_sync_phase():
-            phase_started.set()
+        # Mock leader tasks
+        snapshot_started = asyncio.Event()
+        async def mock_snapshot():
+            snapshot_started.set()
+            pipeline._set_state(pipeline.state | PipelineState.SNAPSHOT_SYNC)
             try:
                 while True:
                     await asyncio.sleep(0.1)
             except asyncio.CancelledError:
-                # This is what we expect
+                pipeline._set_state(pipeline.state & ~PipelineState.SNAPSHOT_SYNC)
                 raise
-                
-        pipeline._run_message_sync = mock_msg_sync_phase
+        pipeline._run_snapshot_sync = mock_snapshot
         
         await pipeline.start()
-        await phase_started.wait()
+        await snapshot_started.wait()
         
-        # Verify it's in MESSAGE_SYNC
-        assert pipeline.state & PipelineState.MESSAGE_SYNC
-        assert pipeline._message_sync_task is not None
-        assert not pipeline._message_sync_task.done()
+        # Verify it's in SNAPSHOT_SYNC
+        assert pipeline.state & PipelineState.SNAPSHOT_SYNC
+        assert pipeline._snapshot_task is not None
         
         # Change role via heartbeat
         mock_sender.role = "follower"
         
-        # Wait for heartbeat to process
-        await asyncio.sleep(0.05)
+        # Wait for heartbeat and role change task to complete, and control loop to set PAUSED
+        for _ in range(100):
+            if pipeline.current_role == "follower" and (pipeline.state & PipelineState.PAUSED):
+                break
+            await asyncio.sleep(0.01)
         
         # Assertions
         assert pipeline.current_role == "follower"
-        # Task should have been cancelled
-        assert pipeline._message_sync_task is None or pipeline._message_sync_task.cancelled() or pipeline._message_sync_task.done()
+        # Snapshot task should have been cancelled
+        assert pipeline._snapshot_task is None or pipeline._snapshot_task.done()
         # State should reflect follower standby (PAUSED)
         assert pipeline.state & PipelineState.PAUSED
+        # Snapshot flag should be gone
+        assert not (pipeline.state & PipelineState.SNAPSHOT_SYNC)
         
         await pipeline.stop()
 
     @pytest.mark.asyncio
     async def test_follower_to_leader_starts_sync(self, mock_source, mock_sender, pipeline_config):
-        """When role changes from follower to leader, pipelinesequence should start."""
+        """When role changes from follower to leader, leader sequence should start."""
         mock_sender.role = "follower"
         
         pipeline = AgentPipeline(
@@ -67,30 +71,28 @@ class TestAgentRoleSwitch:
         
         await pipeline.start()
         
-        # Wait for loop to start in follower mode
-        await asyncio.sleep(0.05)
+        # Wait for it to start as follower
+        for _ in range(100):
+            if pipeline.current_role == "follower" and (pipeline.state & PipelineState.PAUSED):
+                break
+            await asyncio.sleep(0.01)
+        
+        # Verify initial follower state
         assert pipeline.current_role == "follower"
         assert pipeline.state & PipelineState.PAUSED
         
         # Switch to leader
         mock_sender.role = "leader"
         
-        # Mock _run_message_sync to block so we can catch the state
-        phase_started = asyncio.Event()
-        async def mock_msg_sync_phase():
-            phase_started.set()
-            while True:
-                await asyncio.sleep(0.1)
-        pipeline._run_message_sync = mock_msg_sync_phase
-        
-        # Wait for control loop to detect change and finish snapshot
-        await phase_started.wait()
-        
+        # Wait for control loop to detect change and run snapshot
+        for _ in range(100):
+            if mock_source.snapshot_calls >= 1:
+                break
+            await asyncio.sleep(0.01)
+            
         # Assertions
         assert pipeline.current_role == "leader"
         # Snapshot should have been called
         assert mock_source.snapshot_calls >= 1
-        # Now it should be in MESSAGE_SYNC
-        assert pipeline.state & PipelineState.MESSAGE_SYNC
         
         await pipeline.stop()

@@ -5,3 +5,4 @@
   - [ ] PipelineBridge
   - [ ] Tests only
   - [ ] legacy
+  - [ ] direct driver mode

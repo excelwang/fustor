@@ -20,6 +20,7 @@ def mock_pipeline():
     pipeline.view_id = "1"
     pipeline._active_sessions = {}
     pipeline._leader_session = None
+    pipeline.config = {"session_timeout_seconds": 30}
     
     # Mock async methods
     pipeline.on_session_created = AsyncMock()
@@ -110,7 +111,7 @@ class TestSessionCreation:
             
             # Verify result
             assert "session_id" in result
-            assert result["timeout_seconds"] == 60
+            assert result["session_timeout_seconds"] == 60
     
     @pytest.mark.asyncio
     async def test_create_session_returns_role(self, session_bridge, mock_pipeline):

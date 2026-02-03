@@ -56,7 +56,7 @@ async def test_heartbeat_session_obsolete_recovery(mock_source, mock_sender, pip
     """Verify that SessionObsoletedError in heartbeat triggers session reset."""
     hb_called = asyncio.Event()
     
-    async def mock_hb(session_id):
+    async def mock_hb(session_id, **kwargs):
         hb_called.set()
         raise SessionObsoletedError("Session expired")
         

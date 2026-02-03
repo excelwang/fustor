@@ -39,6 +39,7 @@ async def test_clear_all_sessions():
         # Create a session
         payload = type('CreateSessionPayload', (), {})()
         payload.task_id = "task_to_clear"
+        payload.session_timeout_seconds = None
         request = MockRequest(client_host="192.168.1.21")
         
         result = await create_session(payload, request, view_id)

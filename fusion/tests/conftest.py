@@ -24,9 +24,9 @@ async def async_client() -> AsyncClient:
     
 @pytest.fixture(scope="session", autouse=True)
 def register_dummy_route_for_middleware_test():
-    """Register a dummy route that uses check_snapshot_status for middleware testing"""
+    """Register a dummy route that uses make_readiness_checker for middleware testing"""
     from fastapi import APIRouter, Depends
-    from fustor_fusion.api.views import check_snapshot_status, view_router
+    from fustor_fusion.api.views import view_router
     from fustor_fusion.auth.dependencies import get_view_id_from_api_key
     
     # Define a simple router that explicitly uses the middleware we want to test

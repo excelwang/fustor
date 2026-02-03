@@ -98,7 +98,7 @@ class TestPipelineManager:
         
         # Test session created
         session_info = await pipeline_manager._on_session_created(
-            "sess-1", "task-1", "pipe-1", {"client_ip": "1.2.3.4"}
+            "sess-1", "task-1", "pipe-1", {"client_ip": "1.2.3.4"}, 60
         )
         assert session_info.session_id == "sess-1"
         assert session_info.role == "leader"

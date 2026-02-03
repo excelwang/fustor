@@ -43,6 +43,7 @@ async def test_session_creation_multiple_servers():
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "task_server1"
+        payload1.session_timeout_seconds = None
         
         request1 = MockRequest(client_host="192.168.1.10")
         
@@ -53,9 +54,11 @@ async def test_session_creation_multiple_servers():
         assert await view_state_manager.is_locked_by_session(view_id, session_id1)
         
         await asyncio.sleep(1.5)
+        await session_manager.cleanup_expired_sessions()
         
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "task_server2"
+        payload2.session_timeout_seconds = None
         
         request2 = MockRequest(client_host="192.168.1.11")
         
@@ -82,6 +85,7 @@ async def test_session_creation_same_task_id():
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "same_task"
+        payload1.session_timeout_seconds = None
         
         request1 = MockRequest(client_host="192.168.1.12")
         
@@ -92,6 +96,7 @@ async def test_session_creation_same_task_id():
         
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "same_task"
+        payload2.session_timeout_seconds = None
         
         request2 = MockRequest(client_host="192.168.1.13")
         
@@ -116,6 +121,7 @@ async def test_session_creation_different_task_id():
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "different_task_1"
+        payload1.session_timeout_seconds = None
         
         request1 = MockRequest(client_host="192.168.1.14")
         
@@ -126,6 +132,7 @@ async def test_session_creation_different_task_id():
         
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "different_task_2"
+        payload2.session_timeout_seconds = None
         
         request2 = MockRequest(client_host="192.168.1.15")
         
@@ -150,6 +157,7 @@ async def test_concurrent_push_allowed():
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "concurrent_task_1"
+        payload1.session_timeout_seconds = None
         
         request1 = MockRequest(client_host="192.168.1.16")
         
@@ -160,6 +168,7 @@ async def test_concurrent_push_allowed():
         
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "concurrent_task_2"
+        payload2.session_timeout_seconds = None
         
         request2 = MockRequest(client_host="192.168.1.17")
         
@@ -184,6 +193,7 @@ async def test_same_task_id_with_concurrent_push():
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "repeated_task"
+        payload1.session_timeout_seconds = None
         
         request1 = MockRequest(client_host="192.168.1.18")
         
@@ -194,6 +204,7 @@ async def test_same_task_id_with_concurrent_push():
         
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "repeated_task"
+        payload2.session_timeout_seconds = None
         
         request2 = MockRequest(client_host="192.168.1.19")
         
@@ -223,6 +234,7 @@ async def test_stale_lock_handling():
         
         payload = type('CreateSessionPayload', (), {})()
         payload.task_id = "new_task"
+        payload.session_timeout_seconds = None
         
         request = MockRequest(client_host="192.168.1.20")
         

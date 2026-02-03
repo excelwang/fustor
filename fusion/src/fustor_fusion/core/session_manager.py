@@ -50,7 +50,7 @@ class SessionManager:
             
             # Ensure cleanup task is running
             if not self._cleanup_task or self._cleanup_task.done():
-                self.start_periodic_cleanup(1) # Check every second for better responsiveness in tests
+                await self.start_periodic_cleanup(1) # Check every second for better responsiveness in tests
                 
             return session_info
 

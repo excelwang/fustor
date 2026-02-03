@@ -93,7 +93,7 @@ async def test_heartbeat_success(sender, mock_fusion_client):
     result = await sender.heartbeat()
     
     assert result["status"] == "ok"
-    mock_fusion_client.send_heartbeat.assert_called_once_with("sess-1")
+    mock_fusion_client.send_heartbeat.assert_called_once_with("sess-1", can_realtime=False)
 
 @pytest.mark.asyncio
 async def test_audit_signals(sender, mock_fusion_client):

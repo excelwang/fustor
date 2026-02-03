@@ -36,7 +36,7 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
                     pipeline.session_id, batch, {"phase": "snapshot"}
                 )
                 if success:
-                    pipeline._update_role_from_response(response)
+                    await pipeline._update_role_from_response(response)
                     pipeline.statistics["events_pushed"] += len(batch)
                     get_metrics().counter("fustor.agent.events_pushed", len(batch), {"pipeline": pipeline.id, "phase": "snapshot"})
                     batch = []
@@ -50,7 +50,7 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
                 pipeline.session_id, batch, {"phase": "snapshot", "is_final": True}
             )
             if success:
-                pipeline._update_role_from_response(response)
+                await pipeline._update_role_from_response(response)
                 pipeline.statistics["events_pushed"] += len(batch)
                 
         logger.info(f"Pipeline {pipeline.id}: Snapshot sync phase complete")
@@ -90,7 +90,7 @@ async def run_driver_message_sync(pipeline: "AgentPipeline", start_position: int
                     pipeline.session_id, batch, {"phase": "realtime"}
                 )
                 if success:
-                    pipeline._update_role_from_response(response)
+                    await pipeline._update_role_from_response(response)
                     pipeline.statistics["events_pushed"] += len(batch)
                     get_metrics().counter("fustor.agent.events_pushed", len(batch), {"pipeline": pipeline.id, "phase": "realtime"})
                     batch = []
@@ -108,7 +108,7 @@ async def run_driver_message_sync(pipeline: "AgentPipeline", start_position: int
                     pipeline.session_id, batch, {"phase": "realtime", "is_final": True}
                 )
                 if success:
-                    pipeline._update_role_from_response(response)
+                    await pipeline._update_role_from_response(response)
                     pipeline.statistics["events_pushed"] += len(batch)
             except Exception as e:
                 logger.warning(f"Failed to push final message batch: {e}")
@@ -147,7 +147,7 @@ async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
             )
             
             if success:
-                pipeline._update_role_from_response(response)
+                await pipeline._update_role_from_response(response)
                 pipeline.statistics["events_pushed"] += len(events)
                 get_metrics().counter("fustor.agent.events_pushed", len(events), {"pipeline": pipeline.id, "phase": "realtime_bus"})
                 # Commit to bus

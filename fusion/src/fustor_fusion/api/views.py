@@ -43,7 +43,17 @@ def make_readiness_checker(view_name: str) -> Callable:
         manager = await get_cached_view_manager(view_id)
         provider = manager.providers.get(view_name)
         
-        # Fallback Readiness
+        # 1. Check Global Snapshot Status (via ViewStateManager)
+        from ..view_state_manager import view_state_manager
+        is_snapshot_complete = await view_state_manager.is_snapshot_complete(view_id)
+        if not is_snapshot_complete:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"View '{view_name}': Initial snapshot sync phase in progress",
+                headers={"Retry-After": "5"}
+            )
+            
+        # 2. Check Provider Specific Readiness
         if not provider and len(manager.providers) == 1:
             provider = list(manager.providers.values())[0]
             
