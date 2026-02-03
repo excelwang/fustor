@@ -91,6 +91,7 @@ graph TD
 
 ## Current Focus
 - Branch: refactor/xxx
+- Base Commit: [Commit Hash] (Critical for Review Diff)
 - Spec: specs/yyy.md
 
 ## Latest Checkpoint
