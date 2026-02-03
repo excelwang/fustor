@@ -1,5 +1,5 @@
 ---
-name: solution-architect
+name: soarch
 description: 负责需求分析与技术方案设计，输出标准化的技术规格说明书(Specification)，作为开发的唯一法律依据。
 ---
 

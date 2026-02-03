@@ -1,5 +1,5 @@
 ---
-name: iterative-impl
+name: iterimpl
 description: 实现“编码-测试-评审”的自动化闭环。严格遵循 Spec，通过反复的 Review 迭代直到代码完全符合设计要求。
 ---
 
@@ -11,14 +11,14 @@ description: 实现“编码-测试-评审”的自动化闭环。严格遵循 S
 
 ## 1. 核心逻辑 (The Loop)
 
-这是一个死循环，直到 `Code Review Expert` 说 "PASS"。
+这是一个死循环，直到 `cre` 说 "PASS"。
 
 ```mermaid
 graph TD
     A[Start] --> B(Alignment Check)
     B --> C{Coding Phase}
     C --> D(Testing Phase)
-    D --> E(Call Skill: code-review-expert)
+    D --> E(Call Skill: cre)
     E --> F{Review Passed?}
     F -- No (Fail) --> G[Analyze Fix Plan]
     G --> C
@@ -28,16 +28,16 @@ graph TD
 ## 2. 启动条件与初始化 (Entry & Init)
 
 **Case A: 全新开发**
-- 前置：必须先运行 `solution-architect` 产出 Spec。
+- 前置：必须先运行 `soarch` 产出 Spec。
 - 启动：直接进入 Coding Phase。
 
 **Case B: 既有代码接手 (Refactoring/Continuing)**
 - **Step 0: Spec Alignment (归位)**
    1. 检查是否存在对应的 `specs/xxx.md`。
-   2. **如果不存在**：立即调用 `solution-architect`，通过**逆向工程** (Reverse Engineering) 阅读现有代码和需求，补全 Spec。
+   2. **如果不存在**：立即调用 `soarch`，通过**逆向工程** (Reverse Engineering) 阅读现有代码和需求，补全 Spec。
    3. **如果存在**：阅读 Spec 和当前代码，建立基准认知。
 - **Step 1: Baseline Review (基线审查)**
-   - 在修改任何代码前，先运行一次 `code-review-expert` (Mode B)。
+   - 在修改任何代码前，先运行一次 `cre` (Mode B)。
    - 目的：明确当前代码与 Spec 的差距，生成初始的任务清单。
 
 ## 3. 详细执行步骤 (Loop Execution)
@@ -46,7 +46,7 @@ graph TD
 - **Commit Strategy (提交粒度)**:
   - 遵循 **"逻辑完整性 (Logical Completeness)"** 原则。
   - 不要改一行就提交，也不要等完全部做完才提交。
-  - **Action**: 每完成一个独立的子任务（Sub-task，如"定义数据结构"、"实现核心算法"、"完成单测"）且测试通过后，**立即执行 `git commit`**。这作为 Checkpoint，防止后续搞砸。
+  - **Action**: 每完成一个独立的子任务（Sub-task，如"定义数据结构"、"实现核心算法"、"完成单测"）后，**必须调用 `tester` skill 执行验证**。测试通过后，**立即执行 `git commit`**。这作为 Checkpoint，防止后续搞砸。
   - **Loop Condition**: 如果当前 Spec Step 或功能模块尚未全部完成，继续执行 Step 2，积攒更多的 Commits。仅当一个完整的 Feature 或 Step 完成时，才进入 Step 3。
 
 ### Step 3: Self-Review (批量审查)
@@ -61,7 +61,7 @@ graph TD
   3. **Mode A (Feature/Bugfix)**: 如果分支名匹配 `feature/*`, `feat/*`, `fix/*` (非 legacy)。
      - 重点：与 Spec 进行 Design Compliance 对比。
   4. **Mode C (Test Only)**: 如果仅修改了 `tests/` 或 `it/` 目录下的文件。
-- **Action**: 主动调用 `code-review-expert` skill，传入上述 Diff 内容。
+- **Action**: 主动调用 `cre` skill，传入上述 Diff 内容。
 
 ### Step 4: Decision (判决)
 阅读 Review 输出的两个表格：

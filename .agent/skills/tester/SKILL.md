@@ -1,5 +1,5 @@
 ---
-name: test-engineer
+name: tester
 description: 专职测试工程师，负责设计测试策略、执行测试套件、分析失败日志并验证修复。
 ---
 
