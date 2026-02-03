@@ -11,7 +11,7 @@ description: 负责需求分析与技术方案设计，输出标准化的技术�
 
 1.  **需求澄清 (Clarification)**: 与用户多轮对话，直到完全理解目标。
 2.  **方案设计 (Design)**: 确定数据结构、API 接口、模块交互流程。
-3.  **文档输出 (Legislation)**: 撰写或更新 `specifications/` 目录下的 Markdown 文档。
+3.  **文档输出 (Legislation)**: 撰写或更新 `specs/` 目录下的 Markdown 文档。
 
 ## 2. 执行流程 (Workflow)
 
@@ -22,7 +22,7 @@ description: 负责需求分析与技术方案设计，输出标准化的技术�
 
 ### Phase 2: Design (设计)
 在编写代码之前，**必须**先产出设计文档。
-文档应存放在 `specifications/` 目录（如不存在请创建）。
+文档应存放在 `specs/` 目录（如不存在请创建）。
 
 **Design Document Template**:
 ```markdown

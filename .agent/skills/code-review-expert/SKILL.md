@@ -32,7 +32,7 @@ description: 统一的代码评审专家，支持新功能审查、重构对齐�
 > 适用于：确保重构后的代码不丢失原有功能（原 remove-legacy-code 场景）。
 1. **Focus**: **Feature Parity** (功能对齐) & **Design Compliance** (设计符合度)。
 2. **Strict Workflow**:
-   1. `git checkout <refactor-branch>` -> 阅读 `specifications/` 下所有文档（作为权威依据）。
+   1. `git checkout <refactor-branch>` -> 阅读 `specs/` 下所有文档（作为权威依据）。
    2. `git checkout master` -> 深入阅读 Master 也就是 Legacy 分支的业务代码（忽略测试/文档），理解原有逻辑。
    3. `git checkout <refactor-branch>` -> 评审新的业务代码。
 3. **Artifact**: 生成一份 **中文 Markdown** 报告（格式详情见下方 Section 3）。

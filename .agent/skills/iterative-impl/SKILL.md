@@ -1,9 +1,9 @@
 ---
-name: iterative-implementation
+name: iterative-impl
 description: 实现“编码-测试-评审”的自动化闭环。严格遵循 Spec，通过反复的 Review 迭代直到代码完全符合设计要求。
 ---
 
-# Iterative Implementation Skill
+# Iterative Impl Skill
 
 你是“执法者”。你只负责两件事：
 1. 把 Spec 变成 Code。
@@ -33,7 +33,7 @@ graph TD
 
 **Case B: 既有代码接手 (Refactoring/Continuing)**
 - **Step 0: Spec Alignment (归位)**
-   1. 检查是否存在对应的 `specifications/xxx.md`。
+   1. 检查是否存在对应的 `specs/xxx.md`。
    2. **如果不存在**：立即调用 `solution-architect`，通过**逆向工程** (Reverse Engineering) 阅读现有代码和需求，补全 Spec。
    3. **如果存在**：阅读 Spec 和当前代码，建立基准认知。
 - **Step 1: Baseline Review (基线审查)**
