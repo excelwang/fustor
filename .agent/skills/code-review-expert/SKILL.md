@@ -53,9 +53,23 @@ description: 统一的代码评审专家，支持新功能审查、重构对齐�
      - 允许：仅填充 `pass` -> `assert ...`。
      - **REJECT**: 如果修改了 Docstring 或弱化了断言条件。
 
-## 3. Feedback Format (Standardized Artifact)
+## 4. Ticket Modification Rights (权限控制)
 
-### Special Table: Test Scope & Impact
+为了防止 Scope Creep，`cre` 对 Ticket 的修改权限受到严格限制：
+
+1.  **Rule A: Minor Amendment (微调 - ALLOWED)**
+    - **场景**: 验收标准模糊、缺少 Edge Case 测试要求。
+    - **Action**: 直接在 Ticket 中**追加** `Acceptance Criteria`。
+
+2.  **Rule B: Major Design Flaw (阻断 - FORBIDDEN)**
+    - **场景**: 发现 Spec (L2) 本身存在设计漏洞，或 Ticket 目标不可行。
+    - **Action**:
+        1. **严禁** 直接修改 Ticket 试图绕过问题。
+        2. **Must**: 将 Ticket 状态标记为 `BLOCKED`。
+        3. **Escalate**: 指示 `loopi` 呼叫 `soarch` 修复 L2 Spec。
+
+## 5. Feedback Format (Standardized Artifact)
+...
 必须在报告最前方展示：
 | Impacted Domain | Selected Test Suite | Rationale |
 | :--- | :--- | :--- |
