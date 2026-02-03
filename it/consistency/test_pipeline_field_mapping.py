@@ -48,7 +48,7 @@ fields_mapping:
 """
         docker_env.create_file_in_container(
             leader, 
-            "/root/.fustor/pipelines-config/pipeline-task-1.yaml", 
+            "/root/.fustor/agent-pipes-config/pipeline-task-1.yaml", 
             pipeline_config
         )
         

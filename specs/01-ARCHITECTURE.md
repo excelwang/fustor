@@ -372,7 +372,7 @@ Pipeline 停止 或 网络断开                     Session 超时检测
 $FUSTOR_AGENT_HOME/
 ├── sources-config.yaml              # Source 定义
 ├── senders-config.yaml              # Sender 定义 (原 pushers-config.yaml)
-└── pipelines-config/              # Pipeline 定义 (原 pipelines-config/)
+└── agent-pipes-config/              # Pipeline 定义 (原 agent-pipes-config/)
     └── pipe-*.yaml
 ```
 
@@ -397,7 +397,7 @@ fusion-http:
     batch_size: 100
 ```
 
-#### pipelines-config/pipe-research.yaml
+#### agent-pipes-config/pipe-research.yaml
 ```yaml
 id: pipe-research
 source: fs-research
@@ -554,4 +554,4 @@ Agent 收到响应后，设置心跳间隔为 `timeout_seconds / 2`。
 |------|---------------|----------------|
 | Source/View | `sources-config.yaml` | `views-config/` |
 | Sender/Receiver | `senders-config.yaml` | `receivers-config.yaml` |
-| Pipeline | `pipelines-config/` | `fusion-pipes-config/` |
+| Pipeline | `agent-pipes-config/` | `fusion-pipes-config/` |

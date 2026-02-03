@@ -16,7 +16,7 @@ class TestPipelinesConfigLoader:
     
     def test_scan_directory(self, tmp_path):
         """Should scan directory and load all pipeline configs."""
-        pipelines_dir = tmp_path / "pipelines-config"
+        pipelines_dir = tmp_path / "agent-pipes-config"
         pipelines_dir.mkdir()
         
         (pipelines_dir / "pipe-a.yaml").write_text(yaml.dump({
@@ -43,7 +43,7 @@ class TestPipelinesConfigLoader:
     
     def test_get_enabled(self, tmp_path):
         """Should return only enabled pipelines."""
-        pipelines_dir = tmp_path / "pipelines-config"
+        pipelines_dir = tmp_path / "agent-pipes-config"
         pipelines_dir.mkdir()
         
         (pipelines_dir / "enabled.yaml").write_text(yaml.dump({
@@ -68,7 +68,7 @@ class TestPipelinesConfigLoader:
     
     def test_invalid_id_rejected(self, tmp_path):
         """Should reject pipeline config with invalid ID."""
-        pipelines_dir = tmp_path / "pipelines-config"
+        pipelines_dir = tmp_path / "agent-pipes-config"
         pipelines_dir.mkdir()
         
         (pipelines_dir / "invalid.yaml").write_text(yaml.dump({
@@ -85,7 +85,7 @@ class TestPipelinesConfigLoader:
     
     def test_default_intervals(self, tmp_path):
         """Should use default values for optional fields."""
-        pipelines_dir = tmp_path / "pipelines-config"
+        pipelines_dir = tmp_path / "agent-pipes-config"
         pipelines_dir.mkdir()
         
         (pipelines_dir / "minimal.yaml").write_text(yaml.dump({

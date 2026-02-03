@@ -1,5 +1,5 @@
-# Example: pipelines-config/research.yaml
-# Location: $FUSTOR_HOME/pipelines-config/research.yaml
+# Example: agent-pipes-config/research.yaml
+# Location: $FUSTOR_HOME/agent-pipes-config/research.yaml
 
 id: pipe-research
 source: fs-research

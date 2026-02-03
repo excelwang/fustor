@@ -12,7 +12,7 @@ $FUSTOR_HOME/
 │   └── ...
 ├── sources-config.yaml         # [Agent] Data source definitions
 ├── senders-config.yaml         # [Agent] Data destination definitions
-├── pipelines-config/         # [Agent] Pipeline task definitions
+├── agent-pipes-config/         # [Agent] Pipeline task definitions
 │   ├── pipe-research.yaml
 │   └── ...
 ├── agent.id                    # Agent unique identifier
@@ -23,7 +23,7 @@ $FUSTOR_HOME/
 ### Deprecated (V1)
 - `views-config.yaml` (Replaced by `receivers-config.yaml` + `views-config`)
 - `pushers-config.yaml` (Replaced by `senders-config.yaml`)
-- `pipelines-config/` (Replaced by `pipelines-config/`)
+- `agent-pipes-config/` (Replaced by `agent-pipes-config/`)
 
 ---
 
@@ -104,9 +104,9 @@ fusion-main:
 
 ### 5. Pipeline Configuration (Tasks)
 
-Located in `$FUSTOR_HOME/pipelines-config/*.yaml`. Defines the synchronization tasks.
+Located in `$FUSTOR_HOME/agent-pipes-config/*.yaml`. Defines the synchronization tasks.
 
-**Example: `pipelines-config/pipe-research.yaml`**
+**Example: `agent-pipes-config/pipe-research.yaml`**
 
 ```yaml
 pipeline_id: pipe-research

@@ -332,8 +332,12 @@ class AgentPipeline(Pipeline):
                     self._consecutive_errors = 0
                 
             except asyncio.CancelledError:
-                logger.info(f"Pipeline {self.id} control loop cancelled")
-                break
+                if self.state == PipelineState.STOPPED:
+                    logger.info(f"Pipeline {self.id} control loop cancelled")
+                    break
+                else:
+                    logger.debug(f"Pipeline {self.id} control loop received CancelledError, continuing...")
+                    continue
             except SessionObsoletedError as e:
                 logger.warning(f"Pipeline {self.id} session is obsolete: {e}. Reconnecting immediately.")
                 # Clear session so we recreate it in the next iteration

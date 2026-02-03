@@ -82,11 +82,11 @@
 
 | # | 问题 | 选项/说明 |
 |---|------|---------|
-| 8.1 | Agent 的 `pipelines-config/` 重命名为 `pipelines-config/`？ | 确认 |
+| 8.1 | Agent 的 `agent-pipes-config/` 重命名为 `agent-pipes-config/`？ | 确认 |
 | 8.2 | Agent 的 [pushers-config.yaml](cci:7://file:///home/huajin/fustor_monorepo/examples/yaml-config/pushers-config.yaml:0:0-0:0) 重命名为 `senders-config.yaml`？ | 确认 |
 | 8.3 | Fusion 废弃 [views-config.yaml](cci:7://file:///home/huajin/fustor_monorepo/examples/yaml-config/views-config.yaml:0:0-0:0)？ | 确认 |
 | 8.4 | Fusion 新增 `receivers-config.yaml`？ | 确认 |
-| 8.5 | Fusion 新增 `pipelines-config/`？ | 确认 |
+| 8.5 | Fusion 新增 `agent-pipes-config/`？ | 确认 |
 
 ---
 
@@ -148,7 +148,7 @@
 6.5 保留在source-fs、view-fs
 6.7 pipeline级别的。
 7 采纳全部建议。
-8.1 pipelines-config/
+8.1 agent-pipes-config/ 
 8.2、8.3、8.4 OK
 8.5 fusion-pipes-config/
 9 /api/v1/ingest-> /api/v1/pipe，9.4、9.5 OK
@@ -261,7 +261,7 @@
 | 组件 | Agent | Fusion |
 |------|-------|--------|
 | Sender/Receiver | `senders-config.yaml` | `receivers-config.yaml` |
-| Pipeline | `pipelines-config/` | `fusion-pipes-config/` |
+| Pipeline | `agent-pipes-config/` | `fusion-pipes-config/` |
 | views-config | - | **(废弃)** |
 
 ## API 路径

@@ -43,8 +43,8 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
                 else:
                     raise Exception("Snapshot batch send failed")
                 
-        # Send remaining events in batch
-        if batch and pipeline.has_active_session():
+        # Send remaining events and signal completion
+        if pipeline.has_active_session():
             batch = pipeline.map_batch(batch)
             success, response = await pipeline.sender_handler.send_batch(
                 pipeline.session_id, batch, {"phase": "snapshot", "is_final": True}
