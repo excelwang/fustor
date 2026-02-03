@@ -4,7 +4,9 @@ import logging
 
 from .base import BaseInstanceService
 from fustor_core.models.states import PipelineState
-from fustor_agent.runtime import AgentPipeline, PipelineBridge
+from fustor_agent.runtime import AgentPipeline
+from fustor_agent.runtime.source_handler_adapter import SourceHandlerAdapter
+from fustor_agent.runtime.sender_handler_adapter import SenderHandlerAdapter
 from fustor_core.exceptions import NotFoundError
 from fustor_agent_sdk.interfaces import PipelineInstanceServiceInterface # Import the interface
 
@@ -77,42 +79,66 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
         
         self.logger.info(f"Attempting to start pipeline instance '{id}'...")
         try:
-            # Always use new Pipeline architecture
-            self.logger.info(f"Using AgentPipeline for '{id}'")
+            # Obtain EventBus mandatory for all pipelines (unifying architecture)
+            task_id = f"{self.agent_id}:{id}"
+            field_mappings = getattr(pipeline_config, "fields_mapping", [])
             
-            bridge = PipelineBridge(
-                sender_driver_service=self.sender_driver_service,
-                source_driver_service=self.source_driver_service
-            )
-            
-            # NEW: EventBus integration
-            event_bus = None
-            is_transient = self.source_driver_service.is_driver_transient(source_config.driver, source_config)
-            
-            if not is_transient:
-                try:
-                    # We assume start from position 0 for new pipelines (or from saved state TBD)
-                    # In V2, we use a unique task_id (agent_id:pipeline_id) for bus subscription
-                    task_id = f"{self.agent_id}:{id}"
-                    field_mappings = getattr(pipeline_config, "fields_mapping", [])
-                    
-                    event_bus, _ = await self.bus_service.get_or_create_bus_for_subscriber(
-                        source_id=pipeline_config.source,
-                        source_config=source_config,
-                        pipeline_id=task_id,
-                        required_position=0, 
-                        fields_mapping=field_mappings
-                    )
-                    self.logger.info(f"Subscribed to EventBus {event_bus.id} for pipeline '{task_id}'")
-                except Exception as e:
-                    self.logger.warning(f"Failed to acquire EventBus for '{id}': {e}. Falling back to direct driver.")
-
-            pipeline = bridge.create_pipeline(
-                pipeline_id=id,
-                agent_id=self.agent_id,
-                pipeline_config=pipeline_config,
+            # We assume start from position 0 for new pipelines
+            event_bus, needed_position_lost = await self.bus_service.get_or_create_bus_for_subscriber(
+                source_id=pipeline_config.source,
                 source_config=source_config,
-                sender_config=sender_config,
+                pipeline_id=task_id,
+                required_position=0, 
+                fields_mapping=field_mappings
+            )
+            self.logger.info(f"Subscribed to EventBus {event_bus.id} for pipeline '{task_id}'")
+
+            # Create Handlers (Inlined from PipelineBridge to simplify)
+            source_driver_class = self.source_driver_service._get_driver_by_type(source_config.driver)
+            source_driver = source_driver_class(id=pipeline_config.source, config=source_config)
+            source_handler = SourceHandlerAdapter(source_driver, config=source_config)
+
+            sender_driver_class = self.sender_driver_service._get_driver_by_type(sender_config.driver)
+            
+            # Extract sender config and credentials
+            sender_credentials = {}
+            if hasattr(sender_config.credential, "model_dump"):
+                sender_credentials = sender_config.credential.model_dump()
+            elif hasattr(sender_config.credential, "dict"):
+                sender_credentials = sender_config.credential.dict()
+            elif sender_config.credential:
+                sender_credentials = dict(sender_config.credential)
+
+            sender_driver_config = {
+                "batch_size": sender_config.batch_size,
+                "timeout_sec": sender_config.timeout_sec,
+                **sender_config.driver_params
+            }
+
+            sender_driver = sender_driver_class(
+                sender_id=pipeline_config.sender,
+                endpoint=sender_config.uri,
+                credential=sender_credentials,
+                config=sender_driver_config
+            )
+            sender_handler = SenderHandlerAdapter(sender_driver, config=sender_config)
+
+            # Build runtime config
+            runtime_config = {
+                "batch_size": getattr(pipeline_config, 'batch_size', 100),
+                "heartbeat_interval_sec": getattr(pipeline_config, 'heartbeat_interval_sec', 10),
+                "audit_interval_sec": getattr(pipeline_config, 'audit_interval_sec', 600),
+                "sentinel_interval_sec": getattr(pipeline_config, 'sentinel_interval_sec', 120),
+                "session_timeout_seconds": None,
+                "fields_mapping": field_mappings,
+            }
+
+            pipeline = AgentPipeline(
+                pipeline_id=id,
+                task_id=task_id,
+                config=runtime_config,
+                source_handler=source_handler,
+                sender_handler=sender_handler,
                 event_bus=event_bus,
                 bus_service=self.bus_service
             )
@@ -146,26 +172,35 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
             self.logger.info(f"{instance} stopped and removed from pool.")
             
             if should_release_bus and bus_id:
-                await self.bus_service.release_subscriber(bus_id, id)
+                # Use task_id for bus subscription release
+                await self.bus_service.release_subscriber(bus_id, instance.task_id)
         except Exception as e:
             self.logger.error(f"Failed to cleanly stop {instance}: {e}", exc_info=True)
 
     async def remap_pipeline_to_new_bus(self, pipeline_id: str, new_bus: "EventBusInstanceRuntime", needed_position_lost: bool):
+        # Search by short id or task_id (bus uses task_id)
         pipeline_instance = self.get_instance(pipeline_id)
         if not pipeline_instance:
-            self.logger.warning(f"Pipeline task '{pipeline_id}' not found during bus remapping.")
+            # Search by task_id in pool
+            for inst in self.pool.values():
+                if getattr(inst, 'task_id', None) == pipeline_id:
+                    pipeline_instance = inst
+                    break
+        
+        if not pipeline_instance:
+            self.logger.warning(f"Pipeline task '{pipeline_id}' not found in pool during bus remapping.")
             return
 
         old_bus_id = pipeline_instance.bus.id if pipeline_instance.bus else None
-        self.logger.info(f"Remapping sync task '{pipeline_id}' to new bus '{new_bus.id}'...")
+        self.logger.info(f"Remapping sync task '{pipeline_instance.id}' (task_id={pipeline_instance.task_id}) to new bus '{new_bus.id}'...")
         
         # Call the instance's remap method, which also handles the signal
         await pipeline_instance.remap_to_new_bus(new_bus, needed_position_lost)
         
         if old_bus_id:
-            await self.bus_service.release_subscriber(old_bus_id, pipeline_id)
+            await self.bus_service.release_subscriber(old_bus_id, pipeline_instance.task_id)
         
-        self.logger.info(f"Pipeline task '{pipeline_id}' remapped to bus '{new_bus.id}' successfully.")
+        self.logger.info(f"Pipeline task '{pipeline_instance.id}' remapped to bus '{new_bus.id}' successfully.")
 
 
 

@@ -1,14 +1,15 @@
 import asyncio
 import threading
 import logging
-from typing import Iterator, Any, AsyncIterator
+from typing import Iterator, Any, AsyncIterator, Optional
 
 logger = logging.getLogger("fustor_agent.pipeline.worker")
 
 async def aiter_sync_phase_wrapper(
     phase_iter: Iterator[Any], 
     id_for_thread: str,
-    queue_size: int = 1000
+    queue_size: int = 1000,
+    yield_timeout: Optional[float] = None
 ) -> AsyncIterator[Any]:
     """
     Safely and efficiently wrap a synchronous iterator into an async generator.

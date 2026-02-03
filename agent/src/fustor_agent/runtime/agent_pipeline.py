@@ -71,6 +71,10 @@ class AgentPipeline(Pipeline):
         self._bus = event_bus  # Private attribute for bus
         self._bus_service = bus_service
         
+        # Verify architecture: realtime sync REQUIRES a bus
+        if self._bus is None:
+            logger.warning(f"Pipeline {pipeline_id}: Initialized without a bus. Realtime sync will not be possible.")
+        
         # Field Mapper
         self._mapper = EventMapper(config.get("fields_mapping", []))
         
@@ -249,8 +253,6 @@ class AgentPipeline(Pipeline):
         
         logger.info(f"Pipeline {self.id}: Session {session_id} created, role={self.current_role}")
         
-        # Start heartbeat loop
-        self._heartbeat_task = asyncio.create_task(self._run_heartbeat_loop())
     
     async def on_session_closed(self, session_id: str) -> None:
         """Handle session closure."""
@@ -485,13 +487,13 @@ class AgentPipeline(Pipeline):
         if not isinstance(error, SessionObsoletedError):
             logger.error(f"Pipeline {self.id} fatal background error: {error}", exc_info=True)
             self._set_state(PipelineState.ERROR, str(error))
-    async def _aiter_sync_phase(self, phase_iter: Iterator[Any], queue_size: Optional[int] = None):
+    async def _aiter_sync_phase(self, phase_iter: Iterator[Any], queue_size: Optional[int] = None, yield_timeout: Optional[float] = None):
         """
         Safely and efficiently wrap a synchronous iterator into an async generator.
         """
         from .pipeline.worker import aiter_sync_phase_wrapper
         q_size = queue_size if queue_size is not None else self.iterator_queue_size
-        async for item in aiter_sync_phase_wrapper(phase_iter, self.id, q_size):
+        async for item in aiter_sync_phase_wrapper(phase_iter, self.id, q_size, yield_timeout=yield_timeout):
             yield item
 
     def map_batch(self, batch: List[Any]) -> List[Any]:
@@ -502,46 +504,29 @@ class AgentPipeline(Pipeline):
 
     async def _run_snapshot_sync(self) -> None:
         """Execute snapshot sync phase."""
+        # Unification: In Bus mode, the data flows through the single bus stream starting from 0.
+        # We just need to signal completion of the "snapshot" phase to Fusion 
+        # so it can mark its internal view as "Ready" for queries.
+        if self._bus:
+            logger.info(f"Pipeline {self.id}: Using Unified Bus Mode - Signaling snapshot readiness to Fusion")
+            await self.sender_handler.send_batch(
+                self.session_id, [], {"phase": "snapshot", "is_final": True}
+            )
+            return
+
         from .pipeline.phases import run_snapshot_sync
         await run_snapshot_sync(self)
 
     async def _run_message_sync(self) -> None:
         """Execute realtime message sync phase."""
-        logger.info(f"Pipeline {self.id}: Starting message sync phase")
+        logger.info(f"Pipeline {self.id}: Starting message sync phase (Unified Bus Mode)")
         self._set_state(self.state | PipelineState.MESSAGE_SYNC)
         
         try:
-            # Determine start position for resume (D-04/D-06)
-            start_position = self.statistics.get("last_pushed_event_id", 0) or 0
+            if not self._bus:
+                raise RuntimeError(f"Pipeline {self.id}: Cannot run message sync without an EventBus.")
             
-            # Try to setup EventBus for high-throughput mode
-            if self._bus_service and not self._bus:
-                try:
-                    self._bus, position_lost = await self._bus_service.get_or_create_bus_for_subscriber(
-                        source_id=self.config.get("source"),
-                        source_config=self.source_handler.config,
-                        pipeline_id=self.id,
-                        required_position=start_position,
-                        fields_mapping=self.config.get("fields_mapping", [])
-                    )
-                    
-                    if position_lost:
-                        logger.warning(f"Pipeline {self.id}: Position lost.")
-                        # Trigger supplemental snapshot only if we are leader
-                        if self.current_role == "leader":
-                            logger.info(f"Pipeline {self.id}: Triggering supplemental snapshot...")
-                            asyncio.create_task(self._run_snapshot_sync())
-                        
-                    logger.info(f"Pipeline {self.id}: EventBus initialized for high-throughput mode")
-                except Exception as e:
-                    logger.warning(f"Pipeline {self.id}: Failed to setup EventBus ({e}), falling back to driver mode")
-                    self._bus = None
-            
-            # Choose pipeline mode based on bus availability
-            if self._bus:
-                await self._run_bus_message_sync()
-            else:
-                await self._run_driver_message_sync(start_position)
+            await self._run_bus_message_sync()
         except Exception as e:
             await self._handle_fatal_error(e)
         finally:
@@ -552,10 +537,7 @@ class AgentPipeline(Pipeline):
         from .pipeline.phases import run_bus_message_sync
         await run_bus_message_sync(self)
 
-    async def _run_driver_message_sync(self, start_position: int = -1) -> None:
-        """Execute message sync phase directly from driver."""
-        from .pipeline.phases import run_driver_message_sync
-        await run_driver_message_sync(self, start_position)
+
 
     async def _run_audit_loop(self) -> None:
         """Periodically run audit phase."""

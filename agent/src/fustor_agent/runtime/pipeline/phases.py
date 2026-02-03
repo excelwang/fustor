@@ -61,60 +61,7 @@ async def run_snapshot_sync(pipeline: "AgentPipeline") -> None:
         logger.error(f"Pipeline {pipeline.id} snapshot sync phase error: {e}", exc_info=True)
         raise
 
-async def run_driver_message_sync(pipeline: "AgentPipeline", start_position: int = -1) -> None:
-    """Execute message sync phase directly from driver."""
 
-
-    # Pass a stop event if possible for better cleanup
-    stop_event = threading.Event()
-    msg_iter = pipeline.source_handler.get_message_iterator(
-        start_position=start_position, 
-        stop_event=stop_event
-    )
-    
-    try:
-        batch = []
-        if not hasattr(msg_iter, "__aiter__"):
-            msg_iter = pipeline._aiter_sync_phase(msg_iter)
-
-        async for event in msg_iter:
-            # First item received = Prescan complete and watching active
-            pipeline.is_realtime_ready = True
-            if not pipeline.is_running() and not (pipeline.state & PipelineState.RECONNECTING):
-                break
-                
-            batch.append(event)
-            if len(batch) >= pipeline.batch_size:
-                batch = pipeline.map_batch(batch)
-                success, response = await pipeline.sender_handler.send_batch(
-                    pipeline.session_id, batch, {"phase": "realtime"}
-                )
-                if success:
-                    await pipeline._update_role_from_response(response)
-                    pipeline.statistics["events_pushed"] += len(batch)
-                    get_metrics().counter("fustor.agent.events_pushed", len(batch), {"pipeline": pipeline.id, "phase": "realtime"})
-                    batch = []
-                else:
-                    raise Exception("Realtime batch send failed")
-    except asyncio.CancelledError:
-        logger.info(f"Driver message sync phase for {pipeline.id} cancelled")
-        raise
-    finally:
-        # Send remaining events in batch
-        if batch and pipeline.has_active_session():
-            try:
-                batch = pipeline.map_batch(batch)
-                success, response = await pipeline.sender_handler.send_batch(
-                    pipeline.session_id, batch, {"phase": "realtime", "is_final": True}
-                )
-                if success:
-                    await pipeline._update_role_from_response(response)
-                    pipeline.statistics["events_pushed"] += len(batch)
-            except Exception as e:
-                logger.warning(f"Failed to push final message batch: {e}")
-        
-        # Signal stop to the underlying iterator
-        stop_event.set()
 
 async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
     """Execute message sync phase reading from an internal event bus."""
@@ -127,15 +74,18 @@ async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
     try:
         while pipeline.is_running() or (pipeline.state & PipelineState.RECONNECTING):
             # 1. Fetch from bus
+            # Use task_id (agent_id:pipeline_id) for bus operations
             events = await pipeline._bus.internal_bus.get_events_for(
-                pipeline.id, 
+                pipeline.task_id, 
                 pipeline.batch_size, 
-                timeout=0.2  # 200ms poll timeout, matching Master version for low latency
+                timeout=0.2  # 200ms poll timeout
             )
             
             if not events:
                 # Even if no events, we mark ready after first successful poll
                 pipeline.is_realtime_ready = True
+                # Safety sleep to prevent busy loop if get_events_for returns immediately
+                await asyncio.sleep(0.1)
                 continue
             
             pipeline.is_realtime_ready = True
@@ -150,20 +100,22 @@ async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
                 await pipeline._update_role_from_response(response)
                 pipeline.statistics["events_pushed"] += len(events)
                 get_metrics().counter("fustor.agent.events_pushed", len(events), {"pipeline": pipeline.id, "phase": "realtime_bus"})
-                # Commit to bus
+                
+                # Commit to bus using task_id
                 if pipeline._bus_service:
                     await pipeline._bus_service.commit_and_handle_split(
                         pipeline._bus.id, 
-                        pipeline.id, 
+                        pipeline.task_id, 
                         len(events), 
                         events[-1].index,
                         pipeline.config.get("fields_mapping", [])
                     )
                 else:
-                    await pipeline._bus.internal_bus.commit(pipeline.id, len(events), events[-1].index)
+                    await pipeline._bus.internal_bus.commit(pipeline.task_id, len(events), events[-1].index)
             else:
                 logger.warning(f"Pipeline {pipeline.id}: Failed to send bus events")
                 await asyncio.sleep(1.0) # Wait before retry
+
                 
     except asyncio.CancelledError:
         logger.info(f"Bus message sync phase for {pipeline.id} cancelled")

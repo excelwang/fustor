@@ -73,10 +73,7 @@ from .sender_handler_adapter import (
     create_sender_handler_from_config,
 )
 
-from .pipeline_bridge import (
-    PipelineBridge,
-    create_pipeline_from_config,
-)
+
 
 __all__ = [
     # Pipeline
@@ -92,7 +89,5 @@ __all__ = [
     "SenderHandlerFactory",
     "create_sender_handler_from_config",
     
-    # Pipeline Factory
-    "PipelineBridge",
-    "create_pipeline_from_config",
+
 ]
