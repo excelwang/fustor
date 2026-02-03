@@ -66,26 +66,26 @@ graph TD
 
 ### Step 2: Ticket Alignment (归位)
 ...
-**Constraint**: `loopi` 在 Coding 阶段 **严禁修改** `active/` 下的 Ticket 原件。所有进度记录在 `.agent/current_ticket.md` 中。Ticket 原件仅可由 `soarch` (Split) 或 `cre` (Feedback) 修改。
+**Constraint**: `software-engineer` 在 Coding 阶段 **严禁修改** `active/` 下的 Ticket 原件。所有进度记录在 `.agent/current_ticket.md` 中。Ticket 原件仅可由 `solution-architect` (Split) 或 `code-reviewer` (Feedback) 修改。
 
 
 
 **Case A: 全新开发**
-- 前置：必须先运行 `soarch` 输出 Ticket 文档至 `.agent/tickets/backlog/`。
+- 前置：必须先运行 `solution-architect` 输出 Ticket 文档至 `.agent/tickets/backlog/`。
 - 启动：认领 Ticket，移动至 `.agent/tickets/active/`，直接进入 Coding Phase。
 
 **Case B: 既有代码接手 (Refactoring/Continuing)**
 - **Step 0: Ticket Alignment (归位)**
    1. 检查 `.agent/tickets/` 下是否存在对应的 `TICKET_[ID].md`。
-   2. **如果不存在**：调用 `soarch`，逆向生成 Ticket 文档。
+   2. **如果不存在**：调用 `solution-architect`，逆向生成 Ticket 文档。
    3. **如果存在**：阅读 Ticket 和引用的 Spec，建立基准认知。
 - **Step 1: Baseline Review (基线审查)**
-   - 运行 `cre` (Mode B) 对比代码与 Domain Spec。
+   - 运行 `code-reviewer` (Mode B) 对比代码与 Domain Spec。
 
 ### Step 1.5: Ticket Refinement (动态调整)
-如果在编码过程中发现任务过大或被阻塞：
-- **Action**: 调用 `soarch` REQUEST_SPLIT。
-- **Result**: 当前任务 Paused，拆分为新的小任务。重新开始 Step 0。
+如果在编码过程中发现 Ticket 过大或被阻塞：
+- **Action**: 调用 `solution-architect` REQUEST_SPLIT。
+- **Result**: 当前 Ticket Paused，拆分为新的小 Ticket。重新开始 Step 0。
 
 ## 3. 详细执行步骤 (Loop Execution)
 
@@ -93,7 +93,7 @@ graph TD
 - **Commit Strategy (提交粒度)**:
   - 遵循 **"逻辑完整性 (Logical Completeness)"** 原则。
   - 不要改一行就提交，也不要等完全部做完才提交。
-  - **Action**: 每完成一个独立的子任务（Sub-ticket，如"定义数据结构"、"实现核心算法"、"完成单测"）后，**必须调用 `tester` skill 执行验证**。测试通过后，**立即执行 `git commit`**。这作为 Checkpoint，防止后续搞砸。
+  - **Action**: 每完成一个独立的子任务（Sub-ticket，如"定义数据结构"、"实现核心算法"、"完成单测"）后，**必须运行单元测试执行验证**。如果遇到复杂集成故障，**调用 `reliability-engineer` 进行诊断**。测试通过后，**立即执行 `git commit`**。这作为 Checkpoint，防止后续搞砸。
   - **Loop Condition**: 如果当前 Spec Step 或功能模块尚未全部完成，继续执行 Step 2，积攒更多的 Commits。仅当一个完整的 Feature 或 Step 完成时，才进入 Step 3。
 
 ### Step 3: Self-Review (批量审查)
@@ -108,7 +108,7 @@ graph TD
   3. **Mode A (Feature/Bugfix)**: 如果分支名匹配 `feature/*`, `feat/*`, `fix/*` (非 legacy)。
      - 重点：与 Spec 进行 Design Compliance 对比。
   4. **Mode C (Test Only)**: 如果仅修改了 `tests/` 或 `it/` 目录下的文件。
-- **Action**: 主动调用 `code-review-expert` skill，传入上述 Diff 内容。
+- **Action**: 主动调用 `code-reviewer` skill，传入上述 Diff 内容。
 
 ### Step 4: Decision (判决)
 阅读 Review 输出的两个表格：
@@ -133,7 +133,7 @@ graph TD
 **原则**: 只记录当前最新快照，不记流水账，节省 Token。
 
 **Trigger Points**:
-1. 调用 `soarch`, `tester`, `code-review-expert` **之前**。
+1. 调用 `solution-architect`, `reliability-engineer`, `code-reviewer` **之前**。
 2. 收到专家反馈 **之后**。
 3. 流程 **结束时**。
 

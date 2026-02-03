@@ -28,7 +28,7 @@ Observe the USER's request and current system state, then dispatch:
 - **Trigger Words**: "Review this file", "Check logic".
 
 ### Case D: "Run tests / Verify env"
-- **Target Persona**: `test-engineer`
+- **Target Persona**: `reliability-engineer`
 - **Goal**: Run test suites, diagnose failures.
 
 ## 2. Execution Flow
