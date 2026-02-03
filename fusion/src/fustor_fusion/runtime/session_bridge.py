@@ -99,9 +99,9 @@ class PipelineSessionBridge:
         session_id = session_id or str(uuid.uuid4())
         view_id = str(self._pipeline.view_id)
         
-        from fustor_fusion.view_state_manager import view_state_manager
+        logger.info(f"DEBUG: Bridge creating session {session_id} for view {view_id}, timeout={session_timeout_seconds}")
         
-        # Leader/Follower election (First-Come-First-Serve)
+        from fustor_fusion.view_state_manager import view_state_manager
         # Note: view_state_manager should handle string IDs too
         is_leader = await view_state_manager.try_become_leader(view_id, session_id)
         if is_leader:
@@ -134,10 +134,13 @@ class PipelineSessionBridge:
         # Get role from pipeline
         role = await self._pipeline.get_session_role(session_id)
         
+        timeout = session_timeout_seconds or 30
+        
         return {
             "session_id": session_id,
             "role": role,
-            "timeout_seconds": session_timeout_seconds or 30,
+            "session_timeout_seconds": timeout,
+            "suggested_heartbeat_interval_seconds": timeout // 2,
         }
     
     async def keep_alive(
@@ -152,6 +155,7 @@ class PipelineSessionBridge:
         Args:
             session_id: The session to keep alive
             client_ip: Client IP for tracking
+            can_realtime: Whether the agent is ready for realtime events
             
         Returns:
             Heartbeat response with role, tasks, etc.
@@ -159,20 +163,33 @@ class PipelineSessionBridge:
         view_id = self._session_view_map.get(session_id)
         
         if view_id is not None:
-            # Update legacy SessionManager
+            # 1. Update legacy SessionManager
             await self._session_manager.keep_session_alive(
                 view_id=view_id,
                 session_id=session_id,
                 client_ip=client_ip,
                 can_realtime=can_realtime
             )
+            
+            # 2. Try to become leader (Follower promotion)
+            from fustor_fusion.view_state_manager import view_state_manager
+            is_leader = await view_state_manager.try_become_leader(view_id, session_id)
+            if is_leader:
+                await view_state_manager.set_authoritative_session(view_id, session_id)
+                # Note: We don't automatically lock here, as lock_for_session 
+                # is usually for exclusive single-writer sessions. 
+                # In most V2 pipelines, allow_concurrent_push is true.
         
-        # Get role from pipeline
+        # 3. Get role from pipeline/view_state_manager
         role = await self._pipeline.get_session_role(session_id)
+        timeout = self._pipeline.config.get("session_timeout_seconds", 30)
         
         return {
             "role": role,
             "session_id": session_id,
+            "can_realtime": can_realtime,
+            "suggested_heartbeat_interval_seconds": timeout // 2,
+            "status": "ok"
         }
     
     async def close_session(self, session_id: str) -> bool:

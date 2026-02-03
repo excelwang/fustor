@@ -13,9 +13,19 @@ import time
 import logging
 from ..utils import docker_manager
 from ..conftest import (
+    CONTAINER_CLIENT_A, 
+    CONTAINER_CLIENT_B, 
     MOUNT_POINT
 )
-from ..fixtures.constants import EXTREME_TIMEOUT, LONG_TIMEOUT, INGESTION_DELAY
+from ..fixtures.constants import (
+    EXTREME_TIMEOUT, 
+    LONG_TIMEOUT, 
+    INGESTION_DELAY,
+    CONTAINER_FUSION,
+    CONTAINER_CLIENT_A,
+    CONTAINER_CLIENT_B,
+    CONTAINER_CLIENT_C
+)
 
 logger = logging.getLogger("fustor_test")
 

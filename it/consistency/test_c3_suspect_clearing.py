@@ -18,9 +18,11 @@ from ..fixtures.constants import (
     HOT_FILE_THRESHOLD,
     SHORT_TIMEOUT,
     MEDIUM_TIMEOUT,
-    POLL_INTERVAL,
     STRESS_DELAY,
-    SESSION_VANISH_TIMEOUT
+    POLL_INTERVAL,
+    SESSION_VANISH_TIMEOUT,
+    CONTAINER_CLIENT_A,
+    CONTAINER_CLIENT_C
 )
 
 class TestSuspectClearingConditions:

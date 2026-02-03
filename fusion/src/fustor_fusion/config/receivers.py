@@ -19,6 +19,7 @@ http-main:
       pipeline_id: pipeline-2
 ```
 """
+import os
 import yaml
 import logging
 from pathlib import Path
@@ -111,6 +112,9 @@ class ReceiversConfigLoader:
             if not isinstance(data, dict):
                 data = {}
             
+            global_timeout = os.getenv("FUSTOR_FUSION_SESSION_TIMEOUT_SECONDS")
+            global_concurrent = os.getenv("FUSTOR_FUSION_ALLOW_CONCURRENT_PUSH")
+            
             for r_id, r_data in data.items():
                 if not isinstance(r_data, dict):
                     continue
@@ -121,6 +125,12 @@ class ReceiversConfigLoader:
                     if errors:
                         logger.error(f"Invalid receiver ID {r_id_str}: {'; '.join(errors)}")
                         continue
+
+                    # Apply environment variable overrides
+                    if global_timeout:
+                        r_data["session_timeout_seconds"] = int(global_timeout)
+                    if global_concurrent:
+                        r_data["allow_concurrent_push"] = global_concurrent.lower() == "true"
                     
                     # Parse API keys list
                     api_keys_raw = r_data.pop("api_keys", [])
@@ -133,6 +143,7 @@ class ReceiversConfigLoader:
                             api_keys.append(ApiKeyMapping(key=ak, pipeline_id=r_id_str))
                     
                     config = ReceiverConfig(api_keys=api_keys, **r_data)
+                    logger.info(f"DEBUG: Receiver {r_id_str} config: timeout={config.session_timeout_seconds}, concurrent={config.allow_concurrent_push}")
                     self._receivers[r_id_str] = config
                     
                     # Build API key mappings
@@ -142,6 +153,7 @@ class ReceiversConfigLoader:
                         
                 except Exception as e:
                     logger.error(f"Failed to parse receiver {r_id}: {e}")
+            
             
             self._loaded = True
             logger.info(f"Loaded {len(self._receivers)} receivers from {config_path}")

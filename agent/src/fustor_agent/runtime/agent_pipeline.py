@@ -100,7 +100,8 @@ class AgentPipeline(Pipeline):
         self.max_consecutive_errors = config.get("max_consecutive_errors", 5)  # Threshold for warning
         self.backoff_multiplier = config.get("backoff_multiplier", 2.0)        # Exponential backoff factor
         self.max_backoff_seconds = config.get("max_backoff_seconds", 60.0)     # Max backoff delay cap
-        self.session_timeout_seconds = config.get("session_timeout_seconds", 30) # Session expiration timeout
+        self.session_timeout_seconds = config.get("session_timeout_seconds") # Session expiration timeout (optional)
+        print(f"DEBUG_PRINT: AgentPipeline {id(self)} init task_id={task_id} timeout={self.session_timeout_seconds}")
         
 
         
@@ -245,6 +246,7 @@ class AgentPipeline(Pipeline):
         self.current_role = None
         self.is_realtime_ready = False
         self._initial_snapshot_done = False
+        self.audit_context.clear() # Reset cache for fresh start on next session
     
     async def _run_control_loop(self) -> None:
         """
@@ -265,6 +267,7 @@ class AgentPipeline(Pipeline):
                 if not self.has_active_session():
                     self._set_state(PipelineState.RUNNING | PipelineState.RECONNECTING, "Attempting to create session...")
                     try:
+                        logger.info(f"Pipeline {self.id}: Creating session with task_id={self.task_id}, timeout={self.session_timeout_seconds}")
                         session_id, metadata = await self.sender_handler.create_session(
                             task_id=self.task_id,
                             source_type=self.source_handler.schema_name,
@@ -431,6 +434,11 @@ class AgentPipeline(Pipeline):
         if (new_role == "follower" or new_role is None) and old_role == "leader":
             # Lost leadership - cancel leader tasks
             await self._cancel_leader_tasks()
+        
+        if new_role == "leader" and old_role != "leader":
+            # Gained leadership - clear audit context to ensure fresh scan
+            logger.info(f"Pipeline {self.id}: Promoted to LEADER. Clearing audit cache for fresh scan.")
+            self.audit_context.clear()
 
     async def _handle_fatal_error(self, error: Exception) -> None:
         """Handle fatal errors from background tasks."""

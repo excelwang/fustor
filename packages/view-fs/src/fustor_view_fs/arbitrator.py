@@ -179,10 +179,11 @@ class FSArbitrator:
             age = watermark - mtime
             mtime_changed = (existing is None) or (abs(old_mtime - mtime) > self.FLOAT_EPSILON)
             
+            is_snapshot = (source == MessageSource.SNAPSHOT)
             self.logger.debug(f"NON_REALTIME {path} source={source} mtime_changed={mtime_changed} age={age:.1f}")
             
             if mtime_changed:
-                if is_audit:
+                if is_audit or is_snapshot:
                     self.state.blind_spot_additions.add(path)
                     node.known_by_agent = False
                 

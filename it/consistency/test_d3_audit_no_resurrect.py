@@ -11,7 +11,7 @@ from ..utils import docker_manager
 from ..conftest import (
     CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
 )
-from ..fixtures.constants import MEDIUM_TIMEOUT, LONG_TIMEOUT, STRESS_DELAY
+from ..fixtures.constants import MEDIUM_TIMEOUT, LONG_TIMEOUT, STRESS_DELAY, POLL_INTERVAL
 
 
 class TestAuditTombstoneProtection:

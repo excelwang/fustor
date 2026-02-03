@@ -53,6 +53,7 @@ class PipelineManager:
 
     async def initialize_pipelines(self):
         """Initialize pipelines and receivers based on configuration."""
+        logger.info("DEBUG: PipelineManager.initialize_pipelines called")
         # Ensure receivers are loaded first
         if not self._receivers:
             self.load_receivers()
@@ -137,8 +138,9 @@ class PipelineManager:
     # --- Receiver Callbacks ---
 
     async def _on_session_created(
-        self, session_id: str, task_id: str, pipeline_id: str, client_info: Dict[str, Any]
+        self, session_id: str, task_id: str, pipeline_id: str, client_info: Dict[str, Any], session_timeout_seconds: int
     ) -> SessionInfo:
+        logger.info(f"DEBUG: PipelineManager._on_session_created called with timeout={session_timeout_seconds}")
         async with self._lock:
             pipeline = self._pipelines.get(pipeline_id)
             if not pipeline:
@@ -154,7 +156,8 @@ class PipelineManager:
             result = await bridge.create_session(
                 task_id=task_id,
                 client_ip=client_info.get("client_ip"),
-                session_id=session_id
+                session_id=session_id,
+                session_timeout_seconds=session_timeout_seconds
             )
             role = result["role"]
             

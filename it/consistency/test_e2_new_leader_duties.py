@@ -231,22 +231,29 @@ class TestNewLeaderResumesDuties:
             
             # Check roles
             sessions = fusion_client.get_sessions()
+            logger.info(f"Checking roles for returning Agent A. Sessions: {sessions}")
             
             roles = {}
             for s in sessions:
                 aid = s.get("agent_id", "")
+                role = s.get("role")
                 if aid.startswith("client-a"):
-                    roles["client-a"] = s.get("role")
+                    # For agent-a, we might have a stale session. 
+                    # Prefer leader if multiple exist, or the one with "can_snapshot"
+                    if roles.get("client-a") != "leader":
+                        roles["client-a"] = role
                 elif aid.startswith("client-b"):
-                    roles["client-b"] = s.get("role")
+                    if roles.get("client-b") != "leader":
+                        roles["client-b"] = role
             
+            logger.info(f"Inferred roles: {roles}")
             # B should remain leader
             assert roles.get("client-b") == "leader", \
-                f"Agent B should remain leader, got roles: {roles}"
+                f"Agent B should remain leader, got roles: {roles}, sessions: {sessions}"
             
             # A should be follower
             assert roles.get("client-a") == "follower", \
-                f"Returning Agent A should become follower, got roles: {roles}"
+                f"Returning Agent A should become follower, got roles: {roles}, sessions: {sessions}"
             
         finally:
             # Final cleanup - restart to restore original state if needed

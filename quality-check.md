@@ -4,3 +4,4 @@
   - [ ] FUSTOR_USE_PIPELINE
   - [ ] PipelineBridge
   - [ ] Tests only
+  - [ ] legacy

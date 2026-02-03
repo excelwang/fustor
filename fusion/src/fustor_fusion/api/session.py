@@ -30,6 +30,7 @@ class CreateSessionPayload(BaseModel):
     """Payload for creating a new session"""
     task_id: str
     client_info: Optional[Dict[str, Any]] = None
+    session_timeout_seconds: Optional[int] = None
 
 
 def _get_session_config(pipeline_id: str) -> Dict[str, Any]:
@@ -95,8 +96,11 @@ async def create_session(
     view_id = str(view_id)
     session_config = _get_session_config(view_id)
     allow_concurrent_push = session_config["allow_concurrent_push"]
-    session_timeout_seconds = session_config["session_timeout_seconds"]
     
+    # Use client-requested timeout if provided, otherwise fallback to server config
+    session_timeout_seconds = payload.session_timeout_seconds or session_config["session_timeout_seconds"]
+    logger.info(f"DEBUG: Session timeout determined: {session_timeout_seconds}")
+
     session_id = str(uuid.uuid4())
     
     should_allow = await _should_allow_new_session(

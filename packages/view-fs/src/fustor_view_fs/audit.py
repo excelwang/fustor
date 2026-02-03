@@ -35,16 +35,16 @@ class AuditManager:
         if self.state.last_audit_start is None:
             return
 
-        # 1. Tombstone Cleanup (Rule: Purge tombstones older than 1 hour per §6.3)
-        # Use physical local time for TTL calculation to be stable against logical clock jumps
-        # Reference: CONSISTENCY_DESIGN.md §6.3
-        tombstone_ttl_seconds = self.state.config.get("tombstone_ttl_seconds", 3600.0)
-        now_physical = time.time()
+        # 1. Tombstone Cleanup (Rule: Purge tombstones created BEFORE this audit cycle)
+        # Reference: CONSISTENCY_DESIGN.md §4.2 & §6.3
+        # We assume that any "Zombie" files (NFS cache artifacts) would have been discovered
+        # and blocked by the Tombstone during this audit cycle.
+        cutoff_time = self.state.last_audit_start
         before = len(self.state.tombstone_list)
         
         self.state.tombstone_list = {
             path: (l_ts, p_ts) for path, (l_ts, p_ts) in self.state.tombstone_list.items()
-            if (now_physical - p_ts) < tombstone_ttl_seconds
+            if p_ts >= cutoff_time
         }
         cleaned = before - len(self.state.tombstone_list)
         if cleaned > 0:
@@ -75,14 +75,18 @@ class AuditManager:
                             self.logger.info(f"Blind-spot deletion detected: {child_node.path}")
                             paths_to_delete.append(child_node.path)
             
-            missing_count = len(paths_to_delete)
-            for path in paths_to_delete:
-                await self.tree_manager.delete_node(path)
-                self.state.blind_spot_deletions.add(path)
-                self.state.blind_spot_additions.discard(path)
+            try:
+                missing_count = len(paths_to_delete)
+                for path in paths_to_delete:
+                    await self.tree_manager.delete_node(path)
+                    self.state.blind_spot_deletions.add(path)
+                    self.state.blind_spot_additions.discard(path)
+            except Exception as e:
+                self.logger.error(f"Error during missing item deletion: {e}")
+                # We continue to ensure state cleanup
         
         self.logger.info(f"Audit ended. Tombstones cleaned: {cleaned}, Missing items deleted: {missing_count}")
-        self.state.last_audit_finished_at = now_physical
+        self.state.last_audit_finished_at = time.time()
         self.state.audit_cycle_count += 1
         self.state.last_audit_start = None
         self.state.audit_seen_paths.clear()

@@ -25,6 +25,7 @@ class CreateSessionRequest(BaseModel):
     """Request payload for creating a new session."""
     task_id: str
     client_info: Optional[Dict[str, Any]] = None
+    session_timeout_seconds: Optional[int] = None
 
 
 class CreateSessionResponse(BaseModel):
@@ -71,7 +72,7 @@ class SessionInfo:
 
 
 # Type aliases for callbacks
-SessionCreatedCallback = Callable[[str, str, str, Dict[str, Any]], Awaitable[SessionInfo]]
+SessionCreatedCallback = Callable[[str, str, str, Dict[str, Any], int], Awaitable[SessionInfo]]
 EventReceivedCallback = Callable[[str, List[EventBase], str, bool], Awaitable[bool]]
 HeartbeatCallback = Callable[[str, bool], Awaitable[Dict[str, Any]]]
 SessionClosedCallback = Callable[[str], Awaitable[None]]
@@ -111,7 +112,8 @@ class HTTPReceiver(Receiver):
         
         
         # Session timeout configuration
-        self.session_timeout_seconds = config.get("session_timeout_seconds", 30)
+        self.session_timeout_seconds = config.get("session_timeout_seconds", 30) if config else 30
+        print(f"DEBUG_PRINT: HTTPReceiver {receiver_id} at {id(self)} __init__ config={config}, determined_timeout={self.session_timeout_seconds}")
         
         # Create routers
         self._session_router = self._create_session_router()
@@ -210,15 +212,23 @@ class HTTPReceiver(Receiver):
             
             session_id = str(uuid.uuid4())
             
+            # Use client-requested timeout if provided, otherwise fallback to receiver config
+            session_timeout_seconds = payload.session_timeout_seconds or receiver.session_timeout_seconds
+            print(f"DEBUG_PRINT: Handler in {id(receiver)}: payload.timeout={payload.session_timeout_seconds}, receiver.timeout={receiver.session_timeout_seconds}, final={session_timeout_seconds}")
+            
             if receiver._on_session_created:
                 try:
                     session_info = await receiver._on_session_created(
-                        session_id, payload.task_id, pipeline_id, payload.client_info or {}
+                        session_id, 
+                        payload.task_id, 
+                        pipeline_id, 
+                        payload.client_info or {},
+                        session_timeout_seconds
                     )
                     return CreateSessionResponse(
                         session_id=session_info.session_id,
                         role=session_info.role,
-                        session_timeout_seconds=receiver.session_timeout_seconds,
+                        session_timeout_seconds=session_timeout_seconds,
                         message="Session created successfully"
                     )
                 except Exception as e:

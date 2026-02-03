@@ -55,8 +55,7 @@ class TestLeaderFailover:
         
         try:
             # Wait for session timeout (typically 30-60 seconds)
-            # The exact time depends on the configured timeout
-            timeout_wait = MEDIUM_TIMEOUT  # Wait longer than session timeout
+            timeout_wait = MEDIUM_TIMEOUT  # Wait longer than session timeout (4s in docker-compose)
             print(f"Waiting {timeout_wait}s for leader session timeout...")
             time.sleep(timeout_wait)
             

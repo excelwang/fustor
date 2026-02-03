@@ -71,14 +71,29 @@ def reset_fusion_state(fusion_client):
     for container in containers:
         try:
             # Force kill any running agents
-            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"])
+            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"], timeout=10)
             # Remove state files
-            docker_manager.exec_in_container(container, ["rm", "-f", "/root/.fustor/agent.pid"])
-            docker_manager.exec_in_container(container, ["rm", "-f", "/root/.fustor/agent-state.json"])
+            docker_manager.exec_in_container(container, ["rm", "-f", "/root/.fustor/agent.pid"], timeout=5)
+            docker_manager.exec_in_container(container, ["rm", "-f", "/root/.fustor/agent-state.json"], timeout=5)
         except Exception:
             pass
+            
+    # 2. Clean Monitor Directory (Shared Mount)
+    logger.info("Cleaning shared directory before test...")
+    for container in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]:
+        try:
+            # removing * is safer than removing the mount point itself
+            docker_manager.exec_in_container(container, ["sh", "-c", f"rm -rf {MOUNT_POINT}/*"], timeout=20)
+        except Exception:
+            pass
+            
+    # Also clean from NFS server directly to be sure
+    try:
+        docker_manager.exec_in_container(CONTAINER_NFS_SERVER, ["sh", "-c", "rm -rf /exports/*"], timeout=20)
+    except Exception:
+        pass
 
-    # 2. Reset Fusion state
+    # 3. Reset Fusion state
     try:
         fusion_client.reset()
     except Exception as e:
