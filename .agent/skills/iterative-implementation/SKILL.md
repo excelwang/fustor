@@ -42,15 +42,18 @@ graph TD
 
 ## 3. 详细执行步骤 (Loop Execution)
 
-### Step 2: Coding (执行)
-- 编写代码。包含业务逻辑和对应的单元/集成测试。
-- **Call Skill**: 调用 `test-engineer` 执行测试与验证。
-  - Type A: 新写功能测一遍。
-  - Type B: 跑一遍相关回归。
-- **Self-Correction**: 如果 `test-engineer` 报告失败，直接在 Step 2 内部循环修复，直到测试通过，**然后再**进入 Step 3。
+### Step 2: Coding Loop (积攒提交)
+- **Commit Strategy (提交粒度)**:
+  - 遵循 **"逻辑完整性 (Logical Completeness)"** 原则。
+  - 不要改一行就提交，也不要等完全部做完才提交。
+  - **Action**: 每完成一个独立的子任务（Sub-task，如"定义数据结构"、"实现核心算法"、"完成单测"）且测试通过后，**立即执行 `git commit`**。这作为 Checkpoint，防止后续搞砸。
+  - **Loop Condition**: 如果当前 Spec Step 或功能模块尚未全部完成，继续执行 Step 2，积攒更多的 Commits。仅当一个完整的 Feature 或 Step 完成时，才进入 Step 3。
 
-### Step 3: Self-Review (司法介入)
-- **必须主动调用** `code-review-expert` skill。
+### Step 3: Self-Review (批量审查)
+- **Review Scope (审查范围)**:
+  - 必须审查 **Accumulated Diff (累积差异)**，即从任务开始时的基准点 (`Base Commit`) 到当前的 `HEAD`。
+  - Command: `git diff <Base_Commit_ID>...HEAD`
+  - 这样可以一次性审查那一批积攒的 Commits，且自动过滤掉中间过程的反复修改（如 A 加了又在 B 删了）。
 - **Auto-Select Mode (智能模式选择)**:
   1. 执行 `git branch --show-current` 获取当前分支名。
   2. **Mode B (Refactor/Migration)**: 如果分支名匹配 `refactor/*`, `migration/*` 或 `fix/legacy-*`。
@@ -58,7 +61,7 @@ graph TD
   3. **Mode A (Feature/Bugfix)**: 如果分支名匹配 `feature/*`, `feat/*`, `fix/*` (非 legacy)。
      - 重点：与 Spec 进行 Design Compliance 对比。
   4. **Mode C (Test Only)**: 如果仅修改了 `tests/` 或 `it/` 目录下的文件。
-- 传入参数：当前分支 vs Spec文档。
+- **Action**: 主动调用 `code-review-expert` skill，传入上述 Diff 内容。
 
 ### Step 4: Decision (判决)
 阅读 Review 输出的两个表格：
