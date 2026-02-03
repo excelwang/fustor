@@ -57,6 +57,10 @@ graph TD
     3. **Check**: 如果 `mv` 失败（文件不存在），说明被抢占 -> **Retry**。
     4. **Lock**: 成功后，创建 `.agent/sessions/active/{session_id}.json` 记录 Claim。
     5. 初始化 `.agent/current_task.md`。
+  - **Git Flow**:
+    1. `git fetch origin master`
+    2. `git checkout -b feature/task_[ID] origin/master`
+    3. **Rule**: 每个 Session 必须在独立分支工作，严禁直接在 master 上 commit。
 
 ### Step 2: Task Alignment (归位)
 ...
@@ -91,10 +95,10 @@ graph TD
   - **Loop Condition**: 如果当前 Spec Step 或功能模块尚未全部完成，继续执行 Step 2，积攒更多的 Commits。仅当一个完整的 Feature 或 Step 完成时，才进入 Step 3。
 
 ### Step 3: Self-Review (批量审查)
-- **Review Scope (审查范围)**:
-  - 必须审查 **Accumulated Diff (累积差异)**，即从任务开始时的基准点 (`Base Commit`) 到当前的 `HEAD`。
-  - Command: `git diff <Base_Commit_ID>...HEAD`
-  - 这样可以一次性审查那一批积攒的 Commits，且自动过滤掉中间过程的反复修改（如 A 加了又在 B 删了）。
+- **Review Scope (审查范围 - Isolation Check)**:
+  - 必须只审查 **My Delta (我的增量)**。
+  - Command: `git diff origin/master...HEAD`
+  - **Why**: 防止审查到其他 Session 已经 Merge 但我还没 Rebase 的代码，避免重复 Review。
 - **Auto-Select Mode (智能模式选择)**:
   1. 执行 `git branch --show-current` 获取当前分支名。
   2. **Mode B (Refactor/Migration)**: 如果分支名匹配 `refactor/*`, `migration/*` 或 `fix/legacy-*`。
@@ -113,6 +117,13 @@ graph TD
    - 补充缺失的功能。
    - 回到 Step 2。
 3. **Case 3: Tables clean / Review OK** -> **COMMIT & STOP**。
+
+### Step 5: Merge & Conflict (收尾)
+1. **Pre-Merge Check**: 再次运行 Contract Tests。
+2. **Rebase**: `git pull --rebase origin master`
+   - **Conflict?**: 手动解决 -> `git rebase --continue`。
+   - **Check**: 解决冲突后的逻辑是否破坏了 Feature？(Lightweight Review)。
+3. **Merge**: `git push origin feature/xxx` -> Create/Merge PR.
 
 ## 4. 状态持久化 (Task Persistence)
 

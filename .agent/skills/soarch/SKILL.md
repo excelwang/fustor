@@ -108,6 +108,7 @@ description: 负责需求分析与技术方案设计，输出标准化的技术�
 ## 3. Scope & Deliverables (范围与交付物)
 - [ ] Logic: `src/core/pipeline.py`
 - [ ] **Contract Test**: `it/specs/consistency/task_001_contract.py` (Skeleton Created)
+- [ ] **Mock**: `tests/fixtures/mocks/mock_pipeline.py` (If required by others)
 - [ ] Unit Test: `tests/unit/core/test_pipeline.py` (Optional)
 
 ## 4. Work Breakdown (执行步骤)
