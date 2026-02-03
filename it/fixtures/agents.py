@@ -129,53 +129,35 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_A}...")
     ensure_agent_running(CONTAINER_CLIENT_A, api_key, view_id)
     
-    # Wait for A to become Leader
-    logger.info("Waiting for Agent A to register and become Leader...")
-    start_wait = time.time()
-    while time.time() - start_wait < 30:
-        sessions = fusion_client.get_sessions()
-        leader = next((s for s in sessions if s.get("role") == "leader"), None)
-        if leader:
-            agent_id = leader.get("agent_id", "")
-            if "client-a" in agent_id:
-                logger.info(f"Agent A successfully became leader: {agent_id}")
-                break
-            else:
-                logger.warning(f"Someone else is leader: {agent_id}. Waiting...")
-        time.sleep(1)
-    else:
-        raise RuntimeError("Agent A did not become leader within 30 seconds")
+    # Wait for A to become Leader and Ready
+    logger.info("Waiting for Agent A to be ready (Leader + Realtime Ready)...")
+    if not fusion_client.wait_for_agent_ready("client-a", timeout=30):
+        raise RuntimeError("Agent A did not become ready (can_realtime=True) within 30 seconds")
+    
+    sessions = fusion_client.get_sessions()
+    leader = next((s for s in sessions if "client-a" in s.get("agent_id", "")), None)
+    if not leader or leader.get("role") != "leader":
+        raise RuntimeError(f"Agent A registered but not as leader ({leader.get('role') if leader else 'not found'})")
+    
+    logger.info(f"Agent A successfully became leader and is ready: {leader.get('agent_id')}")
 
     # Wait for View to be READY (Snapshot complete)
     logger.info("Waiting for View to be ready (initial snapshot completion)...")
-    start_ready = time.time()
-    while time.time() - start_ready < 30:
-        try:
-            fusion_client.get_stats()
-            logger.info("View is READY.")
-            break
-        except Exception:
-            time.sleep(0.5)
-    else:
+    if not fusion_client.wait_for_view_ready(timeout=30):
         logger.warning("View readiness check timed out. Proceeding anyway.")
+    else:
+        logger.info("View is READY.")
 
     # Start Agent B as Follower
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_B}...")
     ensure_agent_running(CONTAINER_CLIENT_B, api_key, view_id)
     
-    # Wait for Agent B to register
-    logger.info("Waiting for Agent B to register as Follower...")
-    start_wait = time.time()
-    while time.time() - start_wait < 30:
-        sessions = fusion_client.get_sessions()
-        agent_b = next((s for s in sessions if "client-b" in s.get("agent_id", "")), None)
-        if agent_b:
-            logger.info(f"Agent B registered: {agent_b.get('agent_id')} (Role: {agent_b.get('role')})")
-            break
-        time.sleep(0.5)
-    else:
+    # Wait for Agent B to be Ready
+    logger.info("Waiting for Agent B to be ready (Follower + Realtime Ready)...")
+    if not fusion_client.wait_for_agent_ready("client-b", timeout=45):
         logs = docker_manager.get_logs(CONTAINER_CLIENT_B)
         logger.warning(f"Timeout waiting for Agent B. Logs:\n{logs}")
+        # Proceeding anyway for some tests, though most will fail
 
     return {
         "api_key": api_key,

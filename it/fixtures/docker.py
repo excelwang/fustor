@@ -30,13 +30,45 @@ logger = logging.getLogger("fustor_test")
 CONTAINER_NFS_SERVER = "fustor-nfs-server"
 
 
+import hashlib
+import glob
+
+def get_env_hash():
+    """
+    Calculate hash of files that affect the Docker environment.
+    """
+    files_to_hash = [
+        str(_it_dir / "docker-compose.yml"),
+        str(_it_dir / "containers/fustor-services/Dockerfile"),
+        str(_it_dir / "containers/nfs-client/Dockerfile"),
+        str(_it_dir / "containers/nfs-client/entrypoint.sh"),
+        str(_it_dir.parent / "pyproject.toml"),
+    ]
+    # Add all package pyproject.toml files
+    files_to_hash.extend(glob.glob(str(_it_dir.parent / "packages/*/pyproject.toml")))
+    files_to_hash.extend(glob.glob(str(_it_dir.parent / "agent/pyproject.toml")))
+    files_to_hash.extend(glob.glob(str(_it_dir.parent / "fusion/pyproject.toml")))
+    
+    hasher = hashlib.md5()
+    for f in sorted(files_to_hash):
+        if os.path.exists(f):
+            with open(f, "rb") as fh:
+                hasher.update(fh.read())
+    return hasher.hexdigest()
+
+
 @pytest.fixture(scope="session")
 def docker_env():
     """
     Session-scoped fixture that manages the Docker Compose environment.
     Initializes Fusion with static configuration.
     """
-    logger.info("Checking Docker Compose environment (Auto-Reuse Mode)")
+    state_file = _it_dir / ".env_state"
+    current_hash = get_env_hash()
+    
+    stored_hash = None
+    if state_file.exists():
+        stored_hash = state_file.read_text().strip()
     
     # Check if environment is up
     try:
@@ -45,14 +77,22 @@ def docker_env():
     except Exception:
         is_up = False
         
-    if not is_up:
-        logger.info("Environment not running. Starting it automatically...")
+    needs_rebuild = not is_up or (stored_hash != current_hash)
+    
+    if needs_rebuild:
+        logger.info(f"Environment needs rebuild (Hash mismatch or not up). Hash: {current_hash}")
+        # Stop everything to ensure a clean slate if hash changed
+        if is_up:
+            docker_manager.down(volumes=True)
         docker_manager.up(build=True, wait=True)
+        # Update state file
+        state_file.write_text(current_hash)
     else:
-        # Check individual container health
+        logger.info("Environment hash matches. Reusing existing running containers.")
+        # Optional: Fast health check
         for container in [CONTAINER_NFS_SERVER, CONTAINER_FUSION]:
-            if not docker_manager.wait_for_health(container, timeout=30):
-                logger.warning(f"Container {container} not healthy. Repairing ecosystem...")
+            if not docker_manager.wait_for_health(container, timeout=10):
+                logger.warning(f"Container {container} unhealthy. Repairing...")
                 docker_manager.up(build=True, wait=True)
                 break
     
@@ -105,10 +145,18 @@ extra:
 
     # 5. Reload Fusion
 
-    logger.info("Restarting all containers to ensure fresh state...")
-    for container in [CONTAINER_FUSION, CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]:
-        docker_manager.restart_container(container)
-        docker_manager.wait_for_health(container)
+    # 5. Reload environment if needed
+    if needs_rebuild:
+        logger.info("Restarting all containers to ensure fresh state after build...")
+        for container in [CONTAINER_FUSION, CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]:
+            docker_manager.restart_container(container)
+            docker_manager.wait_for_health(container)
+    else:
+        # If we are reusing, we still might want to restart Fusion once per session 
+        # to ensure it picked up the (potentially) updated static configs.
+        logger.info("Restarting Fusion to apply static configs...")
+        docker_manager.restart_container(CONTAINER_FUSION)
+        docker_manager.wait_for_health(CONTAINER_FUSION)
     
     # 5. Log Environment Skew
     logger.info("Clock skew environment active: A:+2h, B:-1h, Fusion/NFS/Host:0")

@@ -43,10 +43,10 @@ class EventBatch(BaseModel):
 
 
 class HeartbeatResponse(BaseModel):
-    """Response for heartbeat requests."""
     status: str
     role: Optional[str] = None
     message: Optional[str] = None
+    can_realtime: Optional[bool] = None
 
 
 # --- Session Handler Protocol ---
@@ -60,6 +60,7 @@ class SessionInfo:
     role: str  # 'leader' or 'follower'
     created_at: float
     last_heartbeat: float
+    can_realtime: bool = False
 
     @property
     def pipeline_id(self) -> str:
@@ -72,7 +73,7 @@ class SessionInfo:
 # Type aliases for callbacks
 SessionCreatedCallback = Callable[[str, str, str, Dict[str, Any]], Awaitable[SessionInfo]]
 EventReceivedCallback = Callable[[str, List[EventBase], str, bool], Awaitable[bool]]
-HeartbeatCallback = Callable[[str], Awaitable[Dict[str, Any]]]
+HeartbeatCallback = Callable[[str, bool], Awaitable[Dict[str, Any]]]
 SessionClosedCallback = Callable[[str], Awaitable[None]]
 
 
@@ -235,9 +236,18 @@ class HTTPReceiver(Receiver):
         @router.post("/{session_id}/heartbeat", response_model=HeartbeatResponse)
         async def heartbeat(session_id: str, request: Request):
             """Send a heartbeat to maintain session."""
+            # Extract can_realtime from payload (if any)
+            try:
+                payload = await request.json()
+                can_realtime = payload.get("can_realtime", False)
+            except Exception:
+                can_realtime = False
+
+            logger.info(f"Received heartbeat for session {session_id}, can_realtime={can_realtime}")
+
             if receiver._on_heartbeat:
                 try:
-                    result = await receiver._on_heartbeat(session_id)
+                    result = await receiver._on_heartbeat(session_id, can_realtime)
                     return HeartbeatResponse(
                         status=result.get("status", "ok"),
                         role=result.get("role"),

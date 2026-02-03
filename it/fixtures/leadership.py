@@ -27,18 +27,13 @@ logger = logging.getLogger("fustor_test")
 
 
 @pytest.fixture
-def wait_for_audit():
+def wait_for_audit(fusion_client):
     """
     Return a function that waits for audit cycle to complete.
-    
-    Usage:
-        def test_something(wait_for_audit):
-            # ... make changes ...
-            wait_for_audit()  # Wait for default audit interval
-            # ... assert results ...
     """
-    def _wait(seconds: int = AUDIT_INTERVAL + 1):
-        time.sleep(seconds)
+    def _wait(timeout: int = 45):
+        if not fusion_client.wait_for_audit(timeout=timeout):
+             logger.warning(f"Timeout waiting for audit cycle ({timeout}s)")
     return _wait
 
 
@@ -98,15 +93,26 @@ def leader_follower_agents(setup_agents, fusion_client):
     logger.info("Restarting Agent A...")
     ensure_agent_running(CONTAINER_CLIENT_A, api_key, view_id)
     
-    # Wait for A to become leader
-    time.sleep(2)
+    # Wait for A to become leader - use polling
+    start_wait = time.time()
+    while time.time() - start_wait < 30:
+        leader = fusion_client.get_leader_session()
+        if leader and "client-a" in leader.get("agent_id", ""):
+            break
+        time.sleep(0.5)
 
     # 2. Start Client B
     logger.info("Restarting Agent B...")
     ensure_agent_running(CONTAINER_CLIENT_B, api_key, view_id)
     
-    # Wait for B
-    time.sleep(1)
+    # Wait for B - use polling
+    start_wait = time.time()
+    while time.time() - start_wait < 30:
+        sessions = fusion_client.get_sessions()
+        if any("client-b" in s.get("agent_id", "") for s in sessions):
+            break
+        time.sleep(0.5)
+    
     logger.info("Leadership reset complete.")
     
     return {
@@ -137,8 +143,20 @@ def reset_leadership(setup_agents, fusion_client):
             
         # Restart A then B
         ensure_agent_running(CONTAINER_CLIENT_A, api_key, view_id)
-        time.sleep(2)
+        # Polling for Agent A
+        start = time.time()
+        while time.time() - start < 15:
+            if fusion_client.get_leader_session(): break
+            time.sleep(0.5)
+
         ensure_agent_running(CONTAINER_CLIENT_B, api_key, view_id)
+        # Polling for Agent B
+        start = time.monotonic()
+        while time.monotonic() - start < 15:
+            sessions = fusion_client.get_sessions()
+            if any("client-b" in s.get("agent_id", "") for s in sessions): break
+            time.sleep(0.5)
+        
         logger.info("Leadership reset via fixture complete.")
         
     return _reset

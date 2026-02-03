@@ -24,3 +24,4 @@ config.yaml
 uv.lock
 *.pkl
 *.db
+it/.env_state

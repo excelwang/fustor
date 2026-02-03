@@ -306,3 +306,54 @@ class FusionClient:
                 pass
             time.sleep(interval)
         return False
+
+    def wait_for_audit(self, timeout: float = 30, interval: float = 0.5) -> bool:
+        """Wait for an audit cycle to complete."""
+        try:
+            initial_stats = self.get_stats()
+            initial_count = initial_stats.get("audit_cycle_count", 0)
+        except Exception:
+            initial_count = -1
+            
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                stats = self.get_stats()
+                current_count = stats.get("audit_cycle_count", 0)
+                if current_count > initial_count and stats.get("last_audit_finished_at", 0) > 0:
+                    return True
+            except Exception:
+                pass
+            time.sleep(interval)
+        return False
+
+    def wait_for_view_ready(self, timeout: float = 60, interval: float = 0.5) -> bool:
+        """Wait for view initial snapshot to complete and queue to drain."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                # Stats endpoint will return 503 if not ready in our readiness checker
+                self.get_stats()
+                return True
+            except requests.HTTPError as e:
+                if e.response.status_code == 503:
+                    time.sleep(interval)
+                    continue
+                raise e
+            except Exception:
+                time.sleep(interval)
+        return False
+
+    def wait_for_agent_ready(self, agent_id: str, timeout: float = 60, interval: float = 0.5) -> bool:
+        """Wait for an agent to be registered and reporting can_realtime=True."""
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                sessions = self.get_sessions()
+                agent_session = next((s for s in sessions if agent_id in s.get("agent_id", "")), None)
+                if agent_session and agent_session.get("can_realtime"):
+                    return True
+            except Exception:
+                pass
+            time.sleep(interval)
+        return False
