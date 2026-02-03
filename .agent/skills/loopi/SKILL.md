@@ -1,5 +1,5 @@
 ---
-name: iterimpl
+name: loopi
 description: 实现“编码-测试-评审”的自动化闭环。严格遵循 Spec，通过反复的 Review 迭代直到代码完全符合设计要求。
 ---
 
