@@ -12,23 +12,23 @@ description: The Central Nervous System (Entrypoint). Dispatches user intent to 
 Observe the USER's request and current system state, then dispatch:
 
 ### Case A: "I have a new requirement / ambiguity"
-- **Target Persona**: `solution-architect`
-- **Goal**: Clarify requirements, create Specs, generate Tickets.
+- **Target Persona**: `architectural-design`
+- **Goal**: Clarify requirements, code-reviewate Specs, generate Tickets.
 - **Trigger Words**: "Design", "Plan", "Refactor", "New Feature", "Fix bug in logic".
 
 ### Case B: "I want to implement / fix / continue"
-- **Target Persona**: `software-engineer` (Workflow Manager)
+- **Target Persona**: `code-implementation` (Workflow Manager)
 - **Goal**: Execute the D-C-R loop (Code -> Test -> Review).
 - **Trigger Words**: "Start ticket", "Resume", "Implement", "Fix test".
-- **Pre-condition**: Must have a Ticket in `active/` or `backlog/`. If not, route to `solution-architect` first.
+- **Pre-condition**: Must have a Ticket in `active/` or `backlog/`. If not, route to `architectural-design` first.
 
 ### Case C: "Just review this / Quick check"
-- **Target Persona**: `code-reviewer`
+- **Target Persona**: `code-review`
 - **Goal**: Static analysis, quick feedback without modifying state.
 - **Trigger Words**: "Review this file", "Check logic".
 
 ### Case D: "Run tests / Verify env"
-- **Target Persona**: `reliability-engineer`
+- **Target Persona**: `system-diagnosis`
 - **Goal**: Run test suites, diagnose failures.
 
 ## 2. Execution Flow

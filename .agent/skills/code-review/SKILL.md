@@ -1,5 +1,5 @@
 ---
-name: code-reviewer
+name: code-review
 description: 统一的代码评审专家，支持新功能审查、重构对齐审查和测试代码审查。
 ---
 
@@ -56,7 +56,7 @@ description: 统一的代码评审专家，支持新功能审查、重构对齐�
 
 ## 4. Ticket Modification Rights (权限控制)
 
-为了防止 Scope Creep，`code-reviewer` 对 Ticket 的修改权限受到严格限制：
+为了防止 Scope Creep，`code-review` 对 Ticket 的修改权限受到严格限制：
 
 1.  **Rule A: Minor Amendment (微调 - ALLOWED)**
     - **场景**: 验收标准模糊、缺少 Edge Case 测试要求。
@@ -67,7 +67,7 @@ description: 统一的代码评审专家，支持新功能审查、重构对齐�
     - **Action**:
         1. **严禁** 直接修改 Ticket 试图绕过问题。
         2. **Must**: 将 Ticket 状态标记为 `BLOCKED`。
-        3. **Escalate**: 指示 `software-engineer` 呼叫 `solution-architect` 修复 L2 Spec。
+        3. **Escalate**: 指示 `code-implementation` 呼叫 `architectural-design` 修复 L2 Spec。
 
 ## 5. Feedback Format (Standardized Artifact)
 ...

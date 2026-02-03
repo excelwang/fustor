@@ -1,5 +1,5 @@
 ---
-name: soarch
+name: architectural-design
 description: 负责需求分析与技术方案设计，输出标准化的技术规格说明书(Specification)，作为开发的唯一法律依据。
 ---
 
@@ -81,12 +81,12 @@ description: 负责需求分析与技术方案设计，输出标准化的技术�
 为了明确“契约”与“实现”的边界，测试分为两类：
 
 1.  **Contract Tests (契约测试)**:
-    - **Source**: 由 `solution-architect` 定义，对应 Spec 验收标准。
+    - **Source**: 由 `architectural-design` 定义，对应 Spec 验收标准。
     - **Path**: `it/specs/{domain}/{ticket_id}_contract.py`
     - **Rule**: 开发阶段 **只允许** 填充实现逻辑，**严禁** 修改测试意图或断言标准。这是 Review 的红线。
 
 2.  **Unit Tests (单元测试)**:
-    - **Source**: 由 `software-engineer` (Dev) 自主编写，辅助内部逻辑验证。
+    - **Source**: 由 `code-implementation` (Dev) 自主编写，辅助内部逻辑验证。
     - **Path**: `tests/unit/{module}/`
     - **Rule**: 开发者拥有完全控制权。
 
