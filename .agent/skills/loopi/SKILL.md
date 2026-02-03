@@ -48,7 +48,23 @@ graph TD
   - 询问用户要认领哪个 Task (Spec)。
 
 ### Step 2: Spec Alignment (归位)
-... (保留原逻辑)
+
+**Case A: 全新开发**
+- 前置：必须先运行 `soarch` 输出 Task 文档至 `.agent/tasks/backlog/`。
+- 启动：认领 Task，移动至 `.agent/tasks/active/`，直接进入 Coding Phase。
+
+**Case B: 既有代码接手 (Refactoring/Continuing)**
+- **Step 0: Task Alignment (归位)**
+   1. 检查 `.agent/tasks/` 下是否存在对应的 `TASK_[ID].md`。
+   2. **如果不存在**：调用 `soarch`，逆向生成 Task 文档。
+   3. **如果存在**：阅读 Task 和引用的 Spec，建立基准认知。
+- **Step 1: Baseline Review (基线审查)**
+   - 运行 `cre` (Mode B) 对比代码与 Domain Spec。
+
+### Step 1.5: Task Refinement (动态调整)
+如果在编码过程中发现任务过大或被阻塞：
+- **Action**: 调用 `soarch` REQUEST_SPLIT。
+- **Result**: 当前任务 Paused，拆分为新的小任务。重新开始 Step 0。
 
 ## 3. 详细执行步骤 (Loop Execution)
 

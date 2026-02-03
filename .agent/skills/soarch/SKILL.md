@@ -24,46 +24,66 @@ description: 负责需求分析与技术方案设计，输出标准化的技术�
 在编写代码之前，**必须**先产出设计文档。
 文档应存放在 `specs/` 目录（如不存在请创建）。
 
-## 3. Spec 划分策略 (Partitioning Strategy)
+## 3. 架构与任务分离策略 (Separation of Concerns)
 
-为了支持并行开发和清晰的 Review，Spec 必须分级：
+为了区分“法典”与“工单”，我们将文档分为两类：
 
-### Level 1: Macro Architecture (`01-ARCHITECTURE.md`)
-- 全局概念、核心组件图、系统边界。
-- **变更频率**: 极低。
+### A. Specifications (法典) - `specs/`
+> **Source of Truth**. 只有 Level 1 & 2 属于这里。
+- **Level 1**: Macro Architecture (`01-ARCHITECTURE.md`)
+- **Level 2**: Domain Specs (`10-DOMAIN_[NAME].md`)
+- **Rule**: 一旦 Review 通过，spec 应当被视为系统的当前“法律”。代码必须符合 Spec。
 
-### Level 2: Domain Specs (`10-DOMAIN_[NAME].md`)
-- 核心模块的详细设计（数据结构、状态机、不变量）。
-- **Example**: `10-DOMAIN_CONSISTENCY.md`
-- **变更频率**: 中。这是 `Review Expert` (Mode B) 的主要依据。
+### B. Tasks (工单) - `.agent/tasks/backlog/`
+> **Workload**. Level 3 移动至此。它们是实现 Spec 的过程性文件。
+- **Naming**: `TASK_[ID]_[TITLE].md`
+- **Lifecycle**: Backlog -> In Progress -> Done (Archived)
+- **Content**: 引用 Spec，定义具体的 TODO List 和 Checkpoints。
 
-### Level 3: Feature/Task Specs (`20-TASK_[ID].md`)
-- 具体开发任务的执行计划（Action Plan）。
-- **Example**: `20-TASK_REF_001_REMOVE_PUSHER.md`
-- **变更频率**: 高。任务完成后归档。
+## 4. 并行拆分与动态调整 (Parallelism & Adjustment)
 
-## 4. 特性任务文档模板 (Level 3 Template)
+### 4.1 拆分策略 (Splitting for Parallelism)
+为了让多个 Session 能并行工作，拆分任务时遵循以下原则：
+1.  **Interface First (契约先行)**: 先在 Spec 中定义好 Interface。一旦 Interface 确定，Producer 和 Consumer 模块即可并行开发。
+2.  **Horizontal Slicing (水平切分)**: 将 Adapter、Core、Driver 拆分为独立任务。
+3.  **Dependency Graph (依赖图)**: 在 Task 中明确 `Prerequisites`。无依赖的任务优先进入 `Active` 队列。
+
+### 4.2 动态调整 (Dynamic Adjustment)
+随着代码实现，最初的任务划分可能变得不合理（太大或太难）。
+- **Action**: 随时可以 **Fork** 或 **Split** 任务。
+- **Trigger**: 当一个 Step 包含超过 5 个原子 Commits 仍未完成时。
+- **Operation**:
+  1. 将当前 Task 标记为 `Paused`。
+  2. 创建两个新的子任务 Task A & Task B。
+  3. 更新原 Task 引用这些子任务。
+
+## 5. 任务文档模板 (Task Template)
 
 ```markdown
 # Task: [ID] [Title]
-> Status: Draft | In Progress | Reviewing | Done
+> Status: Draft | Backlog | In Progress | Paused | Reviewing | Done
 > Owner: AI Assistant
-> Related Domain Spec: specs/10-DOMAIN_XXX.md
+> Created: 202X-XX-XX
 
 ## 1. Goal (目标)
 简述本次变更的业务价值。
 
-## 2. Scope (范围)
+## 2. References (依据)
+> 此任务必须基于以下 Spec 执行：
+- [ ] Spec: `specs/10-DOMAIN_XXX.md`
+- [ ] Prerequisites: Task ID [If Any]
+
+## 3. Scope (范围)
 - [ ] Logic: `src/core/pipeline.py`
 - [ ] Test: `it/consistency/`
 
-## 3. Implementation Steps (实施步骤)
+## 4. Work Breakdown (执行步骤)
 按依赖顺序拆解为原子步骤（对应 Atomic Commits）：
 1. **Step 1**: Define Interface (Interface-first design)
 2. **Step 2**: Implement Core Logic
 3. **Step 3**: Update Tests
 
-## 4. Acceptance Criteria (验收标准)
+## 5. Acceptance Criteria (验收标准)
 > Review Gate Checklist
 - [ ] Feature Parity: 旧版 Pusher 逻辑是否完全覆盖？
 - [ ] Test Pass: `uv run pytest it/xxx` 全绿。
