@@ -43,6 +43,7 @@ description: 统一的代码评审专家，支持新功能审查、重构对齐�
    - **Pollution**: 测试代码是否为了方便测试而污染了业务逻辑？（严查额外的方法或属性）
    - **Mocking**: Mock 是否过于虚假？
    - **Coverage**: 关键路径是否覆盖？
+   - **Test Parity (Regression)**: 对比 Master 分支，确保没有意外删除原有的有效测试用例（Test Case Regression）。
    - **Determinism**: 严禁使用 hardcoded `sleep()` 或盲目等待。必须建议使用 **带循环检测条件的等待** (conditional waiting with loop detection, e.g., `wait_for_condition(lambda: check(), timeout=5)`)。
 
 ## 3. Feedback Format (Standardized Artifact)
