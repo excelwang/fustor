@@ -1,6 +1,6 @@
 ---
 name: cortex
-description: The Central Nervous System (Entrypoint). Dispatches user intent to the appropriate Persona (Soarch, Loopi, CRE).
+description: The Central Nervous System (Entrypoint). Dispatches user intent to the appropriate Persona.
 ---
 
 # Cortex (System Entrypoint)
@@ -12,23 +12,23 @@ description: The Central Nervous System (Entrypoint). Dispatches user intent to 
 Observe the USER's request and current system state, then dispatch:
 
 ### Case A: "I have a new requirement / ambiguity"
-- **Target Persona**: `soarch` (Solution Architect)
+- **Target Persona**: `solution-architect`
 - **Goal**: Clarify requirements, create Specs, generate Tickets.
 - **Trigger Words**: "Design", "Plan", "Refactor", "New Feature", "Fix bug in logic".
 
 ### Case B: "I want to implement / fix / continue"
-- **Target Persona**: `loopi` (Workflow Manager)
+- **Target Persona**: `software-engineer` (Workflow Manager)
 - **Goal**: Execute the D-C-R loop (Code -> Test -> Review).
 - **Trigger Words**: "Start ticket", "Resume", "Implement", "Fix test".
-- **Pre-condition**: Must have a Ticket in `active/` or `backlog/`. If not, route to `soarch` first.
+- **Pre-condition**: Must have a Ticket in `active/` or `backlog/`. If not, route to `solution-architect` first.
 
 ### Case C: "Just review this / Quick check"
-- **Target Persona**: `cre` (Code Review Expert)
+- **Target Persona**: `code-reviewer`
 - **Goal**: Static analysis, quick feedback without modifying state.
 - **Trigger Words**: "Review this file", "Check logic".
 
 ### Case D: "Run tests / Verify env"
-- **Target Persona**: `tester` (Test Engineer)
+- **Target Persona**: `test-engineer`
 - **Goal**: Run test suites, diagnose failures.
 
 ## 2. Execution Flow

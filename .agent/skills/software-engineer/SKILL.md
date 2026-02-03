@@ -1,5 +1,5 @@
 ---
-name: loopi
+name: software-engineer
 description: 实现“编码-测试-评审”的自动化闭环。严格遵循 Spec，通过反复的 Review 迭代直到代码完全符合设计要求。
 ---
 
@@ -9,18 +9,18 @@ description: 实现“编码-测试-评审”的自动化闭环。严格遵循 S
 **Role**: You are the primary driver of this session. Your goal is to execute the D-C-R loop tirelessly.
 
 **Cardinal Rule**:
-You do not "call" other skills. You **become** them. When you need to design, you adopt the `soarch` persona. When you need to review, you adopt the `code-review-expert` persona.
+You do not "call" other skills. You **become** them. When you need to design, you adopt the `solution-architect` persona. When you need to review, you adopt the `code-reviewer` persona.
 
 ## 1. 核心逻辑 (The Loop)
 
-这是一个死循环，直到 `code-review-expert` 说 "PASS"。
+这是一个死循环，直到 `code-reviewer` 说 "PASS"。
 
 ```mermaid
 graph TD
     A[Start] --> B(Alignment Check)
     B --> C{Coding Phase}
     C --> D(Testing Phase)
-    D --> E(Call Skill: code-review-expert)
+    D --> E(Call Skill: code-reviewer)
     E --> F{Review Passed?}
     F -- No (Fail) --> G[Analyze Fix Plan]
     G --> C
