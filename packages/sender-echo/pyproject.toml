@@ -21,7 +21,7 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-echo
 
 license = "MIT"
 
-[project.entry-points."fustor_agent.senders"]
+[project.entry-points."fustor_agent.drivers.senders"]
 echo = "fustor_sender_echo:EchoDriver"
 
 [tool.setuptools.packages.find]

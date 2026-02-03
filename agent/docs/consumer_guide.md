@@ -2,7 +2,7 @@
 
 ## 1. 引言
 
-本指南旨在帮助开发者构建一个可以作为 Fustor Agent 数据接收端的后端服务（以下称为“Consumer”）。一个合格的 Consumer 服务必须实现一套特定的API接口和交互逻辑，以便与 Fustor Agent 的 `pusher_openapi` 驱动进行高效、可靠的数据同步，尤其是在涉及多个 Fustor Agent 实例的分布式部署场景中。
+本指南旨在帮助开发者构建一个可以作为 Fustor Agent 数据接收端的后端服务（以下称为“Consumer”）。一个合格的 Consumer 服务必须实现一套特定的API接口和交互逻辑，以便与 Fustor Agent 的 `sender_openapi` 驱动进行高效、可靠的数据同步，尤其是在涉及多个 Fustor Agent 实例的分布式部署场景中。
 
 Fustor Agent 采用了“消息优先，消费者驱动并发快照”的先进架构。在此模型下，Consumer 不仅是被动的数据接收者，更是整个同步流程的“指挥者”之一，负责按需请求历史数据快照，并处理可能出现的重复数据。
 
@@ -10,7 +10,7 @@ Fustor Agent 采用了“消息优先，消费者驱动并发快照”的先进�
 
 ## 2. 核心交互协议：信封协议 (Envelope Protocol)
 
-Fustor Agent 的 `pusher_openapi` 驱动与 Consumer 之间的所有数据推送，都遵循一个统一的“信封”JSON结构。您的批量接收端点必须能接收和处理这种格式的 `POST` 请求。
+Fustor Agent 的 `sender_openapi` 驱动与 Consumer 之间的所有数据推送，都遵循一个统一的“信封”JSON结构。您的批量接收端点必须能接收和处理这种格式的 `POST` 请求。
 
 ### 推送请求体 (Request Body)
 
@@ -95,7 +95,7 @@ Fustor Agent 的 `pusher_openapi` 驱动与 Consumer 之间的所有数据推送
 
 ## 5. 认证
 
-所有被 Fustor Agent 调用的端点都**必须**使用相同的认证方案。`pusher_openapi` 驱动支持标准的 `Basic Auth` 和 `Bearer Token` (API Key) 认证。
+所有被 Fustor Agent 调用的端点都**必须**使用相同的认证方案。`sender_openapi` 驱动支持标准的 `Basic Auth` 和 `Bearer Token` (API Key) 认证。
 
 ## 6. 完整交互流程示例
 

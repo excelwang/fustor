@@ -23,7 +23,7 @@ class SenderHandler(Handler):
     They are used on the Agent side.
     
     This is the V2 architecture replacement for the driver-based
-    Pusher pattern.
+    legacy Pusher pattern.
     """
     
     @abstractmethod

@@ -42,7 +42,7 @@ sequenceDiagram
     participant User as 用户/API
     participant SIS as PipelineInstanceService
     participant SI as AgentPipeline (控制器)
-    participant PDI as PusherDriver Instance
+    participant PDI as SenderDriver Instance
     participant EBS as EventBusService
     participant EB as EventBusRuntime
     participant SDI as SourceDriver Instance
@@ -92,7 +92,7 @@ sequenceDiagram
 ```
 
 1.  **请求入口与创建**: 用户操作触发 `PipelineInstanceService.start_one(pipeline_id)`，服务实例化一个 `AgentPipeline` 控制器并启动其主控制循环。
-2.  **建立会话与获取检查点**: `AgentPipeline` 启动后，首先调用 `pusher_driver.create_session()` 与消费端建立会话，然后使用返回的 `session_id` 调用 `get_latest_committed_index()` 获取上次的同步点位 `start_position`。
+2.  **建立会话与获取检查点**: `AgentPipeline` 启动后，首先调用 `sender_driver.create_session()` 与消费端建立会话，然后使用返回的 `session_id` 调用 `get_latest_committed_index()` 获取上次的同步点位 `start_position`。
 3.  **启动心跳**: `AgentPipeline` 并发启动一个后台心跳任务 `_run_heartbeat_loop`，定期向消费端发送心跳以保持会话有效。
 4.  **请求总线与点位检查**: `AgentPipeline` 带着 `start_position` 调用 `EventBusService` 请求事件总线。`EventBusService` 在此过程中会检查源驱动是否能从该点位提供数据。如果不能，它会返回 `needed_position_lost=True`。
 5.  **自主触发并发快照**: 如果 `EventBusService` 返回 `needed_position_lost=True`，`AgentPipeline` 会立即使用 `asyncio.create_task()` **异步启动**一个 `_run_message_sync` 任务进行数据回填，然后**不等待其完成**，继续执行下一步。
@@ -125,14 +125,14 @@ graph TD
 
     subgraph Drivers
         SourceDrv[(Source Driver)]
-        PusherDrv[(Pusher Driver)]
+        SenderDrv[(Sender Driver)]
     end
 
     UC -->|Controls| SIS
     SIS -- Manages & Creates --> SI
 
     %% Session and Message Flow
-    SI -- "1. Manages Session" --> PusherDrv
+    SI -- "1. Manages Session" --> SenderDrv
     SI -- "2. Starts Message Bus" --> EBS
     EBS -- Provides --> EB
     EB -- "Produces Msgs from" --> DS
@@ -140,7 +140,7 @@ graph TD
     SI -- "Consumes Msgs from" --> EB
     
     %% Main Loop
-    SI -- "Pushes Msgs" --> PusherDrv
+    SI -- "Pushes Msgs" --> SenderDrv
 
     %% Concurrent Snapshot (if needed)
     SI -- "Triggers Snapshot (Autonomous Task)" --> DS
@@ -151,5 +151,5 @@ graph TD
 
     class SIS,EBS,CS,DS service
     class SI,EB runtime
-    class SourceDrv,PusherDrv driver
+    class SourceDrv,SenderDrv driver
 ```

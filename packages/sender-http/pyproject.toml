@@ -30,9 +30,7 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-http
 [project.entry-points."fustor_agent.drivers.senders"]
 fusion = "fustor_sender_http:HTTPSender"
 
-# Legacy entry point for backward compatibility
-[project.entry-points."fustor_agent.drivers.pushers"]
-fusion = "fustor_sender_http:HTTPSender"
+
 
 [tool.setuptools_scm]
 root = "../.."

@@ -32,7 +32,7 @@ sequenceDiagram
     P->>Q: await asyncio.to_thread(event_queue.get())
     Note left of P: 异步等待，<br>在等待期间 M 可以处理其他任务。 
     Q-->>P: 返回一个事件 (Event)
-    P->>P: 处理事件 (await pusher.push(event))
+    P->>P: 处理事件 (await sender.push(event))
     P->>Q: 再次异步等待下一个事件...
 ```
 
@@ -53,7 +53,7 @@ sequenceDiagram
 ```mermaid
 sequenceDiagram
     participant Main as _run_message_sync (主循环)
-    participant RDI as PusherDriver Instance
+    participant RDI as SenderDriver Instance
     participant BG as _run_message_sync (后台任务)
     participant SDI as SourceDriver Instance
 

@@ -50,7 +50,7 @@ async def test_transient_source_buffer_full_triggers_error(caplog):
             )
             await app.source_config_service.add_config("test-fs-source", source_config)
             
-            # 4. Configure Pusher (Echo)
+            # 4. Configure Sender (Echo)
             sender_config = SenderConfig(
                 driver="echo",
                 uri="http://localhost:8080/echo",
@@ -60,12 +60,12 @@ async def test_transient_source_buffer_full_triggers_error(caplog):
                 retry_delay_sec=1,
                 disabled=False
             )
-            await app.sender_config_service.add_config("test-echo-pusher", sender_config)
+            await app.sender_config_service.add_config("test-echo-sender", sender_config)
             
             # 5. Configure Sync
             pipeline_config = PipelineConfig(
                 source="test-fs-source",
-                sender="test-echo-pusher",
+                sender="test-echo-sender",
                 disabled=False,
                 fields_mapping=[
                     FieldMapping(to="file_path", source=["file_path"], required=True)

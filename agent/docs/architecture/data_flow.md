@@ -28,9 +28,9 @@
 
 全新的、确定性的恢复与数据流如下：
 
-1.  **创建会话**: `AgentPipeline` (同步控制器) 启动后，第一步是调用 `pusher_driver.create_session(task_id)`，向消费端请求创建一个新的同步会话，并获取 `session_id`。
+1.  **创建会话**: `AgentPipeline` (同步控制器) 启动后，第一步是调用 `sender_driver.create_session(task_id)`，向消费端请求创建一个新的同步会话，并获取 `session_id`。
 
-2.  **查询检查点**: `AgentPipeline` 使用获取到的 `session_id` 调用 `pusher_driver.get_latest_committed_index(session_id=...)`，从消费端获取上一次成功同步的检查点 `start_position`。
+2.  **查询检查点**: `AgentPipeline` 使用获取到的 `session_id` 调用 `sender_driver.get_latest_committed_index(session_id=...)`，从消费端获取上一次成功同步的检查点 `start_position`。
 
 3.  **启动消息阶段与“尽力而为”**: `AgentPipeline` 请求 `EventBusService` 从 `start_position` 开始提供数据。`EventBusService` 进而要求 `SourceDriver` 的 `get_message_iterator` 从该点位开始。
     *   **如果点位有效**，驱动正常返回事件迭代器。
@@ -42,7 +42,7 @@
     *   **主任务 (消息阶段)**: `AgentPipeline` 的主控制循环**不会等待快照**，而是继续执行，从 `EventBus` 获取从**最新点位**开始的实时事件，并推送到消费端。
     *   **后台任务 (快照同步)**: `_run_message_sync` 任务独立运行，分批推送历史数据，完全不影响主线程的实时消息处理。
 
-6.  **心跳维持**: 在整个过程中，一个独立的后台任务会定期调用 `pusher_driver.heartbeat(session_id=...)`，确保会话在消费端保持有效。
+6.  **心跳维持**: 在整个过程中，一个独立的后台任务会定期调用 `sender_driver.heartbeat(session_id=...)`，确保会话在消费端保持有效。
 
 通过这种方式，系统保证了实时数据流的绝对优先和低延迟，同时提供了一个由 Agent 自身闭环控制的、对主流程无阻塞的、健壮的历史数据回填机制。
 

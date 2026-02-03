@@ -4,7 +4,7 @@
 
 驱动层是 Fustor Agent 与外部世界交互的桥梁。它通过定义一套标准的抽象基类（Abstract Base Classes, ABCs），将 Fustor Agent 的核心业务逻辑（如任务调度、状态管理）与具体的数据系统（如 MySQL, PostgreSQL, 文件系统）完全解耦。
 
-所有驱动都必须继承自 `SourceDriver` 或 `PusherDriver` 这两个 ABC 之一，并实现其定义的所有抽象方法。这种设计强制确保了所有驱动都遵循统一、明确的接口契约。
+所有驱动都必须继承自 `SourceDriver` 或 `SenderDriver` 这两个 ABC 之一，并实现其定义的所有抽象方法。这种设计强制确保了所有驱动都遵循统一、明确的接口契约。
 
 ### 动态加载机制
 
@@ -60,9 +60,9 @@
 
 ---
 
-## 3. PusherDriver (数据推送驱动)
+## 3. SenderDriver (数据推送驱动)
 
-**`fustor_core.drivers.PusherDriver`**
+**`fustor_core.drivers.SenderDriver`**
 
 数据推送驱动的职责是连接到下游系统（Consumer），建立并维护一个同步会话，并遵循"信封协议"来批量推送事件数据。
 
