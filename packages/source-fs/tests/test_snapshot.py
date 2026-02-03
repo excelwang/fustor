@@ -7,6 +7,12 @@ from fustor_source_fs import FSDriver
 from fustor_core.models.config import SourceConfig, PasswdCredential
 from fustor_core.event import UpdateEvent
 
+@pytest.fixture(autouse=True)
+def clear_driver_instances():
+    """Clears the FSDriver singleton instances before each test."""
+    from fustor_source_fs import FSDriver
+    FSDriver._instances.clear()
+
 @pytest.fixture
 def fs_config(tmp_path: Path):
     """Provides a default FS SourceConfig pointing to a temporary directory."""
@@ -23,8 +29,8 @@ def mock_watch_manager(mocker):
     manager.watches = {}
     manager.lru_cache = MagicMock()
     manager.lru_cache.get_oldest.return_value = (None, 0)
-    # Patch where it is imported in fustor_source_fs/__init__.py
-    mocker.patch('fustor_source_fs._WatchManager', return_value=manager)
+    # Patch where it is imported in fustor_source_fs/driver.py
+    mocker.patch('fustor_source_fs.driver._WatchManager', return_value=manager)
     return manager
 
 def test_snapshot_finds_files_and_generates_events(fs_config, tmp_path: Path, mock_watch_manager):

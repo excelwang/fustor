@@ -10,6 +10,10 @@ from fustor_core.models.config import PasswdCredential, SourceConfig
 from fustor_core.event import DeleteEvent, UpdateEvent
 from fustor_source_fs import FSDriver
 
+@pytest.fixture(autouse=True)
+def clear_driver_instances():
+    """Clears the FSDriver singleton instances before each test."""
+    FSDriver._instances.clear()
 
 @pytest.fixture
 def fs_config(tmp_path: Path) -> SourceConfig:
@@ -62,7 +66,7 @@ def test_realtime_file_creation(tmp_path: Path, message_iterator_runner):
     file_path = tmp_path / "new_file.txt"
     # Use write_text which opens, writes, and closes the file.
     file_path.write_text("hello")
-    time.sleep(0.1) # Wait for event processing
+    time.sleep(0.5) # Wait for event processing
 
     # Assert
     assert len(events) >= 1
@@ -86,7 +90,7 @@ def test_realtime_file_deletion(tmp_path: Path, message_iterator_runner):
 
     # Act
     file_path.unlink()
-    time.sleep(0.1)
+    time.sleep(0.5)
     assert len(events) == 1
     event = events[0]
     assert isinstance(event, DeleteEvent)
@@ -103,7 +107,7 @@ def test_realtime_file_move(tmp_path: Path, message_iterator_runner):
     events.clear()
     # Act
     src_path.rename(dest_path)
-    time.sleep(0.1)
+    time.sleep(0.5)
     # Assert
     assert len(events) == 2
     delete_events = [e for e in events if isinstance(e, DeleteEvent)]

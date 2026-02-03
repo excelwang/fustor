@@ -127,18 +127,3 @@ class EchoDriver(Sender):
         """
         return {}
 
-    @classmethod
-    async def get_wizard_steps(cls) -> Dict[str, Any]:
-        """Provides a simple wizard definition for the Echo driver."""
-        return {
-            "steps": [
-                {
-                    "step_id": "confirmation",
-                    "title": "Echo Driver",
-                    "schema": {
-                        "type": "object",
-                        "description": "此驱动没有任何需要配置的参数。它会将接收到的所有事件打印到日志中。"
-                    }
-                }
-            ]
-        }

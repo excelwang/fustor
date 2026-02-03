@@ -215,12 +215,6 @@ class SenderDriver(ABC):
         """
         return (True, "Privilege check not implemented for this driver.")  
     
-    @classmethod
-    async def get_wizard_steps(cls) -> Dict[str, Any]:
-        """
-        Optional: Provides configuration wizard steps for UI integration.
-        """
-        return {} 
 
 
 
@@ -356,11 +350,3 @@ class SourceDriver(ABC):
         Optional: Creates a agent user for the source service.
         """
         return (True, "Agent user creation not implemented for this driver.")
-    
-    @classmethod
-    async def get_wizard_steps(cls) -> Dict[str, Any]:
-        """
-        Optional: Provides configuration wizard steps for UI integration.
-        Returns a dictionary defining the steps.
-        """
-        return {}

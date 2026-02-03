@@ -39,15 +39,6 @@ async def test_echo_driver_get_needed_fields():
     # 3. Assert
     assert fields == {}
 
-@pytest.mark.asyncio
-async def test_echo_driver_get_wizard_steps():
-    """Tests the get_wizard_steps class method."""
-    # 1. Arrange & 2. Act
-    wizard = await EchoDriver.get_wizard_steps()
-
-    # 3. Assert
-    assert "steps" in wizard
-    assert wizard["steps"][0]["step_id"] == "confirmation"
 
 @pytest.mark.asyncio
 async def test_echo_driver_cumulative_push(caplog):

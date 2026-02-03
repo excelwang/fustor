@@ -384,63 +384,6 @@ class MysqlDriver(SourceDriver):
             if conn is not None:
                 conn.close()
     
-    @classmethod
-    async def get_wizard_steps(cls) -> Dict[str, Any]:
-        return {
-            "steps": [
-                {
-                    "step_id": "connection",
-                    "title": "连接与发现",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "uri": {
-                                "type": "string",
-                                "title": "URI",
-                                "description": "MySQL服务器地址 (例如, localhost:3306)",
-                                "pattern": "^[a-zA-Z0-9._-]+:\\\\d+$"
-                            },
-                            "admin_creds": {
-                                "$ref": "#/components/schemas/PasswdCredential",
-                                "title": "管理员凭证",
-                                "description": "用于执行连接测试、环境检查和创建代理用户的一次性管理员凭证。此凭证不会被保存。"
-                            }
-                        },
-                        "required": ["uri", "admin_creds"]
-                    },
-                    "validations": ["test_connection", "check_params", "discover_fields_no_cache"]
-                },
-                {
-                    "step_id": "agent_setup",
-                    "title": "代理用户与参数",
-                    "schema": {
-                        "type": "object",
-                        "properties": {
-                            "credential": {
-                                "$ref": "#/components/schemas/PasswdCredential",
-                                "title": "代理用户凭证",
-                                "description": "为FuAgent创建一个专用的、权限受限的用户，用于日常的数据拉取。此凭证将被保存。"
-                            }
-                        },
-                        "required": ["credential"]
-                    },
-                    "validations": ["create_agent_user", "check_privileges"]
-                }
-            ],
-            "components": {
-                "schemas": {
-                    "PasswdCredential": {
-                        "type": "object",
-                        "title": "用户名/密码凭证",
-                        "properties": {
-                            "user": { "type": "string", "title": "用户名" },
-                            "passwd": { "type": "string", "title": "密码", "format": "password" }
-                        },
-                        "required": ["user"]
-                    }
-                }
-            }
-        }
 
 # --- Module-level helper functions and classes ---
 
