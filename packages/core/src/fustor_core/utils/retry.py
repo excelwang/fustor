@@ -8,9 +8,18 @@ logger = logging.getLogger(__name__)
 def retry(max_retries_attr: str, delay_sec_attr: str, exceptions: tuple = (DriverError,)):
     def decorator(func):
         @wraps(func)
+        @wraps(func)
         async def wrapper(self, *args, **kwargs):
-            max_retries = getattr(self.config, max_retries_attr)
-            delay_sec = getattr(self.config, delay_sec_attr)
+            max_retries = 3
+            delay_sec = 1
+            
+            if hasattr(self, 'config'):
+                if isinstance(self.config, dict):
+                    max_retries = self.config.get(max_retries_attr, 3)
+                    delay_sec = self.config.get(delay_sec_attr, 1)
+                else:
+                    max_retries = getattr(self.config, max_retries_attr, 3)
+                    delay_sec = getattr(self.config, delay_sec_attr, 1)
             
             retries = 0
             while True:

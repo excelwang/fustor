@@ -519,3 +519,36 @@ class OpenApiDriver(Sender):
                 }
             }
         }
+
+    @classmethod
+    async def _get_spec(cls, client: httpx.AsyncClient, endpoint: str) -> Dict[str, Any]:
+        """Fetch and cache the OpenAPI specification."""
+        if endpoint in _spec_cache:
+            return _spec_cache[endpoint]
+            
+        try:
+            resp = await client.get(endpoint, timeout=10.0)
+            resp.raise_for_status()
+            spec = resp.json()
+            _spec_cache[endpoint] = spec
+            return spec
+        except Exception as e:
+            logger.error(f"Failed to fetch OpenAPI spec from {endpoint}: {e}")
+            raise DriverError(f"Failed to fetch OpenAPI spec: {e}")
+
+    @classmethod
+    async def _get_all_post_endpoints_details(cls, client: httpx.AsyncClient, endpoint: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+        """Get spec and filter for POST endpoints."""
+        spec = await cls._get_spec(client, endpoint)
+        post_endpoints = []
+        
+        paths = spec.get("paths", {})
+        for path, details in paths.items():
+            if "post" in details:
+                post_op = details["post"]
+                # Store minimal info needed
+                post_endpoints.append({
+                    "path": path,
+                    "schema": post_op.get("requestBody", {}).get("content", {}).get("application/json", {}).get("schema", {})
+                })
+        return spec, post_endpoints

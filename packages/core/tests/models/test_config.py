@@ -60,11 +60,11 @@ def test_app_config_add_get_delete_sender():
     app_config = AppConfig()
     sender_config = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
 
-    # Add pusher
+    # Add sender
     app_config.add_sender("my_sender", sender_config)
     assert app_config.get_sender("my_sender") == sender_config
 
-    # Add duplicate pusher
+    # Add duplicate sender
     with pytest.raises(ConfigError, match="Sender config with name 'my_sender' already exists."):
         app_config.add_sender("my_sender", sender_config)
 

@@ -1,6 +1,6 @@
 """
-Test cases specifically for echo pusher logging functionality.
-This test verifies the echo pusher can write to logs for various event types.
+Test cases specifically for echo sender logging functionality.
+This test verifies the echo sender can write to logs for various event types.
 """
 import pytest
 import logging
