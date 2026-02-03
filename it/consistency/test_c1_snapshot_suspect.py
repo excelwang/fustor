@@ -9,6 +9,7 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT
+from ..fixtures.constants import SHORT_TIMEOUT, EXTREME_TIMEOUT
 
 
 class TestSnapshotTriggersSuspect:
@@ -39,15 +40,11 @@ class TestSnapshotTriggersSuspect:
             content="recent file for suspect test"
         )
         
-        # Wait for Audit to discover and mark as suspect
-        # Marker synchronization
-        marker_file = f"{MOUNT_POINT}/audit_marker_c1_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Wait for Audit completion
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
         
         # File should appear
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         assert found is not None, "File should be discovered by Audit"
         
         # Check integrity_suspect flag
@@ -75,12 +72,9 @@ class TestSnapshotTriggersSuspect:
             content="file for suspect list"
         )
         
-        # Wait for Audit
-        marker_file = f"{MOUNT_POINT}/audit_marker_c1_list_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
-        fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        # Wait for Audit completion
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         
         # Get suspect list
         suspect_list = fusion_client.get_suspect_list()

@@ -15,6 +15,7 @@ if str(_it_dir) not in sys.path:
     sys.path.insert(0, str(_it_dir))
 
 from utils import FusionClient
+from .constants import EXTREME_TIMEOUT, POLL_INTERVAL
 
 logger = logging.getLogger("fustor_test")
 
@@ -55,14 +56,15 @@ def fusion_client(docker_env, test_api_key) -> FusionClient:
     
     # Wait for Fusion to be ready to accept requests
     logger.info("Waiting for Fusion to become ready and sync cache...")
-    for i in range(60):
+    start_wait = time.time()
+    while time.time() - start_wait < EXTREME_TIMEOUT:
         try:
             client.get_sessions()
-            logger.info(f"Fusion ready and API key synced after {i+1} seconds")
+            logger.info("Fusion ready and API key synced")
             break
         except Exception:
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
     else:
-        raise RuntimeError("Fusion did not become ready within 60 seconds")
+        raise RuntimeError(f"Fusion did not become ready within {EXTREME_TIMEOUT} seconds")
     
     return client

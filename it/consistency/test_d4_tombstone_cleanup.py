@@ -10,6 +10,7 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
+from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, LONG_TIMEOUT, STRESS_DELAY
 
 
 class TestTombstoneCleanup:
@@ -42,20 +43,20 @@ class TestTombstoneCleanup:
             test_file,
             content="will be deleted and cleaned"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         
         # Delete via Agent (creates Tombstone)
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
         # Wait for DELETE event and Verify deleted
-        assert fusion_client.wait_for_file(test_file, timeout=20, should_exist=False), \
+        assert fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False), \
             f"File {test_file} should be removed from tree after Realtime DELETE"
         
         # Step 2-3: Use a marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_d4_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        time.sleep(STRESS_DELAY) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
         
         # Step 4: After Audit, Tombstone should be cleaned
         # We verify by creating a new file with the same path via Agent
@@ -67,7 +68,7 @@ class TestTombstoneCleanup:
         
         # Step 5: The new file should appear (Tombstone no longer blocks it)
         # Wait for realtime sync of new file
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         
         assert found is not None, \
             f"New file should appear after Tombstone is cleaned. Tree: {fusion_client.get_tree(path='/', max_depth=-1)}"
@@ -91,14 +92,14 @@ class TestTombstoneCleanup:
             test_file,
             content="lifecycle test"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
-        assert fusion_client.wait_for_file(test_file, timeout=20, should_exist=False), \
+        assert fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False), \
             f"File {test_file} should be removed after delete"
         
         # Give a small buffer for potential racing snapshots to be processed and blocked
-        time.sleep(5)
+        time.sleep(STRESS_DELAY)
         
         # Immediately try to create from blind-spot (should be blocked by Tombstone)
         docker_manager.create_file_in_container(
@@ -110,16 +111,16 @@ class TestTombstoneCleanup:
         # Step 4: Use marker to ensure first audit cycle ran
         marker_file = f"{MOUNT_POINT}/audit_marker_d4_lifecycle_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        time.sleep(STRESS_DELAY) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
         
         # After first audit finishes, the tombstone (created before audit) is cleaned.
         # However, the blind-spot file report arrived DURING the first audit and was blocked.
         # We need a SECOND audit cycle to discover the still-existing blind-spot file.
         marker_file_2 = f"{MOUNT_POINT}/audit_marker_d4_lifecycle_2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file_2, content="marker")
-        time.sleep(3) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file_2, timeout=30) is not None
+        time.sleep(STRESS_DELAY) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file_2, timeout=LONG_TIMEOUT) is not None
         
         # Now the file should appear (Tombstone cleaned, blind-spot file exists)
         tree = fusion_client.get_tree(path="/", max_depth=-1)

@@ -11,10 +11,16 @@ import pytest
 import time
 from ..utils import docker_manager
 from ..conftest import (
-    CONTAINER_CLIENT_A, 
-    CONTAINER_CLIENT_C, 
     MOUNT_POINT, 
     AUDIT_INTERVAL
+)
+from ..fixtures.constants import (
+    HOT_FILE_THRESHOLD,
+    SHORT_TIMEOUT,
+    MEDIUM_TIMEOUT,
+    POLL_INTERVAL,
+    STRESS_DELAY,
+    SESSION_VANISH_TIMEOUT
 )
 
 class TestSuspectClearingConditions:
@@ -47,15 +53,15 @@ class TestSuspectClearingConditions:
             ["sh", "-c", f"echo 'old content' > {file_path}"]
         )
         
-        # 2. Wait for file to become "old" (> hot_file_threshold = 5s in test config)
+        # 2. Wait for file to become "old" (> hot_file_threshold)
         # Plus audit interval to ensure next audit sees it
-        time.sleep(10)
+        time.sleep(HOT_FILE_THRESHOLD)
         
         # 3. Trigger audit by waiting
         wait_for_audit()
         
         # 4. Check file - should be discovered but NOT suspect
-        found = fusion_client.wait_for_file_in_tree(file_path, timeout=10)
+        found = fusion_client.wait_for_file_in_tree(file_path, timeout=SHORT_TIMEOUT)
         assert found is not None, "File should be discovered"
         
         flags = fusion_client.check_file_flags(file_path)
@@ -85,8 +91,8 @@ class TestSuspectClearingConditions:
         file_path = f"{MOUNT_POINT}/{filename}"
         
         # 1. Start a partial wait to align with audit cycle, but create file LATER
-        # This ensuring that when audit picks it up, it's still 'hot' (age < 5s)
-        time.sleep(4)
+        # This ensuring that when audit picks it up, it's still 'hot' (age < threshold)
+        time.sleep(SESSION_VANISH_TIMEOUT)
         
         # 2. Create file in blind spot
         docker_manager.exec_in_container(
@@ -95,9 +101,9 @@ class TestSuspectClearingConditions:
         )
         
         # 3. Wait for Audit to discover it (rest of the wait)
-        time.sleep(6)
+        time.sleep(STRESS_DELAY)
         
-        found = fusion_client.wait_for_file_in_tree(file_path, timeout=10)
+        found = fusion_client.wait_for_file_in_tree(file_path, timeout=SHORT_TIMEOUT)
         assert found is not None, "File should be discovered"
         
         flags = fusion_client.check_file_flags(file_path)
@@ -111,10 +117,10 @@ class TestSuspectClearingConditions:
         )
         
         # 4. Wait for Realtime event to propagate
-        time.sleep(3)
+        time.sleep(POLL_INTERVAL * 2)
         
         # 5. Verify file is removed from tree (and thus suspect_list)
-        deleted = fusion_client.wait_for_file_not_in_tree(file_path, timeout=10)
+        deleted = fusion_client.wait_for_file_not_in_tree(file_path, timeout=SHORT_TIMEOUT)
         assert deleted is True, "File should be removed from tree after Realtime Delete"
         
         # Suspect list should not contain the deleted file
@@ -154,7 +160,7 @@ class TestSuspectClearingConditions:
         # 2. Wait for Audit to discover and mark as suspect
         wait_for_audit()
         
-        found = fusion_client.wait_for_file_in_tree(file_path, timeout=10)
+        found = fusion_client.wait_for_file_in_tree(file_path, timeout=SHORT_TIMEOUT)
         assert found is not None, "File should be discovered"
         
         flags = fusion_client.check_file_flags(file_path)
@@ -162,18 +168,18 @@ class TestSuspectClearingConditions:
             "New file from blind spot should be marked as suspect initially"
         
         # 3. Wait for file to "stabilize" (mtime doesn't change)
-        # Wait for hot_file_threshold (5s in test config) + buffer
-        time.sleep(7)
+        # Wait for hot_file_threshold + buffer
+        time.sleep(HOT_FILE_THRESHOLD + POLL_INTERVAL * 2)
         
         # 4. Check if suspect cleared (may need polling)
         start = time.time()
         cleared = False
-        while time.time() - start < 15:
+        while time.time() - start < MEDIUM_TIMEOUT:
             flags = fusion_client.check_file_flags(file_path)
             if flags["integrity_suspect"] is False:
                 cleared = True
                 break
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
         
         assert cleared, \
             f"Suspect should be cleared after stability timeout. Flags: {flags}"

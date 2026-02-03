@@ -9,6 +9,7 @@ import time
 import os
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT, AUDIT_INTERVAL
+from ..fixtures.constants import MEDIUM_TIMEOUT, EXTREME_TIMEOUT, INGESTION_DELAY, POLL_INTERVAL
 
 class TestApiSuspectVisibility:
     """Test API visibility and flags for suspect files."""
@@ -103,13 +104,12 @@ class TestApiSuspectVisibility:
         # Verify initial suspect state
         assert fusion_client.check_file_flags(test_file)["integrity_suspect"] is True
         
-        # Wait for TTL expiry (default 30s in tests)
-        # We need to wait > 30s. Let's wait 35s.
+        # Wait for TTL expiry
         logger_name = "fustor_test"
         import logging
         logger = logging.getLogger(logger_name)
-        logger.info("Waiting 35s for Suspect TTL expiry...")
-        time.sleep(35)
+        logger.info(f"Waiting {EXTREME_TIMEOUT}s for Suspect TTL expiry...")
+        time.sleep(EXTREME_TIMEOUT)
         
         # Verify flag is cleared
         # Note: Depending on implementation, flag might be cleared lazily or by periodic task.
@@ -117,10 +117,10 @@ class TestApiSuspectVisibility:
         # Let's poll for a bit
         start = time.time()
         cleared = False
-        while time.time() - start < 15:
+        while time.time() - start < MEDIUM_TIMEOUT:
             if fusion_client.check_file_flags(test_file)["integrity_suspect"] is False:
                 cleared = True
                 break
-            time.sleep(2)
+            time.sleep(INGESTION_DELAY)
             
         assert cleared, "Suspect flag should be cleared after TTL expiry"

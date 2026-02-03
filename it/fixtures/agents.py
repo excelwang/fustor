@@ -26,9 +26,13 @@ from .constants import (
     MOUNT_POINT, 
     AUDIT_INTERVAL,
     SENTINEL_INTERVAL,
-    SENTINEL_INTERVAL,
     FUSION_ENDPOINT,
-    HEARTBEAT_INTERVAL
+    HEARTBEAT_INTERVAL,
+    THROTTLE_INTERVAL_SEC,
+    AGENT_READY_TIMEOUT,
+    AGENT_B_READY_TIMEOUT,
+    VIEW_READY_TIMEOUT,
+    FAST_POLL_INTERVAL
 )
 
 
@@ -67,7 +71,7 @@ shared-fs:
     user: "unused"
   disabled: false
   driver_params:
-    throttle_interval_sec: 0.5
+    throttle_interval_sec: {THROTTLE_INTERVAL_SEC}
 """
     docker_manager.create_file_in_container(container_name, "/root/.fustor/sources-config.yaml", sources_config)
 
@@ -104,7 +108,7 @@ heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
     docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])
     docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent.pid"])
     docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent-state.json"])
-    time.sleep(0.2)
+    time.sleep(FAST_POLL_INTERVAL)
     
     # 5. Start new agent (Always in Pipeline mode)
     logger.info(f"Starting agent in {container_name} with AgentPipeline mode")
@@ -131,8 +135,8 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     
     # Wait for A to become Leader and Ready
     logger.info("Waiting for Agent A to be ready (Leader + Realtime Ready)...")
-    if not fusion_client.wait_for_agent_ready("client-a", timeout=30):
-        raise RuntimeError("Agent A did not become ready (can_realtime=True) within 30 seconds")
+    if not fusion_client.wait_for_agent_ready("client-a", timeout=AGENT_READY_TIMEOUT):
+        raise RuntimeError(f"Agent A did not become ready (can_realtime=True) within {AGENT_READY_TIMEOUT} seconds")
     
     sessions = fusion_client.get_sessions()
     leader = next((s for s in sessions if "client-a" in s.get("agent_id", "")), None)
@@ -143,7 +147,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
 
     # Wait for View to be READY (Snapshot complete)
     logger.info("Waiting for View to be ready (initial snapshot completion)...")
-    if not fusion_client.wait_for_view_ready(timeout=30):
+    if not fusion_client.wait_for_view_ready(timeout=VIEW_READY_TIMEOUT):
         logger.warning("View readiness check timed out. Proceeding anyway.")
     else:
         logger.info("View is READY.")
@@ -154,9 +158,9 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     
     # Wait for Agent B to be Ready
     logger.info("Waiting for Agent B to be ready (Follower + Realtime Ready)...")
-    if not fusion_client.wait_for_agent_ready("client-b", timeout=45):
+    if not fusion_client.wait_for_agent_ready("client-b", timeout=AGENT_B_READY_TIMEOUT):
         logs = docker_manager.get_logs(CONTAINER_CLIENT_B)
-        logger.warning(f"Timeout waiting for Agent B. Logs:\n{logs}")
+        logger.warning(f"Timeout waiting for Agent B (>{AGENT_B_READY_TIMEOUT}s). Logs:\n{logs}")
         # Proceeding anyway for some tests, though most will fail
 
     return {

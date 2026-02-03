@@ -5,7 +5,7 @@ Integration test for Field Mapping in AgentPipeline.
 import time
 import pytest
 import logging
-from it.fixtures.constants import MOUNT_POINT, FUSION_ENDPOINT
+from it.fixtures.constants import MOUNT_POINT, FUSION_ENDPOINT, MEDIUM_TIMEOUT, POLL_INTERVAL
 
 logger = logging.getLogger("fustor_test")
 
@@ -63,7 +63,8 @@ fields_mapping:
         docker_env.exec_in_container(leader, ["pkill", "-9", "-f", "fustor-agent"])
         
         # Wait for sessions to clear
-        for _ in range(10):
+        start_wait = time.time()
+        while time.time() - start_wait < MEDIUM_TIMEOUT:
             sessions = fusion_client.get_sessions()
             if not sessions:
                 break
@@ -72,7 +73,7 @@ fields_mapping:
                     fusion_client.terminate_session(s["session_id"])
                 except Exception:
                     pass
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
             
         docker_env.exec_in_container(
             leader, 
@@ -82,13 +83,14 @@ fields_mapping:
         
         # Wait for agent to reconnect and become leader
         logger.info("Waiting for Agent A to become leader...")
-        for _ in range(15):
+        start_wait = time.time()
+        while time.time() - start_wait < MEDIUM_TIMEOUT:
             sessions = fusion_client.get_sessions()
             # Ensure it's the ONLY session and it's leader client-a
             if len(sessions) == 1 and sessions[0].get("role") == "leader" and "client-a" in sessions[0].get("agent_id", ""):
                 logger.info(f"Agent A successfully became leader: {sessions[0].get('session_id')}")
                 break
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
         else:
              pytest.fail(f"Agent A failed to become leader. Current sessions: {fusion_client.get_sessions()}")
         
@@ -107,7 +109,7 @@ fields_mapping:
         
         # 4. Wait for Fusion to detect it
         # Based on the tree dump, Fusion stores the absolute path as seen by the Agent
-        success = fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        success = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         assert success, f"File {test_file} not found in tree. Tree: {fusion_client.get_tree()}"
         
         # 5. Verify size in Fusion

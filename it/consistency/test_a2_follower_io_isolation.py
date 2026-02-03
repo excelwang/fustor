@@ -8,6 +8,14 @@ import pytest
 import time
 
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_B
+from ..fixtures.constants import (
+    VIEW_READY_TIMEOUT,
+    AGENT_B_READY_TIMEOUT,
+    SHORT_TIMEOUT,
+    MEDIUM_TIMEOUT,
+    LONG_TIMEOUT,
+    POLL_INTERVAL
+)
 
 
 class TestFollowerIOIsolation:
@@ -25,8 +33,8 @@ class TestFollowerIOIsolation:
         预期: Agent B 被标记为 Follower
         验证方法: 查询 Sessions，确认 Agent B 的 role 为 "follower"
         """
-        # Wait for both agents to establish sessions
-        time.sleep(5)
+        # Wait for agents to establish sessions and view to be ready
+        assert fusion_client.wait_for_view_ready(timeout=VIEW_READY_TIMEOUT), "View did not become ready for Agent A"
         
         # Get all sessions
         sessions = fusion_client.get_sessions()
@@ -72,14 +80,22 @@ class TestFollowerIOIsolation:
         
         test_file = f"{MOUNT_POINT}/test_follower_realtime_{int(time.time()*1000)}.txt"
         
-        # Give more buffer for agents to fully transition to stable state and establish watchers
-        time.sleep(5)
+        # Wait for Agent B to be registered and ready (post-prescan)
+        if not fusion_client.wait_for_agent_ready("client-b", timeout=AGENT_B_READY_TIMEOUT):
+             pytest.fail(f"Agent B did not become ready (can_realtime=True) within {AGENT_B_READY_TIMEOUT}s")
+        
+        # Get session info to verify it's a follower
+        sessions = fusion_client.get_sessions()
+        follower_session = next((s for s in sessions if "client-b" in s.get("agent_id", "")), None)
+        assert follower_session is not None, "Agent B session not found"
+        assert follower_session.get("role") == "follower", \
+            f"Expected client-b to be follower, got {follower_session.get('role')}"
 
         # WARMUP: Ensure Follower's FS Driver is actively watching
         # Create a warmup file and wait for it to be seen. This confirms inotify is ready.
         warmup_file = f"{MOUNT_POINT}/warmup_follower_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_B, warmup_file, "warmup")
-        if not fusion_client.wait_for_file_in_tree(warmup_file, timeout=10):
+        if not fusion_client.wait_for_file_in_tree(warmup_file, timeout=SHORT_TIMEOUT):
             pytest.fail("Follower Agent B failed to detect warmup file. FS Driver might not be ready.")
         
         # Create file on follower's mount
@@ -93,15 +109,15 @@ class TestFollowerIOIsolation:
         # We poll to observe the arrival as soon as possible
         found = None
         start = time.time()
-        while time.time() - start < 30:
+        while time.time() - start < LONG_TIMEOUT:
             # Short-circuit if found
             found = fusion_client.wait_for_file_in_tree(
                 file_path=test_file,
-                timeout=2
+                timeout=SHORT_TIMEOUT
             )
             if found:
                 break
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
         
         assert found is not None, "File should appear via realtime event from follower"
         
@@ -110,12 +126,12 @@ class TestFollowerIOIsolation:
         cleared = False
         start = time.time()
         flags = {}
-        while time.time() - start < 15:
+        while time.time() - start < MEDIUM_TIMEOUT:
             flags = fusion_client.check_file_flags(test_file)
             if flags.get("agent_missing") is False:
                 cleared = True
                 break
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
             
         assert cleared, \
             f"File from follower should eventually have agent_missing=False, got flags: {flags}"

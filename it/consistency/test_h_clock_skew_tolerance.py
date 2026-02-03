@@ -13,13 +13,9 @@ import time
 import logging
 from ..utils import docker_manager
 from ..conftest import (
-    CONTAINER_CLIENT_A,
-    CONTAINER_CLIENT_B,
-    CONTAINER_CLIENT_C,
-    CONTAINER_FUSION,
-    CONTAINER_NFS_SERVER,
     MOUNT_POINT
 )
+from ..fixtures.constants import EXTREME_TIMEOUT, LONG_TIMEOUT, INGESTION_DELAY
 
 logger = logging.getLogger("fustor_test")
 
@@ -98,7 +94,7 @@ class TestClockSkewTolerance:
         wait_for_audit()
         
         # 3. Wait for discovery via Audit/Scan from Agent A (Leader)
-        assert fusion_client.wait_for_file_in_tree(file_path, timeout=60) is not None
+        assert fusion_client.wait_for_file_in_tree(file_path, timeout=EXTREME_TIMEOUT) is not None
         
         # 3. Verify suspect flag
         flags = fusion_client.check_file_flags(file_path)
@@ -128,7 +124,7 @@ class TestClockSkewTolerance:
         docker_manager.exec_in_container(CONTAINER_CLIENT_B, ["sh", "-c", f"echo 'mod' >> {file_path}"])
         
         # 4. Verify suspect is cleared
-        time.sleep(2)
+        time.sleep(INGESTION_DELAY)
         flags = fusion_client.check_file_flags(file_path)
         assert flags["integrity_suspect"] is False, "Realtime update should clear suspect status"
 
@@ -155,7 +151,7 @@ class TestClockSkewTolerance:
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["touch", file_path_a])
         
         # Wait for discovery to ensure clock jumped
-        assert fusion_client.wait_for_file_in_tree(file_path_a, timeout=30) is not None
+        assert fusion_client.wait_for_file_in_tree(file_path_a, timeout=LONG_TIMEOUT) is not None
         
         stats = fusion_client.get_stats()
         logical_now = stats.get("logical_now", 0)
@@ -172,7 +168,7 @@ class TestClockSkewTolerance:
         # (We use a marker to be sure audit finished after the file was created)
         audit_marker = f"marker_jump_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, f"{MOUNT_POINT}/{audit_marker}", "marker")
-        assert fusion_client.wait_for_file_in_tree(f"{MOUNT_POINT}/{audit_marker}", timeout=60) is not None
+        assert fusion_client.wait_for_file_in_tree(f"{MOUNT_POINT}/{audit_marker}", timeout=EXTREME_TIMEOUT) is not None
         
         # 4. Verify the normal file is NOT suspect
         assert fusion_client.wait_for_file_in_tree(file_path_normal) is not None

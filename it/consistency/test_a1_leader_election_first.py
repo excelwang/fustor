@@ -8,6 +8,7 @@ import pytest
 import time
 
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_B
+from ..fixtures.constants import VIEW_READY_TIMEOUT
 
 
 class TestLeaderElectionFirst:
@@ -25,8 +26,8 @@ class TestLeaderElectionFirst:
         预期: Agent A 被选举为 Leader
         验证方法: 查询 Fusion Sessions API，确认 Agent A 的 role 为 "leader"
         """
-        # Wait for agents to establish sessions
-        time.sleep(5)
+        # Wait for agents to establish sessions and View to be READY
+        assert fusion_client.wait_for_view_ready(timeout=VIEW_READY_TIMEOUT), "View did not become ready"
         
         # Get all sessions from Fusion
         sessions = fusion_client.get_sessions()

@@ -9,6 +9,13 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT, AUDIT_INTERVAL
+from ..fixtures.constants import (
+    INGESTION_DELAY,
+    NFS_SYNC_DELAY,
+    SHORT_TIMEOUT,
+    MEDIUM_TIMEOUT,
+    POLL_INTERVAL
+)
 import logging
 logger = logging.getLogger("fustor_test")
 
@@ -35,14 +42,14 @@ class TestBlindSpotFileModification:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         assert found is not None, "File should appear via realtime event"
         
         # Record original mtime from Fusion
         original_mtime = found.get("modified_time")
         
         # Step 2: Wait a bit, then modify file from blind-spot client
-        time.sleep(2)
+        time.sleep(INGESTION_DELAY)
         docker_manager.modify_file_in_container(
             CONTAINER_CLIENT_C,
             test_file,
@@ -83,7 +90,7 @@ class TestBlindSpotFileModification:
             if abs(mtime_after_audit - new_fs_mtime) < 0.001:
                 success = True
                 break
-            time.sleep(0.5)
+            time.sleep(POLL_INTERVAL)
         
         assert success, \
             f"Fusion mtime should match filesystem mtime {new_fs_mtime} after Audit. Got {mtime_after_audit}"
@@ -108,14 +115,14 @@ class TestBlindSpotFileModification:
             test_file,
             content="original"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=20)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         
         # Initial file should not have agent_missing
         flags_initial = fusion_client.check_file_flags(test_file)
         assert flags_initial["agent_missing"] is False
         
         # Modify from blind-spot
-        time.sleep(1.5) # Ensure mtime distinct
+        time.sleep(NFS_SYNC_DELAY) # Ensure mtime distinct
         docker_manager.modify_file_in_container(
             CONTAINER_CLIENT_C,
             test_file,
@@ -130,5 +137,5 @@ class TestBlindSpotFileModification:
         wait_for_audit()
         
         # Check agent_missing flag after modification
-        assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=10), \
+        assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=SHORT_TIMEOUT), \
             "agent_missing flag should be set after blind modification"

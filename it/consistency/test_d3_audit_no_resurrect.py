@@ -11,6 +11,7 @@ from ..utils import docker_manager
 from ..conftest import (
     CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
 )
+from ..fixtures.constants import MEDIUM_TIMEOUT, LONG_TIMEOUT, STRESS_DELAY
 
 
 class TestAuditTombstoneProtection:
@@ -42,13 +43,13 @@ class TestAuditTombstoneProtection:
             test_file,
             content="original content"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         
         # Step 2: Delete via Agent (creates Tombstone)
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
         # Wait for DELETE event and Verify deleted
-        removed = fusion_client.wait_for_file(test_file, timeout=20, should_exist=False)
+        removed = fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False)
         assert removed, "File should be removed"
         
         # Step 3: Recreate same file from blind-spot (simulating a problematic scenario)
@@ -61,10 +62,10 @@ class TestAuditTombstoneProtection:
         # Step 4: Use a marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS cache
+        time.sleep(STRESS_DELAY) # NFS cache
         
         # Wait for marker to appear in Fusion (confirms at least one audit cycle completed)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None, \
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None, \
             "Audit marker file should be discovered by Audit scan"
         
         # Step 5: File SHOULD appear (Reincarnation detected)
@@ -100,22 +101,22 @@ class TestAuditTombstoneProtection:
             test_file,
             content="NFS cache test"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         
         # Delete
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
         # Verify deleted
-        removed = fusion_client.wait_for_file(test_file, timeout=20, should_exist=False)
+        removed = fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False)
         assert removed, "File should be removed"
         
         # Even with NFS cache (actimeo), the tombstone should protect
         # Use marker file to detect Audit completion
         marker_file = f"{MOUNT_POINT}/audit_marker_cache_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS delay
+        time.sleep(STRESS_DELAY) # NFS delay
         
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
         
         # Verify file stays deleted
         tree = fusion_client.get_tree(path="/", max_depth=-1)

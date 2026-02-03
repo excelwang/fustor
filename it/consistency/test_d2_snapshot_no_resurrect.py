@@ -9,6 +9,7 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, MOUNT_POINT
+from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, STRESS_DELAY
 
 
 class TestSnapshotTombstoneProtection:
@@ -41,20 +42,20 @@ class TestSnapshotTombstoneProtection:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         assert found is not None, "File should be synced"
         
         # Step 2: Delete via Agent A (creates Tombstone)
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
         # Wait for DELETE event and Verify file is gone
-        removed = fusion_client.wait_for_file(test_file, timeout=20, should_exist=False)
+        removed = fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False)
         assert removed, "File should be deleted"
         
         # Step 3: Now, if Agent B's snapshot sees the file (due to NFS cache)
         # and sends a snapshot event, it should be discarded.
         # We simulate this by waiting for a snapshot cycle.
-        time.sleep(10)  # Wait for potential snapshot from B
+        time.sleep(SHORT_TIMEOUT)  # Wait for potential snapshot from B
         
         # Step 4: Verify file is still gone (not resurrected)
         tree_after = fusion_client.get_tree(path="/", max_depth=-1)
@@ -86,7 +87,7 @@ class TestSnapshotTombstoneProtection:
             )
         
         # Wait for sync
-        time.sleep(5)
+        time.sleep(STRESS_DELAY)
         
         # Delete all
         for f in test_files:
@@ -94,11 +95,11 @@ class TestSnapshotTombstoneProtection:
         
         # Wait for delete events to be processed
         for f in test_files:
-            assert fusion_client.wait_for_file(f, timeout=20, should_exist=False), \
+            assert fusion_client.wait_for_file(f, timeout=MEDIUM_TIMEOUT, should_exist=False), \
                 f"File {f} should be removed after rapid delete"
         
         # Give a small buffer for potential racing snapshots to be blocked by Tombstone
-        time.sleep(5)
+        time.sleep(STRESS_DELAY)
         
         # All files should remain deleted
         tree = fusion_client.get_tree(path="/", max_depth=-1)

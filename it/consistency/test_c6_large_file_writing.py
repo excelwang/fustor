@@ -10,6 +10,7 @@ import pytest
 import time
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT, AUDIT_INTERVAL
+from ..fixtures.constants import SHORT_TIMEOUT, STRESS_DELAY
 
 class TestLargeFileWriting:
     """Test detection of files currently being written."""
@@ -55,7 +56,7 @@ class TestLargeFileWriting:
             wait_for_audit()
         
             # 3. Check status - should be Suspect
-            found = fusion_client.wait_for_file_in_tree(file_path, timeout=10)
+            found = fusion_client.wait_for_file_in_tree(file_path, timeout=SHORT_TIMEOUT)
             assert found is not None, "File should be discovered by Audit"
             
             flags = fusion_client.check_file_flags(file_path)
@@ -63,7 +64,7 @@ class TestLargeFileWriting:
                 "Writing file from blind-spot should be marked as suspect"
             
             # 4. Wait a bit more (file still being written)
-            time.sleep(5)
+            time.sleep(STRESS_DELAY)
             
             # 5. Check again - should STILL be suspect (mtime keeps updating during write)
             flags = fusion_client.check_file_flags(file_path)

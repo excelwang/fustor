@@ -9,6 +9,7 @@ import pytest
 import logging
 
 from ..utils import docker_manager
+from ..fixtures.constants import MEDIUM_TIMEOUT, POLL_INTERVAL
 
 logger = logging.getLogger(__name__)
 
@@ -50,10 +51,9 @@ class TestSessionRecovery:
         logger.info("Waiting for Agent A to recover and create new session...")
         
         start_wait = time.time()
-        timeout = 20
         new_session_id = None
         
-        while time.time() - start_wait < timeout:
+        while time.time() - start_wait < MEDIUM_TIMEOUT:
             sessions = fusion_client.get_sessions()
             agent_a_sessions = [s for s in sessions if "client-a" in s.get("agent_id", "")]
             if agent_a_sessions:
@@ -61,7 +61,7 @@ class TestSessionRecovery:
                 if new_session_id != old_session_id:
                     logger.info(f"Agent A recovered with new session ID: {new_session_id}")
                     break
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
             
         assert new_session_id is not None, "Agent A did not create a new session"
         assert new_session_id != old_session_id, "Agent A should have a DIFFERENT session ID"

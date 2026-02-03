@@ -7,6 +7,13 @@ import pytest
 import time
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_C, CONTAINER_CLIENT_A, MOUNT_POINT, AUDIT_INTERVAL
+from ..fixtures.constants import (
+    NFS_SYNC_DELAY,
+    STRESS_DELAY,
+    AUDIT_WAIT_TIMEOUT,
+    MEDIUM_TIMEOUT,
+    POLL_INTERVAL
+)
 
 class TestBlindSpotVisibility:
     """Test user-facing API for blind spots."""
@@ -115,10 +122,10 @@ class TestBlindSpotVisibility:
         docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["rm", file_path])
         
         # Ensure mtime changes (NFS/Linux mtime resolution might be 1s)
-        time.sleep(1.5)
+        time.sleep(NFS_SYNC_DELAY)
         # Force root directory update by creating a file in root
         docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["touch", f"{MOUNT_POINT}/root_touch_{int(time.time())}"])
-        time.sleep(1.5) # Wait again for attribute cache
+        time.sleep(NFS_SYNC_DELAY) # Wait again for attribute cache
         
         # 3. Wait for Audit to detect deletion
         # NFS attribute caching on the leader (Agent A) might still see the file.
@@ -128,14 +135,14 @@ class TestBlindSpotVisibility:
         # Need another marker to ensure audit cycle passed
         marker = f"{subdir}/marker_g2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker)
-        time.sleep(5) # Give more time for NFS sync
-        assert fusion_client.wait_for_file_in_tree(marker, timeout=45) is not None
+        time.sleep(STRESS_DELAY) # Give more time for NFS sync
+        assert fusion_client.wait_for_file_in_tree(marker, timeout=AUDIT_WAIT_TIMEOUT) is not None
         
         # 4. Check API with polling - Deletion list is cleared at start of each audit, so we need to catch it "stable"
         found_deletion = False
         start_poll = time.time()
         deletions = []
-        while time.time() - start_poll < 15:
+        while time.time() - start_poll < MEDIUM_TIMEOUT:
             blind_spots = fusion_client.get_blind_spots()
             deletions = blind_spots.get("deletions", [])
             # deletions is a list of Strings (paths) or dicts? 
@@ -143,7 +150,7 @@ class TestBlindSpotVisibility:
             if file_path in deletions:
                 found_deletion = True
                 break
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
             
         assert found_deletion, f"Deleted file {file_path} should be in blind spot deletions list. Last detected: {deletions}"
 

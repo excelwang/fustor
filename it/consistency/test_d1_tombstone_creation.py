@@ -10,6 +10,7 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, MOUNT_POINT
+from ..fixtures.constants import MEDIUM_TIMEOUT
 
 
 class TestRealtimeDeleteTombstone:
@@ -42,14 +43,14 @@ class TestRealtimeDeleteTombstone:
         )
         
         # Wait for sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         assert found is not None, "File should appear in Fusion"
         
         # Step 2: Delete file via Agent
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
         # Step 3 & 4: Wait and Verify file is removed from tree
-        removed = fusion_client.wait_for_file(test_file, timeout=20, should_exist=False)
+        removed = fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False)
         assert removed, "File should be removed from tree after Realtime DELETE"
 
     def test_deleted_file_in_tombstone_list(
@@ -73,13 +74,13 @@ class TestRealtimeDeleteTombstone:
             test_file,
             content="for tombstone list check"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
         # The file should be in tombstone.
         # Verify indirectly by waiting for the tree to reflect deletion
-        removed = fusion_client.wait_for_file(test_file, timeout=20, should_exist=False)
+        removed = fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False)
         assert removed, "File should be removed from tree"
         
         # Tombstone existence is verified by subsequent tests (D2, D3)

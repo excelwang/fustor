@@ -21,7 +21,10 @@ from .constants import (
     CONTAINER_CLIENT_C,
     CONTAINER_FUSION,
     MOUNT_POINT,
-    SESSION_TIMEOUT
+    SESSION_TIMEOUT,
+    HOT_FILE_THRESHOLD,
+    CONTAINER_HEALTH_TIMEOUT,
+    SHORT_TIMEOUT
 )
 
 logger = logging.getLogger("fustor_test")
@@ -91,7 +94,7 @@ def docker_env():
         logger.info("Environment hash matches. Reusing existing running containers.")
         # Optional: Fast health check
         for container in [CONTAINER_NFS_SERVER, CONTAINER_FUSION]:
-            if not docker_manager.wait_for_health(container, timeout=10):
+            if not docker_manager.wait_for_health(container, timeout=SHORT_TIMEOUT):
                 logger.warning(f"Container {container} unhealthy. Repairing...")
                 docker_manager.up(build=True, wait=True)
                 break
@@ -116,14 +119,14 @@ http-main:
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/receivers-config.yaml", receivers_config)
     
     # 3. Inject View Config
-    view_config = """
+    view_config = f"""
 id: "integration-test-ds"
 view_id: "integration-test-ds"
 driver: "fs"
 disabled: false
 driver_params:
   uri: "/mnt/shared-view"
-  hot_file_threshold: 10.0
+  hot_file_threshold: {HOT_FILE_THRESHOLD}
 """
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/integration-test-ds.yaml", view_config)
     

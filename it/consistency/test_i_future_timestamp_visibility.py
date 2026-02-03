@@ -3,6 +3,7 @@ import pytest
 import time
 from it.utils.docker_manager import DockerManager
 from it.utils.fusion_client import FusionClient
+from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, INGESTION_DELAY
 
 logger = logging.getLogger("fustor_test")
 
@@ -65,18 +66,18 @@ async def test_future_timestamp_visibility(
     res = containers.exec_in_container("fustor-nfs-client-a", ["date", "+%s"])
     agent_now = float(res.stdout.strip())
     
-    # Set Future Mtime = Now + 10s (Small enough to wait for in test)
-    future_time = agent_now + 10
+    # Set Future Mtime = Now + SHORT_TIMEOUT
+    future_time = agent_now + SHORT_TIMEOUT
     future_time_str = time.strftime('%Y%m%d%H%M.%S', time.localtime(future_time))
     
-    logger.info(f"Step 1: Creating Future File {test_path} at T+{10}s")
+    logger.info(f"Step 1: Creating Future File {test_path} at T+{SHORT_TIMEOUT}s")
     
     # Create file with future timestamp
     containers.exec_in_container("fustor-nfs-client-a", ["touch", "-t", future_time_str, test_path])
     
     # 2. Wait for ingestion reliably
     logger.info("Step 2: Waiting for ingestion...")
-    exists = fusion_client.wait_for_file(test_path, timeout=10)
+    exists = fusion_client.wait_for_file(test_path, timeout=SHORT_TIMEOUT)
     assert exists, "Node should exist in tree (ingestion timed out)"
     
     # 3. Check Initial State (Should be Suspect)
@@ -100,8 +101,8 @@ async def test_future_timestamp_visibility(
         logger.info("Verified: Node is initially SUSPECT.")
 
     # 4. Wait for Time to Pass (Catch Up)
-    # We need to wait > 10s for physical time to cross future_time.
-    wait_time = 15
+    # We need to wait > SHORT_TIMEOUT for physical time to cross future_time.
+    wait_time = MEDIUM_TIMEOUT
     logger.info(f"Step 3: Waiting {wait_time}s for time to catch up...")
     time.sleep(wait_time)
     
@@ -114,7 +115,7 @@ async def test_future_timestamp_visibility(
     
     # Generate a "tick" file
     containers.exec_in_container("fustor-nfs-client-a", ["touch", "/mnt/shared/tick_tock.txt"])
-    time.sleep(2) # Allow ingest
+    time.sleep(INGESTION_DELAY) # Allow ingest
     
     # 5. Check Final State
     # Now Physical Time > Future Time.

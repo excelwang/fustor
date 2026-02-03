@@ -9,6 +9,13 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
+from ..fixtures.constants import (
+    INGESTION_DELAY,
+    SHORT_TIMEOUT,
+    MEDIUM_TIMEOUT,
+    EXTREME_TIMEOUT,
+    POLL_INTERVAL
+)
 
 
 class TestBlindSpotFileCreation:
@@ -33,7 +40,7 @@ class TestBlindSpotFileCreation:
         )
         
         # Step 2: Check if file appeared
-        time.sleep(2)
+        time.sleep(INGESTION_DELAY)
         # Check presence first
         try:
             tree = fusion_client.get_tree(path=test_file, max_depth=0)
@@ -46,24 +53,19 @@ class TestBlindSpotFileCreation:
         if found_immediately:
             # Re-fetch flags to ensure currency
             print(f"DEBUG: File found immediately. Waiting for agent_missing=True...")
-            assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=10), \
+            assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=SHORT_TIMEOUT), \
                 f"If found immediately, it must be blind spot (agent_missing=True) eventually."
         
-        # Step 3 & 4: Use a marker file to detect Audit completion
-        marker_file = f"{MOUNT_POINT}/audit_marker_b1_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS cache delay
-        
-        # Wait for marker to appear in Fusion (at least one audit cycle completed)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Wait for Audit completion
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
         
         # Now check if the original blind-spot file was discovered
-        found_after_audit = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        found_after_audit = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         assert found_after_audit is not None, \
             f"File {test_file} should be discovered by the Audit scan"
         
         # Step 5: Verify agent_missing flag is set
-        assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=10), \
+        assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=SHORT_TIMEOUT), \
             f"Blind-spot file {test_file} should be marked with agent_missing: true. Tree node: {found_after_audit}"
 
     def test_blind_spot_file_added_to_blind_spot_list(
@@ -84,21 +86,18 @@ class TestBlindSpotFileCreation:
             content="blind list test"
         )
         
-        # Use marker file to detect Audit completion
-        marker_file = f"{MOUNT_POINT}/audit_marker_b1_list_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS cache delay
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Wait for Audit completion
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
         
         # Check blind-spot list for file (poll to be safe)
         start = time.time()
         found = False
-        while time.time() - start < 15:
+        while time.time() - start < MEDIUM_TIMEOUT:
             blind_spot_list = fusion_client.get_blind_spot_list()
             paths_in_list = [item.get("path") for item in blind_spot_list if item.get("type") == "file"]
             if test_file in paths_in_list:
                 found = True
                 break
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
             
         assert found, f"File {test_file} should be in blind-spot list. List: {blind_spot_list}"

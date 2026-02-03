@@ -9,6 +9,7 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT
+from ..fixtures.constants import SHORT_TIMEOUT, EXTREME_TIMEOUT
 
 
 class TestAuditTriggersSuspect:
@@ -40,16 +41,11 @@ class TestAuditTriggersSuspect:
         )
         
         # Wait for Audit to discover
-        # Use marker file to ensure reliable synchronization with NFS latency
-        marker_file = f"{MOUNT_POINT}/audit_marker_c2_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS cache delay
-        
-        # Wait for marker to appear in Fusion (at least one audit cycle completed)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Wait for Audit completion
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
         
         # File should appear
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         assert found is not None, "Blind-spot file should be discovered by Audit"
         
         # Check both flags
@@ -79,14 +75,11 @@ class TestAuditTriggersSuspect:
             content="for audit suspect list"
         )
         
-        # Marker synchronization
-        marker_file = f"{MOUNT_POINT}/audit_marker_c2_list_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Wait for Audit completion
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
         
         # Now wait for the file itself
-        fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         
         suspect_list = fusion_client.get_suspect_list()
         paths = [item.get("path") for item in suspect_list]

@@ -9,6 +9,7 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, MOUNT_POINT
+from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, EXTREME_TIMEOUT, POLL_INTERVAL, SESSION_VANISH_TIMEOUT
 
 
 class TestLeaderFailover:
@@ -55,7 +56,7 @@ class TestLeaderFailover:
         try:
             # Wait for session timeout (typically 30-60 seconds)
             # The exact time depends on the configured timeout
-            timeout_wait = 15  # Wait longer than session timeout (configured as 10s)
+            timeout_wait = MEDIUM_TIMEOUT  # Wait longer than session timeout
             print(f"Waiting {timeout_wait}s for leader session timeout...")
             time.sleep(timeout_wait)
             
@@ -86,7 +87,7 @@ class TestLeaderFailover:
                 setup_agents["api_key"], 
                 setup_agents["view_id"]
             )
-            time.sleep(10)  # Wait for restart
+            time.sleep(SHORT_TIMEOUT)  # Wait for restart
 
     def test_failover_preserves_data_integrity(
         self,
@@ -108,7 +109,7 @@ class TestLeaderFailover:
         )
         
         # Wait for sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=15)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         assert found is not None
         
         # Stop leader
@@ -119,20 +120,20 @@ class TestLeaderFailover:
         print(f"File listing from B after A stop: {output}")
         
         try:
-            # Wait for failover (Session timeout 10s + buffer)
-            time.sleep(15)
+            # Wait for failover (Session timeout + buffer)
+            time.sleep(MEDIUM_TIMEOUT)
 
             # Wait for Snapshot (Readiness) restoration
             # New leader must complete initial snapshot sync phase
             start_wait = time.time()
             ready = False
-            while time.time() - start_wait < 60:
+            while time.time() - start_wait < EXTREME_TIMEOUT:
                 try:
                     stats = fusion_client.get_stats()
                     ready = True # If get_stats succeeds, readiness check passed
                     break
                 except Exception:
-                    time.sleep(1)
+                    time.sleep(POLL_INTERVAL)
             
             if not ready:
                 pytest.fail("View failed to become ready after failover (New Leader Snapshot timed out)")
@@ -143,7 +144,7 @@ class TestLeaderFailover:
             # Wait for the file to be present in Fusion's tree (giving it time for Agent B audit)
             found_after = fusion_client.wait_for_file_in_tree(
                 file_path=test_file,
-                timeout=60  # Allow time for Agent B promotion + Audit cycle
+                timeout=EXTREME_TIMEOUT  # Allow time for Agent B promotion + Audit cycle
             )
             
             assert found_after is not None, \
@@ -156,4 +157,4 @@ class TestLeaderFailover:
                 setup_agents["api_key"], 
                 setup_agents["view_id"]
             )
-            time.sleep(10)
+            time.sleep(SHORT_TIMEOUT)

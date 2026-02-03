@@ -9,6 +9,12 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
+from ..fixtures.constants import (
+    SHORT_TIMEOUT,
+    MEDIUM_TIMEOUT,
+    EXTREME_TIMEOUT,
+    POLL_INTERVAL
+)
 
 
 class TestBlindSpotFileDeletion:
@@ -43,7 +49,7 @@ class TestBlindSpotFileDeletion:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=20)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         assert found is not None, "File should appear via realtime event"
         
         # Step 2: Delete file from blind-spot client
@@ -52,34 +58,12 @@ class TestBlindSpotFileDeletion:
         # Step 3: Immediately after deletion, file should STILL be in Fusion
         # Note: In some environments (or if Audit runs coincidentally), this might fail.
         # We relax this check to focus on eventual consistency.
-        # time.sleep(2)
-        # still_exists = fusion_client.wait_for_file_in_tree(test_file, timeout=5)
-        # assert still_exists is not None, \
-        #    "File should still exist in Fusion (no realtime delete from blind-spot)"
         
-        # Step 4: Wait for NFS cache expiry
-        time.sleep(3)
+        # Step 4: Wait for Audit to detect deletion
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
         
-        # Use a marker file to detect Audit completion
-        marker_file = f"{MOUNT_POINT}/audit_marker_b2_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(2)
-        
-        # Wait for marker to appear in Fusion (at least one audit cycle completed)
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
-        
-        # Step 5: After Audit, file should be removed
-        # Poll for removal with extended timeout
-        start = time.time()
-        removed = False
-        while time.time() - start < 30:
-            tree = fusion_client.get_tree(path="/", max_depth=-1)
-            if fusion_client._find_in_tree(tree, test_file) is None:
-                removed = True
-                break
-            time.sleep(1)
-            
-        assert removed, "File should be removed after Audit detects blind-spot deletion"
+        assert fusion_client.wait_for_file_not_in_tree(test_file, timeout=SHORT_TIMEOUT), \
+            "File should be removed after Audit detects blind-spot deletion"
 
     def test_blind_spot_deletion_added_to_blind_spot_list(
         self,
@@ -100,24 +84,18 @@ class TestBlindSpotFileDeletion:
             test_file,
             content="for blind delete list test"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)
         
-        # Step 4: Wait for NFS cache expiry / ensure distinct mtime update event
-        time.sleep(3)
-        
-        # Step 4: Use marker to ensure audit cycle ran
-        marker_file = f"{MOUNT_POINT}/audit_marker_b2_list_{int(time.time()*1000)}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(2) # Wait for event sync before polling tree
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        # Wait for Audit completion
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
         
         # Check blind-spot list for deletion record
         # Poll since events might be processed shortly after marker appearance
         start = time.time()
         found = False
-        while time.time() - start < 30:
+        while time.time() - start < MEDIUM_TIMEOUT:
             blind_spot_list = fusion_client.get_blind_spot_list()
             deletion_entries = [
                 item for item in blind_spot_list
@@ -126,6 +104,6 @@ class TestBlindSpotFileDeletion:
             if deletion_entries:
                 found = True
                 break
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
         
         assert found, "Blind-spot deletion should be recorded in blind-spot list"

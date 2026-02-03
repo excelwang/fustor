@@ -10,7 +10,13 @@ import pytest
 import logging
 
 from ..utils import docker_manager
-from fixtures.constants import CONTAINER_CLIENT_A
+from ..fixtures.constants import (
+    CONTAINER_CLIENT_A,
+    SESSION_TIMEOUT,
+    SESSION_VANISH_TIMEOUT,
+    MEDIUM_TIMEOUT,
+    POLL_INTERVAL
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,15 +51,15 @@ class TestHeartbeatTimeout:
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["sh", "-c", "kill -STOP $(cat /root/.fustor/agent.pid)"])
         
         # 3. Wait for session timeout in Fusion
-        # Fusion timeout is 3s. Wait 5s to be safe.
-        logger.info("Waiting 5s for session to expire in Fusion...")
-        time.sleep(5)
+        # Fusion timeout is SESSION_TIMEOUT. Wait SESSION_VANISH_TIMEOUT to be safe.
+        logger.info(f"Waiting {SESSION_VANISH_TIMEOUT}s for session to expire in Fusion...")
+        time.sleep(SESSION_VANISH_TIMEOUT)
         
         # Verify session is gone from Fusion's perspective
         sessions_after = fusion_client.get_sessions()
         if old_session_id in [s["session_id"] for s in sessions_after]:
             logger.warning(f"Session {old_session_id} still exists in Fusion. Waiting a bit more...")
-            time.sleep(5)
+            time.sleep(SESSION_VANISH_TIMEOUT)
             sessions_after = fusion_client.get_sessions()
             
         assert old_session_id not in [s["session_id"] for s in sessions_after], "Session should have expired"
@@ -66,10 +72,9 @@ class TestHeartbeatTimeout:
         logger.info("Waiting for Agent A to detect timeout and recover...")
         
         start_wait = time.time()
-        timeout = 20
         new_session_id = None
         
-        while time.time() - start_wait < timeout:
+        while time.time() - start_wait < MEDIUM_TIMEOUT:
             sessions = fusion_client.get_sessions()
             agent_a_sessions = [s for s in sessions if "client-a" in s.get("agent_id", "")]
             if agent_a_sessions:
@@ -77,7 +82,7 @@ class TestHeartbeatTimeout:
                 if new_session_id != old_session_id:
                     logger.info(f"Agent A recovered with new session ID: {new_session_id}")
                     break
-            time.sleep(1)
+            time.sleep(POLL_INTERVAL)
             
         assert new_session_id is not None, "Agent A did not create a new session after timeout"
         assert new_session_id != old_session_id, "Agent A should have a DIFFERENT session ID"

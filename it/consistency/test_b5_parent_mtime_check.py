@@ -9,6 +9,13 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
+from ..fixtures.constants import (
+    INGESTION_DELAY,
+    SHORT_TIMEOUT,
+    LONG_TIMEOUT,
+    STRESS_DELAY,
+    POLL_INTERVAL
+)
 
 
 class TestParentMtimeCheck:
@@ -41,7 +48,7 @@ class TestParentMtimeCheck:
             CONTAINER_CLIENT_A,
             ["mkdir", "-p", test_dir]
         )
-        time.sleep(1)
+        time.sleep(POLL_INTERVAL)
         
         # Create stale file from blind-spot (simulating delayed audit scenario)
         docker_manager.create_file_in_container(
@@ -52,7 +59,7 @@ class TestParentMtimeCheck:
         
         # Before audit runs, delete stale file and create new file via Agent
         # This updates the parent directory mtime
-        time.sleep(1)
+        time.sleep(POLL_INTERVAL)
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, stale_file)
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_A,
@@ -61,14 +68,14 @@ class TestParentMtimeCheck:
         )
         
         # Verify new_file exists but stale_file does not (synced via realtime)
-        assert fusion_client.wait_for_file_in_tree(new_file, timeout=10) is not None
+        assert fusion_client.wait_for_file_in_tree(new_file, timeout=SHORT_TIMEOUT) is not None
         
         # Step 4: Use a marker file to detect Audit completion
         # This confirms that an audit cycle has scanned the directory
         marker_file = f"{MOUNT_POINT}/audit_marker_b5_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        time.sleep(STRESS_DELAY) # NFS cache
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
         
         # After Audit, stale_file should STILL be absent (discarded by parent mtime check)
         # Use retry to handle transient 503 errors (Fusion processing queue)
@@ -80,7 +87,7 @@ class TestParentMtimeCheck:
                 break
             except requests.HTTPError as e:
                 if e.response.status_code == 503:
-                    time.sleep(1)
+                    time.sleep(POLL_INTERVAL)
                     continue
                 raise
         
@@ -122,15 +129,15 @@ class TestParentMtimeCheck:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(file_b, timeout=30)
+        found = fusion_client.wait_for_file_in_tree(file_b, timeout=LONG_TIMEOUT)
         assert found is not None, "File B should appear via realtime"
         
         # Wait for Audit (which may have stale view of parent directory)
         # Use marker file to be sure audit ran
         marker_file = f"{MOUNT_POINT}/audit_marker_b5_2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(3) # NFS delay
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=30) is not None
+        time.sleep(STRESS_DELAY) # NFS delay
+        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
         
         # File B should still exist (Audit mtime check should preserve it)
         # Use retry to handle transient 503 errors (Fusion processing queue)
@@ -142,7 +149,7 @@ class TestParentMtimeCheck:
                 break
             except requests.HTTPError as e:
                 if e.response.status_code == 503:
-                    time.sleep(1)
+                    time.sleep(POLL_INTERVAL)
                     continue
                 raise
         

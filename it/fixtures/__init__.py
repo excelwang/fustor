@@ -17,10 +17,10 @@ _it_dir = _fixtures_dir.parent
 if str(_it_dir) not in sys.path:
     sys.path.insert(0, str(_it_dir))
 
-from fixtures.docker import docker_env, clean_shared_dir
-from fixtures.fusion import fusion_client, test_api_key, test_view
-from fixtures.agents import setup_agents
-from fixtures.leadership import reset_leadership, wait_for_audit
+from .docker import docker_env, clean_shared_dir
+from .fusion import fusion_client, test_api_key, test_view
+from .agents import setup_agents
+from .leadership import reset_leadership, wait_for_audit
 
 __all__ = [
     # Docker

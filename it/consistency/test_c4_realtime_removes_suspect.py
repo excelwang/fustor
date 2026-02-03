@@ -10,6 +10,7 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
+from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, EXTREME_TIMEOUT
 
 
 class TestRealtimeRemovesSuspect:
@@ -33,38 +34,33 @@ class TestRealtimeRemovesSuspect:
         """
         test_file = f"{MOUNT_POINT}/realtime_clear_suspect_{int(time.time()*1000)}.txt"
         
-        # Step 1: Align with Audit cycle, then create file in blind-spot
-        time.sleep(4)
+        # Step 1: Create file in blind-spot
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,
             test_file,
             content="initial content"
         )
-        
         # Wait for Audit to discover it
-        time.sleep(6)
-        fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         
         # Verify file is suspect
         flags_initial = fusion_client.check_file_flags(test_file)
         assert flags_initial["integrity_suspect"] is True, \
             "New file from Audit should be marked as suspect"
         
-        # Step 2: Wait a moment, then modify file from Agent A (trigger Realtime Update)
-        time.sleep(2)
+        # Step 2: Trigger Realtime Update from Agent A
         docker_manager.modify_file_in_container(
             CONTAINER_CLIENT_A,
             test_file,
             append_content="additional content via realtime"
         )
-        
-        # Step 3: Wait for Realtime event to be processed
-        time.sleep(5)
-        
-        # Step 4: Check that suspect flag is cleared
-        flags_after = fusion_client.check_file_flags(test_file)
-        assert flags_after["integrity_suspect"] is False, \
+        # Step 3: Wait for Realtime event to be processed and flag cleared
+        assert fusion_client.wait_for_flag(test_file, "integrity_suspect", False, timeout=MEDIUM_TIMEOUT), \
             "Suspect flag should be cleared after Realtime UPDATE"
+        
+        # Step 4: Check that suspect flag is cleared (already confirmed by wait_for_flag)
+        flags_after = fusion_client.check_file_flags(test_file)
         
         # File should be removed from suspect list
         suspect_list = fusion_client.get_suspect_list()
@@ -84,18 +80,15 @@ class TestRealtimeRemovesSuspect:
         场景: 盲区文件被 Agent 重新创建（INSERT），应清除 suspect 状态
         """
         test_file = f"{MOUNT_POINT}/realtime_insert_clear_{int(time.time()*1000)}.txt"
-        
-        # 1. Align with Audit cycle, then create from blind-spot
-        time.sleep(4)
+        # 1. Create from blind-spot
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,
             test_file,
             content="blind spot content"
         )
-        
         # Wait for Audit to discover it
-        time.sleep(6)
-        fusion_client.wait_for_file_in_tree(test_file, timeout=10)
+        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
         
         # Verify flags
         flags = fusion_client.check_file_flags(test_file)
@@ -103,15 +96,14 @@ class TestRealtimeRemovesSuspect:
         
         # Delete and recreate from Agent (simulates clear INSERT)
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
-        time.sleep(1)
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_A,
             test_file,
             content="recreated from agent"
         )
-        
-        # Wait for realtime events
-        time.sleep(5)
+        # Wait for realtime events to clear flag
+        assert fusion_client.wait_for_flag(test_file, "integrity_suspect", False, timeout=MEDIUM_TIMEOUT), \
+            "Suspect flag should be cleared after Agent recreate"
         
         # After Agent INSERT, suspect should be cleared
         flags_after = fusion_client.check_file_flags(test_file)
