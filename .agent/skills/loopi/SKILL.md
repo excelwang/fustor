@@ -32,9 +32,16 @@ graph TD
 ### Step 0: Session Identification
 **Action**:
 1. 读取 `.agent/sessions/active/` 目录下的所有 JSON 文件。
-2. **List & Ask**: 向用户展示当前活跃的 Session 列表（包括 Task、Owner、Last Update）。
-   - Option [R]: **Resume** <Session_ID> (继续之前的任务，加载 Context)
-   - Option [N]: **New Session** (创建一个新会话，认领新任务)
+2. **List & Ask**: 向用户展示当前活跃的 Session 列表。
+   - Option [R]: **Resume** <Session_ID>
+   - Option [N]: **New Session** (创建一个新会话)
+     > **Smart Recommendation (Context Affinity)**:
+     > 如果刚完成任务或有遗留上下文，优先推荐亲和度高的任务：
+     > - **Score Rule**: 
+     >   - `+20` Same Parent Task/Sequence
+     >   - `+10` Same Domain Spec
+     >   - `+5`  Overlapping File Paths
+     > - **Display**: "[HIGH AFFINITY] Task_002 (Reuses loaded context)"
    - Option [C]: **Clear/Wipe** (强制清除某些过期的僵尸 Session)
 
 ### Step 1: Initialization
