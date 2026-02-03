@@ -48,13 +48,21 @@ graph TD
 - **If Resume**:
   - 读取选定 Session 的 JSON 文件。
   - 恢复 `Base Commit` 和 `Iteration Count`。
-  - 读取 `.agent/tasks/active_task.md` (如果存在且匹配)。
+  - 读取 `.agent/current_task.md` (Context Resume)。
 - **If New Session**:
-  - 生成新的 Session ID (e.g., `sess_{timestamp}_{random}`).
-  - 创建 `.agent/sessions/active/{session_id}.json`，状态标记为 `Created`。
-  - 询问用户要认领哪个 Task (Spec)。
+  - 生成新的 Session ID。
+  - **Atomic Claim (抢占逻辑)**:
+    1. 用户选择 `backlog/` 下的任务。
+    2. 执行 `mv .agent/tasks/backlog/TASK_ID.md .agent/tasks/active/TASK_ID.md`。
+    3. **Check**: 如果 `mv` 失败（文件不存在），说明被抢占 -> **Retry**。
+    4. **Lock**: 成功后，创建 `.agent/sessions/active/{session_id}.json` 记录 Claim。
+    5. 初始化 `.agent/current_task.md`。
 
-### Step 2: Spec Alignment (归位)
+### Step 2: Task Alignment (归位)
+...
+**Constraint**: `loopi` 在 Coding 阶段 **严禁修改** `active/` 下的 Task 原件。所有进度记录在 `.agent/current_task.md` 中。Task 原件仅可由 `soarch` (Split) 或 `cre` (Feedback) 修改。
+
+
 
 **Case A: 全新开发**
 - 前置：必须先运行 `soarch` 输出 Task 文档至 `.agent/tasks/backlog/`。
