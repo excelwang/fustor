@@ -28,6 +28,8 @@ class MockSender(Sender):
         self.session_created = False
         self.events_sent: List[List[Any]] = []
         self.heartbeats_sent = 0
+        self.audit_start_calls = 0
+        self.audit_end_calls = 0
         self.role = "follower"
     
     async def connect(self) -> None:
@@ -66,6 +68,17 @@ class MockSender(Sender):
     
     async def close(self) -> None:
         self.connected = False
+
+    async def signal_audit_start(self) -> bool:
+        self.audit_start_calls += 1
+        return True
+
+    async def signal_audit_end(self) -> bool:
+        self.audit_end_calls += 1
+        return True
+
+    async def get_latest_committed_index(self, session_id: str) -> int:
+        return 100
 
 
 @pytest.fixture
@@ -229,6 +242,30 @@ class TestSenderHandlerAdapterBatch:
         assert source_type == "audit"
 
     @pytest.mark.asyncio
+    async def test_send_batch_audit_lifecycle(self, adapter, mock_sender):
+        """send_batch should trigger audit start/end signals."""
+        await adapter.create_session("test", "fs")
+        events = [{"id": 1}]
+        
+        # Test start signal
+        await adapter.send_batch(
+            session_id="sess-test",
+            events=events,
+            batch_context={"phase": "audit", "is_start": True}
+        )
+        assert mock_sender.audit_start_calls == 1
+        assert mock_sender.audit_end_calls == 0
+        
+        # Test end signal
+        await adapter.send_batch(
+            session_id="sess-test",
+            events=events,
+            batch_context={"phase": "audit", "is_final": True}
+        )
+        assert mock_sender.audit_start_calls == 1
+        assert mock_sender.audit_end_calls == 1
+
+    @pytest.mark.asyncio
     async def test_send_batch_error_sync(self, adapter, mock_sender):
         """send_batch should propagate generic exceptions."""
         mock_sender._send_events_impl = AsyncMock(side_effect=RuntimeError("Network failure"))
@@ -270,6 +307,34 @@ class TestSenderHandlerAdapterConnection:
         
         assert not success
         assert "Network error" in message
+
+
+class TestSenderHandlerAdapterResume:
+    """Test resume functionality (get_latest_committed_index)."""
+
+    @pytest.mark.asyncio
+    async def test_get_latest_committed_index_supported(self, adapter, mock_sender):
+        """Should delegate to sender if supported."""
+        idx = await adapter.get_latest_committed_index("sess-1")
+        assert idx == 100
+
+    @pytest.mark.asyncio
+    async def test_get_latest_committed_index_unsupported(self, adapter):
+        """Should return 0 if sender does not support it."""
+        # Create a sender without the method
+        class LegacySender(Sender):
+            def __init__(self):
+                super().__init__("legacy", "http://legacy", {})
+            async def connect(self): pass
+            async def create_session(self, **kwargs): return {}
+            async def _send_events_impl(self, **kwargs): return {}
+            async def heartbeat(self): return {}
+            
+        legacy_sender = LegacySender()
+        adapter_legacy = SenderHandlerAdapter(legacy_sender)
+        
+        idx = await adapter_legacy.get_latest_committed_index("sess-1")
+        assert idx == 0
 
 
 class TestSenderHandlerFactory:
