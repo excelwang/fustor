@@ -46,8 +46,12 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
         self.throttle_interval = float(getattr(watch_manager, 'throttle_interval', 5.0))
 
     def _get_index(self, mtime=None):
-        # Index is now purely based on physical time to avoid logical clock contamination
-        # from NFS future mtimes during event generation.
+        """
+        Normalize server_mtime into Agent's physical domain for stable TTL logic.
+        This index is used for event ordering and tombstone comparison in Fusion.
+        """
+        if mtime:
+             return int((mtime - self.watch_manager.drift_from_nfs) * 1000)
         return int(time.time() * 1000)
 
     def _touch_recursive_bottom_up(self, path: str):

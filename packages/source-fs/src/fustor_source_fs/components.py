@@ -131,6 +131,7 @@ class _WatchManager:
         self.min_monitoring_window_days = min_monitoring_window_days
         self.stop_driver_event = stop_driver_event 
         self.throttle_interval = throttle_interval
+        self.drift_from_nfs = 0.0
 
         self.inotify = None
         self._ensure_inotify()

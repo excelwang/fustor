@@ -160,6 +160,7 @@ class FSDriver(SourceDriver):
                 latest_mtime_stable = mtimes[p99_idx]
                 
                 self.drift_from_nfs = latest_mtime_stable - time.time()
+                self.watch_manager.drift_from_nfs = self.drift_from_nfs
                 drift_from_nfs = self.drift_from_nfs
                 
                 root_recursive_mtime = dir_mtime_map.get(self.uri, 0.0)
@@ -334,7 +335,7 @@ class FSDriver(SourceDriver):
         mtime_cache = mtime_cache or {}
         batch_size = kwargs.get("batch_size", 100)
         file_pattern = self.config.driver_params.get("file_pattern", "*")
-        audit_time = int(time.time())
+        audit_time = int(time.time() * 1000)
 
         scanner = RecursiveScanner(self.uri, num_workers=self._executor._max_workers, file_pattern=file_pattern)
 
@@ -384,7 +385,7 @@ class FSDriver(SourceDriver):
                                             fields=list(local_batch[0].keys()),
                                             message_source=MessageSource.AUDIT,
                                             index=audit_time
-                                        ), {}))
+                                        ), {root: current_dir_mtime}))
                                         local_batch = []
                         except OSError:
                             pass
@@ -397,7 +398,7 @@ class FSDriver(SourceDriver):
                         fields=list(local_batch[0].keys()),
                         message_source=MessageSource.AUDIT,
                         index=audit_time
-                    ), {}))
+                    ), {root: current_dir_mtime}))
                 elif not is_silent:
                     res_q.put((None, {root: current_dir_mtime}))
 
@@ -460,6 +461,7 @@ class FSDriver(SourceDriver):
             "size": {"type": "integer", "description": "The size of the file in bytes.", "column_index": 1},
             "modified_time": {"type": "number", "description": "The last modification time as a Unix timestamp (float).", "column_index": 2},
             "created_time": {"type": "number", "description": "The creation time as a Unix timestamp (float).", "column_index": 3},
+            "is_dir": {"type": "boolean", "description": "True if the path is a directory.", "column_index": 4},
         }}
 
     @classmethod
