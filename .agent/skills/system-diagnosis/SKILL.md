@@ -28,9 +28,15 @@ description: Diagnose complex failures, run RCA, and stabilize the system. Use w
 - **Goal**: Cleanup zombie workstreams using `scripts/gc_workstreams.py`.
 - **Instruction**: See `references/MAINTENANCE.md` for command parameters and usage.
 
-### 3. Knowledge Capture
-> **Rule**: Never solve the same mystery twice.
-- **Action**: Append successful RCAs to `.agent/brain/lessons.md`.
+### 3. Reflection (Post-Task)
+- **Goal**: Capture valid RCAs, environment fixes, or debugging techniques.
+- **Trigger**: After resolving a failure or completing a diagnosis.
+- **Action**:
+    1. Review the RCA process.
+    2. If a new lesson is found:
+        - Create a new file `references/LESSON_{Topic}.md` using `references/REFLECTION_TEMPLATE.md`.
+        - Append successful RCAs to `.agent/brain/lessons.md`.
+    3. Update `references/environment_spec.md` if the environment was the root cause.
 
 ### 4. Identity Banner
 > **Rule (MANDATORY)**: After "Hi Cortex", EVERY single response in this state MUST start with:
@@ -43,5 +49,6 @@ description: Diagnose complex failures, run RCA, and stabilize the system. Use w
 
 ## References
 - **Debug Report**: `references/DEBUG_REPORT_TEMPLATE.md`
+- **Reflection Template**: `references/REFLECTION_TEMPLATE.md`
 - **Environment Spec**: `references/environment_spec.md`
 - **Maintenance Guide**: `references/MAINTENANCE.md`

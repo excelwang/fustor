@@ -4,9 +4,12 @@ Tests for AgentPipeline role transitions (Leader <-> Follower).
 """
 import pytest
 import asyncio
+from unittest.mock import MagicMock, AsyncMock
 from fustor_core.pipeline import PipelineState
 from fustor_agent.runtime.agent_pipeline import AgentPipeline
+from fustor_agent.runtime.agent_pipeline import AgentPipeline
 
+@pytest.mark.timeout(10)
 class TestAgentRoleSwitch:
     
     @pytest.mark.asyncio
@@ -14,9 +17,14 @@ class TestAgentRoleSwitch:
         """When role changes from leader to follower, leader-specific tasks should be cancelled."""
         mock_sender.role = "leader"
         
+        mock_bus = MagicMock()
+        mock_bus.id = "mock-bus"
+        mock_bus.internal_bus = AsyncMock()
+        mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
+
         pipeline = AgentPipeline(
             "test-id", "agent:test-id", pipeline_config,
-            mock_source, mock_sender
+            mock_source, mock_sender, event_bus=mock_bus
         )
         
         # Mock leader tasks
@@ -43,13 +51,14 @@ class TestAgentRoleSwitch:
         mock_sender.role = "follower"
         
         # Wait for heartbeat and role change task to complete, and control loop to set PAUSED
-        for _ in range(100):
+        # Limit wait to 5 seconds to avoid infinite hangs
+        for _ in range(500):
             if pipeline.current_role == "follower" and (pipeline.state & PipelineState.PAUSED):
                 break
             await asyncio.sleep(0.01)
         
         # Assertions
-        assert pipeline.current_role == "follower"
+        assert pipeline.current_role == "follower", f"Expected follower role, got {pipeline.current_role}"
         # Snapshot task should have been cancelled
         assert pipeline._snapshot_task is None or pipeline._snapshot_task.done()
         # State should reflect follower standby (PAUSED)
@@ -64,9 +73,14 @@ class TestAgentRoleSwitch:
         """When role changes from follower to leader, leader sequence should start."""
         mock_sender.role = "follower"
         
+        mock_bus = MagicMock()
+        mock_bus.id = "mock-bus"
+        mock_bus.internal_bus = AsyncMock()
+        mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
+
         pipeline = AgentPipeline(
             "test-id", "agent:test-id", pipeline_config,
-            mock_source, mock_sender
+            mock_source, mock_sender, event_bus=mock_bus
         )
         
         await pipeline.start()

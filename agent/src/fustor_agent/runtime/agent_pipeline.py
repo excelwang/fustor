@@ -140,10 +140,13 @@ class AgentPipeline(Pipeline):
         backoff = self._calculate_backoff(self._consecutive_errors)
         
         if self._consecutive_errors >= self.max_consecutive_errors:
-            logger.warning(
+            logger.critical(
                 f"Pipeline {self.id} {loop_name} loop reached threshold of {self._consecutive_errors} "
-                f"consecutive errors (Backoff: {backoff}s). Latest error: {error}"
+                f"consecutive errors. Moving to terminal ERROR state."
             )
+            # Move to terminal error
+            self._set_state(PipelineState.ERROR, f"Max retries ({self.max_consecutive_errors}) exceeded: {error}")
+            return backoff
         else:
             logger.error(f"Pipeline {self.id} {loop_name} loop error: {error}. Retrying in {backoff}s...")
             
@@ -194,7 +197,7 @@ class AgentPipeline(Pipeline):
             logger.debug(f"Pipeline {self.id} is already stopped")
             return
         
-        self._set_state(PipelineState.STOPPED, "Stopping...")
+        self._set_state(PipelineState.STOPPING, "Stopping...")
         
         # Cancel all tasks
         tasks_to_cancel = [
@@ -210,10 +213,16 @@ class AgentPipeline(Pipeline):
             if task and not task.done():
                 task.cancel()
         
-        # Wait for tasks to finish
+        # Wait for tasks to finish with a timeout to avoid hanging indefinitely
         active_tasks = [t for t in tasks_to_cancel if t]
         if active_tasks:
-            await asyncio.gather(*active_tasks, return_exceptions=True)
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*active_tasks, return_exceptions=True),
+                    timeout=2.0
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"Pipeline {self.id} stop: Timed out waiting for tasks to cancel")
         
         # Close session
         if self.has_active_session():
@@ -267,6 +276,16 @@ class AgentPipeline(Pipeline):
         self.is_realtime_ready = False
         self._initial_snapshot_done = False
         self.audit_context.clear() # Reset cache for fresh start on next session
+        
+        # Reset task handles
+        self._heartbeat_task = None
+        self._snapshot_task = None
+        self._audit_task = None
+        self._sentinel_task = None
+        self._message_sync_task = None
+        self._message_sync_task = None
+        self._audit_task = None
+        self._sentinel_task = None
     
     async def _run_control_loop(self) -> None:
         """
@@ -277,11 +296,23 @@ class AgentPipeline(Pipeline):
         """
         self._set_state(PipelineState.RUNNING, "Waiting for role assignment...")
         while self.is_running():
-            logger.debug(f"Pipeline {self.id}: Control loop iteration starting (Role: {self.current_role}, Session: {self.session_id})")
+            logger.debug(f"Pipeline {self.id}: Control loop iteration starting (Role: {self.current_role}, Session: {self.session_id}, Errors: {self._consecutive_errors})")
+            
+            # If we have consecutive errors, we MUST backoff here to avoid tight loops
+            if self._consecutive_errors > 0:
+                backoff = self._calculate_backoff(self._consecutive_errors)
+                logger.info(f"Pipeline {self.id}: Backing off for {backoff:.2f}s due to previous errors")
+                await asyncio.sleep(backoff)
+                
+                # Re-check state after sleep
+                if not self.is_running():
+                    break
+
             try:
                 # D-03/D-04: Session Recovery & Leadership
                 # Wait until we have a session (in case of disconnection)
                 if not self.has_active_session():
+                    logger.info(f"Pipeline {self.id}: No active session. Reconnecting...")
                     self._set_state(PipelineState.RUNNING | PipelineState.RECONNECTING, "Attempting to create session...")
                     try:
                         logger.info(f"Pipeline {self.id}: Creating session with task_id={self.task_id}, timeout={self.session_timeout_seconds}")
@@ -309,39 +340,52 @@ class AgentPipeline(Pipeline):
                         logger.error(f"Pipeline {self.id}: Detailed session creation error: {e}", exc_info=True)
                         raise RuntimeError(f"Session creation failed: {e}")
 
-                # Wait until we have a role
-                if not self.current_role:
-                    await asyncio.sleep(self.role_check_interval)
-                    continue
-                
-                # Start Message Sync if not already running (for both Leader and Follower)
-                if self._message_sync_task is None or self._message_sync_task.done():
-                    logger.info(f"Pipeline {self.id}: Starting message sync phase (Role: {self.current_role})")
-                    self._message_sync_task = asyncio.create_task(self._run_message_sync())
-
                 if self.current_role == "leader":
                     # Run leader-specific tasks (Snapshot, Audit, Sentinel)
-                    # Note: We don't block on _message_sync_task here anymore
                     await self._run_leader_sequence()
                     await asyncio.sleep(self.control_loop_interval)
                 else:
-                    # Follower: standby
-                    # Ensure we are RUNNING but also mark as PAUSED (follower standby)
-                    # We keep MESSAGE_SYNC flag if it's there
-                    self._set_state((self.state | PipelineState.RUNNING | PipelineState.PAUSED) & ~PipelineState.SNAPSHOT_SYNC, "Follower mode - standby")
-                    await asyncio.sleep(self.follower_standby_interval)
+                    # Not a leader - ensure leader-specific tasks are NOT running
+                    await self._cancel_leader_tasks()
+                    
+                    if self.current_role == "follower":
+                        # Follower: standby
+                        # Ensure we are RUNNING but also mark as PAUSED (follower standby)
+                        self._set_state((self.state | PipelineState.RUNNING | PipelineState.PAUSED) & ~PipelineState.SNAPSHOT_SYNC, "Follower mode - standby")
+                        await asyncio.sleep(self.follower_standby_interval)
+                    else:
+                        # No role assigned yet
+                        self._set_state(PipelineState.RUNNING, "Waiting for role assignment (retrying)...")
+                        await asyncio.sleep(self.role_check_interval)
+                        # Increment errors if we are stuck without a role for too long
+                        self._consecutive_errors += 1
+                        continue
                 
                 # Reset error counter on successful iteration or state achievement
-                if self._consecutive_errors > 0:
+                # ONLY if background tasks that are supposed to be running are actually alive
+                bg_tasks_ok = True
+                if self.session_id and self.current_role:
+                    # Ensure Message Sync is running (for both Leader and Follower)
+                    if self._message_sync_task is None or self._message_sync_task.done():
+                        logger.info(f"Pipeline {self.id}: Starting message sync phase (Role: {self.current_role})")
+                        self._message_sync_task = asyncio.create_task(self._run_message_sync())
+
+                    if self._message_sync_task and self._message_sync_task.done():
+                        # Something crashed in the background but it didn't throw to us yet
+                        logger.warning(f"Pipeline {self.id}: Detected crashed message sync task")
+                        self._consecutive_errors += 1
+                        bg_tasks_ok = False
+                
+                if self._consecutive_errors > 0 and bg_tasks_ok:
                     logger.info(f"Pipeline {self.id} recovered after {self._consecutive_errors} errors")
                     self._consecutive_errors = 0
                 
             except asyncio.CancelledError:
-                if self.state == PipelineState.STOPPED:
-                    logger.info(f"Pipeline {self.id} control loop cancelled")
+                if (self.state & PipelineState.STOPPING) or (self.state == PipelineState.STOPPED):
+                    logger.info(f"Pipeline {self.id} control loop gracefully terminated")
                     break
                 else:
-                    logger.debug(f"Pipeline {self.id} control loop received CancelledError, continuing...")
+                    logger.debug(f"Pipeline {self.id} control loop received CancelledError, but not stopping. Continuing...")
                     continue
             except SessionObsoletedError as e:
                 logger.warning(f"Pipeline {self.id} session is obsolete: {e}. Reconnecting immediately.")
@@ -350,7 +394,8 @@ class AgentPipeline(Pipeline):
                     await self._cancel_all_tasks()
                     await self.on_session_closed(self.session_id)
                 
-                # No backoff for obsolete session, just restart the loop
+                # Yield to prevent busy loop if reconnection fails repeatedly
+                await asyncio.sleep(0.1)
                 continue
 
             except Exception as e:
@@ -378,20 +423,28 @@ class AgentPipeline(Pipeline):
         if not self._initial_snapshot_done and (self._snapshot_task is None or self._snapshot_task.done()):
             self._set_state(PipelineState.RUNNING | PipelineState.SNAPSHOT_SYNC, "Starting initial snapshot sync phase...")
             try:
-                # Start Snapshot in a background task so it can be safely cancelled 
-                # without killing the main control loop.
+                # Start Snapshot in a background task. 
+                # We do NOT await it here to keep the control loop responsive to role changes.
                 self._snapshot_task = asyncio.create_task(self._run_snapshot_sync())
-                await self._snapshot_task
+                # Note: We don't await self._snapshot_task anymore to allow role transition detection
+                # The next iteration will see it running and won't restart it.
+                logger.info(f"Pipeline {self.id}: Initial snapshot sync phase started in background")
+            except Exception as e:
+                self._set_state(PipelineState.ERROR, f"Failed to start snapshot sync phase: {e}")
+                return
+        
+        # Once snapshot is done, update the internal flag
+        if self._snapshot_task and self._snapshot_task.done() and not self._initial_snapshot_done:
+            try:
+                # Check if it failed
+                self._snapshot_task.result()
                 self._initial_snapshot_done = True
                 logger.info(f"Pipeline {self.id}: Initial snapshot sync phase complete")
             except asyncio.CancelledError:
-                logger.info(f"Pipeline {self.id}: Snapshot sync phase task cancelled")
-                raise # Stop leader sequence if snapshot was cancelled
-            except SessionObsoletedError:
-                raise
+                logger.info(f"Pipeline {self.id}: Snapshot sync phase task was cancelled")
             except Exception as e:
+                logger.error(f"Pipeline {self.id}: Snapshot sync phase failed: {e}")
                 self._set_state(PipelineState.ERROR, f"Snapshot sync phase failed: {e}")
-                return
             finally:
                 self._snapshot_task = None
         
@@ -441,16 +494,36 @@ class AgentPipeline(Pipeline):
     
     
     async def _cancel_leader_tasks(self) -> None:
-        """Cancel leader-specific tasks: Snapshot, Audit, Sentinel."""
-        tasks = []
-        current = asyncio.current_task()
-        for task in [self._audit_task, self._sentinel_task, self._snapshot_task]:
-            if task and task != current and not task.done():
-                task.cancel()
-                tasks.append(task)
-        
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        """Cancel leader-specific background tasks and clear handles."""
+        tasks_to_cancel = []
+        if self._snapshot_task and not self._snapshot_task.done():
+            tasks_to_cancel.append(self._snapshot_task)
+        if self._audit_task and not self._audit_task.done():
+            tasks_to_cancel.append(self._audit_task)
+        if self._sentinel_task and not self._sentinel_task.done():
+            tasks_to_cancel.append(self._sentinel_task)
+            
+        if not tasks_to_cancel:
+            # Ensure handles are cleared if they were finished
+            self._snapshot_task = None
+            self._audit_task = None
+            self._sentinel_task = None
+            return
+
+        logger.info(f"Pipeline {self.id}: Cancelling {len(tasks_to_cancel)} leader tasks")
+        for task in tasks_to_cancel:
+            task.cancel()
+
+        try:
+            # Wait briefly for tasks to acknowledge cancellation
+            await asyncio.wait(tasks_to_cancel, timeout=0.1)
+        except Exception:
+            pass
+            
+        # Clear handles to prevent re-entering this block unnecessarily
+        self._snapshot_task = None
+        self._audit_task = None
+        self._sentinel_task = None
 
     async def _cancel_all_tasks(self) -> None:
         """Cancel all pipeline tasks (usually on session loss or stop)."""
@@ -501,6 +574,8 @@ class AgentPipeline(Pipeline):
             
         if not isinstance(error, SessionObsoletedError):
             logger.error(f"Pipeline {self.id} fatal background error: {error}", exc_info=True)
+            # Increment error counter so control loop will backoff in next iteration
+            self._consecutive_errors += 1
             # Keep RUNNING bit so control loop doesn't exit
             self._set_state(PipelineState.RUNNING | PipelineState.ERROR, str(error))
     async def _aiter_sync_phase(self, phase_iter: Iterator[Any], queue_size: Optional[int] = None, yield_timeout: Optional[float] = None):
@@ -520,18 +595,24 @@ class AgentPipeline(Pipeline):
 
     async def _run_snapshot_sync(self) -> None:
         """Execute snapshot sync phase."""
-        # Unification: In Bus mode, the data flows through the single bus stream starting from 0.
-        # We just need to signal completion of the "snapshot" phase to Fusion 
-        # so it can mark its internal view as "Ready" for queries.
-        if self._bus:
-            logger.info(f"Pipeline {self.id}: Using Unified Bus Mode - Signaling snapshot readiness to Fusion")
-            await self.sender_handler.send_batch(
-                self.session_id, [], {"phase": "snapshot", "is_final": True}
-            )
-            return
-
-        from .pipeline.phases import run_snapshot_sync
-        await run_snapshot_sync(self)
+        logger.info(f"Pipeline {self.id}: Snapshot sync phase starting")
+        try:
+            from .pipeline.phases import run_snapshot_sync
+            await run_snapshot_sync(self)
+            
+            # In Bus mode, we also signal completion so Fusion can transition its view state
+            if self._bus:
+                logger.info(f"Pipeline {self.id}: Bus mode snapshot scan complete - signaling readiness to Fusion")
+                await self.sender_handler.send_batch(
+                    self.session_id, [], {"phase": "snapshot", "is_final": True}
+                )
+                
+            self._initial_snapshot_done = True
+            logger.info(f"Pipeline {self.id}: Initial snapshot sync phase complete")
+        except Exception as e:
+            await self._handle_fatal_error(e)
+        finally:
+            self._set_state(self.state & ~PipelineState.SNAPSHOT_SYNC)
 
     async def _run_message_sync(self) -> None:
         """Execute realtime message sync phase."""
@@ -562,6 +643,10 @@ class AgentPipeline(Pipeline):
             if self.current_role != "leader":
                 await asyncio.sleep(self.role_check_interval)
                 continue
+
+            if self.audit_interval_sec <= 0:
+                logger.debug(f"Pipeline {self.id}: Audit disabled (interval={self.audit_interval_sec})")
+                break
 
             try:
                 await asyncio.sleep(self.audit_interval_sec)
@@ -596,6 +681,10 @@ class AgentPipeline(Pipeline):
             if self.current_role != "leader":
                 await asyncio.sleep(self.role_check_interval)
                 continue
+
+            if self.sentinel_interval_sec <= 0:
+                logger.debug(f"Pipeline {self.id}: Sentinel disabled (interval={self.sentinel_interval_sec})")
+                break
 
             try:
                 await asyncio.sleep(self.sentinel_interval_sec)

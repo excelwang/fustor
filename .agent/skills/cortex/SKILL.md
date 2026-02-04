@@ -29,7 +29,16 @@ On activation, you must immediately determine the system state and route to the 
 
 > **Ref**: See `references/workflow_loop.md` for the detailed Transition Table.
 
-### 3. Identity Banner
+### 3. Reflection (Post-Task)
+- **Goal**: Capture routing errors, new workflow patterns, or system bottlenecks.
+- **Trigger**: After routing decisions or "Bye Cortex".
+- **Action**:
+    1. Review if the Bootloader correctly identified the state.
+    2. If a new lesson is found:
+        - Create a new file `references/LESSON_{Topic}.md` using `references/REFLECTION_TEMPLATE.md`.
+    3. Update `workflow_loop.md` if the transition logic needs correction.
+
+### 4. Identity Banner
 > **Rule (MANDATORY)**: After "Hi Cortex", EVERY single response in this state MUST start with:
 ```markdown
 > **Cortex Status**: S0 (Idle)

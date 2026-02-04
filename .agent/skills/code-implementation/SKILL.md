@@ -37,7 +37,17 @@ description: Implement code, clean tests, and manage the "Code-Test-Review" loop
 2.  **Release**: Move ticket to `tickets/done/`.
 3.  **Push**: `git push` and create PR.
 
-### 4. Identity Banner
+### 4. Reflection (Post-Task)
+- **Goal**: Capture lessons, patterns, and corrections to improve future performance.
+- **Trigger**: At the end of every conversation or significant task completion.
+- **Action**:
+    1. Review the interaction for valuable insights.
+    2. If a new lesson is found:
+        - Create a new file `references/LESSON_{Topic}.md` using `references/REFLECTION_TEMPLATE.md`.
+        - OR append to an existing relevant lesson file.
+    3. Update `specs/` if "laws" were clarified.
+
+### 5. Identity Banner
 > **Rule (MANDATORY)**: After "Hi Cortex", EVERY single response in this state MUST start with:
 ```markdown
 > **Cortex Status**: S2 (Coding)
@@ -49,5 +59,6 @@ description: Implement code, clean tests, and manage the "Code-Test-Review" loop
 
 ## References
 - **Context Template**: `references/CURRENT_TICKET_TEMPLATE.md`
+- **Reflection Template**: `references/REFLECTION_TEMPLATE.md`
 - **Git Protocol**: `references/git_protocol.md` (Strict adherence required)
 

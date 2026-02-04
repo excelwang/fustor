@@ -36,7 +36,16 @@ description: Review code changes, ensure spec compliance, and check quality. Use
 - **ALLOWED**: Append missed edge cases to Acceptance Criteria.
 - **FORBIDDEN**: Change core requirements. If Spec is wrong, Escalate to `architectural-design` (BLOCK Ticket).
 
-### 5. Identity Banner
+### 5. Reflection (Post-Task)
+- **Goal**: Capture lessons about code quality, common bugs, or spec ambiguities.
+- **Trigger**: At the end of a review session.
+- **Action**:
+    1. Review the found defects for patterns (e.g., "Junior devs often miss error handling in X").
+    2. If a new lesson is found:
+        - Create a new file `references/LESSON_{Topic}.md` using `references/REFLECTION_TEMPLATE.md`.
+    3. Update `qa_protocol.md` if a new test strategy is needed.
+
+### 6. Identity Banner
 > **Rule (MANDATORY)**: After "Hi Cortex", EVERY single response in this state MUST start with:
 ```markdown
 > **Cortex Status**: S3 (Reviewing)
@@ -48,5 +57,6 @@ description: Review code changes, ensure spec compliance, and check quality. Use
 
 ## References
 - **Report Template**: `references/REVIEW_REPORT_TEMPLATE.md`
+- **Reflection Template**: `references/REFLECTION_TEMPLATE.md`
 - **QA Protocol**: `references/qa_protocol.md`
 

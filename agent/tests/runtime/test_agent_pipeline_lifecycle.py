@@ -9,6 +9,7 @@ from unittest.mock import MagicMock, AsyncMock, patch
 from fustor_core.pipeline import PipelineState
 from fustor_agent.runtime.agent_pipeline import AgentPipeline
 
+@pytest.mark.timeout(5)
 class TestAgentPipelineLifecycle:
     """Test AgentPipeline lifecycle and role transitions."""
 
@@ -17,6 +18,9 @@ class TestAgentPipelineLifecycle:
         mock_bus = MagicMock()
         mock_bus.id = "mock-bus"
         mock_bus.internal_bus = AsyncMock()
+        # Prevent busy loop in message sync task
+        mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
+        
         return AgentPipeline(
             pipeline_id="test-pipeline",
             task_id="agent:test-pipeline",

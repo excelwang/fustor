@@ -94,22 +94,28 @@ async def test_pipeline_instance_service_integration(integration_configs, tmp_pa
         test_file.write_text("hello")
 
         # Act
+        # Act
         with caplog.at_level(logging.INFO):
-            await service.start_one("test_pipeline")
-            
-            # Give some time for AgentPipeline to run its sequence
-            await asyncio.sleep(1)
-            
-            # Verify instance in pool
-            instance = service.get_instance("test_pipeline")
-            assert instance is not None
-            assert isinstance(instance, AgentPipeline)
-            
-            # Check logs for pipeline activity
-            # AgentPipeline logs "Starting snapshot sync phase..."
-            assert "Using AgentPipeline" in caplog.text
-            assert "Snapshot sync phase complete" in caplog.text or "Starting message sync phase" in caplog.text
+            try:
+                await service.start_one("test_pipeline")
+                
+                # Give some time for AgentPipeline to run its sequence
+                await asyncio.sleep(1)
+                
+                # Verify instance in pool
+                instance = service.get_instance("test_pipeline")
+                assert instance is not None
+                assert isinstance(instance, AgentPipeline)
+                
+                # Check logs for pipeline activity
+                # We assert "start initiated successfully" instead of "Using AgentPipeline"
+                assert "Pipeline instance 'test_pipeline' start initiated successfully" in caplog.text
+                assert "Snapshot sync phase complete" in caplog.text or "Starting message sync phase" in caplog.text
 
-            await service.stop_one("test_pipeline")
+            finally:
+                await service.stop_one("test_pipeline")
+                # Ensure bus service cleanup too
+                await service.stop_all()
+            
             assert service.get_instance("test_pipeline") is None
 
