@@ -18,7 +18,7 @@ async def aiter_sync_phase_wrapper(
     thread and communicates items back via an asyncio.Queue, avoiding the overhead
     of creating a new thread/Future for every single item.
     """
-    queue = asyncio.Queue(maxsize=queue_size)
+    queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=queue_size)
     loop = asyncio.get_event_loop()
     stop_event = threading.Event()
     

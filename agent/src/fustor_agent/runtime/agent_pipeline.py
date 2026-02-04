@@ -104,7 +104,7 @@ class AgentPipeline(Pipeline):
         self.max_consecutive_errors = config.get("max_consecutive_errors", 5)  # Threshold for warning
         self.backoff_multiplier = config.get("backoff_multiplier", 2.0)        # Exponential backoff factor
         self.max_backoff_seconds = config.get("max_backoff_seconds", 60.0)     # Max backoff delay cap
-        self.session_timeout_seconds = config.get("session_timeout_seconds") # Session expiration timeout (optional)
+        self.session_timeout_seconds = config.get("session_timeout_seconds", 30) # Session expiration timeout (optional)
         
 
         
@@ -225,7 +225,7 @@ class AgentPipeline(Pipeline):
                 logger.warning(f"Pipeline {self.id} stop: Timed out waiting for tasks to cancel")
         
         # Close session
-        if self.has_active_session():
+        if self.session_id is not None:
             try:
                 await self.sender_handler.close_session(self.session_id)
             except Exception as e:
@@ -268,10 +268,10 @@ class AgentPipeline(Pipeline):
         logger.info(f"Pipeline {self.id}: {msg}, role={self.current_role}")
         
     
-    async def on_session_closed(self, session_id: str) -> None:
+    async def on_session_closed(self, session_id: Optional[str]) -> None:
         """Handle session closure."""
         logger.info(f"Pipeline {self.id}: Session {session_id} closed")
-        self.session_id = None
+        self.session_id = None  # type: ignore
         self.current_role = None
         self.is_realtime_ready = False
         self._initial_snapshot_done = False
@@ -475,8 +475,9 @@ class AgentPipeline(Pipeline):
                 # Check if message sync is running and post-prescan (driver ready)
                 can_realtime = self.is_realtime_ready
 
-                response = await self.sender_handler.send_heartbeat(self.session_id, can_realtime=can_realtime)
-                await self._update_role_from_response(response)
+                if self.session_id is not None:
+                    response = await self.sender_handler.send_heartbeat(self.session_id, can_realtime=can_realtime)
+                    await self._update_role_from_response(response)
                 
                 # Reset error counter on success
                 if self._consecutive_errors > 0:
@@ -773,7 +774,7 @@ class AgentPipeline(Pipeline):
         return self._bus
 
 
-    def get_dto(self) -> PipelineInstanceDTO:
+    def get_dto(self) -> Dict[str, Any]:
         """Get pipeline data transfer object representation."""
         from fustor_core.models.states import PipelineState as TaskState
         
@@ -797,7 +798,7 @@ class AgentPipeline(Pipeline):
         if self.state & PipelineState.RUNNING and state == TaskState.STOPPED:
             state = TaskState.STARTING
 
-        return PipelineInstanceDTO(
+        dto = PipelineInstanceDTO(
             id=self.id,
             state=state,
             info=self.info or "",
@@ -806,3 +807,4 @@ class AgentPipeline(Pipeline):
             task_id=self.task_id,
             current_role=self.current_role,
         )
+        return dto.model_dump()
