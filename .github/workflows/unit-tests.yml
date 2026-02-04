@@ -9,6 +9,7 @@ on:
     paths:
       - 'agent/**'
       - 'fusion/**'
+      - 'benchmark/**'
       - 'packages/**'
       - '.github/workflows/unit-tests.yml'
       - 'pyproject.toml'
@@ -17,6 +18,7 @@ on:
     paths:
       - 'agent/**'
       - 'fusion/**'
+      - 'benchmark/**'
       - 'packages/**'
       - 'pyproject.toml'
 
@@ -36,6 +38,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           version: "0.5.14"
+          cache: true
 
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
@@ -66,6 +69,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           version: "0.5.14"
+          cache: true
 
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
@@ -83,5 +87,6 @@ jobs:
 
       - name: Run mypy type check
         run: |
-          # Only check core and SDK packages for now to avoid overwhelming errors in legacy code
-          uv run mypy packages/core/src packages/agent-sdk/src packages/fusion-sdk/src
+          # Check core, SDKs and V2 drivers
+          uv run mypy packages/core/src packages/agent-sdk/src packages/fusion-sdk/src \
+                      packages/source-fs/src packages/view-fs/src fusion/src agent/src

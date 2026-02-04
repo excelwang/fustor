@@ -28,6 +28,7 @@ services:
       retries: 30
 
   fusion:
+    image: fustor-integration-fusion
     build:
       context: ..
       dockerfile: it/containers/fustor-services/Dockerfile
@@ -62,6 +63,7 @@ services:
   # ============ NFS Clients with Agents ============
 
   nfs-client-a:
+    image: fustor-integration-nfs-client
     build:
       context: ..
       dockerfile: it/containers/nfs-client/Dockerfile
@@ -105,6 +107,7 @@ services:
       retries: 30
 
   nfs-client-b:
+    image: fustor-integration-nfs-client
     build:
       context: ..
       dockerfile: it/containers/nfs-client/Dockerfile
@@ -150,6 +153,7 @@ services:
   # ============ NFS Client without Agent (Blind-spot Simulation) ============
 
   nfs-client-c:
+    image: fustor-integration-nfs-client
     build:
       context: ..
       dockerfile: it/containers/nfs-client/Dockerfile

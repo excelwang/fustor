@@ -11,6 +11,7 @@ on:
     paths:
       - 'agent/**'
       - 'fusion/**'
+      - 'benchmark/**'
       - 'packages/**'
       - 'it/**'
       - '.github/workflows/integration-tests.yml'
@@ -19,6 +20,7 @@ on:
     paths:
       - 'agent/**'
       - 'fusion/**'
+      - 'benchmark/**'
       - 'packages/**'
       - 'it/**'
   workflow_dispatch:
@@ -78,6 +80,7 @@ jobs:
         uses: astral-sh/setup-uv@v4
         with:
           version: "0.5.14"
+          cache: true
 
       - name: Set up Python
         run: uv python install ${{ env.PYTHON_VERSION }}
@@ -93,7 +96,7 @@ jobs:
 
       - name: Run integration tests
         run: |
-          uv run pytest it/consistency/ -v --tb=short --junit-xml=test-results.xml
+          uv run pytest it/ -v --tb=short --junit-xml=test-results.xml
         env:
           FUSTOR_USE_PIPELINE: 'true'
           FUSTOR_TEST_TIMEOUT: '600'
