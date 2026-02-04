@@ -105,29 +105,32 @@ async def test_sentinel_sweep_verification_flow(parser):
     """
     Test Sentinel Sweep: Suspect file marked, then verified, then cleared.
     """
-    now = time.time()
+    now = 5000.0 # Fixed base time
     parser.hot_file_threshold = 1.0 # 1 second for test
     
     # 1. Audit discovery of hot file -> Mark Suspect
-    await parser.process_event(UpdateEvent(
-        table="files",
-        rows=[{"path": "/hot/file.txt", "modified_time": now, "size": 100}],
-        index=int(now * 1000),
-        fields=[],
-        message_source=MessageSource.AUDIT,
-        event_schema="s"
-    ))
+    with unittest.mock.patch('time.time', return_value=now):
+        # Reset clock to match mocked time, otherwise it holds real system time (huge age)
+        parser.state.logical_clock.reset(now)
+        
+        await parser.process_event(UpdateEvent(
+            table="files",
+            rows=[{"path": "/hot/file.txt", "modified_time": now, "size": 100}],
+            index=int(now * 1000),
+            fields=[],
+            message_source=MessageSource.AUDIT,
+            event_schema="s"
+        ))
     
     node = parser._get_node("/hot/file.txt")
     assert node.integrity_suspect is True
     assert "/hot/file.txt" in parser._suspect_list
     
     # 2. Sentinel Sweep: Report verified (mtime same)
-    # Note: simulate wait so it becomes 'cold' relative to logical clock
-    parser._logical_clock.update(now + 2.0)
+    # Note: Clearing happens if stable, regardless of age
     await parser.update_suspect("/hot/file.txt", now)
     
-    # 3. Verify: Suspect cleared because it's now stable/cold
+    # 3. Verify: Suspect cleared because it's now stable
     assert node.integrity_suspect is False
     assert "/hot/file.txt" not in parser._suspect_list
 

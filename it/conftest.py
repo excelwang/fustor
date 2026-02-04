@@ -58,7 +58,7 @@ from fixtures.leadership import wait_for_audit, reset_leadership
 # ============================================================================
 
 @pytest.fixture(autouse=True)
-def reset_fusion_state(fusion_client):
+def reset_fusion_state(fusion_client, clean_shared_dir):
     """
     Aggressively reset environment before each test:
     1. Kill all agents in containers
@@ -69,43 +69,25 @@ def reset_fusion_state(fusion_client):
     
     # 1. Kill agents and clean up local state
     for container in containers:
-        try:
-            # Force kill any running agents
-            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"], timeout=10)
-            # Remove state files
-            docker_manager.exec_in_container(container, ["rm", "-f", "/root/.fustor/agent.pid"], timeout=5)
-            docker_manager.exec_in_container(container, ["rm", "-f", "/root/.fustor/agent-state.json"], timeout=5)
-        except Exception:
-            pass
+        docker_manager.cleanup_agent_state(container)
             
-    # 2. Clean Monitor Directory (Shared Mount)
-    logger.info("Cleaning shared directory before test...")
-    for container in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]:
-        try:
-            # removing * is safer than removing the mount point itself
-            docker_manager.exec_in_container(container, ["sh", "-c", f"rm -rf {MOUNT_POINT}/*"], timeout=20)
-        except Exception:
-            pass
-            
-    # Also clean from NFS server directly to be sure
-    try:
-        docker_manager.exec_in_container(CONTAINER_NFS_SERVER, ["sh", "-c", "rm -rf /exports/*"], timeout=20)
-    except Exception:
-        pass
-
-    # 3. Reset Fusion state
+    # 2. Reset Fusion state
     try:
         fusion_client.reset()
         
-        # RESTORED: Wait for View to be READY (Initial snapshot complete)
-        # We need to ensure the system is stable before the next test starts.
-        # Otherwise, early requests (like Sentinel polling) might hit 503s.
-        time.sleep(2.0) # Give it a breath
-        max_retries = 30 # 30 seconds should be plenty if healthy
+        # Wait for all stale sessions to vanish
+        logger.debug("Waiting for sessions to vanish after reset...")
+        for _ in range(10):
+            if not fusion_client.get_sessions():
+                break
+            time.sleep(1)
+        
+        # Wait for View to be READY (Initial snapshot complete)
+        time.sleep(1.0)
+        max_retries = 30
         for i in range(max_retries):
             try:
-                # Check if View is accessible (any call, e.g., stats)
-                fusion_client.get_tree(path="/", max_depth=1, silence_503=True)
+                fusion_client.get_stats()
                 break
             except Exception:
                 if i == max_retries - 1:

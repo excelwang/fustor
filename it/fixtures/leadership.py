@@ -81,11 +81,7 @@ def leader_follower_agents(setup_agents, fusion_client):
     
     # Force reset: Stop everyone
     for container in [client_A, client_B]:
-        try:
-            docker_manager.exec_in_container(container, ["sh", "-c", "pkill -CONT -f fustor-agent || true"])
-            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"])
-        except Exception:
-            pass
+        docker_manager.cleanup_agent_state(container)
 
     # Wait for sessions to vanish
     logger.info("Waiting for stale sessions to expire...")
@@ -138,7 +134,7 @@ def reset_leadership(setup_agents, fusion_client):
         logger.warning("Forcing leadership reset via fixture...")
         # Stop everyone
         for container in [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B]:
-            docker_manager.exec_in_container(container, ["pkill", "-9", "-f", "fustor-agent"])
+            docker_manager.cleanup_agent_state(container)
 
         # Wait for sessions to vanish
         start_cleanup = time.time()

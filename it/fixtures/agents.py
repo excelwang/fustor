@@ -113,10 +113,7 @@ heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
     docker_manager.create_file_in_container(container_name, f"{pipes_dir}/pipeline-task-1.yaml", pipelines_config)
     
     # 4. Kill existing agent if running and clean up pid/state files
-    docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])
-    docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent.pid"])
-    docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent-state.json"])
-    docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent.log"])
+    docker_manager.cleanup_agent_state(container_name)
     time.sleep(FAST_POLL_INTERVAL)
     
     logger.info(f"Starting agent in {container_name} in DAEMON mode (-D)")

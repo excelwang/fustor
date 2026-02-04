@@ -184,7 +184,7 @@ self.state.tombstone_list = {
 - **稳定性判定模型 (Stability-based Model)**：
   - **实时移除**：收到文件 Realtime Update/Delete 时立即从名单移除并清除标记
   - **物理过期检查**：后台任务定期检查物理 TTL 已到期的条目
-    - **稳定 (Stable/Cold)**：若 `node.mtime == recorded_mtime`，判定为"已冷却"，正式移除
+    - **稳定 (Stable)**：TTL到期时，若 `node.mtime == recorded_mtime`，则判定为"已校准"，正式移除。此判定不考虑 logical age (hot/cold)，以兼容 mtime 跳向未来的文件能快速清除标记。
     - **活跃 (Active/Hot)**：若 mtime 发生变化，**续期**一个完整 TTL 周期，并更新 `recorded_mtime`
 - **堆优化**：使用 `heapq` 管理 `suspect_heap`，实现 O(log n) 高效过期检查
 - **API 标记**：`integrity_suspect: true`

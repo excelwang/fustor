@@ -112,21 +112,26 @@ class FSViewProvider(FSViewBase):
             node.modified_time = mtime
             watermark = self.state.logical_clock.get_watermark()
             
-            if abs(old_mtime - mtime) > 1e-6:
-                if (watermark - mtime) < self.hot_file_threshold:
-                    # Even if mtime changed, Sentinel *just* verified it.
-                    # It is now "Known" and "Verified".
-                    node.integrity_suspect = False
-                    self.state.suspect_list.pop(path, None)
-                    self.logger.debug(f"Suspect CLEARED (Sentinel Verified + Updated): {path}")
-                else:
-                    node.integrity_suspect = False
-                    self.state.suspect_list.pop(path, None)
-            else:
-                # mtime stable, verify it
+            age = watermark - mtime
+            
+            is_stable = abs(old_mtime - mtime) < 1e-6
+            is_hot = age < self.hot_file_threshold
+            
+            self.logger.debug(f"SENT_CHECK: {path} mtime={mtime:.1f} stable={is_stable} hot={is_hot} age={age:.1f} wm={watermark:.1f}")
+
+            if is_stable:
+                # Stable -> Safe to clear (even if hot, to handle future jumps)
                 node.integrity_suspect = False
                 self.state.suspect_list.pop(path, None)
-                self.logger.debug(f"Suspect CLEARED (Sentinel Verified + Stable): {path}")
+                self.logger.debug(f"Suspect CLEARED (Sentinel Stable): {path}")
+            else:
+                # Active! Must stay suspect.
+                node.integrity_suspect = True
+                if path not in self.state.suspect_list:
+                     expiry = time.monotonic() + self.hot_file_threshold
+                     self.state.suspect_list[path] = (expiry, mtime)
+                     heapq.heappush(self.state.suspect_heap, (expiry, path))
+                self.logger.debug(f"Suspect RETAINED (Sentinel Active): {path}")
 
     async def get_data_view(self, **kwargs) -> dict:
         """Required by the ViewDriver ABC."""
