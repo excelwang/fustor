@@ -91,15 +91,11 @@ class TestClockSkewTolerance:
         file_path = f"{MOUNT_POINT}/{filename}"
         
         # 1. Create file from Client C (No Agent)
-        # Use future date to ensure "Freshness" in skewed environment
-        future_date = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["date", "+%Y%m%d%H%M.%S"]).stdout.strip()
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path, "from_c")
-        docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["touch", "-t", future_date, file_path])
         
         # NOTE: Smart Audit relies on parent directory mtime change.
         trigger_path = f"{MOUNT_POINT}/trigger_h_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, trigger_path, "trigger")
-        docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["touch", "-t", future_date, trigger_path])
         
         logger.info(f"Client C created file: {filename} and trigger.")
         

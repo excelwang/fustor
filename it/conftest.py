@@ -100,8 +100,8 @@ def reset_fusion_state(fusion_client):
         # RESTORED: Wait for View to be READY (Initial snapshot complete)
         # We need to ensure the system is stable before the next test starts.
         # Otherwise, early requests (like Sentinel polling) might hit 503s.
-        time.sleep(1.0) # Give it a breath
-        max_retries = 100
+        time.sleep(2.0) # Give it a breath
+        max_retries = 30 # 30 seconds should be plenty if healthy
         for i in range(max_retries):
             try:
                 # Check if View is accessible (any call, e.g., stats)

@@ -41,25 +41,12 @@ class TestSentinelSweep:
             for i in range(3)
         ]
         
-        # 1. Create files from blind-spot
-        # 1. Create files from blind-spot
-        # NOTE: In this skewed environment, Agent A is at T+2h. To make files appear 
-        # as "Hot/Fresh" (age < 60s) to the Logical Clock, we must create them with
-        # mtime ~ T+2h using optional 'touch -t' which overrides the NFS server default.
-        future_date = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["date", "+%Y%m%d%H%M.%S"]).stdout.strip()
-        logger.info(f"Creating blind-spot files with future timestamp: {future_date} (matching Agent A's logical baseline)")
-        
+        # 1. Create files from blind-spot (Client C uses NFS Server time)
         for f in test_files:
-            # Create file content
             docker_manager.create_file_in_container(
                 CONTAINER_CLIENT_C,
                 f,
                 content=f"content automated for {f}"
-            )
-            # Override NFS Server clock to match the system's Logical Baseline
-            docker_manager.exec_in_container(
-                CONTAINER_CLIENT_C,
-                ["touch", "-t", future_date, f]
             )
         
         # 2. Trigger Audit to discover suspects
