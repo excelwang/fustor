@@ -280,6 +280,11 @@ class ServiceManager:
                 self.agent_process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 self.agent_process.kill()
+            
+            # Remove from tracking list to prevent double-kill in stop_all
+            if self.agent_process in self.processes:
+                self.processes.remove(self.agent_process)
+                
             self.agent_process = None
         
         # Remove PID file

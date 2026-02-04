@@ -35,7 +35,7 @@ class BenchmarkRunner:
         headers = {"X-API-Key": api_key}
         
         try:
-            res = requests.get(f"{fusion_url}/api/v1/views/fs/tree", params={"path": "/", "max_depth": max_fetch_depth, "only_path": "true"}, headers=headers, timeout=30)
+            res = requests.get(f"{fusion_url}/api/v1/views/bench-view/tree", params={"path": "/", "max_depth": max_fetch_depth, "only_path": "true"}, headers=headers, timeout=30)
             if res.status_code != 200: return ["/"]
             tree_data = res.json()
             targets = []
@@ -159,7 +159,7 @@ class BenchmarkRunner:
         while True:
             elapsed = time.time() - start_wait
             try:
-                res = requests.get(f"{fusion_url}/api/v1/views/fs/tree", params={"path": "/", "max_depth": 1, "only_path": "true"}, headers=headers, timeout=5)
+                res = requests.get(f"{fusion_url}/api/v1/views/bench-view/tree", params={"path": "/", "max_depth": 1, "only_path": "true"}, headers=headers, timeout=5)
                 if res.status_code == 200:
                     click.echo(f"  [Fusion] READY after {elapsed:.1f}s.")
                     break
@@ -192,7 +192,7 @@ class BenchmarkRunner:
             fusion_stats = self.run_concurrent_fusion(api_key, targets, concurrency, reqs)
             
             fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
-            res_stats = requests.get(f"{fusion_url}/api/v1/views/fs/stats", headers={"X-API-Key": api_key})
+            res_stats = requests.get(f"{fusion_url}/api/v1/views/bench-view/stats", headers={"X-API-Key": api_key})
             stats_data = res_stats.json() if res_stats.status_code == 200 else {}
             final_results = {
                 "metadata": {"total_files_in_scope": stats_data.get("total_files", 0), "total_directories_in_scope": stats_data.get("total_directories", 0), "source_path": self.data_dir, "api_endpoint": fusion_url, "integrity_interval": integrity_interval},
@@ -348,7 +348,7 @@ class BenchmarkRunner:
             
             # Get total entries for the report
             fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
-            res_stats = requests.get(f"{fusion_url}/api/v1/views/fs/stats", headers={"X-API-Key": api_key})
+            res_stats = requests.get(f"{fusion_url}/api/v1/views/bench-view/stats", headers={"X-API-Key": api_key})
             stats_data = res_stats.json() if res_stats.status_code == 200 else {}
             total_entries = stats_data.get("total_files", 0) + stats_data.get("total_directories", 0)
 
