@@ -102,7 +102,12 @@ class FSViewProvider(FSViewBase):
             return self.query.get_stats()
 
     async def update_suspect(self, path: str, mtime: float):
-        """Update suspect status from sentinel feedback."""
+        """Update suspect status from sentinel feedback.
+        
+        Per Spec §4.3 Stability-based Model:
+        - Stable (mtime unchanged) + TTL expired -> clear suspect (handled by cleanup_expired_suspects)
+        - Active (mtime changed) -> renew TTL
+        """
         async with self._global_semaphore:
             self.state.logical_clock.update(mtime)
             node = self.state.get_node(path)
@@ -112,26 +117,27 @@ class FSViewProvider(FSViewBase):
             node.modified_time = mtime
             watermark = self.state.logical_clock.get_watermark()
             
-            age = watermark - mtime
-            
             is_stable = abs(old_mtime - mtime) < 1e-6
-            is_hot = age < self.hot_file_threshold
+            is_hot = (watermark - mtime) < self.hot_file_threshold
             
-            self.logger.debug(f"SENT_CHECK: {path} mtime={mtime:.1f} stable={is_stable} hot={is_hot} age={age:.1f} wm={watermark:.1f}")
+            self.logger.debug(f"SENT_CHECK: {path} mtime={mtime:.1f} stable={is_stable} hot={is_hot} wm={watermark:.1f}")
 
+            if path not in self.state.suspect_list:
+                # Not in suspect list - nothing to do
+                return
+                
             if is_stable:
-                # Stable -> Safe to clear (even if hot, to handle future jumps)
-                node.integrity_suspect = False
-                self.state.suspect_list.pop(path, None)
-                self.logger.debug(f"Suspect CLEARED (Sentinel Stable): {path}")
+                # Stable: Update recorded_mtime so TTL cleanup knows it's been verified
+                # The actual clearing happens in cleanup_expired_suspects when TTL expires
+                expiry, _ = self.state.suspect_list[path]
+                self.state.suspect_list[path] = (expiry, mtime)
+                self.logger.debug(f"Suspect VERIFIED stable: {path} (awaiting TTL expiry)")
             else:
-                # Active! Must stay suspect.
-                node.integrity_suspect = True
-                if path not in self.state.suspect_list:
-                     expiry = time.monotonic() + self.hot_file_threshold
-                     self.state.suspect_list[path] = (expiry, mtime)
-                     heapq.heappush(self.state.suspect_heap, (expiry, path))
-                self.logger.debug(f"Suspect RETAINED (Sentinel Active): {path}")
+                # Active: Renew TTL and update baseline mtime
+                expiry = time.monotonic() + self.hot_file_threshold
+                self.state.suspect_list[path] = (expiry, mtime)
+                heapq.heappush(self.state.suspect_heap, (expiry, path))
+                self.logger.debug(f"Suspect RENEWED (active): {path}")
 
     async def get_data_view(self, **kwargs) -> dict:
         """Required by the ViewDriver ABC."""

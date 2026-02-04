@@ -103,7 +103,8 @@ async def test_audit_late_start_signal(parser):
 @pytest.mark.asyncio
 async def test_sentinel_sweep_verification_flow(parser):
     """
-    Test Sentinel Sweep: Suspect file marked, then verified, then cleared.
+    Test Sentinel Sweep: Suspect file marked, then verified stable, 
+    then cleared by TTL expiry (Spec §4.3 Stability-based Model).
     """
     now = 5000.0 # Fixed base time
     parser.hot_file_threshold = 1.0 # 1 second for test
@@ -127,10 +128,20 @@ async def test_sentinel_sweep_verification_flow(parser):
     assert "/hot/file.txt" in parser._suspect_list
     
     # 2. Sentinel Sweep: Report verified (mtime same)
-    # Note: Clearing happens if stable, regardless of age
+    # Per Spec §4.3: Stable files stay in suspect_list awaiting TTL expiry
     await parser.update_suspect("/hot/file.txt", now)
     
-    # 3. Verify: Suspect cleared because it's now stable
+    # Verify: Still suspect, waiting for TTL
+    assert node.integrity_suspect is True
+    assert "/hot/file.txt" in parser._suspect_list
+    
+    # 3. Simulate TTL expiry and run cleanup
+    # Force TTL expiry by advancing monotonic time beyond expiry
+    expiry, _ = parser._suspect_list["/hot/file.txt"]
+    with unittest.mock.patch('time.monotonic', return_value=expiry + 1.0):
+        parser._cleanup_expired_suspects_unlocked()
+    
+    # 4. Verify: NOW suspect is cleared after TTL expiry
     assert node.integrity_suspect is False
     assert "/hot/file.txt" not in parser._suspect_list
 

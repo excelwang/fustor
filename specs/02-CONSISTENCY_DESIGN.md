@@ -247,9 +247,12 @@ if event.message_source == MessageSource.REALTIME:
 if event.message_source == MessageSource.SNAPSHOT:
     if path in tombstone_list:
         tombstone_ts, _ = tombstone_list[path]
-        event_ref_ts = event.index / 1000.0 if event.index > 0 else mtime
         
-        if event_ref_ts > tombstone_ts or mtime > tombstone_ts:
+        # 使用 watermark 进行转世判定（与墓碑创建时使用的时间基准一致）
+        # 注：不使用 event.index 是为了免疫 Agent 时钟偏差
+        watermark = logical_clock.get_watermark()
+        
+        if watermark > tombstone_ts or mtime > tombstone_ts:
             # 文件转世：清除墓碑，接受更新
             tombstone_list.pop(path, None)
         else:
@@ -265,6 +268,11 @@ if event.message_source == MessageSource.SNAPSHOT:
         node.integrity_suspect = True
         suspect_list[path] = (time.monotonic() + remaining_life, mtime)
 ```
+
+> [!NOTE]
+> **设计决策**：墓碑转世判定使用 `watermark` 而非 `event.index`，理由：
+> 1. `tombstone_ts` 本身使用 `logical_clock.get_watermark()` 创建，保持时间基准一致
+> 2. 免疫 Agent 时钟偏差（如 faketime、NTP 错误），符合 §4.1.A 设计原则
 
 ### 5.3 Audit 消息处理
 

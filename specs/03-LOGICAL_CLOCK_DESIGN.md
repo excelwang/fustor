@@ -132,15 +132,17 @@ if mtime is None:
 
 ```python
 class LogicalClock:
-    def update(self, mtime: Optional[float], agent_time: Optional[float] = None, 
-               can_sample_skew: bool = True) -> float:
-        """更新时钟状态，返回当前水位线"""
+    def update(self, mtime: Optional[float], can_sample_skew: bool = True) -> float:
+        """更新时钟状态，返回当前水位线
+        
+        注：始终使用 Fusion Local Time 作为物理参考，免疫 Agent 时钟偏差
+        """
     
     def get_watermark(self) -> float:
         """获取当前逻辑水位线"""
     
-    def hybrid_now(self) -> float:
-        """混合时间：max(watermark, get_watermark())"""
+    def now(self) -> float:
+        """获取当前水位线（get_watermark 的别名）"""
     
     def reset(self, initial_ts: float):
         """重置时钟状态"""

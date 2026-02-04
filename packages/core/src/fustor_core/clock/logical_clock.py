@@ -42,21 +42,20 @@ class LogicalClock:
         self._cached_global_skew: Optional[int] = None
         self._dirty = False # If histogram changed, re-calc skew
 
-    def update(self, observed_mtime: float, agent_time: Optional[float] = None, can_sample_skew: bool = True) -> float:
+    def update(self, observed_mtime: float, can_sample_skew: bool = True) -> float:
         """
         Update the logical clock.
         
         Args:
             observed_mtime: The mtime value observed from a file (NFS domain)
-            agent_time: Optional. If provided, used for sampling. Defaults to Fusion Local Time.
             can_sample_skew: Whether this event is suitable for skew sampling (Realtime vs Audit)
             
         Returns:
             The current clock value after the update
         """
-        # Unified physical reference: Use Fusion local time if no agent_time or if prioritizing stability
-        # Note: Using Fusion time here makes the system immune to Agent local clock errors.
-        reference_time = time.time() if agent_time is None else agent_time
+        # Unified physical reference: Always use Fusion Local Time (Spec §4.1.A)
+        # This makes the system immune to Agent local clock errors (Faketime/NTP drift).
+        reference_time = time.time()
         
         with self._lock:
             # --- Special Case: Deletion/Metadata event (observed_mtime is None) ---
@@ -124,10 +123,14 @@ class LogicalClock:
                     # Monotonicity check
                     if target_value > self._value:
                         self._value = target_value
+                    
+                    # ENFORCE BASELINE: Spec §4.1 "推进" (Progression)
+                    # Even if mtime is old (past data), the clock must flow with physical time.
+                    # This fixes the "Stagnation" issue where lack of new writes
+                    # caused the watermark to freeze, making old files look "fresh" (0 age).
+                    if baseline > self._value:
+                        self._value = baseline
 
-                # Note: No mandatory BaseLine enforcement here in update().
-                # This ensures update() returns a strict logical timestamp for arbitration.
-                # Physical progression (BaseLine) is handled in now() and get_watermark().
             except Exception as e:
                 # Silent fail to proceed with event processing
                 pass

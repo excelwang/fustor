@@ -59,7 +59,7 @@ class FSArbitrator:
             # the Global Skew with Agent-specific clock drifts (e.g. faketime).
             # The LogicalClock will calculate skew = FusionTime - mtime.
             # providing a simplified, consistent time base (Reception Time).
-            self.state.logical_clock.update(mtime, agent_time=None, can_sample_skew=is_realtime)
+            self.state.logical_clock.update(mtime, can_sample_skew=is_realtime)
             
             # Update latency (Lag) based on current watermark
             watermark = self.state.logical_clock.get_watermark()

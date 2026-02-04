@@ -28,29 +28,28 @@ class AuditManager:
         if not is_late_start:
              self.state.audit_seen_paths.clear()
         
-        # --- Spec §4.2 Optimization: Cleanup BEFORE scan ---
-        # Move Tombstone Cleanup to handle_start to ensure that expired tombstones
-        # DON'T block discovery during the audit cycle they should have been removed in.
+        self.logger.info(f"Audit started at local time {now}. late_start={is_late_start}")
+
+    async def handle_end(self):
+        """Finalizes audit cycle, performs Tombstone cleanup and Missing Item Detection.
+        
+        Per Spec §4.2 and §7: Tombstone TTL cleanup happens at Audit-End.
+        """
+        if self.state.last_audit_start is None:
+            return
+
+        # 1. Tombstone Cleanup (Spec §4.2: TTL cleanup at Audit-End)
         tombstone_ttl = getattr(self.state, 'tombstone_ttl_seconds', 3600.0)
-        cutoff_time = now - tombstone_ttl
+        cutoff_time = time.time() - tombstone_ttl
         before = len(self.state.tombstone_list)
         
         self.state.tombstone_list = {
             path: (l_ts, p_ts) for path, (l_ts, p_ts) in self.state.tombstone_list.items()
             if p_ts >= cutoff_time
         }
-        cleaned = before - len(self.state.tombstone_list)
-        if cleaned > 0:
-            self.logger.info(f"Tombstone CLEANUP (Audit-Start): removed {cleaned} items (TTL > {tombstone_ttl}s).")
-        
-        self.logger.info(f"Audit started at local time {now}. late_start={is_late_start}")
-
-    async def handle_end(self):
-        """Finalizes audit cycle, performs Tombstone cleanup and Missing Item Detection."""
-        if self.state.last_audit_start is None:
-            return
-
-        # 1. (Cleanup now happens at Audit-Start)
+        tombstones_cleaned = before - len(self.state.tombstone_list)
+        if tombstones_cleaned > 0:
+            self.logger.info(f"Tombstone CLEANUP (Audit-End): removed {tombstones_cleaned} items (TTL > {tombstone_ttl}s).")
 
         # 2. Optimized Missing File Detection
         missing_count = 0
@@ -87,8 +86,9 @@ class AuditManager:
                 self.logger.error(f"Error during missing item deletion: {e}")
                 # We continue to ensure state cleanup
         
-        self.logger.info(f"Audit ended. Missing items deleted: {missing_count}")
+        self.logger.info(f"Audit ended. Tombstones cleaned: {tombstones_cleaned}, Missing items deleted: {missing_count}")
         self.state.last_audit_finished_at = time.time()
         self.state.audit_cycle_count += 1
         self.state.last_audit_start = None
         self.state.audit_seen_paths.clear()
+

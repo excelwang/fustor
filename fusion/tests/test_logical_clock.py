@@ -21,29 +21,33 @@ class TestLogicalClockBasic:
     
     def test_initial_value_custom(self):
         """Clock should accept custom initial value."""
-        clock = LogicalClock(initial_time=1000.0)
-        assert clock.now() == 1000.0
+        with patch('time.time', return_value=1000.0):
+            clock = LogicalClock(initial_time=1000.0)
+            assert clock.now() == 1000.0
     
     def test_update_advances_clock(self):
         """Update should advance clock when mtime is newer."""
-        clock = LogicalClock(initial_time=100.0)
-        result = clock.update(200.0)
-        assert result == 200.0
-        assert clock.now() == 200.0
+        with patch('time.time', return_value=200.0):
+            clock = LogicalClock(initial_time=100.0)
+            result = clock.update(200.0)
+            assert result == 200.0
+            assert clock.now() == 200.0
     
     def test_update_ignores_older_time(self):
         """Update should ignore mtime older than current value."""
-        clock = LogicalClock(initial_time=200.0)
-        result = clock.update(100.0)
-        assert result == 200.0
-        assert clock.now() == 200.0
+        with patch('time.time', return_value=200.0):
+            clock = LogicalClock(initial_time=200.0)
+            result = clock.update(100.0)
+            assert result == 200.0
+            assert clock.now() == 200.0
     
     def test_update_ignores_equal_time(self):
         """Update with equal time should not change clock."""
-        clock = LogicalClock(initial_time=150.0)
-        result = clock.update(150.0)
-        assert result == 150.0
-        assert clock.now() == 150.0
+        with patch('time.time', return_value=150.0):
+            clock = LogicalClock(initial_time=150.0)
+            result = clock.update(150.0)
+            assert result == 150.0
+            assert clock.now() == 150.0
     
     def test_update_handles_none(self):
         """Update should handle None gracefully."""
@@ -64,9 +68,10 @@ class TestLogicalClockReset:
     
     def test_reset_to_value(self):
         """Reset should set clock to specified value."""
-        clock = LogicalClock(initial_time=500.0)
-        clock.reset(100.0)
-        assert clock.now() == 100.0
+        with patch('time.time', return_value=100.0):
+            clock = LogicalClock(initial_time=500.0)
+            clock.reset(100.0)
+            assert clock.now() == 100.0
 
 
 class TestLogicalClockThreadSafety:
@@ -74,31 +79,33 @@ class TestLogicalClockThreadSafety:
     
     def test_concurrent_updates(self):
         """Multiple threads updating should be safe."""
-        # Initialize with a fixed small value to ensure updates (0 to 9099) advance it
-        clock = LogicalClock(initial_time=0.001)
-        errors = []
-        
-        def worker(start_value: int, count: int):
-            try:
-                for i in range(count):
-                    val = start_value + i
-                    clock.update(val, agent_time=val + 100.0)
-            except Exception as e:
-                errors.append(e)
-        
-        threads = [
-            threading.Thread(target=worker, args=(i * 1000, 100))
-            for i in range(10)
-        ]
-        
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-        
-        assert len(errors) == 0
-        # Final value should be the max of all updates
-        assert clock.now() == 9099  # 9 * 1000 + 99
+        # Use patched time to control BaseLine
+        with patch('time.time', return_value=9100.0):
+            # Initialize with a fixed small value to ensure updates (0 to 9099) advance it
+            clock = LogicalClock(initial_time=0.001)
+            errors = []
+            
+            def worker(start_value: int, count: int):
+                try:
+                    for i in range(count):
+                        val = start_value + i
+                        clock.update(val)
+                except Exception as e:
+                    errors.append(e)
+            
+            threads = [
+                threading.Thread(target=worker, args=(i * 1000, 100))
+                for i in range(10)
+            ]
+            
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            
+            assert len(errors) == 0
+            # Final value should be the max of all updates (9099) or BaseLine
+            assert clock.now() >= 9099  # At least the max update value
     
     def test_concurrent_read_write(self):
         """Concurrent reads and writes should be safe."""
@@ -151,63 +158,69 @@ class TestLogicalClockThreadSafety:
         with patch('time.time', return_value=t_system):
             clock = LogicalClock()
 
-        # Audit finds a very old file (mtime=1000)
-        # Observed mtime (1000) < Current Watermark (2000)
-        clock.update(observed_mtime=1000.0, can_sample_skew=False)
+            # Audit finds a very old file (mtime=1000)
+            # Observed mtime (1000) < Current Watermark (2000)
+            clock.update(observed_mtime=1000.0, can_sample_skew=False)
 
-        # Clock must stay at 2000
-        assert clock.get_watermark() == 2000.0
+            # Clock must stay at 2000 (BaseLine = time.time() when no skew established)
+            assert clock.get_watermark() == 2000.0
 
     def test_realtime_events_establish_skew_and_take_control(self):
         """Establishing a skew mode allows the clock to move based on physical progress."""
-        t_start = 10000.0
-        with patch('time.time', return_value=t_start):
-            clock = LogicalClock()
+        # Use Fusion Local Time = 10500.0
+        t_fusion = 10500.0
+        nfs_mtime = 10400.0  # NFS mtime being written
+        # Expected Skew = 10500 - 10400 = 100s
+        
+        with patch('time.time', return_value=t_fusion):
+            # Use small initial_time so mtime can advance the clock
+            clock = LogicalClock(initial_time=0.001)
+            
+            # Inject some samples to stabilize Mode
+            for _ in range(5):
+                clock.update(observed_mtime=nfs_mtime)
+            
+            # After updates: skew=100, baseline=10400, _value advanced to 10400
+            assert clock._value == nfs_mtime
+            assert clock.get_watermark() == nfs_mtime
+        
+        # Time progresses to 10510
+        with patch('time.time', return_value=10510.0):
+            # Logic clock should advance based on BaseLine = 10510 - 100 = 10410
+            clock.update(observed_mtime=None)
+            assert clock.get_watermark() == 10410.0
 
-        # Sync Phase 1: Establish Skew
-        # Agent physical clock: 10500
-        # NFS mtime being written: 10400
-        # Skew = 100s (Agent - NFS)
-        agent_now = 10500.0
-        nfs_mtime = 10400.0
+    def test_global_consensus_isolates_rogue_mtime(self):
+        """Clock should follow the majority skew and not be affected by anomalous mtime."""
+        t_fusion = 2000.0
         
-        # Inject some samples to stabilize Mode
-        for _ in range(5):
-            clock.update(observed_mtime=nfs_mtime, agent_time=agent_now) # Removed session_id
-        
-        # Logic clock should advance to 10410 even if mtime is None
-        clock.update(observed_mtime=None, agent_time=10510.0) # Removed session_id
-        
-        assert clock.get_watermark() == 10410.0
+        with patch('time.time', return_value=t_fusion):
+            # Use small initial_time so mtime can advance the clock
+            clock = LogicalClock(initial_time=0.001)
 
-    def test_global_consensus_isolates_rogue_agent(self):
-        """Clock should follow the majority skew and ignore a rogue agent's unstable samples."""
-        t_start = 1000.0
-        with patch('time.time', return_value=t_start):
-            clock = LogicalClock()
+            # 1. Majority of samples establish a Skew of 100
+            # Formula: Diff = FusionTime - mtime = 2000 - 1900 = 100
+            for i in range(3):
+                clock.update(observed_mtime=1900.0)
+            
+            # After updates: baseline=1900, _value=1900
+            assert clock._value == 1900.0
+            assert clock._cached_global_skew == 100
 
-        # 1. Majority of samples (3 agents) establish a Skew of 100
-        # Formula: Diff = AgentTime - mtime = 2000 - 1900 = 100
-        for i in range(3):
-            clock.update(observed_mtime=1900.0, agent_time=2000.0)
+            # 2. A file with future mtime (outside trust window) should not pull clock forward  
+            clock.update(observed_mtime=3500.0)  # Way beyond trust window (upper_bound=1901)
+            
+            # 3. VERIFY: The global skew is affected but Mode picks the majority
+            assert clock._cached_global_skew == 100
+            
+            # 4. _value should still be 1900 (baseline enforcement = max(1900, 1900))
+            assert clock._value == 1900.0
+            assert clock.get_watermark() == 1900.0
         
-        assert clock.get_watermark() == 1900.0
-        assert clock._cached_global_skew == 100
+        # 5. Time progresses to 7000
+        with patch('time.time', return_value=7000.0):
+            clock.update(None)  # Deletion event
+            # BaseLine = 7000 - 100 = 6900
+            assert clock.get_watermark() == 6900.0
 
-        # 2. A rogue agent appears with a wildly different skew of 5000 (Agent is far in future)
-        # Diff = 6900 - 1900 = 5000
-        clock.update(observed_mtime=1900.0, agent_time=6900.0)
 
-        # 3. VERIFY: The global skew MUST still be 100 (because it's the Mode)
-        assert clock._cached_global_skew == 100
-        
-        # 4. Progress check: Even if rogue agent sends a deletion at its 'physical' 7000,
-        # it should be translated using the global skew (100), not its own (5000).
-        # Baseline = 7000 - 100 = 6900
-        clock.update(None, agent_time=7000.0)
-        
-        # The clock will advance to 6900 because we trust the ROGUE agent's physical flow
-        # but translated via the STABLE global skew.
-        # Note: In a real rogue scenario, if its physical time is wrong, we still 
-        # follow its 'tick', but the translation is now consistent with the cluster.
-        assert clock.get_watermark() == 6900.0
