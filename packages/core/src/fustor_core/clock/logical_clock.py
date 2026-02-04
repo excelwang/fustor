@@ -173,7 +173,7 @@ class LogicalClock:
                 baseline = time.time() - effective_skew
                 return max(self._value, baseline)
                 
-            return self._value
+            return max(self._value, time.time())
             
     def get_watermark(self) -> float:
         return self.now()
