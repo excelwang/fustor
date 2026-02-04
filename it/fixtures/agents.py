@@ -56,6 +56,10 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
     except Exception as e:
         logger.debug(f"Container {container_name} already running or could not be started: {e}")
 
+    # 0. Clean up previous state first
+    docker_manager.cleanup_agent_state(container_name)
+    time.sleep(FAST_POLL_INTERVAL)
+
     fusion_endpoint = FUSION_ENDPOINT
     
     # Generate unique agent ID
@@ -112,9 +116,8 @@ heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
 """
     docker_manager.create_file_in_container(container_name, f"{pipes_dir}/pipeline-task-1.yaml", pipelines_config)
     
-    # 4. Kill existing agent if running and clean up pid/state files
-    docker_manager.cleanup_agent_state(container_name)
-    time.sleep(FAST_POLL_INTERVAL)
+    
+
     
     logger.info(f"Starting agent in {container_name} in DAEMON mode (-D)")
     env_prefix = "FUSTOR_USE_PIPELINE=true "
@@ -197,7 +200,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
         # Filter for errors before tailing as suggested by user
         logs_res = docker_manager.exec_in_container(
             CONTAINER_CLIENT_B, 
-            ["sh", "-c", "grep -Ei 'error|fatal|exception|fail|exit' /root/.fustor/agent.log | tail -n 100"]
+            ["sh", "-c", "grep /root/.fustor/agent.log | tail -n 100"]
         )
         logs = logs_res.stdout + logs_res.stderr
         logger.error(f"FATAL: Agent B did not become ready. Relevant Logs:\n{logs}")
