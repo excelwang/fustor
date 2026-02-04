@@ -40,25 +40,20 @@ logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 async def lifespan(app: FastAPI):
     logger.info("Application startup initiated.")
     
-    # NEW: Initialize the global task manager reference
-    # NEW: Initialize the global task manager reference
-    # runtime_objects.task_manager = processing_manager # Deprecated: Legacy queue removed
-    
     # Initialize the Pipeline Manager
     from .runtime.pipeline_manager import pipeline_manager as pm
     runtime_objects.pipeline_manager = pm
     
-    # NEW: Initialize pipelines and receivers first (so they are available for router setup)
+    # Initialize pipelines and receivers first (so they are available for router setup)
     await pm.initialize_pipelines()
     
-    # NEW: Setup Pipeline API routers after pipeline_manager/receivers are available
+    # Setup Pipeline API routers after pipeline_manager/receivers are available
     from .api.pipe import setup_pipe_routers
     setup_pipe_routers()
     
     await pm.start()
 
-
-    # Perform initial configuration load and start processors
+    # Perform initial configuration load
     try:
         receivers_config.reload()
     except Exception as e:
@@ -78,12 +73,11 @@ async def lifespan(app: FastAPI):
                 break
             except Exception as e:
                 logger.error(f"Error in periodic_suspect_cleanup task: {e}", exc_info=True)
-                await asyncio.sleep(0.5) # Avoid tight error loop
+                await asyncio.sleep(0.5)
             
     suspect_cleanup_task = asyncio.create_task(periodic_suspect_cleanup())
     
     # Start periodic session cleanup
-    # Derive interval from configured timeouts (approx 1/5 of min timeout, min 1s)
     min_timeout = 30
     all_receivers = receivers_config.get_all()
     if all_receivers:
@@ -93,12 +87,11 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting session cleanup (Interval: {cleanup_interval}s, Min Timeout: {min_timeout}s)")
     await session_manager.start_periodic_cleanup(cleanup_interval)
 
-    # NEW: Auto-start enabled views from YAML
+    # Auto-start enabled views from YAML
     try:
         from .config import views_config
         from .view_manager.manager import get_cached_view_manager
         
-        # Reload to ensure fresh config
         views_config.reload()
         enabled_views = views_config.get_enabled()
         logger.info(f"Auto-starting {len(enabled_views)} enabled views...")
@@ -106,47 +99,27 @@ async def lifespan(app: FastAPI):
         for view_instance_id, config in enabled_views.items():
             try:
                 v_group_id = config.view_id
-                
-                # Use the centralized cache to ensure consistency with API/Ingestion
                 vm = await get_cached_view_manager(v_group_id)
-                
-                # Check if provider is already loaded (get_cached_view_manager initializes them)
                 if view_instance_id in vm.providers:
                     logger.info(f"View {view_instance_id} already initialized by manager.")
                     continue
-                
                 logger.info(f"Verified view {view_instance_id} is active in manager for group {v_group_id}")
-                
             except Exception as e:
                 logger.error(f"Failed to auto-start view {view_instance_id}: {e}", exc_info=True)
         
-        # After starting views, re-setup API routers to ensure prefixes are correct
+        # After starting views, re-setup API routers
         from .api.views import setup_view_routers
         setup_view_routers()
                 
     except Exception as e:
         logger.error(f"Error during view auto-start: {e}", exc_info=True)
 
-    # --- Register Routers (AFTER all pipelinesetup is complete) ---
-    # Registering inside lifespan ensures that setup_pipe_routers has correctly 
-    # populated pipe_router.
-    
-    # 1. Pipeline Domain (/api/v1/pipe) - Main API
-    api_v1 = APIRouter()
-    api_v1.include_router(pipe_router, prefix="/pipe")
-    api_v1.include_router(view_router, prefix="/views")
-    api_v1.include_router(management_router)
-    
-    # Finally include versioned router in app
-    app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
-    
     logger.info("Application lifespan initialization complete. READY.")
     yield # Ready
 
     logger.info("Application shutdown initiated.")
     suspect_cleanup_task.cancel()
     
-    # Stop clinical pipeline
     if runtime_objects.pipeline_manager:
         await runtime_objects.pipeline_manager.stop()
         
@@ -154,24 +127,38 @@ async def lifespan(app: FastAPI):
     logger.info("Application shutdown complete.")
 
 
-# 实例化
-app = FastAPI(lifespan=lifespan)
+def create_app() -> FastAPI:
+    """
+    Factory function to create the FastAPI application.
+    """
+    app = FastAPI(lifespan=lifespan, title="Fusion Storage Engine API", version="1.0.0")
 
-# --- API Routing Version 1 ---
-from .api.pipe import pipe_router, setup_pipe_routers
-from .api.management import router as management_router
-from .api.views import view_router
+    # --- Router Registration ---
+    # Imports are local to avoid circular dependencies during initial module load
+    from .api.pipe import pipe_router
+    from .api.management import router as management_router
+    from .api.views import view_router
 
-# NOTE: Routers are now included inside lifespan() after pipeline initialization.
+    # 1. Main API v1 (/api/v1)
+    api_v1 = APIRouter()
+    api_v1.include_router(pipe_router, prefix="/pipe")
+    api_v1.include_router(view_router, prefix="/views")
+    api_v1.include_router(management_router)
+    
+    app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
 
+    # 2. Root & UI Endpoints
+    ui_dir = os.path.dirname(__file__)
 
+    @app.get("/", tags=["Root"])
+    async def read_web_api_root():
+        return {"message": "Welcome to Fusion Storage Engine Ingest API"}
 
-ui_dir = os.path.dirname(__file__)
+    @app.get("/view", tags=["UI"])
+    async def read_view_ui(request: Request):
+        return FileResponse(f"{ui_dir}/view.html")
 
-@app.get("/", tags=["Root"])
-async def read_web_api_root():
-    return {"message": "Welcome to Fusion Storage Engine Ingest API"}
+    return app
 
-@app.get("/view", tags=["UI"])
-async def read_web_api_root(request: Request):
-    return FileResponse(f"{ui_dir}/view.html")
+# Entry point for uvicorn
+app = create_app()
