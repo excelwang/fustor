@@ -123,45 +123,49 @@ async def test_tombstone_effectiveness(arbitrator, fs_state):
     Property: A Realtime Delete should create a Tombstone that blocks
     any subsequent Non-Realtime event with an older mtime.
     """
-    path = "/tombstone_test.txt"
-    base_time = 1000.0
+    from unittest.mock import patch
     
-    # 1. Realtime Insert
-    await arbitrator.process_event(MockEvent(
-        EventType.INSERT,
-        [{"path": path, "modified_time": base_time, "size": 100}],
-        source=MessageSource.REALTIME
-    ))
-    
-    # 2. Realtime Delete (Creates Tombstone at ~1000.0)
-    await arbitrator.process_event(MockEvent(
-        EventType.DELETE,
-        [{"path": path, "modified_time": base_time + 10}],
-        source=MessageSource.REALTIME
-    ))
-    
-    # Verify Tombstone exists
-    assert path in fs_state.tombstone_list
-    
-    # 3. Attempt to resurrect with Stale Snapshot (Time < Delete Time)
-    await arbitrator.process_event(MockEvent(
-        EventType.UPDATE,
-        [{"path": path, "modified_time": base_time + 5, "size": 999}],
-        source=MessageSource.SNAPSHOT
-    ))
-    
-    # Verify stays deleted
-    assert fs_state.get_node(path) is None
-    
-    # 4. Attempt to resurrect with Newer Snapshot (Time > Delete Time) -> Reincarnation
-    await arbitrator.process_event(MockEvent(
-        EventType.UPDATE,
-        [{"path": path, "modified_time": base_time + 20, "size": 200}],
-        source=MessageSource.SNAPSHOT
-    ))
-    
-    # Verify resurrected
-    node = fs_state.get_node(path)
-    assert node is not None
-    assert node.size == 200
-    assert path not in fs_state.tombstone_list
+    # Patch time.time() to match the clock.reset(500.0) in fixture
+    with patch('time.time', return_value=500.0):
+        path = "/tombstone_test.txt"
+        base_time = 1000.0
+        
+        # 1. Realtime Insert
+        await arbitrator.process_event(MockEvent(
+            EventType.INSERT,
+            [{"path": path, "modified_time": base_time, "size": 100}],
+            source=MessageSource.REALTIME
+        ))
+        
+        # 2. Realtime Delete (Creates Tombstone at ~1000.0)
+        await arbitrator.process_event(MockEvent(
+            EventType.DELETE,
+            [{"path": path, "modified_time": base_time + 10}],
+            source=MessageSource.REALTIME
+        ))
+        
+        # Verify Tombstone exists
+        assert path in fs_state.tombstone_list
+        
+        # 3. Attempt to resurrect with Stale Snapshot (Time < Delete Time)
+        await arbitrator.process_event(MockEvent(
+            EventType.UPDATE,
+            [{"path": path, "modified_time": base_time + 5, "size": 999}],
+            source=MessageSource.SNAPSHOT
+        ))
+        
+        # Verify stays deleted
+        assert fs_state.get_node(path) is None
+        
+        # 4. Attempt to resurrect with Newer Snapshot (Time > Delete Time) -> Reincarnation
+        await arbitrator.process_event(MockEvent(
+            EventType.UPDATE,
+            [{"path": path, "modified_time": base_time + 20, "size": 200}],
+            source=MessageSource.SNAPSHOT
+        ))
+        
+        # Verify resurrected
+        node = fs_state.get_node(path)
+        assert node is not None
+        assert node.size == 200
+        assert path not in fs_state.tombstone_list

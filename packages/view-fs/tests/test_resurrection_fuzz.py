@@ -44,48 +44,52 @@ async def test_tombstone_resurrection_logic(arbitrator, state):
     """
     Verify that tombstones properly block stale events and allow newer events.
     """
-    path = "/data/resurrection.txt"
+    from unittest.mock import patch
     
-    # 1. DELETE event (Realtime) establishes a tombstone
-    # Set logical clock watermark
-    state.logical_clock.reset(1000.0)
-    
-    del_event = MockEvent({
-        "event_type": EventType.DELETE,
-        "rows": [{"path": path, "modified_time": 1000.1}],
-        "message_source": MessageSource.REALTIME,
-        "index": 1000100 # 1000.1s
-    })
-    
-    await arbitrator.process_event(del_event)
-    assert path in state.tombstone_list
-    tombstone_ts, _ = state.tombstone_list[path]
-    assert tombstone_ts > 1000.0
+    # Patch time.time() to match clock.reset(1000.0) called below
+    with patch('time.time', return_value=1000.0):
+        path = "/data/resurrection.txt"
+        
+        # 1. DELETE event (Realtime) establishes a tombstone
+        # Set logical clock watermark
+        state.logical_clock.reset(1000.0)
+        
+        del_event = MockEvent({
+            "event_type": EventType.DELETE,
+            "rows": [{"path": path, "modified_time": 1000.1}],
+            "message_source": MessageSource.REALTIME,
+            "index": 1000100 # 1000.1s
+        })
+        
+        await arbitrator.process_event(del_event)
+        assert path in state.tombstone_list
+        tombstone_ts, _ = state.tombstone_list[path]
+        assert tombstone_ts > 1000.0
 
-    # 2. STALE event (Snapshot) should be blocked
-    stale_event = MockEvent({
-        "event_type": EventType.UPDATE,
-        "rows": [{"path": path, "modified_time": 999.0}],
-        "message_source": MessageSource.SNAPSHOT,
-        "index": 999000 # 999.0s
-    })
-    
-    await arbitrator.process_event(stale_event)
-    # Should still be in tombstone list, and tree_manager.update_node should NOT have been called for this path
-    assert path in state.tombstone_list
-    arbitrator.tree_manager.update_node.assert_not_called()
+        # 2. STALE event (Snapshot) should be blocked
+        stale_event = MockEvent({
+            "event_type": EventType.UPDATE,
+            "rows": [{"path": path, "modified_time": 999.0}],
+            "message_source": MessageSource.SNAPSHOT,
+            "index": 999000 # 999.0s
+        })
+        
+        await arbitrator.process_event(stale_event)
+        # Should still be in tombstone list, and tree_manager.update_node should NOT have been called for this path
+        assert path in state.tombstone_list
+        arbitrator.tree_manager.update_node.assert_not_called()
 
-    # 3. NEW activity (Realtime/Audit) should resurrect
-    resurrect_event = MockEvent({
-        "event_type": EventType.UPDATE,
-        "rows": [{"path": path, "modified_time": 1005.0}],
-        "message_source": MessageSource.REALTIME,
-        "index": 1005100
-    })
-    
-    await arbitrator.process_event(resurrect_event)
-    assert path not in state.tombstone_list
-    arbitrator.tree_manager.update_node.assert_called_once()
+        # 3. NEW activity (Realtime/Audit) should resurrect
+        resurrect_event = MockEvent({
+            "event_type": EventType.UPDATE,
+            "rows": [{"path": path, "modified_time": 1005.0}],
+            "message_source": MessageSource.REALTIME,
+            "index": 1005100
+        })
+        
+        await arbitrator.process_event(resurrect_event)
+        assert path not in state.tombstone_list
+        arbitrator.tree_manager.update_node.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_fuzzed_arbitration_stability(arbitrator, state):

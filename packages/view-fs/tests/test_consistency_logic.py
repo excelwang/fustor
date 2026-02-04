@@ -5,48 +5,53 @@ from fustor_core.event import EventBase, EventType, MessageSource, UpdateEvent, 
 
 @pytest.mark.asyncio
 async def test_arbitration_logic():
-    parser = FSViewProvider(id="test_view", view_id="1")
+    from unittest.mock import patch
+    
+    # Use a fixed time for deterministic testing
+    fixed_time = 1000000.0
+    
+    with patch('time.time', return_value=fixed_time):
+        parser = FSViewProvider(id="test_view", view_id="1")
 
-    
-    # 1. Snapshot event (old data)
-    old_time = time.time() - 1000
-    rows = [{"path": "/test/file1", "modified_time": old_time, "size": 100}]
-    evt1 = UpdateEvent(table="files", rows=rows, index=1, fields=[], message_source=MessageSource.SNAPSHOT, event_schema="s")
-    await parser.process_event(evt1)
-    
-    node = parser.state.get_node("/test/file1")
-    assert node.size == 100
-    
-    # 2. Realtime event (newer data)
-    new_time = time.time()
-    rows2 = [{"path": "/test/file1", "modified_time": new_time, "size": 200}]
-    evt2 = UpdateEvent(table="files", rows=rows2, index=2, fields=[], message_source=MessageSource.REALTIME, event_schema="s")
-    await parser.process_event(evt2)
-    
-    node = parser.state.get_node("/test/file1")
-    assert node.size == 200
-    assert node.modified_time == new_time
-    
-    # 3. Snapshot event (older than current) - Should be ignored due to Mtime check
-    rows3 = [{"path": "/test/file1", "modified_time": old_time, "size": 300}]
-    evt3 = UpdateEvent(table="files", rows=rows3, index=3, fields=[], message_source=MessageSource.SNAPSHOT, event_schema="s")
-    await parser.process_event(evt3)
-    
-    node = parser.state.get_node("/test/file1")
-    assert node.size == 200 # Should NOT change to 300
-    
-    # 4. Realtime Delete
-    del_evt = DeleteEvent(table="files", rows=[{"path": "/test/file1"}], index=4, fields=[], message_source=MessageSource.REALTIME, event_schema="s")
-    await parser.process_event(del_evt)
-    
-    node = parser.state.get_node("/test/file1")
-    assert node is None
-    assert "/test/file1" in parser.state.tombstone_list
-    
-    # 5. Snapshot resurrect check - Should be ignored due to Tombstone
-    await parser.process_event(evt1) # Resend old snapshot
-    node = parser.state.get_node("/test/file1")
-    assert node is None # Still dead
+        # 1. Snapshot event (old data)
+        old_time = fixed_time - 1000
+        rows = [{"path": "/test/file1", "modified_time": old_time, "size": 100}]
+        evt1 = UpdateEvent(table="files", rows=rows, index=1, fields=[], message_source=MessageSource.SNAPSHOT, event_schema="s")
+        await parser.process_event(evt1)
+        
+        node = parser.state.get_node("/test/file1")
+        assert node.size == 100
+        
+        # 2. Realtime event (newer data)
+        new_time = fixed_time
+        rows2 = [{"path": "/test/file1", "modified_time": new_time, "size": 200}]
+        evt2 = UpdateEvent(table="files", rows=rows2, index=2, fields=[], message_source=MessageSource.REALTIME, event_schema="s")
+        await parser.process_event(evt2)
+        
+        node = parser.state.get_node("/test/file1")
+        assert node.size == 200
+        assert node.modified_time == new_time
+        
+        # 3. Snapshot event (older than current) - Should be ignored due to Mtime check
+        rows3 = [{"path": "/test/file1", "modified_time": old_time, "size": 300}]
+        evt3 = UpdateEvent(table="files", rows=rows3, index=3, fields=[], message_source=MessageSource.SNAPSHOT, event_schema="s")
+        await parser.process_event(evt3)
+        
+        node = parser.state.get_node("/test/file1")
+        assert node.size == 200 # Should NOT change to 300
+        
+        # 4. Realtime Delete
+        del_evt = DeleteEvent(table="files", rows=[{"path": "/test/file1"}], index=4, fields=[], message_source=MessageSource.REALTIME, event_schema="s")
+        await parser.process_event(del_evt)
+        
+        node = parser.state.get_node("/test/file1")
+        assert node is None
+        assert "/test/file1" in parser.state.tombstone_list
+        
+        # 5. Snapshot resurrect check - Should be ignored due to Tombstone
+        await parser.process_event(evt1) # Resend old snapshot
+        node = parser.state.get_node("/test/file1")
+        assert node is None # Still dead
 
 @pytest.mark.asyncio
 async def test_audit_sentinel_logic():
