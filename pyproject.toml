@@ -3,20 +3,20 @@ members = [
     "agent",
     "fusion",
     "benchmark",
-    "packages/core",
-    "packages/agent-sdk",
-    "packages/fusion-sdk",
+    "packages/fustor-core",
+    "packages/fustor-agent-sdk",
+    "packages/fustor-fusion-sdk",
     "packages/sender-echo",
     "packages/sender-openapi",
-    "packages/sender-http",
-    "packages/receiver-http",
-    "packages/schema-fs",
+    "packages/fustor-sender-http",
+    "packages/fustor-receiver-http",
+    "packages/fustor-schema-fs",
     "packages/source-elasticsearch",
-    "packages/source-fs",
+    "packages/fustor-source-fs",
     "packages/source-mysql",
-    "packages/source-oss",
+    "packages/fustor-source-oss",
     "packages/demo",
-    "packages/view-fs"
+    "packages/fustor-view-fs"
 ]
 
 [tool.uv.sources]
@@ -41,18 +41,18 @@ fustor-view-fs = { workspace = true }
 pythonpath = [
     "agent/src",
     "fusion/src",
-    "packages/core/src",
+    "packages/fustor-core/src",
     "packages/sender-echo/src",
     "packages/sender-openapi/src",
-    "packages/sender-http/src",
-    "packages/receiver-http/src",
-    "packages/schema-fs/src",
+    "packages/fustor-sender-http/src",
+    "packages/fustor-receiver-http/src",
+    "packages/fustor-schema-fs/src",
     "packages/source-elasticsearch/src",
-    "packages/source-fs/src",
+    "packages/fustor-source-fs/src",
     "packages/source-mysql/src",
-    "packages/source-oss/src",
+    "packages/fustor-source-oss/src",
     "packages/demo/src",
-    "packages/view-fs/src"
+    "packages/fustor-view-fs/src"
 ]
 markers = [
     "timeout: mark test to timeout after X seconds",

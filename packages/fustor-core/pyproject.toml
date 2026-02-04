@@ -24,7 +24,7 @@ version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/core"
+Homepage = "https://github.com/excelwang/fustor/tree/master/packages/fustor-core"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 license = "MIT"

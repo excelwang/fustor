@@ -18,11 +18,11 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 
 # Install Fustor packages (all pip dependencies declared in package pyproject.toml)
 RUN pip install --no-cache-dir \
-    /app/packages/core \
-    /app/packages/fusion-sdk \
-    /app/packages/schema-fs \
-    /app/packages/view-fs \
-    /app/packages/receiver-http \
+    /app/packages/fustor-core \
+    /app/packages/fustor-fusion-sdk \
+    /app/packages/fustor-schema-fs \
+    /app/packages/fustor-view-fs \
+    /app/packages/fustor-receiver-http \
     /app/fusion
 
 

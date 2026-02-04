@@ -88,5 +88,5 @@ jobs:
       - name: Run mypy type check
         run: |
           # Check core, SDKs and V2 drivers
-          uv run mypy packages/core/src packages/agent-sdk/src packages/fusion-sdk/src \
-                      packages/source-fs/src packages/view-fs/src fusion/src agent/src
+          uv run mypy packages/fustor-core/src packages/fustor-agent-sdk/src packages/fustor-fusion-sdk/src \
+                      packages/fustor-source-fs/src packages/fustor-view-fs/src fusion/src agent/src
