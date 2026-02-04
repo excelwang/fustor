@@ -54,6 +54,9 @@ pythonpath = [
     "packages/demo/src",
     "packages/view-fs/src"
 ]
+markers = [
+    "timeout: mark test to timeout after X seconds",
+]
 testpaths = [
     "agent/tests",
     "fusion/tests",
