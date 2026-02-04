@@ -102,7 +102,7 @@ sys.exit(1)  # Exit with an error code
         # The main assertion: Check if an UpdateEvent was generated for the crashed process file
         update_events = [e for e in events if isinstance(e, UpdateEvent)]
         crash_file_events = [e for e in update_events 
-                            if e.rows and any(row.get('file_path', '').endswith('crash_test_file.txt') for row in e.rows)]
+                            if e.rows and any(row.get('path', '').endswith('crash_test_file.txt') for row in e.rows)]
         
         print(f"Update events: {len(update_events)}")
         print(f"Events for crash test file: {len(crash_file_events)}")

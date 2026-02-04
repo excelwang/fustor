@@ -276,7 +276,7 @@ def test_get_file_metadata_with_real_exception():
         # Test with valid file - should return metadata
         result = get_file_metadata(test_file)
         assert result is not None
-        assert result["file_path"] == test_file
+        assert result["path"] == test_file
 
 
 if __name__ == "__main__":

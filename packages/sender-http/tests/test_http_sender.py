@@ -40,9 +40,10 @@ async def test_create_session(sender, mock_fusion_client):
         "session_timeout_seconds": 60
     }
     
-    result = await sender.create_session("task-1", "snapshot", 60)
+    session_id, result = await sender.create_session("task-1", "snapshot", 60)
     
     assert result["session_id"] == "sess-1"
+    assert session_id == "sess-1"
     assert sender.session_id == "sess-1"
     mock_fusion_client.create_session.assert_called_once_with("task-1", source_type="snapshot", session_timeout_seconds=60)
 

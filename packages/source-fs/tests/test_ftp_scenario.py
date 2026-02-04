@@ -96,7 +96,7 @@ print("FTP server process ending")
             iterator = driver.get_message_iterator(start_position=start_time, stop_event=stop_event)
             for event in iterator:
                 events.append(event)
-                print(f"Monitor: Captured event - {{type(event).__name__}} for {{event.rows[0]['file_path'] if event.rows else 'N/A'}}")
+                print(f"Monitor: Captured event - {{type(event).__name__}} for {{event.rows[0]['path'] if event.rows else 'N/A'}}")
                 # Collect events for a reasonable period
                 if time.time() * 1000 - start_time > 10000:  # 10 seconds max
                     break
@@ -133,14 +133,14 @@ print("FTP server process ending")
             print(f"Event {i}: {type(event).__name__}")
             if hasattr(event, 'rows') and event.rows:
                 row = event.rows[0]
-                print(f"  - File: {row.get('file_path', 'N/A')}")
+                print(f"  - File: {row.get('path', 'N/A')}")
                 print(f"  - Size: {row.get('size', 'N/A')} bytes")
                 print(f"  - Modified: {time.ctime(row.get('modified_time', 0)) if 'modified_time' in row else 'N/A'}")
         
         # Check if we got an update event for the interrupted transfer
         update_events = [e for e in events if isinstance(e, UpdateEvent)]
         ftp_file_events = [e for e in update_events 
-                          if e.rows and any('ftp_transfer_interrupted' in row.get('file_path', '') for row in e.rows)]
+                          if e.rows and any('ftp_transfer_interrupted' in row.get('path', '') for row in e.rows)]
         
         print(f"\\nUpdate events total: {len(update_events)}")
         print(f"Events for FTP interrupted file: {len(ftp_file_events)}")

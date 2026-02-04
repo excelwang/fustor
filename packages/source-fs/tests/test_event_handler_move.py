@@ -15,7 +15,7 @@ from fustor_source_fs.components import _WatchManager
 # Mock _get_file_metadata to return consistent data for testing
 def _mock_get_file_metadata(path: str):
     if os.path.exists(path) and os.path.isfile(path):
-        return {"file_path": path, "size": 100, "modified_time": time.time(), "created_time": time.time()}
+        return {"path": path, "size": 100, "modified_time": time.time(), "created_time": time.time()}
     return None
 
 
@@ -74,7 +74,7 @@ def test_on_moved_directory_generates_correct_events_and_touches(mocker, tmp_pat
     # Expected DeleteEvents (4: src_dir, sub_dir_src, file_in_sub_src, file_in_src_root)
     delete_events = [e for e in captured_events if isinstance(e, DeleteEvent)]
     assert len(delete_events) == 4
-    delete_paths = {e.rows[0]['file_path'] for e in delete_events}
+    delete_paths = {e.rows[0]['path'] for e in delete_events}
     assert str(src_dir) in delete_paths
     assert str(sub_dir_src) in delete_paths
     assert str(file_in_sub_src) in delete_paths
@@ -83,7 +83,7 @@ def test_on_moved_directory_generates_correct_events_and_touches(mocker, tmp_pat
     # Expected UpdateEvents (2: file_in_sub_dest, file_in_dest_root)
     update_events = [e for e in captured_events if isinstance(e, UpdateEvent)]
     assert len(update_events) == 2
-    update_paths = {e.rows[0]['file_path'] for e in update_events}
+    update_paths = {e.rows[0]['path'] for e in update_events}
     assert str(dest_dir / "sub_dir" / "file_in_sub.txt") in update_paths
     assert str(dest_dir / "file_in_src.txt") in update_paths
 
@@ -147,12 +147,12 @@ def test_on_moved_file_generates_correct_events_and_touches(mocker, tmp_path: Pa
     # Expected DeleteEvent
     delete_events = [e for e in captured_events if isinstance(e, DeleteEvent)]
     assert len(delete_events) == 1
-    assert delete_events[0].rows[0]['file_path'] == str(src_file)
+    assert delete_events[0].rows[0]['path'] == str(src_file)
 
     # Expected UpdateEvent
     update_events = [e for e in captured_events if isinstance(e, UpdateEvent)]
     assert len(update_events) == 1
-    assert update_events[0].rows[0]['file_path'] == str(dest_file)
+    assert update_events[0].rows[0]['path'] == str(dest_file)
 
     # Assertions for watch_manager calls
     touch_calls = mock_watch_manager.touch.call_args_list

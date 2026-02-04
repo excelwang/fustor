@@ -68,7 +68,7 @@ async def test_transient_source_buffer_full_triggers_error(caplog):
                 sender="test-echo-sender",
                 disabled=False,
                 fields_mapping=[
-                    FieldMapping(to="file_path", source=["file_path"], required=True)
+                    FieldMapping(to="file_path", source=["path"], required=True)
                 ]
             )
             await app.pipeline_config_service.add_config("test-sync-task", pipeline_config)
