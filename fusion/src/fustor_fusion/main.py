@@ -114,6 +114,22 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Error during view auto-start: {e}", exc_info=True)
 
+    # --- Register Routers (AFTER all pipelinesetup is complete) ---
+    # Registering inside lifespan ensure that setup_pipe_routers has populated pipe_router
+    # AND setup_view_routers has populated view_router.
+    # Note: Modifying app.routes during lifespan is technically "late", but necessary for this plugin architecture.
+    
+    from .api.pipe import pipe_router
+    from .api.management import router as management_router
+    from .api.views import view_router
+
+    api_v1 = APIRouter()
+    api_v1.include_router(pipe_router, prefix="/pipe")
+    api_v1.include_router(view_router, prefix="/views")
+    api_v1.include_router(management_router)
+    
+    app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
+
     logger.info("Application lifespan initialization complete. READY.")
     yield # Ready
 
@@ -132,20 +148,6 @@ def create_app() -> FastAPI:
     Factory function to create the FastAPI application.
     """
     app = FastAPI(lifespan=lifespan, title="Fusion Storage Engine API", version="1.0.0")
-
-    # --- Router Registration ---
-    # Imports are local to avoid circular dependencies during initial module load
-    from .api.pipe import pipe_router
-    from .api.management import router as management_router
-    from .api.views import view_router
-
-    # 1. Main API v1 (/api/v1)
-    api_v1 = APIRouter()
-    api_v1.include_router(pipe_router, prefix="/pipe")
-    api_v1.include_router(view_router, prefix="/views")
-    api_v1.include_router(management_router)
-    
-    app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
 
     # 2. Root & UI Endpoints
     ui_dir = os.path.dirname(__file__)

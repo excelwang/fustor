@@ -121,10 +121,11 @@ fields_mapping:
         # Because we mapped 'size' to 'remapped_size', and Fusion expects 'size',
         # Fusion should see the default value (0) instead of 1234.
         node = fusion_client.get_node(expected_path_in_tree)
+        assert node is not None, f"Node {expected_path_in_tree} should exist but get_node returned None."
         
         logger.info(f"Fusion node data: {node}")
         
-        actual_size = node.get('size') if node else None
+        actual_size = node.get('size')
         
         assert actual_size == 0, f"Expected size 0 (due to mapping), but got {actual_size}"
         logger.info("✅ Field mapping confirmed: 'size' was correctly redirected to 'remapped_size', causing Fusion to see 0.")

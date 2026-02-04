@@ -72,6 +72,10 @@ class TestSentinelSweep:
                     if not is_suspect:
                         logger.info(f"File {f} was already verified or processed! Marking as success.")
                         continue
+                else:
+                    # Node missing from tree - this is unexpected if it's not in suspect list either
+                    # But it could have been deleted?
+                    logger.warning(f"File {f} not found in tree (get_node returned None) and not in suspect list.")
                         
                 assert f in suspect_paths, f"File {f} must be suspect initially, or already processed"
             
