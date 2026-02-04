@@ -28,18 +28,11 @@ class AuditManager:
         if not is_late_start:
              self.state.audit_seen_paths.clear()
         
-        self.logger.info(f"Audit started at local time {now}. late_start={is_late_start}")
-
-    async def handle_end(self):
-        """Finalizes audit cycle, performs Tombstone cleanup and Missing Item Detection."""
-        if self.state.last_audit_start is None:
-            return
-
-        # 1. Tombstone Cleanup (Rule: 1 hour physical TTL by default, configurable)
-        # Reference: CONSISTENCY_DESIGN.md §4.2 & §6.3
-        # We keep tombstones to protect against NFS cache "Resurrection"
+        # --- Spec §4.2 Optimization: Cleanup BEFORE scan ---
+        # Move Tombstone Cleanup to handle_start to ensure that expired tombstones
+        # DON'T block discovery during the audit cycle they should have been removed in.
         tombstone_ttl = getattr(self.state, 'tombstone_ttl_seconds', 3600.0)
-        cutoff_time = time.time() - tombstone_ttl
+        cutoff_time = now - tombstone_ttl
         before = len(self.state.tombstone_list)
         
         self.state.tombstone_list = {
@@ -48,7 +41,16 @@ class AuditManager:
         }
         cleaned = before - len(self.state.tombstone_list)
         if cleaned > 0:
-            self.logger.info(f"Tombstone CLEANUP: removed {cleaned} items (TTL > 1hr).")
+            self.logger.info(f"Tombstone CLEANUP (Audit-Start): removed {cleaned} items (TTL > {tombstone_ttl}s).")
+        
+        self.logger.info(f"Audit started at local time {now}. late_start={is_late_start}")
+
+    async def handle_end(self):
+        """Finalizes audit cycle, performs Tombstone cleanup and Missing Item Detection."""
+        if self.state.last_audit_start is None:
+            return
+
+        # 1. (Cleanup now happens at Audit-Start)
 
         # 2. Optimized Missing File Detection
         missing_count = 0
@@ -85,7 +87,7 @@ class AuditManager:
                 self.logger.error(f"Error during missing item deletion: {e}")
                 # We continue to ensure state cleanup
         
-        self.logger.info(f"Audit ended. Tombstones cleaned: {cleaned}, Missing items deleted: {missing_count}")
+        self.logger.info(f"Audit ended. Missing items deleted: {missing_count}")
         self.state.last_audit_finished_at = time.time()
         self.state.audit_cycle_count += 1
         self.state.last_audit_start = None

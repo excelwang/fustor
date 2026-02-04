@@ -72,13 +72,17 @@ Fusion 放弃被动的 `Max(mtime)` 机制，采用 **"统计学校准的主动�
 
 1.  **Skew 采样**: 对于每个 Realtime 事件，计算：
     ```python
+    ```python
     if mtime and can_sample_skew:
+        # 使用 Fusion Local Time 作为物理参考系 (Server-Side Calculation)
+        # 忽略 Agent 携带的 'agent_time' 以免疫 Agent 端时钟偏差 (如 Faketime/NTP 错误)
+        reference_time = time.time()
         diff = reference_time - mtime  # 量化到整数秒
         diff_int = int(diff)
         self._global_buffer.append(diff_int)
         self._global_histogram[diff_int] += 1
     ```
-    - `reference_time` 优先使用 Agent 事件携带的物理时刻 (`agent_time`)，保底使用 Fusion 本地时间
+    - **免疫力**: 即使 Agent 时钟被篡改（如 Faketime +2h），其产生文件的 mtime 也会相应偏移。Fusion 通过 `FusionTime - mtime` 直接计算出这一偏移，从而正确还原逻辑时间。
 
 2.  **Global Skew 选举 (Mode)**:
     ```python

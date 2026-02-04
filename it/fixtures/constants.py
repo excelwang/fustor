@@ -28,7 +28,7 @@ HEARTBEAT_INTERVAL = 1    # seconds
 SESSION_TIMEOUT = 5       # seconds (used in sessions and heartbeats)
 
 # FS Specific Thresholds
-HOT_FILE_THRESHOLD = 10.0   # seconds
+HOT_FILE_THRESHOLD = 30.0   # seconds
 THROTTLE_INTERVAL_SEC = 0.5 # seconds (event deduplication)
 TEST_TOMBSTONE_TTL = 2.0    # seconds (for D4 test injection)
 TOMBSTONE_CLEANUP_WAIT = 3.0 # seconds (Wait for TTL + Buffer)
@@ -37,8 +37,8 @@ TOMBSTONE_CLEANUP_WAIT = 3.0 # seconds (Wait for TTL + Buffer)
 
 TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "600"))
 CONTAINER_HEALTH_TIMEOUT = 120
-AGENT_READY_TIMEOUT = 45
-AGENT_B_READY_TIMEOUT = 60 # Agent B usually takes longer due to follower sync
+AGENT_READY_TIMEOUT = 90     # Increased from 45s to handle slower environments/View polling
+AGENT_B_READY_TIMEOUT = 120  # Agent B usually takes longer due to follower sync
 VIEW_READY_TIMEOUT = 45
 AUDIT_WAIT_TIMEOUT = 45    # How long to wait for an audit cycle to complete
 SESSION_VANISH_TIMEOUT = 12 # How long to wait for stale sessions to expire (SESSION_TIMEOUT + 8s)

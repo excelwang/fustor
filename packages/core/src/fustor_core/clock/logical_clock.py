@@ -62,12 +62,12 @@ class LogicalClock:
             # --- Special Case: Deletion/Metadata event (observed_mtime is None) ---
             if observed_mtime is None:
                 effective_skew = self._get_global_skew_locked()
-                
                 if effective_skew is not None:
-                    # Advance clock to BaseLine to reflect physical progress in Fusion Domain
+                    # Return BaseLine value for deletion/metadata tracking
+                    # But don't advance the internal state purely based on physical time here
+                    # now() will handle the physical progression
                     baseline = reference_time - effective_skew
-                    if baseline > self._value:
-                        self._value = baseline
+                    return max(self._value, baseline)
                 return self._value
 
             # --- Robust Sampling Mode ---
@@ -124,12 +124,10 @@ class LogicalClock:
                     # Monotonicity check
                     if target_value > self._value:
                         self._value = target_value
-                    
-                    # ENFORCE BASELINE: Even if mtime is old (past data), the clock must flow with physical time.
-                    # This fixes the "Stagnation" issue (Spec Section 4.1) where lack of new writes
-                    # caused the watermark to freeze, making old files look "fresh" (0 age).
-                    if baseline > self._value:
-                        self._value = baseline
+
+                # Note: No mandatory BaseLine enforcement here in update().
+                # This ensures update() returns a strict logical timestamp for arbitration.
+                # Physical progression (BaseLine) is handled in now() and get_watermark().
             except Exception as e:
                 # Silent fail to proceed with event processing
                 pass
@@ -165,6 +163,16 @@ class LogicalClock:
         with self._lock:
             if self._value == 0.0:
                 return time.time()
+            
+            # --- Spec §5.1 / §6.2 Mitigation: Dual-Track Time ---
+            # Composite Reference = Max(LogicalState, PhysicalBaseLine)
+            # This ensures Age calculations (Suspect logic) advance with physical time,
+            # while internal state (Arbitration) stays strictly event-driven.
+            effective_skew = self._get_global_skew_locked()
+            if effective_skew is not None:
+                baseline = time.time() - effective_skew
+                return max(self._value, baseline)
+                
             return self._value
             
     def get_watermark(self) -> float:

@@ -33,7 +33,8 @@ from .constants import (
     AGENT_B_READY_TIMEOUT,
     VIEW_READY_TIMEOUT,
     FAST_POLL_INTERVAL,
-    SESSION_TIMEOUT
+    SESSION_TIMEOUT,
+    SHORT_TIMEOUT
 )
 
 
@@ -49,6 +50,12 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
         view_id: View ID for the pipeline
         mount_point: Path to the NFS mount point
     """
+    # Ensure container is actually running
+    try:
+        docker_manager.start_container(container_name)
+    except Exception as e:
+        logger.debug(f"Container {container_name} already running or could not be started: {e}")
+
     fusion_endpoint = FUSION_ENDPOINT
     
     # Generate unique agent ID
@@ -161,6 +168,20 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
         logger.warning("View readiness check timed out. Proceeding anyway.")
     else:
         logger.info("View is READY.")
+
+    # --- Skew Calibration Warmup ---
+    # We must generate at least one Realtime event to calibrate the Logical Clock Skew
+    # before running any consistency tests. Otherwise, the clock defaults to physical time,
+    # causing false-suspicious flags for "Old" files if skew exists (e.g., Faketime).
+    logger.info("Performing Skew Calibration Warmup...")
+    warmup_file = f"{MOUNT_POINT}/skew_calibration_{int(time.time()*1000)}.txt"
+    docker_manager.create_file_in_container(CONTAINER_CLIENT_A, warmup_file, content="warmup")
+    
+    # Wait for Fusion to ingest it (implicitly calibrates skew)
+    if not fusion_client.wait_for_file_in_tree(warmup_file, timeout=SHORT_TIMEOUT):
+        logger.warning("Skew calibration file not seen in tree. Clock might be uncalibrated.")
+    else:
+        logger.info("Skew calibration successful.")
 
     # Start Agent B as Follower
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_B}...")

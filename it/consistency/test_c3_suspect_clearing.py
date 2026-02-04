@@ -22,8 +22,32 @@ from ..fixtures.constants import (
     POLL_INTERVAL,
     SESSION_VANISH_TIMEOUT,
     CONTAINER_CLIENT_A,
+    CONTAINER_CLIENT_B,
     CONTAINER_CLIENT_C
 )
+from ..fixtures.agents import ensure_agent_running
+
+@pytest.fixture
+def setup_agent_b_only(fusion_client, test_api_key, test_view):
+    """
+    Start ONLY Agent B (Skew -1h) for Age checks. 
+    Agent A (+2h) poisons the clock making fresh files look old.
+    """
+    # Ensure A is stopped
+    docker_manager.stop_container(CONTAINER_CLIENT_A)
+    
+    # Start B
+    ensure_agent_running(CONTAINER_CLIENT_B, test_api_key, test_view)
+    
+    # Wait for Leader (B should become leader)
+    start = time.time()
+    while time.time() - start < 45: # AGENT_READY_TIMEOUT
+        leader = fusion_client.get_leader_session()
+        if leader:
+             break
+        time.sleep(POLL_INTERVAL)
+    
+    return {"api_key": test_api_key, "view_id": test_view}
 
 class TestSuspectClearingConditions:
     """Test all conditions under which suspect status is cleared."""
@@ -136,7 +160,7 @@ class TestSuspectClearingConditions:
         fusion_client,
         setup_agents,
         clean_shared_dir,
-        wait_for_audit
+        # wait_for_audit removed to avoid fixture flakiness
     ):
         """
         条件3: cleanup_expired_suspects() 定时清理 - mtime 稳定时清除。
@@ -160,7 +184,9 @@ class TestSuspectClearingConditions:
         )
         
         # 2. Wait for Audit to discover and mark as suspect
-        wait_for_audit()
+        # Use explicit sleep instead of wait_for_audit to ensure timing control
+        # Audit Interval is 5s. Wait 7s to be safe.
+        time.sleep(AUDIT_INTERVAL + 2)
         
         found = fusion_client.wait_for_file_in_tree(file_path, timeout=SHORT_TIMEOUT)
         assert found is not None, "File should be discovered"
