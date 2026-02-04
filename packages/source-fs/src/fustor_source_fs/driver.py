@@ -22,7 +22,7 @@ from fustor_core.event import EventBase, UpdateEvent, DeleteEvent, MessageSource
 
 from .components import _WatchManager, safe_path_handling
 from .event_handler import OptimizedWatchEventHandler, get_file_metadata
-from .scanner import RecursiveScanner
+from .scanner import FSScanner
 
 logger = logging.getLogger("fustor_agent.driver.fs")
             
@@ -101,47 +101,11 @@ class FSDriver(SourceDriver):
             
             dir_mtime_map: Dict[str, float] = {}
             dir_children_map: Dict[str, List[str]] = {}
-            map_lock = threading.Lock()
             total_entries = 0
-            error_count = 0
+            scanner = FSScanner(self.uri, num_workers=self._executor._max_workers)
             
-            scanner = RecursiveScanner(self.uri, num_workers=self._executor._max_workers)
-            
-            def pre_scan_worker(root, work_q, res_q, stop_ev):
-                nonlocal total_entries, error_count
-                try:
-                    latest_mtime = os.path.getmtime(root)
-                    local_subdirs = []
-                    local_total = 1
-                    
-                    with os.scandir(root) as it:
-                        for entry in it:
-                            local_total += 1
-                            if stop_ev.is_set(): break
-                            try:
-                                if entry.is_dir(follow_symlinks=False):
-                                    local_subdirs.append(entry.path)
-                                    scanner.increment_pending()
-                                    work_q.put(entry.path)
-                                else:
-                                    st = entry.stat(follow_symlinks=False)
-                                    latest_mtime = max(latest_mtime, st.st_mtime)
-                            except Exception as e:
-                                error_count += 1
-                                logger.warning(f"[fs] Error scanning entry '{entry.path}': {e}. Skipping entry.")
-
-                    with map_lock:
-                        dir_mtime_map[root] = latest_mtime
-                        dir_children_map[root] = local_subdirs
-                        total_entries += local_total
-                    
-                except Exception as e:
-                    error_count += 1
-                    logger.error(f"[fs] Failed to scan directory '{root}': {e}")
-
-            # Execute parallel scan
-            for _ in scanner.scan_parallel(pre_scan_worker):
-                pass
+            # Execute pre-scan
+            dir_mtime_map, dir_children_map, total_entries, error_count = scanner.perform_pre_scan()
 
             # Bottom-up pass to calculate recursive subtree mtimes
             logger.info(f"[fs] Parallel scan finished. Calculating recursive mtimes for {len(dir_mtime_map)} directories...")
@@ -199,89 +163,14 @@ class FSDriver(SourceDriver):
             
         file_pattern = driver_params.get("file_pattern", "*")
         batch_size = kwargs.get("batch_size", 100)
-        snapshot_time = int(time.time() * 1000)
 
-        scanner = RecursiveScanner(self.uri, num_workers=self._executor._max_workers, file_pattern=file_pattern)
+        scanner = FSScanner(self.uri, num_workers=self._executor._max_workers, 
+                           file_pattern=file_pattern, drift_from_nfs=self.drift_from_nfs)
 
-        def snapshot_worker(root, work_q, res_q, stop_ev):
-            try:
-                dir_stat = os.stat(root)
-                latest_mtime_in_subtree = dir_stat.st_mtime
-                dir_metadata = get_file_metadata(root, stat_info=dir_stat)
-                res_q.put(UpdateEvent(
-                    event_schema=self.uri,
-                    table="files",
-                    rows=[dir_metadata],
-                    fields=list(dir_metadata.keys()),
-                    message_source=MessageSource.SNAPSHOT,
-                    index=snapshot_time
-                ))
+        def touch_callback(path, relative_mtime):
+            self.watch_manager.touch(path, relative_mtime, is_recursive_upward=False)
 
-                local_batch = []
-                with os.scandir(root) as it:
-                    for entry in it:
-                        if stop_ev.is_set(): break
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                scanner.increment_pending()
-                                work_q.put(entry.path)
-                            elif fnmatch.fnmatch(entry.name, file_pattern):
-                                st = entry.stat()
-                                meta = get_file_metadata(entry.path, stat_info=st)
-                                latest_mtime_in_subtree = max(latest_mtime_in_subtree, meta['modified_time'])
-                                local_batch.append(meta)
-                                if len(local_batch) >= batch_size:
-                                    res_q.put(UpdateEvent(
-                                        event_schema=self.uri,
-                                        table="files",
-                                        rows=local_batch,
-                                        fields=list(local_batch[0].keys()),
-                                        message_source=MessageSource.SNAPSHOT,
-                                        index=snapshot_time
-                                    ))
-                                    local_batch = []
-                        except Exception as e:
-                            logger.warning(f"[fs] Error statting entry '{entry.path}' during snapshot: {e}. Skipping.")
-                
-                if local_batch:
-                    res_q.put(UpdateEvent(
-                        event_schema=self.uri,
-                        table="files",
-                        rows=local_batch,
-                        fields=list(local_batch[0].keys()),
-                        message_source=MessageSource.SNAPSHOT,
-                        index=snapshot_time
-                    ))
-                
-                self.watch_manager.touch(root, latest_mtime_in_subtree - self.drift_from_nfs, is_recursive_upward=False)
-
-            except Exception as e:
-                logger.error(f"[fs] Failed to process directory '{root}' during snapshot: {e}")
-
-        # Global re-batching buffer
-        row_buffer = []
-        for event in scanner.scan_parallel(snapshot_worker):
-            row_buffer.extend(event.rows)
-            while len(row_buffer) >= batch_size:
-                yield UpdateEvent(
-                    event_schema=self.uri,
-                    table="files",
-                    rows=row_buffer[:batch_size],
-                    fields=list(row_buffer[0].keys()),
-                    message_source=MessageSource.SNAPSHOT,
-                    index=snapshot_time
-                )
-                row_buffer = row_buffer[batch_size:]
-        
-        if row_buffer:
-            yield UpdateEvent(
-                event_schema=self.uri,
-                table="files",
-                rows=row_buffer,
-                fields=list(row_buffer[0].keys()),
-                message_source=MessageSource.SNAPSHOT,
-                index=snapshot_time
-            )
+        yield from scanner.scan_snapshot(self.uri, batch_size=batch_size, callback=touch_callback)
         
         logger.info(f"[{stream_id}] Snapshot scan completed.")
 
@@ -335,81 +224,9 @@ class FSDriver(SourceDriver):
         mtime_cache = mtime_cache or {}
         batch_size = kwargs.get("batch_size", 100)
         file_pattern = self.config.driver_params.get("file_pattern", "*")
-        audit_time = int(time.time() * 1000)
 
-        scanner = RecursiveScanner(self.uri, num_workers=self._executor._max_workers, file_pattern=file_pattern)
-
-        def audit_worker(item, work_q, res_q, stop_ev):
-            root, _parent_path = item
-            try:
-                dir_stat = os.stat(root)
-                current_dir_mtime = dir_stat.st_mtime
-                cached_mtime = mtime_cache.get(root)
-                is_silent = (cached_mtime is not None and cached_mtime == current_dir_mtime)
-                
-                # Report directory (either full or skipped)
-                dir_metadata = get_file_metadata(root, stat_info=dir_stat)
-                if dir_metadata:
-                    if is_silent:
-                        dir_metadata['audit_skipped'] = True
-                    
-                    res_q.put((UpdateEvent(
-                        event_schema=self.uri,
-                        table="files",
-                        rows=[dir_metadata],
-                        fields=list(dir_metadata.keys()),
-                        message_source=MessageSource.AUDIT,
-                        index=audit_time
-                    ), {}))
-
-                local_batch = []
-                local_subdirs = []
-                with os.scandir(root) as it:
-                    for entry in it:
-                        if stop_ev.is_set(): break
-                        try:
-                            if entry.is_dir(follow_symlinks=False):
-                                local_subdirs.append(entry.path)
-                            elif not is_silent and fnmatch.fnmatch(entry.name, file_pattern):
-                                st = entry.stat()
-                                meta = get_file_metadata(entry.path, stat_info=st)
-                                if meta:
-                                    meta['parent_path'] = root
-                                    meta['parent_mtime'] = current_dir_mtime
-                                    local_batch.append(meta)
-                                    if len(local_batch) >= batch_size:
-                                        res_q.put((UpdateEvent(
-                                            event_schema=self.uri,
-                                            table="files",
-                                            rows=local_batch,
-                                            fields=list(local_batch[0].keys()),
-                                            message_source=MessageSource.AUDIT,
-                                            index=audit_time
-                                        ), {root: current_dir_mtime}))
-                                        local_batch = []
-                        except OSError:
-                            pass
-
-                if local_batch:
-                    res_q.put((UpdateEvent(
-                        event_schema=self.uri,
-                        table="files",
-                        rows=local_batch,
-                        fields=list(local_batch[0].keys()),
-                        message_source=MessageSource.AUDIT,
-                        index=audit_time
-                    ), {root: current_dir_mtime}))
-                elif not is_silent:
-                    res_q.put((None, {root: current_dir_mtime}))
-
-                for sd in local_subdirs:
-                    scanner.increment_pending()
-                    work_q.put((sd, root))
-
-            except Exception as e:
-                logger.error(f"[fs] Failed to process directory '{root}' during audit: {e}")
-
-        yield from scanner.scan_parallel(audit_worker, initial_item=(self.uri, None))
+        scanner = FSScanner(self.uri, num_workers=self._executor._max_workers, file_pattern=file_pattern)
+        yield from scanner.scan_audit(self.uri, mtime_cache or {}, batch_size=batch_size)
         logger.info(f"[{stream_id}] Audit scan completed.")
 
 
