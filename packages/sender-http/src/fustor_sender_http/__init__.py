@@ -80,13 +80,14 @@ class HTTPSender(Sender):
         )
         
         if session_data and session_data.get("session_id"):
-            self.session_id = session_data["session_id"]
+            session_id = session_data["session_id"]
+            self.session_id = session_id
             self.logger.info(
                 f"Session created: {self.session_id}, "
                 f"Role: {session_data.get('role')}, "
                 f"Timeout: {session_data.get('session_timeout_seconds')}s"
             )
-            return session_data
+            return session_id, session_data
         else:
             self.logger.error("Failed to create session.")
             raise RuntimeError("Failed to create session with Fusion service.")
@@ -160,9 +161,9 @@ class HTTPSender(Sender):
                 return result
             else:
                 msg = result.get("message") if result else "Unknown error"
-                self.logger.warning(f"Heartbeat failed: {msg}")
-                if result and result.get("message") == "Session not found":
-                     raise SessionObsoletedError(f"Session {self.session_id} not found on server")
+                # Fallback: some legacy or non-FastAPI paths might still return 200 with error body
+                if result and result.get("status") == "error":
+                     raise SessionObsoletedError(f"Session {self.session_id} is no longer valid: {msg}")
                 return {"status": "error", "message": msg}
         except httpx.HTTPStatusError as e:
             if e.response.status_code == 419:

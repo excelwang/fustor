@@ -32,6 +32,9 @@ from .api.views import view_router
 
 logger = logging.getLogger(__name__) # Re-initialize logger after setting levels
 logging.getLogger("fustor_fusion.auth.dependencies").setLevel(logging.DEBUG)
+# Silence uvicorn noisy logs
+logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

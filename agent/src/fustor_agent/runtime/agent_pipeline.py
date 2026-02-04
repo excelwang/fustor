@@ -246,12 +246,17 @@ class AgentPipeline(Pipeline):
         self._initial_snapshot_done = False
         self.is_realtime_ready = False
         
-        # Start heartbeat loop if not active
+        self._heartbeat_task = None
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._heartbeat_task = asyncio.create_task(self._run_heartbeat_loop())
-            logger.info(f"Pipeline {self.id}: Using server-suggested heartbeat interval: {suggested_interval}s")
+            logger.info(f"Pipeline {self.id}: Started heartbeat loop (Session: {session_id})")
         
-        logger.info(f"Pipeline {self.id}: Session {session_id} created, role={self.current_role}")
+        msg = f"Session {session_id} created"
+        if self._consecutive_errors > 0:
+            msg = f"Session {session_id} RECOVERED after {self._consecutive_errors} errors"
+            self._consecutive_errors = 0
+            
+        logger.info(f"Pipeline {self.id}: {msg}, role={self.current_role}")
         
     
     async def on_session_closed(self, session_id: str) -> None:
@@ -269,15 +274,12 @@ class AgentPipeline(Pipeline):
         
         State machine:
         1. Wait for LEADER role
-        2. Run snapshot sync phase (SNAPSHOT_SYNC)
-        3. Start message sync phase (MESSAGE_SYNC)
-        4. Handle role changes
         """
         self._set_state(PipelineState.RUNNING, "Waiting for role assignment...")
-        
-        # In V2, we keep trying unless explicitly stopped
-        while self.state != PipelineState.STOPPED:
+        while self.is_running():
+            logger.debug(f"Pipeline {self.id}: Control loop iteration starting (Role: {self.current_role}, Session: {self.session_id})")
             try:
+                # D-03/D-04: Session Recovery & Leadership
                 # Wait until we have a session (in case of disconnection)
                 if not self.has_active_session():
                     self._set_state(PipelineState.RUNNING | PipelineState.RECONNECTING, "Attempting to create session...")
@@ -304,6 +306,7 @@ class AgentPipeline(Pipeline):
                             logger.warning(f"Pipeline {self.id}: Failed to fetch committed index: {e}. Defaulting to 0/Latest.")
 
                     except Exception as e:
+                        logger.error(f"Pipeline {self.id}: Detailed session creation error: {e}", exc_info=True)
                         raise RuntimeError(f"Session creation failed: {e}")
 
                 # Wait until we have a role
@@ -383,6 +386,7 @@ class AgentPipeline(Pipeline):
                 logger.info(f"Pipeline {self.id}: Initial snapshot sync phase complete")
             except asyncio.CancelledError:
                 logger.info(f"Pipeline {self.id}: Snapshot sync phase task cancelled")
+                raise # Stop leader sequence if snapshot was cancelled
             except SessionObsoletedError:
                 raise
             except Exception as e:
@@ -391,6 +395,10 @@ class AgentPipeline(Pipeline):
             finally:
                 self._snapshot_task = None
         
+        # Double check session and running state before starting more background tasks
+        if not self.has_active_session() or not self.is_running():
+            return
+
         # Background Leader Tasks: Audit and Sentinel
         if self.audit_interval_sec > 0 and (self._audit_task is None or self._audit_task.done()):
             self._audit_task = asyncio.create_task(self._run_audit_loop())
@@ -448,13 +456,20 @@ class AgentPipeline(Pipeline):
         """Cancel all pipeline tasks (usually on session loss or stop)."""
         tasks = []
         current = asyncio.current_task()
-        for task in [self._audit_task, self._sentinel_task, self._snapshot_task, self._message_sync_task]:
+        for task in [self._heartbeat_task, self._audit_task, self._sentinel_task, self._snapshot_task, self._message_sync_task]:
             if task and task != current and not task.done():
                 task.cancel()
                 tasks.append(task)
         
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Reset handles
+        self._heartbeat_task = None
+        self._audit_task = None
+        self._sentinel_task = None
+        self._snapshot_task = None
+        self._message_sync_task = None
                 
     async def _handle_role_change(self, new_role: str) -> None:
         """Handle role change from heartbeat response."""
@@ -486,7 +501,8 @@ class AgentPipeline(Pipeline):
             
         if not isinstance(error, SessionObsoletedError):
             logger.error(f"Pipeline {self.id} fatal background error: {error}", exc_info=True)
-            self._set_state(PipelineState.ERROR, str(error))
+            # Keep RUNNING bit so control loop doesn't exit
+            self._set_state(PipelineState.RUNNING | PipelineState.ERROR, str(error))
     async def _aiter_sync_phase(self, phase_iter: Iterator[Any], queue_size: Optional[int] = None, yield_timeout: Optional[float] = None):
         """
         Safely and efficiently wrap a synchronous iterator into an async generator.

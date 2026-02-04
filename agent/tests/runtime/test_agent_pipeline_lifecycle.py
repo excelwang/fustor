@@ -14,12 +14,16 @@ class TestAgentPipelineLifecycle:
 
     @pytest.fixture
     def agent_pipeline(self, mock_source, mock_sender, pipeline_config):
+        mock_bus = MagicMock()
+        mock_bus.id = "mock-bus"
+        mock_bus.internal_bus = AsyncMock()
         return AgentPipeline(
             pipeline_id="test-pipeline",
             task_id="agent:test-pipeline",
             config=pipeline_config,
             source_handler=mock_source,
-            sender_handler=mock_sender
+            sender_handler=mock_sender,
+            event_bus=mock_bus
         )
 
     @pytest.mark.asyncio

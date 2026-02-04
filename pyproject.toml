@@ -61,7 +61,7 @@ testpaths = [
     "packages/source_oss/tests"
 ]
 addopts = "-v --tb=short"
-asyncio_default_fixture_loop_scope = "function"
+asyncio_mode = "strict"
 norecursedirs = ["it"]
 filterwarnings = [
     "ignore:pythonjsonlogger.jsonlogger:DeprecationWarning",

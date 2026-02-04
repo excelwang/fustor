@@ -51,7 +51,7 @@ class TestAgentPipelineBus:
             "test-session", [mock_event], {"phase": "realtime"}
         )
         # 3. Should have committed to bus
-        mock_bus.internal_bus.commit.assert_called_with("test-id", 1, 100)
+        mock_bus.internal_bus.commit.assert_called_with("agent:test-id", 1, 100)
         # 4. Statistics should be updated
         assert pipeline.statistics["events_pushed"] == 1
 
@@ -91,4 +91,5 @@ class TestAgentPipelineBus:
         # Should have called send_batch twice
         assert mock_sender.send_batch.call_count == 2
         # Should have committed only ONCE (after second success)
+        mock_bus.internal_bus.commit.assert_called_with("agent:test-id", 1, 100)
         assert mock_bus.internal_bus.commit.call_count == 1

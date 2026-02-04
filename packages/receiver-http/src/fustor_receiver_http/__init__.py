@@ -258,14 +258,22 @@ class HTTPReceiver(Receiver):
             if receiver._on_heartbeat:
                 try:
                     result = await receiver._on_heartbeat(session_id, can_realtime)
+                    if result and result.get("status") == "error":
+                        raise HTTPException(
+                            status_code=419,
+                            detail=result.get("message", "Session obsoleted")
+                        )
                     return HeartbeatResponse(
                         status=result.get("status", "ok"),
                         role=result.get("role"),
                         message=result.get("message")
                     )
+                except HTTPException:
+                    raise
                 except Exception as e:
                     receiver.logger.warning(f"Heartbeat failed for {session_id}: {e}")
                     return HeartbeatResponse(status="error", message=str(e))
+            
             return HeartbeatResponse(status="ok")
         
         @router.delete("/{session_id}")

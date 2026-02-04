@@ -162,25 +162,38 @@ class PipelineSessionBridge:
         """
         view_id = self._session_view_map.get(session_id)
         
-        if view_id is not None:
+        if view_id is None:
+            # Try to get it from pipeline as fallback
+            role = await self._pipeline.get_session_role(session_id)
+            if role is None:
+                return {
+                    "status": "error",
+                    "message": f"Session {session_id} not found",
+                    "session_id": session_id
+                }
+            # If pipeline knows it, then we are fine (maybe bridge map lost it but pipeline has it)
+        else:
             # 1. Update legacy SessionManager
-            await self._session_manager.keep_session_alive(
+            alive = await self._session_manager.keep_session_alive(
                 view_id=view_id,
                 session_id=session_id,
                 client_ip=client_ip,
                 can_realtime=can_realtime
             )
+            if not alive:
+                return {
+                    "status": "error",
+                    "message": f"Session {session_id} expired in SessionManager",
+                    "session_id": session_id
+                }
             
             # 2. Try to become leader (Follower promotion)
             from fustor_fusion.view_state_manager import view_state_manager
             is_leader = await view_state_manager.try_become_leader(view_id, session_id)
             if is_leader:
                 await view_state_manager.set_authoritative_session(view_id, session_id)
-                # Note: We don't automatically lock here, as lock_for_session 
-                # is usually for exclusive single-writer sessions. 
-                # In most V2 pipelines, allow_concurrent_push is true.
         
-        # 3. Get role from pipeline/view_state_manager
+        # 3. Get final status from pipeline
         role = await self._pipeline.get_session_role(session_id)
         timeout = self._pipeline.config.get("session_timeout_seconds", 30)
         

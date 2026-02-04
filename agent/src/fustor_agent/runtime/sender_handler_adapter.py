@@ -102,13 +102,20 @@ class SenderHandlerAdapter(SenderHandler):
         """
         await self.initialize()
         
-        session_data = await self._sender.create_session(
+        result = await self._sender.create_session(
             task_id,
             source_type=source_type,
             session_timeout_seconds=session_timeout_seconds
         )
         
-        session_id = session_data.get("session_id", "")
+        # Determine if result is (session_id, metadata) tuple or legacy dict
+        if isinstance(result, tuple) and len(result) == 2:
+            session_id, session_data = result
+        else:
+            # Fallback for legacy drivers or unusual returns
+            session_id = result.get("session_id", "") if isinstance(result, dict) else ""
+            session_data = result if isinstance(result, dict) else {}
+
         metadata = {
             "role": session_data.get("role", "follower"),
             "session_timeout_seconds": session_data.get("session_timeout_seconds", session_timeout_seconds),

@@ -457,7 +457,7 @@ class FSDriver(SourceDriver):
     @classmethod
     async def get_available_fields(cls, **kwargs) -> Dict[str, Any]:
         return {"properties": {
-            "file_path": {"type": "string", "description": "The full, absolute path to the file.", "column_index": 0},
+            "path": {"type": "string", "description": "The full, absolute path to the file.", "column_index": 0},
             "size": {"type": "integer", "description": "The size of the file in bytes.", "column_index": 1},
             "modified_time": {"type": "number", "description": "The last modification time as a Unix timestamp (float).", "column_index": 2},
             "created_time": {"type": "number", "description": "The creation time as a Unix timestamp (float).", "column_index": 3},

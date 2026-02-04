@@ -141,6 +141,7 @@ class Pipeline(ABC):
         """Check if pipeline is in a running state."""
         return bool(self.state & (PipelineState.RUNNING | 
                                   PipelineState.PAUSED |
+                                  PipelineState.RECONNECTING |
                                   PipelineState.SNAPSHOT_SYNC | 
                                   PipelineState.MESSAGE_SYNC | 
                                   PipelineState.AUDIT_PHASE))

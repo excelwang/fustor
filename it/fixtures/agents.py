@@ -109,17 +109,26 @@ heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
     docker_manager.exec_in_container(container_name, ["pkill", "-f", "fustor-agent"])
     docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent.pid"])
     docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent-state.json"])
+    docker_manager.exec_in_container(container_name, ["rm", "-f", "/root/.fustor/agent.log"])
     time.sleep(FAST_POLL_INTERVAL)
     
-    # 5. Start new agent (Always in Pipeline mode)
-    logger.info(f"Starting agent in {container_name} with AgentPipeline mode")
+    logger.info(f"Starting agent in {container_name} in DAEMON mode (-D)")
     env_prefix = "FUSTOR_USE_PIPELINE=true "
     
+    # Use -D for daemon mode as requested by user
     docker_manager.exec_in_container(
         container_name, 
-        ["sh", "-c", f"{env_prefix}fustor-agent start -V > /proc/1/fd/1 2>&1"],
-        detached=True
+        ["sh", "-c", f"{env_prefix}fustor-agent start -D -V"],
+        detached=False # -D returns immediately anyway
     )
+    
+    # Wait for the log file to be created
+    start_wait = time.time()
+    while time.time() - start_wait < 5:
+        res = docker_manager.exec_in_container(container_name, ["test", "-f", "/root/.fustor/agent.log"])
+        if res.returncode == 0:
+            break
+        time.sleep(0.5)
 
 
 @pytest.fixture
@@ -160,9 +169,11 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     # Wait for Agent B to be Ready
     logger.info("Waiting for Agent B to be ready (Follower + Realtime Ready)...")
     if not fusion_client.wait_for_agent_ready("client-b", timeout=AGENT_B_READY_TIMEOUT):
-        logs = docker_manager.get_logs(CONTAINER_CLIENT_B)
-        logger.warning(f"Timeout waiting for Agent B (>{AGENT_B_READY_TIMEOUT}s). Logs:\n{logs}")
-        # Proceeding anyway for some tests, though most will fail
+        # Directly read the fresh log file as suggested by user
+        logs_res = docker_manager.exec_in_container(CONTAINER_CLIENT_B, ["cat", "/root/.fustor/agent.log"])
+        logs = logs_res.stdout + logs_res.stderr
+        logger.error(f"FATAL: Agent B did not become ready. Logs:\n{logs}")
+        pytest.fail(f"Agent B did not become ready within {AGENT_B_READY_TIMEOUT}s")
 
     return {
         "api_key": api_key,

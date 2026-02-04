@@ -75,7 +75,25 @@ class TestHeartbeatTimeout:
         new_session_id = None
         
         while time.time() - start_wait < MEDIUM_TIMEOUT:
+            # OPTIMIZATION: Check for early failure by reading log file directly
+            logs_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/agent.log"])
+            logs = logs_res.stdout + logs_res.stderr
+            
+            # Aggressive Fast-Fail
+            critical_errors = ["Traceback", "SyntaxError", "AttributeError", "FATAL", "Exception"]
+            for err in critical_errors:
+                if err in logs:
+                    logger.error(f"Agent A CRITICAL ERROR detected in agent.log:\n{logs}")
+                    pytest.fail(f"Agent A failed with {err}")
+            
+            # Check if process is still alive
+            ps_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["ps", "aux"])
+            if "fustor-agent" not in ps_res.stdout and "python" not in ps_res.stdout:
+                logger.error(f"Agent A process DIED during recovery. Logs:\n{logs}")
+                pytest.fail("Agent A process died during recovery")
+
             sessions = fusion_client.get_sessions()
+            logger.debug(f"Current Fusion sessions: {[s.get('agent_id') for s in sessions]}")
             agent_a_sessions = [s for s in sessions if "client-a" in s.get("agent_id", "")]
             if agent_a_sessions:
                 new_session_id = agent_a_sessions[0]["session_id"]
@@ -83,6 +101,12 @@ class TestHeartbeatTimeout:
                     logger.info(f"Agent A recovered with new session ID: {new_session_id}")
                     break
             time.sleep(POLL_INTERVAL)
+            
+        if new_session_id is None:
+            # DUMP LOG FILE ON FAILURE
+            logs_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/agent.log"])
+            logs = logs_res.stdout + logs_res.stderr
+            logger.error(f"FATAL: Agent A did not recover. Dumping agent.log:\n{logs}")
             
         assert new_session_id is not None, "Agent A did not create a new session after timeout"
         assert new_session_id != old_session_id, "Agent A should have a DIFFERENT session ID"

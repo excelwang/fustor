@@ -18,15 +18,23 @@ class TestAgentErrorRecovery:
     async def test_session_creation_retry(self, mock_source, mock_sender, pipeline_config):
         """Pipeline should retry session creation if it fails."""
         # Setup sender to fail first 2 times then succeed
-        mock_sender.create_session = AsyncMock(side_effect=[
-            RuntimeError("Connection refused"),
-            RuntimeError("Timeout"),
-            ("valid-session", {"role": "leader"})
-        ])
+        call_count = 0
+        async def mock_create_session(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1: raise RuntimeError("Connection refused")
+            if call_count == 2: raise RuntimeError("Timeout")
+            return "valid-session", {"role": "leader"}
+            
+        mock_sender.create_session = AsyncMock(side_effect=mock_create_session)
+        
+        mock_bus = MagicMock()
+        mock_bus.id = "mock-bus"
+        mock_bus.internal_bus = AsyncMock()
         
         pipeline = AgentPipeline(
             "test-id", "agent:test-id", pipeline_config,
-            mock_source, mock_sender
+            mock_source, mock_sender, event_bus=mock_bus
         )
         
         # Start pipeline
@@ -149,24 +157,34 @@ class TestAgentErrorRecovery:
         pipeline_config_no_bg["audit_interval_sec"] = 0
         pipeline_config_no_bg["sentinel_interval_sec"] = 0
         
+        mock_bus = MagicMock()
+        mock_bus.id = "mock-bus"
+        mock_bus.internal_bus = AsyncMock()
+        
         pipeline = AgentPipeline(
             "test-id", "agent:test-id", pipeline_config_no_bg,
-            mock_source, mock_sender
+            mock_source, mock_sender, event_bus=mock_bus
         )
         
         # Setup: Success first time, then 419 error, then success again
         # Note: send_batch is called multiple times during leader sequence
-        mock_sender.create_session = AsyncMock(side_effect=[
-            ("sess-1", {"role": "leader"}),
-            ("sess-2", {"role": "leader"}),
-        ])
+        create_call_count = 0
+        async def mock_create_session(*args, **kwargs):
+            nonlocal create_call_count
+            create_call_count += 1
+            return f"sess-{create_call_count}", {"role": "leader"}
+            
+        mock_sender.create_session = mock_create_session
         
-        mock_sender.send_batch = AsyncMock(side_effect=[
-            (True, {"success": True}), # Snapshot batch 1
-            (True, {"success": True}), # Snapshot batch 2
-            SessionObsoletedError("Session dead"), # Realtime batch
-            (True, {"success": True}), # Post-recovery batch
-        ])
+        batch_call_count = 0
+        async def mock_send_batch(*args, **kwargs):
+            nonlocal batch_call_count
+            batch_call_count += 1
+            if batch_call_count == 3:
+                raise SessionObsoletedError("Session dead")
+            return True, {"success": True}
+            
+        mock_sender.send_batch = mock_send_batch
         
         # Wait for recovery
         await pipeline.start()

@@ -102,11 +102,12 @@ class EchoDriver(Sender):
         role = self.config.get("mock_role", "leader")
         timeout = session_timeout_seconds or self.config.get("session_timeout_seconds", 30)
         self.logger.info(f"[EchoSender] Created session {session_id} for task {task_id} with role {role}")
-        return {
+        metadata = {
             "session_id": session_id,
             "role": role,
             "session_timeout_seconds": timeout
         }
+        return session_id, metadata
 
     async def close_session(self) -> None:
         """Close the current session."""
