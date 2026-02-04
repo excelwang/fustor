@@ -8,6 +8,21 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
+class FSSchemaFields:
+    """Constants for FS schema field names."""
+    PATH = "path"
+    FILE_NAME = "file_name"
+    SIZE = "size"
+    MODIFIED_TIME = "modified_time"
+    IS_DIRECTORY = "is_directory"
+    CREATED_TIME = "created_time"
+    PARENT_PATH = "parent_path"
+    PARENT_MTIME = "parent_mtime"
+    AUDIT_SKIPPED = "audit_skipped"
+    
+    # Deprecated
+    FILE_PATH = "file_path"
+
 class FSRow(BaseModel):
     """
     A file system row representing a file or directory.

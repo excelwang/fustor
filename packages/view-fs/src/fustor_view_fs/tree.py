@@ -4,6 +4,7 @@ import time
 from typing import Dict, Any
 from .nodes import DirectoryNode, FileNode
 from .state import FSState
+from fustor_schema_fs.models import FSSchemaFields
 
 logger = logging.getLogger(__name__)
 
@@ -21,10 +22,10 @@ class TreeManager:
         parent_path = os.path.normpath(os.path.dirname(path))
         name = os.path.basename(path)
         
-        size = payload.get('size', 0)
-        mtime = payload.get('modified_time', 0.0)
-        ctime = payload.get('created_time', 0.0)
-        is_dir = payload.get('is_dir', False)
+        size = payload.get(FSSchemaFields.SIZE, 0)
+        mtime = payload.get(FSSchemaFields.MODIFIED_TIME, 0.0)
+        ctime = payload.get(FSSchemaFields.CREATED_TIME, 0.0)
+        is_dir = payload.get(FSSchemaFields.IS_DIRECTORY, payload.get('is_dir', False))
 
         # 1. Ensure parent exists (Recursive creation if missing)
         if parent_path not in self.state.directory_path_map and path != '/':
@@ -43,10 +44,10 @@ class TreeManager:
                 node.size = size
                 node.modified_time = mtime
                 node.created_time = ctime
-                node.audit_skipped = payload.get('audit_skipped', False)
+                node.audit_skipped = payload.get(FSSchemaFields.AUDIT_SKIPPED, False)
             else:
                 node = DirectoryNode(name, path, size, mtime, ctime)
-                node.audit_skipped = payload.get('audit_skipped', False)
+                node.audit_skipped = payload.get(FSSchemaFields.AUDIT_SKIPPED, False)
                 self.state.directory_path_map[path] = node
                 if path != '/':
                     parent_node = self.state.directory_path_map.get(parent_path)

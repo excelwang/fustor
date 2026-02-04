@@ -92,6 +92,7 @@ async def run_bus_message_sync(pipeline: "AgentPipeline") -> None:
                 
             # 2. Send to fusion
             events = pipeline.map_batch(events)
+            
             success, response = await pipeline.sender_handler.send_batch(
                 pipeline.session_id, events, {"phase": "realtime"}
             )

@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 
 from watchdog.events import FileSystemEventHandler, FileSystemEvent
 from fustor_core.event import UpdateEvent, DeleteEvent
-
+from fustor_schema_fs.models import FSSchemaFields
 from .components import _WatchManager
 
 logger = logging.getLogger("fustor_agent.driver.fs")
@@ -20,12 +20,16 @@ def get_file_metadata(path: str, root_path: str = None, stat_info: Optional[os.s
         
         is_dir = stat.S_ISDIR(stat_info.st_mode)
         
+        # Schema definition says path is "Absolute file path".
+        # We return the absolute path here.
+        
         return {
-            "file_path": path,
-            "size": stat_info.st_size,
-            "modified_time": stat_info.st_mtime,
-            "created_time": stat_info.st_ctime,
-            "is_dir": is_dir
+            FSSchemaFields.PATH: path,
+            FSSchemaFields.FILE_NAME: os.path.basename(path) if path != "/" else "",
+            FSSchemaFields.SIZE: stat_info.st_size,
+            FSSchemaFields.MODIFIED_TIME: stat_info.st_mtime,
+            FSSchemaFields.CREATED_TIME: stat_info.st_ctime,
+            FSSchemaFields.IS_DIRECTORY: is_dir
         }
     except FileNotFoundError:
         logger.warning(f"[fs] Could not stat file, it may have been deleted before processing: {path}")
@@ -46,12 +50,8 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
         self.throttle_interval = float(getattr(watch_manager, 'throttle_interval', 5.0))
 
     def _get_index(self, mtime=None):
-        """
-        Normalize server_mtime into Agent's physical domain for stable TTL logic.
-        This index is used for event ordering and tombstone comparison in Fusion.
-        """
-        if mtime:
-             return int((mtime - self.watch_manager.drift_from_nfs) * 1000)
+        # Index is now purely based on physical time to avoid logical clock contamination
+        # from NFS future mtimes during event generation.
         return int(time.time() * 1000)
 
     def _touch_recursive_bottom_up(self, path: str):
@@ -77,7 +77,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 del_path = add_path.replace(to_path, from_path, 1)
                 
                 # Generate DeleteEvent for the old path
-                row = {"file_path": del_path}
+                row = {FSSchemaFields.PATH: del_path}
                 delete_event = DeleteEvent(
                     event_schema=self.watch_manager.root_path,
                     table="files",
@@ -104,7 +104,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 subdir_del_path = subdir_add_path.replace(to_path, from_path, 1)
 
                 # Generate DeleteEvent for the old directory path
-                row = {"file_path": subdir_del_path}
+                row = {FSSchemaFields.PATH: subdir_del_path}
                 delete_event = DeleteEvent(
                     event_schema=self.watch_manager.root_path,
                     table="files",
@@ -152,7 +152,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             if event.is_directory:
                 self.watch_manager.unschedule_recursive(event.src_path)
             
-            row = {"file_path": event.src_path}
+            row = {FSSchemaFields.PATH: event.src_path}
             delete_event = DeleteEvent(
                 event_schema=self.watch_manager.root_path,
                 table="files",
@@ -180,7 +180,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             self.watch_manager.touch(os.path.dirname(event.dest_path))
             
             # Create and queue the delete event for the old location
-            delete_row = {"file_path": event.src_path}
+            delete_row = {FSSchemaFields.PATH: event.src_path}
             delete_event = DeleteEvent(
                 event_schema=self.watch_manager.root_path,
                 table="files",

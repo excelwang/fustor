@@ -20,7 +20,7 @@ class TestPipelineFieldMapping:
     ):
         """
         Test that field mapping correctly transforms data.
-        We will map 'size' to 'wrong_size' so that Fusion sees default size (0).
+        We will map 'size' to 'remapped_size' so that Fusion sees default size (0).
         """
         logger.info("Running field mapping test")
         
@@ -30,20 +30,24 @@ class TestPipelineFieldMapping:
         api_key = setup_agents["api_key"]
         
         # 1. Update Agent Config to include fields_mapping
-        # Map: file_path -> path, modified_time -> modified_time, is_dir -> is_dir, size -> wrong_size
+        # Map: path -> path, modified_time -> modified_time, is_directory -> is_directory, size -> remapped_size
         pipeline_config = f"""
 id: "pipeline-task-1"
 source: "shared-fs"
 sender: "fusion"
 disabled: false
 fields_mapping:
-  - to: "files.path"
-    source: ["file_path:string"]
-  - to: "files.modified_time"
+  - to: "path"
+    source: ["path:string"]
+  - to: "modified_time"
     source: ["modified_time:number"]
-  - to: "files.is_dir"
-    source: ["is_dir:boolean"]
-  - to: "files.wrong_size"
+  - to: "is_directory"
+    source: ["is_directory:boolean"]
+  - to: "created_time"
+    source: ["created_time:number"]
+  # Test mapping: Map standard 'size' to a custom field 'remapped_size'
+  # This verifies that the 'size' field in Fusion becomes 0 (default) because its source was redirected.
+  - to: "remapped_size"
     source: ["size:integer"]
 """
         docker_env.create_file_in_container(
@@ -108,18 +112,19 @@ fields_mapping:
         logger.info(f"Created test file with size {expected_size}: {test_file}")
         
         # 4. Wait for Fusion to detect it
-        # Based on the tree dump, Fusion stores the absolute path as seen by the Agent
-        success = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
-        assert success, f"File {test_file} not found in tree. Tree: {fusion_client.get_tree()}"
+        # FSDriver should use absolute paths by default (matching schema 'Absolute file path')
+        expected_path_in_tree = test_file
+        success = fusion_client.wait_for_file_in_tree(expected_path_in_tree, timeout=MEDIUM_TIMEOUT)
+        assert success, f"File {expected_path_in_tree} not found in tree. Tree: {fusion_client.get_tree()}"
         
         # 5. Verify size in Fusion
-        # Because we mapped 'size' to 'wrong_size', and Fusion expects 'size',
+        # Because we mapped 'size' to 'remapped_size', and Fusion expects 'size',
         # Fusion should see the default value (0) instead of 1234.
-        node = fusion_client.get_node(test_file)
+        node = fusion_client.get_node(expected_path_in_tree)
         
         logger.info(f"Fusion node data: {node}")
         
         actual_size = node.get('size') if node else None
         
         assert actual_size == 0, f"Expected size 0 (due to mapping), but got {actual_size}"
-        logger.info("✅ Field mapping confirmed: 'size' was correctly redirected to 'wrong_size', causing Fusion to see 0.")
+        logger.info("✅ Field mapping confirmed: 'size' was correctly redirected to 'remapped_size', causing Fusion to see 0.")
