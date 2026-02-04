@@ -10,7 +10,14 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
-from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, LONG_TIMEOUT, STRESS_DELAY
+from ..fixtures.constants import (
+    STRESS_DELAY,
+    SHORT_TIMEOUT,
+    MEDIUM_TIMEOUT,
+    LONG_TIMEOUT,
+    TEST_TOMBSTONE_TTL,
+    TOMBSTONE_CLEANUP_WAIT
+)
 
 
 class TestTombstoneCleanup:
@@ -35,43 +42,57 @@ class TestTombstoneCleanup:
           - Audit 完成后，旧 Tombstone 被清理
           - 相同路径的新文件可以被正常同步
         """
-        test_file = f"{MOUNT_POINT}/tombstone_cleanup_{int(time.time()*1000)}.txt"
+        # Spec defaults to 1 hour, but we need to verify cleanup mechanism in seconds.
+        # This is now handled by Env Injection (docker.py) using TEST_TOMBSTONE_TTL.
         
-        # Step 1: Create and delete file (creates Tombstone)
-        docker_manager.create_file_in_container(
-            CONTAINER_CLIENT_A,
-            test_file,
-            content="will be deleted and cleaned"
-        )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
-        
-        # Delete via Agent (creates Tombstone)
-        docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
-        
-        # Wait for DELETE event and Verify deleted
-        assert fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False), \
-            f"File {test_file} should be removed from tree after Realtime DELETE"
-        
-        # Step 2-3: Use a marker file to detect Audit completion
-        marker_file = f"{MOUNT_POINT}/audit_marker_d4_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(STRESS_DELAY) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
-        
-        # Step 4: After Audit, Tombstone should be cleaned
-        # We verify by creating a new file with the same path via Agent
-        docker_manager.create_file_in_container(
-            CONTAINER_CLIENT_A,
-            test_file,
-            content="new file after tombstone cleanup"
-        )
-        
-        # Step 5: The new file should appear (Tombstone no longer blocks it)
-        # Wait for realtime sync of new file
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
-        
-        assert found is not None, \
-            f"New file should appear after Tombstone is cleaned. Tree: {fusion_client.get_tree(path='/', max_depth=-1)}"
+        try:
+            test_file = f"{MOUNT_POINT}/tombstone_cleanup_{int(time.time()*1000)}.txt"
+            
+            # Step 1: Create and delete file (creates Tombstone)
+            docker_manager.create_file_in_container(
+                CONTAINER_CLIENT_A,
+                test_file,
+                content="will be deleted and cleaned"
+            )
+            fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+            
+            # Delete via Agent (creates Tombstone)
+            docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
+            
+            # Wait for DELETE event and Verify deleted
+            assert fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False), \
+                f"File {test_file} should be removed from tree after Realtime DELETE"
+            
+            assert fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False), \
+                f"File {test_file} should be removed from tree after Realtime DELETE"
+            
+            # Wait for TTL to expire (TEST_TOMBSTONE_TTL + Buffer)
+            time.sleep(TOMBSTONE_CLEANUP_WAIT) 
+            
+            # Step 2-3: Use a marker file to detect Audit completion
+            # Audit End triggers the cleanup
+            marker_file = f"{MOUNT_POINT}/audit_marker_d4_{int(time.time())}.txt"
+            docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+            time.sleep(STRESS_DELAY) # NFS cache
+            assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
+            
+            # Step 4: After Audit, Tombstone should be cleaned
+            # We verify by creating a new file with the same path via Agent
+            docker_manager.create_file_in_container(
+                CONTAINER_CLIENT_A,
+                test_file,
+                content="new file after tombstone cleanup"
+            )
+            
+            # Step 5: The new file should appear (Tombstone no longer blocks it)
+            # Wait for realtime sync of new file
+            found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
+            
+            assert found is not None, \
+                f"New file should appear after Tombstone is cleaned. Tree: {fusion_client.get_tree(path='/', max_depth=-1)}"
+        finally:
+            # TTL restore not needed as we didn't modify it locally
+            pass
 
     def test_tombstone_blocks_during_audit_but_not_after(
         self,
@@ -84,50 +105,54 @@ class TestTombstoneCleanup:
         """
         场景: 验证 Tombstone 在 Audit 期间阻止复活，但 Audit 后允许新创建
         """
-        test_file = f"{MOUNT_POINT}/tombstone_lifecycle_{int(time.time()*1000)}.txt"
+
+        # Env Injection (docker.py) sets TEST_TOMBSTONE_TTL
         
-        # Create and delete
-        docker_manager.create_file_in_container(
-            CONTAINER_CLIENT_A,
-            test_file,
-            content="lifecycle test"
-        )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
-        
-        docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
-        assert fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False), \
-            f"File {test_file} should be removed after delete"
-        
-        # Give a small buffer for potential racing snapshots to be processed and blocked
-        time.sleep(STRESS_DELAY)
-        
-        # Immediately try to create from blind-spot (should be blocked by Tombstone)
-        docker_manager.create_file_in_container(
-            CONTAINER_CLIENT_C,
-            test_file,
-            content="blind spot attempt during tombstone"
-        )
-        
-        # Step 4: Use marker to ensure first audit cycle ran
-        marker_file = f"{MOUNT_POINT}/audit_marker_d4_lifecycle_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
-        time.sleep(STRESS_DELAY) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
-        
-        # After first audit finishes, the tombstone (created before audit) is cleaned.
-        # However, the blind-spot file report arrived DURING the first audit and was blocked.
-        # We need a SECOND audit cycle to discover the still-existing blind-spot file.
-        marker_file_2 = f"{MOUNT_POINT}/audit_marker_d4_lifecycle_2_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file_2, content="marker")
-        time.sleep(STRESS_DELAY) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file_2, timeout=LONG_TIMEOUT) is not None
-        
-        # Now the file should appear (Tombstone cleaned, blind-spot file exists)
-        tree = fusion_client.get_tree(path="/", max_depth=-1)
-        found = fusion_client._find_in_tree(tree, test_file)
-        
-        assert found is not None, \
-            "Blind-spot file should be discovered after tombstone expires"
+        try:
+            test_file = f"{MOUNT_POINT}/tombstone_lifecycle_{int(time.time()*1000)}.txt"
+            
+            # Create and delete
+            docker_manager.create_file_in_container(
+                CONTAINER_CLIENT_A,
+                test_file,
+                content="lifecycle test"
+            )
+            fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+            
+            docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
+            assert fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False), \
+                f"File {test_file} should be removed after delete"
+            
+            # Give a small buffer for potential racing snapshots to be processed and blocked
+            time.sleep(STRESS_DELAY)
+            
+            # Immediately try to create from blind-spot (should be blocked by Tombstone)
+            docker_manager.create_file_in_container(
+                CONTAINER_CLIENT_C,
+                test_file,
+                content="blind spot attempt during tombstone"
+            )
+            
+            # Step 4: Use marker to ensure first audit cycle ran
+            marker_file = f"{MOUNT_POINT}/audit_marker_d4_lifecycle_{int(time.time())}.txt"
+            docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+            time.sleep(STRESS_DELAY) # NFS cache
+            assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
+            
+            # Tombstone should be expired by TTL (2s) by now (we waited > 5s in STRESS_DELAY)
+            # The blind-spot file creation attempt happened at T+delta.
+            # The Audit Scan happened at T+5+.
+            # If Tombstone is gone, the Audit Scan should see the file and add it.
+            
+            # After Tombstone cleanup, the blind-spot file should be discoverable
+            # Verify file exists
+            tree = fusion_client.get_tree(path="/", max_depth=-1)
+            found = fusion_client._find_in_tree(tree, test_file)
+            
+            assert found is not None, \
+                "Blind-spot file should be discovered after tombstone expires"
+        finally:
+             pass
         
         # After Tombstone cleanup, the blind-spot file should be discoverable
         # Note: The exact behavior depends on implementation details

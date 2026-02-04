@@ -30,6 +30,8 @@ SESSION_TIMEOUT = 5       # seconds (used in sessions and heartbeats)
 # FS Specific Thresholds
 HOT_FILE_THRESHOLD = 10.0   # seconds
 THROTTLE_INTERVAL_SEC = 0.5 # seconds (event deduplication)
+TEST_TOMBSTONE_TTL = 2.0    # seconds (for D4 test injection)
+TOMBSTONE_CLEANUP_WAIT = 3.0 # seconds (Wait for TTL + Buffer)
 
 # --- Orchestration Timeouts (Wait Limits) ---
 

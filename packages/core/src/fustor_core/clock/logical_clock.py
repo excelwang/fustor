@@ -124,6 +124,12 @@ class LogicalClock:
                     # Monotonicity check
                     if target_value > self._value:
                         self._value = target_value
+                    
+                    # ENFORCE BASELINE: Even if mtime is old (past data), the clock must flow with physical time.
+                    # This fixes the "Stagnation" issue (Spec Section 4.1) where lack of new writes
+                    # caused the watermark to freeze, making old files look "fresh" (0 age).
+                    if baseline > self._value:
+                        self._value = baseline
             except Exception as e:
                 # Silent fail to proceed with event processing
                 pass

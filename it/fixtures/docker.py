@@ -24,7 +24,9 @@ from .constants import (
     SESSION_TIMEOUT,
     HOT_FILE_THRESHOLD,
     CONTAINER_HEALTH_TIMEOUT,
-    SHORT_TIMEOUT
+    CONTAINER_HEALTH_TIMEOUT,
+    SHORT_TIMEOUT,
+    TEST_TOMBSTONE_TTL
 )
 
 logger = logging.getLogger("fustor_test")
@@ -128,7 +130,7 @@ driver_params:
   uri: "/mnt/shared-view"
   hot_file_threshold: {HOT_FILE_THRESHOLD}
   consistency:
-    tombstone_ttl_seconds: 5
+    tombstone_ttl_seconds: {TEST_TOMBSTONE_TTL}
 """
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/integration-test-ds.yaml", view_config)
     
