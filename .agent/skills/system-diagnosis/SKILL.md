@@ -7,14 +7,21 @@ description: Diagnose complex failures, run RCA, and stabilize the system. Use w
 
 ## Instructions
 
-### 1. The Detective's Protocol (RCA Loop)
+### 1. Input Analysis (Intake Phase)
+- **Action**: Check user message for specific scope (e.g., "debug Authorization").
+- **Logic**:
+    - **Scoped**: Focus analysis ONLY on the named component/service. **User Scope OVERRIDES Active Ticket.**
+    - **Unscoped**: Perform full system health check.
+- **Override**: If a scope is provided, **IGNORE** `tickets/active` for the initial analysis.
+
+### 2. The Detective's Protocol (RCA Loop)
 1.  **Analyze**: Read Logs, Tracebacks, and Environment State.
 2.  **Hypothesize**: Formulate a theory (e.g., "Network timeout", "Race condition").
 3.  **Reproduction**: Create a minimal reproduction script (`tests/repro/`).
 4.  **Verify**: Run the script to confirm the bug.
 5.  **Report**: Generate `references/DEBUG_REPORT_TEMPLATE.md`.
 
-### 2. Capabilities & Actions
+### 3. Capabilities & Actions
 
 #### Action A: Deep Testing
 - Run `pytest -v` with high verbosity.
@@ -28,7 +35,7 @@ description: Diagnose complex failures, run RCA, and stabilize the system. Use w
 - **Goal**: Cleanup zombie workstreams using `scripts/gc_workstreams.py`.
 - **Instruction**: See `references/MAINTENANCE.md` for command parameters and usage.
 
-### 3. Reflection (Post-Task)
+### 4. Reflection (Post-Task)
 - **Goal**: Capture valid RCAs, environment fixes, or debugging techniques.
 - **Trigger**: After resolving a failure or completing a diagnosis.
 - **Action**:
@@ -38,13 +45,13 @@ description: Diagnose complex failures, run RCA, and stabilize the system. Use w
         - Append successful RCAs to `.agent/brain/lessons.md`.
     3. Update `references/environment_spec.md` if the environment was the root cause.
 
-### 4. Identity Banner
+### 5. Identity Banner
 > **Rule (MANDATORY)**: After "Hi Cortex", EVERY single response in this state MUST start with:
 ```markdown
 > **Cortex Status**: S4 (Diagnosing)
 > **Workstream**: $wk-current
 > **Persona**: 🕵️ Detective (Diagnostician)
-> **Ticket**: [Current Ticket ID]
+> **Ticket**: [Current Ticket ID] OR [Scope Name]
 ```
 
 ## References

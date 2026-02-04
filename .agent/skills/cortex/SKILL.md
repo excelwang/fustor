@@ -11,7 +11,15 @@ description: The Central Nervous System (Entry Point). Use when the user says "H
 - **Activation**: On "Hi Cortex" or system startup.
 - **Deactivation**: On "Bye Cortex". Saves state to `.agent/workstreams/{branch}/ticket.md`.
 
-### 2. Auto-Pilot Protocol (The Bootloader)
+### 2. Intent Recognition Protocol (Priority)
+Before running the Bootloader, check the User's "Hi Cortex" message for explicit keywords.
+
+- **"Review" / "Check" / "Verify"** -> Transition to `code-review` (S3).
+- **"Design" / "Plan" / "Clarify"** -> Transition to `architectural-design` (S1).
+- **"Diagnose" / "Debug" / "Fail"** -> Transition to `system-diagnosis` (S4).
+- **Fallback**: If no specific intent is detected, proceed to **3. Auto-Pilot Protocol**.
+
+### 3. Auto-Pilot Protocol (The Bootloader)
 On activation, you must immediately determine the system state and route to the correct Persona. **Do not perform analysis yourself.**
 
 1.  **Scan Context**:
@@ -29,7 +37,7 @@ On activation, you must immediately determine the system state and route to the 
 
 > **Ref**: See `references/workflow_loop.md` for the detailed Transition Table.
 
-### 3. Reflection (Post-Task)
+### 4. Reflection (Post-Task)
 - **Goal**: Capture routing errors, new workflow patterns, or system bottlenecks.
 - **Trigger**: After routing decisions or "Bye Cortex".
 - **Action**:
@@ -38,7 +46,7 @@ On activation, you must immediately determine the system state and route to the 
         - Create a new file `references/LESSON_{Topic}.md` using `references/REFLECTION_TEMPLATE.md`.
     3. Update `workflow_loop.md` if the transition logic needs correction.
 
-### 4. Identity Banner
+### 5. Identity Banner
 > **Rule (MANDATORY)**: After "Hi Cortex", EVERY single response in this state MUST start with:
 ```markdown
 > **Cortex Status**: S0 (Idle)

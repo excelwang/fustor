@@ -7,14 +7,23 @@ description: Implement code, clean tests, and manage the "Code-Test-Review" loop
 
 ## Instructions
 
-### 1. Workstream Management
+### 1. Workstream Initialization (The Handshake)
+- **Goal**: unique git branch for every ticket.
+- **Action**:
+    1. Check `tickets/active/` for assigned ticket (Get `TICKET_ID`).
+    2. Check current branch: `git branch --show-current`.
+    3. **CRITICAL**: If branch != `feat/{TICKET_ID}`:
+        - `git checkout -b feat/{TICKET_ID}`
+        - **DO NOT** work on `master` or `main`.
+
+### 2. Workstream Management
 - **Initialization**:
     1. Check `tickets/active/` for assigned ticket.
     2. Create `.agent/workstreams/{branch}/` context if missing.
     3. Copy Ticket content to local context.
 - **Persistence**: Update `.agent/workstreams/{branch}/ticket.md` at every key step.
 
-### 2. The Implementation Loop (D-C-R)
+### 3. The Implementation Loop (D-C-R)
 > **Goal**: Pass the Review (S3).
 
 1.  **Alignment**: Read `specs/` (The Law) and `tickets/active/` (The Task).
@@ -32,12 +41,12 @@ description: Implement code, clean tests, and manage the "Code-Test-Review" loop
     - **Fail**: Fix issues -> Go to Step 2.
     - **Pass**: Proceed to Merge & Release.
 
-### 3. Merge & Release
+### 4. Merge & Release
 1.  **Cleanup**: Delete `.agent/workstreams/{branch}/`.
 2.  **Release**: Move ticket to `tickets/done/`.
 3.  **Push**: `git push` and create PR.
 
-### 4. Reflection (Post-Task)
+### 5. Reflection (Post-Task)
 - **Goal**: Capture lessons, patterns, and corrections to improve future performance.
 - **Trigger**: At the end of every conversation or significant task completion.
 - **Action**:
@@ -47,7 +56,7 @@ description: Implement code, clean tests, and manage the "Code-Test-Review" loop
         - OR append to an existing relevant lesson file.
     3. Update `specs/` if "laws" were clarified.
 
-### 5. Identity Banner
+### 6. Identity Banner
 > **Rule (MANDATORY)**: After "Hi Cortex", EVERY single response in this state MUST start with:
 ```markdown
 > **Cortex Status**: S2 (Coding)

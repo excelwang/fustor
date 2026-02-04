@@ -81,7 +81,7 @@ async def test_send_events_obsolete_session(sender, mock_fusion_client):
     # Simulate 419 error
     request = httpx.Request("POST", "http://locahost")
     response = httpx.Response(419, request=request)
-    mock_fusion_client.push_events.side_effect = httpx.HTTPStatusError("Pbsolete", request=request, response=response)
+    mock_fusion_client.push_events.side_effect = httpx.HTTPStatusError("obsolete", request=request, response=response)
     
     with pytest.raises(SessionObsoletedError):
         await sender._send_events_impl([{"event_type": "INSERT", "table": "t", "rows": []}])

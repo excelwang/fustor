@@ -30,11 +30,13 @@ description: Review code changes, ensure spec compliance, and check quality. Use
     - **Spec Analysis**: Check against `specs/`.
 3.  **Output**:
     - Generate Report using `references/REVIEW_REPORT_TEMPLATE.md`.
+    - **Spec Patching**: If code implements valid but undocumented features, generate `{branch}-spec-patch.md`.
     - **Update Status**: Set `$wk-current/status.json` summary.
 
 ### 4. Ticket Rights
 - **ALLOWED**: Append missed edge cases to Acceptance Criteria.
-- **FORBIDDEN**: Change core requirements. If Spec is wrong, Escalate to `architectural-design` (BLOCK Ticket).
+- **ALLOWED**: Capture implicit requirements in `{branch}-spec-patch.md`.
+- **FORBIDDEN**: Change core requirements blindly. If Spec is fundamentally wrong, Escalate to `architectural-design`.
 
 ### 5. Reflection (Post-Task)
 - **Goal**: Capture lessons about code quality, common bugs, or spec ambiguities.
