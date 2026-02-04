@@ -55,7 +55,8 @@ class FusionClient:
         path: str = "/",
         max_depth: int = -1,
         only_path: bool = False,
-        dry_run: bool = False
+        dry_run: bool = False,
+        silence_503: bool = False
     ) -> dict[str, Any]:
         """Get file tree from Fusion."""
         resp = self.session.get(
@@ -71,11 +72,12 @@ class FusionClient:
             resp.raise_for_status()
         except requests.HTTPError as e:
             if resp.status_code == 503:
-                try:
-                    detail = resp.json().get('detail', 'No detail provided')
-                    print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {detail}")
-                except Exception:
-                    print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {resp.text}")
+                if not silence_503:
+                    try:
+                        detail = resp.json().get('detail', 'No detail provided')
+                        print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {detail}")
+                    except Exception:
+                        print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {resp.text}")
             raise e
         return resp.json()
 
@@ -205,7 +207,7 @@ class FusionClient:
         try:
             # max_depth=0 returns the node itself if it's a file, or the dir with children if it's a dir
             # But the tree API returns the subtree rooted at 'path'.
-            tree = self.get_tree(path=path, max_depth=0)
+            tree = self.get_tree(path=path, max_depth=0, silence_503=True)
             if not tree:
                 return None
             # If path doesn't exist, get_tree might throw 404 or return empty?
@@ -227,7 +229,7 @@ class FusionClient:
         start = time.time()
         while time.time() - start < timeout:
             try:
-                tree = self.get_tree(path=path, max_depth=0)
+                tree = self.get_tree(path=path, max_depth=0, silence_503=True)
                 exists = tree.get("name") is not None or tree.get("path") is not None
                 if exists == should_exist:
                     return True
@@ -248,7 +250,7 @@ class FusionClient:
         start = time.time()
         while time.time() - start < timeout:
             try:
-                tree = self.get_tree(path=root_path, max_depth=-1)
+                tree = self.get_tree(path=root_path, max_depth=-1, silence_503=True)
                 found = self._find_in_tree(tree, file_path)
                 if found:
                     return found
@@ -292,7 +294,7 @@ class FusionClient:
         """Check flag status of a file."""
         # Check integrity_suspect from tree
         try:
-            tree = self.get_tree(path=file_path, max_depth=0)
+            tree = self.get_tree(path=file_path, max_depth=0, silence_503=True)
             suspect = tree.get("integrity_suspect", False)
         except requests.HTTPError:
             suspect = False

@@ -153,6 +153,10 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     # Wait for A to become Leader and Ready
     logger.info("Waiting for Agent A to be ready (Leader + Realtime Ready)...")
     if not fusion_client.wait_for_agent_ready("client-a", timeout=AGENT_READY_TIMEOUT):
+        # Dump logs for Agent A
+        logs_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/agent.log"])
+        logs = logs_res.stdout + logs_res.stderr
+        logger.error(f"FATAL: Agent A did not become ready. Logs:\n{logs}")
         raise RuntimeError(f"Agent A did not become ready (can_realtime=True) within {AGENT_READY_TIMEOUT} seconds")
     
     sessions = fusion_client.get_sessions()

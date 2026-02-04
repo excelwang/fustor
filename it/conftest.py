@@ -105,7 +105,7 @@ def reset_fusion_state(fusion_client):
         for i in range(max_retries):
             try:
                 # Check if View is accessible (any call, e.g., stats)
-                fusion_client.get_tree(path="/", max_depth=1)
+                fusion_client.get_tree(path="/", max_depth=1, silence_503=True)
                 break
             except Exception:
                 if i == max_retries - 1:
