@@ -96,6 +96,21 @@ def reset_fusion_state(fusion_client):
     # 3. Reset Fusion state
     try:
         fusion_client.reset()
+        
+        # RESTORED: Wait for View to be READY (Initial snapshot complete)
+        # We need to ensure the system is stable before the next test starts.
+        # Otherwise, early requests (like Sentinel polling) might hit 503s.
+        time.sleep(1.0) # Give it a breath
+        max_retries = 100
+        for i in range(max_retries):
+            try:
+                # Check if View is accessible (any call, e.g., stats)
+                fusion_client.get_tree(path="/", max_depth=1)
+                break
+            except Exception:
+                if i == max_retries - 1:
+                    logger.warning("View failed to become ready after reset (timeout)")
+                time.sleep(1)
     except Exception as e:
         logger.debug(f"Fusion reset failed: {e}")
     
