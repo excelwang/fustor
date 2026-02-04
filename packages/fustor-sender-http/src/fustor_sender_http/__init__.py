@@ -57,10 +57,10 @@ class HTTPSender(Sender):
     
     async def create_session(
         self, 
-        task_id: str,
+        task_id: str, 
         source_type: Optional[str] = None,
         session_timeout_seconds: Optional[int] = None
-    ) -> Dict[str, Any]:
+    ) -> tuple[str, Dict[str, Any]]:
         """
         Create a new session with Fusion.
         
@@ -87,6 +87,11 @@ class HTTPSender(Sender):
                 f"Role: {session_data.get('role')}, "
                 f"Timeout: {session_data.get('session_timeout_seconds')}s"
             )
+            # Conform to Sender.create_session signature which returns Dict[str, Any]
+            # but legacy code might expect tuple. We stick to the interface.
+            # However, Sender.create_session returns Dict. 
+            # Wait, Sender ABC defines create_session -> tuple[str, dict]
+            # Let's check fustor_core/transport/sender.py
             return session_id, session_data
         else:
             self.logger.error("Failed to create session.")

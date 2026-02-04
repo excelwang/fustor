@@ -70,7 +70,7 @@ class Sender(ABC):
         task_id: str, 
         source_type: Optional[str] = None,
         session_timeout_seconds: Optional[int] = None
-    ) -> Dict[str, Any]:
+    ) -> tuple[str, Dict[str, Any]]:
         """
         Create a new session with the Fusion receiver.
         
@@ -80,7 +80,8 @@ class Sender(ABC):
             session_timeout_seconds: Requested session timeout
             
         Returns:
-            Session metadata including:
+            Tuple of (session_id, metadata_dict).
+            Metadata includes:
             - session_id: The session identifier
             - timeout_seconds: Session timeout from server
             - role: 'leader' or 'follower' (for FS consistency)
