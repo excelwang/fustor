@@ -138,6 +138,15 @@ async def test_future_timestamp_visibility(
     logger.info("Step 4: Checking Final State after catch-up...")
     node_final = fusion_client.get_node(test_path)
     
+    if node_final is None:
+        logger.error(f"Node {test_path} not found in tree. Dumping partial tree...")
+        try:
+            tree_dump = fusion_client.get_tree("/", max_depth=2)
+            logger.error(f"Tree Dump: {tree_dump}")
+        except Exception as e:
+            logger.error(f"Failed to dump tree: {e}")
+        pytest.fail(f"Node {test_path} disappeared from view (returned None).")
+
     logger.info(f"Node State 2: suspect={node_final.get('integrity_suspect')}")
     
     assert node_final.get('integrity_suspect') is False, f"Node should be visible (suspect=False) after clock catch-up. Current suspect={node_final.get('integrity_suspect')}"
