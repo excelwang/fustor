@@ -5,31 +5,32 @@ from collections import defaultdict
 import os
 from contextlib import asynccontextmanager
 
-from fustor_core.drivers import ViewDriver
+from fustor_core.pipeline.handler import ViewHandler
 from fustor_core.clock import LogicalClock
 from .nodes import DirectoryNode, FileNode
 
 logger = logging.getLogger(__name__)
 
-class FSViewBase(ViewDriver):
+class FSViewBase(ViewHandler):
     """
-    Base class for FS View Providers, inheriting from the core ViewDriver ABC.
+    Base class for FS View Providers, inheriting from the core ViewHandler ABC.
     Provides shared state and concurrency primitives.
     """
     
-    def __init__(self, id: str, view_id: str, config: Optional[Dict[str, Any]] = None, hot_file_threshold: float = 30.0):
-        # Allow config to override argument
-        final_config = config or {}
-        # Support both keys, prefer item
-        threshold = final_config.get("hot_file_threshold") or final_config.get("hot_file_threshold") or hot_file_threshold
+    # Schema identifier
+    schema_name = "fs"
+    schema_version = "2.0"
+    
+    def __init__(self, id: str, config: Dict[str, Any]):
+        super().__init__(id, config)
         
-        # Ensure config has at least one valid key for upstream
-        final_config.setdefault("hot_file_threshold", threshold)
+        # Legacy config support
+        self.view_id = config.get("view_id", id)
         
-        super().__init__(id, view_id, final_config)
-        
-        self.logger = logging.getLogger(f"fustor_view.fs.{view_id}")
+        threshold = config.get("hot_file_threshold", 30.0)
         self.hot_file_threshold = float(threshold)
+        
+        self.logger = logging.getLogger(f"fustor_view.fs.{self.view_id}")
         
         # Concurrency management
         self._MAX_READERS = 1000

@@ -16,7 +16,7 @@ import threading
 import multiprocessing
 from typing import Any, Dict, Iterator, List, Tuple, Optional, Set
 from concurrent.futures import ThreadPoolExecutor
-from fustor_core.drivers import SourceDriver
+from fustor_core.pipeline.handler import SourceHandler
 from fustor_core.models.config import SourceConfig
 from fustor_core.event import EventBase, UpdateEvent, DeleteEvent, MessageSource
 
@@ -26,10 +26,14 @@ from .scanner import FSScanner
 
 logger = logging.getLogger("fustor_agent.driver.fs")
             
-class FSDriver(SourceDriver):
+class FSDriver(SourceHandler):
     _instances: Dict[str, 'FSDriver'] = {}
     _lock = threading.Lock()
     
+    # Schema identifier
+    schema_name = "fs"
+    schema_version = "2.0"
+
     # FS driver doesn't require discovery as fields are fixed metadata.
     require_schema_discovery = False
 
@@ -40,30 +44,36 @@ class FSDriver(SourceDriver):
         """
         return True
     
-    def __new__(cls, id: str, config: SourceConfig):
+    def __new__(cls, id: str, config: Dict[str, Any]):
         # Generate unique signature based on URI and credentials to ensure permission isolation
-        signature = f"{config.uri}#{hash(str(config.credential))}"
+        # V2: config is a dict, not SourceConfig object
+        uri = config.get("uri")
+        credential = config.get("credential")
+        signature = f"{uri}#{hash(str(credential))}"
         
         with FSDriver._lock:
             if signature not in FSDriver._instances:
                 # Create new instance
-                instance = super().__new__(cls)
+                instance = super(FSDriver, cls).__new__(cls)
                 FSDriver._instances[signature] = instance
             return FSDriver._instances[signature]
     
-    def __init__(self, id: str, config: SourceConfig):
+    def __init__(self, id: str, config: Dict[str, Any]):
         # Prevent re-initialization of shared instances
         if hasattr(self, '_initialized'):
             return
         
         super().__init__(id, config)
-        self.uri = self.config.uri
+        self.uri = self.config.get("uri")
+        self.credential = self.config.get("credential")
+        self.driver_params = self.config.get("driver_params", {})
+        
         self.event_queue: queue.Queue[EventBase] = queue.Queue()
         self.drift_from_nfs = 0.0
         self._stop_driver_event = threading.Event()
         
-        min_monitoring_window_days = self.config.driver_params.get("min_monitoring_window_days", 30.0)
-        throttle_interval = self.config.driver_params.get("throttle_interval_sec", 5.0)
+        min_monitoring_window_days = self.driver_params.get("min_monitoring_window_days", 30.0)
+        throttle_interval = self.driver_params.get("throttle_interval_sec", 5.0)
         self.watch_manager = _WatchManager(
             self.uri, 
             event_handler=None, 
@@ -82,7 +92,7 @@ class FSDriver(SourceDriver):
         # Thread pool for parallel scanning
         # Issue 7 Fix: Use a more conservative default (min(4, cpu_count)) to prevent NFS IOPS spikes.
         default_workers = min(4, multiprocessing.cpu_count())
-        max_workers = self.config.driver_params.get("max_scan_workers", default_workers)
+        max_workers = self.driver_params.get("max_scan_workers", default_workers)
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
         logger.info(f"[fs] Driver initialized with {max_workers} scan workers (default was {default_workers}).")
         
@@ -158,11 +168,10 @@ class FSDriver(SourceDriver):
         stream_id = f"snapshot-fs-{uuid.uuid4().hex[:6]}"
         logger.info(f"[{stream_id}] Starting Parallel Snapshot Scan: {self.uri}")
 
-        driver_params = self.config.driver_params
-        if driver_params.get("startup_mode") == "message-only":
+        if self.driver_params.get("startup_mode") == "message-only":
             return
             
-        file_pattern = driver_params.get("file_pattern", "*")
+        file_pattern = self.driver_params.get("file_pattern", "*")
         batch_size = kwargs.get("batch_size", 100)
 
         scanner = FSScanner(self.uri, num_workers=self._executor._max_workers, 
@@ -197,7 +206,7 @@ class FSDriver(SourceDriver):
                 # Process events normally, but use the effective start position
                 while not (stop_event and stop_event.is_set()):
                     try:
-                        max_sync_delay_seconds = self.config.driver_params.get("max_sync_delay_seconds", 1.0)
+                        max_sync_delay_seconds = self.driver_params.get("max_sync_delay_seconds", 1.0)
                         event = self.event_queue.get(timeout=max_sync_delay_seconds)
                         
                         if start_position!=-1 and event.index < start_position:
@@ -214,7 +223,7 @@ class FSDriver(SourceDriver):
 
         return _iterator_func()
 
-    def get_audit_iterator(self, mtime_cache: Dict[str, float] = None, **kwargs) -> Iterator[Tuple[Optional[EventBase], Dict[str, float]]]:
+    def get_audit_iterator(self, mtime_cache: Optional[Dict[str, float]] = None, **kwargs) -> Iterator[EventBase]:
         """
         Parallel Audit Sync: Uses a task queue to scan subtrees in parallel.
         Correctly implements mtime-based 'True Silence'.
@@ -224,7 +233,7 @@ class FSDriver(SourceDriver):
         
         mtime_cache = mtime_cache or {}
         batch_size = kwargs.get("batch_size", 100)
-        file_pattern = self.config.driver_params.get("file_pattern", "*")
+        file_pattern = self.driver_params.get("file_pattern", "*")
 
         scanner = FSScanner(self.uri, num_workers=self._executor._max_workers, file_pattern=file_pattern)
         yield from scanner.scan_audit(self.uri, mtime_cache or {}, batch_size=batch_size)

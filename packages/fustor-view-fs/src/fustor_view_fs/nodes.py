@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import os
 
 class DirectoryNode:
@@ -16,9 +16,9 @@ class DirectoryNode:
         self.known_by_agent: bool = False # Set to True if seen via Realtime event
         self.audit_skipped: bool = False  # Temporary flag for missing file detection
 
-    def to_dict(self, recursive=True, max_depth=None, only_path=False):
+    def to_dict(self, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Dict[str, Any]:
         """Converts the directory node to a dictionary representation."""
-        result = {
+        result: Dict[str, Any] = {
             'name': self.name,
             'content_type': 'directory',
             'path': self.path
@@ -36,7 +36,8 @@ class DirectoryNode:
         if max_depth is not None and max_depth == 0:
             return result
 
-        result['children'] = []
+        children_list: List[Dict[str, Any]] = []
+        result['children'] = children_list
         if recursive:
             for child in self.children.values():
                 child_dict = child.to_dict(
@@ -45,13 +46,13 @@ class DirectoryNode:
                     only_path=only_path
                 )
                 if child_dict is not None:
-                    result['children'].append(child_dict)
+                    children_list.append(child_dict)
         else:
             for child in self.children.values():
                 # Non-recursive: get child metadata only
                 child_dict = child.to_dict(recursive=False, max_depth=0, only_path=only_path)
                 if child_dict is not None:
-                    result['children'].append(child_dict)
+                    children_list.append(child_dict)
         
         return result
 
@@ -68,9 +69,9 @@ class FileNode:
         self.integrity_suspect: bool = False
         self.known_by_agent: bool = False # Set to True if seen via Realtime event
 
-    def to_dict(self, recursive=True, max_depth=None, only_path=False):
+    def to_dict(self, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Dict[str, Any]:
         """Converts the file node to a dictionary representation."""
-        result = {
+        result: Dict[str, Any] = {
             'name': self.name,
             'content_type': 'file',
             'path': self.path

@@ -16,11 +16,11 @@ class FSViewProvider(FSViewBase):
     Coordinates various components to maintain a fused, consistent view 
     of the FS using Smart Merge arbitration logic.
     """
-    def __init__(self, id: str, view_id: str, config: Optional[Dict[str, Any]] = None):
-        super().__init__(id, view_id, config) 
+    def __init__(self, id: str, config: Dict[str, Any]):
+        super().__init__(id, config) 
         
         # Composition Root
-        self.state = FSState(view_id, config=self.config) # FSState uses group view_id
+        self.state = FSState(self.view_id, config=self.config) # FSState uses group view_id
         self.tree_manager = TreeManager(self.state)
         self.arbitrator = FSArbitrator(
             self.state, 
