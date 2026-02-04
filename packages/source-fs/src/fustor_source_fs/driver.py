@@ -131,8 +131,9 @@ class FSDriver(SourceDriver):
                 newest_relative_age = latest_mtime_stable - root_recursive_mtime
                 
                 logger.info(
-                    f"[fs] Pre-scan completed: processed {total_entries} entries, "
-                    f"errors: {error_count}, newest_relative_age: {newest_relative_age/86400:.2f} days, drift: {drift_from_nfs:.2f}s"
+                    "[fs] Pre-scan completed: processed %d entries, "
+                    "errors: %d, newest_relative_age: %.2f days, drift: %.2fs",
+                    total_entries, error_count, newest_relative_age/86400, drift_from_nfs
                 )
 
             logger.info(f"[fs] Found {len(dir_mtime_map)} total directories. Building capacity-aware, hierarchy-complete watch set...")

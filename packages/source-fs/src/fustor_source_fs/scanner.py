@@ -222,20 +222,7 @@ class FSScanner:
                         index=snapshot_time
                     ))
                 
-                # Report back for touch/watch updates
-                # We yield a special "touch" object/event or handle it via side effect?
-                # Using side effects in worker is okay if thread-safe.
-                # Here we pass it out via queue to be handled by consumer?
-                # The original code called self.watch_manager.touch() inside worker.
-                # To keep it loosely coupled, we can yield a control message or just accept 
-                # that we are yielding events.
-                
-                # Actually, wait. self.engine.scan_parallel yields whatever we put in res_q.
-                # So we can put a "Control" object. 
-                # Or, simpler: caller passes a callback, but callback runs in worker thread.
-                # Pre-scan logic: caller passed self.watch_manager.touch.
-                # Let's use the callback argument if provided. 
-                # Note: callback must be threadsafe. WatchManager.touch is threadsafe.
+
                 if callback:
                     callback(root, latest_mtime_in_subtree - self.drift_from_nfs)
 
