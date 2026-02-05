@@ -5,6 +5,6 @@ driver: "fs"
 disabled: false
 driver_params:
   uri: "/mnt/shared-view"
-  hot_file_threshold: 30.0
+  hot_file_threshold: 5.0
   consistency:
-    tombstone_ttl_seconds: 2.0
+    tombstone_ttl_seconds: 0.5

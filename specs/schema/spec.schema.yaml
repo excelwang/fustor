@@ -1,0 +1,119 @@
+# Fustor Spec Schema
+# Version: 1.0.0
+# Purpose: Define the structure and validation rules for all spec files.
+
+$schema: "http://json-schema.org/draft-07/schema#"
+title: "Fustor Spec File"
+description: "Schema for validating YAML frontmatter in Fustor specification files."
+
+type: object
+required:
+  - layer
+  - id
+  - version
+
+properties:
+  layer:
+    type: integer
+    enum: [0, 1, 2, 3]
+    description: |
+      Specification layer level:
+      - 0: Vision (L0)
+      - 1: Contracts (L1)
+      - 2: Architecture (L2)
+      - 3: Detailed Specs (L3)
+
+  id:
+    type: string
+    pattern: "^[A-Z][A-Z0-9_]*$"
+    description: "Unique identifier for this spec, e.g., VISION, CONTRACTS, ARCH, API, ALGO, RUNTIME"
+
+  version:
+    type: string
+    pattern: "^\\d+\\.\\d+\\.\\d+$"
+    description: "Semantic version of this spec"
+
+  requires:
+    type: array
+    items:
+      type: string
+      pattern: "^[A-Z][A-Z0-9_]*(\\.[A-Z][A-Z0-9_]*)*$"
+    description: "List of spec IDs from upper layers that this spec depends on"
+    default: []
+
+  exports:
+    type: array
+    items:
+      type: string
+      pattern: "^[A-Z][A-Z0-9_]*(\\.[A-Z][A-Z0-9_]*)*$"
+    description: "List of requirement IDs that this spec exports for lower layers"
+    default: []
+
+  invariants:
+    type: array
+    items:
+      type: object
+      required:
+        - id
+        - statement
+      properties:
+        id:
+          type: string
+          pattern: "^INV_[A-Z0-9_]+$"
+        statement:
+          type: string
+    description: "Formal invariants that must be verified"
+    default: []
+
+  components:
+    type: array
+    items:
+      type: string
+      pattern: "^[A-Z][A-Za-z0-9_]*$"
+    description: "(L2 only) List of component IDs defined in this architecture"
+    default: []
+
+# Layer-specific validation
+allOf:
+  # L0 Vision should not have requires
+  - if:
+      properties:
+        layer:
+          const: 0
+    then:
+      properties:
+        requires:
+          maxItems: 0
+
+  # L1 Contracts must require only from L0
+  - if:
+      properties:
+        layer:
+          const: 1
+    then:
+      properties:
+        requires:
+          items:
+            pattern: "^VISION(\\.[A-Z][A-Z0-9_]*)*$"
+
+  # L2 Architecture must require from L1
+  - if:
+      properties:
+        layer:
+          const: 2
+    then:
+      properties:
+        requires:
+          items:
+            pattern: "^CONTRACTS(\\.[A-Z][A-Z0-9_]*)*$"
+
+  # L3 Specs must require from L2
+  - if:
+      properties:
+        layer:
+          const: 3
+    then:
+      properties:
+        requires:
+          items:
+            pattern: "^ARCH(\\.[A-Z][A-Z0-9_]*)*$"
