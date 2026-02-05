@@ -106,8 +106,10 @@ def docker_env():
     
     # 1. Create .fustor directory
     docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/views-config"])
+    docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/receivers-config"])
+    docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/fusion-pipes-config"])
     
-    # 2. Inject Receivers Config (v2: renamed from 'views')
+    # 2. Inject Receivers Config (v2: receivers-config.yaml)
     receivers_config = f"""
 http-main:
   driver: "http"
@@ -126,6 +128,7 @@ id: "integration-test-ds"
 view_id: "integration-test-ds"
 driver: "fs"
 disabled: false
+hot_file_threshold: {HOT_FILE_THRESHOLD}
 driver_params:
   uri: "/mnt/shared-view"
   hot_file_threshold: {HOT_FILE_THRESHOLD}
@@ -147,7 +150,6 @@ allow_concurrent_push: true
 extra:
   view_id: "integration-test-ds"
 """
-    docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/fusion-pipes-config"])
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/fusion-pipes-config/integration-test-ds.yaml", pipeline_config)
 
     # 5. Reload Fusion
