@@ -28,9 +28,9 @@ class AgentPipelineConfig(BaseModel):
     sender: Optional[str] = None
     disabled: bool = False
     fields_mapping: List[FieldMappingYaml] = []
-    audit_interval_sec: int = 600
-    sentinel_interval_sec: int = 120
-    heartbeat_interval_sec: int = 10
+    audit_interval_sec: float = 600.0
+    sentinel_interval_sec: float = 120.0
+    heartbeat_interval_sec: float = 10.0
     
 
 

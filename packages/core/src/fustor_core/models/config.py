@@ -94,9 +94,9 @@ class PipelineConfig(BaseModel):
     disabled: bool = Field(default=True, description="是否禁用此配置")
     fields_mapping: List[FieldMapping] = Field(default_factory=list)
     # Consistency-related intervals (Section 7 of CONSISTENCY_DESIGN)
-    audit_interval_sec: int = Field(default=600, ge=0, description="审计扫描间隔(秒)，0表示禁用，默认10分钟")
-    sentinel_interval_sec: int = Field(default=120, ge=0, description="哨兵巡检间隔(秒)，0表示禁用，默认2分钟")
-    heartbeat_interval_sec: int = Field(default=10, ge=1, description="心跳间隔(秒)，默认10秒")
+    audit_interval_sec: float = Field(default=600.0, ge=0, description="审计扫描间隔(秒)，0表示禁用，默认10分钟")
+    sentinel_interval_sec: float = Field(default=120.0, ge=0, description="哨兵巡检间隔(秒)，0表示禁用，默认2分钟")
+    heartbeat_interval_sec: float = Field(default=10.0, ge=0.1, description="心跳间隔(秒)，默认10秒")
 
     # Reliability Configuration
     error_retry_interval: float = Field(default=5.0, gt=0, description="错误重试初始间隔(秒)")
