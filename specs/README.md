@@ -1,22 +1,28 @@
 # Fustor V2 Specifications
 
-This directory contains the authoritative design documents for Fustor V2, organized logically from goals to implementation.
+## Document Hierarchy
 
-## 1. Vision & Architecture
-- **[01-GOALS.md](./01-GOALS.md)**: **START HERE**. The Project Scope, User Value, and Core Principles.
-- **[02-ARCHITECTURE.md](./02-ARCHITECTURE.md)**: The System Architecture, Component Layering (Agent/Fusion), and Package Structure.
+> **Authority decreases, volatility increases from top to bottom.**
 
-## 2. Core Logic (The "Brain")
-- **[03-CORE_ALGORITHMS.md](./03-CORE_ALGORITHMS.md)**: The consistency algorithms (Smart Merge, Tombstones) and Dual-Track Time (Logical Clock) design.
+### L0 — Vision (最权威)
+- **00-GOALS** — 用户价值、设计原则、边界约束
+  - 变更需架构评审
 
-## 3. Definitions
-- **[04-MODELS_AND_TERMS.md](./04-MODELS_AND_TERMS.md)**: The shared Vocabulary (Glossary) and Data Models (Schema).
+### L1 — Contract
+- **10-ARCHITECTURE** — 系统分层、组件边界
+- **11-MODELS_AND_TERMS** — 术语表、数据模型契约
 
-## 4. Implementation Details
-- **[05-INTERFACES_AND_IMPLEMENTATION.md](./05-INTERFACES_AND_IMPLEMENTATION.md)**: APIs, Configuration, Pseudocode, Concurrency Control, and ViewDriver Hooks.
-- **[06-RUNTIME_BEHAVIOR.md](./06-RUNTIME_BEHAVIOR.md)**: Leader election, Audit cache lifecycle, Hot Watch Set.
+### L2 — Algorithm
+- **20-CORE_ALGORITHMS** — Smart Merge、Logical Clock、Suspect 模型
+- **21-VERIFICATION_MODEL** — 系统不变量、正确性定义
 
-## 5. Quality & Verification
-- **[08-RELIABILITY_DESIGN.md](./08-RELIABILITY_DESIGN.md)**: Error handling and resilience strategies.
-- **[09-VERIFICATION_MODEL.md](./09-VERIFICATION_MODEL.md)**: System invariants for correctness verification.
-- **[20-QUALITY_ASSURANCE.md](./20-QUALITY_ASSURANCE.md)**: Testing strategy.
+### L3 — Interface
+- **30-INTERFACES** — API 定义、配置参考
+- **31-RELIABILITY** — 错误处理、容错策略
+
+### L4 — Runtime
+- **40-RUNTIME_BEHAVIOR** — Leader 选举、缓存生命周期
+
+### L9 — Process (最易变)
+- **90-QUALITY_ASSURANCE** — 测试策略
+- **99-DECISION_LOG** — 历史决策记录
