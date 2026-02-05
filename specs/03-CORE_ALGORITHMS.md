@@ -120,3 +120,57 @@ Files transition through states to ensure integrity.
     - Schedule poll for `Expected_Expiry_Time`.
     - If `os.stat()` confirms mtime stable -> Promote to Stable.
     - If mtime changed -> Renew Suspect lease.
+
+### 3.3 Suspect Stability Model (Stability-based TTL)
+
+The Suspect state uses a **Stability-based Model** rather than pure age:
+
+| Condition | Action |
+|-----------|--------|
+| **Realtime Update/Delete** | Immediately remove from Suspect List |
+| **TTL Expired + mtime unchanged** | Promote to Stable (clear suspect flag) |
+| **TTL Expired + mtime changed** | Renew TTL for another full cycle |
+
+**Key Design**:
+- Stability check compares `current_mtime` vs `recorded_mtime` at entry time
+- Does NOT re-check logical age (allows future-timestamp files to stabilize)
+- Uses `time.monotonic()` for TTL to avoid system clock adjustments
+
+### 3.4 Blind-spot Lifecycle
+
+Blind-spot records track files discovered/deleted outside Agent monitoring.
+
+| Subset | Content | Lifecycle |
+|--------|---------|-----------|
+| `blind_spot_additions` | Files found by Audit but not by Realtime | Persists until Realtime confirms |
+| `blind_spot_deletions` | Files missing in Audit but present in Tree | Persists until Realtime confirms |
+
+**Clear Conditions**:
+1. **Realtime Confirmation**: A Realtime event for the same path clears the blind-spot record
+2. **Session Reset**: `on_session_start` clears all blind-spot records (new baseline)
+
+**Persistence Rule**: Blind-spots do NOT use TTL auto-expiration (prevents valid data loss).
+
+---
+
+## 4. Audit Quick-Scan Algorithm (Agent-Side)
+
+Leverages POSIX semantics: creating/deleting files only updates the **direct parent directory's** mtime.
+
+### 4.1 True Silence Optimization
+
+| Directory State | Action |
+|-----------------|--------|
+| `mtime == cached_mtime` | Skip file enumeration, send `audit_skipped=True`, recurse subdirs |
+| `mtime != cached_mtime` | Full scan: enumerate all files, update cache |
+
+**Benefit**: O(dirs) instead of O(files) for unchanged directories.
+
+### 4.2 Audit Message Fields
+
+| Field | Purpose |
+|-------|---------|
+| `parent_path` | Parent directory path (for Parent Mtime Check) |
+| `parent_mtime` | Parent mtime at scan time |
+| `audit_skipped` | `true` if directory was skipped due to unchanged mtime |
+| `index` | Physical capture timestamp (ms) |

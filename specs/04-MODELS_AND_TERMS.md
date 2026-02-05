@@ -66,11 +66,26 @@ class FileNode:
 
 ### 2.3 Session Model
 
-```python
-class Session:
-    session_id: str
-    task_id: str
-    role: Literal["leader", "follower"]
-    created_at: float
-    last_heartbeat_at: float
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `session_id` | `str` | Unique session identifier |
+| `task_id` | `str` | Agent pipeline task ID |
+| `role` | `leader/follower` | Current role |
+| `created_at` | `float` | Session creation time |
+| `last_heartbeat_at` | `float` | Last heartbeat timestamp |
+
+### 2.4 DirectoryNode Extensions
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `audit_skipped` | `bool` | True if skipped due to unchanged mtime |
+
+### 2.5 Internal State Structures
+
+**Tombstone Entry**: `(LogicalTime, PhysicalTime)`
+- `LogicalTime`: For reincarnation check (`mtime > logical_ts`)
+- `PhysicalTime`: For TTL cleanup (1 hour default)
+
+**Suspect Entry**: `(ExpiryMonotonic, RecordedMtime)`
+- `ExpiryMonotonic`: TTL expiry via `time.monotonic()`
+- `RecordedMtime`: mtime at entry time (for stability check)

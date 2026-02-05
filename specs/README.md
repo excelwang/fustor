@@ -13,7 +13,8 @@ This directory contains the authoritative design documents for Fustor V2, organi
 - **[04-MODELS_AND_TERMS.md](./04-MODELS_AND_TERMS.md)**: The shared Vocabulary (Glossary) and Data Models (Schema).
 
 ## 4. Implementation Details
-- **[05-INTERFACES_AND_IMPLEMENTATION.md](./05-INTERFACES_AND_IMPLEMENTATION.md)**: Concrete API definitions, Configuration reference, and Algorithm Pseudocode.
+- **[05-INTERFACES_AND_IMPLEMENTATION.md](./05-INTERFACES_AND_IMPLEMENTATION.md)**: APIs, Configuration, Pseudocode, Concurrency Control, and ViewDriver Hooks.
+- **[06-RUNTIME_BEHAVIOR.md](./06-RUNTIME_BEHAVIOR.md)**: Leader election, Audit cache lifecycle, Hot Watch Set.
 
 ## 5. Quality & Verification
 - **[08-RELIABILITY_DESIGN.md](./08-RELIABILITY_DESIGN.md)**: Error handling and resilience strategies.
