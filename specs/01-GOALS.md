@@ -51,14 +51,15 @@ Fustor solves this by deploying lightweight **Agents** on client nodes that stre
     - Strict separation of concerns (Layer 0 to Layer 5).
     - Reference Netty architecture.
 
-4.  **Extensibility**:
-    - Support multiple protocols (HTTP, gRPC).
-    - Support multiple Schemas (FS, Database, etc.).
+5.  **Configuration Simplicity (No-DB)**:
+    - **File-Based**: Source, Receiver, Sender, View, and Pipeline configurations must be stored in independent files (YAML), editable by users. No internal database.
+    - **Hot Patching**: Support `add-config` / `del-config` commands to patch configuration at runtime without full restart.
+    - **Enabled-Driven**: Runtime execution is strictly controlled by the `enabled` flag in the configuration. `start/stop` commands control the global lifecycle.
 
 ### 2.2 Non-Functional Requirements
 
 - **Performance**: High throughput using EventBus.
 - **Consistency**: Strong consistency via LogicalClock and arbitration.
 - **Reliability**: Session management, heartbeats, and fault tolerance.
-- **Efficiency**: Determine file integrity as efficiently as possible (minimize IOPS).
+- **Efficiency**: Determine file integrity as efficiently as possible.
 - **Coverage**: **Structural Consistency**. Ensure the file tree structure matches the filesystem (100% Add/Delete detection). Content freshness (modifications) in blind-spots is **Best-Effort** and may be sacrificed for efficiency.

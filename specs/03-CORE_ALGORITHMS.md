@@ -10,7 +10,19 @@ The core arbitration logic determines which events are accepted into the global 
 1.  **Realtime Events** (Highest Priority): Inotify events from Agents are considered the most current truth.
 2.  **Snapshot/Audit Events** (Lower Priority): Used to fill gaps (blind spots) but must never overwrite Realtime data unless proven newer.
 
-### 1.2 Arbitration Rules
+### 1.2 Leader Election (Fusion-Side)
+*Who is allowed to perform heavy tasks (Snapshot/Audit/Sentinel)?*
+
+- **Strategy**: **First-Come-First-Served (FCFS)** with **Fastest Follower Promotion**.
+- **Logic**:
+    1.  The first Session to connect to a View acquires the **Leader Lock**.
+    2.  Subsequent Sessions become **Followers**.
+    3.  If Leader disconnects:
+        - The lock is released.
+        - The Follower with the **fastest response** is promoted to Leader.
+        - Agent receives `role: leader` in next Heartbeat response.
+
+### 1.3 Arbitration Rules
 
 When Fusion receives an event `E` for path `P`:
 
@@ -36,8 +48,9 @@ When Fusion receives an event `E` for path `P`:
 *Verify if a "new" file found by Audit is actually new.*
 - **Context**: Audit finds `file.txt` in `/dir`, but Fusion doesn't have it.
 - **Logic**:
-    - If `/dir` in Memory Tree has `mtime > E.parent_mtime`:
-        - **Interpretation**: The directory has changed *after* the Audit scan started. The file might have been deleted in the interim.
+- **Logic**:
+    - If `/dir` in Memory Tree has `mtime > E.parent_mtime` (The parent mtime observed by Audit):
+        - **Interpretation**: The directory has changed *after* the Audit scan observed this file. A Realtime event (e.g., deletion) has likely superseded this finding.
         - **Action**: Discard `E` (Stale).
     - Else:
         - **Action**: Accept `E` as **Blind-spot Addition**.
@@ -64,22 +77,25 @@ Fustor uses a hybrid clock system to order events across uncoordinated nodes.
 - **Clock Skew**: Agent clocks vary by seconds/minutes.
 - **Unreliable Mtime**: `touch -d` can set mtime to 2050 or 1970.
 
-### 2.2 Solution: Robust Logical Clock
+### 2.2 Solution: Simplified Logical Clock
 
-Fusion maintains a **Logical Watermark** that advances monotonically.
+Fusion maintains a **Logical Watermark** that advances linearly with Fusion's physical clock, corrected for the dominant skew.
 
 #### A. Skew Correction (Fusion-Side)
 - **Concept**: Calculate `offset = Fusion_Physical_Time - Event_Mtime`.
 - **Mechanism**:
     - Collect skew samples from all Realtime events.
     - Compute the **Mode** (most frequent) skew.
-    - **Result**: A global `BaseLine` time = `Fusion_Physical_Time - Mode_Skew`.
 
-#### B. Watermark Advancement
-- **Logic**:
-    - `BaseLine` advances naturally with physical time.
-    - `FastForward`: If `Event.mtime > Watermark` (within a Trust Window), jump Watermark forward.
-    - **Trust Window**: Prevents a single "2050 file" from dragging the whole system forward.
+#### B. Watermark Definition
+- **Formula**:
+  `Watermark = Fusion_Physical_Time - Mode_Skew`
+  where `Mode_Skew` is the most frequent skew between Fusion and Agents. when cold start, Mode_Skew = 0.
+
+- **Advantages**:
+    - **Stability**: Prevents "Time Travel" caused by rogue clients with future clocks (e.g., `touch -d 2050`).
+    - **Predictability**: The watermark always flows forward at the speed of real-time, regardless of bursty event traffic.
+    - **Simplicity**: No complex "FastForward" or "Trust Window" logic required.
 
 #### C. Derived Logical Time
 - Used for **Suspect Age** calculation.
@@ -93,7 +109,7 @@ Files transition through states to ensure integrity.
 
 ### 3.1 States
 1.  **Suspect (Hot)**: Recently modified. Might be incomplete (NFS cache, active write).
-    - **Indicator**: `Age < Threshold (30s)`.
+    - **Indicator**: `Age < Threshold (65s)`.
 2.  **Stable**: Age > Threshold AND mtime hasn't changed.
 3.  **Tombstone**: Deleted recently.
 
