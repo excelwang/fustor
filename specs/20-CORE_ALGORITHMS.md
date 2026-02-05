@@ -29,11 +29,13 @@ When Fusion receives an event `E` for path `P`:
 #### Rule 1: Tombstone Protection
 *Prevent "Zombie Resurrection" (deleted files reappearing due to stale snapshots).*
 - **Logic**:
-    - If `P` exists in **Tombstone List** with logical timestamp `Ts_tomb`:
-    - If `E.mtime > Ts_tomb + epsilon`:
+    - Tombstone stores dual timestamps: `(Ts_logical, Ts_physical)` per §11-MODELS_AND_TERMS.
+    - If `P` exists in **Tombstone List** with logical timestamp `Ts_logical`:
+    - If `E.mtime > Ts_logical`:
         - **Action**: Accept `E`, Remove Tombstone (Reincarnation).
     - Else:
         - **Action**: Discard `E` (Stale).
+    - `Ts_physical` is used for TTL cleanup (see §30-INTERFACES).
 
 #### Rule 2: Mtime Arbitration
 *Prevent overwriting newer data with older data.*
@@ -48,14 +50,13 @@ When Fusion receives an event `E` for path `P`:
 *Verify if a "new" file found by Audit is actually new.*
 - **Context**: Audit finds `file.txt` in `/dir`, but Fusion doesn't have it.
 - **Logic**:
-- **Logic**:
     - If `/dir` in Memory Tree has `mtime > E.parent_mtime` (The parent mtime observed by Audit):
         - **Interpretation**: The directory has changed *after* the Audit scan observed this file. A Realtime event (e.g., deletion) has likely superseded this finding.
         - **Action**: Discard `E` (Stale).
     - Else:
         - **Action**: Accept `E` as **Blind-spot Addition**.
 
-### 1.3 Audit Logic (Efficiency Mode)
+### 1.4 Audit Logic (Efficiency Mode)
 
 To balance **Efficiency** and **Coverage**:
 

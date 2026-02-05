@@ -13,7 +13,7 @@
 
 **`POST /pipe/events/{session_id}`**
 - **Purpose**: High-throughput event ingestion.
-- **Input**: `EventBatch` (defined in `04-MODELS_AND_TERMS.md`).
+- **Input**: `EventBatch` (defined in `11-MODELS_AND_TERMS`).
 - **Behavior**: Async dispatch to `View.process_event`.
 
 **`POST /pipe/consistency/sentinel/feedback`**
@@ -57,7 +57,7 @@
 - **Purpose**: List all blind-spot files.
 - **Output**: `{additions: [...], deletions: [...]}`.
 
-### 1.3 Management CLI (Local)
+### 1.4 Management CLI (Local)
 
 **`fustor-agent|fusion config add --file <path>`**
 - **Purpose**: Hot patch configuration.
@@ -93,9 +93,10 @@ tombstone_ttl_seconds: 3600 # 1 hour
 For each incoming event `E` targeting path `P`:
 
 1. **Tombstone Guard**
-   - IF `P` exists in Tombstone List with timestamp `Ts`:
-     - IF `E.mtime > Ts`: Remove tombstone (Reincarnation), ACCEPT
+   - IF `P` exists in Tombstone List with logical timestamp `Ts_logical`:
+     - IF `E.mtime > Ts_logical`: Remove tombstone (Reincarnation), ACCEPT
      - ELSE: DISCARD (Stale)
+   - Note: Physical timestamp `Ts_physical` is used for TTL cleanup (§2.2).
 
 2. **Mtime Arbitration**
    - IF `P` exists in Memory Tree with `node.mtime`:
@@ -137,6 +138,8 @@ Use a Min-Heap ordered by expiry time for O(log n) suspect management.
 | `suspect_heap` (Heap) | `(expiry, path)` tuples | Ordered expiration |
 
 **Cleanup Algorithm**: Pop expired entries from heap top, verify via dict, then process.
+
+> This heap structure is also used by **Sentinel Sweep** (§20-CORE_ALGORITHMS §3.2) to schedule verification tasks.
 
 ---
 

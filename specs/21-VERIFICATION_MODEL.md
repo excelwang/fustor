@@ -3,6 +3,7 @@
 > **Status**: Draft
 > **Version**: 1.0
 > **Purpose**: Defines the "Truth" for Integration Testing.
+> **Scope**: These invariants are specific to **fs-view** (file system view driver).
 
 ## 1. System Invariants
 

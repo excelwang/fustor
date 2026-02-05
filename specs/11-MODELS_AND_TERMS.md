@@ -17,6 +17,7 @@
 - **Suspect**: A file that is "Hot" (recent mtime) or unstable.
 - **Tombstone**: A record of a deleted file to prevent stale data resurrection.
 - **Blind-spot**: A file change that happened outside of Agent monitoring (e.g., on a node without an agent).
+- **Structural Consistency**: 100% detection of Add/Delete/Rename operations. Content freshness in blind-spots is Best-Effort.
 
 ---
 
