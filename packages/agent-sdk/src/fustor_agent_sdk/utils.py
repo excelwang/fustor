@@ -11,7 +11,7 @@ def get_or_generate_agent_id(config_dir: str, logger: logging.Logger) -> str:
     try:
         with open(agent_id_path, 'r', encoding='utf-8') as f:
             agent_id = f.read().strip()
-            if not agent_id:
+        if not agent_id:
                 raise FileNotFoundError # Treat empty file as not found
         logger.info(f"Loaded existing Agent ID: {agent_id}")
         return agent_id

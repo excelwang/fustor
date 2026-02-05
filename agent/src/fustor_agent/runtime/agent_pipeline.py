@@ -474,6 +474,7 @@ class AgentPipeline(Pipeline):
 
                 # Check if message sync is running and post-prescan (driver ready)
                 can_realtime = self.is_realtime_ready
+                logger.debug(f"Pipeline {self.id}: Sending heartbeat. can_realtime={can_realtime} (is_realtime_ready={self.is_realtime_ready})")
 
                 response = await self.sender_handler.send_heartbeat(self.session_id, can_realtime=can_realtime)
                 await self._update_role_from_response(response)

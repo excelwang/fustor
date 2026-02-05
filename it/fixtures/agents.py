@@ -61,12 +61,27 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
     # Generate unique agent ID
     agent_id = f"{container_name.replace('fustor-nfs-', '')}-{os.urandom(2).hex()}"
     
+    # 1. Kill existing agent if running and clean up pid/state files INITIAL CLEANUP
+    docker_manager.cleanup_agent_state(container_name)
+    time.sleep(FAST_POLL_INTERVAL)
+
+    # Determine the home directory in the container
+    home_res = docker_manager.exec_in_container(container_name, ["sh", "-c", "echo $HOME"])
+    if home_res.returncode != 0 or not home_res.stdout.strip():
+        logger.warning(f"Could not determine HOME in {container_name}, defaulting to /root")
+        home_dir = "/root"
+    else:
+        home_dir = home_res.stdout.strip()
+    
+    config_dir = f"{home_dir}/.fustor"
+    logger.info(f"Using config directory: {config_dir}")
+
     # Ensure config dir exists
-    docker_manager.exec_in_container(container_name, ["mkdir", "-p", "/root/.fustor"])
+    docker_manager.exec_in_container(container_name, ["mkdir", "-p", config_dir])
 
     docker_manager.create_file_in_container(
         container_name,
-        "/root/.fustor/agent.id",
+        f"{config_dir}/agent.id",
         content=agent_id
     )
 
@@ -81,7 +96,7 @@ shared-fs:
   driver_params:
     throttle_interval_sec: {THROTTLE_INTERVAL_SEC}
 """
-    docker_manager.create_file_in_container(container_name, "/root/.fustor/sources-config.yaml", sources_config)
+    docker_manager.create_file_in_container(container_name, f"{config_dir}/sources-config.yaml", sources_config)
 
     # 2. Senders Config
     senders_config = f"""
@@ -95,10 +110,10 @@ fusion:
     view_id: {view_id}
     api_version: "pipe"
 """
-    docker_manager.create_file_in_container(container_name, "/root/.fustor/senders-config.yaml", senders_config)
+    docker_manager.create_file_in_container(container_name, f"{config_dir}/senders-config.yaml", senders_config)
 
     # 3. Pipelines Config
-    pipes_dir = "/root/.fustor/agent-pipes-config"
+    pipes_dir = f"{config_dir}/agent-pipes-config"
     docker_manager.exec_in_container(container_name, ["mkdir", "-p", pipes_dir])
     
     pipelines_config = f"""
@@ -112,9 +127,6 @@ heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
 """
     docker_manager.create_file_in_container(container_name, f"{pipes_dir}/pipeline-task-1.yaml", pipelines_config)
     
-    # 4. Kill existing agent if running and clean up pid/state files
-    docker_manager.cleanup_agent_state(container_name)
-    time.sleep(FAST_POLL_INTERVAL)
     
     logger.info(f"Starting agent in {container_name} in DAEMON mode (-D)")
     env_prefix = "FUSTOR_USE_PIPELINE=true "
@@ -179,7 +191,9 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     # causing false-suspicious flags for "Old" files if skew exists (e.g., Faketime).
     logger.info("Performing Skew Calibration Warmup...")
     warmup_file = f"{MOUNT_POINT}/skew_calibration_{int(time.time()*1000)}.txt"
-    docker_manager.create_file_in_container(CONTAINER_CLIENT_A, warmup_file, content="warmup")
+    # Use touch to ensure mtime reflects the container's skewed time (libfaketime)
+    # create_file_in_container uses echo|base64 which might have different timestamp behavior
+    docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["touch", warmup_file])
     
     # Wait for Fusion to ingest it (implicitly calibrates skew)
     if not fusion_client.wait_for_file_in_tree(warmup_file, timeout=SHORT_TIMEOUT):
