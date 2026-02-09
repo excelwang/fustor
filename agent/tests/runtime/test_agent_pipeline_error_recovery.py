@@ -1,12 +1,12 @@
-# agent/tests/runtime/test_agent_pipeline_error_recovery.py
+# agent/tests/runtime/test_agent_pipe_error_recovery.py
 """
-Tests for AgentPipeline error recovery and session loss handling.
+Tests for AgentPipe error recovery and session loss handling.
 """
 import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
-from fustor_core.pipeline import PipelineState
-from fustor_agent.runtime.agent_pipeline import AgentPipeline
+from fustor_core.pipe import PipeState
+from fustor_agent.runtime.agent_pipe import AgentPipe
 from .mocks import MockSourceHandler, MockSenderHandler
 
 # Using fixtures and fast intervals from conftest.py
@@ -15,8 +15,8 @@ from .mocks import MockSourceHandler, MockSenderHandler
 class TestAgentErrorRecovery:
     
     @pytest.mark.asyncio
-    async def test_session_creation_retry(self, mock_source, mock_sender, pipeline_config):
-        """Pipeline should retry session creation if it fails."""
+    async def test_session_creation_retry(self, mock_source, mock_sender, pipe_config):
+        """Pipe should retry session creation if it fails."""
         # Setup sender to fail first 2 times then succeed
         call_count = 0
         async def mock_create_session(*args, **kwargs):
@@ -34,13 +34,13 @@ class TestAgentErrorRecovery:
         # Ensure it doesn't fail on length check or iteration
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
         
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
         
-        # Start pipeline
-        await pipeline.start()
+        # Start pipe
+        await pipe.start()
         
         # Wait for retries to happen - need time for backoff (0.1s, 0.2s etc)
         await asyncio.sleep(1.0)
@@ -48,43 +48,43 @@ class TestAgentErrorRecovery:
         try:
             # Should eventually succeed
             assert mock_sender.create_session.call_count >= 3
-            assert pipeline.session_id == "valid-session"
+            assert pipe.session_id == "valid-session"
             # It should be in RUNNING | MESSAGE_SYNC now
-            assert pipeline.is_running()
+            assert pipe.is_running()
         finally:
-            await pipeline.stop()
+            await pipe.stop()
 
     @pytest.mark.asyncio
-    async def test_session_loss_during_message_sync(self, mock_source, mock_sender, pipeline_config):
-        """Pipeline should detect session loss and restart from snapshot."""
+    async def test_session_loss_during_message_sync(self, mock_source, mock_sender, pipe_config):
+        """Pipe should detect session loss and restart from snapshot."""
         # Setup: Start as leader
         mock_sender.role = "leader"
         
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config,
             mock_source, mock_sender
         )
         
         # Mock _run_message_sync to simulate error after some time
-        original_msg_sync_phase = pipeline._run_message_sync
+        original_msg_sync_phase = pipe._run_message_sync
         
         error_triggered = False
         async def mock_msg_sync_phase():
             nonlocal error_triggered
-            pipeline._set_state(pipeline.state | PipelineState.MESSAGE_SYNC)
+            pipe._set_state(pipe.state | PipeState.MESSAGE_SYNC)
             if not error_triggered:
                 await asyncio.sleep(0.05)
                 error_triggered = True
-                await pipeline._handle_fatal_error(RuntimeError("Session lost"))
+                await pipe._handle_fatal_error(RuntimeError("Session lost"))
                 return
             # Success on retry
             while True:
                 await asyncio.sleep(0.1)
             
-        pipeline._run_message_sync = mock_msg_sync_phase
+        pipe._run_message_sync = mock_msg_sync_phase
         
         # Start
-        await pipeline.start()
+        await pipe.start()
         
         # Wait for error and recovery
         # We need enough time for error -> backoff -> retry -> success
@@ -95,19 +95,19 @@ class TestAgentErrorRecovery:
             # Should have restarted and called snapshot again
             assert mock_source.snapshot_calls >= 2
             # Check state after recovery
-            assert pipeline.session_id is not None
+            assert pipe.session_id is not None
         finally:
-            await pipeline.stop()
+            await pipe.stop()
 
     @pytest.mark.asyncio
-    async def test_audit_sync_with_session_loss(self, mock_source, mock_sender, pipeline_config):
+    async def test_audit_sync_with_session_loss(self, mock_source, mock_sender, pipe_config):
         """Audit phase should handle session being cleared during execution."""
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config,
             mock_source, mock_sender
         )
-        pipeline.session_id = "test-session"
-        pipeline.current_role = "leader"
+        pipe.session_id = "test-session"
+        pipe.current_role = "leader"
         
         # Mock send_batch to clear session_id mid-audit
         call_count = 0
@@ -115,57 +115,57 @@ class TestAgentErrorRecovery:
             nonlocal call_count
             call_count += 1
             if call_count == 1: # First call (audit start)
-                pipeline.session_id = None # Clear session!
+                pipe.session_id = None # Clear session!
             return True, {}
             
         mock_sender.send_batch = mock_send_batch
         
         # Manually run one audit phase
         # We need set_state to include RUNNING for it to work
-        pipeline.state = PipelineState.RUNNING
-        await pipeline._run_audit_sync()
+        pipe.state = PipeState.RUNNING
+        await pipe._run_audit_sync()
         
         # Assertions:
         # 1. It should NOT throw AttributeError when trying to send "audit end" if session_id is None
         # (This is what we fixed with has_active_session())
-        assert pipeline.session_id is None
+        assert pipe.session_id is None
         assert call_count == 1 # Second call (audit end) should have been skipped or handled safely
         
     @pytest.mark.asyncio
-    async def test_initialization_error_sets_error_state(self, mock_source, mock_sender, pipeline_config):
-        """Pipeline should go to ERROR state if handler initialization fails."""
+    async def test_initialization_error_sets_error_state(self, mock_source, mock_sender, pipe_config):
+        """Pipe should go to ERROR state if handler initialization fails."""
         mock_source.initialize = AsyncMock(side_effect=RuntimeError("Init failed"))
         
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config,
             mock_source, mock_sender
         )
         
-        await pipeline.start()
+        await pipe.start()
         
-        assert pipeline.state == PipelineState.ERROR
-        assert "Initialization failed" in pipeline.info
+        assert pipe.state == PipeState.ERROR
+        assert "Initialization failed" in pipe.info
 
     @pytest.mark.asyncio
     async def test_session_obsolete_clears_session_immediately(
-        self, mock_source, mock_sender, pipeline_config
+        self, mock_source, mock_sender, pipe_config
     ):
-        """Pipeline should clear session and reconnect immediately on SessionObsoletedError."""
+        """Pipe should clear session and reconnect immediately on SessionObsoletedError."""
         from fustor_core.exceptions import SessionObsoletedError
         
         mock_sender.role = "leader"
         # Disable background tasks to make test deterministic
-        pipeline_config_no_bg = pipeline_config.copy()
-        pipeline_config_no_bg["audit_interval_sec"] = 0
-        pipeline_config_no_bg["sentinel_interval_sec"] = 0
+        pipe_config_no_bg = pipe_config.copy()
+        pipe_config_no_bg["audit_interval_sec"] = 0
+        pipe_config_no_bg["sentinel_interval_sec"] = 0
         
         mock_bus = MagicMock()
         mock_bus.id = "mock-bus"
         mock_bus.internal_bus = AsyncMock()
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
         
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config_no_bg,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config_no_bg,
             mock_source, mock_sender, event_bus=mock_bus
         )
         
@@ -196,7 +196,7 @@ class TestAgentErrorRecovery:
         mock_bus.internal_bus.get_events_for = AsyncMock(side_effect=[[mock_event]] + [[]] * 100)
         
         # Wait for recovery
-        await pipeline.start()
+        await pipe.start()
         
         # Give it time to hit the error and recover
         # Since we use 'continue' and no backoff for 419, it should be fast
@@ -211,24 +211,24 @@ class TestAgentErrorRecovery:
             # Should have called create_session at least twice (initial + recovery)
             assert success, f"Expected 2+ calls, got {mock_sender.create_session.call_count}"
             # Should be back with an active session
-            assert pipeline.has_active_session()
+            assert pipe.has_active_session()
             assert mock_sender.create_session.call_count >= 2
         finally:
-            await pipeline.stop()
+            await pipe.stop()
 
     @pytest.mark.asyncio
-    async def test_exponential_backoff_values(self, mock_source, mock_sender, pipeline_config):
+    async def test_exponential_backoff_values(self, mock_source, mock_sender, pipe_config):
 
         """Test that consecutive errors increase backoff."""
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config,
             mock_source, mock_sender
         )
         
         mock_sender.create_session = AsyncMock(side_effect=RuntimeError("Fail"))
         
         # Start and let it fail
-        task = asyncio.create_task(pipeline._run_control_loop())
+        task = asyncio.create_task(pipe._run_control_loop())
         
         # Wait for a couple of retries (interval is 0.1s + backoff)
         await asyncio.sleep(0.5)
@@ -237,9 +237,9 @@ class TestAgentErrorRecovery:
             # 1st error: backoff should be ERROR_RETRY_INTERVAL (0.01)
             # 2nd error: backoff should be 0.02
             # 3rd error: backoff should be 0.04
-            assert pipeline._consecutive_errors >= 2
+            assert pipe._consecutive_errors >= 2
             # The state info should reflect backoff
-            assert "backoff" in pipeline.info
+            assert "backoff" in pipe.info
         finally:
             task.cancel()
-            await pipeline.stop()
+            await pipe.stop()

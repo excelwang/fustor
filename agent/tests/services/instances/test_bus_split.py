@@ -35,7 +35,7 @@ def event_bus_service(source_config, mock_source_driver_service):
         source_configs={"test_source": source_config},
         source_driver_service=mock_source_driver_service
     )
-    service.pipeline_instance_service = AsyncMock()
+    service.pipe_instance_service = AsyncMock()
     return service
 
 @pytest.mark.asyncio
@@ -46,11 +46,11 @@ async def test_bus_split_logic(event_bus_service, source_config):
     # 1. Create a bus and subscribe two consumers
     # S1 is the slow consumer, S2 is the fast one
     bus_runtime, _ = await event_bus_service.get_or_create_bus_for_subscriber(
-        source_id="test_source", source_config=source_config, pipeline_id="S1", required_position=100, fields_mapping=[]
+        source_id="test_source", source_config=source_config, pipe_id="S1", required_position=100, fields_mapping=[]
     )
     
     await event_bus_service.get_or_create_bus_for_subscriber(
-        source_id="test_source", source_config=source_config, pipeline_id="S2", required_position=100, fields_mapping=[]
+        source_id="test_source", source_config=source_config, pipe_id="S2", required_position=100, fields_mapping=[]
     )
     
     internal_bus = bus_runtime.internal_bus
@@ -83,18 +83,18 @@ async def test_bus_split_logic(event_bus_service, source_config):
     
     await event_bus_service.commit_and_handle_split(
         bus_id=bus_runtime.id,
-        pipeline_id="S2",
+        pipe_id="S2",
         num_events=96,
         last_consumed_position=195,
         fields_mapping=[]
     )
     
     # 4. Verify results
-    # check if remap_pipeline_to_new_bus was called for S2
-    event_bus_service.pipeline_instance_service.remap_pipeline_to_new_bus.assert_called_once()
-    call_args = event_bus_service.pipeline_instance_service.remap_pipeline_to_new_bus.call_args
-    pipeline_id, new_bus_runtime, lost = call_args[0]
+    # check if remap_pipe_to_new_bus was called for S2
+    event_bus_service.pipe_instance_service.remap_pipe_to_new_bus.assert_called_once()
+    call_args = event_bus_service.pipe_instance_service.remap_pipe_to_new_bus.call_args
+    pipe_id, new_bus_runtime, lost = call_args[0]
     
-    assert pipeline_id == "S2"
+    assert pipe_id == "S2"
     # CRITICAL: Is it a NEW bus or the SAME bus?
     assert new_bus_runtime is not bus_runtime, "Should have created a NEW bus during split!"

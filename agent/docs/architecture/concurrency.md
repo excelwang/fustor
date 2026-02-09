@@ -2,7 +2,7 @@
 
 ## 1\. 核心挑战
 
-Fustor Agent 的核心是基于 `asyncio` 构建的异步应用，它必须能同时高效地处理 Web API 请求、管理多个Pipeline 任务的生命周期以及执行内部逻辑。`asyncio` 的高效运行依赖于一个核心原则：**任何任务都不能长时间阻塞事件循环**。
+Fustor Agent 的核心是基于 `asyncio` 构建的异步应用，它必须能同时高效地处理 Web API 请求、管理多个Pipe 任务的生命周期以及执行内部逻辑。`asyncio` 的高效运行依赖于一个核心原则：**任何任务都不能长时间阻塞事件循环**。
 
 然而，`Source` 驱动中的 `get_snapshot_iterator` 和 `get_message_iterator` 方法，通常被设计为**同步的、可能发生阻塞的生成器**。如果直接在主 `asyncio` 事件循环中调用这些方法，将会导致整个应用程序被“冻结”。
 
@@ -81,7 +81,7 @@ sequenceDiagram
 
 ### 关键组件解析
 
-1.  **主任务 (`_run_message_sync`)**: 这是 `AgentPipeline` 的主控制循环，它永远以最高优先级运行，负责处理实时消息流。
+1.  **主任务 (`_run_message_sync`)**: 这是 `AgentPipe` 的主控制循环，它永远以最高优先级运行，负责处理实时消息流。
 
 2.  **信号检测**: 在每次 `push` 实时数据后，主任务会检查来自远端消费者的响应，看是否包含 `snapshot_needed: true` 的请求。
 
@@ -89,7 +89,7 @@ sequenceDiagram
 
 4.  **后台任务 (`_run_message_sync`)**: 这个 `aphase` 方法现在作为一个独立的、并发的后台任务运行。它内部依然使用第2节描述的“生产者-消费者”模型来拉取数据和推送数据。它的运行完全独立，不影响主任务。
 
-5.  **状态同步 (`_is_snapshot_running` 标志)**: 这个布尔标志起到了一个简单的互斥锁（Mutex）的作用，确保在任何时候，对于同一个 `AgentPipeline`，最多只有一个补充快照任务在运行。
+5.  **状态同步 (`_is_snapshot_running` 标志)**: 这个布尔标志起到了一个简单的互斥锁（Mutex）的作用，确保在任何时候，对于同一个 `AgentPipe`，最多只有一个补充快照任务在运行。
 
 通过这种两层并发模型的组合，Fustor Agent 既解决了底层驱动的 I/O 阻塞问题，又实现了上层业务逻辑的“实时不中断，后台异步回填”的高级功能。
 
@@ -97,11 +97,11 @@ sequenceDiagram
 
 ### 4.1 基于源签名的事件总线共享机制
 
-为优化资源利用，Fustor Agent 引入了基于“源签名”的事件总线共享机制。如果多个Pipeline 任务实际指向同一个物理数据源，它们将共享同一个 `EventBusInstanceRuntime`，从而避免重复建立连接和拉取数据。
+为优化资源利用，Fustor Agent 引入了基于“源签名”的事件总线共享机制。如果多个Pipe 任务实际指向同一个物理数据源，它们将共享同一个 `EventBusInstanceRuntime`，从而避免重复建立连接和拉取数据。
 
 ### 4.2 状态持久化与恢复的增强
 
-`AgentPipelineDTO` 中持久化的 `bus_id` 字段，确保了在应用重启后，`AgentPipeline` 能够恢复并重新连接到它之前所属的正确事件总线上。
+`AgentPipeDTO` 中持久化的 `bus_id` 字段，确保了在应用重启后，`AgentPipe` 能够恢复并重新连接到它之前所属的正确事件总线上。
 
 ### 4.3 总线分裂机制
 

@@ -1,26 +1,26 @@
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
 from fustor_agent.services.configs.source import SourceConfigService
-from fustor_core.models.config import AppConfig, SourceConfig, PipelineConfig, PasswdCredential
+from fustor_core.models.config import AppConfig, SourceConfig, PipeConfig, PasswdCredential
 from fustor_core.exceptions import NotFoundError
 
 @pytest.fixture
 def mock_app_config():
     app_config = MagicMock(spec=AppConfig)
     app_config.get_sources.return_value = {}
-    app_config.get_pipelines.return_value = {}
+    app_config.get_pipes.return_value = {}
     return app_config
 
 @pytest.fixture
-def mock_pipeline_instance_service():
+def mock_pipe_instance_service():
     mock = MagicMock()
-    mock.mark_dependent_pipelines_outdated = AsyncMock()
+    mock.mark_dependent_pipes_outdated = AsyncMock()
     return mock
 
 @pytest.fixture
-def source_config_service(mock_app_config, mock_pipeline_instance_service):
+def source_config_service(mock_app_config, mock_pipe_instance_service):
     service = SourceConfigService(mock_app_config)
-    service.set_dependencies(mock_pipeline_instance_service)
+    service.set_dependencies(mock_pipe_instance_service)
     return service
 
 @pytest.fixture
@@ -28,14 +28,14 @@ def sample_source_config():
     return SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
 
 @pytest.fixture
-def sample_pipeline_config(sample_source_config):
-    return PipelineConfig(source="source1", sender="sender1", disabled=False)
+def sample_pipe_config(sample_source_config):
+    return PipeConfig(source="source1", sender="sender1", disabled=False)
 
 class TestSourceConfigService:
     def test_set_dependencies(self, source_config_service):
-        mock_pipeline_service = MagicMock()
-        source_config_service.set_dependencies(mock_pipeline_service)
-        assert source_config_service.pipeline_instance_service == mock_pipeline_service
+        mock_pipe_service = MagicMock()
+        source_config_service.set_dependencies(mock_pipe_service)
+        assert source_config_service.pipe_instance_service == mock_pipe_service
 
     @pytest.mark.asyncio
     @patch('fustor_agent.services.configs.source.config_lock')
@@ -88,9 +88,9 @@ class TestSourceConfigService:
             "src3": SourceConfig(driver="d", uri="u", credential=PasswdCredential(user="u"), disabled=True), # Obsolete
             "src4": SourceConfig(driver="d", uri="u", credential=PasswdCredential(user="u"), disabled=False), # Not obsolete (enabled)
         }
-        mock_app_config.get_pipelines.return_value = {
-            "p1": PipelineConfig(source="src2", sender="r1", disabled=False),
-            "p2": PipelineConfig(source="src4", sender="r1", disabled=False),
+        mock_app_config.get_pipes.return_value = {
+            "p1": PipeConfig(source="src2", sender="r1", disabled=False),
+            "p2": PipeConfig(source="src4", sender="r1", disabled=False),
         }
         
 

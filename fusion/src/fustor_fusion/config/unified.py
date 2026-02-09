@@ -13,7 +13,7 @@ Example:
         driver: http
         port: 8102
         api_keys:
-          - {key: fk_key, pipeline_id: research-sync}
+          - {key: fk_key, pipe_id: research-sync}
     views:
       fs-group-1:
         driver: fs
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 class APIKeyConfig(BaseModel):
     """API Key configuration."""
     key: str
-    pipeline_id: str
+    pipe_id: str
 
 
 class ReceiverConfig(BaseModel):

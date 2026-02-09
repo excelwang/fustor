@@ -9,7 +9,7 @@ View Drivers are discovered dynamically via the 'fustor.view_drivers' entry poin
 from typing import Dict, Any, Optional, Type
 from importlib.metadata import entry_points
 from fustor_core.drivers import ViewDriver
-from ..config import views_config
+from ..config.unified import fusion_config
 import logging
 import asyncio
 from fustor_core.event import EventBase
@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # --- Global Cache for View Managers ---
 # Use the unified registry in runtime_objects to ensure consistency between 
-# pipelines, API endpoints, and management commands.
+# pipes, API endpoints, and management commands.
 from .. import runtime_objects
 _cache_lock = asyncio.Lock()
 
@@ -76,13 +76,22 @@ class ViewManager:
         
         available_drivers = _load_view_drivers()
         
-        # Try loading from views_config loader
-        view_configs = views_config.get_by_view(self.view_id)
+        # Try loading from fusion_config loader
+        view_config = fusion_config.get_view(self.view_id)
         
-        if view_configs:
-            self.logger.info(f"Using view configuration for view {self.view_id}: {[v.id for v in view_configs]}")
+        if view_config:
+            # New Unified Config V2: ViewConfig is a single object, not a list
+            # It maps 1:1 to a view/driver instance.
+            # To support multiple drivers per view_group (if needed), we might need logic change.
+            # But currently, Unified Config defines 'views' as a dict of ViewConfig.
+            # The view_id here corresponds to the config key.
+            
+            self.logger.info(f"Using view configuration for view {self.view_id}")
+            # Wrap in list to keep loop structure or refactor
+            view_configs = [view_config]
+             
             for config in view_configs:
-                view_name = config.id
+                view_name = self.view_id # In unified config, key is ID
                 driver_type = config.driver
                 if not driver_type:
                     self.logger.warning(f"View '{view_name}' config missing 'driver' field, skipping")
@@ -93,8 +102,9 @@ class ViewManager:
                     self.logger.error(f"Driver type '{driver_type}' not found for view '{view_name}'. Available: {list(available_drivers.keys())}")
                     continue
                 
-                # Use driver_params directly
-                driver_params = config.driver_params
+                # ViewConfig V2 puts extra params in 'extra' dict commonly, or we might add specific fields
+                # For now assume 'driver_params' might be in extra, or pass extra as config
+                driver_params = config.extra
                 
                 try:
                     driver_instance = driver_cls(
@@ -110,7 +120,7 @@ class ViewManager:
                     
         else:
             # Fallback: Auto-load all found drivers IF config is empty
-            if not views_config.get_all():
+            if not fusion_config.get_all_views():
                  self.logger.info(f"No fusion config file found, auto-loading all installed view drivers")
                  
                  for schema, driver_cls in available_drivers.items():

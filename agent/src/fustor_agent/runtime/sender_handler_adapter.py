@@ -1,14 +1,14 @@
 # agent/src/fustor_agent/runtime/sender_handler_adapter.py
 """
-Adapter to wrap a Sender transport as a SenderHandler for use in AgentPipeline.
+Adapter to wrap a Sender transport as a SenderHandler for use in AgentPipe.
 
 This allows the existing sender-http and other transport implementations
-to be used with the new Pipeline-based architecture.
+to be used with the new Pipe-based architecture.
 """
 import logging
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 
-from fustor_core.pipeline.sender import SenderHandler
+from fustor_core.pipe.sender import SenderHandler
 from fustor_core.transport import Sender
 from fustor_core.models.config import SenderConfig
 
@@ -24,7 +24,7 @@ class SenderHandlerAdapter(SenderHandler):
     
     This adapter bridges the gap between:
     - fustor_core.transport.Sender (transport/protocol layer)
-    - fustor_core.pipeline.sender.SenderHandler (pipeline/handler layer)
+    - fustor_core.pipe.sender.SenderHandler (pipe/handler layer)
     
     Example usage:
         from fustor_sender_http import HTTPSender
@@ -36,8 +36,8 @@ class SenderHandlerAdapter(SenderHandler):
         )
         handler = SenderHandlerAdapter(sender)
         
-        # Now usable with AgentPipeline
-        pipeline = AgentPipeline(
+        # Now usable with AgentPipe
+        pipe = AgentPipe(
             source_handler=source,
             sender_handler=handler,
             ...

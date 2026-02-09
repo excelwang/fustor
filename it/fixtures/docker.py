@@ -114,7 +114,7 @@ http-main:
   port: 8102
   api_keys:
     - key: "test-api-key-123"
-      pipeline_id: "integration-test-ds"
+      pipe_id: "integration-test-ds"
   session_timeout_seconds: {SESSION_TIMEOUT}
   allow_concurrent_push: true
 """
@@ -134,8 +134,8 @@ driver_params:
 """
     docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/integration-test-ds.yaml", view_config)
     
-    # 4. Inject Fusion Pipeline Config (V2 binding)
-    pipeline_config = f"""
+    # 4. Inject Fusion Pipe Config (V2 binding)
+    pipe_config = f"""
 id: "integration-test-ds"
 receiver: "http-main"
 views:
@@ -148,7 +148,7 @@ extra:
   view_id: "integration-test-ds"
 """
     docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/fusion-pipes-config"])
-    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/fusion-pipes-config/integration-test-ds.yaml", pipeline_config)
+    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/fusion-pipes-config/integration-test-ds.yaml", pipe_config)
 
     # 5. Reload Fusion
 

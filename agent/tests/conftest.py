@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, AsyncMock
 import yaml
 
 from fustor_agent.app import App
-from fustor_core.models.config import SenderConfig, PipelineConfig, PasswdCredential, FieldMapping, SourceConfig
+from fustor_core.models.config import SenderConfig, PipeConfig, PasswdCredential, FieldMapping, SourceConfig
 from fustor_core.event import EventBase, InsertEvent
 
 @pytest.fixture(scope="function")
@@ -24,7 +24,7 @@ def test_app_instance(tmp_path):
             }
         },
         "senders": {},
-        "pipelines": {},
+        "pipes": {},
     }
     with open(config_dir / "agent-config.yaml", 'w') as f:
         yaml.dump(config_content, f)
@@ -35,7 +35,7 @@ def test_app_instance(tmp_path):
 @pytest_asyncio.fixture
 async def snapshot_sync_test_setup(test_app_instance: App, mocker):
     # ... (this fixture is unchanged)
-    pipeline_id = "test-snapshot-phase"
+    pipe_id = "test-snapshot-phase"
     source_id = "test-snapshot-source"
     sender_id = "test-snapshot-sender"
 
@@ -76,7 +76,7 @@ async def snapshot_sync_test_setup(test_app_instance: App, mocker):
         driver="mock-driver", uri="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
     ))
     
-    await test_app_instance.pipeline_config_service.add_config(pipeline_id, PipelineConfig(
+    await test_app_instance.pipe_config_service.add_config(pipe_id, PipeConfig(
         source=source_id,
         sender=sender_id,
         disabled=False,
@@ -87,20 +87,20 @@ async def snapshot_sync_test_setup(test_app_instance: App, mocker):
 
     class Setup:
         def __init__(self):
-            self.pipeline_id = pipeline_id
+            self.pipe_id = pipe_id
             self.mock_sender_driver = mock_sender_driver
             self.spy_get_snapshot_iterator = spy_get_snapshot_iterator
             self.snapshot_data = snapshot_data
 
     yield Setup()
 
-    await test_app_instance.pipeline_config_service.delete_config(pipeline_id)
+    await test_app_instance.pipe_config_service.delete_config(pipe_id)
     await test_app_instance.source_config_service.delete_config(source_id)
     await test_app_instance.sender_config_service.delete_config(sender_id)
 
 @pytest_asyncio.fixture
 async def message_sync_test_setup(test_app_instance: App, mocker):
-    pipeline_id = "test-message-sync"
+    pipe_id = "test-message-sync"
     source_id = "test-message-source"
     sender_id = "test-message-sender"
     start_position = 99999
@@ -142,7 +142,7 @@ async def message_sync_test_setup(test_app_instance: App, mocker):
         driver="mock-driver", uri="mock-endpoint", credential=PasswdCredential(user="mock"), disabled=False
     ))
 
-    await test_app_instance.pipeline_config_service.add_config(pipeline_id, PipelineConfig(
+    await test_app_instance.pipe_config_service.add_config(pipe_id, PipeConfig(
         source=source_id,
         sender=sender_id,
         disabled=False,
@@ -153,7 +153,7 @@ async def message_sync_test_setup(test_app_instance: App, mocker):
 
     class Setup:
         def __init__(self):
-            self.pipeline_id = pipeline_id
+            self.pipe_id = pipe_id
             self.start_position = start_position
             self.mock_sender_driver = mock_sender_driver
             self.spy_get_message_iterator = spy_get_message_iterator
@@ -162,6 +162,6 @@ async def message_sync_test_setup(test_app_instance: App, mocker):
 
     yield Setup()
 
-    await test_app_instance.pipeline_config_service.delete_config(pipeline_id)
+    await test_app_instance.pipe_config_service.delete_config(pipe_id)
     await test_app_instance.source_config_service.delete_config(source_id)
     await test_app_instance.sender_config_service.delete_config(sender_id)

@@ -4,15 +4,15 @@ from pathlib import Path
 import time
 import logging
 
-from fustor_agent.runtime import AgentPipeline
+from fustor_agent.runtime import AgentPipe
 from fustor_agent.services.drivers.source_driver import SourceDriverService
 from fustor_agent.services.drivers.sender_driver import SenderDriverService
 from fustor_agent.services.instances.bus import EventBusService
-from fustor_agent.services.instances.pipeline import PipelineInstanceService
-from fustor_agent.services.configs.pipeline import PipelineConfigService
+from fustor_agent.services.instances.pipe import PipeInstanceService
+from fustor_agent.services.configs.pipe import PipeConfigService
 from fustor_agent.services.configs.source import SourceConfigService
 from fustor_agent.services.configs.sender import SenderConfigService
-from fustor_core.models.config import PipelineConfig, SourceConfig, SenderConfig, PasswdCredential, FieldMapping, AppConfig
+from fustor_core.models.config import PipeConfig, SourceConfig, SenderConfig, PasswdCredential, FieldMapping, AppConfig
 
 @pytest.fixture
 def integration_configs(tmp_path: Path):
@@ -30,7 +30,7 @@ def integration_configs(tmp_path: Path):
         batch_size=10,
         disabled=False
     )
-    pipeline_config = PipelineConfig(
+    pipe_config = PipeConfig(
         source="test_source", 
         sender="test_sender",
         disabled=False,
@@ -40,7 +40,7 @@ def integration_configs(tmp_path: Path):
             FieldMapping(to="target.size", source=["fs.files.size:0"])
         ]
     )
-    return pipeline_config, source_config, sender_config
+    return pipe_config, source_config, sender_config
 
 class MockSenderDriver:
     """Mock for EchoDriver to avoid real network if any, though Echo is usually local."""
@@ -55,32 +55,32 @@ class MockSenderDriver:
     async def close_session(self): pass
 
 @pytest.mark.asyncio
-async def test_pipeline_instance_service_integration(integration_configs, tmp_path: Path, caplog):
-    """Integration test for PipelineInstanceService using AgentPipeline."""
-    pipeline_config, source_config, sender_config = integration_configs
+async def test_pipe_instance_service_integration(integration_configs, tmp_path: Path, caplog):
+    """Integration test for PipeInstanceService using AgentPipe."""
+    pipe_config, source_config, sender_config = integration_configs
     
     # Setup AppConfig
     app_config = AppConfig()
     app_config.add_source("test_source", source_config)
     app_config.add_sender("test_sender", sender_config)
-    app_config.add_pipeline("test_pipeline", pipeline_config)
+    app_config.add_pipe("test_pipe", pipe_config)
 
     from unittest.mock import patch
-    with patch("fustor_agent.services.configs.pipeline.pipelines_config") as mock_pipes:
-        mock_pipes.get_all.return_value = {}
-        mock_pipes.get.return_value = None
+    with patch("fustor_agent.services.configs.pipe.agent_config") as mock_agent_config:
+        mock_agent_config.get_all_pipes.return_value = {}
+        mock_agent_config.get_pipe.return_value = None
         
         # Initialize Services
         source_cfg_svc = SourceConfigService(app_config)
         sender_cfg_svc = SenderConfigService(app_config)
-        pipeline_cfg_svc = PipelineConfigService(app_config, source_cfg_svc, sender_cfg_svc)
+        pipe_cfg_svc = PipeConfigService(app_config, source_cfg_svc, sender_cfg_svc)
         
         source_dr_svc = SourceDriverService()
         sender_dr_svc = SenderDriverService()
         bus_svc = EventBusService(source_configs={"test_source": source_config}, source_driver_service=source_dr_svc)
         
-        service = PipelineInstanceService(
-            pipeline_config_service=pipeline_cfg_svc,
+        service = PipeInstanceService(
+            pipe_config_service=pipe_cfg_svc,
             source_config_service=source_cfg_svc,
             sender_config_service=sender_cfg_svc,
             bus_service=bus_svc,
@@ -97,25 +97,25 @@ async def test_pipeline_instance_service_integration(integration_configs, tmp_pa
         # Act
         with caplog.at_level(logging.INFO):
             try:
-                await service.start_one("test_pipeline")
+                await service.start_one("test_pipe")
                 
-                # Give some time for AgentPipeline to run its sequence
+                # Give some time for AgentPipe to run its sequence
                 await asyncio.sleep(1)
                 
                 # Verify instance in pool
-                instance = service.get_instance("test_pipeline")
+                instance = service.get_instance("test_pipe")
                 assert instance is not None
-                assert isinstance(instance, AgentPipeline)
+                assert isinstance(instance, AgentPipe)
                 
-                # Check logs for pipeline activity
-                # We assert "start initiated successfully" instead of "Using AgentPipeline"
-                assert "Pipeline instance 'test_pipeline' start initiated successfully" in caplog.text
+                # Check logs for pipe activity
+                # We assert "start initiated successfully" instead of "Using AgentPipe"
+                assert "Pipe instance 'test_pipe' start initiated successfully" in caplog.text
                 assert "Snapshot sync phase complete" in caplog.text or "Starting message sync phase" in caplog.text
 
             finally:
-                await service.stop_one("test_pipeline")
+                await service.stop_one("test_pipe")
                 # Ensure bus service cleanup too
                 await service.stop_all()
             
-            assert service.get_instance("test_pipeline") is None
+            assert service.get_instance("test_pipe") is None
 

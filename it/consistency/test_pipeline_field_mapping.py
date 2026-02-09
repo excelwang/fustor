@@ -1,6 +1,6 @@
-# it/consistency/test_pipeline_field_mapping.py
+# it/consistency/test_pipe_field_mapping.py
 """
-Integration test for Field Mapping in AgentPipeline.
+Integration test for Field Mapping in AgentPipe.
 """
 import time
 import pytest
@@ -9,8 +9,8 @@ from it.fixtures.constants import MOUNT_POINT, FUSION_ENDPOINT, MEDIUM_TIMEOUT, 
 
 logger = logging.getLogger("fustor_test")
 
-class TestPipelineFieldMapping:
-    """Test field mapping functionality in AgentPipeline."""
+class TestPipeFieldMapping:
+    """Test field mapping functionality in AgentPipe."""
     
     def test_field_mapping_affects_data(
         self, 
@@ -31,8 +31,8 @@ class TestPipelineFieldMapping:
         
         # 1. Update Agent Config to include fields_mapping
         # Map: path -> path, modified_time -> modified_time, is_directory -> is_directory, size -> remapped_size
-        pipeline_config = f"""
-id: "pipeline-task-1"
+        pipe_config = f"""
+id: "pipe-task-1"
 source: "shared-fs"
 sender: "fusion"
 disabled: false
@@ -52,8 +52,8 @@ fields_mapping:
 """
         docker_env.create_file_in_container(
             leader, 
-            "/root/.fustor/agent-pipes-config/pipeline-task-1.yaml", 
-            pipeline_config
+            "/root/.fustor/agent-pipes-config/pipe-task-1.yaml", 
+            pipe_config
         )
         
         # 2. Restart Agent to apply config

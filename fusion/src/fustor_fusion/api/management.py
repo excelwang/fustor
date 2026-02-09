@@ -5,7 +5,7 @@ Management API for dynamic view start/stop operations.
 import logging
 from fastapi import APIRouter, HTTPException, status
 
-from ..config import views_config
+from ..config.unified import fusion_config
 
 logger = logging.getLogger(__name__)
 
@@ -25,27 +25,29 @@ async def start_view(view_id: str):
     from ..core.session_manager import session_manager
     
     # Load view config
-    config = views_config.get(view_id)
+    config = fusion_config.get_view(view_id)
     if not config:
         # Try reloading in case file was just added
-        views_config.reload()
-        config = views_config.get(view_id)
+        fusion_config.reload()
+        config = fusion_config.get_view(view_id)
     
     if not config:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"View config '{view_id}' not found in views-config/"
+            detail=f"View config '{view_id}' not found in fusion-config/"
         )
     
-    if config.disabled:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"View '{view_id}' is disabled in config"
-        )
+    # ViewConfig currently doesn't have 'disabled' field directly, 
+    # but we can check extra or just proceed.
+    # if config.disabled:
+    #     raise HTTPException(
+    #         status_code=status.HTTP_400_BAD_REQUEST,
+    #         detail=f"View '{view_id}' is disabled in config"
+    #     )
     
     # Get or create ViewManager for this view group
     from ..view_manager.manager import get_cached_view_manager
-    v_group_id = config.view_id
+    v_group_id = view_id
     vm = await get_cached_view_manager(v_group_id)
     
     # Check if view already running

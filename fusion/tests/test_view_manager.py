@@ -6,7 +6,7 @@ from unittest.mock import patch, MagicMock
 
 from fustor_core.drivers import ViewDriver
 from fustor_fusion.view_manager.manager import ViewManager
-from fustor_fusion.config.views import ViewConfig
+from fustor_fusion.config.unified import ViewConfig
 
 class MockViewDriver(ViewDriver):
     target_schema = "mock"
@@ -32,19 +32,19 @@ async def test_view_manager_initialization():
         id="test-view",
         view_id="1", # Now called view_id in Config
         driver="mock",
-        driver_params={"param1": "val1"}
+        extra={"param1": "val1"}
     )
     
-    with patch("fustor_fusion.config.views.views_config.get_by_view", return_value=[mock_config]), \
+    with patch("fustor_fusion.config.unified.fusion_config.get_view", return_value=mock_config), \
          patch("fustor_fusion.view_manager.manager._load_view_drivers", return_value={"mock": MockViewDriver}):
         
         vm = ViewManager(view_id="1")
         await vm.initialize_driver_instances()
         
-        assert "test-view" in vm.driver_instances
-        driver_instance = vm.driver_instances["test-view"]
+        assert "1" in vm.driver_instances
+        driver_instance = vm.driver_instances["1"]
         assert isinstance(driver_instance, MockViewDriver)
-        assert driver_instance.id == "test-view"
+        assert driver_instance.id == "1"
         assert driver_instance.view_id == "1"
         assert driver_instance.config == {"param1": "val1"}
         # Note: initialize() IS called in ViewManager.initialize_driver_instances()

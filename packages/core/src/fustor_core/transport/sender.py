@@ -75,7 +75,7 @@ class Sender(ABC):
         Create a new session with the Fusion receiver.
         
         Args:
-            task_id: Identifier for this pipeline 
+            task_id: Identifier for this pipe 
             source_type: Type of source (e.g. 'fs', 'mysql')
             session_timeout_seconds: Requested session timeout
             

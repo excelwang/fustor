@@ -1,53 +1,53 @@
-# agent/tests/runtime/test_agent_pipeline_lifecycle.py
+# agent/tests/runtime/test_agent_pipe_lifecycle.py
 """
-Lifecycle and role management tests for AgentPipeline.
-These tests verify the state transitions and sequence of the pipeline.
+Lifecycle and role management tests for AgentPipe.
+These tests verify the state transitions and sequence of the pipe.
 """
 import asyncio
 import pytest
 from unittest.mock import MagicMock, AsyncMock, patch
-from fustor_core.pipeline import PipelineState
-from fustor_agent.runtime.agent_pipeline import AgentPipeline
+from fustor_core.pipe import PipeState
+from fustor_agent.runtime.agent_pipe import AgentPipe
 
 @pytest.mark.timeout(5)
-class TestAgentPipelineLifecycle:
-    """Test AgentPipeline lifecycle and role transitions."""
+class TestAgentPipeLifecycle:
+    """Test AgentPipe lifecycle and role transitions."""
 
     @pytest.fixture
-    def agent_pipeline(self, mock_source, mock_sender, pipeline_config):
+    def agent_pipe(self, mock_source, mock_sender, pipe_config):
         mock_bus = MagicMock()
         mock_bus.id = "mock-bus"
         mock_bus.internal_bus = AsyncMock()
         # Prevent busy loop in message sync task
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
         
-        return AgentPipeline(
-            pipeline_id="test-pipeline",
-            task_id="agent:test-pipeline",
-            config=pipeline_config,
+        return AgentPipe(
+            pipe_id="test-pipe",
+            task_id="agent:test-pipe",
+            config=pipe_config,
             source_handler=mock_source,
             sender_handler=mock_sender,
             event_bus=mock_bus
         )
 
     @pytest.mark.asyncio
-    async def test_pipeline_start_and_wait_for_role(self, agent_pipeline, mock_sender):
-        """Test starting the pipeline and waiting in follower mode."""
-        await agent_pipeline.start()
+    async def test_pipe_start_and_wait_for_role(self, agent_pipe, mock_sender):
+        """Test starting the pipe and waiting in follower mode."""
+        await agent_pipe.start()
         
         # Initially follower, should be in PAUSED/standby mode
         await asyncio.sleep(0.2)
-        assert "Follower mode" in agent_pipeline.info
-        assert PipelineState.PAUSED in agent_pipeline.state
+        assert "Follower mode" in agent_pipe.info
+        assert PipeState.PAUSED in agent_pipe.state
         
-        await agent_pipeline.stop()
+        await agent_pipe.stop()
         assert mock_sender.session_closed
 
     @pytest.mark.asyncio
-    async def test_pipeline_leader_transition(self, agent_pipeline, mock_sender, mock_source):
+    async def test_pipe_leader_transition(self, agent_pipe, mock_sender, mock_source):
         """Test transition from follower to leader."""
         # Start as follower
-        await agent_pipeline.start()
+        await agent_pipe.start()
         
         # Transition to leader
         mock_sender.role = "leader"
@@ -55,43 +55,43 @@ class TestAgentPipelineLifecycle:
         await asyncio.sleep(0.2)
         
         # Should be running sequence
-        assert agent_pipeline.current_role == "leader"
+        assert agent_pipe.current_role == "leader"
         
         # Wait for snapshot to finish
         await asyncio.sleep(0.5)
         
         assert mock_source.snapshot_calls > 0
         assert len(mock_sender.batches) >= 2
-        assert PipelineState.MESSAGE_SYNC in agent_pipeline.state
+        assert PipeState.MESSAGE_SYNC in agent_pipe.state
         
-        await agent_pipeline.stop()
+        await agent_pipe.stop()
 
     @pytest.mark.asyncio
-    async def test_manual_triggers(self, agent_pipeline, mock_sender, mock_source):
+    async def test_manual_triggers(self, agent_pipe, mock_sender, mock_source):
         """Test manual audit and sentinel triggers."""
-        agent_pipeline.current_role = "leader"
-        agent_pipeline.session_id = "test-session"
+        agent_pipe.current_role = "leader"
+        agent_pipe.session_id = "test-session"
         
         # We need to set state to include RUNNING for triggers to work
-        agent_pipeline.state = PipelineState.RUNNING
+        agent_pipe.state = PipeState.RUNNING
         
-        await agent_pipeline.trigger_audit()
+        await agent_pipe.trigger_audit()
         await asyncio.sleep(0.2)
         
         assert mock_source.audit_calls > 0
         
         # Sentinel check
-        await agent_pipeline.trigger_sentinel()
+        await agent_pipe.trigger_sentinel()
         # verify no crash at least
         
-        await agent_pipeline.stop()
+        await agent_pipe.stop()
 
     @pytest.mark.asyncio
-    async def test_message_to_audit_transition(self, agent_pipeline, mock_sender, mock_source):
-        """Pipeline should transition to AUDIT_PHASE when audit is triggered."""
-        agent_pipeline.current_role = "leader"
-        agent_pipeline.session_id = "test-session"
-        agent_pipeline._set_state(PipelineState.RUNNING | PipelineState.MESSAGE_SYNC)
+    async def test_message_to_audit_transition(self, agent_pipe, mock_sender, mock_source):
+        """Pipe should transition to AUDIT_PHASE when audit is triggered."""
+        agent_pipe.current_role = "leader"
+        agent_pipe.session_id = "test-session"
+        agent_pipe._set_state(PipeState.RUNNING | PipeState.MESSAGE_SYNC)
         
         # Mock audit to take some time
         async def slow_audit():
@@ -101,22 +101,22 @@ class TestAgentPipelineLifecycle:
         mock_sender.send_batch = AsyncMock(return_value=(True, {}))
         
         # Trigger audit
-        await agent_pipeline.trigger_audit()
+        await agent_pipe.trigger_audit()
         
         # It runs in background, so wait a bit
         await asyncio.sleep(0.1)
         
         # While audit is running, state should include AUDIT_PHASE
-        assert PipelineState.AUDIT_PHASE in agent_pipeline.state
-        assert PipelineState.MESSAGE_SYNC in agent_pipeline.state
+        assert PipeState.AUDIT_PHASE in agent_pipe.state
+        assert PipeState.MESSAGE_SYNC in agent_pipe.state
         
         # After audit, it should return to MESSAGE_SYNC (implicit, but check no crash)
-        await agent_pipeline.stop()
+        await agent_pipe.stop()
 
     @pytest.mark.asyncio
-    async def test_stop_during_snapshot(self, agent_pipeline, mock_sender, mock_source):
+    async def test_stop_during_snapshot(self, agent_pipe, mock_sender, mock_source):
 
-        """Test stopping the pipeline while it is in snapshot sync phase."""
+        """Test stopping the pipe while it is in snapshot sync phase."""
         # Slow down snapshot iterator to simulate work
         async def slow_iter():
             for i in range(10):
@@ -125,11 +125,11 @@ class TestAgentPipelineLifecycle:
                 
         with patch.object(mock_source, 'get_snapshot_iterator', return_value=slow_iter()):
             mock_sender.role = "leader"
-            await agent_pipeline.start()
+            await agent_pipe.start()
             
             await asyncio.sleep(0.2)
-            assert PipelineState.SNAPSHOT_SYNC in agent_pipeline.state
+            assert PipeState.SNAPSHOT_SYNC in agent_pipe.state
             
-            await agent_pipeline.stop()
-            assert agent_pipeline.state == PipelineState.STOPPED
+            await agent_pipe.stop()
+            assert agent_pipe.state == PipeState.STOPPED
             assert mock_sender.session_closed

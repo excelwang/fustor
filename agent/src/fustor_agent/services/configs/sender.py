@@ -9,7 +9,7 @@ import logging
 from typing import Dict, Optional, List
 
 from fustor_core.models.config import AppConfig, SenderConfig
-from fustor_agent.services.instances.pipeline import PipelineInstanceService
+from fustor_agent.services.instances.pipe import PipeInstanceService
 from fustor_agent.services.common import config_lock
 from .base import BaseConfigService
 from fustor_agent_sdk.interfaces import SenderConfigServiceInterface
@@ -28,11 +28,11 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
     def __init__(self, app_config: AppConfig):
         # Still use 'sender' internally for config file compatibility
         super().__init__(app_config, None, 'sender')
-        self.pipeline_instance_service: Optional[PipelineInstanceService] = None
+        self.pipe_instance_service: Optional[PipeInstanceService] = None
 
-    def set_dependencies(self, pipeline_instance_service: PipelineInstanceService):
-        """Injects the PipelineInstanceService for dependency management."""
-        self.pipeline_instance_service = pipeline_instance_service
+    def set_dependencies(self, pipe_instance_service: PipeInstanceService):
+        """Injects the PipeInstanceService for dependency management."""
+        self.pipe_instance_service = pipe_instance_service
 
     async def cleanup_obsolete_configs(self) -> List[str]:
         """
@@ -42,8 +42,8 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
         Returns:
             A list of the configuration IDs that were deleted.
         """
-        all_pipeline_configs = self.app_config.get_pipelines().values()
-        in_use_sender_ids = {p.sender for p in all_pipeline_configs}
+        all_pipe_configs = self.app_config.get_pipes().values()
+        in_use_sender_ids = {p.sender for p in all_pipe_configs}
 
         all_sender_configs = self.list_configs()
         obsolete_ids = [

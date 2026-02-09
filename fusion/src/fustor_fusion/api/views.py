@@ -9,7 +9,7 @@ from importlib.metadata import entry_points
 
 from ..auth.dependencies import get_view_id_from_api_key
 from ..view_manager.manager import get_cached_view_manager
-from ..config.views import views_config
+from ..config.unified import fusion_config
 
 logger = logging.getLogger(__name__)
 
@@ -105,8 +105,8 @@ def setup_view_routers():
     view_router.routes = []
     
     # Reload config to ensure we have the latest
-    views_config.reload()
-    current_view_configs = views_config.get_all()
+    fusion_config.reload()
+    current_view_configs = fusion_config.get_all_views()
     
     available_factories = {name: func for name, func in _discover_view_api_factories()}
     
@@ -119,9 +119,9 @@ def setup_view_routers():
     # 1. Registered via config
     if current_view_configs:
         for view_name, cfg in current_view_configs.items():
-            # Skip disabled views
-            if cfg.disabled:
-                continue
+            # Skip disabled views (if supported in future or via extra)
+    #         if cfg.extra.get('disabled', False):
+    #             continue
                 
             driver_name = cfg.driver
             create_func = available_factories.get(driver_name)

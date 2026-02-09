@@ -58,24 +58,15 @@ class SenderConfigServiceInterface(BaseConfigService[SenderConfig]):
 
 
 
-from fustor_core.models.config import PipelineConfig
+from fustor_core.models.config import PipeConfig
 
-class PipelineConfigServiceInterface(BaseConfigService[PipelineConfig]):
+class PipeConfigServiceInterface(BaseConfigService[PipeConfig]):
     """
-    Interface for managing PipelineConfig objects.
+    Interface for managing PipeConfig objects.
     """
     async def enable(self, id: str):
-        """Enables a Pipeline configuration, ensuring its source and sender are also enabled."""
+        """Enables a Pipe configuration, ensuring its source and sender are also enabled."""
         ...
-
-    def get_wizard_definition(self) -> Dict[str, Any]:
-        """
-        Returns the step definitions for the Pipeline  configuration wizard.
-        """
-        ...
-
-from fustor_core.models.states import EventBusInstance, EventBusState
-from fustor_core.models.config import SourceConfig, FieldMapping
 
 class BaseInstanceServiceInterface(Protocol):
     """
@@ -91,20 +82,20 @@ class EventBusServiceInterface(BaseInstanceServiceInterface):
     """
     Interface for managing EventBusService objects.
     """
-    def set_dependencies(self, pipeline_instance_service: "PipelineInstanceService"):
+    def set_dependencies(self, pipe_instance_service: "PipeInstanceService"):
         ...
 
     async def get_or_create_bus_for_subscriber(
         self, 
         source_id: str,
         source_config: SourceConfig, 
-        pipeline_id: str,
+        pipe_id: str,
         required_position: int,
         fields_mapping: List[FieldMapping]
     ) -> Tuple[Any, bool]: # Use Any for EventBusInstanceRuntime to avoid circular import
         ...
 
-    async def release_subscriber(self, bus_id: str, pipeline_id: str):
+    async def release_subscriber(self, bus_id: str, pipe_id: str):
         ...
 
     async def release_all_unused_buses(self):
@@ -113,7 +104,7 @@ class EventBusServiceInterface(BaseInstanceServiceInterface):
     async def commit_and_handle_split(
         self, 
         bus_id: str, 
-        pipeline_id: str, 
+        pipe_id: str, 
         num_events: int, 
         last_consumed_position: int,
         fields_mapping: List[FieldMapping]
@@ -127,9 +118,6 @@ class SourceDriverServiceInterface(Protocol):
     Interface for discovering and interacting with Source driver classes.
     """
     def list_available_drivers(self) -> List[str]:
-        ...
-
-    async def get_wizard_definition_by_type(self, driver_type: str) -> Dict[str, Any]:
         ...
 
     async def get_available_fields(self, driver_type: str, **kwargs) -> Dict[str, Any]:
@@ -156,10 +144,7 @@ class SenderDriverServiceInterface(Protocol):
     def list_available_drivers(self) -> List[str]:
         ...
 
-    async def get_wizard_definition_by_type(self, driver_type: str) -> Dict[str, Any]:
-        ...
 
-    async def test_connection(self, driver_type: str, **kwargs) -> Tuple[bool, str]:
         ...
 
     async def check_privileges(self, driver_type: str, **kwargs) -> Tuple[bool, str]:
@@ -170,11 +155,11 @@ class SenderDriverServiceInterface(Protocol):
 
 
 
-from fustor_core.models.states import PipelineState
+from fustor_core.models.states import PipeState
 
-class PipelineInstanceServiceInterface(BaseInstanceServiceInterface):
+class PipeInstanceServiceInterface(BaseInstanceServiceInterface):
     """
-    Interface for managing PipelineInstanceService objects.
+    Interface for managing PipeInstanceService objects.
     """
     async def start_one(self, id: str):
         ...
@@ -182,16 +167,16 @@ class PipelineInstanceServiceInterface(BaseInstanceServiceInterface):
     async def stop_one(self, id: str, should_release_bus: bool = True):
         ...
 
-    async def remap_pipeline_to_new_bus(self, pipeline_id: str, new_bus: Any, needed_position_lost: bool):
+    async def remap_pipe_to_new_bus(self, pipe_id: str, new_bus: Any, needed_position_lost: bool):
         ...
 
-    async def mark_dependent_pipelines_outdated(self, dependency_type: str, dependency_id: str, reason_info: str, updates: Optional[Dict[str, Any]] = None):
+    async def mark_dependent_pipes_outdated(self, dependency_type: str, dependency_id: str, reason_info: str, updates: Optional[Dict[str, Any]] = None):
         ...
 
     async def start_all_enabled(self):
         ...
 
-    async def restart_outdated_pipelines(self) -> int:
+    async def restart_outdated_pipes(self) -> int:
         ...
 
     async def stop_all(self):

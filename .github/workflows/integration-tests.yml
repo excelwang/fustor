@@ -1,7 +1,7 @@
 # .github/workflows/integration-tests.yml
 # Integration test workflow for Fustor NFS multi-mount consistency tests
 # 
-# Runs integration tests for the Fusion Pipeline architecture.
+# Runs integration tests for the Fusion Pipe architecture.
 
 name: Integration Tests
 

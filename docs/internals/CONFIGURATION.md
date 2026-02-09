@@ -12,7 +12,7 @@ $FUSTOR_HOME/
 │   └── ...
 ├── sources-config.yaml         # [Agent] Data source definitions
 ├── senders-config.yaml         # [Agent] Data destination definitions
-├── agent-pipes-config/         # [Agent] Pipeline task definitions
+├── agent-pipes-config/         # [Agent] Pipe task definitions
 │   ├── pipe-research.yaml
 │   └── ...
 ├── agent.id                    # Agent unique identifier
@@ -102,14 +102,14 @@ fusion-main:
     key: fk_secure_key_1
 ```
 
-### 5. Pipeline Configuration (Tasks)
+### 5. Pipe Configuration (Tasks)
 
 Located in `$FUSTOR_HOME/agent-pipes-config/*.yaml`. Defines the synchronization tasks.
 
 **Example: `agent-pipes-config/pipe-research.yaml`**
 
 ```yaml
-pipeline_id: pipe-research
+pipe_id: pipe-research
 source: fs-research
 sender: fusion-main
 disabled: false
@@ -121,7 +121,7 @@ fields_mapping:
 
 | Field | Description |
 |-------|-------------|
-| `pipeline_id` | Unique task identifier |
+| `pipe_id` | Unique task identifier |
 | `source` | ID from `sources-config.yaml` |
 | `sender` | ID from `senders-config.yaml` |
 | `fields_mapping` | (Optional) List of field transformations |
@@ -131,10 +131,10 @@ fields_mapping:
 ## Batch Operations
 
 ```bash
-# Start all pipelines
+# Start all pipes
 fustor-agent start
 
-# Stop all pipelines
+# Stop all pipes
 fustor-agent stop
 
 # Start all views/receivers

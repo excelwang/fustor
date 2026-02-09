@@ -1,4 +1,4 @@
-# Fusion Pipeline Configuration Example
+# Fusion Pipe Configuration Example
 # 
 # This configuration binds a Receiver to Views, defining how events flow
 # from Agent to View handlers.
@@ -16,4 +16,4 @@ allow_concurrent_push: false
 
 # Additional configuration (optional)
 extra:
-  description: "Main HTTP pipeline for research data"
+  description: "Main HTTP pipe for research data"

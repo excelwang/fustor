@@ -3,8 +3,8 @@ import asyncio
 from unittest.mock import MagicMock, AsyncMock
 from typing import Dict, Any, Optional
 
-from fustor_fusion.runtime.fusion_pipeline import FusionPipeline
-from fustor_core.pipeline.handler import ViewHandler
+from fustor_fusion.runtime.fusion_pipe import FusionPipe
+from fustor_core.pipe.handler import ViewHandler
 from fustor_core.event import EventBase
 
 class MockViewHandler(ViewHandler):
@@ -34,16 +34,16 @@ class MockViewHandler(ViewHandler):
         return self.processed_events
 
 @pytest.mark.asyncio
-async def test_fusion_pipeline_queue_behavior():
+async def test_fusion_pipe_queue_behavior():
     # Setup
     mock_handler = MockViewHandler("mock-1")
-    pipeline = FusionPipeline(
-        pipeline_id="test-pipeline",
+    pipe = FusionPipe(
+        pipe_id="test-pipe",
         config={"view_id": "test-view"},
         view_handlers=[mock_handler]
     )
     
-    await pipeline.start()
+    await pipe.start()
     
     try:
         # Test Data
@@ -57,7 +57,7 @@ async def test_fusion_pipeline_queue_behavior():
         events = [event]
         
         # Action: Process Events (Should enqueue)
-        result = await pipeline.process_events(events, session_id="test-session")
+        result = await pipe.process_events(events, session_id="test-session")
         
         # Verify: Immediate Return
         assert result["success"] is True
@@ -70,29 +70,29 @@ async def test_fusion_pipeline_queue_behavior():
         assert mock_handler.processed_events[0].table == "test_table"
         
         # Verify Stats
-        stats = await pipeline.get_aggregated_stats()
+        stats = await pipe.get_aggregated_stats()
         # Queue should be drained
-        assert stats["pipeline"]["queue_size"] == 0
-        assert stats["pipeline"]["events_processed"] == 1
+        assert stats["pipe"]["queue_size"] == 0
+        assert stats["pipe"]["events_processed"] == 1
         assert stats["views"]["mock-1"]["mock_processed"] == 1
         
     finally:
-        await pipeline.stop()
+        await pipe.stop()
 
 @pytest.mark.asyncio
-async def test_fusion_pipeline_queue_observability():
+async def test_fusion_pipe_queue_observability():
     """Test that we can observe items in the queue if processing is slow."""
     # Setup
     mock_handler = MockViewHandler("mock-slow")
     mock_handler.delay = 0.2 # Slow processing
     
-    pipeline = FusionPipeline(
-        pipeline_id="test-pipeline-slow",
+    pipe = FusionPipe(
+        pipe_id="test-pipe-slow",
         config={"view_id": "test-view-slow"},
         view_handlers=[mock_handler]
     )
     
-    await pipeline.start()
+    await pipe.start()
     
     try:
         # Send a batch
@@ -106,29 +106,29 @@ async def test_fusion_pipeline_queue_observability():
         events = [event] * 1 # Batch of 1
         
         # This returns immediately, putting items into queue
-        await pipeline.process_events(events, session_id="sess-1")
+        await pipe.process_events(events, session_id="sess-1")
         
         # Check stats immediately
         # We assume queue processing hasn't finished yet (due to delay)
         # We push multiple batches to see queue buildup.
         
-        await pipeline.process_events(events, session_id="sess-2") # 2nd batch
-        await pipeline.process_events(events, session_id="sess-3") # 3rd batch
+        await pipe.process_events(events, session_id="sess-2") # 2nd batch
+        await pipe.process_events(events, session_id="sess-3") # 3rd batch
         
         # Now we have 3 batches. Each takes 0.2s * 1 = 0.2s.
         # Total processing time = 0.6s.
         
-        stats = await pipeline.get_aggregated_stats()
+        stats = await pipe.get_aggregated_stats()
         # Dependent on scheduler, but likely >= 0.
-        assert "queue_size" in stats["pipeline"]
+        assert "queue_size" in stats["pipe"]
         
         # Wait for all to finish (3 batches * 0.2s = 0.6s + buffer)
         await asyncio.sleep(1.0)
         
         # Verify all processed
-        stats = await pipeline.get_aggregated_stats()
-        assert stats["pipeline"]["queue_size"] == 0
+        stats = await pipe.get_aggregated_stats()
+        assert stats["pipe"]["queue_size"] == 0
         assert len(mock_handler.processed_events) == 3
         
     finally:
-        await pipeline.stop()
+        await pipe.stop()

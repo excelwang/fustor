@@ -5,8 +5,8 @@ from typing import Dict, Optional, TypeVar, Generic, Any
 from fustor_agent import get_app_config
 from fustor_core.models.config import AppConfig
 from fustor_agent.services.common import config_lock
-from fustor_agent.services.instances.pipeline import PipelineInstanceService
-from fustor_core.models.states import PipelineState
+from fustor_agent.services.instances.pipe import PipeInstanceService
+from fustor_core.models.states import PipeState
 from fustor_core.exceptions import ConfigError, NotFoundError, ConflictError
 from fustor_agent_sdk.interfaces import BaseConfigService # Import the interface
 
@@ -21,7 +21,7 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
     def __init__(
         self,
         app_config: AppConfig,
-        pipeline_instance_service: Optional[PipelineInstanceService],
+        pipe_instance_service: Optional[PipeInstanceService],
         config_type: str
     ):
         """
@@ -29,11 +29,11 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
         
         Args:
             app_config: 主应用配置实例。
-            pipeline_instance_service: 同步任务实例服务，用于处理依赖关系。
-            config_type: 配置类型的小写字符串 (例如 'source', 'sender', 'pipeline')。
+            pipe_instance_service: 同步任务实例服务，用于处理依赖关系。
+            config_type: 配置类型的小写字符串 (例如 'source', 'sender', 'pipe')。
         """
         self.app_config = app_config
-        self.pipeline_instance_service = pipeline_instance_service
+        self.pipe_instance_service = pipe_instance_service
         self.config_type = config_type
         self.config_type_capitalized = config_type.capitalize()
 
@@ -90,35 +90,35 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
             # Check if disabled status changed and notify if necessary
             if 'disabled' in updates and updates['disabled'] != old_disabled_status:
                 status = "disabled" if updates['disabled'] else "enabled"
-                if self.pipeline_instance_service:
+                if self.pipe_instance_service:
                     reason = f"Dependency {self.config_type_capitalized} '{id}' configuration was {status}."
                     if self.config_type in ['source', 'sender']:
-                        await self.pipeline_instance_service.mark_dependent_pipelines_outdated(self.config_type, id, reason, updates)
-                    elif self.config_type == 'pipeline':
-                        instance = self.pipeline_instance_service.get_instance(id)
-                        if instance and instance.state not in {PipelineState.STOPPED, PipelineState.ERROR}:
-                            instance._set_state(PipelineState.RUNNING_CONF_OUTDATE, reason)
+                        await self.pipe_instance_service.mark_dependent_pipes_outdated(self.config_type, id, reason, updates)
+                    elif self.config_type == 'pipe':
+                        instance = self.pipe_instance_service.get_instance(id)
+                        if instance and instance.state not in {PipeState.STOPPED, PipeState.ERROR}:
+                            instance._set_state(PipeState.RUNNING_CONF_OUTDATE, reason)
             return conf
 
     async def delete_config(self, id: str) -> T:
         """Deletes a configuration item after checking for dependencies."""
         # Check for dependent sync tasks before deleting.
-        dependent_pipelines = [
-            pipeline_id for pipeline_id, pipeline_config in self.app_config.get_pipelines().items()
-            if (self.config_type == 'source' and pipeline_config.source == id) or \
-               (self.config_type == 'sender' and pipeline_config.sender == id)
+        dependent_pipes = [
+            pipe_id for pipe_id, pipe_config in self.app_config.get_pipes().items()
+            if (self.config_type == 'source' and pipe_config.source == id) or \
+               (self.config_type == 'sender' and pipe_config.sender == id)
         ]
 
-        if dependent_pipelines:
+        if dependent_pipes:
             raise ConflictError(
-                f"{self.config_type_capitalized} '{id}' cannot be deleted because it is used by the following pipelines: {', '.join(dependent_pipelines)}. "
+                f"{self.config_type_capitalized} '{id}' cannot be deleted because it is used by the following pipes: {', '.join(dependent_pipes)}. "
                 f"Please delete these tasks first."
             )
 
         async with config_lock:
             # Stop the instance if it's a sync task itself being deleted.
-            if self.pipeline_instance_service and self.config_type == 'pipeline':
-                await self.pipeline_instance_service.stop_one(id)
+            if self.pipe_instance_service and self.config_type == 'pipe':
+                await self.pipe_instance_service.stop_one(id)
             
             conf = self._delete_config_from_app(id)
             # Removed legacy persistence call

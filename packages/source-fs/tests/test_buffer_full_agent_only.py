@@ -10,9 +10,9 @@ from unittest.mock import MagicMock
 import logging # Added import
 
 # Import necessary modules
-from fustor_core.models.config import SourceConfig, SenderConfig, PipelineConfig, PasswdCredential, FieldMapping
+from fustor_core.models.config import SourceConfig, SenderConfig, PipeConfig, PasswdCredential, FieldMapping
 from fustor_agent.app import App
-from fustor_core.models.states import PipelineState
+from fustor_core.models.states import PipeState
 
 @pytest.mark.xfail(reason="Expected to fail: Buffer full bug reproduction")
 @pytest.mark.asyncio
@@ -63,7 +63,7 @@ async def test_transient_source_buffer_full_triggers_error(caplog):
             await app.sender_config_service.add_config("test-echo-sender", sender_config)
             
             # 5. Configure Sync
-            pipeline_config = PipelineConfig(
+            pipe_config = PipeConfig(
                 source="test-fs-source",
                 sender="test-echo-sender",
                 disabled=False,
@@ -71,11 +71,11 @@ async def test_transient_source_buffer_full_triggers_error(caplog):
                     FieldMapping(to="file_path", source=["path"], required=True)
                 ]
             )
-            await app.pipeline_config_service.add_config("test-sync-task", pipeline_config)
+            await app.pipe_config_service.add_config("test-sync-task", pipe_config)
             
             # Use caplog to check for the specific error message
             with caplog.at_level(logging.ERROR):
-                await app.pipeline_instance_service.start_one("test-sync-task")
+                await app.pipe_instance_service.start_one("test-sync-task")
                 
                 # 7. Generate load (burst of events)
                 # Create more files than the buffer size
@@ -87,8 +87,8 @@ async def test_transient_source_buffer_full_triggers_error(caplog):
                 # 8. Wait for the system to react and enter ERROR state
                 error_state_found = False
                 for _ in range(50): # 50 iterations * 0.1s check = 5s max wait
-                    pipeline_instance = app.pipeline_instance_service.get_instance("test-sync-task")
-                    if pipeline_instance and pipeline_instance.state == PipelineState.ERROR:
+                    pipe_instance = app.pipe_instance_service.get_instance("test-sync-task")
+                    if pipe_instance and pipe_instance.state == PipeState.ERROR:
                         error_state_found = True
                         # Assert the log message content here as part of the bug reproduction check
                         buffer_full_log_found = False
@@ -101,7 +101,7 @@ async def test_transient_source_buffer_full_triggers_error(caplog):
                     await asyncio.sleep(0.1) 
                 
                 # This assertion will fail if the bug exists (system enters ERROR state)
-                assert not error_state_found, f"Sync task entered ERROR state unexpectedly (Bug Reproduced): {pipeline_instance.info}"
+                assert not error_state_found, f"Sync task entered ERROR state unexpectedly (Bug Reproduced): {pipe_instance.info}"
                 
         finally:
             await app.shutdown()

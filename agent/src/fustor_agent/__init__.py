@@ -5,7 +5,7 @@ from typing import Optional, Dict
 from dotenv import load_dotenv, find_dotenv
 from pathlib import Path
 
-from fustor_core.models.config import AppConfig, PipelineConfig, PipelineConfigDict, SourceConfigDict, SenderConfigDict
+from fustor_core.models.config import AppConfig, PipeConfig, PipeConfigDict, SourceConfigDict, SenderConfigDict
 from fustor_core.common import get_fustor_home_dir
 
 # Standardize Fustor home directory across all services
@@ -35,7 +35,7 @@ logger.setLevel(logging.DEBUG)
 def get_app_config() -> AppConfig:
     global _app_config_instance
     if _app_config_instance is None:
-        from .config import sources_config, senders_config, pipelines_config
+        from .config import sources_config, senders_config, pipes_config
 
         # 1. Load Sources
         sources_config.reload()
@@ -45,21 +45,21 @@ def get_app_config() -> AppConfig:
         senders_config.reload()
         valid_senders = senders_config.get_all()
 
-        # 3. Load Pipelines from directory
-        pipelines_config.reload()
-        valid_pipelines_yaml = pipelines_config.get_all()
-        valid_pipelines: Dict[str, PipelineConfig] = {}
+        # 3. Load Pipes from directory
+        pipes_config.reload()
+        valid_pipes_yaml = pipes_config.get_all()
+        valid_pipes: Dict[str, PipeConfig] = {}
         
-        # Convert AgentPipelineConfig to PipelineConfig
-        for p_id, p_yaml in valid_pipelines_yaml.items():
-            # PipelineConfig doesn't have 'id' field, it's the key in the dict
+        # Convert AgentPipeConfig to PipeConfig
+        for p_id, p_yaml in valid_pipes_yaml.items():
+            # PipeConfig doesn't have 'id' field, it's the key in the dict
             p_dict = p_yaml.model_dump(exclude={'id'})
-            valid_pipelines[p_id] = PipelineConfig(**p_dict)
+            valid_pipes[p_id] = PipeConfig(**p_dict)
 
         _app_config_instance = AppConfig(
             sources=SourceConfigDict(root=valid_sources),
             senders=SenderConfigDict(root=valid_senders),
-            pipelines=PipelineConfigDict(root=valid_pipelines)
+            pipes=PipeConfigDict(root=valid_pipes)
         )
 
     return _app_config_instance

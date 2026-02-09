@@ -4,12 +4,12 @@ This package contains core components, abstractions, and utilities shared across
 
 ## Key Components
 
-*   **`pipeline/`**: Core abstractions for the V2 Pipeline architecture (Handlers, Mappers, Context).
+*   **`pipe/`**: Core abstractions for the V2 Pipe architecture (Handlers, Mappers, Context).
 *   **`transport/`**: Protocol-agnostic interfaces for `Sender` and `Receiver`.
 *   **`common/`**:
     *   `logging_config.py`: Standardized, decoupled logging setup.
     *   `metrics.py`: Unified metrics interface (Counter, Gauge, Histogram).
-*   **`models/`**: Pydantic models for `PipelineConfig`, `EventBase`, and system states.
+*   **`models/`**: Pydantic models for `PipeConfig`, `EventBase`, and system states.
 *   **`clock/`**: Logical and Hybrid Clock implementations for data consistency.
 *   **`drivers.py`**: Base classes for `SourceDriver` and `SenderDriver`.
 *   **`exceptions.py`**: Standardized exception hierarchy for Fustor.

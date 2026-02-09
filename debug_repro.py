@@ -22,8 +22,8 @@ sys.path.insert(0, os.path.join(os.getcwd(), 'packages/receiver-http/src'))
 sys.path.insert(0, os.path.join(os.getcwd(), 'packages/sender-echo/src'))
 
 
-from fustor_core.models.config import SourceConfig, PasswdCredential, PipelineConfig
-from fustor_agent.services.instances.pipeline import PipelineInstanceService
+from fustor_core.models.config import SourceConfig, PasswdCredential, PipeConfig
+from fustor_agent.services.instances.pipe import PipeInstanceService
 from fustor_agent.services.instances.bus import EventBusService
 from fustor_agent.services.drivers.source_driver import SourceDriverService
 from fustor_agent.services.drivers.sender_driver import SenderDriverService
@@ -39,7 +39,7 @@ async def main():
         driver_params={"throttle_interval_sec": 5.0} # Ensure dict
     )
     
-    pipeline_config = PipelineConfig(
+    pipe_config = PipeConfig(
         source="my-source",
         sender="my-sender",
         disabled=False,
@@ -49,8 +49,8 @@ async def main():
     )
 
     # Mock Services
-    pipeline_cfg_svc = MagicMock()
-    pipeline_cfg_svc.get_config.return_value = pipeline_config
+    pipe_cfg_svc = MagicMock()
+    pipe_cfg_svc.get_config.return_value = pipe_config
     
     source_cfg_svc = MagicMock()
     source_cfg_svc.get_config.return_value = source_config
@@ -86,8 +86,8 @@ async def main():
 
     bus_svc = EventBusService({ "my-source": source_config }, source_driver_svc)
     
-    svc = PipelineInstanceService(
-        pipeline_config_service=pipeline_cfg_svc,
+    svc = PipeInstanceService(
+        pipe_config_service=pipe_cfg_svc,
         source_config_service=source_cfg_svc,
         sender_config_service=sender_cfg_svc,
         bus_service=bus_svc,
@@ -98,9 +98,9 @@ async def main():
     
     bus_svc.set_dependencies(svc)
 
-    print("Starting pipeline...")
+    print("Starting pipe...")
     try:
-        await svc.start_one("my-pipeline")
+        await svc.start_one("my-pipe")
         print("Success")
     except Exception as e:
         print(f"Caught expected exception: {e}")

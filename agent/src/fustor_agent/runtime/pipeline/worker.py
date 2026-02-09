@@ -3,7 +3,7 @@ import threading
 import logging
 from typing import Iterator, Any, AsyncIterator, Optional
 
-logger = logging.getLogger("fustor_agent.pipeline.worker")
+logger = logging.getLogger("fustor_agent.pipe.worker")
 
 async def aiter_sync_phase_wrapper(
     phase_iter: Iterator[Any], 
@@ -42,7 +42,7 @@ async def aiter_sync_phase_wrapper(
     # Start producer thread
     thread = threading.Thread(
         target=_producer, 
-        name=f"PipelineSource-Producer-{id_for_thread}", 
+        name=f"PipeSource-Producer-{id_for_thread}", 
         daemon=True
     )
     thread.start()

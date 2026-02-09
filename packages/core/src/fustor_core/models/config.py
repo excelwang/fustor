@@ -83,9 +83,9 @@ class SenderConfig(BaseModel):
     model_config = ConfigDict(extra='ignore')
 
 
-class PipelineConfig(BaseModel):
+class PipeConfig(BaseModel):
     """
-    Configuration for a Pipeline task that connects a Source to a Sender.
+    Configuration for a Pipe task that connects a Source to a Sender.
     
     The 'sender' field specifies which sender configuration to use.
     """
@@ -112,19 +112,19 @@ class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):
 class SenderConfigDict(RootModel[Dict[str, SenderConfig]]):
     root: Dict[str, SenderConfig] = Field(default_factory=dict)
 
-class PipelineConfigDict(RootModel[Dict[str, PipelineConfig]]):
-    root: Dict[str, PipelineConfig] = Field(default_factory=dict)
+class PipeConfigDict(RootModel[Dict[str, PipeConfig]]):
+    root: Dict[str, PipeConfig] = Field(default_factory=dict)
 
 class AppConfig(BaseModel):
     """
-    Application configuration containing sources, senders, and pipelines.
+    Application configuration containing sources, senders, and pipes.
     """
     model_config = ConfigDict(populate_by_name=True)
 
     sources: SourceConfigDict = Field(default_factory=SourceConfigDict)
     senders: SenderConfigDict = Field(default_factory=SenderConfigDict)
-    pipelines: PipelineConfigDict = Field(
-        default_factory=PipelineConfigDict
+    pipes: PipeConfigDict = Field(
+        default_factory=PipeConfigDict
     )
 
     def get_sources(self) -> Dict[str, SourceConfig]:
@@ -134,8 +134,8 @@ class AppConfig(BaseModel):
         """Get all sender configurations."""
         return self.senders.root
 
-    def get_pipelines(self) -> Dict[str, PipelineConfig]:
-        return self.pipelines.root
+    def get_pipes(self) -> Dict[str, PipeConfig]:
+        return self.pipes.root
     
     def get_source(self, id: str) -> Optional[SourceConfig]:
         return self.get_sources().get(id)
@@ -145,8 +145,8 @@ class AppConfig(BaseModel):
         return self.get_senders().get(id)
 
 
-    def get_pipeline(self, id: str) -> Optional[PipelineConfig]:
-        return self.get_pipelines().get(id)
+    def get_pipe(self, id: str) -> Optional[PipeConfig]:
+        return self.get_pipes().get(id)
     
     def add_source(self, id: str, config: SourceConfig) -> SourceConfig:
         config_may = self.get_source(id)
@@ -163,10 +163,10 @@ class AppConfig(BaseModel):
         self.get_senders()[id] = config
         return config
 
-    def add_pipeline(self, id: str, config: PipelineConfig) -> PipelineConfig:
-        config_may = self.get_pipeline(id)
+    def add_pipe(self, id: str, config: PipeConfig) -> PipeConfig:
+        config_may = self.get_pipe(id)
         if config_may:
-            raise ConfigError(f"Pipeline config with id '{id}' already exists.")
+            raise ConfigError(f"Pipe config with id '{id}' already exists.")
         
         # Dependency check
         if not self.get_source(config.source):
@@ -174,7 +174,7 @@ class AppConfig(BaseModel):
         if not self.get_sender(config.sender):
             raise NotFoundError(f"Dependency sender '{config.sender}' not found.")
         
-        self.get_pipelines()[id] = config
+        self.get_pipes()[id] = config
         return config
     
     def delete_source(self, id: str) -> SourceConfig:
@@ -182,10 +182,10 @@ class AppConfig(BaseModel):
         if not config:
             raise NotFoundError(f"Source config with id '{id}' not found.")
         
-        # Delete dependent pipelines first
-        pipeline_ids_to_delete = [pid for pid, cfg in self.get_pipelines().items() if cfg.source == id]
-        for pid in pipeline_ids_to_delete:
-            self.delete_pipeline(pid)
+        # Delete dependent pipes first
+        pipe_ids_to_delete = [pid for pid, cfg in self.get_pipes().items() if cfg.source == id]
+        for pid in pipe_ids_to_delete:
+            self.delete_pipe(pid)
             
         return self.get_sources().pop(id)
     
@@ -195,34 +195,34 @@ class AppConfig(BaseModel):
         if not config:
             raise NotFoundError(f"Sender config with id '{id}' not found.")
         
-        # Delete dependent pipelines first
-        pipeline_ids_to_delete = [pid for pid, cfg in self.get_pipelines().items() if cfg.sender == id]
-        for pid in pipeline_ids_to_delete:
-            self.delete_pipeline(pid)
+        # Delete dependent pipes first
+        pipe_ids_to_delete = [pid for pid, cfg in self.get_pipes().items() if cfg.sender == id]
+        for pid in pipe_ids_to_delete:
+            self.delete_pipe(pid)
             
         return self.get_senders().pop(id)
     
-    def delete_pipeline(self, id: str) -> PipelineConfig:
-        config = self.get_pipeline(id)
+    def delete_pipe(self, id: str) -> PipeConfig:
+        config = self.get_pipe(id)
         if not config:
-            raise NotFoundError(f"Pipeline config with id '{id}' not found.")
-        return self.get_pipelines().pop(id)
+            raise NotFoundError(f"Pipe config with id '{id}' not found.")
+        return self.get_pipes().pop(id)
 
-    def check_pipeline_is_disabled(self, id: str) -> bool:
-        config = self.get_pipeline(id)
+    def check_pipe_is_disabled(self, id: str) -> bool:
+        config = self.get_pipe(id)
         if not config:
-            raise NotFoundError(f"Pipeline with id '{id}' not found.")
+            raise NotFoundError(f"Pipe with id '{id}' not found.")
         
         if config.disabled:
             return True
         
         source_config = self.sources.root.get(config.source)
         if not source_config:
-            raise NotFoundError(f"Dependency source '{config.source}' not found for pipeline '{id}'.")
+            raise NotFoundError(f"Dependency source '{config.source}' not found for pipe '{id}'.")
             
         sender_config = self.senders.root.get(config.sender)
         if not sender_config:
-            raise NotFoundError(f"Dependency sender '{config.sender}' not found for pipeline '{id}'.")
+            raise NotFoundError(f"Dependency sender '{config.sender}' not found for pipe '{id}'.")
             
         return source_config.disabled or sender_config.disabled
 

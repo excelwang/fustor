@@ -2,13 +2,13 @@
 """
 Runtime components for Fustor Agent.
 
-This module provides the new Pipeline-based architecture for Agent:
+This module provides the new Pipe-based architecture for Agent:
 
-AgentPipeline Architecture:
+AgentPipe Architecture:
 ===========================
 
 ┌─────────────────────────────────────────────────────────────┐
-│                     AgentPipeline                           │
+│                     AgentPipe                           │
 │  (orchestrates Source -> Sender data flow)                  │
 └──────────────┬───────────────────────────┬──────────────────┘
                │                           │
@@ -28,7 +28,7 @@ Example Usage:
 --------------
 
     from fustor_agent.runtime import (
-        AgentPipeline,
+        AgentPipe,
         create_source_handler_from_config,
         create_sender_handler_from_config,
     )
@@ -44,10 +44,10 @@ Example Usage:
         sender_driver_service=sender_driver_service
     )
 
-    # Create and start pipeline
-    pipeline = AgentPipeline(
-        pipeline_id="my-pipeline",
-        task_id="agent-1:my-pipeline",
+    # Create and start pipe
+    pipe = AgentPipe(
+        pipe_id="my-pipe",
+        task_id="agent-1:my-pipe",
         config={
             "batch_size": 100,
             "heartbeat_interval_sec": 10,
@@ -56,10 +56,10 @@ Example Usage:
         sender_handler=sender_handler,
     )
 
-    await pipeline.start()
+    await pipe.start()
 """
 
-from .agent_pipeline import AgentPipeline
+from .agent_pipe import AgentPipe
 
 from .source_handler_adapter import (
     SourceHandlerAdapter,
@@ -76,8 +76,8 @@ from .sender_handler_adapter import (
 
 
 __all__ = [
-    # Pipeline
-    "AgentPipeline",
+    # Pipe
+    "AgentPipe",
     
     # Source Handler
     "SourceHandlerAdapter",

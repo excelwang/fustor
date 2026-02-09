@@ -5,7 +5,7 @@
 > **Code Path**: /home/huajin/fustor_monorepo/
 
 ## 1. Executive Summary
-The system has successfully transitioned to the V2 architecture in terms of core structural elements: the `fustor-core` package exists, and both `fustor-agent` and `fustor-fusion` use the new Pipeline/Handler/Transport abstractions. The Robust Logical Clock and Session Management are also implemented and aligned with the specs.
+The system has successfully transitioned to the V2 architecture in terms of core structural elements: the `fustor-core` package exists, and both `fustor-agent` and `fustor-fusion` use the new Pipe/Handler/Transport abstractions. The Robust Logical Clock and Session Management are also implemented and aligned with the specs.
 
 However, several implementation details violate the project's coding principles (e.g., file size limits), and some planned features (gRPC transport) are still missing. The `source-fs` driver specifically requires refactoring to reduce complexity and redundancy.
 
@@ -17,7 +17,7 @@ However, several implementation details violate the project's coding principles 
 | G-002 | 01-ARCHITECTURE.md:3.4 | `packages/` | gRPC Sender and Receiver packages are missing despite being planned for Phase 3. | Medium |
 | G-003 | todo.md:5 | `packages/source-fs/__init__.py` | Redundant directory scanning logic between `_perform_pre_scan_and_schedule` and `get_snapshot_iterator`. | Medium |
 | G-004 | 02-CONSISTENCY_DESIGN.md | `fusion/src/fustor_fusion/main.py` | Router registration logic is messy and contains deprecated "Legacy mode" comments. | Low |
-| G-005 | 03-LOGICAL_CLOCK_DESIGN.md | `packages/core/src/fustor_core/clock/logical_clock.py` | Double import of `SessionObsoletedError` in `agent_pipeline.py`. | Low |
+| G-005 | 03-LOGICAL_CLOCK_DESIGN.md | `packages/core/src/fustor_core/clock/logical_clock.py` | Double import of `SessionObsoletedError` in `agent_pipe.py`. | Low |
 
 ## 3. Recommended Actions
 - [ ] Refactor `FSDriver` into smaller logical components (e.g., `SnapshotManager`, `AuditManager`).

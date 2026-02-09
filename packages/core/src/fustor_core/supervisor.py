@@ -136,8 +136,8 @@ class ComponentSupervisor:
     
     Usage:
         supervisor = ComponentSupervisor()
-        await supervisor.register("pipeline-1", pipeline1)
-        await supervisor.register("pipeline-2", pipeline2)
+        await supervisor.register("pipe-1", pipe1)
+        await supervisor.register("pipe-2", pipe2)
         
         results = await supervisor.start_all()
         # results shows which components succeeded/failed

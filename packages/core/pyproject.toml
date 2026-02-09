@@ -1,7 +1,7 @@
 [project]
 name = "fustor-core"
 dynamic = ["version"]
-description = "Core foundation for Fustor - event models, pipeline/transport abstractions, and common utilities"
+description = "Core foundation for Fustor - event models, pipe/transport abstractions, and common utilities"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.11.7",

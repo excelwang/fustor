@@ -1,7 +1,7 @@
 import pytest
 from fustor_core.models.config import (
     PasswdCredential, ApiKeyCredential, FieldMapping,
-    SourceConfig, SenderConfig, PipelineConfig,
+    SourceConfig, SenderConfig, PipeConfig,
     AppConfig, ConfigError, NotFoundError
 )
 
@@ -77,80 +77,80 @@ def test_app_config_add_get_delete_sender():
     with pytest.raises(NotFoundError, match="Sender config with id 'non_existent' not found."):
         app_config.delete_sender("non_existent")
 
-def test_app_config_add_get_delete_pipeline():
+def test_app_config_add_get_delete_pipe():
     app_config = AppConfig()
     source_config = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
     sender_config = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
-    pipeline_config = PipelineConfig(source="my_source", sender="my_sender", disabled=False)
+    pipe_config = PipeConfig(source="my_source", sender="my_sender", disabled=False)
 
-    # Add pipeline without dependencies
+    # Add pipe without dependencies
     with pytest.raises(NotFoundError, match="Dependency source 'my_source' not found."):
-        app_config.add_pipeline("my_pipeline", pipeline_config)
+        app_config.add_pipe("my_pipe", pipe_config)
     
     app_config.add_source("my_source", source_config)
     with pytest.raises(NotFoundError, match="Dependency sender 'my_sender' not found."):
-        app_config.add_pipeline("my_pipeline", pipeline_config)
+        app_config.add_pipe("my_pipe", pipe_config)
 
     app_config.add_sender("my_sender", sender_config)
-    app_config.add_pipeline("my_pipeline", pipeline_config)
-    assert app_config.get_pipeline("my_pipeline") == pipeline_config
+    app_config.add_pipe("my_pipe", pipe_config)
+    assert app_config.get_pipe("my_pipe") == pipe_config
 
-    # Add duplicate pipeline
-    with pytest.raises(ConfigError, match="Pipeline config with id 'my_pipeline' already exists."):
-        app_config.add_pipeline("my_pipeline", pipeline_config)
+    # Add duplicate pipe
+    with pytest.raises(ConfigError, match="Pipe config with id 'my_pipe' already exists."):
+        app_config.add_pipe("my_pipe", pipe_config)
 
-    # Delete pipeline
-    deleted_pipeline = app_config.delete_pipeline("my_pipeline")
-    assert deleted_pipeline == pipeline_config
-    assert app_config.get_pipeline("my_pipeline") is None
+    # Delete pipe
+    deleted_pipe = app_config.delete_pipe("my_pipe")
+    assert deleted_pipe == pipe_config
+    assert app_config.get_pipe("my_pipe") is None
 
-    # Delete non-existent pipeline
-    with pytest.raises(NotFoundError, match="Pipeline config with id 'non_existent' not found."):
-        app_config.delete_pipeline("non_existent")
+    # Delete non-existent pipe
+    with pytest.raises(NotFoundError, match="Pipe config with id 'non_existent' not found."):
+        app_config.delete_pipe("non_existent")
 
-def test_app_config_delete_source_with_dependent_pipelines():
+def test_app_config_delete_source_with_dependent_pipes():
     app_config = AppConfig()
     source_config = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
     sender_config = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
-    pipeline_config1 = PipelineConfig(source="my_source", sender="my_sender", disabled=False)
-    pipeline_config2 = PipelineConfig(source="my_source", sender="my_sender", disabled=False) # Another pipeline using the same source
+    pipe_config1 = PipeConfig(source="my_source", sender="my_sender", disabled=False)
+    pipe_config2 = PipeConfig(source="my_source", sender="my_sender", disabled=False) # Another pipe using the same source
 
     app_config.add_source("my_source", source_config)
     app_config.add_sender("my_sender", sender_config)
-    app_config.add_pipeline("pipeline1", pipeline_config1)
-    app_config.add_pipeline("pipeline2", pipeline_config2)
+    app_config.add_pipe("pipe1", pipe_config1)
+    app_config.add_pipe("pipe2", pipe_config2)
 
-    assert app_config.get_pipeline("pipeline1") is not None
-    assert app_config.get_pipeline("pipeline2") is not None
+    assert app_config.get_pipe("pipe1") is not None
+    assert app_config.get_pipe("pipe2") is not None
 
     app_config.delete_source("my_source")
 
     assert app_config.get_source("my_source") is None
-    assert app_config.get_pipeline("pipeline1") is None
-    assert app_config.get_pipeline("pipeline2") is None
+    assert app_config.get_pipe("pipe1") is None
+    assert app_config.get_pipe("pipe2") is None
 
-def test_app_config_delete_sender_with_dependent_pipelines():
+def test_app_config_delete_sender_with_dependent_pipes():
     app_config = AppConfig()
     source_config = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
     sender_config = SenderConfig(driver="http", uri="http://localhost", credential=PasswdCredential(user="u"), disabled=False)
-    pipeline_config1 = PipelineConfig(source="my_source", sender="my_sender", disabled=False)
-    pipeline_config2 = PipelineConfig(source="my_source", sender="my_sender", disabled=False) # Another pipeline using the same sender
+    pipe_config1 = PipeConfig(source="my_source", sender="my_sender", disabled=False)
+    pipe_config2 = PipeConfig(source="my_source", sender="my_sender", disabled=False) # Another pipe using the same sender
 
     app_config.add_source("my_source", source_config)
     app_config.add_sender("my_sender", sender_config)
-    app_config.add_pipeline("pipeline1", pipeline_config1)
-    app_config.add_pipeline("pipeline2", pipeline_config2)
+    app_config.add_pipe("pipe1", pipe_config1)
+    app_config.add_pipe("pipe2", pipe_config2)
 
-    assert app_config.get_pipeline("pipeline1") is not None
-    assert app_config.get_pipeline("pipeline2") is not None
+    assert app_config.get_pipe("pipe1") is not None
+    assert app_config.get_pipe("pipe2") is not None
 
     app_config.delete_sender("my_sender")
 
     assert app_config.get_sender("my_sender") is None
-    assert app_config.get_pipeline("pipeline1") is None
-    assert app_config.get_pipeline("pipeline2") is None
+    assert app_config.get_pipe("pipe1") is None
+    assert app_config.get_pipe("pipe2") is None
 
-def test_app_config_check_pipeline_is_disabled():
+def test_app_config_check_pipe_is_disabled():
     app_config = AppConfig()
     source_config_enabled = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=False)
     source_config_disabled = SourceConfig(driver="mysql", uri="mysql://host", credential=PasswdCredential(user="u"), disabled=True)
@@ -162,36 +162,36 @@ def test_app_config_check_pipeline_is_disabled():
     app_config.add_sender("sender_e", sender_config_enabled)
     app_config.add_sender("sender_d", sender_config_disabled)
 
-    # Pipeline itself disabled
-    pipeline_disabled = PipelineConfig(source="source_e", sender="sender_e", disabled=True)
-    app_config.add_pipeline("pipeline_d", pipeline_disabled)
-    assert app_config.check_pipeline_is_disabled("pipeline_d") is True
+    # Pipe itself disabled
+    pipe_disabled = PipeConfig(source="source_e", sender="sender_e", disabled=True)
+    app_config.add_pipe("pipe_d", pipe_disabled)
+    assert app_config.check_pipe_is_disabled("pipe_d") is True
 
     # Source disabled
-    pipeline_source_disabled = PipelineConfig(source="source_d", sender="sender_e", disabled=False)
-    app_config.add_pipeline("pipeline_source_d", pipeline_source_disabled)
-    assert app_config.check_pipeline_is_disabled("pipeline_source_d") is True
+    pipe_source_disabled = PipeConfig(source="source_d", sender="sender_e", disabled=False)
+    app_config.add_pipe("pipe_source_d", pipe_source_disabled)
+    assert app_config.check_pipe_is_disabled("pipe_source_d") is True
 
     # Sender disabled
-    pipeline_sender_disabled = PipelineConfig(source="source_e", sender="sender_d", disabled=False)
-    app_config.add_pipeline("pipeline_sender_d", pipeline_sender_disabled)
-    assert app_config.check_pipeline_is_disabled("pipeline_sender_d") is True
+    pipe_sender_disabled = PipeConfig(source="source_e", sender="sender_d", disabled=False)
+    app_config.add_pipe("pipe_sender_d", pipe_sender_disabled)
+    assert app_config.check_pipe_is_disabled("pipe_sender_d") is True
 
     # All enabled
-    pipeline_enabled = PipelineConfig(source="source_e", sender="sender_e", disabled=False)
-    app_config.add_pipeline("pipeline_e", pipeline_enabled)
-    assert app_config.check_pipeline_is_disabled("pipeline_e") is False
+    pipe_enabled = PipeConfig(source="source_e", sender="sender_e", disabled=False)
+    app_config.add_pipe("pipe_e", pipe_enabled)
+    assert app_config.check_pipe_is_disabled("pipe_e") is False
 
-    # Non-existent pipeline
-    with pytest.raises(NotFoundError, match="Pipeline with id 'non_existent' not found."):
-        app_config.check_pipeline_is_disabled("non_existent")
+    # Non-existent pipe
+    with pytest.raises(NotFoundError, match="Pipe with id 'non_existent' not found."):
+        app_config.check_pipe_is_disabled("non_existent")
 
     # Missing source dependency
-    pipeline_missing_source = PipelineConfig(source="non_existent_source", sender="sender_e", disabled=False)
+    pipe_missing_source = PipeConfig(source="non_existent_source", sender="sender_e", disabled=False)
     with pytest.raises(NotFoundError, match="Dependency source 'non_existent_source' not found."):
-        app_config.add_pipeline("pipeline_missing_source", pipeline_missing_source)
+        app_config.add_pipe("pipe_missing_source", pipe_missing_source)
 
     # Missing sender dependency
-    pipeline_missing_sender = PipelineConfig(source="source_e", sender="non_existent_sender", disabled=False)
+    pipe_missing_sender = PipeConfig(source="source_e", sender="non_existent_sender", disabled=False)
     with pytest.raises(NotFoundError, match="Dependency sender 'non_existent_sender' not found."):
-        app_config.add_pipeline("pipeline_missing_sender", pipeline_missing_sender)
+        app_config.add_pipe("pipe_missing_sender", pipe_missing_sender)

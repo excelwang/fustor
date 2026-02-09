@@ -16,7 +16,7 @@ Fustor Agent 使用一个主目录来存放配置和状态。
 *   **默认路径**: `~/.fustor`
 *   **自定义路径**: 设置 `FUSTOR_HOME` 环境变量。
 
-Agent 的核心配置文件位于 Fustor 主目录下的 `agent-config.yaml`。你需要定义 `sources` (数据源)、`senders` (推送目标) 和 `pipelines` (同步任务)。
+Agent 的核心配置文件位于 Fustor 主目录下的 `agent-config.yaml`。你需要定义 `sources` (数据源)、`senders` (推送目标) 和 `pipes` (同步任务)。
 
 ### 1. 配置 Source (数据源)
 
@@ -48,12 +48,12 @@ senders:
       credential: "YOUR_API_KEY_HERE"
 ```
 
-### 3. 配置 Pipeline (数据管道任务)
+### 3. 配置 Pipe (数据管道任务)
 
 将 Source 和 Sender 绑定：
 
 ```yaml
-pipelines:
+pipes:
   - id: "phase-files-to-fusion"
     source_id: "my-local-files"
     sender_id: "to-fusion"

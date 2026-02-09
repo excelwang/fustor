@@ -63,10 +63,10 @@ async def signal_audit_end(
 
     while elapsed < max_wait:
         queue_size = 0
-        pm = runtime_objects.pipeline_manager
+        pm = runtime_objects.pipe_manager
         if pm:
-            pipelines = pm.get_pipelines()
-            for p in pipelines.values():
+            pipes = pm.get_pipes()
+            for p in pipes.values():
                  if hasattr(p, 'view_id') and p.view_id == view_id:
                      dto = await p.get_dto()
                      queue_size += dto.get('queue_size', 0)
@@ -76,8 +76,8 @@ async def signal_audit_end(
             # Check again to ensure stability
             recheck_queue = 0
             if pm:
-                pipelines = pm.get_pipelines()
-                for p in pipelines.values():
+                pipes = pm.get_pipes()
+                for p in pipes.values():
                      if hasattr(p, 'view_id') and p.view_id == view_id:
                          dto = await p.get_dto()
                          recheck_queue += dto.get('queue_size', 0)

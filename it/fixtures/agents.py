@@ -47,7 +47,7 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
     Args:
         container_name: Docker container name
         api_key: API key for authentication
-        view_id: View ID for the pipeline
+        view_id: View ID for the pipe
         mount_point: Path to the NFS mount point
     """
     # Ensure container is actually running
@@ -112,12 +112,12 @@ fusion:
 """
     docker_manager.create_file_in_container(container_name, f"{config_dir}/senders-config.yaml", senders_config)
 
-    # 3. Pipelines Config
+    # 3. Pipes Config
     pipes_dir = f"{config_dir}/agent-pipes-config"
     docker_manager.exec_in_container(container_name, ["mkdir", "-p", pipes_dir])
     
-    pipelines_config = f"""
-id: "pipeline-task-1"
+    pipes_config = f"""
+id: "pipe-task-1"
 source: "shared-fs"
 sender: "fusion"
 disabled: false
@@ -125,7 +125,7 @@ audit_interval_sec: {AUDIT_INTERVAL}
 sentinel_interval_sec: {SENTINEL_INTERVAL}
 heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
 """
-    docker_manager.create_file_in_container(container_name, f"{pipes_dir}/pipeline-task-1.yaml", pipelines_config)
+    docker_manager.create_file_in_container(container_name, f"{pipes_dir}/pipe-task-1.yaml", pipes_config)
     
     
     logger.info(f"Starting agent in {container_name} in DAEMON mode (-D)")

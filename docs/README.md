@@ -4,11 +4,11 @@ Welcome to the Fustor documentation. Fustor is a high-reliability, consistency-a
 
 ## Core Concepts
 
-- **Pipeline**: The fundamental unit of synchronization, connecting a **Source** to a **Sender**.
+- **Pipe**: The fundamental unit of synchronization, connecting a **Source** to a **Sender**.
 - **Source**: A data origin (e.g., local FS, MySQL CDC, S3).
 - **Sender**: A data destination (e.g., Fusion API, S3, HTTP Hook).
 - **View**: A materialized state of the data in the destination system (Fusion).
-- **Agent**: The process that runs pipelines and captures local events.
+- **Agent**: The process that runs pipes and captures local events.
 - **Fusion**: The central state manager that performs arbitration and serves the data.
 
 ## Documentation Index

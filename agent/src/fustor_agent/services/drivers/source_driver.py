@@ -44,7 +44,7 @@ class SourceDriverService(SourceDriverServiceInterface): # Inherit from the inte
     def _get_driver_by_type(self, driver_type: str) -> Any:
         """
         Loads a driver class by its name.
-        This method is intended for internal use by services like PipelineInstanceService.
+        This method is intended for internal use by services like PipeInstanceService.
         """
         if not driver_type:
             raise ConfigError("Driver type cannot be empty.")
@@ -93,17 +93,7 @@ class SourceDriverService(SourceDriverServiceInterface): # Inherit from the inte
         except Exception:
             return False
 
-    async def get_wizard_definition_by_type(self, driver_type: str) -> Dict[str, Any]:
-        """Gets the wizard step definitions for a given driver type by calling the class method."""
-        try:
-            driver_class = self._get_driver_by_type(driver_type)
-            # Directly call the method, relying on the ABC for a default implementation.
-            return await driver_class.get_wizard_steps()
-        except (ConfigError, DriverError) as e:
-            raise e
-        except Exception as e:
-            logger.error(f"Unexpected error getting wizard definition for driver '{driver_type}': {e}", exc_info=True)
-            raise DriverError(f"Could not retrieve wizard definition for driver '{driver_type}'.")
+
 
     async def get_available_fields(self, driver_type: str, **kwargs) -> Dict[str, Any]:
         """Gets the available fields for a given source driver by calling the class method."""

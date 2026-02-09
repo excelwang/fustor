@@ -1,20 +1,20 @@
 # fusion/src/fustor_fusion/runtime/session_bridge.py
 """
-Bridge between FusionPipeline and the existing SessionManager.
+Bridge between FusionPipe and the existing SessionManager.
 
 This module enables gradual migration from the legacy SessionManager
-to the Pipeline-based session management.
+to the Pipe-based session management.
 
 Architecture:
     
     ┌────────────────────────┐
-    │   FusionPipeline       │
+    │   FusionPipe       │
     │   (new architecture)   │
     └───────────┬────────────┘
                 │
                 ▼
     ┌────────────────────────┐
-    │   PipelineSessionBridge│
+    │   PipeSessionBridge│
     │   (integration layer)  │
     └───────────┬────────────┘
                 │
@@ -25,48 +25,48 @@ Architecture:
     └────────────────────────┘
 
 Usage:
-    from fustor_fusion.runtime import FusionPipeline, PipelineSessionBridge
+    from fustor_fusion.runtime import FusionPipe, PipeSessionBridge
     
-    pipeline = FusionPipeline(...)
-    bridge = PipelineSessionBridge(pipeline, session_manager)
+    pipe = FusionPipe(...)
+    bridge = PipeSessionBridge(pipe, session_manager)
     
     # Create session goes through both systems
-    session_id = await bridge.create_session(task_id="agent:pipeline", ...)
+    session_id = await bridge.create_session(task_id="agent:pipe", ...)
 """
 import asyncio
 import logging
 from typing import Any, Dict, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from .fusion_pipeline import FusionPipeline
+    from .fusion_pipe import FusionPipe
     from fustor_fusion.core.session_manager import SessionManager
 
 logger = logging.getLogger("fustor_fusion.session_bridge")
 
 
-class PipelineSessionBridge:
+class PipeSessionBridge:
     """
-    Bridge that synchronizes sessions between FusionPipeline and SessionManager.
+    Bridge that synchronizes sessions between FusionPipe and SessionManager.
     
     This allows:
     1. Gradual migration without breaking existing code
-    2. Session state shared between Pipeline and legacy components
+    2. Session state shared between Pipe and legacy components
     3. Eventual deprecation of SessionManager global singleton
     """
     
     def __init__(
         self,
-        pipeline: "FusionPipeline",
+        pipe: "FusionPipe",
         session_manager: "SessionManager"
     ):
         """
         Initialize the bridge.
         
         Args:
-            pipeline: FusionPipeline instance
+            pipe: FusionPipe instance
             session_manager: Legacy SessionManager instance
         """
-        self._pipeline = pipeline
+        self._pipe = pipe
         self._session_manager = session_manager
         
         # Map session_id -> view_id (for legacy compatibility)
@@ -81,7 +81,7 @@ class PipelineSessionBridge:
         session_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        Create a session in both Pipeline and SessionManager.
+        Create a session in both Pipe and SessionManager.
         
         Args:
             task_id: Agent task ID
@@ -97,7 +97,7 @@ class PipelineSessionBridge:
         import time
         
         session_id = session_id or str(uuid.uuid4())
-        view_id = str(self._pipeline.view_id)
+        view_id = str(self._pipe.view_id)
         
         logger.info(f"DEBUG: Bridge creating session {session_id} for view {view_id}, timeout={session_timeout_seconds}")
         
@@ -119,9 +119,9 @@ class PipelineSessionBridge:
             session_timeout_seconds=session_timeout_seconds
         )
         
-        # Create in Pipeline
-        # Pass is_leader hint if the pipelinesupports it
-        await self._pipeline.on_session_created(
+        # Create in Pipe
+        # Pass is_leader hint if the pipesupports it
+        await self._pipe.on_session_created(
             session_id=session_id,
             task_id=task_id,
             client_ip=client_ip,
@@ -131,8 +131,8 @@ class PipelineSessionBridge:
         # Track mapping
         self._session_view_map[session_id] = view_id
         
-        # Get role from pipeline
-        role = await self._pipeline.get_session_role(session_id)
+        # Get role from pipe
+        role = await self._pipe.get_session_role(session_id)
         
         timeout = session_timeout_seconds or 30
         
@@ -163,15 +163,15 @@ class PipelineSessionBridge:
         view_id = self._session_view_map.get(session_id)
         
         if view_id is None:
-            # Try to get it from pipeline as fallback
-            role = await self._pipeline.get_session_role(session_id)
+            # Try to get it from pipe as fallback
+            role = await self._pipe.get_session_role(session_id)
             if role is None:
                 return {
                     "status": "error",
                     "message": f"Session {session_id} not found",
                     "session_id": session_id
                 }
-            # If pipeline knows it, then we are fine (maybe bridge map lost it but pipeline has it)
+            # If pipe knows it, then we are fine (maybe bridge map lost it but pipe has it)
         else:
             # 1. Update legacy SessionManager
             alive = await self._session_manager.keep_session_alive(
@@ -193,9 +193,9 @@ class PipelineSessionBridge:
             if is_leader:
                 await view_state_manager.set_authoritative_session(view_id, session_id)
         
-        # 3. Get final status from pipeline
-        role = await self._pipeline.get_session_role(session_id)
-        timeout = self._pipeline.config.get("session_timeout_seconds", 30)
+        # 3. Get final status from pipe
+        role = await self._pipe.get_session_role(session_id)
+        timeout = self._pipe.config.get("session_timeout_seconds", 30)
         
         return {
             "role": role,
@@ -232,8 +232,8 @@ class PipelineSessionBridge:
             if session_id in self._session_view_map:
                 del self._session_view_map[session_id]
         
-        # Close in Pipeline
-        await self._pipeline.on_session_closed(session_id)
+        # Close in Pipe
+        await self._pipe.on_session_closed(session_id)
         
         return True
     
@@ -241,10 +241,10 @@ class PipelineSessionBridge:
         """
         Get session info from both systems.
         
-        Priority: Pipeline session info, fallback to SessionManager.
+        Priority: Pipe session info, fallback to SessionManager.
         """
-        # Try Pipeline first
-        info = await self._pipeline.get_session_info(session_id)
+        # Try Pipe first
+        info = await self._pipe.get_session_info(session_id)
         if info:
             return info
         
@@ -265,30 +265,30 @@ class PipelineSessionBridge:
     
     async def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
         """Get all active sessions."""
-        return await self._pipeline.get_all_sessions()
+        return await self._pipe.get_all_sessions()
     
     @property
     def leader_session(self) -> Optional[str]:
         """Get the current leader session ID."""
-        return self._pipeline.leader_session
+        return self._pipe.leader_session
 
 
 def create_session_bridge(
-    pipeline: "FusionPipeline",
+    pipe: "FusionPipe",
     session_manager: Optional["SessionManager"] = None
-) -> PipelineSessionBridge:
+) -> PipeSessionBridge:
     """
-    Create a session bridge for the given pipeline.
+    Create a session bridge for the given pipe.
     
     Args:
-        pipeline: The FusionPipeline instance
+        pipe: The FusionPipe instance
         session_manager: Optional SessionManager, uses global if not provided
         
     Returns:
-        PipelineSessionBridge instance
+        PipeSessionBridge instance
     """
     if session_manager is None:
         from fustor_fusion.core.session_manager import session_manager as global_session_manager
         session_manager = global_session_manager
     
-    return PipelineSessionBridge(pipeline, session_manager)
+    return PipeSessionBridge(pipe, session_manager)

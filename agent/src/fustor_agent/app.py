@@ -18,7 +18,7 @@ from .config.unified import agent_config, AgentPipeConfig
 from .services.drivers.source_driver import SourceDriverService
 from .services.drivers.sender_driver import SenderDriverService
 from .services.instances.bus import EventBusService
-from .services.instances.pipeline import PipelineInstanceService
+from .services.instances.pipe import PipeInstanceService
 
 # State file path
 HOME_FUSTOR_DIR = get_fustor_home_dir()
@@ -62,7 +62,7 @@ class App:
             self.source_driver_service
         )
         
-        self.pipeline_runtime: Dict[str, Any] = {}
+        self.pipe_runtime: Dict[str, Any] = {}
         
         self.logger.info(f"Target pipes: {self._target_pipe_ids}")
     
@@ -121,7 +121,7 @@ class App:
         bus_runtime, _ = await self.event_bus_service.get_or_create_bus_for_subscriber(
             source_id=source_id,
             source_config=source_cfg,
-            pipeline_id=pipe_id,
+            pipe_id=pipe_id,
             required_position=0,
             fields_mapping=pipe_cfg.fields_mapping
         )
@@ -130,14 +130,14 @@ class App:
         # SenderDriverService expects a Config object, unified config provides Pydantic SenderConfig
         sender = self.sender_driver_service.create_driver(sender_cfg)
         
-        # 3. Create pipeline instance
-        from .runtime.agent_pipeline import AgentPipeline
+        # 3. Create pipe instance
+        from .runtime.agent_pipe import AgentPipe
         
-        # Adapt unified AgentPipeConfig to what AgentPipeline expects (dict-like or object)
-        # AgentPipeline usually takes a config dict or object. 
-        # We'll pass the unified config object directly if AgentPipeline supports it, 
+        # Adapt unified AgentPipeConfig to what AgentPipe expects (dict-like or object)
+        # AgentPipe usually takes a config dict or object. 
+        # We'll pass the unified config object directly if AgentPipe supports it, 
         # or convert relevant fields.
-        pipeline_config = {
+        pipe_config = {
             "id": pipe_id,
             "max_concurrent_tasks": 10, # Default or from config if added
             "audit_interval_sec": pipe_cfg.audit_interval_sec,
@@ -146,39 +146,39 @@ class App:
             "fields_mapping": [m for m in pipe_cfg.fields_mapping] 
         }
 
-        pipeline = AgentPipeline(
+        pipe = AgentPipe(
             id=pipe_id,
-            config=pipeline_config, 
+            config=pipe_config, 
             bus=bus_runtime,
             sender=sender,
             agent_id=self.agent_id,
         )
         
-        # 4. Start pipeline
-        await pipeline.start()
-        self.pipeline_runtime[pipe_id] = pipeline
+        # 4. Start pipe
+        await pipe.start()
+        self.pipe_runtime[pipe_id] = pipe
         self.logger.info(f"Pipe '{pipe_id}' started successfully")
 
     async def _stop_pipe(self, pipe_id: str):
         """Stop a single pipe and release its resources."""
-        pipeline = self.pipeline_runtime.get(pipe_id)
-        if not pipeline:
+        pipe = self.pipe_runtime.get(pipe_id)
+        if not pipe:
             return
         
         self.logger.info(f"Stopping pipe: {pipe_id}")
-        await pipeline.stop()
+        await pipe.stop()
         
         # Release subscriber from bus
-        await self.event_bus_service.release_subscriber(pipeline.bus.id, pipe_id)
+        await self.event_bus_service.release_subscriber(pipe.bus.id, pipe_id)
         
-        del self.pipeline_runtime[pipe_id]
+        del self.pipe_runtime[pipe_id]
         self.logger.info(f"Pipe '{pipe_id}' stopped and resources released")
     
     async def shutdown(self):
         """Gracefully shutdown all pipes."""
         self.logger.info("Shutting down application...")
         
-        for pipe_id in list(self.pipeline_runtime.keys()):
+        for pipe_id in list(self.pipe_runtime.keys()):
             try:
                 await self._stop_pipe(pipe_id)
             except Exception as e:
@@ -194,7 +194,7 @@ class App:
             state = {
                 "pipes": {
                     pid: {"state": str(p.state)} 
-                    for pid, p in self.pipeline_runtime.items()
+                    for pid, p in self.pipe_runtime.items()
                 }
             }
             if os.path.exists(STATE_FILE_PATH):

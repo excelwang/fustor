@@ -1,7 +1,7 @@
 """
 Handler abstraction for Fustor.
 
-Handlers process data within a pipeline - they are the actual
+Handlers process data within a pipe - they are the actual
 business logic implementations (Sources, Views, etc.)
 """
 from abc import ABC, abstractmethod
@@ -18,7 +18,7 @@ class Handler(ABC):
     Abstract base class for all Handlers.
     
     A Handler encapsulates data processing logic. Handlers are invoked
-    by Pipelines to perform actual data operations.
+    by Pipes to perform actual data operations.
     
     Examples:
     - Source handlers: Read data and produce events

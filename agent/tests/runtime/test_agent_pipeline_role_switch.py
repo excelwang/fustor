@@ -1,19 +1,19 @@
-# agent/tests/runtime/test_agent_pipeline_role_switch.py
+# agent/tests/runtime/test_agent_pipe_role_switch.py
 """
-Tests for AgentPipeline role transitions (Leader <-> Follower).
+Tests for AgentPipe role transitions (Leader <-> Follower).
 """
 import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock
-from fustor_core.pipeline import PipelineState
-from fustor_agent.runtime.agent_pipeline import AgentPipeline
-from fustor_agent.runtime.agent_pipeline import AgentPipeline
+from fustor_core.pipe import PipeState
+from fustor_agent.runtime.agent_pipe import AgentPipe
+from fustor_agent.runtime.agent_pipe import AgentPipe
 
 @pytest.mark.timeout(10)
 class TestAgentRoleSwitch:
     
     @pytest.mark.asyncio
-    async def test_leader_to_follower_cancels_tasks(self, mock_source, mock_sender, pipeline_config):
+    async def test_leader_to_follower_cancels_tasks(self, mock_source, mock_sender, pipe_config):
         """When role changes from leader to follower, leader-specific tasks should be cancelled."""
         mock_sender.role = "leader"
         
@@ -22,8 +22,8 @@ class TestAgentRoleSwitch:
         mock_bus.internal_bus = AsyncMock()
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
 
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
         
@@ -31,21 +31,21 @@ class TestAgentRoleSwitch:
         snapshot_started = asyncio.Event()
         async def mock_snapshot():
             snapshot_started.set()
-            pipeline._set_state(pipeline.state | PipelineState.SNAPSHOT_SYNC)
+            pipe._set_state(pipe.state | PipeState.SNAPSHOT_SYNC)
             try:
                 while True:
                     await asyncio.sleep(0.1)
             except asyncio.CancelledError:
-                pipeline._set_state(pipeline.state & ~PipelineState.SNAPSHOT_SYNC)
+                pipe._set_state(pipe.state & ~PipeState.SNAPSHOT_SYNC)
                 raise
-        pipeline._run_snapshot_sync = mock_snapshot
+        pipe._run_snapshot_sync = mock_snapshot
         
-        await pipeline.start()
+        await pipe.start()
         await snapshot_started.wait()
         
         # Verify it's in SNAPSHOT_SYNC
-        assert pipeline.state & PipelineState.SNAPSHOT_SYNC
-        assert pipeline._snapshot_task is not None
+        assert pipe.state & PipeState.SNAPSHOT_SYNC
+        assert pipe._snapshot_task is not None
         
         # Change role via heartbeat
         mock_sender.role = "follower"
@@ -53,23 +53,23 @@ class TestAgentRoleSwitch:
         # Wait for heartbeat and role change task to complete, and control loop to set PAUSED
         # Limit wait to 5 seconds to avoid infinite hangs
         for _ in range(500):
-            if pipeline.current_role == "follower" and (pipeline.state & PipelineState.PAUSED):
+            if pipe.current_role == "follower" and (pipe.state & PipeState.PAUSED):
                 break
             await asyncio.sleep(0.01)
         
         # Assertions
-        assert pipeline.current_role == "follower", f"Expected follower role, got {pipeline.current_role}"
+        assert pipe.current_role == "follower", f"Expected follower role, got {pipe.current_role}"
         # Snapshot task should have been cancelled
-        assert pipeline._snapshot_task is None or pipeline._snapshot_task.done()
+        assert pipe._snapshot_task is None or pipe._snapshot_task.done()
         # State should reflect follower standby (PAUSED)
-        assert pipeline.state & PipelineState.PAUSED
+        assert pipe.state & PipeState.PAUSED
         # Snapshot flag should be gone
-        assert not (pipeline.state & PipelineState.SNAPSHOT_SYNC)
+        assert not (pipe.state & PipeState.SNAPSHOT_SYNC)
         
-        await pipeline.stop()
+        await pipe.stop()
 
     @pytest.mark.asyncio
-    async def test_follower_to_leader_starts_sync(self, mock_source, mock_sender, pipeline_config):
+    async def test_follower_to_leader_starts_sync(self, mock_source, mock_sender, pipe_config):
         """When role changes from follower to leader, leader sequence should start."""
         mock_sender.role = "follower"
         
@@ -78,22 +78,22 @@ class TestAgentRoleSwitch:
         mock_bus.internal_bus = AsyncMock()
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
 
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
         
-        await pipeline.start()
+        await pipe.start()
         
         # Wait for it to start as follower
         for _ in range(100):
-            if pipeline.current_role == "follower" and (pipeline.state & PipelineState.PAUSED):
+            if pipe.current_role == "follower" and (pipe.state & PipeState.PAUSED):
                 break
             await asyncio.sleep(0.01)
         
         # Verify initial follower state
-        assert pipeline.current_role == "follower"
-        assert pipeline.state & PipelineState.PAUSED
+        assert pipe.current_role == "follower"
+        assert pipe.state & PipeState.PAUSED
         
         # Switch to leader
         mock_sender.role = "leader"
@@ -105,8 +105,8 @@ class TestAgentRoleSwitch:
             await asyncio.sleep(0.01)
             
         # Assertions
-        assert pipeline.current_role == "leader"
+        assert pipe.current_role == "leader"
         # Snapshot should have been called
         assert mock_source.snapshot_calls >= 1
         
-        await pipeline.stop()
+        await pipe.stop()

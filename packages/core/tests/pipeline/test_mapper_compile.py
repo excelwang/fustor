@@ -1,7 +1,7 @@
 import pytest
 import logging
 from unittest.mock import MagicMock, patch
-from fustor_core.pipeline.mapper import EventMapper
+from fustor_core.pipe.mapper import EventMapper
 
 class TestEventMapperCompile:
     """Targeted tests for the 'compilation' logic in EventMapper."""

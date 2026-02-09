@@ -7,7 +7,7 @@ from fustor_sender_echo import EchoDriver
 from fustor_core.event import UpdateEvent
 
 @pytest.mark.asyncio
-async def test_echo_pipeline_instance_triggers_snapshot():
+async def test_echo_pipe_instance_triggers_snapshot():
     """Integration test to verify echo sender triggers snapshot."""
     # 1. Arrange - Create configurations
     credential = {"user": "echo-user"}

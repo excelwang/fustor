@@ -57,16 +57,16 @@ async def test_audit_end_endpoint(client, mock_view_manager):
     manager.get_driver_instance.return_value = driver_instance
     
     # Patch queue / processing manager to simulate drained queue
-    # Patch runtime_objects to simulate drained queue via pipeline manager
+    # Patch runtime_objects to simulate drained queue via pipe manager
     with patch("fustor_fusion.api.consistency.runtime_objects") as mock_ro:
         mock_pm = MagicMock()
-        mock_ro.pipeline_manager = mock_pm
+        mock_ro.pipe_manager = mock_pm
         
-        mock_pipeline = AsyncMock()
-        mock_pipeline.view_id = "1"
-        mock_pipeline.get_dto.return_value = {"queue_size": 0}
+        mock_pipe = AsyncMock()
+        mock_pipe.view_id = "1"
+        mock_pipe.get_dto.return_value = {"queue_size": 0}
         
-        mock_pm.get_pipelines.return_value = {'pipe1': mock_pipeline}
+        mock_pm.get_pipes.return_value = {'pipe1': mock_pipe}
         
         response = client.post("/api/v1/pipe/consistency/audit/end")
     

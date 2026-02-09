@@ -76,16 +76,7 @@ class SenderDriverService(SenderDriverServiceInterface):
             f"Available drivers: {list(self._discovered_drivers.keys())}"
         )
 
-    async def get_wizard_definition_by_type(self, driver_type: str) -> Dict[str, Any]:
-        """Proxies the call to the driver's get_wizard_steps class method."""
-        try:
-            driver_class = self._get_driver_by_type(driver_type)
-            return await driver_class.get_wizard_steps()
-        except (ConfigError, DriverError) as e:
-            raise e
-        except Exception as e:
-            logger.error(f"Unexpected error getting wizard definition for driver '{driver_type}': {e}", exc_info=True)
-            raise DriverError(f"Could not retrieve wizard definition for driver '{driver_type}'.")
+
 
     async def test_connection(self, driver_type: str, **kwargs) -> Tuple[bool, str]:
         """Proxies the call to the driver's test_connection class method."""

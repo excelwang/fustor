@@ -44,7 +44,7 @@ MIN_NFS_DELAY = scaled_duration(NFS_PHYSICAL_LATENCY_SEC, min_val=1.0) + NFS_SAF
 # --- Test Timing Configurations ---
 
 # Driver / Core Intervals (Production Defaults from Source)
-# Source: agent/src/fustor_agent/config/pipelines.py
+# Source: agent/src/fustor_agent/config/pipes.py
 AUDIT_INTERVAL = scaled_duration(100.0, min_val=0.5)      # Prod: 10m -> Test: 5s
 SENTINEL_INTERVAL = scaled_duration(120.0, min_val=MIN_SLEEP_DURATION) # Prod: 2m -> Test: 6s
 HEARTBEAT_INTERVAL = scaled_duration(10.0, min_val=MIN_SLEEP_DURATION) # Prod: 10s -> Test: 0.5s

@@ -1,15 +1,15 @@
-# fusion/tests/runtime/test_fusion_pipeline.py
+# fusion/tests/runtime/test_fusion_pipe.py
 """
-Tests for FusionPipeline.
+Tests for FusionPipe.
 """
 import pytest
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 from typing import Any, Dict, List, Optional
 
-from fustor_core.pipeline import PipelineState
-from fustor_core.pipeline.handler import ViewHandler
-from fustor_fusion.runtime import FusionPipeline
+from fustor_core.pipe import PipeState
+from fustor_core.pipe.handler import ViewHandler
+from fustor_fusion.runtime import FusionPipe
 
 
 class MockViewHandler(ViewHandler):
@@ -53,7 +53,7 @@ def mock_view_handler():
 
 
 @pytest.fixture
-def pipeline_config():
+def pipe_config():
     return {
         "view_id": "1",
         "allow_concurrent_push": True,
@@ -62,163 +62,163 @@ def pipeline_config():
 
 
 @pytest.fixture
-def fusion_pipeline(mock_view_handler, pipeline_config):
-    return FusionPipeline(
-        pipeline_id="test-pipeline",
-        config=pipeline_config,
+def fusion_pipe(mock_view_handler, pipe_config):
+    return FusionPipe(
+        pipe_id="test-pipe",
+        config=pipe_config,
         view_handlers=[mock_view_handler]
     )
 
 
-class TestFusionPipelineInit:
-    """Test FusionPipeline initialization."""
+class TestFusionPipeInit:
+    """Test FusionPipe initialization."""
     
-    def test_initial_state(self, fusion_pipeline):
-        """Pipeline should start in STOPPED state."""
-        assert fusion_pipeline.state == PipelineState.STOPPED
-        assert fusion_pipeline.view_id == "1"
+    def test_initial_state(self, fusion_pipe):
+        """Pipe should start in STOPPED state."""
+        assert fusion_pipe.state == PipeState.STOPPED
+        assert fusion_pipe.view_id == "1"
     
-    def test_view_handlers_registered(self, fusion_pipeline, mock_view_handler):
+    def test_view_handlers_registered(self, fusion_pipe, mock_view_handler):
         """View handlers should be registered."""
-        assert "mock-view" in fusion_pipeline.get_available_views()
-        assert fusion_pipeline.get_view_handler("mock-view") is mock_view_handler
+        assert "mock-view" in fusion_pipe.get_available_views()
+        assert fusion_pipe.get_view_handler("mock-view") is mock_view_handler
     
-    def test_config_parsing(self, fusion_pipeline, pipeline_config):
+    def test_config_parsing(self, fusion_pipe, pipe_config):
         """Configuration should be parsed correctly."""
-        assert fusion_pipeline.allow_concurrent_push == pipeline_config["allow_concurrent_push"]
-        assert fusion_pipeline.queue_batch_size == pipeline_config["queue_batch_size"]
+        assert fusion_pipe.allow_concurrent_push == pipe_config["allow_concurrent_push"]
+        assert fusion_pipe.queue_batch_size == pipe_config["queue_batch_size"]
     
     @pytest.mark.asyncio
-    async def test_dto(self, fusion_pipeline):
-        """get_dto should return pipeline info."""
-        dto = await fusion_pipeline.get_dto()
-        assert dto["id"] == "test-pipeline"
+    async def test_dto(self, fusion_pipe):
+        """get_dto should return pipe info."""
+        dto = await fusion_pipe.get_dto()
+        assert dto["id"] == "test-pipe"
         assert dto["view_id"] == "1"
         assert "mock-view" in dto["view_handlers"]
         assert "statistics" in dto
 
 
-class TestFusionPipelineLifecycle:
-    """Test FusionPipeline start/stop lifecycle."""
+class TestFusionPipeLifecycle:
+    """Test FusionPipe start/stop lifecycle."""
     
     @pytest.mark.asyncio
-    async def test_start(self, fusion_pipeline, mock_view_handler):
+    async def test_start(self, fusion_pipe, mock_view_handler):
         """start() should initialize handlers and start processing."""
-        await fusion_pipeline.start()
+        await fusion_pipe.start()
         
-        assert fusion_pipeline.is_running()
+        assert fusion_pipe.is_running()
         assert mock_view_handler.initialized
         
-        await fusion_pipeline.stop()
+        await fusion_pipe.stop()
     
     @pytest.mark.asyncio
-    async def test_stop(self, fusion_pipeline, mock_view_handler):
+    async def test_stop(self, fusion_pipe, mock_view_handler):
         """stop() should close handlers."""
-        await fusion_pipeline.start()
-        await fusion_pipeline.stop()
+        await fusion_pipe.start()
+        await fusion_pipe.stop()
         
-        assert not fusion_pipeline.is_running()
+        assert not fusion_pipe.is_running()
         assert mock_view_handler._closed
 
 
-class TestFusionPipelineSession:
+class TestFusionPipeSession:
     """Test session management."""
     
     @pytest.mark.asyncio
-    async def test_session_created_first_is_leader(self, fusion_pipeline, mock_view_handler):
+    async def test_session_created_first_is_leader(self, fusion_pipe, mock_view_handler):
         """First session should become leader."""
         from fustor_fusion.runtime.session_bridge import create_session_bridge
-        bridge = create_session_bridge(fusion_pipeline)
+        bridge = create_session_bridge(fusion_pipe)
         
-        await fusion_pipeline.start()
+        await fusion_pipe.start()
         
         # Use bridge to create session (handles election and backing store)
-        await bridge.create_session(task_id="agent:pipeline", session_id="sess-1")
+        await bridge.create_session(task_id="agent:pipe", session_id="sess-1")
         
-        assert await fusion_pipeline.get_session_role("sess-1") == "leader"
+        assert await fusion_pipe.get_session_role("sess-1") == "leader"
         assert mock_view_handler.session_starts == 1
         
-        await fusion_pipeline.stop()
+        await fusion_pipe.stop()
     
     @pytest.mark.asyncio
-    async def test_session_created_second_is_follower(self, fusion_pipeline):
+    async def test_session_created_second_is_follower(self, fusion_pipe):
         """Second session should be follower."""
         from fustor_fusion.runtime.session_bridge import create_session_bridge
-        bridge = create_session_bridge(fusion_pipeline)
+        bridge = create_session_bridge(fusion_pipe)
         
-        await fusion_pipeline.start()
+        await fusion_pipe.start()
         
-        await bridge.create_session(task_id="agent1:pipeline", session_id="sess-1")
-        await bridge.create_session(task_id="agent2:pipeline", session_id="sess-2")
+        await bridge.create_session(task_id="agent1:pipe", session_id="sess-1")
+        await bridge.create_session(task_id="agent2:pipe", session_id="sess-2")
         
-        assert await fusion_pipeline.get_session_role("sess-1") == "leader"
-        assert await fusion_pipeline.get_session_role("sess-2") == "follower"
+        assert await fusion_pipe.get_session_role("sess-1") == "leader"
+        assert await fusion_pipe.get_session_role("sess-2") == "follower"
         
-        await fusion_pipeline.stop()
+        await fusion_pipe.stop()
     
     @pytest.mark.asyncio
-    async def test_leader_election_on_close(self, fusion_pipeline):
+    async def test_leader_election_on_close(self, fusion_pipe):
         """New leader should be elected when leader leaves."""
         from fustor_fusion.runtime.session_bridge import create_session_bridge
-        bridge = create_session_bridge(fusion_pipeline)
+        bridge = create_session_bridge(fusion_pipe)
         
-        await fusion_pipeline.start()
+        await fusion_pipe.start()
         
-        await bridge.create_session(task_id="agent1:pipeline", session_id="sess-1")
-        await bridge.create_session(task_id="agent2:pipeline", session_id="sess-2")
+        await bridge.create_session(task_id="agent1:pipe", session_id="sess-1")
+        await bridge.create_session(task_id="agent2:pipe", session_id="sess-2")
         
-        # Close via bridge (which calls pipeline.on_session_closed)
+        # Close via bridge (which calls pipe.on_session_closed)
         await bridge.close_session("sess-1")
         
-        assert await fusion_pipeline.get_session_role("sess-2") == "leader"
+        assert await fusion_pipe.get_session_role("sess-2") == "leader"
         
-        await fusion_pipeline.stop()
+        await fusion_pipe.stop()
 
 
-class TestFusionPipelineDto:
+class TestFusionPipeDto:
     """Test DTO and stats."""
     
     @pytest.mark.asyncio
-    async def test_aggregated_stats(self, fusion_pipeline, mock_view_handler):
+    async def test_aggregated_stats(self, fusion_pipe, mock_view_handler):
         """Aggregated stats should include view stats."""
-        await fusion_pipeline.start()
+        await fusion_pipe.start()
         
-        stats = await fusion_pipeline.get_aggregated_stats()
+        stats = await fusion_pipe.get_aggregated_stats()
         
-        assert "pipeline" in stats
+        assert "pipe" in stats
         assert "views" in stats
         assert "mock-view" in stats["views"]
         
-        await fusion_pipeline.stop()
+        await fusion_pipe.stop()
     
-    def test_str_representation(self, fusion_pipeline):
+    def test_str_representation(self, fusion_pipe):
         """__str__ should return readable format."""
-        s = str(fusion_pipeline)
-        assert "test-pipeline" in s
+        s = str(fusion_pipe)
+        assert "test-pipe" in s
         assert "STOPPED" in s
 
 
-class TestFusionPipelineViewHandler:
+class TestFusionPipeViewHandler:
     """Test view handler operations."""
     
-    def test_register_handler(self, fusion_pipeline):
+    def test_register_handler(self, fusion_pipe):
         """should be able to register additional handlers."""
         new_handler = MockViewHandler("another-view")
-        fusion_pipeline.register_view_handler(new_handler)
+        fusion_pipe.register_view_handler(new_handler)
         
-        assert "another-view" in fusion_pipeline.get_available_views()
+        assert "another-view" in fusion_pipe.get_available_views()
     
     @pytest.mark.asyncio
-    async def test_get_view(self, fusion_pipeline, mock_view_handler):
+    async def test_get_view(self, fusion_pipe, mock_view_handler):
         """get_view should return handler's data view."""
-        await fusion_pipeline.start()
+        await fusion_pipe.start()
         
-        view = fusion_pipeline.get_view("mock-view")
+        view = fusion_pipe.get_view("mock-view")
         assert view == {"events_count": 0}
         
-        await fusion_pipeline.stop()
+        await fusion_pipe.stop()
     
-    def test_get_view_nonexistent(self, fusion_pipeline):
+    def test_get_view_nonexistent(self, fusion_pipe):
         """get_view should return None for nonexistent handler."""
-        view = fusion_pipeline.get_view("nonexistent")
+        view = fusion_pipe.get_view("nonexistent")
         assert view is None

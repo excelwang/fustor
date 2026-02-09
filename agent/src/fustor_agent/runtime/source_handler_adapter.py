@@ -1,14 +1,14 @@
 # agent/src/fustor_agent/runtime/source_handler_adapter.py
 """
-Adapter to wrap a Source driver as a SourceHandler for use in AgentPipeline.
+Adapter to wrap a Source driver as a SourceHandler for use in AgentPipe.
 
 This allows the existing source-fs and other driver implementations
-to be used with the new Pipeline-based architecture.
+to be used with the new Pipe-based architecture.
 """
 import logging
 from typing import Any, Dict, Iterator, List, Optional, TYPE_CHECKING
 
-from fustor_core.pipeline.handler import SourceHandler
+from fustor_core.pipe.handler import SourceHandler
 from fustor_core.models.config import SourceConfig
 
 if TYPE_CHECKING:
@@ -25,7 +25,7 @@ class SourceHandlerAdapter(SourceHandler):
     
     This adapter bridges the gap between:
     - Source drivers (like FSDriver) which are class-based with entry points
-    - SourceHandler (pipeline/handler layer)
+    - SourceHandler (pipe/handler layer)
     
     Example usage:
         from fustor_source_fs import FSDriver
@@ -35,8 +35,8 @@ class SourceHandlerAdapter(SourceHandler):
         driver = FSDriver(id="my-source", config=config)
         handler = SourceHandlerAdapter(driver)
         
-        # Now usable with AgentPipeline
-        pipeline = AgentPipeline(
+        # Now usable with AgentPipe
+        pipe = AgentPipe(
             source_handler=handler,
             sender_handler=sender,
             ...
@@ -91,7 +91,7 @@ class SourceHandlerAdapter(SourceHandler):
                 await self._driver.connect()
             
             # Perform Schema Discovery if required by the driver (V2 Reliability)
-            # This ensures we have a valid connection and matching schema before pipelinestarts
+            # This ensures we have a valid connection and matching schema before pipestarts
             if getattr(self._driver, 'require_schema_discovery', True):
                 if hasattr(self._driver, 'get_available_fields'):
                     logger.info(f"SourceHandlerAdapter {self.id}: Performing schema discovery")

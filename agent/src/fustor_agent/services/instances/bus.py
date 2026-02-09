@@ -35,7 +35,7 @@ from fustor_agent.runtime.bus import MemoryEventBus
 from fustor_core.exceptions import ConfigError, NotFoundError, DriverError, TransientSourceBufferFullError
 
 if TYPE_CHECKING:
-    from fustor_agent.services.instances.pipeline import PipelineInstanceService
+    from fustor_agent.services.instances.pipe import PipeInstanceService
     from fustor_agent.services.drivers.source_driver import SourceDriverService
 
 logger = logging.getLogger("fustor_agent")
@@ -202,10 +202,10 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
         self.source_driver_service = source_driver_service
         self.bus_by_signature: Dict[Any, EventBusInstanceRuntime] = {}
         self._bus_creation_locks: Dict[str, asyncio.Lock] = collections.defaultdict(asyncio.Lock)
-        self.pipeline_instance_service: Optional["PipelineInstanceService"] = None
+        self.pipe_instance_service: Optional["PipeInstanceService"] = None
 
-    def set_dependencies(self, pipeline_instance_service: "PipelineInstanceService"):
-        self.pipeline_instance_service = pipeline_instance_service
+    def set_dependencies(self, pipe_instance_service: "PipeInstanceService"):
+        self.pipe_instance_service = pipe_instance_service
 
     def _generate_source_signature(self, source_config: SourceConfig) -> Any:
         return (source_config.driver, source_config.uri, source_config.credential)
@@ -214,7 +214,7 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
         self, 
         source_id: str,
         source_config: SourceConfig, 
-        pipeline_id: str,
+        pipe_id: str,
         required_position: int,
         fields_mapping: List[FieldMapping],
         force_new: bool = False
@@ -233,7 +233,7 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
                 bus_runtime = None
 
             if bus_runtime and not bus_runtime.internal_bus.can_subscribe(required_position):
-                logger.info(f"Existing bus '{bus_runtime.id}' is unsuitable for pipeline '{pipeline_id}' (requires position {required_position}, bus starts at {bus_runtime.internal_bus.buffer_start_position}). Creating a new bus.")
+                logger.info(f"Existing bus '{bus_runtime.id}' is unsuitable for pipe '{pipe_id}' (requires position {required_position}, bus starts at {bus_runtime.internal_bus.buffer_start_position}). Creating a new bus.")
                 bus_runtime = None
 
             if not bus_runtime:
@@ -256,19 +256,19 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
         # All callers must wait for the producer to be ready before proceeding
         await bus_runtime.ready_event.wait()
 
-        await bus_runtime.internal_bus.subscribe(pipeline_id, required_position, fields_mapping)
+        await bus_runtime.internal_bus.subscribe(pipe_id, required_position, fields_mapping)
         bus_runtime.update_driver_required_fields(bus_runtime.internal_bus.required_fields)
         
         # Return the tuple with the signal
         return bus_runtime, bus_runtime.needed_position_lost
 
-    async def release_subscriber(self, bus_id: str, pipeline_id: str):
+    async def release_subscriber(self, bus_id: str, pipe_id: str):
         bus_runtime = self.get_instance(bus_id)
         if not bus_runtime:
             logger.warning(f"Attempted to release subscriber from non-existent bus '{bus_id}'.")
             return
         
-        await bus_runtime.internal_bus.unsubscribe(pipeline_id)
+        await bus_runtime.internal_bus.unsubscribe(pipe_id)
         
         if bus_runtime.internal_bus.get_subscriber_count() == 0:
             logger.info(f"Bus '{bus_id}' has no more subscribers, stopping its producer.")
@@ -290,7 +290,7 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
     async def commit_and_handle_split(
         self, 
         bus_id: str, 
-        pipeline_id: str, 
+        pipe_id: str, 
         num_events: int, 
         last_consumed_position: int,
         fields_mapping: List[FieldMapping]
@@ -299,7 +299,7 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
         if not bus_runtime:
             return
 
-        task_to_split_id = await bus_runtime.internal_bus.commit(pipeline_id, num_events, last_consumed_position)
+        task_to_split_id = await bus_runtime.internal_bus.commit(pipe_id, num_events, last_consumed_position)
 
         if task_to_split_id:
             logger.warning(f"Bus split condition met on '{bus_id}'. Task '{task_to_split_id}' will be migrated.")
@@ -313,11 +313,11 @@ class EventBusService(BaseInstanceService, EventBusServiceInterface): # Inherit 
             new_bus, needed_position_lost = await self.get_or_create_bus_for_subscriber(
                 source_id=bus_runtime.source_id,
                 source_config=source_config,
-                pipeline_id=task_to_split_id,
+                pipe_id=task_to_split_id,
                 required_position=last_consumed_position,
                 fields_mapping=fields_mapping,
                 force_new=True
             )
             
-            # The remapping pipeline instance needs to know about the signal too
-            await self.pipeline_instance_service.remap_pipeline_to_new_bus(task_to_split_id, new_bus, needed_position_lost)
+            # The remapping pipe instance needs to know about the signal too
+            await self.pipe_instance_service.remap_pipe_to_new_bus(task_to_split_id, new_bus, needed_position_lost)

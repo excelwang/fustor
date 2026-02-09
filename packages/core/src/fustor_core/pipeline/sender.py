@@ -1,6 +1,6 @@
-# packages/core/src/fustor_core/pipeline/sender.py
+# packages/core/src/fustor_core/pipe/sender.py
 """
-Sender Handler abstraction for Agent Pipelines.
+Sender Handler abstraction for Agent Pipes.
 
 A Sender handler transmits events from Agent to Fusion.
 This is the counterpart to SourceHandler.
@@ -38,7 +38,7 @@ class SenderHandler(Handler):
         Create a new session with the Fusion endpoint.
         
         Args:
-            task_id: Unique identifier for the pipeline 
+            task_id: Unique identifier for the pipe 
             source_type: Type of source (e.g., "fs", "mysql")
             session_timeout_seconds: Session timeout value
             **kwargs: Additional session parameters

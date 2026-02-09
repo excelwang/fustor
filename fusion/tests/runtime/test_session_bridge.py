@@ -1,52 +1,52 @@
 # fusion/tests/runtime/test_session_bridge.py
 """
-Tests for PipelineSessionBridge.
+Tests for PipeSessionBridge.
 """
 import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock, patch
 
 from fustor_fusion.runtime import (
-    FusionPipeline,
-    PipelineSessionBridge,
+    FusionPipe,
+    PipeSessionBridge,
     create_session_bridge,
 )
 
 
 @pytest.fixture
-def mock_pipeline():
-    """Create a mock FusionPipeline."""
-    pipeline = MagicMock(spec=FusionPipeline)
-    pipeline.view_id = "1"
-    pipeline._active_sessions = {}
-    pipeline._leader_session = None
-    pipeline.config = {"session_timeout_seconds": 30}
+def mock_pipe():
+    """Create a mock FusionPipe."""
+    pipe = MagicMock(spec=FusionPipe)
+    pipe.view_id = "1"
+    pipe._active_sessions = {}
+    pipe._leader_session = None
+    pipe.config = {"session_timeout_seconds": 30}
     
     # Mock async methods
-    pipeline.on_session_created = AsyncMock()
-    pipeline.on_session_closed = AsyncMock()
+    pipe.on_session_created = AsyncMock()
+    pipe.on_session_closed = AsyncMock()
     
     # Mock get_session_role
     async def get_role(session_id):
-        session = pipeline._active_sessions.get(session_id)
+        session = pipe._active_sessions.get(session_id)
         return session.get("role", "unknown") if session else "unknown"
     
-    pipeline.get_session_role = get_role
+    pipe.get_session_role = get_role
     
     # Mock get_session_info - returns session info with session_id added, or None if not found
     async def get_session_info(session_id):
-        session = pipeline._active_sessions.get(session_id)
+        session = pipe._active_sessions.get(session_id)
         if session:
             return {**session, "session_id": session_id}
         return None
     
-    pipeline.get_session_info = get_session_info
+    pipe.get_session_info = get_session_info
     
     async def get_all_sessions():
-        return {sid: {**s, "session_id": sid} for sid, s in pipeline._active_sessions.items()}
-    pipeline.get_all_sessions = get_all_sessions
+        return {sid: {**s, "session_id": sid} for sid, s in pipe._active_sessions.items()}
+    pipe.get_all_sessions = get_all_sessions
     
-    return pipeline
+    return pipe
 
 
 @pytest.fixture
@@ -62,19 +62,19 @@ def mock_session_manager():
 
 
 @pytest.fixture
-def session_bridge(mock_pipeline, mock_session_manager):
-    """Create a PipelineSessionBridge."""
-    return PipelineSessionBridge(mock_pipeline, mock_session_manager)
+def session_bridge(mock_pipe, mock_session_manager):
+    """Create a PipeSessionBridge."""
+    return PipeSessionBridge(mock_pipe, mock_session_manager)
 
 
-class TestPipelineSessionBridgeInit:
+class TestPipeSessionBridgeInit:
     """Test bridge initialization."""
     
-    def test_init(self, mock_pipeline, mock_session_manager):
-        """Bridge should initialize with pipeline and session manager."""
-        bridge = PipelineSessionBridge(mock_pipeline, mock_session_manager)
+    def test_init(self, mock_pipe, mock_session_manager):
+        """Bridge should initialize with pipe and session manager."""
+        bridge = PipeSessionBridge(mock_pipe, mock_session_manager)
         
-        assert bridge._pipeline is mock_pipeline
+        assert bridge._pipe is mock_pipe
         assert bridge._session_manager is mock_session_manager
         assert bridge._session_view_map == {}
 
@@ -83,21 +83,21 @@ class TestSessionCreation:
     """Test session creation."""
     
     @pytest.mark.asyncio
-    async def test_create_session(self, session_bridge, mock_pipeline, mock_session_manager):
+    async def test_create_session(self, session_bridge, mock_pipe, mock_session_manager):
         """create_session should create in both systems."""
         # Wrap everything in a patch for view_state_manager to avoid side effects
         with patch("fustor_fusion.view_state_manager.view_state_manager.try_become_leader", AsyncMock(return_value=True)), \
              patch("fustor_fusion.view_state_manager.view_state_manager.set_authoritative_session", AsyncMock()), \
              patch("fustor_fusion.view_state_manager.view_state_manager.lock_for_session", AsyncMock()):
             
-            # Simulate pipelinesetting role
+            # Simulate pipesetting role
             async def set_role(session_id, **kwargs):
-                mock_pipeline._active_sessions[session_id] = {"role": "leader"}
+                mock_pipe._active_sessions[session_id] = {"role": "leader"}
             
-            mock_pipeline.on_session_created = set_role
+            mock_pipe.on_session_created = set_role
             
             result = await session_bridge.create_session(
-                task_id="agent-1:pipeline-1",
+                task_id="agent-1:pipe-1",
                 client_ip="192.168.1.1",
                 session_timeout_seconds=60
             )
@@ -106,7 +106,7 @@ class TestSessionCreation:
             mock_session_manager.create_session_entry.assert_called_once()
             call_args = mock_session_manager.create_session_entry.call_args
             assert call_args.kwargs["view_id"] == "1"
-            assert call_args.kwargs["task_id"] == "agent-1:pipeline-1"
+            assert call_args.kwargs["task_id"] == "agent-1:pipe-1"
             assert call_args.kwargs["client_ip"] == "192.168.1.1"
             
             # Verify result
@@ -114,14 +114,14 @@ class TestSessionCreation:
             assert result["session_timeout_seconds"] == 60
     
     @pytest.mark.asyncio
-    async def test_create_session_returns_role(self, session_bridge, mock_pipeline):
-        """create_session should return the role from pipeline."""
+    async def test_create_session_returns_role(self, session_bridge, mock_pipe):
+        """create_session should return the role from pipe."""
         async def set_role(session_id, **kwargs):
-            mock_pipeline._active_sessions[session_id] = {"role": "follower"}
+            mock_pipe._active_sessions[session_id] = {"role": "follower"}
         
-        mock_pipeline.on_session_created = set_role
+        mock_pipe.on_session_created = set_role
         
-        result = await session_bridge.create_session(task_id="agent-1:pipeline-1")
+        result = await session_bridge.create_session(task_id="agent-1:pipe-1")
         
         assert result["role"] == "follower"
 
@@ -130,13 +130,13 @@ class TestSessionKeepAlive:
     """Test keep alive (heartbeat)."""
     
     @pytest.mark.asyncio
-    async def test_keep_alive(self, session_bridge, mock_pipeline, mock_session_manager):
+    async def test_keep_alive(self, session_bridge, mock_pipe, mock_session_manager):
         """keep_alive should update both systems."""
         # First create a session
         async def set_role(session_id, **kwargs):
-            mock_pipeline._active_sessions[session_id] = {"role": "leader"}
+            mock_pipe._active_sessions[session_id] = {"role": "leader"}
         
-        mock_pipeline.on_session_created = set_role
+        mock_pipe.on_session_created = set_role
         
         create_result = await session_bridge.create_session(task_id="agent:sync")
         session_id = create_result["session_id"]
@@ -156,16 +156,16 @@ class TestSessionClose:
     """Test session closure."""
     
     @pytest.mark.asyncio
-    async def test_close_session(self, session_bridge, mock_pipeline, mock_session_manager):
+    async def test_close_session(self, session_bridge, mock_pipe, mock_session_manager):
         """close_session should close in both systems."""
         with patch("fustor_fusion.view_state_manager.view_state_manager.unlock_for_session", AsyncMock()), \
              patch("fustor_fusion.view_state_manager.view_state_manager.release_leader", AsyncMock()):
             # First create a session
             async def set_role(session_id, **kwargs):
-                mock_pipeline._active_sessions[session_id] = {"role": "leader"}
+                mock_pipe._active_sessions[session_id] = {"role": "leader"}
             
-            mock_pipeline.on_session_created = set_role
-            mock_pipeline.on_session_closed = AsyncMock()
+            mock_pipe.on_session_created = set_role
+            mock_pipe.on_session_closed = AsyncMock()
             
             # Initialize map
             session_bridge._session_view_map["sess-123"] = "1"
@@ -179,8 +179,8 @@ class TestSessionClose:
                 session_id="sess-123"
             )
             
-            # Verify pipeline was called
-            mock_pipeline.on_session_closed.assert_called_once_with("sess-123")
+            # Verify pipe was called
+            mock_pipe.on_session_closed.assert_called_once_with("sess-123")
             
             assert result is True
 
@@ -189,9 +189,9 @@ class TestGetSessionInfo:
     """Test session info retrieval."""
     
     @pytest.mark.asyncio
-    async def test_get_session_info_from_pipeline(self, session_bridge, mock_pipeline):
-        """get_session_info should get info from pipeline first."""
-        mock_pipeline._active_sessions["sess-1"] = {
+    async def test_get_session_info_from_pipe(self, session_bridge, mock_pipe):
+        """get_session_info should get info from pipe first."""
+        mock_pipe._active_sessions["sess-1"] = {
             "role": "leader",
             "task_id": "agent:sync"
         }
@@ -228,9 +228,9 @@ class TestGetSessionInfo:
 class TestConvenienceFunction:
     """Test create_session_bridge convenience function."""
     
-    def test_create_session_bridge_with_explicit_manager(self, mock_pipeline, mock_session_manager):
+    def test_create_session_bridge_with_explicit_manager(self, mock_pipe, mock_session_manager):
         """create_session_bridge should work with explicit session manager."""
-        bridge = create_session_bridge(mock_pipeline, mock_session_manager)
+        bridge = create_session_bridge(mock_pipe, mock_session_manager)
         
-        assert isinstance(bridge, PipelineSessionBridge)
+        assert isinstance(bridge, PipeSessionBridge)
         assert bridge._session_manager is mock_session_manager

@@ -7,9 +7,9 @@ class EventBusState(str, Enum):
     PRODUCING = "PRODUCING"
     ERROR = "ERROR"
 
-class PipelineState(Flag):
+class PipeState(Flag):
     """
-    Enumeration for the state of a pipeline instance.
+    Enumeration for the state of a pipe instance.
     """
     STOPPED = 0
     STARTING = auto()
@@ -29,9 +29,9 @@ class EventBusInstance(BaseModel):
     info: str
     statistics: Dict[str, Any]
 
-class PipelineInstanceDTO(BaseModel):
+class PipeInstanceDTO(BaseModel):
     id: str
-    state: PipelineState
+    state: PipeState
     info: str
     statistics: Dict[str, Any]
     bus_info: Optional[EventBusInstance] = None
@@ -42,8 +42,8 @@ class PipelineInstanceDTO(BaseModel):
 
 class AgentState(BaseModel):
     agent_id: str = Field(..., description="The unique identifier for the agent.")
-    pipelines: Dict[str, PipelineInstanceDTO] = Field(
+    pipes: Dict[str, PipeInstanceDTO] = Field(
         default_factory=dict, 
-        description="A dictionary of all pipelines, keyed by their ID."
+        description="A dictionary of all pipes, keyed by their ID."
     )
     event_buses: Dict[str, EventBusInstance] = Field(default_factory=dict, description="A dictionary of all active event buses, keyed by their ID.")

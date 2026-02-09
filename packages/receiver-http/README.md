@@ -23,16 +23,16 @@ receiver = HTTPReceiver(
     config={"session_timeout_seconds": 30}
 )
 
-# Register API keys for pipelines
-receiver.register_api_key("fk_abc123", "pipeline-1")
+# Register API keys for pipes
+receiver.register_api_key("fk_abc123", "pipe-1")
 
 # Register callbacks
-async def on_session_created(session_id, task_id, pipeline_id, client_info):
+async def on_session_created(session_id, task_id, pipe_id, client_info):
     # Handle session creation
     return SessionInfo(
         session_id=session_id,
         task_id=task_id,
-        pipeline_id=pipeline_id,
+        pipe_id=pipe_id,
         role="leader",
         created_at=time.time(),
         last_heartbeat=time.time()

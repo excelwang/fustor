@@ -31,7 +31,7 @@ Fustor Agent 的 `sender_openapi` 驱动与 Consumer 之间的所有数据推送
 
 *   `agent_id` (`string`): **必需**。推送数据的 Fustor Agent 实例的全局唯一、持久化ID。Fustor Agent 应用在首次启动时会自动生成并保存此ID。
 
-*   `task_id` (`string`): **必需**。当前正在推送数据的Pipeline 任务的唯一ID。`agent_id` 和 `task_id` 的**组合**，才能在分布式环境中唯一标识一个数据流。
+*   `task_id` (`string`): **必需**。当前正在推送数据的Pipe 任务的唯一ID。`agent_id` 和 `task_id` 的**组合**，才能在分布式环境中唯一标识一个数据流。
 
 *   `events` (`Array<Object>`): **必需**。一个事件数据对象的数组。每个对象就是一条需要被处理的数据记录。
 
@@ -91,7 +91,7 @@ Fustor Agent 的 `sender_openapi` 驱动与 Consumer 之间的所有数据推送
 
 ### 4.2. 检查点持久化 (Checkpointing)
 
-您的服务是“真理之源”。在每次成功处理一批事件后，您**必须**将这批事件中最新的 `index`，与 `(agent_id, task_id)` 这个**复合键**关联起来，并将其持久化存储。这是 `GET /pipeline-status` 端点的数据来源。
+您的服务是“真理之源”。在每次成功处理一批事件后，您**必须**将这批事件中最新的 `index`，与 `(agent_id, task_id)` 这个**复合键**关联起来，并将其持久化存储。这是 `GET /pipe-status` 端点的数据来源。
 
 ## 5. 认证
 
@@ -99,7 +99,7 @@ Fustor Agent 的 `sender_openapi` 驱动与 Consumer 之间的所有数据推送
 
 ## 6. 完整交互流程示例
 
-1.  **启动**: Fustor Agent (Agent ID: `agent-A`) 启动一个新任务 (`task-1`)，首先调用 `GET /pipeline-status?agent_id=agent-A&task_id=task-1`，得到 `0`。
+1.  **启动**: Fustor Agent (Agent ID: `agent-A`) 启动一个新任务 (`task-1`)，首先调用 `GET /pipe-status?agent_id=agent-A&task_id=task-1`，得到 `0`。
 2.  **消息阶段**: Fustor Agent 开始向 `POST /ingest-batch` 推送包含 `agent_id: "agent-A"` 和 `task_id: "task-1"` 的实时事件。
 3.  **源端回退**: Fustor Agent 的源驱动发现请求的点位丢失，通过信号链，最终导致 Fustor Agent 在一次 `push` 请求中发送了 `snapshot_sync_suggested: true`。
 4.  **请求快照**: 您的 Consumer 服务收到了这个“建议”，决定需要回填历史数据。于是在这次 `push` 请求的响应中，返回 `{"snapshot_needed": true}`。

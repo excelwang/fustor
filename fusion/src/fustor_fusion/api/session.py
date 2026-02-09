@@ -1,6 +1,6 @@
 # fusion/src/fustor_fusion/api/session.py
 """
-Session management API for creating, maintaining, and closing pipelinesessions.
+Session management API for creating, maintaining, and closing pipesessions.
 """
 from fastapi import APIRouter, Depends, status, HTTPException, Header, Query, Request
 from pydantic import BaseModel
@@ -12,7 +12,7 @@ import uuid
 from ..auth.dependencies import get_view_id_from_api_key
 
 
-from ..config import receivers_config
+from ..config.unified import fusion_config
 from ..core.session_manager import session_manager
 from ..view_state_manager import view_state_manager
 from ..view_manager.manager import reset_views, on_session_start, on_session_close
@@ -33,15 +33,17 @@ class CreateSessionPayload(BaseModel):
     session_timeout_seconds: Optional[int] = None
 
 
-def _get_session_config(pipeline_id: str) -> Dict[str, Any]:
-    """Get session configuration from receivers config."""
-    pipelines = receivers_config.get_active_pipelines()
-    if pipeline_id in pipelines:
-        cfg = pipelines[pipeline_id]
+def _get_session_config(pipe_id: str) -> Dict[str, Any]:
+    """Get session configuration from fusion config (pipes configuration)."""
+    # In unified config, pipe config holds session parameters
+    pipe = fusion_config.get_pipe(pipe_id)
+    
+    if pipe:
         return {
-            "session_timeout_seconds": cfg.get("session_timeout_seconds", DEFAULT_SESSION_TIMEOUT),
-            "allow_concurrent_push": cfg.get("allow_concurrent_push", DEFAULT_ALLOW_CONCURRENT_PUSH),
+            "session_timeout_seconds": pipe.session_timeout_seconds,
+            "allow_concurrent_push": pipe.allow_concurrent_push,
         }
+        
     return {
         "session_timeout_seconds": DEFAULT_SESSION_TIMEOUT,
         "allow_concurrent_push": DEFAULT_ALLOW_CONCURRENT_PUSH,
@@ -87,7 +89,7 @@ async def _should_allow_new_session(
             return False
 
 
-@session_router.post("/", summary="Create new pipelinesession")
+@session_router.post("/", summary="Create new pipesession")
 async def create_session(
     payload: CreateSessionPayload,
     request: Request,

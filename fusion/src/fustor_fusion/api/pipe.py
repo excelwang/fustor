@@ -1,6 +1,6 @@
 # fusion/src/fustor_fusion/api/pipe.py
 """
-Unified Pipeline API Router.
+Unified Pipe API Router.
 
 This module provides the new /api/v1/pipe endpoint that will eventually
 replace /api/v1/ingest. For now, it reuses existing session and ingestion
@@ -14,6 +14,7 @@ API Structure:
 import logging
 from fastapi import APIRouter, HTTPException
 from .. import runtime_objects
+from ..config.unified import fusion_config
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +23,7 @@ from .session import session_router
 from .consistency import consistency_router
 
 # Create unified pipe router
-pipe_router = APIRouter(tags=["Pipeline"])
+pipe_router = APIRouter(tags=["Pipe"])
 
 def setup_pipe_routers():
     """
@@ -34,14 +35,30 @@ def setup_pipe_routers():
     # 1. Clear existing routes to avoid duplicates if called multiple times (e.g. during tests)
     pipe_router.routes = []
     
-    if runtime_objects.pipeline_manager is None:
-        logger.error("setup_pipe_routers called before pipeline_manager initialized!")
+    if runtime_objects.pipe_manager is None:
+        logger.error("setup_pipe_routers called before pipe_manager initialized!")
         return False
         
     success = False
     
     # Get the default HTTP receiver (e.g., 'http-main')
-    receiver = runtime_objects.pipeline_manager.get_receiver("http-main")
+    # Try looking up by common ID first
+    receiver = runtime_objects.pipe_manager.get_receiver("http-main")
+    
+    # If not found, try to find ANY http receiver
+    if not receiver:
+        # scan for http receiver
+        # accessing private _receivers is risky, assume get_receiver handles it or add get_http_receiver
+        pass
+    
+    # Actually, let's rely on get_receiver handling config ID lookup
+    if not receiver:
+         # Try to find valid receiver from loaded configs
+         receivers = fusion_config.get_all_receivers()
+         for rid, rcfg in receivers.items():
+             if rcfg.driver == 'http':
+                 receiver = runtime_objects.pipe_manager.get_receiver(rid)
+                 if receiver: break
     if receiver and hasattr(receiver, "get_session_router"):
         logger.info("Mounting Session and Ingestion routers from HTTPReceiver")
         pipe_router.include_router(receiver.get_session_router(), prefix="/session")
@@ -58,21 +75,21 @@ def setup_pipe_routers():
     pipe_router.include_router(consistency_router)
     
     # 2. Add Management endpoints for debugging/monitoring
-    @pipe_router.get("/pipelines", tags=["Pipeline Management"])
-    async def list_pipelines():
-        """List all managed pipelines."""
-        pipelines = runtime_objects.pipeline_manager.get_pipelines()
-        return {pid: await p.get_dto() for pid, p in pipelines.items()}
+    @pipe_router.get("/pipes", tags=["Pipe Management"])
+    async def list_pipes():
+        """List all managed pipes."""
+        pipes = runtime_objects.pipe_manager.get_pipes()
+        return {pid: await p.get_dto() for pid, p in pipes.items()}
 
-    @pipe_router.get("/pipelines/{pipeline_id}", tags=["Pipeline Management"])
-    async def get_pipeline_info(pipeline_id: str):
-        """Get detailed information about a specific pipeline."""
-        pipeline = runtime_objects.pipeline_manager.get_pipeline(pipeline_id)
-        if not pipeline:
-            raise HTTPException(status_code=404, detail="Pipeline not found")
-        return await pipeline.get_dto()
+    @pipe_router.get("/pipes/{pipe_id}", tags=["Pipe Management"])
+    async def get_pipe_info(pipe_id: str):
+        """Get detailed information about a specific pipe."""
+        pipe = runtime_objects.pipe_manager.get_pipe(pipe_id)
+        if not pipe:
+            raise HTTPException(status_code=404, detail="Pipe not found")
+        return await pipe.get_dto()
     
-    @pipe_router.get("/session/", tags=["Pipeline"])
+    @pipe_router.get("/session/", tags=["Pipe"])
     async def list_active_sessions():
         """
         List all active sessions across all view_ids.

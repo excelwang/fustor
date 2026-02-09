@@ -1,12 +1,12 @@
-# it/consistency/test_pipeline_basic.py
+# it/consistency/test_pipe_basic.py
 """
-Basic integration tests for AgentPipeline.
+Basic integration tests for AgentPipe.
 
-These tests verify that the AgentPipeline architecture works correctly
+These tests verify that the AgentPipe architecture works correctly
 with the integration test environment.
 
 Run with:
-    uv run pytest it/consistency/test_pipeline_basic.py -v
+    uv run pytest it/consistency/test_pipe_basic.py -v
 """
 import time
 import pytest
@@ -19,8 +19,8 @@ logger = logging.getLogger("fustor_test")
 MOUNT_POINT = "/mnt/shared"
 
 
-class TestPipelineBasicOperations:
-    """Test basic file operations in AgentPipeline mode."""
+class TestPipeBasicOperations:
+    """Test basic file operations in AgentPipe mode."""
     
     def test_file_create_detected(
         self, 
@@ -39,13 +39,13 @@ class TestPipelineBasicOperations:
         
         # Create a unique test file
         timestamp = int(time.time() * 1000)
-        file_name = f"pipeline_test_{timestamp}.txt"
+        file_name = f"pipe_test_{timestamp}.txt"
         test_file = f"{MOUNT_POINT}/{file_name}"
         
         # Create file from leader container
         docker_env.exec_in_container(
             leader,
-            ["sh", "-c", f"echo 'Pipeline test content' > {test_file}"]
+            ["sh", "-c", f"echo 'Pipe test content' > {test_file}"]
         )
         logger.info(f"Created test file: {test_file}")
         

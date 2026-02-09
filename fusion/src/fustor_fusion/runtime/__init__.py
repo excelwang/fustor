@@ -2,13 +2,13 @@
 """
 Runtime components for Fustor Fusion.
 
-This module provides the Pipeline-based architecture for Fusion:
+This module provides the Pipe-based architecture for Fusion:
 
-FusionPipeline Architecture:
+FusionPipe Architecture:
 ============================
 
 ┌─────────────────────────────────────────────────────────────┐
-│                    FusionPipeline                           │
+│                    FusionPipe                           │
 │  (receives events from Agents)                              │
 └────────────────────────┬────────────────────────────────────┘
                          │
@@ -23,26 +23,26 @@ FusionPipeline Architecture:
 Example Usage:
 --------------
 
-    from fustor_fusion.runtime import FusionPipeline
+    from fustor_fusion.runtime import FusionPipe
 
-    # Create pipeline
-    pipeline = FusionPipeline(
-        pipeline_id="view-1",
+    # Create pipe
+    pipe = FusionPipe(
+        pipe_id="view-1",
         config={"view_id": 1},
         view_handlers=[fs_view_handler]
     )
 
     # Start processing
-    await pipeline.start()
+    await pipe.start()
 
     # Process incoming events from Agent
-    await pipeline.process_events(events, session_id="sess-123")
+    await pipe.process_events(events, session_id="sess-123")
 
     # Query views
-    tree = pipeline.get_view("fs", path="/")
+    tree = pipe.get_view("fs", path="/")
 """
 
-from .fusion_pipeline import FusionPipeline
+from .fusion_pipe import FusionPipe
 
 from .view_handler_adapter import (
     ViewDriverAdapter,
@@ -52,15 +52,15 @@ from .view_handler_adapter import (
 )
 
 from .session_bridge import (
-    PipelineSessionBridge,
+    PipeSessionBridge,
     create_session_bridge,
 )
 
 
 
 __all__ = [
-    # Pipeline
-    "FusionPipeline",
+    # Pipe
+    "FusionPipe",
     
     # View Handler Adapters
     "ViewDriverAdapter",
@@ -69,7 +69,7 @@ __all__ = [
     "create_view_handler_from_manager",
     
     # Session Bridge
-    "PipelineSessionBridge",
+    "PipeSessionBridge",
     "create_session_bridge",
     
 

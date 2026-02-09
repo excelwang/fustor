@@ -16,12 +16,12 @@ This package is part of the Fustor monorepo and is typically installed in editab
 
 ## Usage
 
-To use the `fustor-sender-echo` driver, configure a Sender in your Fustor Agent setup with the driver type `echo`. When a pipeline involves this sender, all data processed by the Agent will be logged by this driver.
+To use the `fustor-sender-echo` driver, configure a Sender in your Fustor Agent setup with the driver type `echo`. When a pipe involves this sender, all data processed by the Agent will be logged by this driver.
 
 This driver is particularly useful for:
 *   **Debugging**: Understanding the exact data and control signals being sent by the Fustor Agent.
 *   **Development**: As a template for creating new `SenderDriver` implementations.
-*   **Testing**: Verifying that the Fustor Agent's data pipeline is correctly delivering events.
+*   **Testing**: Verifying that the Fustor Agent's data pipe is correctly delivering events.
 
 Example (conceptual configuration in Fustor Agent):
 

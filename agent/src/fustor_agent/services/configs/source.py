@@ -5,7 +5,7 @@ from typing import Dict, Optional, List, Any
 
 # Removed legacy import
 from fustor_core.models.config import AppConfig, SourceConfig
-from fustor_agent.services.instances.pipeline import PipelineInstanceService
+from fustor_agent.services.instances.pipe import PipeInstanceService
 from .base import BaseConfigService
 from fustor_agent.services.common import config_lock
 from fustor_agent.services import schema_cache # Import schema_cache at the top level
@@ -21,14 +21,14 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
     """
     def __init__(self, app_config: AppConfig):
         super().__init__(app_config, None, 'source')
-        self.pipeline_instance_service: Optional[PipelineInstanceService] = None
+        self.pipe_instance_service: Optional[PipeInstanceService] = None
 
-    def set_dependencies(self, pipeline_instance_service: PipelineInstanceService):
+    def set_dependencies(self, pipe_instance_service: PipeInstanceService):
         """
-        Injects the PipelineInstanceService for dependency management.
+        Injects the PipeInstanceService for dependency management.
         This is to resolve circular dependencies between services.
         """
-        self.pipeline_instance_service = pipeline_instance_service
+        self.pipe_instance_service = pipe_instance_service
 
     async def add_config(self, id: str, config: SourceConfig) -> SourceConfig:
         """
@@ -73,8 +73,8 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
         Returns:
             A list of the configuration IDs that were deleted.
         """
-        all_pipeline_configs = self.app_config.get_pipelines().values()
-        in_use_source_ids = {p.source for p in all_pipeline_configs}
+        all_pipe_configs = self.app_config.get_pipes().values()
+        in_use_source_ids = {p.source for p in all_pipe_configs}
 
         all_source_configs = self.list_configs()
         obsolete_ids = [

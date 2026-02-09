@@ -64,10 +64,10 @@ class SessionInfo:
     can_realtime: bool = False
 
     @property
-    def pipeline_id(self) -> str:
+    def pipe_id(self) -> str:
         """Deprecated alias for view_id."""
         import warnings
-        warnings.warn("pipeline_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
+        warnings.warn("pipe_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
         return self.view_id
 
 
@@ -106,8 +106,8 @@ class HTTPReceiver(Receiver):
         self._on_heartbeat: Optional[HeartbeatCallback] = None
         self._on_session_closed: Optional[SessionClosedCallback] = None
         
-        # API key to pipeline mapping
-        self._api_key_to_pipeline: Dict[str, str] = {}
+        # API key to pipe mapping
+        self._api_key_to_pipe: Dict[str, str] = {}
         self._api_key_cache: Dict[str, str] = {}
         
         
@@ -136,11 +136,11 @@ class HTTPReceiver(Receiver):
         if on_session_closed:
             self._on_session_closed = on_session_closed
     
-    def register_api_key(self, api_key: str, pipeline_id: str):
-        """Register an API key for a pipeline."""
-        self._api_key_to_pipeline[api_key] = pipeline_id
+    def register_api_key(self, api_key: str, pipe_id: str):
+        """Register an API key for a pipe."""
+        self._api_key_to_pipe[api_key] = pipe_id
         self._api_key_cache.clear()  # Invalidate cache
-        self.logger.debug(f"Registered API key for pipeline {pipeline_id}")
+        self.logger.debug(f"Registered API key for pipe {pipe_id}")
     
     async def validate_credential(self, credential: Dict[str, Any]) -> Optional[str]:
         """
@@ -150,7 +150,7 @@ class HTTPReceiver(Receiver):
             credential: The credential to validate (expects {"api_key": "..."})
             
         Returns:
-            Associated pipeline_id if valid, None if invalid
+            Associated pipe_id if valid, None if invalid
         """
         api_key = credential.get("api_key") or credential.get("key")
         if not api_key:
@@ -161,10 +161,10 @@ class HTTPReceiver(Receiver):
             return self._api_key_cache[api_key]
             
         # Check mapping
-        if api_key in self._api_key_to_pipeline:
-            pipeline_id = self._api_key_to_pipeline[api_key]
-            self._api_key_cache[api_key] = pipeline_id
-            return pipeline_id
+        if api_key in self._api_key_to_pipe:
+            pipe_id = self._api_key_to_pipe[api_key]
+            self._api_key_cache[api_key] = pipe_id
+            return pipe_id
             
         return None
     
@@ -203,8 +203,8 @@ class HTTPReceiver(Receiver):
                     detail="API key required"
                 )
             
-            pipeline_id = await receiver.validate_credential({"api_key": api_key})
-            if not pipeline_id:
+            pipe_id = await receiver.validate_credential({"api_key": api_key})
+            if not pipe_id:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid API key"
@@ -221,7 +221,7 @@ class HTTPReceiver(Receiver):
                     session_info = await receiver._on_session_created(
                         session_id, 
                         payload.task_id, 
-                        pipeline_id, 
+                        pipe_id, 
                         payload.client_info or {},
                         session_timeout_seconds
                     )

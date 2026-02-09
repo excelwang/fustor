@@ -10,7 +10,7 @@
 
 ## 2. 核心设计原则
 
-1.  **消息优先 (Message-First)**: 系统的默认运行模式是**消息阶段 (Message Sync Phase)**。Pipeline 任务一旦启动，会立即开始监听和推送实时数据流，确保新数据的同步延迟达到最小化。
+1.  **消息优先 (Message-First)**: 系统的默认运行模式是**消息阶段 (Message Sync Phase)**。Pipe 任务一旦启动，会立即开始监听和推送实时数据流，确保新数据的同步延迟达到最小化。
 
 2.  **会话状态管理 (Session-Based State)**: Fustor Agent 与消费端之间的所有交互都基于一个明确的**会话 (Session)**。任务启动时创建会话，并通过心跳维持。消费端负责持久化与该会话相关的同步点位，Fustor Agent 在启动时查询此点位以决定同步的起点。
 
@@ -22,24 +22,24 @@
 
 ### 3.1 数据追赶与恢复：会话与自主快照
 
-**问题描述**: 新启动或长期离线的Pipeline 任务，如何获取其错过的所有历史数据，并平滑地过渡到实时数据流。
+**问题描述**: 新启动或长期离线的Pipe 任务，如何获取其错过的所有历史数据，并平滑地过渡到实时数据流。
 
 **解决方案**: **此问题的解决逻辑由一个“会话优先”的启动策略，和一个由Agent自主决策的、并发执行的“补充快照”机制共同完成。**
 
 全新的、确定性的恢复与数据流如下：
 
-1.  **创建会话**: `AgentPipeline` (同步控制器) 启动后，第一步是调用 `sender_driver.create_session(task_id)`，向消费端请求创建一个新的同步会话，并获取 `session_id`。
+1.  **创建会话**: `AgentPipe` (同步控制器) 启动后，第一步是调用 `sender_driver.create_session(task_id)`，向消费端请求创建一个新的同步会话，并获取 `session_id`。
 
-2.  **查询检查点**: `AgentPipeline` 使用获取到的 `session_id` 调用 `sender_driver.get_latest_committed_index(session_id=...)`，从消费端获取上一次成功同步的检查点 `start_position`。
+2.  **查询检查点**: `AgentPipe` 使用获取到的 `session_id` 调用 `sender_driver.get_latest_committed_index(session_id=...)`，从消费端获取上一次成功同步的检查点 `start_position`。
 
-3.  **启动消息阶段与“尽力而为”**: `AgentPipeline` 请求 `EventBusService` 从 `start_position` 开始提供数据。`EventBusService` 进而要求 `SourceDriver` 的 `get_message_iterator` 从该点位开始。
+3.  **启动消息阶段与“尽力而为”**: `AgentPipe` 请求 `EventBusService` 从 `start_position` 开始提供数据。`EventBusService` 进而要求 `SourceDriver` 的 `get_message_iterator` 从该点位开始。
     *   **如果点位有效**，驱动正常返回事件迭代器。
     *   **如果点位无效** (例如 `fs` 的时间戳过早，或 `mysql` 的 binlog 已被清理)，驱动**不会抛出异常**。相反，它必须从当前可用的**最新位置**开始监听。点位丢失的逻辑由上层服务(`EventBusService`)在订阅时进行处理，并最终决定是否需要触发快照。
 
-4.  **自主启动并发快照**: `AgentPipeline` 在收到 `needed_position_lost=True` 信号后，得知源端发生了数据丢失。它会立即使用 `asyncio.create_task()` **异步启动**一个 `_run_message_sync` 任务，该任务负责在后台独立地进行历史数据回填。
+4.  **自主启动并发快照**: `AgentPipe` 在收到 `needed_position_lost=True` 信号后，得知源端发生了数据丢失。它会立即使用 `asyncio.create_task()` **异步启动**一个 `_run_message_sync` 任务，该任务负责在后台独立地进行历史数据回填。
 
 5.  **并发执行**:
-    *   **主任务 (消息阶段)**: `AgentPipeline` 的主控制循环**不会等待快照**，而是继续执行，从 `EventBus` 获取从**最新点位**开始的实时事件，并推送到消费端。
+    *   **主任务 (消息阶段)**: `AgentPipe` 的主控制循环**不会等待快照**，而是继续执行，从 `EventBus` 获取从**最新点位**开始的实时事件，并推送到消费端。
     *   **后台任务 (快照同步)**: `_run_message_sync` 任务独立运行，分批推送历史数据，完全不影响主线程的实时消息处理。
 
 6.  **心跳维持**: 在整个过程中，一个独立的后台任务会定期调用 `sender_driver.heartbeat(session_id=...)`，确保会话在消费端保持有效。
@@ -66,6 +66,6 @@
 1.  **配置标识**: 在 `SourceConfig` 中包含布尔型标识 `is_transient: bool`，用于标识瞬态数据源。
 2.  **增强总线逻辑**: `EventBus.put()` 方法在尝试添加事件前，会检查总线是否已满。
 3.  **快速失败**: 如果总线已满，且 `put()` 方法的调用者指明了 `is_transient=True`，总线会立即抛出一个 `TransientSourceBufferFullError` 异常，而不会阻塞等待。
-4.  **任务终止**: `AgentPipeline` 的上层逻辑捕获此异常后，会将Pipeline 任务置为 `ERROR` 状态，并向用户显示清晰的错误信息，例如："**瞬态数据源 'source-name' 的事件队列已满，为防止数据丢失，任务已停止。请增大该数据源的 `max_queue_size` 配置项。**"
+4.  **任务终止**: `AgentPipe` 的上层逻辑捕获此异常后，会将Pipe 任务置为 `ERROR` 状态，并向用户显示清晰的错误信息，例如："**瞬态数据源 'source-name' 的事件队列已满，为防止数据丢失，任务已停止。请增大该数据源的 `max_queue_size` 配置项。**"
 
 通过此设计，Fustor Agent 将一个隐蔽的运行时数据丢失风险，转变成了一个有明确指引的、可由用户自行修复的配置问题。

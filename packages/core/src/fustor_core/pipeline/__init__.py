@@ -1,14 +1,14 @@
-# fustor_core.pipeline - Pipeline abstractions for Fustor
+# fustor_core.pipe - Pipe abstractions for Fustor
 
-from .pipeline import Pipeline, PipelineState
-from .context import PipelineContext
+from .pipe import Pipe, PipeState
+from .context import PipeContext
 from .handler import Handler, SourceHandler, ViewHandler
 from .sender import SenderHandler
 
 __all__ = [
-    "Pipeline",
-    "PipelineState",
-    "PipelineContext",
+    "Pipe",
+    "PipeState",
+    "PipeContext",
     "Handler",
     "SourceHandler",
     "ViewHandler",

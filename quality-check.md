@@ -2,7 +2,7 @@
   - [ ] allow_concurrent_push 
   - [ ] may duplicate push
   - [ ] FUSTOR_USE_PIPELINE
-  - [ ] PipelineBridge
+  - [ ] PipeBridge
   - [ ] Tests only
   - [ ] legacy
   - [ ] direct driver mode

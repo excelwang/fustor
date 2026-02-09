@@ -1,10 +1,10 @@
 # Fustor V2 Reliability and Error Recovery Guide
 
-This document describes how Fustor V2 ensures reliable data transfer and handles various error scenarios in its distributed pipeline architecture.
+This document describes how Fustor V2 ensures reliable data transfer and handles various error scenarios in its distributed pipe architecture.
 
 ## 1. Overview
 
-Fustor V2 uses a "Pipeline" model where the Agent and Fusion coordinate through **Sessions**. Reliability is achieved through:
+Fustor V2 uses a "Pipe" model where the Agent and Fusion coordinate through **Sessions**. Reliability is achieved through:
 - **Session-based state tracking**: Ensures both sides are in sync about roles and progress.
 - **Heartbeats**: Detects network failures or process crashes.
 - **Exponential Backoff**: Prevents overwhelming the system during transient errors.
@@ -12,11 +12,11 @@ Fustor V2 uses a "Pipeline" model where the Agent and Fusion coordinate through 
 
 ## 2. Agent Reliability Mechanisms
 
-The `AgentPipeline` implements robust error recovery in its main control loop.
+The `AgentPipe` implements robust error recovery in its main control loop.
 
 ### 2.1 Exponential Backoff
 
-When an error occurs during session creation or data sync, the pipeline enters a retry loop with exponential backoff:
+When an error occurs during session creation or data sync, the pipe enters a retry loop with exponential backoff:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -54,7 +54,7 @@ Reliability also means data correctness. Fustor V2 uses:
 These properties can be set in your `agent-pipes-config/*.yaml`:
 
 ```yaml
-id: my-pipeline
+id: my-pipe
 # ...
 session_timeout_seconds: 30
 heartbeat_interval_sec: 10

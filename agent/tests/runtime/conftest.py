@@ -2,7 +2,7 @@
 import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock
-from fustor_core.pipeline import PipelineState
+from fustor_core.pipe import PipeState
 from .mocks import MockSourceHandler, MockSenderHandler
 
 @pytest.fixture
@@ -21,7 +21,7 @@ def mock_sender():
     return MockSenderHandler()
 
 @pytest.fixture
-def pipeline_config():
+def pipe_config():
     return {
         "batch_size": 5,
         "heartbeat_interval_sec": 0.1,

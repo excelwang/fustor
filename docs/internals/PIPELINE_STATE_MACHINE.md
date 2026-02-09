@@ -1,17 +1,17 @@
-# Fustor Pipeline State Machine
+# Fustor Pipe State Machine
 
-The Fustor Pipeline uses an `IntFlag` bitmask to represent its current state. This allows for composite states where multiple flags can be active simultaneously (e.g., `RUNNING | SNAPSHOT_SYNC`).
+The Fustor Pipe uses an `IntFlag` bitmask to represent its current state. This allows for composite states where multiple flags can be active simultaneously (e.g., `RUNNING | SNAPSHOT_SYNC`).
 
-## State Flags (`fustor_core.pipeline.PipelineState`)
+## State Flags (`fustor_core.pipe.PipeState`)
 
 | Flag | Value | Description |
 |------|-------|-------------|
-| `STOPPED` | 0 | Pipeline is idle and has no active tasks or sessions. |
-| `INITIALIZING` | 1 | Pipeline is setting up resources and handlers. |
-| `RUNNING` | 2 | Pipeline is currently active. Usually combined with a phase flag. |
-| `PAUSED` | 4 | Pipeline is temporarily suspended. |
-| `ERROR` | 8 | Pipeline encountered a fatal error and reached a terminal state. |
-| `CONF_OUTDATED` | 16 | Configuration changed while pipeline was running. |
+| `STOPPED` | 0 | Pipe is idle and has no active tasks or sessions. |
+| `INITIALIZING` | 1 | Pipe is setting up resources and handlers. |
+| `RUNNING` | 2 | Pipe is currently active. Usually combined with a phase flag. |
+| `PAUSED` | 4 | Pipe is temporarily suspended. |
+| `ERROR` | 8 | Pipe encountered a fatal error and reached a terminal state. |
+| `CONF_OUTDATED` | 16 | Configuration changed while pipe was running. |
 | `SNAPSHOT_SYNC` | 32 | Currently executing full snapshot synchronization. |
 | `MESSAGE_SYNC` | 64 | Currently executing realtime message synchronization. |
 | `AUDIT_PHASE` | 128 | Currently executing periodic audit check. |
@@ -31,7 +31,7 @@ The Fustor Pipeline uses an `IntFlag` bitmask to represent its current state. Th
 ## State Transitions (Agent)
 
 1. **Start**: `STOPPED` -> `INITIALIZING` -> `RUNNING`
-2. **Pipeline Flow**: `RUNNING` -> `RUNNING | SNAPSHOT_SYNC` -> `RUNNING | MESSAGE_SYNC`
+2. **Pipe Flow**: `RUNNING` -> `RUNNING | SNAPSHOT_SYNC` -> `RUNNING | MESSAGE_SYNC`
 3. **Audit**: `RUNNING | MESSAGE_SYNC` -> `RUNNING | MESSAGE_SYNC | AUDIT_PHASE` -> `RUNNING | MESSAGE_SYNC`
 4. **Error Recovery**: `RUNNING | ...` -> `RUNNING | RECONNECTING` -> `RUNNING | ...` (if successful) or `ERROR` (if failed max retries)
 5. **Stop**: `RUNNING | ...` -> `STOPPING` -> `DRAINING` -> `STOPPED`

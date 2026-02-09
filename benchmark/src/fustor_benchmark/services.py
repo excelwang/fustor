@@ -159,10 +159,10 @@ class ServiceManager:
         with open(os.path.join(self.env_dir, "senders-config.yaml"), "w") as f:
             yaml.dump(senders_config, f)
 
-        # 3. Pipelines Config
+        # 3. Pipes Config
         os.makedirs(os.path.join(self.env_dir, "agent-pipes-config"), exist_ok=True)
         pipe_config = {
-            "pipeline_id": "bench-pipe",
+            "pipe_id": "bench-pipe",
             "source": "bench-fs",
             "sender": "bench-fusion",
             "disabled": False,
@@ -252,23 +252,23 @@ class ServiceManager:
             time.sleep(0.5)
         return None
 
-    def trigger_agent_audit(self, pipeline_id="bench-pipe"):
-        """Triggers audit for a pipeline instance via Agent API."""
-        url = f"http://localhost:{self.agent_port}/api/instances/pipelines/{pipeline_id}/_actions/trigger_audit"
+    def trigger_agent_audit(self, pipe_id="bench-pipe"):
+        """Triggers audit for a pipe instance via Agent API."""
+        url = f"http://localhost:{self.agent_port}/api/instances/pipes/{pipe_id}/_actions/trigger_audit"
         res = requests.post(url)
         res.raise_for_status()
         return res.json()
 
-    def trigger_agent_sentinel(self, pipeline_id="bench-pipe"):
-        """Triggers sentinel for a pipeline instance via Agent API."""
-        url = f"http://localhost:{self.agent_port}/api/instances/pipelines/{pipeline_id}/_actions/trigger_sentinel"
+    def trigger_agent_sentinel(self, pipe_id="bench-pipe"):
+        """Triggers sentinel for a pipe instance via Agent API."""
+        url = f"http://localhost:{self.agent_port}/api/instances/pipes/{pipe_id}/_actions/trigger_sentinel"
         res = requests.post(url)
         res.raise_for_status()
         return res.json()
 
-    def wait_for_leader(self, pipeline_id="bench-pipe", timeout=30, start_offset=0):
-        click.echo(f"Waiting for {pipeline_id} to become LEADER...")
-        pattern = rf"Assigned LEADER role for {pipeline_id}"
+    def wait_for_leader(self, pipe_id="bench-pipe", timeout=30, start_offset=0):
+        click.echo(f"Waiting for {pipe_id} to become LEADER...")
+        pattern = rf"Assigned LEADER role for {pipe_id}"
         return self.wait_for_log(self.get_agent_log_path(), pattern, start_offset=start_offset, timeout=timeout)
 
     def stop_agent(self):

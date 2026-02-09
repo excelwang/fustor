@@ -1,14 +1,14 @@
 # fusion/src/fustor_fusion/runtime/view_handler_adapter.py
 """
-Adapter to wrap a ViewDriver or ViewManager as a ViewHandler for use in FusionPipeline.
+Adapter to wrap a ViewDriver or ViewManager as a ViewHandler for use in FusionPipe.
 
 This allows the existing view-fs and other view driver implementations
-to be used with the new Pipeline-based architecture.
+to be used with the new Pipe-based architecture.
 """
 import logging
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from fustor_core.pipeline.handler import ViewHandler
+from fustor_core.pipe.handler import ViewHandler
 from fustor_core.drivers import ViewDriver
 from fustor_core.event import EventBase
 
@@ -24,7 +24,7 @@ class ViewDriverAdapter(ViewHandler):
     
     This adapter bridges the gap between:
     - fustor_core.drivers.ViewDriver (driver layer)
-    - fustor_core.pipeline.handler.ViewHandler (pipeline/handler layer)
+    - fustor_core.pipe.handler.ViewHandler (pipe/handler layer)
     
     Example usage:
         from fustor_view_fs import FSViewDriver
@@ -36,9 +36,9 @@ class ViewDriverAdapter(ViewHandler):
         )
         handler = ViewDriverAdapter(driver)
         
-        # Now usable with FusionPipeline
-        pipeline = FusionPipeline(
-            pipeline_id="ds-1",
+        # Now usable with FusionPipe
+        pipe = FusionPipe(
+            pipe_id="ds-1",
             config={...},
             view_handlers=[handler]
         )
@@ -150,7 +150,7 @@ class ViewManagerAdapter(ViewHandler):
     Adapts the entire ViewManager to a single ViewHandler interface.
     
     This is useful when you want to treat the ViewManager's multi-driver
-    routing as a single handler in the FusionPipeline.
+    routing as a single handler in the FusionPipe.
     
     Example usage:
         from fustor_fusion.view_manager.manager import ViewManager
@@ -161,7 +161,7 @@ class ViewManagerAdapter(ViewHandler):
         handler = ViewManagerAdapter(manager)
         
         # Use as a single handler
-        pipeline = FusionPipeline(
+        pipe = FusionPipe(
             view_handlers=[handler]
         )
     """

@@ -64,7 +64,7 @@ class Receiver(ABC):
         Set the callback for processing received events.
         
         Args:
-            handler: Async function taking (pipeline_id, event) and returning success
+            handler: Async function taking (pipe_id, event) and returning success
         """
         self._event_handler = handler
     
@@ -98,7 +98,7 @@ class Receiver(ABC):
             credential: The credential to validate
             
         Returns:
-            Associated pipeline_id if valid, None if invalid
+            Associated pipe_id if valid, None if invalid
         """
         raise NotImplementedError
     
@@ -111,7 +111,7 @@ class Receiver(ABC):
     async def on_session_created(
         self, 
         session_id: str, 
-        pipeline_id: str,
+        pipe_id: str,
         client_info: Optional[Dict[str, Any]] = None
     ) -> None:
         """
@@ -121,7 +121,7 @@ class Receiver(ABC):
         """
         pass
     
-    async def on_session_closed(self, session_id: str, pipeline_id: str) -> None:
+    async def on_session_closed(self, session_id: str, pipe_id: str) -> None:
         """
         Called when a session is closed.
         

@@ -44,12 +44,12 @@ Leader 的选举完全由 Fusion 端控制，采用非抢占式的锁机制。
 `Audit Context` (即 mtime cache) 是 Agent 端的内存缓存，用于实现增量审计 (Incremental Audit) 和 "True Silence" 优化。
 
 ### 2.2 生命周期
-- **存储位置**: `AgentPipeline` 实例的内存堆 (非持久化)。
+- **存储位置**: `AgentPipe` 实例的内存堆 (非持久化)。
 - **构建时机**: 当选 Leader 后的 **第一次 Audit** 过程中动态构建。
 - **清空时机**:
     1. **Session 重建**: 显式清空。
     2. **角色切换**: 当选 Leader 时 (`_handle_role_change`) 显式清空。
-    3. **Pipeline 重启**: 进程重启意味着内存丢失。
+    3. **Pipe 重启**: 进程重启意味着内存丢失。
 
 ### 2.3 行为影响
 - **Leader 当选后首轮审计**: **全量扫描** (IO 较高)。

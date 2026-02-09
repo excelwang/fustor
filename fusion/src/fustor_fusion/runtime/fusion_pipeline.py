@@ -1,8 +1,8 @@
-# fusion/src/fustor_fusion/runtime/fusion_pipeline.py
+# fusion/src/fustor_fusion/runtime/fusion_pipe.py
 """
-FusionPipeline - The V2 Pipeline implementation for Fusion.
+FusionPipe - The V2 Pipe implementation for Fusion.
 
-This Pipeline receives events from Agents and dispatches them to ViewHandlers.
+This Pipe receives events from Agents and dispatches them to ViewHandlers.
 It implements the receiver side of the Agent -> Fusion data flow.
 
 Architecture:
@@ -10,7 +10,7 @@ Architecture:
 
     Agent                               Fusion
     ┌─────────────┐                    ┌─────────────────────────────┐
-    │AgentPipeline│ ─── HTTP/gRPC ───▶ │     FusionPipeline          │
+    │AgentPipe│ ─── HTTP/gRPC ───▶ │     FusionPipe          │
     └─────────────┘                    │  ┌─────────────────────┐    │
                                        │  │ ReceiverHandler     │    │
                                        │  │ (session, events)   │    │
@@ -27,66 +27,66 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from fustor_core.pipeline import Pipeline, PipelineState
-from fustor_core.pipeline.handler import ViewHandler
+from fustor_core.pipe import Pipe, PipeState
+from fustor_core.pipe.handler import ViewHandler
 from fustor_core.event import EventBase
 from fustor_core.common.metrics import get_metrics
 
 if TYPE_CHECKING:
-    from fustor_core.pipeline.context import PipelineContext
+    from fustor_core.pipe.context import PipeContext
 
-logger = logging.getLogger("fustor_fusion.pipeline")
+logger = logging.getLogger("fustor_fusion.pipe")
 
 
-class FusionPipeline(Pipeline):
+class FusionPipe(Pipe):
     """
-    Fusion-side Pipeline for receiving and processing events.
+    Fusion-side Pipe for receiving and processing events.
     
-    This pipeline:
+    This pipe:
     1. Receives events from Agents (via receivers)
     2. Dispatches events to registered ViewHandlers
     3. Manages session lifecycle on the Fusion side
     4. Provides aggregated statistics and data views
     
     Usage:
-        from fustor_fusion.runtime import FusionPipeline
+        from fustor_fusion.runtime import FusionPipe
         
-        pipeline = FusionPipeline(
-            pipeline_id="view-1",
+        pipe = FusionPipe(
+            pipe_id="view-1",
             config={"view_id": "view-1"},
             view_handlers=[fs_view_handler, ...]
         )
         
-        await pipeline.start()
+        await pipe.start()
         
         # Process incoming events
-        await pipeline.process_events(events, session_id="...")
+        await pipe.process_events(events, session_id="...")
         
         # Query views
-        data = pipeline.get_view("fs")
+        data = pipe.get_view("fs")
     """
     
     def __init__(
         self,
-        pipeline_id: str,
+        pipe_id: str,
         config: Dict[str, Any],
         view_handlers: Optional[List[ViewHandler]] = None,
-        context: Optional["PipelineContext"] = None
+        context: Optional["PipeContext"] = None
     ):
         """
-        Initialize the FusionPipeline.
+        Initialize the FusionPipe.
         
         Args:
-            pipeline_id: Unique identifier (typically view_id)
+            pipe_id: Unique identifier (typically view_id)
             config: Configuration dict containing:
                 - view_id: str
             view_handlers: List of ViewHandler instances to dispatch events to
-            context: Optional PipelineContext for dependency injection
+            context: Optional PipeContext for dependency injection
         """
-        super().__init__(pipeline_id, config, context)
+        super().__init__(pipe_id, config, context)
         
         # Terminology: view_id is the primary identifier
-        self.view_id = str(config.get("view_id", pipeline_id))
+        self.view_id = str(config.get("view_id", pipe_id))
 
         
         self.allow_concurrent_push = config.get("allow_concurrent_push", True)
@@ -96,8 +96,8 @@ class FusionPipeline(Pipeline):
         self._view_handlers: Dict[str, ViewHandler] = {}
         for handler in (view_handlers or []):
             self.register_view_handler(handler)
-        # Session tracking - handled centrally via PipelineManager/SessionManager
-        self._lock = asyncio.Lock()  # Generic lock for pipelinestate
+        # Session tracking - handled centrally via PipeManager/SessionManager
+        self._lock = asyncio.Lock()  # Generic lock for pipestate
         
         # Processing task
         self._processing_task: Optional[asyncio.Task] = None
@@ -140,13 +140,13 @@ class FusionPipeline(Pipeline):
         return list(self._view_handlers.keys())
     
     async def start(self) -> None:
-        """Start the pipeline and begin processing events."""
+        """Start the pipe and begin processing events."""
         if self.is_running():
-            logger.warning(f"Pipeline {self.id} is already running")
+            logger.warning(f"Pipe {self.id} is already running")
             return
         
-        logger.info(f"Starting FusionPipeline {self.id}")
-        self._set_state(PipelineState.RUNNING, "Pipeline started")
+        logger.info(f"Starting FusionPipe {self.id}")
+        self._set_state(PipeState.RUNNING, "Pipe started")
         
         # Initialize all handlers
         for handler in self._view_handlers.values():
@@ -156,24 +156,24 @@ class FusionPipeline(Pipeline):
         # Start processing task
         self._processing_task = asyncio.create_task(
             self._processing_loop(),
-            name=f"fusion-pipeline-{self.id}"
+            name=f"fusion-pipe-{self.id}"
         )
         
         # Start cleanup task
         self._cleanup_task = asyncio.create_task(
             self._session_cleanup_loop(),
-            name=f"fusion-pipeline-cleanup-{self.id}"
+            name=f"fusion-pipe-cleanup-{self.id}"
         )
         
-        logger.info(f"FusionPipeline {self.id} started with {len(self._view_handlers)} view handlers")
+        logger.info(f"FusionPipe {self.id} started with {len(self._view_handlers)} view handlers")
     
     async def stop(self) -> None:
-        """Stop the pipeline."""
+        """Stop the pipe."""
         if not self.is_running():
             return
         
-        logger.info(f"Stopping FusionPipeline {self.id}")
-        self._set_state(PipelineState.PAUSED, "Pipeline stopping")
+        logger.info(f"Stopping FusionPipe {self.id}")
+        self._set_state(PipeState.PAUSED, "Pipe stopping")
         
         # Cancel processing task
         if self._processing_task:
@@ -194,15 +194,15 @@ class FusionPipeline(Pipeline):
         # Clear sessions for this view
         await session_manager.clear_all_sessions(self.view_id)
         
-        self._set_state(PipelineState.STOPPED, "Pipeline stopped")
+        self._set_state(PipeState.STOPPED, "Pipe stopped")
         if self._cleanup_task:
             self._cleanup_task.cancel()
             
-        logger.info(f"FusionPipeline {self.id} stopped")
+        logger.info(f"FusionPipe {self.id} stopped")
     
     async def _processing_loop(self) -> None:
         """Background loop for processing queued events."""
-        logger.debug(f"Processing loop started for pipeline {self.id}")
+        logger.debug(f"Processing loop started for pipe {self.id}")
         
         while True:
             try:
@@ -219,13 +219,13 @@ class FusionPipeline(Pipeline):
                     self.statistics["events_processed"] += 1
                 
                 duration = time.time() - t0
-                get_metrics().counter("fustor.fusion.events_processed", len(event_batch), {"pipeline": self.id})
-                get_metrics().histogram("fustor.fusion.processing_latency", duration, {"pipeline": self.id})
+                get_metrics().counter("fustor.fusion.events_processed", len(event_batch), {"pipe": self.id})
+                get_metrics().histogram("fustor.fusion.processing_latency", duration, {"pipe": self.id})
                 
                 self._event_queue.task_done()
                 
             except asyncio.CancelledError:
-                logger.debug(f"Processing loop cancelled for pipeline {self.id}")
+                logger.debug(f"Processing loop cancelled for pipe {self.id}")
                 break
             except Exception as e:
                 logger.error(f"Error in processing loop: {e}", exc_info=True)
@@ -296,7 +296,7 @@ class FusionPipeline(Pipeline):
             is_leader: Whether this session has been elected as leader (by bridge)
             **kwargs: Additional metadata
         """
-        # Note: Session creation in backing store is handled by PipelineSessionBridge
+        # Note: Session creation in backing store is handled by PipeSessionBridge
         
         self.statistics["sessions_created"] += 1
         
@@ -314,7 +314,7 @@ class FusionPipeline(Pipeline):
         """
         Handle session closure notification.
         """
-        # Note: Session removal from backing store is handled by PipelineSessionBridge
+        # Note: Session removal from backing store is handled by PipeSessionBridge
         
         self.statistics["sessions_closed"] += 1
         
@@ -394,11 +394,11 @@ class FusionPipeline(Pipeline):
             Processing result dict
         """
         if not self.is_running():
-            return {"success": False, "error": "Pipeline not running"}
+            return {"success": False, "error": "Pipe not running"}
         
         async with self._lock:
             self.statistics["events_received"] += len(events)
-            logger.debug(f"Pipeline {self.id}: Received {len(events)} events from {session_id} (source={source_type})")
+            logger.debug(f"Pipe {self.id}: Received {len(events)} events from {session_id} (source={source_type})")
         
         # Convert dict events to EventBase if needed
         processed_events = []
@@ -411,7 +411,7 @@ class FusionPipeline(Pipeline):
         
         # Queue for processing
         self.statistics["events_received"] += len(events)
-        get_metrics().counter("fustor.fusion.events_received", len(events), {"pipeline": self.id, "source": source_type})
+        get_metrics().counter("fustor.fusion.events_received", len(events), {"pipe": self.id, "source": source_type})
         await self._event_queue.put(processed_events)
         
         # Handle snapshot completion signal
@@ -421,9 +421,9 @@ class FusionPipeline(Pipeline):
             # Only leader can signal snapshot end
             if await view_state_manager.is_leader(self.view_id, session_id):
                 await view_state_manager.set_snapshot_complete(self.view_id, session_id)
-                logger.info(f"Pipeline {self.id}: Received snapshot end signal from leader session {session_id}. Marking snapshot as complete.")
+                logger.info(f"Pipe {self.id}: Received snapshot end signal from leader session {session_id}. Marking snapshot as complete.")
             else:
-                logger.warning(f"Pipeline {self.id}: Received snapshot end signal from non-leader session {session_id}. Ignored.")
+                logger.warning(f"Pipe {self.id}: Received snapshot end signal from non-leader session {session_id}. Ignored.")
 
         return {
             "success": True,
@@ -453,7 +453,7 @@ class FusionPipeline(Pipeline):
     # --- DTO & Stats ---
     
     async def get_dto(self) -> Dict[str, Any]:
-        """Get pipelinestatus as a dictionary."""
+        """Get pipestatus as a dictionary."""
         from ..core.session_manager import session_manager
         from ..view_state_manager import view_state_manager
         
@@ -475,11 +475,11 @@ class FusionPipeline(Pipeline):
     
     async def get_aggregated_stats(self) -> Dict[str, Any]:
         """Get aggregated statistics from all view handlers."""
-        pipeline_stats = self.statistics.copy()
-        pipeline_stats["queue_size"] = self._event_queue.qsize()
+        pipe_stats = self.statistics.copy()
+        pipe_stats["queue_size"] = self._event_queue.qsize()
         
         stats = {
-            "pipeline": pipeline_stats,
+            "pipe": pipe_stats,
             "views": {},
         }
         
@@ -525,7 +525,7 @@ class FusionPipeline(Pipeline):
         return self._cached_leader_session
     
     def __str__(self) -> str:
-        return f"FusionPipeline({self.id}, state={self.state.name})"
+        return f"FusionPipe({self.id}, state={self.state.name})"
 
 
 

@@ -268,7 +268,7 @@ class ViewStateManager:
             return None
 
     async def get_leader(self, view_id: str) -> Optional[str]:
-        """Alias for get_leader_session_id to match FusionPipeline expectations."""
+        """Alias for get_leader_session_id to match FusionPipe expectations."""
         return await self.get_leader_session_id(view_id)
 
     async def clear_state(self, view_id: str):

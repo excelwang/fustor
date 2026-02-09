@@ -1,7 +1,7 @@
 """
-Pipeline abstraction for Fustor.
+Pipe abstraction for Fustor.
 
-A Pipeline represents the runtime binding between data sources/receivers
+A Pipe represents the runtime binding between data sources/receivers
 and data sinks/views. It manages the lifecycle of data transfer tasks.
 """
 from abc import ABC, abstractmethod
@@ -10,15 +10,15 @@ from typing import Optional, Dict, Any, TYPE_CHECKING
 import logging
 
 if TYPE_CHECKING:
-    from .context import PipelineContext
+    from .context import PipeContext
     from .handler import Handler
 
 logger = logging.getLogger(__name__)
 
 
-class PipelineState(IntFlag):
+class PipeState(IntFlag):
     """
-    Pipeline state flags using bitmask for composite states.
+    Pipe state flags using bitmask for composite states.
     
     States can be combined, e.g., RUNNING | CONF_OUTDATED
     """
@@ -36,55 +36,55 @@ class PipelineState(IntFlag):
     STOPPING = auto()        # Gracefully stopping
 
 
-class Pipeline(ABC):
+class Pipe(ABC):
     """
-    Abstract base class for all Pipelines.
+    Abstract base class for all Pipes.
     
-    A Pipeline orchestrates:
+    A Pipe orchestrates:
     - Session lifecycle management
     - Handler invocation (Source/Sender or Receiver/View)
     - Heartbeat and timeout handling
     - Error recovery
     
-    Agent Pipeline: Source -> Sender
-    Fusion Pipeline: Receiver -> View(s)
+    Agent Pipe: Source -> Sender
+    Fusion Pipe: Receiver -> View(s)
     """
     
     def __init__(
         self,
-        pipeline_id: str,
+        pipe_id: str,
         config: Dict[str, Any],
-        context: Optional["PipelineContext"] = None
+        context: Optional["PipeContext"] = None
     ):
         """
-        Initialize the pipeline.
+        Initialize the pipe.
         
         Args:
-            pipeline_id: Unique identifier for this pipeline
-            config: Pipeline configuration dictionary
-            context: Optional shared context for cross-pipeline coordination
+            pipe_id: Unique identifier for this pipe
+            config: Pipe configuration dictionary
+            context: Optional shared context for cross-pipe coordination
         """
-        self.id = pipeline_id
+        self.id = pipe_id
         self.config = config
         self.context = context
-        self.state = PipelineState.STOPPED
+        self.state = PipeState.STOPPED
         self.info: Optional[str] = None  # Human-readable status info
-        self.logger = logging.getLogger(f"{__name__}.{pipeline_id}")
+        self.logger = logging.getLogger(f"{__name__}.{pipe_id}")
         
         # Session tracking
         self.session_id: Optional[str] = None
         self.session_timeout_seconds: int = config.get("session_timeout_seconds", 30)
         
     def __str__(self) -> str:
-        return f"Pipeline({self.id}, state={self.state.name})"
+        return f"Pipe({self.id}, state={self.state.name})"
     
-    def _set_state(self, new_state: PipelineState, info: Optional[str] = None):
-        """Update pipelinestate with optional info message."""
+    def _set_state(self, new_state: PipeState, info: Optional[str] = None):
+        """Update pipestate with optional info message."""
         old_state = self.state
         self.state = new_state
         if info:
             self.info = info
-        if PipelineState.ERROR in new_state:
+        if PipeState.ERROR in new_state:
             self.logger.warning(f"State changed: {old_state.name} -> {new_state.name}" + 
                             (f" ({info})" if info else ""))
         else:
@@ -94,7 +94,7 @@ class Pipeline(ABC):
     @abstractmethod
     async def start(self) -> None:
         """
-        Start the pipeline.
+        Start the pipe.
         
         This should:
         1. Initialize handlers
@@ -106,7 +106,7 @@ class Pipeline(ABC):
     @abstractmethod
     async def stop(self) -> None:
         """
-        Stop the pipeline gracefully.
+        Stop the pipe gracefully.
         
         This should:
         1. Stop data transfer loop
@@ -116,7 +116,7 @@ class Pipeline(ABC):
         raise NotImplementedError
     
     async def restart(self) -> None:
-        """Restart the pipeline (stop then start)."""
+        """Restart the pipe (stop then start)."""
         await self.stop()
         await self.start()
     
@@ -142,24 +142,24 @@ class Pipeline(ABC):
         raise NotImplementedError
     
     def is_running(self) -> bool:
-        """Check if pipeline is in a running state."""
-        return bool(self.state & (PipelineState.RUNNING | 
-                                  PipelineState.PAUSED |
-                                  PipelineState.RECONNECTING |
-                                  PipelineState.SNAPSHOT_SYNC | 
-                                  PipelineState.MESSAGE_SYNC | 
-                                  PipelineState.AUDIT_PHASE))
+        """Check if pipe is in a running state."""
+        return bool(self.state & (PipeState.RUNNING | 
+                                  PipeState.PAUSED |
+                                  PipeState.RECONNECTING |
+                                  PipeState.SNAPSHOT_SYNC | 
+                                  PipeState.MESSAGE_SYNC | 
+                                  PipeState.AUDIT_PHASE))
     
     def has_active_session(self) -> bool:
-        """Check if pipeline has an active session with the remote peer."""
+        """Check if pipe has an active session with the remote peer."""
         return self.session_id is not None
 
     def is_outdated(self) -> bool:
-        """Check if pipeline configuration is outdated."""
-        return bool(self.state & PipelineState.CONF_OUTDATED)
+        """Check if pipe configuration is outdated."""
+        return bool(self.state & PipeState.CONF_OUTDATED)
     
     def get_dto(self) -> Dict[str, Any]:
-        """Get a data transfer object representation of the pipeline."""
+        """Get a data transfer object representation of the pipe."""
         return {
             "id": self.id,
             "state": self.state.name,

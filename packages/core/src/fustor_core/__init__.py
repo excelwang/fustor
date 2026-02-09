@@ -3,7 +3,7 @@ Fustor Core - Foundation module for the Fustor data synchronization platform.
 
 This package provides:
 - Event models and types (event/)
-- Pipeline abstractions (pipeline/)
+- Pipe abstractions (pipe/)
 - Transport abstractions (transport/)
 - Time synchronization (clock/)
 - Common utilities (common/)
@@ -16,14 +16,14 @@ This package provides:
 from . import common
 from . import event
 from . import clock
-from . import pipeline
+from . import pipe
 from . import transport
 from . import models
 
 # Re-export commonly used classes at package level
 from .event import EventBase, EventType, MessageSource
 from .clock import LogicalClock
-from .pipeline import Pipeline, PipelineState, PipelineContext, Handler
+from .pipe import Pipe, PipeState, PipeContext, Handler
 from .transport import Sender, Receiver
 from .exceptions import (
     FustorException,
@@ -42,7 +42,7 @@ __all__ = [
     "common",
     "event",
     "clock",
-    "pipeline",
+    "pipe",
     "transport",
     "models",
     # Event types
@@ -51,10 +51,10 @@ __all__ = [
     "MessageSource",
     # Clock
     "LogicalClock",
-    # Pipeline
-    "Pipeline",
-    "PipelineState",
-    "PipelineContext",
+    # Pipe
+    "Pipe",
+    "PipeState",
+    "PipeContext",
     "Handler",
     # Transport
     "Sender",

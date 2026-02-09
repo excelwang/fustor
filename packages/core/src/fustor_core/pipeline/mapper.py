@@ -1,5 +1,5 @@
 """
-Event Mapper utility for Pipeline.
+Event Mapper utility for Pipe.
 
 Handles transformation of event data based on configuration mapping rules.
 """
@@ -79,7 +79,7 @@ class EventMapper:
                 
                 # Careful: modifying event in place if it's mutable
                 # For safety/correctness with Pydantic, we usually shouldn't mutate 
-                # but for performance in pipeline we often do.
+                # but for performance in pipe we often do.
                 event.rows = new_rows
             
             # If the event itself is a dict (raw), map it directly

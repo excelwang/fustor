@@ -1,18 +1,18 @@
-# agent/tests/runtime/test_agent_pipeline_bus.py
+# agent/tests/runtime/test_agent_pipe_bus.py
 """
-Tests for AgentPipeline integration with EventBus.
+Tests for AgentPipe integration with EventBus.
 """
 import pytest
 import asyncio
 from unittest.mock import MagicMock, AsyncMock
-from fustor_core.pipeline import PipelineState
-from fustor_agent.runtime.agent_pipeline import AgentPipeline
+from fustor_core.pipe import PipeState
+from fustor_agent.runtime.agent_pipe import AgentPipe
 
-class TestAgentPipelineBus:
+class TestAgentPipeBus:
 
     @pytest.mark.asyncio
-    async def test_run_bus_message_sync_success(self, mock_source, mock_sender, pipeline_config):
-        """Pipeline should read from bus and commit successfully."""
+    async def test_run_bus_message_sync_success(self, mock_source, mock_sender, pipe_config):
+        """Pipe should read from bus and commit successfully."""
         # Setup mock bus
         mock_bus = MagicMock()
         mock_bus.id = "bus-123"
@@ -30,16 +30,16 @@ class TestAgentPipelineBus:
         # Override send_batch with AsyncMock for assertions
         mock_sender.send_batch = AsyncMock(return_value=(True, {"count": 1}))
         
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
-        pipeline.session_id = "test-session"
-        pipeline.state = PipelineState.RUNNING
+        pipe.session_id = "test-session"
+        pipe.state = PipeState.RUNNING
         
         # Run bus message sync phase
         try:
-            await pipeline._run_bus_message_sync()
+            await pipe._run_bus_message_sync()
         except asyncio.CancelledError:
             pass
             
@@ -53,11 +53,11 @@ class TestAgentPipelineBus:
         # 3. Should have committed to bus
         mock_bus.internal_bus.commit.assert_called_with("agent:test-id", 1, 100)
         # 4. Statistics should be updated
-        assert pipeline.statistics["events_pushed"] == 1
+        assert pipe.statistics["events_pushed"] == 1
 
     @pytest.mark.asyncio
-    async def test_run_bus_message_sync_retry_on_failure(self, mock_source, mock_sender, pipeline_config):
-        """Pipeline should retry if sending bus events fails."""
+    async def test_run_bus_message_sync_retry_on_failure(self, mock_source, mock_sender, pipe_config):
+        """Pipe should retry if sending bus events fails."""
         mock_bus = MagicMock()
         mock_bus.internal_bus = AsyncMock()
         
@@ -75,16 +75,16 @@ class TestAgentPipelineBus:
             (True, {"success": True})
         ])
         
-        pipeline = AgentPipeline(
-            "test-id", "agent:test-id", pipeline_config,
+        pipe = AgentPipe(
+            "test-id", "agent:test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
-        pipeline.session_id = "test-session"
-        pipeline.state = PipelineState.RUNNING
+        pipe.session_id = "test-session"
+        pipe.state = PipeState.RUNNING
         
         # Run
         try:
-            await pipeline._run_bus_message_sync()
+            await pipe._run_bus_message_sync()
         except asyncio.CancelledError:
             pass
             

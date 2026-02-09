@@ -275,7 +275,7 @@ class TestSenderHandlerAdapterBatch:
 
     @pytest.mark.asyncio
     async def test_send_batch_session_obsolete_error(self, adapter, mock_sender):
-        """send_batch should propagate SessionObsoletedError (important for pipeline)."""
+        """send_batch should propagate SessionObsoletedError (important for pipe)."""
         from fustor_core.exceptions import SessionObsoletedError
         mock_sender._send_events_impl = AsyncMock(side_effect=SessionObsoletedError("Expired"))
         

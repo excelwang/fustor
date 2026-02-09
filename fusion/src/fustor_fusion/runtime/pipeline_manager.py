@@ -1,4 +1,4 @@
-# fusion/src/fustor_fusion/runtime/pipeline_manager.py
+# fusion/src/fustor_fusion/runtime/pipe_manager.py
 import asyncio
 import logging
 import time
@@ -8,7 +8,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from fustor_core.transport import Receiver
 from fustor_core.event import EventBase
 from fustor_receiver_http import HTTPReceiver, SessionInfo
-from .fusion_pipeline import FusionPipeline
+from .fusion_pipe import FusionPipe
 from .session_bridge import create_session_bridge
 from .view_handler_adapter import create_view_handler_from_manager
 from ..config.unified import fusion_config, FusionPipeConfig
@@ -16,26 +16,26 @@ from ..view_manager.manager import get_cached_view_manager
 
 logger = logging.getLogger(__name__)
 
-class PipelineManager:
+class PipeManager:
     """
-    Manages the lifecycle of FusionPipelines and their associated Receivers.
+    Manages the lifecycle of FusionPipes and their associated Receivers.
     
     Refactored to use unified FusionConfigLoader V2.
     """
     
     def __init__(self):
-        self._pipelines: Dict[str, FusionPipeline] = {}
+        self._pipes: Dict[str, FusionPipe] = {}
         self._receivers: Dict[str, Receiver] = {} # Keyed by signature (driver, port)
         self._bridges: Dict[str, Any] = {}
-        self._session_to_pipeline: Dict[str, str] = {}
+        self._session_to_pipe: Dict[str, str] = {}
         self._lock = asyncio.Lock()
         self._target_pipe_ids: List[str] = []
     
-    async def initialize_pipelines(self, config_list: Optional[List[str]] = None):
+    async def initialize_pipes(self, config_list: Optional[List[str]] = None):
         """
-        Initialize pipelines and receivers based on configuration.
+        Initialize pipes and receivers based on configuration.
         """
-        logger.info(f"PipelineManager.initialize_pipelines called with config_list={config_list}")
+        logger.info(f"PipeManager.initialize_pipes called with config_list={config_list}")
         
         # 1. Load configs
         fusion_config.reload()
@@ -83,9 +83,9 @@ class PipelineManager:
                     # Register API keys for this specific pipe on the shared receiver
                     if isinstance(receiver, HTTPReceiver):
                         for ak in r_cfg.api_keys:
-                            # Only register keys relevant to this pipeline
-                            if ak.pipeline_id == p_id:
-                                receiver.register_api_key(ak.key, ak.pipeline_id)
+                            # Only register keys relevant to this pipe
+                            if ak.pipe_id == p_id:
+                                receiver.register_api_key(ak.key, ak.pipe_id)
 
                     # 2. Initialize Views
                     view_handlers = []
@@ -99,20 +99,20 @@ class PipelineManager:
                             handler = create_view_handler_from_manager(vm)
                             view_handlers.append(handler)
                         except Exception as e:
-                            logger.error(f"Failed to load view group {v_id} for pipeline {p_id}: {e}")
+                            logger.error(f"Failed to load view group {v_id} for pipe {p_id}: {e}")
 
                     if not view_handlers:
-                        logger.warning(f"Pipeline {p_id} has no valid views, skipping")
+                        logger.warning(f"Pipe {p_id} has no valid views, skipping")
                         continue
 
-                    # 3. Create Pipeline
+                    # 3. Create Pipe
                     # Determine primary view ID for session leadership
                     primary_view_id = p_id 
                     if p_cfg.views:
                          primary_view_id = p_cfg.views[0]
 
-                    pipeline = FusionPipeline(
-                        pipeline_id=p_id,
+                    pipe = FusionPipe(
+                        pipe_id=p_id,
                         config={
                             "view_id": primary_view_id,
                             "allow_concurrent_push": p_cfg.allow_concurrent_push,
@@ -121,14 +121,14 @@ class PipelineManager:
                         view_handlers=view_handlers
                     )
                     
-                    self._pipelines[p_id] = pipeline
-                    self._bridges[p_id] = create_session_bridge(pipeline)
+                    self._pipes[p_id] = pipe
+                    self._bridges[p_id] = create_session_bridge(pipe)
                     
-                    logger.info(f"Initialized Fusion Pipeline: {p_id} with {len(view_handlers)} views")
+                    logger.info(f"Initialized Fusion Pipe: {p_id} with {len(view_handlers)} views")
                     initialized_count += 1
                     
                 except Exception as e:
-                    logger.error(f"Failed to initialize pipeline {p_id}: {e}", exc_info=True)
+                    logger.error(f"Failed to initialize pipe {p_id}: {e}", exc_info=True)
             
         return {"initialized": initialized_count}
 
@@ -150,8 +150,8 @@ class PipelineManager:
 
     async def start(self):
         async with self._lock:
-            for p_id, pipeline in self._pipelines.items():
-                await pipeline.start()
+            for p_id, pipe in self._pipes.items():
+                await pipe.start()
             for r_sig, receiver in self._receivers.items():
                 await receiver.start()
             logger.info("Fusion components started")
@@ -160,46 +160,66 @@ class PipelineManager:
         async with self._lock:
             for r_sig, receiver in self._receivers.items():
                 await receiver.stop()
-            for p_id, pipeline in self._pipelines.items():
-                await pipeline.stop()
+            for p_id, pipe in self._pipes.items():
+                await pipe.stop()
             logger.info("Fusion components stopped")
 
-    def get_pipelines(self) -> Dict[str, FusionPipeline]:
-        return self._pipelines.copy()
+    def get_pipes(self) -> Dict[str, FusionPipe]:
+        return self._pipes.copy()
+
+    def get_receiver(self, receiver_id: str) -> Optional[Receiver]:
+        """
+        Get receiver by ID (e.g. 'http-main') or internal signature ID.
+        Unified config maps IDs (like 'http-main') to configs.
+        The runtime keyed them by signature (driver, port).
+        We need to match the config ID to the runtime instance.
+        """
+        # 1. Check if receiver_id is a config ID
+        config = fusion_config.get_receiver(receiver_id)
+        if config:
+            sig = (config.driver, config.port)
+            return self._receivers.get(sig)
+        
+        # 2. Check if it's an internal ID (e.g. recv_http_8102)
+        for r in self._receivers.values():
+            if r.receiver_id == receiver_id:
+                return r
+        
+        return None
 
     # --- Receiver Callbacks (UNCHANGED) ---
-    async def _on_session_created(self, session_id, task_id, pipeline_id, client_info, session_timeout_seconds):
+    async def _on_session_created(self, session_id, task_id, pipe_id, client_info, session_timeout_seconds):
         async with self._lock:
-            pipeline = self._pipelines.get(pipeline_id)
-            if not pipeline: raise ValueError(f"Pipeline {pipeline_id} not found")
-            bridge = self._bridges.get(pipeline_id)
+            pipe = self._pipes.get(pipe_id)
+            if not pipe: raise ValueError(f"Pipe {pipe_id} not found")
+            bridge = self._bridges.get(pipe_id)
             # Create session via bridge (legacy compat)
             result = await bridge.create_session(task_id, client_info.get("client_ip"), session_id, session_timeout_seconds)
-            self._session_to_pipeline[session_id] = pipeline_id
-            return SessionInfo(session_id, task_id, pipeline_id, result["role"], time.time(), time.time())
+            self._session_to_pipe[session_id] = pipe_id
+            return SessionInfo(session_id, task_id, pipe_id, result["role"], time.time(), time.time())
 
     async def _on_event_received(self, session_id, events, source_type, is_end):
-        pipeline_id = self._session_to_pipeline.get(session_id)
-        if pipeline_id:
-            pipeline = self._pipelines.get(pipeline_id)
-            if pipeline:
-                res = await pipeline.process_events(events, session_id, source_type, is_end=is_end)
+        pipe_id = self._session_to_pipe.get(session_id)
+        if pipe_id:
+            pipe = self._pipes.get(pipe_id)
+            if pipe:
+                res = await pipe.process_events(events, session_id, source_type, is_end=is_end)
                 return res.get("success", False)
         return False
 
     async def _on_heartbeat(self, session_id, can_realtime=False):
-        pipeline_id = self._session_to_pipeline.get(session_id)
-        if pipeline_id:
-            bridge = self._bridges.get(pipeline_id)
+        pipe_id = self._session_to_pipe.get(session_id)
+        if pipe_id:
+            bridge = self._bridges.get(pipe_id)
             if bridge: return await bridge.keep_alive(session_id, can_realtime=can_realtime)
         return {"status": "error"}
 
     async def _on_session_closed(self, session_id):
         async with self._lock:
-            pipeline_id = self._session_to_pipeline.pop(session_id, None)
-            if pipeline_id:
-                bridge = self._bridges.get(pipeline_id)
+            pipe_id = self._session_to_pipe.pop(session_id, None)
+            if pipe_id:
+                bridge = self._bridges.get(pipe_id)
                 if bridge: await bridge.close_session(session_id)
 
 # Global singleton
-pipeline_manager = PipelineManager()
+pipe_manager = PipeManager()

@@ -32,22 +32,22 @@ from .api.views import view_router
 async def lifespan(app: FastAPI):
     logger.info("Application startup initiated.")
     
-    # Initialize the Pipeline Manager
-    from .runtime.pipeline_manager import pipeline_manager as pm
-    runtime_objects.pipeline_manager = pm
+    # Initialize the Pipe Manager
+    from .runtime.pipe_manager import pipe_manager as pm
+    runtime_objects.pipe_manager = pm
     
     # Read target configs from environment (set by CLI)
     config_env = os.environ.get("FUSTOR_FUSION_CONFIGS")
     config_list = config_env.split(",") if config_env else None
     
-    # Initialize pipelines based on targets
-    await pm.initialize_pipelines(config_list)
+    # Initialize pipes based on targets
+    await pm.initialize_pipes(config_list)
     
-    # Setup Pipeline API routers
+    # Setup Pipe API routers
     from .api.pipe import setup_pipe_routers
     setup_pipe_routers()
     
-    # Start all pipelines and receivers
+    # Start all pipes and receivers
     await pm.start()
 
     # Start periodic suspect cleanup
@@ -71,7 +71,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Starting session cleanup (Interval: {cleanup_interval}s)")
     await session_manager.start_periodic_cleanup(cleanup_interval)
 
-    # Note: View auto-start is now handled by PipelineManager via pipe config
+    # Note: View auto-start is now handled by PipeManager via pipe config
     
     # Setup View routers
     from .api.views import setup_view_routers
@@ -95,8 +95,8 @@ async def lifespan(app: FastAPI):
     logger.info("Application shutdown initiated.")
     suspect_cleanup_task.cancel()
     
-    if runtime_objects.pipeline_manager:
-        await runtime_objects.pipeline_manager.stop()
+    if runtime_objects.pipe_manager:
+        await runtime_objects.pipe_manager.stop()
         
     await session_manager.stop_periodic_cleanup()
     logger.info("Application shutdown complete.")

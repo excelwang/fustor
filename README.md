@@ -39,7 +39,7 @@ mkdir -p ~/.fustor/agent-pipes-config
 ### 3. 角色操作手册
 
 #### 👨‍🔧 Fusion Admin (融合服务管理员)
-**职责**: 配置接收端 (Receiver)、视图 (View) 和管道 (Pipeline)，启动 Fusion 服务。
+**职责**: 配置接收端 (Receiver)、视图 (View) 和管道 (Pipe)，启动 Fusion 服务。
 
 1.  **安装 Fusion**:
     ```bash
@@ -69,7 +69,7 @@ mkdir -p ~/.fustor/agent-pipes-config
       root_path: "/mnt/fusion-view"
     ```
 
-4.  **配置 Pipeline**:
+4.  **配置 Pipe**:
     在 `~/.fustor/fusion-pipes-config/pipe-1.yaml` 中绑定 Receiver 与 View。
 
 5.  **启动 Fusion 服务**:
@@ -87,7 +87,7 @@ mkdir -p ~/.fustor/agent-pipes-config
     pip install fustor-agent fustor-source-fs
     ```
 
-2.  **配置 Pipeline 任务**:
+2.  **配置 Pipe 任务**:
     在 `~/.fustor/agent-pipes-config/pipe-job.yaml` 中定义采集与推送逻辑。
 
 3.  **启动 Agent**:
@@ -113,7 +113,7 @@ mkdir -p ~/.fustor/agent-pipes-config
 
 ## 📖 核心文档
 
-*   **[架构设计 V2 (最新)](docs/refactoring/1-ARCHITECTURE_V2.md)**: 了解 V2 架构的解耦设计、Pipeline 抽象与 Handler 适配器模式。
+*   **[架构设计 V2 (最新)](docs/refactoring/1-ARCHITECTURE_V2.md)**: 了解 V2 架构的解耦设计、Pipe 抽象与 Handler 适配器模式。
 *   **[配置指南](docs/CONFIGURATION.md)**: 详细的 YAML 配置说明。
 *   **[架构设计](docs/ARCHITECTURE.md)**: 了解 Fustor 的顶层设计和服务交互。
 *   **[一致性设计](docs/CONSISTENCY_DESIGN.md)**: 了解多 Agent 环境下的数据一致性机制。
