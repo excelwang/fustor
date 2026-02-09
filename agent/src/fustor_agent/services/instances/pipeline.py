@@ -1,6 +1,7 @@
 import asyncio
-from typing import TYPE_CHECKING, Dict, Any, Optional, Union
+from typing import TYPE_CHECKING, Dict, Any, Optional, Union, List
 import logging 
+from dataclasses import dataclass
 
 from .base import BaseInstanceService
 from fustor_core.models.states import PipelineState
@@ -9,6 +10,15 @@ from fustor_agent.runtime.source_handler_adapter import SourceHandlerAdapter
 from fustor_agent.runtime.sender_handler_adapter import SenderHandlerAdapter
 from fustor_core.exceptions import NotFoundError
 from fustor_agent_sdk.interfaces import PipelineInstanceServiceInterface # Import the interface
+
+
+@dataclass
+class StartResult:
+    """Result of a pipeline start operation for fault isolation."""
+    pipeline_id: str
+    success: bool
+    error: Optional[str] = None
+    skipped: bool = False
 
 # PipelineRuntime is now always AgentPipeline
 PipelineRuntime = AgentPipeline
@@ -48,33 +58,53 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
         self.agent_id = agent_id  # Store agent_id
         self.logger = logging.getLogger("fustor_agent") 
 
-    async def start_one(self, id: str):
+    async def start_one(self, id: str, raise_on_error: bool = False) -> StartResult:
+        """
+        Start a single pipeline instance with fault isolation.
+        
+        Args:
+            id: Pipeline configuration ID
+            raise_on_error: If True, raise exceptions (for API calls). 
+                           If False (default), return error in StartResult (for batch starts).
+        
+        Returns:
+            StartResult with success status and optional error message
+        """
         self.logger.debug(f"Enter start_one for pipeline_id: {id}")
 
         if self.get_instance(id):
             self.logger.warning(f"Pipeline instance '{id}' is already running or being managed.")
-            return
+            return StartResult(pipeline_id=id, success=True, skipped=True)
 
         pipeline_config = self.pipeline_config_service.get_config(id)
         if not pipeline_config:
-            self.logger.error(f"Pipeline config '{id}' not found.")
-            raise NotFoundError(f"Pipeline config '{id}' not found.")
+            error_msg = f"Pipeline config '{id}' not found."
+            self.logger.error(error_msg)
+            if raise_on_error:
+                raise NotFoundError(error_msg)
+            return StartResult(pipeline_id=id, success=False, error=error_msg)
         self.logger.debug(f"Found pipeline config for {id}")
 
         if pipeline_config.disabled:
             self.logger.info(f"Pipeline instance '{id}' will not be started because its configuration is disabled.")
-            return
+            return StartResult(pipeline_id=id, success=True, skipped=True)
 
         source_config = self.source_config_service.get_config(pipeline_config.source)
         if not source_config:
-            self.logger.error(f"Source config for {id} not found")
-            raise NotFoundError(f"Source config '{pipeline_config.source}' not found for pipeline '{id}'.")
+            error_msg = f"Source config '{pipeline_config.source}' not found for pipeline '{id}'."
+            self.logger.error(error_msg)
+            if raise_on_error:
+                raise NotFoundError(error_msg)
+            return StartResult(pipeline_id=id, success=False, error=error_msg)
         self.logger.debug(f"Found source config for {id}")
         
         sender_config = self.sender_config_service.get_config(pipeline_config.sender)
         if not sender_config:
-            self.logger.error(f"Sender config for {id} not found")
-            raise NotFoundError(f"Required Sender config '{pipeline_config.sender}' not found.")
+            error_msg = f"Required Sender config '{pipeline_config.sender}' not found."
+            self.logger.error(error_msg)
+            if raise_on_error:
+                raise NotFoundError(error_msg)
+            return StartResult(pipeline_id=id, success=False, error=error_msg)
         self.logger.debug(f"Found sender config for {id}")
         
         self.logger.info(f"Attempting to start pipeline instance '{id}'...")
@@ -148,13 +178,15 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
             await pipeline.start()
             
             self.logger.info(f"Pipeline instance '{id}' start initiated successfully.")
+            return StartResult(pipeline_id=id, success=True)
 
         except Exception as e:
             self.logger.error(f"Failed to start pipeline instance '{id}': {e}", exc_info=True)
             if self.get_instance(id):
                 self.pool.pop(id)
-            # Re-raise to be caught by the API layer
-            raise
+            if raise_on_error:
+                raise
+            return StartResult(pipeline_id=id, success=False, error=str(e))
 
 
 
@@ -227,20 +259,55 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
 
 
 
-    async def start_all_enabled(self):
+    async def start_all_enabled(self) -> Dict[str, Any]:
+        """
+        Start all enabled pipelines with fault isolation.
+        
+        Individual pipeline failures do not block other pipelines from starting.
+        
+        Returns:
+            Summary dict with started/failed/skipped counts and details
+        """
         all_pipeline_configs = self.pipeline_config_service.list_configs()
         if not all_pipeline_configs:
-            return
+            return {"started": 0, "failed": 0, "skipped": 0, "details": []}
 
-        self.logger.info(f"Attempting to auto-start all enabled sync tasks...")
-        start_tasks = [
-            self.start_one(id)
-            for id, cfg in all_pipeline_configs.items() if not cfg.disabled
-        ]
-        if start_tasks:
-            # We must run tasks sequentially to avoid race conditions if they share resources,
-            # but for now, gather is acceptable for starting independent tasks.
-            await asyncio.gather(*start_tasks, return_exceptions=True)
+        enabled_ids = [pid for pid, cfg in all_pipeline_configs.items() if not cfg.disabled]
+        self.logger.info(f"Attempting to auto-start {len(enabled_ids)} enabled sync tasks (fault-isolated)...")
+        
+        # Use gather with return_exceptions=True for fault isolation
+        results: List[StartResult] = await asyncio.gather(
+            *[self.start_one(pid) for pid in enabled_ids],
+            return_exceptions=True
+        )
+        
+        # Convert exceptions to StartResult
+        normalized_results = []
+        for pid, result in zip(enabled_ids, results):
+            if isinstance(result, Exception):
+                self.logger.error(f"Unexpected error starting pipeline '{pid}': {result}")
+                normalized_results.append(StartResult(pipeline_id=pid, success=False, error=str(result)))
+            else:
+                normalized_results.append(result)
+        
+        # Calculate summary
+        started = sum(1 for r in normalized_results if r.success and not r.skipped)
+        failed = sum(1 for r in normalized_results if not r.success)
+        skipped = sum(1 for r in normalized_results if r.skipped)
+        
+        self.logger.info(f"Pipeline startup complete: {started} started, {failed} failed, {skipped} skipped")
+        
+        # Log failures for visibility
+        for r in normalized_results:
+            if not r.success:
+                self.logger.error(f"  - {r.pipeline_id}: {r.error}")
+        
+        return {
+            "started": started,
+            "failed": failed,
+            "skipped": skipped,
+            "details": [vars(r) for r in normalized_results]
+        }
             
     async def restart_outdated_pipelines(self) -> int:
         from fustor_core.pipeline import PipelineState

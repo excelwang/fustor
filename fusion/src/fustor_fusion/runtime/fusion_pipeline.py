@@ -113,6 +113,12 @@ class FusionPipeline(Pipeline):
             "errors": 0,
         }
         self._cached_leader_session: Optional[str] = None
+        
+        # Handler fault isolation
+        self._handler_errors: Dict[str, int] = {}  # Per-handler error counts
+        self._disabled_handlers: set = set()  # Handlers disabled due to repeated failures
+        self.HANDLER_TIMEOUT = config.get("handler_timeout", 30.0)  # Seconds
+        self.MAX_HANDLER_ERRORS = config.get("max_handler_errors", 50)  # Before disabling
     
     def register_view_handler(self, handler: ViewHandler) -> None:
         """
@@ -227,24 +233,49 @@ class FusionPipeline(Pipeline):
                 await asyncio.sleep(0.1)
     
     async def _dispatch_to_handlers(self, event: EventBase) -> None:
-        """Dispatch an event to all registered view handlers."""
+        """
+        Dispatch an event to all registered view handlers with fault isolation.
+        
+        Features:
+        - Timeout protection: Handlers that take too long are timed out
+        - Per-handler degradation: Repeatedly failing handlers are disabled
+        - Error containment: One handler's failure doesn't affect others
+        """
         for handler_id, handler in self._view_handlers.items():
+            # Skip disabled handlers
+            if handler_id in self._disabled_handlers:
+                continue
+                
             try:
                 if hasattr(handler, 'process_event'):
-                    success = await handler.process_event(event)
-                    if not success:
-                        self.statistics["errors"] += 1
-                        logger.warning(f"Handler {handler_id} returned False for event processing")
+                    # Apply timeout protection
+                    try:
+                        success = await asyncio.wait_for(
+                            handler.process_event(event),
+                            timeout=self.HANDLER_TIMEOUT
+                        )
+                        if not success:
+                            self._record_handler_error(handler_id, "Returned False")
+                            logger.warning(f"Handler {handler_id} returned False for event processing")
+                    except asyncio.TimeoutError:
+                        self._record_handler_error(handler_id, f"Timeout after {self.HANDLER_TIMEOUT}s")
+                        logger.error(f"Handler {handler_id} timed out processing event")
             except Exception as e:
-                import traceback
-                print(f"DEBUG_HANDLER_ERROR in {handler_id} for event {event.event_type} {event.table}")
-                traceback.print_exc()
+                self._record_handler_error(handler_id, str(e))
                 logger.error(f"Error in handler {handler_id}: {e}", exc_info=True)
-                self.statistics["errors"] += 1
-                
-                # If we encounter too many errors, we might want to flag the pipeline
-                if self.statistics["errors"] > 1000: # Threshold for illustration
-                    self._set_state(self.state | PipelineState.ERROR, "Excessive handler errors")
+    
+    def _record_handler_error(self, handler_id: str, reason: str) -> None:
+        """Record a handler error and disable if threshold exceeded."""
+        self.statistics["errors"] += 1
+        self._handler_errors[handler_id] = self._handler_errors.get(handler_id, 0) + 1
+        
+        if self._handler_errors[handler_id] >= self.MAX_HANDLER_ERRORS:
+            if handler_id not in self._disabled_handlers:
+                self._disabled_handlers.add(handler_id)
+                logger.warning(
+                    f"Handler {handler_id} disabled after {self._handler_errors[handler_id]} errors. "
+                    f"Last error: {reason}"
+                )
     
     
     # --- Session Management ---

@@ -35,6 +35,7 @@ from .exceptions import (
     ValidationError,
 )
 from .drivers import SourceDriver, SenderDriver, ViewDriver
+from .supervisor import ComponentSupervisor, ComponentState, ComponentWrapper, StartResult
 
 __all__ = [
     # Submodules
@@ -70,4 +71,9 @@ __all__ = [
     "SourceDriver",
     "SenderDriver",
     "ViewDriver",
+    # Supervisor
+    "ComponentSupervisor",
+    "ComponentState",
+    "ComponentWrapper",
+    "StartResult",
 ]

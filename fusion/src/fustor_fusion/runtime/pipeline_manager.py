@@ -52,11 +52,19 @@ class PipelineManager:
                 logger.info(f"Initialized HTTP Receiver: {r_id}")
 
     async def initialize_pipelines(self):
-        """Initialize pipelines and receivers based on configuration."""
-        logger.info("DEBUG: PipelineManager.initialize_pipelines called")
+        """
+        Initialize pipelines and receivers based on configuration.
+        
+        Fault Isolation: Individual pipeline failures are logged but do not
+        block other pipelines from initializing.
+        """
+        logger.info("PipelineManager.initialize_pipelines called")
         # Ensure receivers are loaded first
         if not self._receivers:
             self.load_receivers()
+        
+        initialized_count = 0
+        failed_count = 0
             
         async with self._lock:
             pipes_cfg = fusion_pipelines_config.reload()
@@ -64,47 +72,60 @@ class PipelineManager:
                 if not p_cfg.enabled:
                     continue
                 
-                # Load ViewHandlers
-                view_handlers = []
-                # Use a specific view_id for session management (leader election etc)
-                # We prioritize extra.view_id, then the first view in the list, then the pipeline_id
-                primary_view_id = p_cfg.extra.get("view_id")
-                if not primary_view_id and p_cfg.views:
-                    primary_view_id = p_cfg.views[0]
-                if not primary_view_id:
-                    primary_view_id = p_id
+                try:
+                    # Load ViewHandlers with per-view fault isolation
+                    view_handlers = []
+                    # Use a specific view_id for session management (leader election etc)
+                    # We prioritize extra.view_id, then the first view in the list, then the pipeline_id
+                    primary_view_id = p_cfg.extra.get("view_id")
+                    if not primary_view_id and p_cfg.views:
+                        primary_view_id = p_cfg.views[0]
+                    if not primary_view_id:
+                        primary_view_id = p_id
 
-                # ViewHandlers are associated with a view_id group
-                unique_group_ids = []
-                for v_id in p_cfg.views:
-                    if v_id not in unique_group_ids:
-                        unique_group_ids.append(v_id)
+                    # ViewHandlers are associated with a view_id group
+                    unique_group_ids = []
+                    for v_id in p_cfg.views:
+                        if v_id not in unique_group_ids:
+                            unique_group_ids.append(v_id)
 
-                for group_id in unique_group_ids:
-                    try:
-                        vm = await get_cached_view_manager(group_id)
-                        handler = create_view_handler_from_manager(vm)
-                        view_handlers.append(handler)
-                    except Exception as e:
-                        logger.error(f"Failed to load view group {group_id} for pipeline {p_id}: {e}")
-                
-                pipeline = FusionPipeline(
-                    pipeline_id=p_id,
-                    config={
-                        "view_id": primary_view_id,
-                        "allow_concurrent_push": p_cfg.allow_concurrent_push,
-                        "session_timeout_seconds": p_cfg.session_timeout_seconds
-                    },
-                    view_handlers=view_handlers
-                )
-                
-                self._pipelines[p_id] = pipeline
-                
-                # Setup Bridge to legacy SessionManager
-                bridge = create_session_bridge(pipeline)
-                self._bridges[p_id] = bridge
-                
-                logger.info(f"Initialized Fusion Pipeline: {p_id} with {len(view_handlers)} views")
+                    for group_id in unique_group_ids:
+                        try:
+                            vm = await get_cached_view_manager(group_id)
+                            handler = create_view_handler_from_manager(vm)
+                            view_handlers.append(handler)
+                        except Exception as e:
+                            logger.error(f"Failed to load view group {group_id} for pipeline {p_id}: {e}")
+                            # Continue with remaining views (per-view isolation)
+                    
+                    if not view_handlers:
+                        logger.warning(f"Pipeline {p_id} has no valid views, skipping initialization")
+                        failed_count += 1
+                        continue
+                    
+                    pipeline = FusionPipeline(
+                        pipeline_id=p_id,
+                        config={
+                            "view_id": primary_view_id,
+                            "allow_concurrent_push": p_cfg.allow_concurrent_push,
+                            "session_timeout_seconds": p_cfg.session_timeout_seconds
+                        },
+                        view_handlers=view_handlers
+                    )
+                    
+                    self._pipelines[p_id] = pipeline
+                    
+                    # Setup Bridge to legacy SessionManager
+                    bridge = create_session_bridge(pipeline)
+                    self._bridges[p_id] = bridge
+                    
+                    logger.info(f"Initialized Fusion Pipeline: {p_id} with {len(view_handlers)} views")
+                    initialized_count += 1
+                    
+                except Exception as e:
+                    logger.error(f"Failed to initialize pipeline {p_id}: {e}", exc_info=True)
+                    failed_count += 1
+                    # Continue with next pipeline (fault isolation)
             
             # 4. Link Receivers to Pipelines via callbacks
             for r_id, receiver in self._receivers.items():
@@ -115,6 +136,10 @@ class PipelineManager:
                         on_heartbeat=self._on_heartbeat,
                         on_session_closed=self._on_session_closed
                     )
+        
+        logger.info(f"Pipeline initialization complete: {initialized_count} succeeded, {failed_count} failed")
+        return {"initialized": initialized_count, "failed": failed_count}
+
     
     async def start(self):
         """Start all pipelines and receivers."""
