@@ -1,4 +1,13 @@
 #!/usr/bin/env python
+"""
+Fustor Fusion CLI - Simplified WireGuard-style interface.
+
+Commands:
+  fustor-fusion start [configs...]  # Start fusion + pipe(s), default.yaml if no args
+  fustor-fusion stop [configs...]   # Stop pipe(s) or the entire fusion
+  fustor-fusion list                # List running pipes
+  fustor-fusion status [pipe]       # Show status
+"""
 import click
 import asyncio
 import signal
@@ -10,62 +19,54 @@ import subprocess
 import time
 
 from fustor_core.common import setup_logging, get_fustor_home_dir
-from fustor_core.exceptions import ConfigError as ConfigurationError
 
 # Define standard directories and file names for fusion
-HOME_FUSTOR_DIR = get_fustor_home_dir() # Use the common function
-FUSION_PID_FILE = os.path.join(HOME_FUSTOR_DIR, "fusion.pid") # Renamed from fustor_fusion.pid
-FUSION_LOG_FILE = os.path.join(HOME_FUSTOR_DIR, "fusion.log") # Renamed from fustor_fusion.log
+HOME_FUSTOR_DIR = get_fustor_home_dir()
+FUSION_PID_FILE = os.path.join(HOME_FUSTOR_DIR, "fusion.pid")
+FUSION_LOG_FILE = os.path.join(HOME_FUSTOR_DIR, "fusion.log")
 
 
 def _is_running():
-    """Check if the fusion daemon is already running by checking the PID file."""
+    """Check if the fusion daemon is already running."""
     if not os.path.exists(FUSION_PID_FILE):
         return False
     try:
         with open(FUSION_PID_FILE, 'r') as f:
-            pid_str = f.read().strip()
-            if not pid_str:
-                return False
-            pid = int(pid_str)
-            
-        # If the PID in the file is our own PID, we are not "already" running (we are just starting)
+            pid = int(f.read().strip())
         if pid == os.getpid():
             return False
-            
-        # Check if the process with this PID is actually running
-        os.kill(pid, 0) # Signal 0 doesn't do anything, but checks if PID exists
+        os.kill(pid, 0)
     except (IOError, ValueError, OSError):
-        # If PID file is invalid or process not found, clean up the PID file
         try:
             os.remove(FUSION_PID_FILE)
         except OSError:
-            pass # Ignore if removal fails
+            pass
         return False
     else:
         return pid
 
+
 @click.group()
 def cli():
-    """Fustor Fusion Command-Line Interface Tool"""
+    """Fustor Fusion CLI"""
     pass
 
-@cli.command()
-@click.option("--reload", is_flag=True, help="Enable auto-reloading of the server on code changes (foreground only).")
-@click.option("-p", "--port", default=8102, help="Port to run the server on.")
-@click.option("-h", "--host", default="0.0.0.0", help="Host to bind the server to.")
-@click.option("-D", "--daemon", is_flag=True, help="Run the service as a background daemon.")
-@click.option("-V", "--verbose", is_flag=True, help="Enable verbose (DEBUG level) logging.")
-@click.option("--no-console-log", is_flag=True, hidden=True, help="Internal: Disable console logging for daemon process.")
-def start(reload, port, host, daemon, verbose, no_console_log):
-    """Starts the Fustor Fusion service (in the foreground by default)."""
-    default_level = os.environ.get("FUSTOR_LOG_LEVEL", "INFO").upper()
-    log_level = "DEBUG" if verbose else default_level
-    
-    # Ensure log directory exists for the FUSION_LOG_FILE
-    os.makedirs(os.path.dirname(FUSION_LOG_FILE), exist_ok=True)
 
-    # Setup logging for the Fusion CLI
+@cli.command()
+@click.argument("configs", nargs=-1)
+@click.option("--reload", is_flag=True, help="Enable auto-reloading (foreground only).")
+@click.option("-p", "--port", default=8101, help="Port to run the server on.")
+@click.option("-h", "--host", default="0.0.0.0", help="Host to bind the server to.")
+@click.option("-D", "--daemon", is_flag=True, help="Run as background daemon.")
+@click.option("-V", "--verbose", is_flag=True, help="Enable DEBUG logging.")
+@click.option("--no-console-log", is_flag=True, hidden=True)
+def start(configs, reload, port, host, daemon, verbose, no_console_log):
+    """
+    Start Fusion and pipe(s).
+    
+    If no configs specified, starts all pipes listed in default.yaml.
+    """
+    log_level = "DEBUG" if verbose else "INFO"
     setup_logging(
         log_file_path=FUSION_LOG_FILE,
         base_logger_name="fustor_fusion",
@@ -77,181 +78,172 @@ def start(reload, port, host, daemon, verbose, no_console_log):
     if daemon:
         pid = _is_running()
         if pid:
-            click.echo(f"Fustor Fusion is already running with PID: {pid}")
+            click.echo(f"Fusion already running with PID: {pid}")
             return
         
-        click.echo("Starting Fustor Fusion in the background...")
-        # Use a common daemon launcher function to avoid module path issues
-        import fustor_core.common.daemon as daemon_module
-        daemon_module.start_daemon(
-            service_module_path='fustor_fusion.main',
-            app_var_name='app',
-            pid_file_name='fusion.pid',
-            log_file_name='fusion.log',
-            display_name='FuFusion',
-            port=port,
-            host=host,  # Use the host parameter
-            verbose=verbose,
-            reload=reload  # Pass reload parameter
-        )
-        time.sleep(2) # Give the daemon time to start and write its PID file
-        pid = _is_running()
-        if pid:
-            click.echo(f"Fustor Fusion daemon started successfully with PID: {pid}")
-        else:
-            click.echo(click.style("Failed to start Fustor Fusion daemon. Check logs for details.", fg="red"))
+        click.echo("Starting Fusion in background...")
+        
+        cmd = [sys.executable, sys.argv[0], "start", "--no-console-log"]
+        if verbose: cmd.append("--verbose")
+        if port != 8101: cmd.extend(["--port", str(port)])
+        if host != "0.0.0.0": cmd.extend(["--host", host])
+        cmd.extend(configs)
+        
+        try:
+            kwargs = {}
+            if sys.platform != 'win32':
+                kwargs['start_new_session'] = True
+            
+            with open(FUSION_LOG_FILE, 'a') as log_f:
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_f,
+                    stderr=subprocess.STDOUT,
+                    **kwargs
+                )
+            click.echo(f"Fusion started with PID: {proc.pid}")
+        except Exception as e:
+            click.echo(click.style(f"Failed to start: {e}", fg="red"))
         return
 
-    # --- Foreground Execution Logic ---
+    # --- Foreground Execution ---
     if _is_running():
-        click.echo("Fustor Fusion is already running in the background. Stop it first.")
-        return
+        pass # Allow overwrite if child
 
     try:
-        os.makedirs(HOME_FUSTOR_DIR, exist_ok=True) # Ensure Fustor home directory exists for PID file
+        os.makedirs(HOME_FUSTOR_DIR, exist_ok=True)
         with open(FUSION_PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
 
-        from .main import app as fastapi_app
-
-        click.echo("\n" + "="*60)
-        click.echo("Fustor Fusion")
-        click.echo(f"Web : http://{host}:{port}")
-        click.echo("="*60 + "\n")
+        # Set environment variables for config_list to be read by main.py/lifespan
+        if configs:
+            os.environ["FUSTOR_FUSION_CONFIGS"] = ",".join(configs)
         
-        app_to_run = fastapi_app
-        if reload:
-            app_to_run = "fustor_fusion.main:app"
-
-        # Configure uvicorn to use DEBUG level for access logs to reduce verbosity
-        uvicorn_logger = logging.getLogger("uvicorn.access")
-        uvicorn_logger.setLevel(logging.DEBUG)
-
+        from .main import app as fastapi_app
+        
+        click.echo(f"Fusion starting on http://{host}:{port}")
+        
         uvicorn.run(
-            app_to_run,
+            fastapi_app if not reload else "fustor_fusion.main:app",
             host=host,
             port=port,
-            log_config=None, # Logging handled by setup_logging
+            log_config=None,
             access_log=True,
             reload=reload,
         )
 
     except KeyboardInterrupt:
-        logger.info("Fustor Fusion is shutting down...")
-        click.echo("\nFustor Fusion is shutting down...")
-    except ConfigurationError as e:
-        logger.critical(f"Fustor Fusion Configuration Error: {e}", exc_info=True)
-        click.echo("="*60)
-        click.echo(click.style(f"Fustor Fusion Configuration Error: {e}", fg="red"))
-        click.echo("Please check your environment variables and .env file in the home directory.")
-        click.echo("="*60)
+        click.echo("\nFusion shutting down...")
     except Exception as e:
-        logger.critical(f"An unexpected error occurred during startup: {e}", exc_info=True)
-        click.echo(click.style(f"\nFATAL: An unexpected error occurred: {e}", fg="red"))
+        logger.critical(f"Startup error: {e}", exc_info=True)
+        click.echo(click.style(f"\nFATAL: {e}", fg="red"))
     finally:
         if os.path.exists(FUSION_PID_FILE):
-            os.remove(FUSION_PID_FILE)
-            logger.info("Removed PID file.")
+            try:
+                with open(FUSION_PID_FILE, 'r') as f:
+                    if int(f.read().strip()) == os.getpid():
+                        os.remove(FUSION_PID_FILE)
+            except Exception:
+                pass
+
 
 @cli.command()
-def stop():
-    """Stops the background Fustor Fusion service."""
+@click.argument("configs", nargs=-1)
+def stop(configs):
+    """Stop pipe(s) or the entire Fusion server."""
     pid = _is_running()
-    if not pid:
-        click.echo("Fustor Fusion is not running.")
-        return
-
-    click.echo(f"Stopping Fustor Fusion with PID: {pid}...")
-    try:
-        os.kill(pid, signal.SIGTERM)
-        for _ in range(10): # Wait up to 10 seconds for the process to terminate
-            if not _is_running():
-                break
-            time.sleep(1)
-        else:
-            click.echo(click.style("Fustor Fusion did not stop in time. Forcing shutdown.", fg="yellow"))
-            os.kill(pid, signal.SIGKILL) # Force kill if SIGTERM fails
-
-        click.echo("Fustor Fusion stopped successfully.")
-    except OSError as e:
-        click.echo(click.style(f"Error stopping process: {e}", fg="red"))
-    finally:
-        if os.path.exists(FUSION_PID_FILE):
-            os.remove(FUSION_PID_FILE)
-
-
-@cli.command("start-view")
-@click.argument("view_id")
-def start_view(view_id: str):
-    """Start a single view by ID. Starts daemon if not running."""
-    import requests
     
-    # Check if daemon is running
-    pid = _is_running()
-    if not pid:
-        click.echo("Fusion daemon not running. Starting it first...")
-        # Start daemon
-        ctx = click.get_current_context()
-        ctx.invoke(start, daemon=True, port=8102)
-        time.sleep(3)  # Wait for daemon to start
-        
-        pid = _is_running()
+    if not configs:
         if not pid:
-            click.echo(click.style("Failed to start Fusion daemon.", fg="red"))
+            click.echo("Fusion is not running.")
             return
-    
-    # Call management API to start view
-    try:
-        response = requests.post(
-            f"http://localhost:8102/api/v1/management/views/{view_id}/start",
-            timeout=10
-        )
-        if response.ok:
-            click.echo(click.style(f"View '{view_id}' started successfully.", fg="green"))
-        else:
-            detail = response.json().get("detail", "Unknown error")
-            click.echo(click.style(f"Failed to start view '{view_id}': {detail}", fg="red"))
-    except requests.exceptions.ConnectionError:
-        click.echo(click.style("Cannot connect to Fusion daemon.", fg="red"))
-    except Exception as e:
-        click.echo(click.style(f"Error: {e}", fg="red"))
+        
+        click.echo(f"Stopping Fusion (PID: {pid})...")
+        try:
+            os.kill(pid, signal.SIGTERM)
+            for _ in range(10):
+                if not _is_running(): break
+                time.sleep(1)
+            else:
+                os.kill(pid, signal.SIGKILL)
+            click.echo("Fusion stopped.")
+        except OSError as e:
+            click.echo(click.style(f"Error: {e}", fg="red"))
+    else:
+        if not pid:
+            click.echo("Fusion is not running. Cannot stop individual pipes.")
+            return
+        
+        import requests
+        for config in configs:
+            try:
+                response = requests.post(
+                    f"http://localhost:8101/api/v1/management/pipes/{config}/stop",
+                    timeout=10
+                )
+                if response.ok:
+                    click.echo(click.style(f"[{config}] ✓ Stopped", fg="green"))
+                else:
+                    detail = response.json().get("detail", "Unknown error")
+                    click.echo(click.style(f"[{config}] ✗ {detail}", fg="red"))
+            except Exception as e:
+                click.echo(click.style(f"[{config}] ✗ {e}", fg="red"))
 
 
-@cli.command("stop-view")
-@click.argument("view_id")
-def stop_view(view_id: str):
-    """Stop a single view by ID. Stops daemon if no views left."""
-    import requests
-    
+@cli.command("list")
+def list_pipes():
+    """List all running pipes in Fusion."""
     pid = _is_running()
     if not pid:
-        click.echo("Fusion daemon is not running.")
+        click.echo("Fusion is not running.")
         return
     
+    import requests
     try:
-        response = requests.post(
-            f"http://localhost:8102/api/v1/management/views/{view_id}/stop",
-            timeout=10
-        )
+        response = requests.get("http://localhost:8101/api/v1/management/pipes", timeout=10)
         if response.ok:
-            data = response.json()
-            click.echo(click.style(f"View '{view_id}' stopped.", fg="green"))
-            
-            if data.get("should_shutdown"):
-                click.echo("No active views remaining. Stopping Fusion daemon...")
-                ctx = click.get_current_context()
-                ctx.invoke(stop)
+            pipes = response.json()
+            if not pipes:
+                click.echo("No pipes configured.")
+                return
+            click.echo(f"{'ID':<30} {'STATUS':<15} {'VIEWS':<20}")
+            click.echo("-" * 65)
+            for p in pipes:
+                status_color = "green" if p.get("running") else "yellow"
+                views = ", ".join(p.get("views", []))
+                click.echo(
+                    f"{p['id']:<30} "
+                    f"{click.style('RUNNING' if p.get('running') else 'STOPPED', fg=status_color):<15} "
+                    f"{views:<20}"
+                )
         else:
-            detail = response.json().get("detail", "Unknown error")
-            click.echo(click.style(f"Failed to stop view '{view_id}': {detail}", fg="red"))
-    except requests.exceptions.ConnectionError:
-        click.echo(click.style("Cannot connect to Fusion daemon.", fg="red"))
+            click.echo(click.style(f"Error: {response.text}", fg="red"))
     except Exception as e:
         click.echo(click.style(f"Error: {e}", fg="red"))
 
 
-# End of CLI
-
-
-# Define FUSION_LOG_FILE_NAME here as it's used in setup_logging
-FUSION_LOG_FILE_NAME = "fustor_fusion.log"
+@cli.command()
+@click.argument("pipe_id", required=False)
+def status(pipe_id):
+    """Show status of Fusion or specific pipe."""
+    pid = _is_running()
+    if not pid:
+        click.echo("Fusion Status: " + click.style("STOPPED", fg="red"))
+        return
+    
+    click.echo("Fusion Status: " + click.style(f"RUNNING (PID: {pid})", fg="green"))
+    
+    if pipe_id:
+        import requests
+        try:
+            response = requests.get(f"http://localhost:8101/api/v1/management/pipes/{pipe_id}", timeout=10)
+            if response.ok:
+                data = response.json()
+                click.echo(f"\nPipe: {pipe_id}")
+                click.echo(f"  Running: {data.get('running')}")
+                click.echo(f"  Views: {', '.join(data.get('views', []))}")
+            else:
+                click.echo(click.style(f"Pipe '{pipe_id}' not found.", fg="yellow"))
+        except Exception as e:
+            click.echo(click.style(f"Error: {e}", fg="red"))

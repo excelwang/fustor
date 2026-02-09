@@ -1,16 +1,25 @@
+"""
+Agent runner - entry point for headless operation.
+"""
 import asyncio
 import signal
 import logging
-import os
-from .app import App
+from typing import Optional, List
 
 logger = logging.getLogger("fustor_agent")
 
-async def run_agent(config_dir: str):
+
+async def run_agent(config_list: Optional[List[str]] = None):
     """
-    Main entry point for running the Agent in headless mode.
+    Main entry point for running the Agent.
+    
+    Args:
+        config_list: List of pipe config names/paths to start.
+                    If None, loads from default.yaml.
     """
-    app = App(config_dir)
+    from .app import App
+    
+    app = App(config_list=config_list)
     
     # Handle shutdown signals
     loop = asyncio.get_running_loop()

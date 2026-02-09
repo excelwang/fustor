@@ -3,13 +3,12 @@ from fastapi.responses import FileResponse
 import os
 import asyncio
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, List
 
 import sys
 import logging
-import sys
 
-# Configure basic logging for the entire application
+# Configure basic logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -19,7 +18,6 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # --- Ingestor Service Specific Imports ---
-from .config import receivers_config
 from .core.session_manager import session_manager
 from .view_state_manager import view_state_manager
 from . import runtime_objects
@@ -30,12 +28,6 @@ from .view_manager.manager import process_event as process_single_event, cleanup
 from .api.views import view_router
 
 
-logger = logging.getLogger(__name__) # Re-initialize logger after setting levels
-logging.getLogger("fustor_fusion.auth.dependencies").setLevel(logging.DEBUG)
-# Silence uvicorn noisy logs
-logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
-logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     logger.info("Application startup initiated.")
@@ -44,24 +36,21 @@ async def lifespan(app: FastAPI):
     from .runtime.pipeline_manager import pipeline_manager as pm
     runtime_objects.pipeline_manager = pm
     
-    # Initialize pipelines and receivers first (so they are available for router setup)
-    await pm.initialize_pipelines()
+    # Read target configs from environment (set by CLI)
+    config_env = os.environ.get("FUSTOR_FUSION_CONFIGS")
+    config_list = config_env.split(",") if config_env else None
     
-    # Setup Pipeline API routers after pipeline_manager/receivers are available
+    # Initialize pipelines based on targets
+    await pm.initialize_pipelines(config_list)
+    
+    # Setup Pipeline API routers
     from .api.pipe import setup_pipe_routers
     setup_pipe_routers()
     
+    # Start all pipelines and receivers
     await pm.start()
 
-    # Perform initial configuration load
-    try:
-        receivers_config.reload()
-    except Exception as e:
-        logger.error(f"Initial configuration load failed: {e}. Aborting startup.")
-        raise
-    logger.info("Initial configuration load successful.")
-
-    # Start periodic suspect cleanup (Every 0.5 seconds)
+    # Start periodic suspect cleanup
     async def periodic_suspect_cleanup():
         logger.info("Starting periodic suspect cleanup task")
         while True:
@@ -69,56 +58,26 @@ async def lifespan(app: FastAPI):
                 await asyncio.sleep(0.5)
                 await cleanup_all_expired_suspects()
             except asyncio.CancelledError:
-                logger.info("Periodic suspect cleanup task cancelled")
                 break
             except Exception as e:
-                logger.error(f"Error in periodic_suspect_cleanup task: {e}", exc_info=True)
+                logger.error(f"Error in periodic_suspect_cleanup task: {e}")
                 await asyncio.sleep(0.5)
             
     suspect_cleanup_task = asyncio.create_task(periodic_suspect_cleanup())
     
     # Start periodic session cleanup
-    min_timeout = 30
-    all_receivers = receivers_config.get_all()
-    if all_receivers:
-        min_timeout = min(r.session_timeout_seconds for r in all_receivers.values())
-    
-    cleanup_interval = max(1, min_timeout // 5)
-    logger.info(f"Starting session cleanup (Interval: {cleanup_interval}s, Min Timeout: {min_timeout}s)")
+    # We use a default interval since receivers are now per-pipe
+    cleanup_interval = 10
+    logger.info(f"Starting session cleanup (Interval: {cleanup_interval}s)")
     await session_manager.start_periodic_cleanup(cleanup_interval)
 
-    # Auto-start enabled views from YAML
-    try:
-        from .config import views_config
-        from .view_manager.manager import get_cached_view_manager
-        
-        views_config.reload()
-        enabled_views = views_config.get_enabled()
-        logger.info(f"Auto-starting {len(enabled_views)} enabled views...")
-        
-        for view_instance_id, config in enabled_views.items():
-            try:
-                v_group_id = config.view_id
-                vm = await get_cached_view_manager(v_group_id)
-                if view_instance_id in vm.driver_instances:
-                    logger.info(f"View {view_instance_id} already initialized by manager.")
-                    continue
-                logger.info(f"Verified view {view_instance_id} is active in manager for group {v_group_id}")
-            except Exception as e:
-                logger.error(f"Failed to auto-start view {view_instance_id}: {e}", exc_info=True)
-        
-        # After starting views, re-setup API routers
-        from .api.views import setup_view_routers
-        setup_view_routers()
-                
-    except Exception as e:
-        logger.error(f"Error during view auto-start: {e}", exc_info=True)
-
-    # --- Register Routers (AFTER all pipelinesetup is complete) ---
-    # Registering inside lifespan ensure that setup_pipe_routers has populated pipe_router
-    # AND setup_view_routers has populated view_router.
-    # Note: Modifying app.routes during lifespan is technically "late", but necessary for this plugin architecture.
+    # Note: View auto-start is now handled by PipelineManager via pipe config
     
+    # Setup View routers
+    from .api.views import setup_view_routers
+    setup_view_routers()
+
+    # --- Register Routers ---
     from .api.pipe import pipe_router
     from .api.management import router as management_router
     from .api.views import view_router
@@ -144,12 +103,7 @@ async def lifespan(app: FastAPI):
 
 
 def create_app() -> FastAPI:
-    """
-    Factory function to create the FastAPI application.
-    """
     app = FastAPI(lifespan=lifespan, title="Fusion Storage Engine API", version="1.0.0")
-
-    # 2. Root & UI Endpoints
     ui_dir = os.path.dirname(__file__)
 
     @app.get("/", tags=["Root"])
@@ -162,5 +116,4 @@ def create_app() -> FastAPI:
 
     return app
 
-# Entry point for uvicorn
 app = create_app()
