@@ -44,6 +44,7 @@ async def test_session_creation_multiple_servers():
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "task_server1"
         payload1.session_timeout_seconds = None
+        payload1.client_info = None
         
         request1 = MockRequest(client_host="192.168.1.10")
         
@@ -59,6 +60,7 @@ async def test_session_creation_multiple_servers():
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "task_server2"
         payload2.session_timeout_seconds = None
+        payload2.client_info = None
         
         request2 = MockRequest(client_host="192.168.1.11")
         
@@ -86,6 +88,7 @@ async def test_session_creation_same_task_id():
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "same_task"
         payload1.session_timeout_seconds = None
+        payload1.client_info = None
         
         request1 = MockRequest(client_host="192.168.1.12")
         
@@ -97,6 +100,7 @@ async def test_session_creation_same_task_id():
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "same_task"
         payload2.session_timeout_seconds = None
+        payload2.client_info = None
         
         request2 = MockRequest(client_host="192.168.1.13")
         
@@ -122,6 +126,7 @@ async def test_session_creation_different_task_id():
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "different_task_1"
         payload1.session_timeout_seconds = None
+        payload1.client_info = None
         
         request1 = MockRequest(client_host="192.168.1.14")
         
@@ -133,6 +138,7 @@ async def test_session_creation_different_task_id():
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "different_task_2"
         payload2.session_timeout_seconds = None
+        payload2.client_info = None
         
         request2 = MockRequest(client_host="192.168.1.15")
         
@@ -158,6 +164,7 @@ async def test_concurrent_push_allowed():
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "concurrent_task_1"
         payload1.session_timeout_seconds = None
+        payload1.client_info = None
         
         request1 = MockRequest(client_host="192.168.1.16")
         
@@ -169,6 +176,7 @@ async def test_concurrent_push_allowed():
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "concurrent_task_2"
         payload2.session_timeout_seconds = None
+        payload2.client_info = None
         
         request2 = MockRequest(client_host="192.168.1.17")
         
@@ -194,6 +202,7 @@ async def test_same_task_id_with_concurrent_push():
         payload1 = type('CreateSessionPayload', (), {})()
         payload1.task_id = "repeated_task"
         payload1.session_timeout_seconds = None
+        payload1.client_info = None
         
         request1 = MockRequest(client_host="192.168.1.18")
         
@@ -205,6 +214,7 @@ async def test_same_task_id_with_concurrent_push():
         payload2 = type('CreateSessionPayload', (), {})()
         payload2.task_id = "repeated_task"
         payload2.session_timeout_seconds = None
+        payload2.client_info = None
         
         request2 = MockRequest(client_host="192.168.1.19")
         
@@ -235,6 +245,7 @@ async def test_stale_lock_handling():
         payload = type('CreateSessionPayload', (), {})()
         payload.task_id = "new_task"
         payload.session_timeout_seconds = None
+        payload.client_info = None
         
         request = MockRequest(client_host="192.168.1.20")
         

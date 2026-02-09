@@ -119,7 +119,7 @@ class FusionClient:
             return False
 
 
-    async def push_events(self, session_id: str, events: List[Dict[str, Any]], source_type: str, is_snapshot_end: bool = False) -> bool:
+    async def push_events(self, session_id: str, events: List[Dict[str, Any]], source_type: str, is_snapshot_end: bool = False, metadata: Optional[Dict[str, Any]] = None) -> bool:
         """
         Pushes a batch of events to the Fusion service.
         """
@@ -132,8 +132,12 @@ class FusionClient:
                 "session_id": session_id,
                 "events": sanitized_events,
                 "source_type": sanitized_source_type,
-                "is_end": is_snapshot_end  # Fixed: Receiver expects 'is_end', not 'is_snapshot_end'
+                "is_end": is_snapshot_end,  # Fixed: Receiver expects 'is_end', not 'is_snapshot_end'
+                "metadata": metadata
             }
+            # Remove None values
+            payload = {k: v for k, v in payload.items() if v is not None}
+            
             response = await self.client.post(f"{self._events_path}/{session_id}/events", json=payload)
             response.raise_for_status()
             return True

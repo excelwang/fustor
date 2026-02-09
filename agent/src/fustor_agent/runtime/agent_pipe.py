@@ -515,6 +515,10 @@ class AgentPipe(Pipe):
                 response = await self.sender_handler.send_heartbeat(self.session_id, can_realtime=can_realtime)
                 await self._update_role_from_response(response)
                 
+                # Check for commands in response
+                if response and "commands" in response:
+                    await self._handle_commands(response["commands"])
+                
                 # Reset error counter on success
                 if self._consecutive_errors > 0:
                     logger.info(f"Pipe {self.id} heartbeat recovered after {self._consecutive_errors} errors")
@@ -795,9 +799,76 @@ class AgentPipe(Pipe):
             # The RECONNECTING state will cause the control loop to 
             # recreate session and restart pipe phases
             self._set_state(
-                PipeState.RUNNING | PipeState.RECONNECTING, 
-                f"Bus remap with position loss - triggering re-sync"
-            )
+                 PipeState.RUNNING | PipeState.RECONNECTING, 
+                 f"Bus remap with position loss - triggering re-sync"
+             )
+
+    async def _handle_commands(self, commands: List[Dict[str, Any]]):
+        """Process commands received from Fusion."""
+        for cmd in commands:
+            try:
+                cmd_type = cmd.get("type")
+                logger.info(f"Pipe {self.id}: Received command '{cmd_type}'")
+                
+                if cmd_type == "scan":
+                    await self._handle_command_scan(cmd)
+                else:
+                    logger.warning(f"Pipe {self.id}: Unknown command type '{cmd_type}'")
+            except Exception as e:
+                logger.error(f"Pipe {self.id}: Error processing command {cmd}: {e}")
+
+    async def _handle_command_scan(self, cmd: Dict[str, Any]):
+        """Handle 'scan' command."""
+        path = cmd.get("path")
+        recursive = cmd.get("recursive", True)
+        
+        if not path:
+            return
+
+        logger.info(f"Pipe {self.id}: Executing on-demand scan for '{path}' (recursive={recursive})")
+        
+        # Check if source handler supports scan_path
+        if hasattr(self.source_handler, "scan_path"):
+            # Execute scan in background to not block heartbeat/control loop
+            asyncio.create_task(self._run_on_demand_scan(path, recursive))
+        else:
+            logger.warning(f"Pipe {self.id}: Source handler does not support 'scan_path'")
+
+    async def _run_on_demand_scan(self, path: str, recursive: bool):
+        """Run the actual scan task."""
+        try:
+            # We use the source handler to get events and push them immediately
+            # This bypasses the normal message/snapshot loop but uses the same sender
+            
+            # Use iterator from source handler
+            iterator = self.source_handler.scan_path(path, recursive=recursive)
+            
+            # Push batch
+            batch = []
+            count = 0
+            for event in iterator:
+                batch.append(event)
+                if len(batch) >= self.batch_size:
+                    mapped_batch = self.map_batch(batch)
+                    await self.sender_handler.send_batch(self.session_id, mapped_batch, {"phase": "message"})
+                    count += len(batch)
+                    batch = []
+            
+            if batch:
+                mapped_batch = self.map_batch(batch)
+                await self.sender_handler.send_batch(self.session_id, mapped_batch, {"phase": "message"})
+                count += len(batch)
+            
+            # Notify Fusion that scan is complete
+            await self.sender_handler.send_batch(self.session_id, [], {
+                "phase": "scan_complete",
+                "scan_path": path
+            })
+                
+            logger.info(f"Pipe {self.id}: On-demand scan complete for '{path}'. Sent {count} events.")
+            
+        except Exception as e:
+            logger.error(f"Pipe {self.id}: On-demand scan failed: {e}")
         else:
             logger.info(
                 f"Pipe {self.id}: Remapped to new bus {new_bus.id} "

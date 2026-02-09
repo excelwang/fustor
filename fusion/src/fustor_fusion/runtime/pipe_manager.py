@@ -74,7 +74,8 @@ class PipeManager:
                                 on_session_created=self._on_session_created,
                                 on_event_received=self._on_event_received,
                                 on_heartbeat=self._on_heartbeat,
-                                on_session_closed=self._on_session_closed
+                                on_session_closed=self._on_session_closed,
+                                on_scan_complete=self._on_scan_complete
                             )
                             self._receivers[r_sig] = receiver
                             logger.info(f"Initialized shared HTTP Receiver on port {r_cfg.port}")
@@ -230,6 +231,17 @@ class PipeManager:
             if pipe_id:
                 bridge = self._bridges.get(pipe_id)
                 if bridge: await bridge.close_session(session_id)
+
+    async def _on_scan_complete(self, session_id: str, scan_path: str):
+        """Handle scan completion notification from Agent."""
+        from .session_bridge import session_manager
+        pipe_id = self._session_to_pipe.get(session_id)
+        if pipe_id:
+            pipe = self._pipes.get(pipe_id)
+            if pipe:
+                view_id = pipe.view_id
+                await session_manager.complete_scan(view_id, session_id, scan_path)
+                logger.debug(f"Scan complete for path {scan_path} on session {session_id}")
 
 # Global singleton
 pipe_manager = PipeManager()

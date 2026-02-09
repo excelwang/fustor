@@ -43,6 +43,7 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep):
         max_depth: Optional[int] = Query(None, description="最大递归深度 (1 表示仅当前目录及其直接子级)"),
         only_path: bool = Query(False, description="是否仅返回路径结构，排除元数据"),
         dry_run: bool = Query(False, description="压测模式：跳过逻辑处理以测量框架延迟"),
+        force_real_time: bool = Query(False, description="强制触发Agent端实时扫描"),
         view_id: str = Depends(get_view_id_dep)
     ) -> Optional[Dict[str, Any]]:
         """获取指定路径起始的目录结构树。"""
@@ -54,13 +55,33 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep):
         driver = await get_driver_func(view_id)
         if not driver:
             return ORJSONResponse(content={"detail": "Driver not initialized"}, status_code=503)
+            
+        if force_real_time:
+            if hasattr(driver, "trigger_realtime_scan"):
+                triggered = await driver.trigger_realtime_scan(path, recursive=recursive)
+                if triggered:
+                    logger.info(f"Triggered real-time scan for {path} on view {view_id}")
+                else:
+                    logger.warning(f"Failed to trigger real-time scan for {path} on view {view_id} (No active session?)")
+            else:
+                logger.warning(f"Driver for view {view_id} does not support trigger_realtime_scan")
         
         effective_recursive = recursive if max_depth is None else True
         result = await driver.get_directory_tree(path, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
         
         if result is None:
             return ORJSONResponse(content={"detail": "路径未找到或尚未同步"}, status_code=404)
-        return ORJSONResponse(content=result)
+        
+        # Check if there's a pending scan for this path
+        scan_pending = False
+        if force_real_time:
+            from fustor_fusion.core.session_manager import session_manager
+            scan_pending = await session_manager.has_pending_scan(view_id, path)
+        
+        return ORJSONResponse(content={
+            "data": result,
+            "scan_pending": scan_pending
+        })
 
     @router.get("/search", summary="基于模式搜索文件")
     async def search_files_api(

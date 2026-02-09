@@ -47,11 +47,8 @@ class DirectoryNode:
                 if child_dict is not None:
                     result['children'].append(child_dict)
         else:
-            for child in self.children.values():
-                # Non-recursive: get child metadata only
-                child_dict = child.to_dict(recursive=False, max_depth=0, only_path=only_path)
-                if child_dict is not None:
-                    result['children'].append(child_dict)
+            # Non-recursive: return only self, no children
+            pass
         
         return result
 

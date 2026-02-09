@@ -111,7 +111,8 @@ class HTTPSender(Sender):
         self, 
         events: List[EventBase], 
         source_type: str = "message",
-        is_end: bool = False
+        is_end: bool = False,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Implementation of sending events to Fusion.
@@ -139,7 +140,8 @@ class HTTPSender(Sender):
                 session_id=self.session_id,
                 events=event_dicts,
                 source_type=source_type,
-                is_snapshot_end=is_end
+                is_snapshot_end=is_end,
+                metadata=metadata
             )
             
             if success:

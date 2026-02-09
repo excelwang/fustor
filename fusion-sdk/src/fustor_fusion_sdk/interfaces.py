@@ -1,4 +1,4 @@
-from typing import Dict, Optional, List, Any, Protocol
+from typing import Dict, Optional, List, Any, Protocol, Set
 from dataclasses import dataclass
 import asyncio
 
@@ -13,6 +13,14 @@ class SessionInfo:
     session_timeout_seconds: Optional[int] = None
     client_ip: Optional[str] = None
     source_uri: Optional[str] = None
+    pending_commands: List[Dict[str, Any]] = None  # Queue of commands for the Agent
+    pending_scans: Set[str] = None  # Paths currently being scanned
+
+    def __post_init__(self):
+        if self.pending_commands is None:
+            self.pending_commands = []
+        if self.pending_scans is None:
+            self.pending_scans = set()
     can_realtime: bool = False
     cleanup_task: Optional[asyncio.Task] = None
 

@@ -1,6 +1,6 @@
 import asyncio
 import time
-from typing import Dict, Optional, List, Any, Set
+from typing import Dict, Optional, List, Any, Set, Tuple
 import logging
 from fustor_fusion_sdk.interfaces import SessionInfo 
 
@@ -56,10 +56,56 @@ class SessionManager:
                 
             return session_info
 
+    async def queue_command(self, view_id: str, session_id: str, command: Dict[str, Any]) -> bool:
+        """Queue a command for the agent to pick up on next heartbeat."""
+        view_id = str(view_id)
+        async with self._lock:
+            if view_id in self._sessions and session_id in self._sessions[view_id]:
+                session_info = self._sessions[view_id][session_id]
+                if session_info.pending_commands is None:
+                    session_info.pending_commands = []
+                session_info.pending_commands.append(command)
+                
+                # Track pending scans
+                if command.get("type") == "scan" and command.get("path"):
+                    if session_info.pending_scans is None:
+                        session_info.pending_scans = set()
+                    session_info.pending_scans.add(command["path"])
+                    
+                logger.debug(f"Queued command for session {session_id}: {command['type']}")
+                return True
+        return False
+
+    async def complete_scan(self, view_id: str, session_id: str, path: str) -> bool:
+        """Mark a scan as complete."""
+        view_id = str(view_id)
+        async with self._lock:
+            if view_id in self._sessions and session_id in self._sessions[view_id]:
+                session_info = self._sessions[view_id][session_id]
+                if session_info.pending_scans and path in session_info.pending_scans:
+                    session_info.pending_scans.discard(path)
+                    return True
+        return False
+
+    async def has_pending_scan(self, view_id: str, path: str) -> bool:
+        """Check if any session has a pending scan for the given path."""
+        view_id = str(view_id)
+        async with self._lock:
+            if view_id in self._sessions:
+                for session_info in self._sessions[view_id].values():
+                    if session_info.pending_scans and path in session_info.pending_scans:
+                        return True
+        return False
+
     async def keep_session_alive(self, view_id: str, session_id: str, 
                                client_ip: Optional[str] = None,
-                               can_realtime: bool = False) -> bool:
+                               can_realtime: bool = False) -> Tuple[bool, List[Dict[str, Any]]]:
+        """
+        Updates session activity and returns any pending commands.
+        Returns: (success, list_of_commands)
+        """
         view_id = str(view_id)
+        commands = []
         async with self._lock:
             if view_id in self._sessions and session_id in self._sessions[view_id]:
                 session_info = self._sessions[view_id][session_id]
@@ -67,8 +113,14 @@ class SessionManager:
                 session_info.can_realtime = can_realtime
                 if client_ip:
                     session_info.client_ip = client_ip
-                return True
-        return False
+                
+                # Pop commands
+                if session_info.pending_commands:
+                    commands = session_info.pending_commands[:]
+                    session_info.pending_commands.clear()
+                    
+                return True, commands
+        return False, []
 
     async def get_session_info(self, view_id: str, session_id: str) -> Optional[SessionInfo]:
         view_id = str(view_id)

@@ -183,7 +183,9 @@ async def heartbeat(
     if not is_locked_by_session:
         await view_state_manager.lock_for_session(view_id, session_id)
     
-    await session_manager.keep_session_alive(view_id, session_id, client_ip=request.client.host)
+    success, commands = await session_manager.keep_session_alive(view_id, session_id, client_ip=request.client.host)
+    if not success:  # Should match session existence check above, but for safety
+        logger.warning(f"Session {session_id} not found during heartbeat update (race condition?)")
     
     is_leader = await view_state_manager.try_become_leader(view_id, session_id)
     
@@ -196,7 +198,8 @@ async def heartbeat(
         "status": "ok", 
         "message": f"Session {session_id} heartbeat updated successfully",
         "role": role,
-        "is_leader": is_leader
+        "is_leader": is_leader,
+        "commands": commands
     }
 
 

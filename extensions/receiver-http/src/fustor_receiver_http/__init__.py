@@ -39,8 +39,9 @@ class CreateSessionResponse(BaseModel):
 class EventBatch(BaseModel):
     """Batch of events to ingest."""
     events: List[EventBase]
-    source_type: str = "message"  # 'message', 'snapshot', 'audit'
+    source_type: str = "message"  # 'message', 'snapshot', 'audit', 'scan_complete'
     is_end: bool = False
+    metadata: Optional[Dict[str, Any]] = None  # Extra info e.g., scan_path
 
 
 class HeartbeatResponse(BaseModel):
@@ -105,6 +106,7 @@ class HTTPReceiver(Receiver):
         self._on_event_received: Optional[EventReceivedCallback] = None
         self._on_heartbeat: Optional[HeartbeatCallback] = None
         self._on_session_closed: Optional[SessionClosedCallback] = None
+        self._on_scan_complete: Optional[Callable[[str, str], Awaitable[None]]] = None  # session_id, path
         
         # API key to pipe mapping
         self._api_key_to_pipe: Dict[str, str] = {}
@@ -125,6 +127,7 @@ class HTTPReceiver(Receiver):
         on_event_received: Optional[EventReceivedCallback] = None,
         on_heartbeat: Optional[HeartbeatCallback] = None,
         on_session_closed: Optional[SessionClosedCallback] = None,
+        on_scan_complete: Optional[Callable[[str, str], Awaitable[None]]] = None,
     ):
         """Register callbacks for event processing."""
         if on_session_created:
@@ -135,6 +138,8 @@ class HTTPReceiver(Receiver):
             self._on_heartbeat = on_heartbeat
         if on_session_closed:
             self._on_session_closed = on_session_closed
+        if on_scan_complete:
+            self._on_scan_complete = on_scan_complete
     
     def register_api_key(self, api_key: str, pipe_id: str):
         """Register an API key for a pipe."""
@@ -297,6 +302,17 @@ class HTTPReceiver(Receiver):
             request: Request,
         ):
             """Ingest a batch of events."""
+            
+            # Handle scan_complete notification
+            if batch.source_type == "scan_complete" and batch.metadata:
+                scan_path = batch.metadata.get("scan_path")
+                if scan_path and receiver._on_scan_complete:
+                    try:
+                        await receiver._on_scan_complete(session_id, scan_path)
+                        return {"status": "ok", "phase": "scan_complete"}
+                    except Exception as e:
+                        receiver.logger.error(f"Scan complete handling failed: {e}")
+                return {"status": "ok", "phase": "scan_complete"}
 
             if receiver._on_event_received:
                 try:

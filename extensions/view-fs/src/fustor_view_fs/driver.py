@@ -171,6 +171,33 @@ class FSViewDriver(FSViewBase):
                 self.logger.info(f"Suspect RENEWED (mismatch via Sentinel): {path} (Mtime: {mtime})")
 
 
+    async def trigger_realtime_scan(self, path: str, recursive: bool = True) -> bool:
+        """
+        Triggers a real-time scan on the agent side by queuing a command.
+        """
+        from fustor_fusion.core.session_manager import session_manager
+        
+        async with self._global_semaphore:
+            # 1. Find the authoritative session (Leader)
+            lead_session_id = await self.arbitrator.get_leader_session_id()
+            if not lead_session_id:
+                # Fallback: check any active session if leader not explicitly set
+                active_sessions = await session_manager.get_view_sessions(self.view_id)
+                if not active_sessions:
+                    return False
+                # Pick any session (likely there's only one relevant one per view usually)
+                lead_session_id = list(active_sessions.keys())[0]
+            
+            # 2. Queue the command
+            command = {
+                "type": "scan",
+                "path": path,
+                "recursive": recursive,
+                "created_at": time.time()
+            }
+            
+            return await session_manager.queue_command(self.view_id, lead_session_id, command)
+
     async def get_data_view(self, **kwargs) -> dict:
         """Required by the ViewDriver ABC."""
         return await self.get_directory_tree(**kwargs) # type: ignore

@@ -230,7 +230,53 @@ class FSDriver(SourceDriver):
         yield from scanner.scan_audit(self.uri, mtime_cache or {}, batch_size=batch_size)
         logger.info(f"[{stream_id}] Audit scan completed.")
 
+    def scan_path(self, path: str, recursive: bool = True) -> Iterator[EventBase]:
+        """
+        On-demand scan of a specific path.
+        Returns an iterator of events.
+        """
+        stream_id = f"od-scan-{uuid.uuid4().hex[:6]}"
+        logger.info(f"[{stream_id}] Starting On-Demand Scan: {path} (recursive={recursive})")
+        
+        # Ensure path is within the source URI
+        if not path.startswith(self.uri):
+            # Try joining, assuming relative path
+            full_path = os.path.join(self.uri, path.lstrip("/"))
+            if not full_path.startswith(self.uri):
+                logger.error(f"[{stream_id}] Path {path} is outside of source URI {self.uri}")
+                return iter([])
+            path = full_path
 
+        # Configure scanner
+        # Use Fewer workers for on-demand scan to avoid impact
+        num_workers = max(1, self._executor._max_workers // 2)
+        
+        # We use a custom file pattern if needed, but default to driver config
+        file_pattern = self.config.driver_params.get("file_pattern", "*")
+        
+        scanner = FSScanner(self.uri, num_workers=num_workers, 
+                           file_pattern=file_pattern, drift_from_nfs=self.drift_from_nfs)
+
+        def touch_callback(p, relative_mtime):
+            # Update watch manager to keep it fresh
+            self.watch_manager.touch(p, relative_mtime, is_recursive_upward=False)
+
+        if recursive:
+            yield from scanner.scan_snapshot(path, batch_size=100, callback=touch_callback)
+        else:
+            # Non-recursive: only return directory metadata itself
+            try:
+                stat = os.stat(path)
+                meta = get_file_metadata(path, stat)
+                yield UpdateEvent(
+                    key=os.path.relpath(path, self.uri),
+                    schema="fs",
+                    rows=[meta]
+                )
+            except Exception as e:
+                logger.error(f"[{stream_id}] Error scanning path: {e}")
+        
+        logger.info(f"[{stream_id}] On-Demand scan completed.")
 
     def perform_sentinel_check(self, task_batch: Dict[str, Any]) -> Dict[str, Any]:
         """
