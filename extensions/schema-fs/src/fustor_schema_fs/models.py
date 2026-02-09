@@ -43,7 +43,9 @@ class FSRow(BaseModel):
     created_time: Optional[float] = Field(None, description="Creation time (Unix timestamp)")
     parent_path: Optional[str] = Field(None, description="Parent directory path")
     parent_mtime: Optional[float] = Field(None, description="Parent directory mtime (for audit)")
+    parent_mtime: Optional[float] = Field(None, description="Parent directory mtime (for audit)")
     audit_skipped: bool = Field(False, description="True if this was a heartbeat during audit")
+    is_atomic_write: bool = Field(True, description="True if file is in a stable state (e.g. created, close_write, snapshot)")
     
     @field_validator('path', mode='before')
     @classmethod

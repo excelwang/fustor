@@ -161,10 +161,28 @@ class FSArbitrator:
         # 3. Blind Spot and Suspect Management
         if is_realtime:
             self.logger.debug(f"REALTIME_EVENT for {path}. Current blind_spot_additions: {path in self.state.blind_spot_additions}")
-            self.state.suspect_list.pop(path, None)
+            
+            # Atomic Write Check:
+            # If the event is NOT an atomic write (e.g. IN_MODIFY), we treat it as "Partial/Dirty".
+            # We MUST maintain the SUSPECT status to ensure it eventually gets verified if the stream stops.
+            is_atomic = payload.get('is_atomic_write', True)
+            
+            if is_atomic:
+                # Clean write (Close/Create) -> Clear suspect
+                self.state.suspect_list.pop(path, None)
+                node.old_suspect_state = False # Cleanup partial state
+                node.integrity_suspect = False
+            else:
+                # Partial write (Modify) -> Mark/Renew suspect
+                # We set a TTL so that if we never get the Close event, Sentinel will check it.
+                expiry = time.monotonic() + self.hot_file_threshold
+                self.state.suspect_list[path] = (expiry, mtime)
+                heapq.heappush(self.state.suspect_heap, (expiry, path))
+                node.integrity_suspect = True
+                self.logger.debug(f"Partial Write (Suspect): {path}")
+
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
-            node.integrity_suspect = False
             node.known_by_agent = True
             self.logger.debug(f"REALTIME_DONE for {path}. Now agent_known={node.known_by_agent}, missing={path in self.state.blind_spot_additions}")
         else:

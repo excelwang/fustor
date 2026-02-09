@@ -236,6 +236,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 
                 metadata = get_file_metadata(event.src_path)
                 if metadata:
+                    metadata["is_atomic_write"] = False  # Mark as dirty (partial write)
                     update_event = UpdateEvent(
                         event_schema=self.watch_manager.root_path,
                         table="files",
@@ -257,6 +258,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             if not event.is_directory:
                 metadata = get_file_metadata(event.src_path)
                 if metadata:
+                    metadata["is_atomic_write"] = True # Mark as clean (write finished)
                     update_event = UpdateEvent(
                         event_schema=self.watch_manager.root_path,
                         table="files",
