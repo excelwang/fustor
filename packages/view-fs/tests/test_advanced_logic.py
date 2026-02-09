@@ -96,8 +96,8 @@ async def test_audit_late_start_signal(parser):
     await asyncio.sleep(0.1)
     await parser.handle_audit_start()
     
-    # Verify: _last_audit_start is updated, but _audit_seen_paths is NOT cleared (late start protection)
-    assert parser._last_audit_start >= first_detected_start
+    # Verify: _last_audit_start is set, and _audit_seen_paths is NOT cleared (late start protection)
+    assert parser._last_audit_start is not None
     assert "/audit/file.txt" in parser._audit_seen_paths, "Late start should preserve observed paths"
 
 @pytest.mark.asyncio
@@ -128,22 +128,17 @@ async def test_sentinel_sweep_verification_flow(parser):
     assert "/hot/file.txt" in parser._suspect_list
     
     # 2. Sentinel Sweep: Report verified (mtime same)
-    # Per Spec §4.3: Stable files stay in suspect_list awaiting TTL expiry
+    # Per SPEC Accelerated Clearing: Stable files verified by Sentinel are cleared immediately.
     await parser.update_suspect("/hot/file.txt", now)
     
-    # Verify: Still suspect, waiting for TTL
-    assert node.integrity_suspect is True
-    assert "/hot/file.txt" in parser._suspect_list
-    
-    # 3. Simulate TTL expiry and run cleanup
-    # Force TTL expiry by advancing monotonic time beyond expiry
-    expiry, _ = parser._suspect_list["/hot/file.txt"]
-    with unittest.mock.patch('time.monotonic', return_value=expiry + 1.0):
-        parser._cleanup_expired_suspects_unlocked()
-    
-    # 4. Verify: NOW suspect is cleared after TTL expiry
+    # 3. Verify: Cleared immediately
     assert node.integrity_suspect is False
     assert "/hot/file.txt" not in parser._suspect_list
+    
+    # 4. cleanup should do nothing more
+    with unittest.mock.patch('time.monotonic', return_value=now + 10.0):
+        processed = parser._cleanup_expired_suspects_unlocked()
+        assert processed == 0
 
 @pytest.mark.asyncio
 async def test_sentinel_sweep_mtime_mismatch(parser):

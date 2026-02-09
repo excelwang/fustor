@@ -426,7 +426,7 @@ POST /api/v1/ingest/consistency/sentinel/feedback
      Body: {"type": "suspect_update", "updates": [{"path": "...", "mtime": 123.0, "status": "exists"}, ...]}
 ```
 
-Fusion 收到反馈后通过 `provider.update_suspect()` 执行稳定性判定。
+Fusion 收到反馈后通过 `provider.update_suspect()` 执行稳定性判定。若反馈证明文件稳定，则立即清除可疑标记（加速收敛）。
 
 ---
 

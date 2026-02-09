@@ -154,12 +154,14 @@ class FSViewProvider(FSViewBase):
                 
             if is_stable:
                 # Stable!
-                # Per Spec §4.3: Stable files stay in suspect_list awaiting TTL expiry.
-                # Do NOT clear immediately even if verified by Sentinel, to ensure
-                # the "Cool-off" period is fully honored for hot files.
-                self.logger.debug(f"Suspect VERIFIED stable (Sentinel): {path}. Waiting for cool-off.")
+                # If verified stable, we trust the agent's check and CLEAR it 
+                # even if it's technically "Hot" (recent).
+                # The agent said "I checked this RIGHT NOW and it matches".
+                self.logger.info(f"Suspect VERIFIED stable (Active via Sentinel): {path}. Clearing immediately.")
+                self.state.suspect_list.pop(path, None)
+                node.integrity_suspect = False
             else:
-                # Active: Renew TTL and update node state
+                # Active: Update node and renew TTL
                 node.modified_time = mtime
                 node.integrity_suspect = True
                 
