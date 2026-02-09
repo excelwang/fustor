@@ -100,7 +100,7 @@ async def lifespan(app: FastAPI):
             try:
                 v_group_id = config.view_id
                 vm = await get_cached_view_manager(v_group_id)
-                if view_instance_id in vm.providers:
+                if view_instance_id in vm.driver_instances:
                     logger.info(f"View {view_instance_id} already initialized by manager.")
                     continue
                 logger.info(f"Verified view {view_instance_id} is active in manager for group {v_group_id}")

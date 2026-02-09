@@ -156,7 +156,7 @@ class ViewManagerAdapter(ViewHandler):
         from fustor_fusion.view_manager.manager import ViewManager
         
         manager = ViewManager(view_id="1")
-        await manager.initialize_providers()
+        await manager.initialize_driver_instances()
         
         handler = ViewManagerAdapter(manager)
         
@@ -191,21 +191,21 @@ class ViewManagerAdapter(ViewHandler):
         return self._manager
     
     async def initialize(self) -> None:
-        """Initialize the view manager's providers."""
-        await self._manager.initialize_providers()
+        """Initialize the view manager's driver instances."""
+        await self._manager.initialize_driver_instances()
         logger.debug(f"ViewManagerAdapter {self.id} initialized")
     
     async def close(self) -> None:
-        """Close all providers."""
-        # ViewManager doesn't have explicit close, but providers might
-        for provider_id, provider in self._manager.providers.items():
-            if hasattr(provider, 'close'):
-                await provider.close()
+        """Close all driver instances."""
+        # ViewManager doesn't have explicit close, but driver instances might
+        for driver_id, driver_instance in self._manager.driver_instances.items():
+            if hasattr(driver_instance, 'close'):
+                await driver_instance.close()
         logger.debug(f"ViewManagerAdapter {self.id} closed")
     
     async def process_event(self, event: Any) -> bool:
         """
-        Process an event through all view providers.
+        Process an event through all view driver instances.
         
         Delegates to the ViewManager's process_event method.
         """
@@ -215,7 +215,7 @@ class ViewManagerAdapter(ViewHandler):
         
         results = await self._manager.process_event(event)
 
-        # Return True if any provider processed successfully
+        # Return True if any driver processed successfully
         return any(
             (r if isinstance(r, bool) else r.get("success", False))
             for r in results.values()
@@ -223,61 +223,61 @@ class ViewManagerAdapter(ViewHandler):
     
     async def get_data_view(self, **kwargs) -> Any:
         """
-        Get data view from a specific provider.
+        Get data view from a specific driver instance.
         
         Args:
-            provider: The provider name to query
-            **kwargs: Provider-specific parameters
+            driver_id: The driver instance ID to query
+            **kwargs: Driver-specific parameters
         
         Returns:
-            The data view from the specified provider
+            The data view from the specified driver
         """
-        provider_name = kwargs.pop("provider", None)
-        if provider_name:
-            return self._manager.get_data_view(provider_name, **kwargs)
+        driver_id = kwargs.pop("driver_id", None)
+        if driver_id:
+            return self._manager.get_data_view(driver_id, **kwargs)
         
-        # Return all available providers if none specified
+        # Return all available driver IDs if none specified
         return {
-            "providers": self._manager.get_available_providers()
+            "driver_instances": self._manager.get_available_driver_ids()
         }
     
     async def on_session_start(self) -> None:
-        """Handle session start for all providers."""
+        """Handle session start for all driver instances."""
         await self._manager.on_session_start()
     
     async def on_session_close(self) -> None:
-        """Handle session close for all providers."""
+        """Handle session close for all driver instances."""
         await self._manager.on_session_close()
     
     async def handle_audit_start(self) -> None:
-        """Handle audit start for all providers."""
-        for provider in self._manager.providers.values():
-            if hasattr(provider, 'handle_audit_start'):
-                await provider.handle_audit_start()
+        """Handle audit start for all driver instances."""
+        for driver_instance in self._manager.driver_instances.values():
+            if hasattr(driver_instance, 'handle_audit_start'):
+                await driver_instance.handle_audit_start()
     
     async def handle_audit_end(self) -> None:
-        """Handle audit end for all providers."""
-        for provider in self._manager.providers.values():
-            if hasattr(provider, 'handle_audit_end'):
-                await provider.handle_audit_end()
+        """Handle audit end for all driver instances."""
+        for driver_instance in self._manager.driver_instances.values():
+            if hasattr(driver_instance, 'handle_audit_end'):
+                await driver_instance.handle_audit_end()
     
     async def reset(self) -> None:
-        """Reset all providers."""
-        for provider in self._manager.providers.values():
-            if hasattr(provider, 'reset'):
-                await provider.reset()
+        """Reset all driver instances."""
+        for driver_instance in self._manager.driver_instances.values():
+            if hasattr(driver_instance, 'reset'):
+                await driver_instance.reset()
     
     def get_stats(self) -> Dict[str, Any]:
         """Get aggregated statistics from ViewManager."""
         return self._manager.get_aggregated_stats()
     
-    def get_available_providers(self) -> List[str]:
-        """Get list of available provider names."""
-        return self._manager.get_available_providers()
+    def get_available_driver_ids(self) -> List[str]:
+        """Get list of available driver instance IDs."""
+        return self._manager.get_available_driver_ids()
     
-    def get_provider(self, name: str) -> Optional[ViewDriver]:
-        """Get a specific provider by name."""
-        return self._manager.get_provider(name)
+    def get_driver_instance(self, name: str) -> Optional[ViewDriver]:
+        """Get a specific driver instance by name."""
+        return self._manager.get_driver_instance(name)
 
 
 def create_view_handler_from_driver(

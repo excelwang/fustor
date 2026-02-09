@@ -217,7 +217,7 @@ async def end_session(
     try:
         await on_session_close(view_id)
     except Exception as e:
-        logger.warning(f"Failed to notify view providers of session close: {e}")
+        logger.warning(f"Failed to notify view driver instances of session close: {e}")
     
     return {
         "status": "ok",

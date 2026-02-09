@@ -16,32 +16,32 @@ logger = logging.getLogger(__name__)
 # Base router for all view-related endpoints
 view_router = APIRouter(tags=["Data Views"])
 
-async def get_view_provider(view_id: str, lookup_key: str):
+async def get_view_driver_instance(view_id: str, lookup_key: str):
     """
-    Helper to get a view provider for a specific key (instance name or driver name).
+    Helper to get a view driver instance for a specific key (instance name or driver name).
     """
     manager = await get_cached_view_manager(view_id)
-    provider = manager.providers.get(lookup_key)
+    driver_instance = manager.driver_instances.get(lookup_key)
     
-    if not provider:
-        # Fallback to checking if there's only one provider and using that
+    if not driver_instance:
+        # Fallback to checking if there's only one driver instance and using that
         # (Useful if queried by driver name but configured with instance name)
-        if len(manager.providers) == 1:
-            provider = list(manager.providers.values())[0]
+        if len(manager.driver_instances) == 1:
+            driver_instance = list(manager.driver_instances.values())[0]
         else:
-            logger.warning(f"View provider '{lookup_key}' not found in ViewManager '{view_id}' (Available: {list(manager.providers.keys())})")
+            logger.warning(f"View driver instance '{lookup_key}' not found in ViewManager '{view_id}' (Available: {list(manager.driver_instances.keys())})")
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"View '{lookup_key}' not found or not active"
             )
             
-    return provider
+    return driver_instance
 
 def make_readiness_checker(view_name: str) -> Callable:
     """Creates a dependency that ensures a view is ready before allowing API access."""
     async def check_ready(view_id: str = Depends(get_view_id_from_api_key)):
         manager = await get_cached_view_manager(view_id)
-        provider = manager.providers.get(view_name)
+        driver_instance = manager.driver_instances.get(view_name)
         
         # 1. Check Global Snapshot Status (via ViewStateManager)
         from ..view_state_manager import view_state_manager
@@ -53,19 +53,19 @@ def make_readiness_checker(view_name: str) -> Callable:
                 headers={"Retry-After": "5"}
             )
             
-        # 2. Check Provider Specific Readiness
-        if not provider and len(manager.providers) == 1:
-            provider = list(manager.providers.values())[0]
+        # 2. Check Driver Instance Specific Readiness
+        if not driver_instance and len(manager.driver_instances) == 1:
+            driver_instance = list(manager.driver_instances.values())[0]
             
-        if not provider:
+        if not driver_instance:
              raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail=f"View '{view_name}' not found"
             )
 
-        # Check if provider has readiness flag (e.g. initial snapshot done)
-        # Note: FSViewProvider implementation uses is_ready property
-        is_ready = getattr(provider, "is_ready", True)
+        # Check if driver instance has readiness flag (e.g. initial snapshot done)
+        # Note: FSViewDriver implementation uses is_ready property
+        is_ready = getattr(driver_instance, "is_ready", True)
         if callable(is_ready):
             is_ready = is_ready()
             

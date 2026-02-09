@@ -49,28 +49,28 @@ async def start_view(view_id: str):
     vm = await get_cached_view_manager(v_group_id)
     
     # Check if view already running
-    if view_id in vm.providers:
+    if view_id in vm.driver_instances:
         return {"status": "already_running", "view_id": view_id}
     
-    # Register view provider
+    # Register view driver instance
     try:
-        # Load the driver and create provider
+        # Load the driver and create instance
         from fustor_fusion_sdk.loaders import load_view
-        provider_class = load_view(config.driver)
-        provider = provider_class(
+        driver_class = load_view(config.driver)
+        driver_instance = driver_class(
             id=view_id,
             view_id=v_group_id,
             config=config.driver_params
         )
-        await provider.initialize()
-        vm.providers[view_id] = provider
-        logger.info(f"Registered view provider: {view_id}")
+        await driver_instance.initialize()
+        vm.driver_instances[view_id] = driver_instance
+        logger.info(f"Registered view driver instance: {view_id}")
         
         # If active session exists, trigger on_session_start
         sessions = await session_manager.get_view_sessions(v_group_id)
         if sessions:
             # session_id = list(sessions.keys())[0] # Not used
-            await provider.on_session_start()
+            await driver_instance.on_session_start()
             logger.info(f"Triggered on_session_start for view {view_id}")
         
     except Exception as e:
@@ -98,7 +98,7 @@ async def stop_view(view_id: str):
     # Find which ViewManager has this view
     v_group_id = None
     for manager_id, vm in view_managers.items():
-        if view_id in vm.providers:
+        if view_id in vm.driver_instances:
             v_group_id = manager_id
             break
     
@@ -112,14 +112,14 @@ async def stop_view(view_id: str):
     
     # Unregister view
     try:
-        provider = vm.providers.pop(view_id)
-        await provider.cleanup()
+        driver_instance = vm.driver_instances.pop(view_id)
+        await driver_instance.cleanup()
         logger.info(f"Stopped view: {view_id}")
     except Exception as e:
         logger.error(f"Error stopping view {view_id}: {e}", exc_info=True)
     
     # Check if other views exist for this view group
-    remaining_views = len(vm.providers)
+    remaining_views = len(vm.driver_instances)
     
     if remaining_views == 0:
         # No views left for this view group, terminate sessions
@@ -132,7 +132,7 @@ async def stop_view(view_id: str):
         del view_managers[v_group_id]
     
     # Check if any views left globally
-    total_views = sum(len(vm.providers) for vm in view_managers.values())
+    total_views = sum(len(vm.driver_instances) for vm in view_managers.values())
     should_shutdown = total_views == 0
     
     return {
@@ -149,6 +149,6 @@ async def list_views():
     
     result = {}
     for v_group_id, vm in view_managers.items():
-        result[v_group_id] = list(vm.providers.keys())
+        result[v_group_id] = list(vm.driver_instances.keys())
     
     return {"running_views": result}

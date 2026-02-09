@@ -1,5 +1,5 @@
 """
-Main View Manager module that coordinates different view providers.
+Main View Manager module that coordinates view driver instances.
 This module provides a unified interface for processing various event types
 and building corresponding consistent data views.
 All data is stored in memory only.
@@ -63,16 +63,16 @@ class ViewManager:
     """
     
     def __init__(self, view_id: str):
-        self.providers: Dict[str, ViewDriver] = {}
+        self.driver_instances: Dict[str, ViewDriver] = {}
         self.logger = logging.getLogger(__name__)
         self.view_id = view_id
     
-    async def initialize_providers(self):
-        """Initialize view providers by loading them from entry points."""
+    async def initialize_driver_instances(self):
+        """Initialize view driver instances by loading them from view configs."""
         if not self.view_id:
             return
             
-        self.logger.info(f"Initializing view providers for view {self.view_id}")
+        self.logger.info(f"Initializing view driver instances for view {self.view_id}")
         
         available_drivers = _load_view_drivers()
         
@@ -97,13 +97,13 @@ class ViewManager:
                 driver_params = config.driver_params
                 
                 try:
-                    provider = driver_cls(
+                    driver_instance = driver_cls(
                         id=view_name,
                         view_id=self.view_id,
                         config=driver_params
                     )
-                    await provider.initialize()
-                    self.providers[view_name] = provider
+                    await driver_instance.initialize()
+                    self.driver_instances[view_name] = driver_instance
                     self.logger.info(f"Initialized ViewDriver '{view_name}' (type={driver_type})")
                 except Exception as e:
                     self.logger.error(f"Failed to initialize ViewDriver '{view_name}': {e}", exc_info=True)
@@ -117,13 +117,13 @@ class ViewManager:
                      try:
                          # For auto-discovery, we use the schema name as the view instance name
                          # No default config provided
-                         provider = driver_cls(
+                         driver_instance = driver_cls(
                              id=schema,
                              view_id=self.view_id,
                              config={}
                          )
-                         await provider.initialize()
-                         self.providers[schema] = provider
+                         await driver_instance.initialize()
+                         self.driver_instances[schema] = driver_instance
                          self.logger.info(f"Initialized ViewDriver '{schema}' for view {self.view_id}")
                      except Exception as e:
                          self.logger.error(f"Failed to initialize ViewDriver '{schema}': {e}", exc_info=True)
@@ -133,57 +133,57 @@ class ViewManager:
 
     
     async def process_event(self, event: EventBase) -> Dict[str, bool]:
-        """Process an event with all applicable providers and return results"""
+        """Process an event with all driver instances and return results"""
         results = {}
         
-        for provider_name, provider in self.providers.items():
+        for driver_id, driver_instance in self.driver_instances.items():
             try:
-                result = await provider.process_event(event)
-                results[provider_name] = result
+                result = await driver_instance.process_event(event)
+                results[driver_id] = result
             except Exception as e:
-                self.logger.error(f"Error processing event with provider {provider_name}: {e}", exc_info=True)
-                results[provider_name] = False
+                self.logger.error(f"Error processing event with driver {driver_id}: {e}", exc_info=True)
+                results[driver_id] = False
         
         return results
     
-    def get_provider(self, name: str) -> Optional[ViewDriver]:
-        """Get a provider by name."""
-        return self.providers.get(name)
+    def get_driver_instance(self, name: str) -> Optional[ViewDriver]:
+        """Get a driver instance by name."""
+        return self.driver_instances.get(name)
 
-    async def get_data_view(self, provider_name: str, **kwargs) -> Optional[Any]:
-        """Get the data view from a specific provider"""
-        provider = self.providers.get(provider_name)
-        if provider:
-            return await provider.get_data_view(**kwargs)
+    async def get_data_view(self, driver_id: str, **kwargs) -> Optional[Any]:
+        """Get the data view from a specific driver instance"""
+        driver_instance = self.driver_instances.get(driver_id)
+        if driver_instance:
+            return await driver_instance.get_data_view(**kwargs)
         return None
     
-    def get_available_providers(self) -> list:
-        """Get list of available provider names"""
-        return list(self.providers.keys())
+    def get_available_driver_ids(self) -> list:
+        """Get list of available driver instance IDs"""
+        return list(self.driver_instances.keys())
 
     async def cleanup_expired_suspects(self):
-        """Cleanup expired suspects in all providers that support it."""
-        for name, provider in self.providers.items():
-            if hasattr(provider, 'cleanup_expired_suspects'):
+        """Cleanup expired suspects in all driver instances that support it."""
+        for driver_id, driver_instance in self.driver_instances.items():
+            if hasattr(driver_instance, 'cleanup_expired_suspects'):
                 try:
-                    await provider.cleanup_expired_suspects()
+                    await driver_instance.cleanup_expired_suspects()
                 except Exception as e:
-                    self.logger.error(f"Error cleaning up suspects for provider {name}: {e}")
+                    self.logger.error(f"Error cleaning up suspects for driver {driver_id}: {e}")
 
 
     async def on_session_start(self):
-        """Dispatch session start event to all providers."""
-        for name, provider in self.providers.items():
-            await provider.on_session_start()
+        """Dispatch session start event to all driver instances."""
+        for driver_id, driver_instance in self.driver_instances.items():
+            await driver_instance.on_session_start()
 
     async def on_session_close(self):
-        """Dispatch session close event to all providers for cleanup."""
-        for name, provider in self.providers.items():
-            await provider.on_session_close()
+        """Dispatch session close event to all driver instances for cleanup."""
+        for driver_id, driver_instance in self.driver_instances.items():
+            await driver_instance.on_session_close()
 
     async def get_aggregated_stats(self) -> Dict[str, Any]:
         """
-        Collect and aggregate stats from all providers using standardized interface.
+        Collect and aggregate stats from all driver instances using standardized interface.
         """
         aggregated = {
             "total_volume": 0,
@@ -191,51 +191,50 @@ class ViewManager:
             "max_staleness_seconds": 0,
             "oldest_item_info": None,
             "logical_now": 0,
-            "providers": {}
+            "driver_instances": {}
         }
         
-        for name, provider in self.providers.items():
+        for driver_id, driver_instance in self.driver_instances.items():
             try:
                 # Enforce generic stats interface
-                if not hasattr(provider, 'get_stats'):
-                    self.logger.warning(f"Provider {name} does not implement get_stats(), skipping metrics.")
+                if not hasattr(driver_instance, 'get_stats'):
+                    self.logger.warning(f"Driver {driver_id} does not implement get_stats(), skipping metrics.")
                     continue
 
-                provider_stats = await provider.get_stats()
-                aggregated["providers"][name] = provider_stats
+                driver_stats = await driver_instance.get_stats()
+                aggregated["driver_instances"][driver_id] = driver_stats
                 
                 # Aggregate standardized metrics
                 # 1. Volume
-                aggregated["total_volume"] += provider_stats.get("item_count", 0)
+                aggregated["total_volume"] += driver_stats.get("item_count", 0)
                 
                 # 2. Latency
-                lat = provider_stats.get("latency_ms", 0)
+                lat = driver_stats.get("latency_ms", 0)
                 if lat > aggregated["max_latency_ms"]:
                      aggregated["max_latency_ms"] = lat
                      
                 # 3. Logical Clock
-                aggregated["logical_now"] = max(aggregated["logical_now"], provider_stats.get("logical_now", 0))
+                aggregated["logical_now"] = max(aggregated["logical_now"], driver_stats.get("logical_now", 0))
 
                 # 4. Oldest Item / Staleness
-                stale = provider_stats.get("staleness_seconds", 0)
+                stale = driver_stats.get("staleness_seconds", 0)
                 if stale > aggregated["max_staleness_seconds"]:
                     aggregated["max_staleness_seconds"] = stale
-                    # We might need provider-specific formatting for path, but generally we just preface with provider name
-                    path = provider_stats.get('oldest_item_path', 'unknown')
+                    path = driver_stats.get('oldest_item_path', 'unknown')
                     aggregated["oldest_item_info"] = {
-                        "path": f"[{name}] {path}",
+                        "path": f"[{driver_id}] {path}",
                         "age_seconds": stale
                     }
             except Exception as e:
-                self.logger.error(f"Failed to get stats from provider {name}: {e}", exc_info=True)
+                self.logger.error(f"Failed to get stats from driver {driver_id}: {e}", exc_info=True)
                          
         return aggregated
 
     async def reset(self):
-        """Reset all providers."""
-        for provider in self.providers.values():
-            if hasattr(provider, 'reset'):
-                await provider.reset()
+        """Reset all driver instances."""
+        for driver_instance in self.driver_instances.values():
+            if hasattr(driver_instance, 'reset'):
+                await driver_instance.reset()
 
 async def reset_views(view_id: str) -> bool:
     """
@@ -271,7 +270,7 @@ async def get_cached_view_manager(view_id: str) -> 'ViewManager':
         
         logger.info(f"Creating new view manager for view {v_id_str}")
         new_manager = ViewManager(view_id=v_id_str)
-        await new_manager.initialize_providers()
+        await new_manager.initialize_driver_instances()
         runtime_objects.view_managers[v_id_str] = new_manager
         return new_manager
 
@@ -288,20 +287,20 @@ async def cleanup_all_expired_suspects():
 # --- Public Interface for Processing events ---
 
 async def process_event(event: EventBase, view_id: str) -> Dict[str, bool]:
-    """Process a single event with all available view providers"""
+    """Process a single event with all available view driver instances"""
     manager = await get_cached_view_manager(view_id)
     return await manager.process_event(event)
 
 
 async def on_session_start(view_id: str):
-    """Notify view providers that a new session has started."""
+    """Notify view driver instances that a new session has started."""
     manager = await get_cached_view_manager(view_id)
     await manager.on_session_start()
 
 
 async def on_session_close(view_id: str):
-    """Notify view providers that a session has closed for cleanup."""
+    """Notify view driver instances that a session has closed for cleanup."""
     v_id_str = str(view_id)
-    if v_id_str in _view_manager_cache:
-        manager = _view_manager_cache[v_id_str]
+    if v_id_str in runtime_objects.view_managers:
+        manager = runtime_objects.view_managers[v_id_str]
         await manager.on_session_close()

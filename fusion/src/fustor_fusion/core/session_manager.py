@@ -166,8 +166,8 @@ class SessionManager:
         try:
             manager = await get_cached_view_manager(view_id)
             if manager:
-                for provider in manager.providers.values():
-                    if getattr(provider, "requires_full_reset_on_session_close", False):
+                for driver_instance in manager.driver_instances.values():
+                    if getattr(driver_instance, "requires_full_reset_on_session_close", False):
                         return True
         except Exception:
             pass

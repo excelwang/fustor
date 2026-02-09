@@ -23,28 +23,28 @@ async def signal_audit_start(
     """
     Explicitly signal the start of an audit cycle.
     This clears blind-spot lists and prepares the system for full reconciliation.
-    Broadcasts to all view providers that support audit handling.
+    Broadcasts to all view driver instances that support audit handling.
     """
     view_manager = await get_cached_view_manager(view_id)
-    provider_names = view_manager.get_available_providers()
+    driver_ids = view_manager.get_available_driver_ids()
     
     handled_count = 0
-    for name in provider_names:
-        provider = view_manager.get_provider(name)
-        if hasattr(provider, 'handle_audit_start'):
+    for driver_id in driver_ids:
+        driver_instance = view_manager.get_driver_instance(driver_id)
+        if hasattr(driver_instance, 'handle_audit_start'):
             try:
-                await provider.handle_audit_start()
+                await driver_instance.handle_audit_start()
                 handled_count += 1
             except Exception as e:
-                logger.error(f"Failed to handle audit start for provider {name}: {e}")
+                logger.error(f"Failed to handle audit start for driver {driver_id}: {e}")
 
-    if handled_count == 0 and provider_names:
-        logger.debug(f"No providers handled audit start (available: {provider_names})")
+    if handled_count == 0 and driver_ids:
+        logger.debug(f"No driver instances handled audit start (available: {driver_ids})")
     
-    if not provider_names:
-        logger.warning(f"Audit start signal received but no view providers are loaded for view {view_id}")
+    if not driver_ids:
+        logger.warning(f"Audit start signal received but no view driver instances are loaded for view {view_id}")
 
-    return {"status": "audit_started", "providers_handled": handled_count}
+    return {"status": "audit_started", "drivers_handled": handled_count}
 
 
 @consistency_router.post("/audit/end", summary="Signal end of an audit cycle")
@@ -54,7 +54,7 @@ async def signal_audit_end(
     """
     Signal the completion of an audit cycle.
     This triggers missing item detection and cleanup logic.
-    Broadcasts to all view providers that support audit handling.
+    Broadcasts to all view driver instances that support audit handling.
     """
     max_wait = 10.0
     wait_interval = 0.1
@@ -94,19 +94,19 @@ async def signal_audit_end(
         logger.info(f"Queue drained for audit end (waited {elapsed:.2f}s), proceeding with missing item detection")
 
     view_manager = await get_cached_view_manager(view_id)
-    provider_names = view_manager.get_available_providers()
+    driver_ids = view_manager.get_available_driver_ids()
     
     handled_count = 0
-    for name in provider_names:
-        provider = view_manager.get_provider(name)
-        if hasattr(provider, 'handle_audit_end'):
+    for driver_id in driver_ids:
+        driver_instance = view_manager.get_driver_instance(driver_id)
+        if hasattr(driver_instance, 'handle_audit_end'):
             try:
-                await provider.handle_audit_end()
+                await driver_instance.handle_audit_end()
                 handled_count += 1
             except Exception as e:
-                logger.error(f"Failed to handle audit end for provider {name}: {e}")
+                logger.error(f"Failed to handle audit end for driver {driver_id}: {e}")
 
-    return {"status": "audit_ended", "providers_handled": handled_count}
+    return {"status": "audit_ended", "drivers_handled": handled_count}
 
 
 @consistency_router.get("/sentinel/tasks", summary="Get sentinel check tasks")
@@ -115,23 +115,23 @@ async def get_sentinel_tasks(
 ) -> Dict[str, Any]:
     """
     Get generic sentinel check tasks.
-    Aggregates tasks from all view providers.
+    Aggregates tasks from all view driver instances.
     Currently maps Suspect Lists to 'suspect_check' tasks.
     """
     view_manager = await get_cached_view_manager(view_id)
-    provider_names = view_manager.get_available_providers()
+    driver_ids = view_manager.get_available_driver_ids()
     
     all_suspects_paths = []
     
-    for name in provider_names:
-        provider = view_manager.get_provider(name)
-        if hasattr(provider, 'get_suspect_list'):
+    for driver_id in driver_ids:
+        driver_instance = view_manager.get_driver_instance(driver_id)
+        if hasattr(driver_instance, 'get_suspect_list'):
             try:
-                suspects = await provider.get_suspect_list()
+                suspects = await driver_instance.get_suspect_list()
                 if suspects:
                     all_suspects_paths.extend(list(suspects.keys()))
             except Exception as e:
-                logger.error(f"Failed to get suspect list from provider {name}: {e}")
+                logger.error(f"Failed to get suspect list from driver {driver_id}: {e}")
     
     if all_suspects_paths:
         unique_paths = list(set(all_suspects_paths))
@@ -152,10 +152,10 @@ async def submit_sentinel_feedback(
     """
     Submit feedback from sentinel checks.
     Expects payload: {"type": "suspect_update", "updates": [...]}
-    Broadcasts feedback to all view providers.
+    Broadcasts feedback to all view driver instances.
     """
     view_manager = await get_cached_view_manager(view_id)
-    provider_names = view_manager.get_available_providers()
+    driver_ids = view_manager.get_available_driver_ids()
 
     res_type = feedback.get('type')
     processed_count = 0
@@ -163,23 +163,23 @@ async def submit_sentinel_feedback(
     if res_type == 'suspect_update':
         updates = feedback.get('updates', [])
         
-        for name in provider_names:
-            provider = view_manager.get_provider(name)
-            if hasattr(provider, 'update_suspect'):
+        for driver_id in driver_ids:
+            driver_instance = view_manager.get_driver_instance(driver_id)
+            if hasattr(driver_instance, 'update_suspect'):
                 try:
-                    count_for_provider = 0
+                    count_for_driver = 0
                     for item in updates:
                         path = item.get('path')
                         mtime = item.get('mtime')
                         if path and mtime is not None:
-                            await provider.update_suspect(path, float(mtime))
-                            count_for_provider += 1
-                    if count_for_provider > 0:
+                            await driver_instance.update_suspect(path, float(mtime))
+                            count_for_driver += 1
+                    if count_for_driver > 0:
                         processed_count += 1
                 except Exception as e:
-                    logger.error(f"Failed to update suspects in provider {name}: {e}")
+                    logger.error(f"Failed to update suspects in driver {driver_id}: {e}")
 
-        return {"status": "processed", "providers_updated": processed_count}
+        return {"status": "processed", "drivers_updated": processed_count}
     
     return {"status": "ignored", "reason": "unknown_type"}
 @consistency_router.post("/reset", summary="Reset consistency state for a view (Tests only)")
