@@ -64,7 +64,7 @@ async def test_tombstone_resurrection_logic(arbitrator, state):
         await arbitrator.process_event(del_event)
         assert path in state.tombstone_list
         tombstone_ts, _ = state.tombstone_list[path]
-        assert tombstone_ts > 1000.0
+        assert tombstone_ts >= 1000.0  # With simplified watermark, equals time.time() when no skew
 
         # 2. STALE event (Snapshot) should be blocked
         stale_event = MockEvent({

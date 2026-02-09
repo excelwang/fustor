@@ -34,12 +34,16 @@ class TestLogicalClockBasic:
             assert clock.now() == 200.0
     
     def test_update_ignores_older_time(self):
-        """Update should ignore mtime older than current value."""
+        """Update should sample skew regardless of mtime order.
+        
+        New behavior: Watermark = time.time() - skew, mtime doesn't directly affect value.
+        """
         with patch('time.time', return_value=200.0):
             clock = LogicalClock(initial_time=200.0)
-            result = clock.update(100.0)
-            assert result == 200.0
-            assert clock.now() == 200.0
+            result = clock.update(100.0)  # skew = 200 - 100 = 100
+            # Watermark = 200 - 100 = 100
+            assert result == 100.0
+            assert clock.now() == 100.0
     
     def test_update_ignores_equal_time(self):
         """Update with equal time should not change clock."""
@@ -50,10 +54,12 @@ class TestLogicalClockBasic:
             assert clock.now() == 150.0
     
     def test_update_handles_none(self):
-        """Update should handle None gracefully."""
-        clock = LogicalClock(initial_time=100.0)
-        result = clock.update(None)
-        assert result == 100.0
+        """Update should handle None gracefully (returns current watermark)."""
+        with patch('time.time', return_value=100.0):
+            clock = LogicalClock(initial_time=100.0)
+            result = clock.update(None)
+            # No skew samples yet, so watermark = time.time() = 100.0
+            assert result == 100.0
 
 class TestLogicalClockReset:
     """Tests for reset functionality."""
@@ -173,20 +179,19 @@ class TestLogicalClockThreadSafety:
         # Expected Skew = 10500 - 10400 = 100s
         
         with patch('time.time', return_value=t_fusion):
-            # Use small initial_time so mtime can advance the clock
             clock = LogicalClock(initial_time=0.001)
             
             # Inject some samples to stabilize Mode
             for _ in range(5):
                 clock.update(observed_mtime=nfs_mtime)
             
-            # After updates: skew=100, baseline=10400, _value advanced to 10400
-            assert clock._value == nfs_mtime
-            assert clock.get_watermark() == nfs_mtime
+            # Skew = 100, Watermark = time.time() - skew = 10500 - 100 = 10400
+            assert clock.get_skew() == 100.0
+            assert clock.get_watermark() == nfs_mtime  # 10400
         
         # Time progresses to 10510
         with patch('time.time', return_value=10510.0):
-            # Logic clock should advance based on BaseLine = 10510 - 100 = 10410
+            # Watermark = 10510 - 100 = 10410
             clock.update(observed_mtime=None)
             assert clock.get_watermark() == 10410.0
 
@@ -195,7 +200,6 @@ class TestLogicalClockThreadSafety:
         t_fusion = 2000.0
         
         with patch('time.time', return_value=t_fusion):
-            # Use small initial_time so mtime can advance the clock
             clock = LogicalClock(initial_time=0.001)
 
             # 1. Majority of samples establish a Skew of 100
@@ -203,24 +207,23 @@ class TestLogicalClockThreadSafety:
             for i in range(3):
                 clock.update(observed_mtime=1900.0)
             
-            # After updates: baseline=1900, _value=1900
-            assert clock._value == 1900.0
-            assert clock._cached_global_skew == 100
+            # Skew=100, Watermark = 2000 - 100 = 1900
+            assert clock.get_skew() == 100.0
+            assert clock.get_watermark() == 1900.0
 
-            # 2. A file with future mtime (outside trust window) should not pull clock forward  
-            clock.update(observed_mtime=3500.0)  # Way beyond trust window (upper_bound=1901)
+            # 2. A rogue mtime should affect histogram but Mode picks the majority
+            clock.update(observed_mtime=3500.0)  # skew = 2000 - 3500 = -1500
             
-            # 3. VERIFY: The global skew is affected but Mode picks the majority
-            assert clock._cached_global_skew == 100
+            # 3. VERIFY: Mode still picks skew=100 (3 samples vs 1 sample)
+            assert clock.get_skew() == 100.0
             
-            # 4. _value should still be 1900 (baseline enforcement = max(1900, 1900))
-            assert clock._value == 1900.0
+            # 4. Watermark still based on mode skew
             assert clock.get_watermark() == 1900.0
         
         # 5. Time progresses to 7000
         with patch('time.time', return_value=7000.0):
             clock.update(None)  # Deletion event
-            # BaseLine = 7000 - 100 = 6900
+            # Watermark = 7000 - 100 = 6900
             assert clock.get_watermark() == 6900.0
 
 

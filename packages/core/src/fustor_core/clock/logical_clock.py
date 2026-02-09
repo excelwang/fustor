@@ -29,7 +29,8 @@ class LogicalClock:
             initial_time: Initial clock value (default 0.0, will use time.time())
         """
         self._value = initial_time if initial_time > 0 else time.time()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # Use RLock for reentrant locking (update -> get_watermark -> now)
+
         
         # --- Unified Global Clock State ---
         self._trust_window = 1.0  # seconds
@@ -44,38 +45,30 @@ class LogicalClock:
 
     def update(self, observed_mtime: float, can_sample_skew: bool = True) -> float:
         """
-        Update the logical clock.
+        Update the logical clock by sampling skew from observed mtime.
         
         Args:
             observed_mtime: The mtime value observed from a file (NFS domain)
             can_sample_skew: Whether this event is suitable for skew sampling (Realtime vs Audit)
             
         Returns:
-            The current clock value after the update
+            The current watermark value after the update
+        
+        Note:
+            Watermark is now purely `Fusion_Physical_Time - Mode_Skew`.
+            The old Trust Window / Fast Path logic has been removed for simplicity and immunity.
         """
         # Unified physical reference: Always use Fusion Local Time (Spec §4.1.A)
         # This makes the system immune to Agent local clock errors (Faketime/NTP drift).
         reference_time = time.time()
         
-        # DEBUG SKEW
-
-
-        
         with self._lock:
             # --- Special Case: Deletion/Metadata event (observed_mtime is None) ---
             if observed_mtime is None:
-                effective_skew = self._get_global_skew_locked()
-                if effective_skew is not None:
-                    # Return BaseLine value for deletion/metadata tracking
-                    # But don't advance the internal state purely based on physical time here
-                    # now() will handle the physical progression
-                    baseline = reference_time - effective_skew
-                    return max(self._value, baseline)
-                return self._value
+                return self.get_watermark()
 
-            # --- Robust Sampling Mode ---
+            # --- Skew Sampling Only ---
             try:
-                # 1. Update Global Statistics
                 if can_sample_skew:
                     diff = int(reference_time - observed_mtime)
                     
@@ -89,57 +82,12 @@ class LogicalClock:
                     self._global_buffer.append(diff)
                     self._global_histogram[diff] += 1
                     self._dirty = True
-                
-                # 2. Get Global Skew (Stable Mode)
-                effective_skew = self._get_global_skew_locked()
-                
-                # 3. Calculate Watermark Candidates
-                if effective_skew is None:
-                    # Fallback: No statistics yet
-                    if observed_mtime > self._value:
-                        self._value = observed_mtime
-                else:
-                    # BaseLine = FusionPhysicalTime - Skew
-                    baseline = reference_time - effective_skew
-                    
-                    # Trust Window Logic
-                    upper_bound = baseline + self._trust_window
-                    
-                    target_value = self._value # Start with current
-                    
-                    # Logic Table from Design Doc
-                    if observed_mtime <= self._value:
-                        # Past data, ignore for clock movement
-                        pass
-                    elif baseline < observed_mtime <= upper_bound:
-                        # [Fast Path] mtime is within [BaseLine, BaseLine + 1.0s]
-                        # Trust the mtime directly for maximum real-time precision
-                        target_value = observed_mtime
-                    elif observed_mtime > upper_bound:
-                        # [Future/Anomaly] Advance to BaseLine only
-                        # Protects against 'touch' future files or massive clock jumps
-                        if baseline > self._value:
-                            target_value = baseline
-                    else:
-                        # observed_mtime <= baseline (but > current value)
-                        target_value = observed_mtime
-
-                    # Monotonicity check
-                    if target_value > self._value:
-                        self._value = target_value
-                    
-                    # ENFORCE BASELINE: Spec §4.1 "推进" (Progression)
-                    # Even if mtime is old (past data), the clock must flow with physical time.
-                    # This fixes the "Stagnation" issue where lack of new writes
-                    # caused the watermark to freeze, making old files look "fresh" (0 age).
-                    if baseline > self._value:
-                        self._value = baseline
-
-            except Exception as e:
+            except Exception:
                 # Silent fail to proceed with event processing
                 pass
 
-            return self._value
+            return self.get_watermark()
+
 
     def _get_global_skew_locked(self) -> Optional[int]:
         """Recalculate or return cached global skew (Mode)."""
@@ -162,28 +110,26 @@ class LogicalClock:
         self._cached_global_skew = best_skew
         self._dirty = False
         return best_skew
+
     def now(self) -> float:
         """
-        Get the current logical clock value (Observation Watermark).
-        Fallback: Returns time.time() ONLY if clock is completely uninitialized (0.0).
+        Get the current watermark value.
+        
+        Formula: Fusion_Physical_Time - Mode_Skew
+        
+        When skew is not yet calibrated (cold start), falls back to physical time.
         """
         with self._lock:
-            if self._value == 0.0:
-                return time.time()
-            
-            # --- Spec §5.1 / §6.2 Mitigation: Dual-Track Time ---
-            # Composite Reference = Max(LogicalState, PhysicalBaseLine)
-            # This ensures Age calculations (Suspect logic) advance with physical time,
-            # while internal state (Arbitration) stays strictly event-driven.
             effective_skew = self._get_global_skew_locked()
             if effective_skew is not None:
-                baseline = time.time() - effective_skew
-                return max(self._value, baseline)
-                
-            return max(self._value, time.time())
+                return time.time() - effective_skew
+            # Cold start: no skew samples yet, use physical time
+            return time.time()
             
     def get_watermark(self) -> float:
+        """Get the current watermark (alias for now())."""
         return self.now()
+
 
     def get_skew(self) -> float:
         """

@@ -62,71 +62,61 @@ Agent 侧的时钟逻辑**仅用于本地资源管理**，不驱动全局逻辑�
 
 Fusion 侧的逻辑时钟（Watermark）是系统的"真相之钟"，它决定了如何合并来自不同 Agent 的消息。
 
-### 4.1 稳健逻辑时钟算法 (Robust Logical Clock)
+### 4.1 简化逻辑时钟算法 (Simplified Logical Clock)
 
-Fusion 放弃被动的 `Max(mtime)` 机制，采用 **"统计学校准的主动时钟"**。
+Fusion 采用 **纯物理时间驱动的水位线**，完全免疫 mtime 异常。
 
-**实现** (`fustor_common/logical_clock.py`)：
-
-#### A. 基准线 (BaseLine) 驱动
-
-1.  **Skew 采样**: 对于每个 Realtime 事件，计算：
-    ```python
-    ```python
-    if mtime and can_sample_skew:
-        # 使用 Fusion Local Time 作为物理参考系 (Server-Side Calculation)
-        # 忽略 Agent 携带的 'agent_time' 以免疫 Agent 端时钟偏差 (如 Faketime/NTP 错误)
-        reference_time = time.time()
-        diff = reference_time - mtime  # 量化到整数秒
-        diff_int = int(diff)
-        self._global_buffer.append(diff_int)
-        self._global_histogram[diff_int] += 1
-    ```
-    - **免疫力**: 即使 Agent 时钟被篡改（如 Faketime +2h），其产生文件的 mtime 也会相应偏移。Fusion 通过 `FusionTime - mtime` 直接计算出这一偏移，从而正确还原逻辑时间。
-
-2.  **Global Skew 选举 (Mode)**:
-    ```python
-    def _compute_mode_skew(self) -> float:
-        if not self._global_histogram:
-            return 0.0
-        mode_key = self._global_histogram.most_common(1)[0][0]
-        return float(mode_key)
-    ```
-    - 选取出现频率最高 (Mode) 的差异值作为权威偏差
-    - **De-sessionization**: 时钟独立于会话，同一 View 下所有 Agent 的样本进入全局池共同校准
-
-3.  **推进**:
-    ```python
-    baseline = time.time() - self._compute_mode_skew()
-    ```
-    确保即使无写入，时钟也会随物理时间自然流逝推进。
-
-#### B. 信任窗口 (Trust Window) 与快进
-
-为保留实时性，允许在安全范围内直接采信 mtime：
+**公式**：
 
 ```python
-TRUST_WINDOW = 1.0  # seconds
-
-if mtime and mtime > self._watermark:
-    baseline = time.time() - self._compute_mode_skew()
-    if mtime <= baseline + self.TRUST_WINDOW:
-        # FastPath: 直接快进
-        self._watermark = mtime
+Watermark = Fusion_Physical_Time - Mode_Skew
 ```
 
-#### C. 删除事件的"物理引导"
+**实现** (`fustor_core/clock/logical_clock.py`)：
 
-由于 `DELETE` 消息无 `mtime`，Fusion 利用物理观察时刻和全局 Skew 计算逻辑时刻：
+#### A. Skew 采样
+
+对于每个 Realtime 事件，计算 Fusion 本地时间与 mtime 的差异：
 
 ```python
-if mtime is None:
-    # Physical-guided advancement for DELETE events
-    skew = self._compute_mode_skew()
-    derived_logical = time.time() - skew
-    if derived_logical > self._watermark:
-        self._watermark = derived_logical
+if mtime and can_sample_skew:
+    reference_time = time.time()  # Fusion Local Time
+    diff = int(reference_time - mtime)
+    self._global_buffer.append(diff)
+    self._global_histogram[diff] += 1
 ```
+
+- **免疫力**: 使用 Fusion Local Time 作为参考系，免疫 Agent 时钟偏差
+
+#### B. Mode Skew 选举
+
+```python
+def _get_global_skew_locked(self) -> float:
+    mode_key = self._global_histogram.most_common(1)[0][0]
+    return float(mode_key)
+```
+
+- 选取出现频率最高 (Mode) 的差异值作为权威偏差
+
+#### C. Watermark 计算
+
+```python
+def get_watermark(self) -> float:
+    skew = self._get_global_skew_locked() or 0.0
+    return time.time() - skew
+```
+
+- **简洁性**: 纯函数，无状态依赖
+- **免疫性**: 恶意 mtime（如 `touch -d 2050`）完全无法推进 Watermark
+- **一致性**: Watermark 始终与物理时间同步推进，不受写入流量影响
+
+> [!NOTE]
+> **移除的旧逻辑**: 
+> - ~~Trust Window~~ (±1s 信任窗口)
+> - ~~Fast Path~~ (mtime 直接推进水位线)
+> 
+> 这些已被移除以简化实现并增强对时间异常的免疫力。
+
 
 ### 4.2 核心 API
 

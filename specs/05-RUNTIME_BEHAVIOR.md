@@ -16,12 +16,14 @@ Leader 的选举完全由 Fusion 端控制，采用非抢占式的锁机制。
 - **释放锁**: 仅当 Leader Session 断开连接或显式销毁时，锁才会被释放。
 
 ### 1.2 故障转移 (Failover Promotion)
-当 Leader 掉线时，Fusion 会执行 **Oldest Follower Promotion**：
+当 Leader 掉线时，Fusion 会执行 **First Response Promotion**：
 
 1. 检测到 Leader Session 终止。
 2. 释放 View 的 Leader 锁。
-3. 按照连接顺序（通常是 Session Map 的遍历顺序）选择**连接时间最久**的 Follower。
+3. 选择**第一个成功获取锁**的 Follower（基于 `try_become_leader` 返回顺序）。
 4. 立即将其提拔为新的 Leader。
+
+> **设计理由**：响应快的节点通常意味着网络延迟低、负载轻，更适合承担 Leader 的 Snapshot/Audit 任务。此策略实现简单且自然地实现了负载均衡。
 
 ### 1.3 角色切换时的动作 (Agent 侧)
 
