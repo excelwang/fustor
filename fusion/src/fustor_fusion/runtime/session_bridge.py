@@ -78,7 +78,8 @@ class PipeSessionBridge:
         client_ip: Optional[str] = None,
         session_timeout_seconds: Optional[int] = None,
         allow_concurrent_push: Optional[bool] = None,
-        session_id: Optional[str] = None
+        session_id: Optional[str] = None,
+        source_uri: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         Create a session in both Pipe and SessionManager.
@@ -116,7 +117,8 @@ class PipeSessionBridge:
             task_id=task_id,
             client_ip=client_ip,
             allow_concurrent_push=allow_concurrent_push,
-            session_timeout_seconds=session_timeout_seconds
+            session_timeout_seconds=session_timeout_seconds,
+            source_uri=source_uri
         )
         
         # Create in Pipe

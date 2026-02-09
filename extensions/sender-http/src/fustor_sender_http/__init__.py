@@ -60,7 +60,8 @@ class HTTPSender(Sender):
         self, 
         task_id: str,
         source_type: Optional[str] = None,
-        session_timeout_seconds: Optional[int] = None
+        session_timeout_seconds: Optional[int] = None,
+        **kwargs
     ) -> Dict[str, Any]:
         """
         Create a new session with Fusion.
@@ -78,7 +79,8 @@ class HTTPSender(Sender):
             session_data = await self.client.create_session(
                 task_id, 
                 source_type=source_type,
-                session_timeout_seconds=session_timeout_seconds
+                session_timeout_seconds=session_timeout_seconds,
+                client_info=kwargs
             )
             
             if session_data and session_data.get("session_id"):

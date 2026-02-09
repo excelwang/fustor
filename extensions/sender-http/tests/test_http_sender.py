@@ -45,7 +45,7 @@ async def test_create_session(sender, mock_fusion_client):
     assert result["session_id"] == "sess-1"
     assert session_id == "sess-1"
     assert sender.session_id == "sess-1"
-    mock_fusion_client.create_session.assert_called_once_with("task-1", source_type="snapshot", session_timeout_seconds=60)
+    mock_fusion_client.create_session.assert_called_once_with("task-1", source_type="snapshot", session_timeout_seconds=60, client_info={})
 
 @pytest.mark.asyncio
 async def test_create_session_failure(sender, mock_fusion_client):

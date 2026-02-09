@@ -194,9 +194,19 @@ class PipeManager:
             if not pipe: raise ValueError(f"Pipe {pipe_id} not found")
             bridge = self._bridges.get(pipe_id)
             # Create session via bridge (legacy compat)
-            result = await bridge.create_session(task_id, client_info.get("client_ip"), session_id, session_timeout_seconds)
+            source_uri = client_info.get("source_uri") if client_info else None
+            result = await bridge.create_session(
+                task_id=task_id, 
+                client_ip=client_info.get("client_ip") if client_info else None, 
+                session_id=session_id, 
+                session_timeout_seconds=session_timeout_seconds,
+                source_uri=source_uri
+            )
             self._session_to_pipe[session_id] = pipe_id
-            return SessionInfo(session_id, task_id, pipe_id, result["role"], time.time(), time.time())
+            # Return updated SessionInfo with source_uri
+            info = SessionInfo(session_id, task_id, pipe_id, result["role"], time.time(), time.time())
+            info.source_uri = source_uri
+            return info
 
     async def _on_event_received(self, session_id, events, source_type, is_end):
         pipe_id = self._session_to_pipe.get(session_id)

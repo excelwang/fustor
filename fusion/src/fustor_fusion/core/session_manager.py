@@ -24,7 +24,8 @@ class SessionManager:
                                  task_id: Optional[str] = None, 
                                  client_ip: Optional[str] = None,
                                  allow_concurrent_push: Optional[bool] = None,
-                                 session_timeout_seconds: Optional[int] = None) -> SessionInfo:
+                                 session_timeout_seconds: Optional[int] = None,
+                                 source_uri: Optional[str] = None) -> SessionInfo:
         view_id = str(view_id)
         timeout = session_timeout_seconds or self._default_session_timeout
         
@@ -43,7 +44,8 @@ class SessionManager:
                 task_id=task_id,
                 allow_concurrent_push = allow_concurrent_push,
                 session_timeout_seconds = timeout,
-                client_ip=client_ip
+                client_ip=client_ip,
+                source_uri=source_uri
             )
             self._sessions[view_id][session_id] = session_info
             logger.info(f"Created session {session_id} for view {view_id} (timeout: {timeout}s)")

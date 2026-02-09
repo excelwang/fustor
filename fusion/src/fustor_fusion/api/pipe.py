@@ -107,6 +107,7 @@ def setup_pipe_routers():
                     "session_id": sid,
                     "task_id": si.task_id,
                     "agent_id": si.task_id, # IT tests expect agent_id
+                    "source_uri": si.source_uri,
                     "view_id": view_id,
                     "role": "leader" if is_leader else "follower",
                     "can_snapshot": is_leader,

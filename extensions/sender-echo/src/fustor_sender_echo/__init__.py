@@ -91,7 +91,8 @@ class EchoDriver(Sender):
         self,
         task_id: str,
         source_type: Optional[str] = None,
-        session_timeout_seconds: Optional[int] = None
+        session_timeout_seconds: Optional[int] = None,
+        **kwargs
     ) -> Dict[str, Any]:
         """
         Creates a new session.

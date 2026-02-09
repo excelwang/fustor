@@ -105,7 +105,8 @@ class SenderHandlerAdapter(SenderHandler):
         result = await self._sender.create_session(
             task_id,
             source_type=source_type,
-            session_timeout_seconds=session_timeout_seconds
+            session_timeout_seconds=session_timeout_seconds,
+            **kwargs
         )
         
         # Determine if result is (session_id, metadata) tuple or legacy dict

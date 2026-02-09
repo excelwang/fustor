@@ -74,7 +74,8 @@ class FusionClient:
         self, 
         task_id: str, 
         source_type: Optional[str] = None,
-        session_timeout_seconds: Optional[int] = None
+        session_timeout_seconds: Optional[int] = None,
+        client_info: Optional[Dict[str, Any]] = None
     ) -> Optional[Dict[str, Any]]:
         """
         Creates a new session and returns the session details (including ID and role).
@@ -83,7 +84,8 @@ class FusionClient:
         payload = {
             "task_id": task_id,
             "source_type": source_type,
-            "session_timeout_seconds": session_timeout_seconds
+            "session_timeout_seconds": session_timeout_seconds,
+            "client_info": client_info
         }
         # Remove None values
         payload = {k: v for k, v in payload.items() if v is not None}

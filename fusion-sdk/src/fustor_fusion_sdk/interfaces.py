@@ -12,6 +12,7 @@ class SessionInfo:
     allow_concurrent_push: Optional[bool] = None
     session_timeout_seconds: Optional[int] = None
     client_ip: Optional[str] = None
+    source_uri: Optional[str] = None
     can_realtime: bool = False
     cleanup_task: Optional[asyncio.Task] = None
 

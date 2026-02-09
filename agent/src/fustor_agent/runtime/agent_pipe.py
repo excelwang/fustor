@@ -315,10 +315,15 @@ class AgentPipe(Pipe):
                     self._set_state(PipeState.RUNNING | PipeState.RECONNECTING, "Attempting to create session...")
                     try:
                         logger.info(f"Pipe {self.id}: Creating session with task_id={self.task_id}, timeout={self.session_timeout_seconds}")
+                        # Source URI extraction (Best effort)
+                        source_uri = self.source_handler.config.get("uri") or \
+                                     self.source_handler.config.get("driver_params", {}).get("uri")
+
                         session_id, metadata = await self.sender_handler.create_session(
                             task_id=self.task_id,
                             source_type=self.source_handler.schema_name,
-                            session_timeout_seconds=self.session_timeout_seconds
+                            session_timeout_seconds=self.session_timeout_seconds,
+                            source_uri=source_uri
                         )
                         await self.on_session_created(session_id, **metadata)
                         

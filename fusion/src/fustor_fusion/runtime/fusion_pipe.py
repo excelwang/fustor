@@ -505,6 +505,7 @@ class FusionPipe(Pipe):
                 "session_id": si.session_id,
                 "task_id": si.task_id,
                 "client_ip": si.client_ip,
+                "source_uri": si.source_uri,
                 "created_at": si.created_at,
                 "last_activity": si.last_activity,
             }

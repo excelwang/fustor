@@ -138,13 +138,16 @@ async def create_session(
     except Exception as e:
         logger.error(f"Failed to trigger on_session_start during session creation: {e}")
 
+    source_uri = payload.client_info.get("source_uri") if payload.client_info else None
+    
     await session_manager.create_session_entry(
         view_id, 
         session_id, 
         task_id=payload.task_id,
         client_ip=client_ip,
         allow_concurrent_push=allow_concurrent_push,
-        session_timeout_seconds=session_timeout_seconds
+        session_timeout_seconds=session_timeout_seconds,
+        source_uri=source_uri
     )
     
     if not allow_concurrent_push:
@@ -241,6 +244,7 @@ async def list_sessions(
             "task_id": session_info.task_id,
             
             "client_ip": session_info.client_ip,
+            "source_uri": session_info.source_uri,
             "last_activity": session_info.last_activity,
             "created_at": session_info.created_at,
             "allow_concurrent_push": session_info.allow_concurrent_push,
