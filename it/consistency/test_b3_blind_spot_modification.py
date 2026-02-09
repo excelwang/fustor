@@ -42,13 +42,14 @@ class TestBlindSpotFileModification:
             content="original content"
         )
         
-        # Wait for realtime sync
-        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
-        found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
-        assert found is not None, "File should appear via realtime event"
+        # Wait for realtime sync and get mtime
+        # Wait for realtime sync and get mtime
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
+        node = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
+        assert node is not None, "File should appear via realtime event"
         
         # Record original mtime from Fusion
-        original_mtime = found.get("modified_time")
+        original_mtime = node.get("modified_time")
         
         # Step 2: Wait a bit, then modify file from blind-spot client
         time.sleep(INGESTION_DELAY)
@@ -117,7 +118,7 @@ class TestBlindSpotFileModification:
             test_file,
             content="original"
         )
-        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         
         # Initial file should not have agent_missing

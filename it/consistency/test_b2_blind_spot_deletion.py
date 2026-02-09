@@ -50,7 +50,8 @@ class TestBlindSpotFileDeletion:
         )
         
         # Wait for realtime sync
-        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        # Wait for realtime sync
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         assert found is not None, "File should appear via realtime event"
         
@@ -86,7 +87,7 @@ class TestBlindSpotFileDeletion:
             test_file,
             content="for blind delete list test"
         )
-        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)

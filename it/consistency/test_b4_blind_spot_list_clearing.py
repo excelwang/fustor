@@ -48,18 +48,19 @@ class TestBlindSpotListPersistence:
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, test_file_a, content="file A")
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, test_file_c, content="file C - persistent")
         
+        
         # Trigger Audit
         marker_1 = f"{MOUNT_POINT}/audit_marker_b4_p1_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_1, content="marker")
         time.sleep(STRESS_DELAY)
-        marker_1_rel = os.path.relpath(marker_1, MOUNT_POINT)
+        marker_1_rel = "/" + os.path.relpath(marker_1, MOUNT_POINT)
         assert fusion_client.wait_for_file_in_tree(marker_1_rel, timeout=LONG_TIMEOUT)
         
         # Verify A and C are in blind-spot list
         blind_list = fusion_client.get_blind_spot_list()
         paths = [item.get("path") for item in blind_list if item.get("type") == "file"]
-        test_file_a_rel = os.path.relpath(test_file_a, MOUNT_POINT)
-        test_file_c_rel = os.path.relpath(test_file_c, MOUNT_POINT)
+        test_file_a_rel = "/" + os.path.relpath(test_file_a, MOUNT_POINT)
+        test_file_c_rel = "/" + os.path.relpath(test_file_c, MOUNT_POINT)
         
         assert test_file_a_rel in paths, "File A should be in blind-spot list"
         assert test_file_c_rel in paths, "File C should be in blind-spot list"
@@ -72,7 +73,7 @@ class TestBlindSpotListPersistence:
         marker_2 = f"{MOUNT_POINT}/audit_marker_b4_p2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_2, content="marker")
         time.sleep(SESSION_VANISH_TIMEOUT) # Increased NFS cache wait
-        marker_2_rel = os.path.relpath(marker_2, MOUNT_POINT)
+        marker_2_rel = "/" + os.path.relpath(marker_2, MOUNT_POINT)
         assert fusion_client.wait_for_file_in_tree(marker_2_rel, timeout=AUDIT_WAIT_TIMEOUT)
         
         # Step 4: Verify List State
@@ -84,8 +85,7 @@ class TestBlindSpotListPersistence:
         blind_list_2 = []
         paths_2 = []
         a_removed = False
-        
-        test_file_b_rel = os.path.relpath(test_file_b, MOUNT_POINT)
+        test_file_b_rel = "/" + os.path.relpath(test_file_b, MOUNT_POINT)
         
         while time.time() - start_wait < LONG_TIMEOUT:
             blind_list_2 = fusion_client.get_blind_spot_list()
@@ -126,11 +126,11 @@ class TestBlindSpotListPersistence:
         marker_file = f"{MOUNT_POINT}/audit_marker_b4_flag_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
         time.sleep(STRESS_DELAY) # NFS cache delay
-        marker_file_rel = os.path.relpath(marker_file, MOUNT_POINT)
+        marker_file_rel = "/" + os.path.relpath(marker_file, MOUNT_POINT)
         assert fusion_client.wait_for_file_in_tree(marker_file_rel, timeout=LONG_TIMEOUT) is not None
         
         # Verify agent_missing is set
-        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         assert fusion_client.wait_for_flag(test_file_rel, "agent_missing", True, timeout=SHORT_TIMEOUT), \
             "File should eventually be marked agent_missing"
         

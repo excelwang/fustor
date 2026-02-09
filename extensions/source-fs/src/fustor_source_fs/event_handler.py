@@ -12,6 +12,17 @@ from .components import _WatchManager
 
 logger = logging.getLogger("fustor_agent.driver.fs")
 
+def _get_relative_path(path: str, root_path: str) -> str:
+    """Convert path to be relative to root_path, but ensuring it starts with /."""
+    if not root_path:
+        return path
+    rel = os.path.relpath(path, root_path)
+    if rel == ".":
+        return "/"
+    if not rel.startswith("/"):
+        return "/" + rel
+    return rel
+
 def get_file_metadata(path: str, root_path: str = None, stat_info: Optional[os.stat_result] = None) -> Optional[Dict[str, Any]]:
     """Get file metadata, returning mtime and ctime as float timestamps."""
     try:
@@ -20,12 +31,12 @@ def get_file_metadata(path: str, root_path: str = None, stat_info: Optional[os.s
         
         is_dir = stat.S_ISDIR(stat_info.st_mode)
         
-        # Schema definition says path is "Absolute file path".
-        # We return the absolute path here.
+        # If root_path provided, return relative path with leading slash
+        report_path = _get_relative_path(path, root_path) if root_path else path
         
         return {
-            FSSchemaFields.PATH: path,
-            FSSchemaFields.FILE_NAME: os.path.basename(path) if path != "/" else "",
+            FSSchemaFields.PATH: report_path,
+            FSSchemaFields.FILE_NAME: os.path.basename(path) if report_path != "/" else "",
             FSSchemaFields.SIZE: stat_info.st_size,
             FSSchemaFields.MODIFIED_TIME: stat_info.st_mtime,
             FSSchemaFields.CREATED_TIME: stat_info.st_ctime,
@@ -77,7 +88,8 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 del_path = add_path.replace(to_path, from_path, 1)
                 
                 # Generate DeleteEvent for the old path
-                row = {FSSchemaFields.PATH: del_path}
+                rel_del_path = _get_relative_path(del_path, self.watch_manager.root_path)
+                row = {FSSchemaFields.PATH: rel_del_path}
                 delete_event = DeleteEvent(
                     event_schema=self.watch_manager.root_path,
                     table="files",
@@ -88,7 +100,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 self.event_queue.put(delete_event)
                 
                 # Generate UpdateEvent for the new path
-                metadata = get_file_metadata(add_path)
+                metadata = get_file_metadata(add_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     update_event = UpdateEvent(
                         event_schema=self.watch_manager.root_path,
@@ -104,7 +116,8 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 subdir_del_path = subdir_add_path.replace(to_path, from_path, 1)
 
                 # Generate DeleteEvent for the old directory path
-                row = {FSSchemaFields.PATH: subdir_del_path}
+                rel_del_path = _get_relative_path(subdir_del_path, self.watch_manager.root_path)
+                row = {FSSchemaFields.PATH: rel_del_path}
                 delete_event = DeleteEvent(
                     event_schema=self.watch_manager.root_path,
                     table="files",
@@ -114,7 +127,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 )
                 self.event_queue.put(delete_event)
                 # Generate UpdateEvent for the new path
-                metadata = get_file_metadata(subdir_add_path)
+                metadata = get_file_metadata(subdir_add_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     update_event = UpdateEvent(
                         event_schema=self.watch_manager.root_path,
@@ -129,7 +142,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
         """Called when a file or directory is created."""
         try:
             if event.is_directory:
-                metadata = get_file_metadata(event.src_path)
+                metadata = get_file_metadata(event.src_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     update_event = UpdateEvent(
                         event_schema=self.watch_manager.root_path,
@@ -152,7 +165,8 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             if event.is_directory:
                 self.watch_manager.unschedule_recursive(event.src_path)
             
-            row = {FSSchemaFields.PATH: event.src_path}
+            rel_path = _get_relative_path(event.src_path, self.watch_manager.root_path)
+            row = {FSSchemaFields.PATH: rel_path}
             delete_event = DeleteEvent(
                 event_schema=self.watch_manager.root_path,
                 table="files",
@@ -180,7 +194,8 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             self.watch_manager.touch(os.path.dirname(event.dest_path))
             
             # Create and queue the delete event for the old location
-            delete_row = {FSSchemaFields.PATH: event.src_path}
+            rel_src_path = _get_relative_path(event.src_path, self.watch_manager.root_path)
+            delete_row = {FSSchemaFields.PATH: rel_src_path}
             delete_event = DeleteEvent(
                 event_schema=self.watch_manager.root_path,
                 table="files",
@@ -200,7 +215,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 self.watch_manager.unschedule_recursive(event.src_path)
             else:
                 # For files, create update event for new location
-                metadata = get_file_metadata(event.dest_path)
+                metadata = get_file_metadata(event.dest_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     update_event = UpdateEvent(
                         event_schema=self.watch_manager.root_path,
@@ -234,7 +249,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 if now - last_sent < self.throttle_interval:
                     return # Throttled
                 
-                metadata = get_file_metadata(event.src_path)
+                metadata = get_file_metadata(event.src_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     metadata["is_atomic_write"] = False  # Mark as dirty (partial write)
                     update_event = UpdateEvent(
@@ -256,7 +271,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
         try:
             self.watch_manager.touch(event.src_path)
             if not event.is_directory:
-                metadata = get_file_metadata(event.src_path)
+                metadata = get_file_metadata(event.src_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     metadata["is_atomic_write"] = True # Mark as clean (write finished)
                     update_event = UpdateEvent(

@@ -43,8 +43,9 @@ class TestBlindSpotFileCreation:
         # Step 2: Check if file appeared
         time.sleep(INGESTION_DELAY)
         # Check presence first
+        # Check presence first
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         try:
-            test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
             tree = fusion_client.get_tree(path=test_file_rel, max_depth=0)
             found_immediately = tree.get("path") == test_file_rel
         except Exception as e:
@@ -62,14 +63,13 @@ class TestBlindSpotFileCreation:
         wait_for_audit()
         
         # Now check if the original blind-spot file was discovered
-        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
         found_after_audit = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
         assert found_after_audit is not None, \
-            f"File {test_file} should be discovered by the Audit scan"
+            f"File {test_file_rel} should be discovered by the Audit scan"
         
         # Step 5: Verify agent_missing flag is set
         assert fusion_client.wait_for_flag(test_file_rel, "agent_missing", True, timeout=SHORT_TIMEOUT), \
-            f"Blind-spot file {test_file} should be marked with agent_missing: true. Tree node: {found_after_audit}"
+            f"Blind-spot file {test_file_rel} should be marked with agent_missing: true. Tree node: {found_after_audit}"
 
     def test_blind_spot_file_added_to_blind_spot_list(
         self,
@@ -95,7 +95,7 @@ class TestBlindSpotFileCreation:
         # Check blind-spot list for file (poll to be safe)
         start = time.time()
         found = False
-        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         while time.time() - start < MEDIUM_TIMEOUT:
             blind_spot_list = fusion_client.get_blind_spot_list()
             paths_in_list = [item.get("path") for item in blind_spot_list if item.get("type") == "file"]
@@ -104,4 +104,4 @@ class TestBlindSpotFileCreation:
                 break
             time.sleep(POLL_INTERVAL)
             
-        assert found, f"File {test_file} should be in blind-spot list. List: {blind_spot_list}"
+        assert found, f"File {test_file_rel} should be in blind-spot list. List: {blind_spot_list}"

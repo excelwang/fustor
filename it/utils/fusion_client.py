@@ -79,7 +79,10 @@ class FusionClient:
                     except Exception:
                         print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {resp.text}")
             raise e
-        return resp.json()
+        data = resp.json()
+        if isinstance(data, dict) and "data" in data and "path" not in data:
+            return data["data"]
+        return data
 
     def search(self, pattern: str, path: str = "/") -> dict[str, Any]:
         """Search files by pattern."""
@@ -261,12 +264,19 @@ class FusionClient:
 
     def _find_in_tree(self, node: dict, target_path: str) -> Optional[dict]:
         """Recursively find a file in tree."""
+        # Unpack API response wrapper if present
+        if "data" in node and "path" not in node:
+            node = node["data"]
+
         if node.get("path") == target_path:
             return node
-        for child in node.get("children", []):
-            found = self._find_in_tree(child, target_path)
-            if found:
-                return found
+        
+        # Check children
+        if "children" in node:
+            for child in node["children"]:
+                found = self._find_in_tree(child, target_path)
+                if found:
+                    return found
         return None
 
     def wait_for_file_not_in_tree(

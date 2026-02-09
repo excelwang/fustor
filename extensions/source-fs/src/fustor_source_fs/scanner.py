@@ -174,7 +174,7 @@ class FSScanner:
             try:
                 dir_stat = os.stat(root)
                 latest_mtime_in_subtree = dir_stat.st_mtime
-                dir_metadata = get_file_metadata(root, stat_info=dir_stat)
+                dir_metadata = get_file_metadata(root, root_path=self.root, stat_info=dir_stat)
                 
                 # Emit directory event immediately
                 res_q.put(UpdateEvent(
@@ -196,7 +196,7 @@ class FSScanner:
                                 work_q.put(entry.path)
                             elif fnmatch.fnmatch(entry.name, self.engine.file_pattern):
                                 st = entry.stat()
-                                meta = get_file_metadata(entry.path, stat_info=st)
+                                meta = get_file_metadata(entry.path, root_path=self.root, stat_info=st)
                                 latest_mtime_in_subtree = max(latest_mtime_in_subtree, meta['modified_time'])
                                 local_batch.append(meta)
                                 if len(local_batch) >= batch_size:
@@ -276,7 +276,7 @@ class FSScanner:
                 is_silent = (cached_mtime is not None and cached_mtime == current_dir_mtime)
                 
                 # Report directory
-                dir_metadata = get_file_metadata(root, stat_info=dir_stat)
+                dir_metadata = get_file_metadata(root, root_path=self.root, stat_info=dir_stat)
                 if dir_metadata:
                     if is_silent:
                         dir_metadata['audit_skipped'] = True
@@ -300,7 +300,7 @@ class FSScanner:
                                 local_subdirs.append(entry.path)
                             elif not is_silent and fnmatch.fnmatch(entry.name, self.engine.file_pattern):
                                 st = entry.stat()
-                                meta = get_file_metadata(entry.path, stat_info=st)
+                                meta = get_file_metadata(entry.path, root_path=self.root, stat_info=st)
                                 if meta:
                                     meta['parent_path'] = root
                                     meta['parent_mtime'] = current_dir_mtime

@@ -7,6 +7,7 @@ Test B5: Parent mtime check prevents stale Audit data.
 import pytest
 import time
 
+import os
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
 from ..fixtures.constants import (
@@ -68,22 +69,26 @@ class TestParentMtimeCheck:
         )
         
         # Verify new_file exists but stale_file does not (synced via realtime)
-        assert fusion_client.wait_for_file_in_tree(new_file, timeout=SHORT_TIMEOUT) is not None
+        new_file_rel = "/" + os.path.relpath(new_file, MOUNT_POINT)
+        assert fusion_client.wait_for_file_in_tree(new_file_rel, timeout=SHORT_TIMEOUT) is not None
         
         # Step 4: Use a marker file to detect Audit completion
         # This confirms that an audit cycle has scanned the directory
         marker_file = f"{MOUNT_POINT}/audit_marker_b5_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
         time.sleep(STRESS_DELAY) # NFS cache
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
+        marker_file_rel = "/" + os.path.relpath(marker_file, MOUNT_POINT)
+        assert fusion_client.wait_for_file_in_tree(marker_file_rel, timeout=LONG_TIMEOUT) is not None
         
         # After Audit, stale_file should STILL be absent (discarded by parent mtime check)
         # Use retry to handle transient 503 errors (Fusion processing queue)
         import requests
         tree = None
+        test_dir_rel = "/" + os.path.relpath(test_dir, MOUNT_POINT)
+        
         for _ in range(10):
             try:
-                tree = fusion_client.get_tree(path=test_dir, max_depth=-1)
+                tree = fusion_client.get_tree(path=test_dir_rel, max_depth=-1)
                 break
             except requests.HTTPError as e:
                 if e.response.status_code == 503:
@@ -92,7 +97,8 @@ class TestParentMtimeCheck:
                 raise
         
         assert tree is not None, "Failed to get tree after retries"
-        stale_found = fusion_client._find_in_tree(tree, stale_file)
+        stale_file_rel = "/" + os.path.relpath(stale_file, MOUNT_POINT)
+        stale_found = fusion_client._find_in_tree(tree, stale_file_rel)
         assert stale_found is None, \
             f"Stale file should not appear after Audit. Tree: {tree}"
 
@@ -129,15 +135,18 @@ class TestParentMtimeCheck:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(file_b, timeout=LONG_TIMEOUT)
+        file_b_rel = "/" + os.path.relpath(file_b, MOUNT_POINT)
+        found = fusion_client.wait_for_file_in_tree(file_b_rel, timeout=LONG_TIMEOUT)
         assert found is not None, "File B should appear via realtime"
         
         # Wait for Audit (which may have stale view of parent directory)
         # Use marker file to be sure audit ran
         marker_file = f"{MOUNT_POINT}/audit_marker_b5_2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
         time.sleep(STRESS_DELAY) # NFS delay
-        assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
+        marker_file_rel = "/" + os.path.relpath(marker_file, MOUNT_POINT)
+        assert fusion_client.wait_for_file_in_tree(marker_file_rel, timeout=LONG_TIMEOUT) is not None
         
         # File B should still exist (Audit mtime check should preserve it)
         # Use retry to handle transient 503 errors (Fusion processing queue)
@@ -145,7 +154,8 @@ class TestParentMtimeCheck:
         tree_after = None
         for _ in range(10):
             try:
-                tree_after = fusion_client.get_tree(path=test_dir, max_depth=-1)
+                test_dir_rel = "/" + os.path.relpath(test_dir, MOUNT_POINT)
+                tree_after = fusion_client.get_tree(path=test_dir_rel, max_depth=-1)
                 break
             except requests.HTTPError as e:
                 if e.response.status_code == 503:
@@ -154,7 +164,8 @@ class TestParentMtimeCheck:
                 raise
         
         assert tree_after is not None, "Failed to get tree after retries"
-        b_after = fusion_client._find_in_tree(tree_after, file_b)
+        file_b_rel = "/" + os.path.relpath(file_b, MOUNT_POINT)
+        b_after = fusion_client._find_in_tree(tree_after, file_b_rel)
         
         assert b_after is not None, \
             "File B should still exist (stale Audit should not delete it)"

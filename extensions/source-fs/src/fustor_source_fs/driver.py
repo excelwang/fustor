@@ -267,7 +267,7 @@ class FSDriver(SourceDriver):
             # Non-recursive: only return directory metadata itself
             try:
                 stat = os.stat(path)
-                meta = get_file_metadata(path, stat)
+                meta = get_file_metadata(path, root_path=self.uri, stat_info=stat)
                 yield UpdateEvent(
                     key=os.path.relpath(path, self.uri),
                     schema="fs",

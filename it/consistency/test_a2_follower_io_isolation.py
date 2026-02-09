@@ -98,7 +98,7 @@ class TestFollowerIOIsolation:
         docker_manager.create_file_in_container(CONTAINER_CLIENT_B, warmup_file, "warmup")
         
         # Check against relative path since Source-FS emits relative keys
-        warmup_rel = os.path.relpath(warmup_file, MOUNT_POINT)
+        warmup_rel = "/" + os.path.relpath(warmup_file, MOUNT_POINT)
         if not fusion_client.wait_for_file_in_tree(warmup_rel, timeout=SHORT_TIMEOUT):
             pytest.fail("Follower Agent B failed to detect warmup file. FS Driver might not be ready.")
         
@@ -113,7 +113,7 @@ class TestFollowerIOIsolation:
         # We poll to observe the arrival as soon as possible
         found = None
         start = time.time()
-        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         while time.time() - start < LONG_TIMEOUT:
             # Short-circuit if found
