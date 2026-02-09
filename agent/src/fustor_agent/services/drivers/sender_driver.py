@@ -13,6 +13,8 @@ from fustor_agent_sdk.interfaces import SenderDriverServiceInterface
 
 logger = logging.getLogger("fustor_agent")
 
+from fustor_core.models.config import SenderConfig
+
 
 class SenderDriverService(SenderDriverServiceInterface):
     """
@@ -77,6 +79,40 @@ class SenderDriverService(SenderDriverServiceInterface):
         )
 
 
+    def create_driver(self, id: str, config: SenderConfig) -> Any:
+        """
+        Creates a new instance of a sender driver.
+        Supports both new SenderDriver (id, config) and legacy Sender (id, endpoint, cred, config).
+        """
+        driver_class = self._get_driver_by_type(config.driver)
+        
+        # Check for legacy Sender inheritance
+        # We need to import Sender here or at top. Using lazy import to be safe?
+        # But fustor_core.transport should be available.
+        # However, checking __init__ signature is also an option, but checking base class is safer if available.
+        
+        # Determine if it's a legacy Sender
+        is_legacy = False
+        try:
+            from fustor_core.transport import Sender
+            if issubclass(driver_class, Sender):
+                is_legacy = True
+        except ImportError:
+            pass
+            
+        if is_legacy:
+            # Legacy signature: (sender_id: str, endpoint: str, credential: Dict, config: Dict)
+            cred_dict = config.credential.model_dump() if hasattr(config.credential, 'model_dump') else config.credential
+            # driver_params maps to config
+            return driver_class(
+                sender_id=id,
+                endpoint=config.uri,
+                credential=cred_dict,
+                config=config.driver_params
+            )
+        else:
+            # New SenderDriver signature: (id: str, config: SenderConfig)
+            return driver_class(id, config)
 
     async def test_connection(self, driver_type: str, **kwargs) -> Tuple[bool, str]:
         """Proxies the call to the driver's test_connection class method."""

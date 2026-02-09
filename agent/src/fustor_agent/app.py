@@ -19,6 +19,8 @@ from .services.drivers.source_driver import SourceDriverService
 from .services.drivers.sender_driver import SenderDriverService
 from .services.instances.bus import EventBusService
 from .services.instances.pipe import PipeInstanceService
+from .runtime.sender_handler_adapter import SenderHandlerAdapter
+from .runtime.source_handler_adapter import SourceHandlerAdapter
 
 # State file path
 HOME_FUSTOR_DIR = get_fustor_home_dir()
@@ -128,7 +130,7 @@ class App:
         
         # 2. Create sender driver
         # SenderDriverService expects a Config object, unified config provides Pydantic SenderConfig
-        sender = self.sender_driver_service.create_driver(sender_cfg)
+        sender = self.sender_driver_service.create_driver(pipe_cfg.sender, sender_cfg)
         
         # 3. Create pipe instance
         from .runtime.agent_pipe import AgentPipe
@@ -137,21 +139,26 @@ class App:
         # AgentPipe usually takes a config dict or object. 
         # We'll pass the unified config object directly if AgentPipe supports it, 
         # or convert relevant fields.
-        pipe_config = {
-            "id": pipe_id,
-            "max_concurrent_tasks": 10, # Default or from config if added
-            "audit_interval_sec": pipe_cfg.audit_interval_sec,
-            "sentinel_interval_sec": pipe_cfg.sentinel_interval_sec,
-            "heartbeat_interval_sec": pipe_cfg.heartbeat_interval_sec,
-            "fields_mapping": [m for m in pipe_cfg.fields_mapping] 
-        }
+        # Wrap drivers in adapters for AgentPipe
+        # AgentPipe requires SourceHandler and SenderHandler
+        
+        # Source Handler: Adapt from the bus's source driver
+        source_handler = SourceHandlerAdapter(bus_runtime.source_driver_instance)
+        
+        # Sender Handler: Adapt from the sender driver
+        sender_handler = SenderHandlerAdapter(sender)
+        
+        # Helper to get dict from pydantic model (v1/v2 compatible)
+        pipe_config_dict = pipe_cfg.model_dump() if hasattr(pipe_cfg, "model_dump") else pipe_cfg.dict()
 
         pipe = AgentPipe(
-            id=pipe_id,
-            config=pipe_config, 
-            bus=bus_runtime,
-            sender=sender,
-            agent_id=self.agent_id,
+            pipe_id=pipe_id,
+            task_id=f"{self.agent_id}:{pipe_id}",
+            config=pipe_config_dict,
+            source_handler=source_handler,
+            sender_handler=sender_handler,
+            event_bus=bus_runtime,
+            bus_service=self.event_bus_service
         )
         
         # 4. Start pipe
