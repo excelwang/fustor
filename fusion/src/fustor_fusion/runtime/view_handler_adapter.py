@@ -214,6 +214,7 @@ class ViewManagerAdapter(ViewHandler):
                 event = EventBase.model_validate(event)
         
         results = await self._manager.process_event(event)
+
         # Return True if any provider processed successfully
         return any(
             (r if isinstance(r, bool) else r.get("success", False))

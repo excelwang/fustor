@@ -66,21 +66,32 @@ class PipelineManager:
                 
                 # Load ViewHandlers
                 view_handlers = []
-                # ViewHandlers are associated with a view_id
+                # Use a specific view_id for session management (leader election etc)
+                # We prioritize extra.view_id, then the first view in the list, then the pipeline_id
+                primary_view_id = p_cfg.extra.get("view_id")
+                if not primary_view_id and p_cfg.views:
+                    primary_view_id = p_cfg.views[0]
+                if not primary_view_id:
+                    primary_view_id = p_id
+
+                # ViewHandlers are associated with a view_id group
+                unique_group_ids = []
                 for v_id in p_cfg.views:
+                    if v_id not in unique_group_ids:
+                        unique_group_ids.append(v_id)
+
+                for group_id in unique_group_ids:
                     try:
-                        # We use view_id from extra or default to pipeline_id
-                        view_id = p_cfg.extra.get("view_id", p_id)
-                        vm = await get_cached_view_manager(view_id)
+                        vm = await get_cached_view_manager(group_id)
                         handler = create_view_handler_from_manager(vm)
                         view_handlers.append(handler)
                     except Exception as e:
-                        logger.error(f"Failed to load view {v_id} for pipeline {p_id}: {e}")
+                        logger.error(f"Failed to load view group {group_id} for pipeline {p_id}: {e}")
                 
                 pipeline = FusionPipeline(
                     pipeline_id=p_id,
                     config={
-                        "view_id": p_cfg.extra.get("view_id", p_id),
+                        "view_id": primary_view_id,
                         "allow_concurrent_push": p_cfg.allow_concurrent_push,
                         "session_timeout_seconds": p_cfg.session_timeout_seconds
                     },
