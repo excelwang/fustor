@@ -112,6 +112,7 @@ class PipelineInstanceService(BaseInstanceService, PipelineInstanceServiceInterf
             sender_driver_config = {
                 "batch_size": sender_config.batch_size,
                 "timeout_sec": sender_config.timeout_sec,
+                "api_version": getattr(sender_config, "api_version", "v2"),
                 **sender_config.driver_params
             }
 

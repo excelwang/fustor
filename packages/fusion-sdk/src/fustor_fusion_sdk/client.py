@@ -79,25 +79,18 @@ class FusionClient:
         """
         Creates a new session and returns the session details (including ID and role).
         """
-        try:
-            # Sanitize task_id to handle any surrogate characters before JSON serialization
-            payload = {
-                "task_id": task_id,
-                "source_type": source_type,
-                "session_timeout_seconds": session_timeout_seconds
-            }
-            # Remove None values
-            payload = {k: v for k, v in payload.items() if v is not None}
-            
-            response = await self.client.post(f"{self._session_path}/", json=payload)
-            response.raise_for_status()
-            return response.json()
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error occurred: {e.response.status_code} - {e.response.text}")
-            return None
-        except Exception as e:
-            logger.error(f"An error occurred connecting to {self.base_url}: {e!r}")
-            return None
+        # Sanitize task_id to handle any surrogate characters before JSON serialization
+        payload = {
+            "task_id": task_id,
+            "source_type": source_type,
+            "session_timeout_seconds": session_timeout_seconds
+        }
+        # Remove None values
+        payload = {k: v for k, v in payload.items() if v is not None}
+        
+        response = await self.client.post(f"{self._session_path}/", json=payload)
+        response.raise_for_status()
+        return response.json()
 
     async def get_sentinel_tasks(self) -> Dict[str, Any]:
         """

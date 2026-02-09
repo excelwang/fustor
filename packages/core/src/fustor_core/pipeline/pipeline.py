@@ -84,8 +84,12 @@ class Pipeline(ABC):
         self.state = new_state
         if info:
             self.info = info
-        self.logger.info(f"State changed: {old_state.name} -> {new_state.name}" + 
-                        (f" ({info})" if info else ""))
+        if PipelineState.ERROR in new_state:
+            self.logger.warning(f"State changed: {old_state.name} -> {new_state.name}" + 
+                            (f" ({info})" if info else ""))
+        else:
+            self.logger.info(f"State changed: {old_state.name} -> {new_state.name}" + 
+                            (f" ({info})" if info else ""))
     
     @abstractmethod
     async def start(self) -> None:

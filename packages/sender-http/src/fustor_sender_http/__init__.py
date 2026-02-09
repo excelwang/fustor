@@ -73,24 +73,33 @@ class HTTPSender(Sender):
             Session metadata including session_id, timeout, role
         """
         self.logger.info(f"Creating session for task {task_id}...")
-        session_data = await self.client.create_session(
-            task_id, 
-            source_type=source_type,
-            session_timeout_seconds=session_timeout_seconds
-        )
-        
-        if session_data and session_data.get("session_id"):
-            session_id = session_data["session_id"]
-            self.session_id = session_id
-            self.logger.info(
-                f"Session created: {self.session_id}, "
-                f"Role: {session_data.get('role')}, "
-                f"Timeout: {session_data.get('session_timeout_seconds')}s"
+        try:
+            session_data = await self.client.create_session(
+                task_id, 
+                source_type=source_type,
+                session_timeout_seconds=session_timeout_seconds
             )
-            return session_id, session_data
-        else:
-            self.logger.error("Failed to create session.")
-            raise RuntimeError("Failed to create session with Fusion service.")
+            
+            if session_data and session_data.get("session_id"):
+                session_id = session_data["session_id"]
+                self.session_id = session_id
+                self.logger.info(
+                    f"Session created: {self.session_id}, "
+                    f"Role: {session_data.get('role')}, "
+                    f"Timeout: {session_data.get('session_timeout_seconds')}s"
+                )
+                return session_id, session_data
+            else:
+                # Should not happen if client raises exception on error, but handling just in case
+                self.logger.error("Failed to create session: Empty response.")
+                raise RuntimeError("Failed to create session with Fusion service: Empty response.")
+
+        except httpx.HTTPStatusError as e:
+            self.logger.error(f"Failed to create session: HTTP {e.response.status_code} - {e.response.text}")
+            raise RuntimeError(f"Failed to create session with Fusion service: HTTP {e.response.status_code} - {e.response.text}") from e
+        except Exception as e:
+            self.logger.error(f"Failed to create session: {e!r}")
+            raise RuntimeError(f"Failed to create session with Fusion service: {e}") from e
     
     async def _send_events_impl(
         self, 

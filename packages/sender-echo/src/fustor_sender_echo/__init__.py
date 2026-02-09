@@ -80,7 +80,7 @@ class EchoDriver(Sender):
 
         return {"success": True, "snapshot_needed": snapshot_needed}
 
-    async def heartbeat(self) -> Dict[str, Any]:
+    async def heartbeat(self, **kwargs) -> Dict[str, Any]:
         """
         Sends a heartbeat to maintain session state.
         """
