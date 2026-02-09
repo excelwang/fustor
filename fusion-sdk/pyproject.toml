@@ -1,21 +1,21 @@
 [project]
-name = "fustor-agent-sdk"
+name = "fustor-fusion-sdk"
 dynamic = ["version"]
-description = "SDK for Fustor Agent service"
+description = "SDK for Fustor Fusion service"
 license = "MIT"
-dependencies = [ "fustor-core"]
+dependencies = ["fustor-core", "httpx", "pydantic"]
 
 [build-system]
 requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
-root = "../.."
+root = ".."
 version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/agent-sdk"
+Homepage = "https://github.com/excelwang/fustor/tree/master/fusion-sdk"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 [tool.setuptools.packages.find]

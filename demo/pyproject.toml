@@ -1,22 +1,24 @@
 [project]
-name = "fustor-fusion-sdk"
+name = "fustor-demo"
 dynamic = ["version"]
-description = "SDK for Fustor Fusion service"
-license = "MIT"
-dependencies = ["fustor-core", "httpx", "pydantic"]
+description = "Fustor Bio-Fusion Demo for unified directory service"
+dependencies = ["fastapi[all]>=0.104.1", "uvicorn>=0.23.2", "fustor-core", "pydantic>=2.0.0", "httpx>=0.25.0"]
+requires-python = ">=3.11"
 
 [build-system]
 requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools_scm]
-root = "../.."
+root = ".."
 version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/fusion-sdk"
+Homepage = "https://github.com/excelwang/fustor/tree/master/demo"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
+
+license = "MIT"
 
 [tool.setuptools.packages.find]
 where = [ "src",]

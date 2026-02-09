@@ -3,20 +3,20 @@ members = [
     "agent",
     "fusion",
     "benchmark",
-    "packages/core",
-    "packages/agent-sdk",
-    "packages/fusion-sdk",
-    "packages/sender-echo",
-    "packages/sender-openapi",
-    "packages/sender-http",
-    "packages/receiver-http",
-    "packages/schema-fs",
-    "packages/source-elasticsearch",
-    "packages/source-fs",
-    "packages/source-mysql",
-    "packages/source-oss",
-    "packages/demo",
-    "packages/view-fs"
+    "core",
+    "agent-sdk",
+    "fusion-sdk",
+    "extensions/sender-echo",
+    "extensions/sender-openapi",
+    "extensions/sender-http",
+    "extensions/receiver-http",
+    "extensions/schema-fs",
+    "extensions/source-elasticsearch",
+    "extensions/source-fs",
+    "extensions/source-mysql",
+    "extensions/source-oss",
+    "demo",
+    "extensions/view-fs"
 ]
 
 [tool.uv.sources]
@@ -41,18 +41,18 @@ fustor-view-fs = { workspace = true }
 pythonpath = [
     "agent/src",
     "fusion/src",
-    "packages/core/src",
-    "packages/sender-echo/src",
-    "packages/sender-openapi/src",
-    "packages/sender-http/src",
-    "packages/receiver-http/src",
-    "packages/schema-fs/src",
-    "packages/source-elasticsearch/src",
-    "packages/source-fs/src",
-    "packages/source-mysql/src",
-    "packages/source-oss/src",
-    "packages/demo/src",
-    "packages/view-fs/src"
+    "core/src",
+    "extensions/sender-echo/src",
+    "extensions/sender-openapi/src",
+    "extensions/sender-http/src",
+    "extensions/receiver-http/src",
+    "extensions/schema-fs/src",
+    "extensions/source-elasticsearch/src",
+    "extensions/source-fs/src",
+    "extensions/source-mysql/src",
+    "extensions/source-oss/src",
+    "demo/src",
+    "extensions/view-fs/src"
 ]
 markers = [
     "timeout: mark test to timeout after X seconds",
@@ -60,8 +60,8 @@ markers = [
 testpaths = [
     "agent/tests",
     "fusion/tests",
-    "packages/*/tests",
-    "packages/source_oss/tests"
+    "core/tests",
+    "extensions/*/tests",
 ]
 addopts = "-v --tb=short"
 asyncio_mode = "strict"

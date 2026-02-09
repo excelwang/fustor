@@ -1,9 +1,9 @@
 [project]
-name = "fustor-source-mysql"
+name = "fustor-source-elasticsearch"
 dynamic = ["version"]
-description = "A MySQL source for Fustor Agent"
+description = "An Elasticsearch source for Fustor Agent"
 requires-python = ">=3.11"
-dependencies = [ "fustor-core", "aiomysql>=0.2.0", "mysql-replication>=1.0.9",]
+dependencies = [ "elasticsearch>=9.2.0", "fustor-core",]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
@@ -18,16 +18,13 @@ version_scheme = "post-release"
 local_scheme = "dirty-tag"
 
 ["project.urls"]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/source-mysql"
+Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/source-elasticsearch"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 license = "MIT"
 
-[project.optional-dependencies]
-dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0",]
-
 [project.entry-points."fustor_agent.drivers.sources"]
-mysql = "fustor_source_mysql:MysqlDriver"
+elasticsearch = "fustor_source_elasticsearch:ElasticsearchDriver"
 
 [tool.setuptools.packages.find]
 where = [ "src",]

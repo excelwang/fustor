@@ -3,9 +3,9 @@ requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "fustor-sender-http"
+name = "fustor-receiver-http"
 dynamic = ["version"]
-description = "Fustor HTTP Sender - Transport layer for Agent to Fusion communication"
+description = "Fustor HTTP Receiver - Transport layer for Fusion to receive events from Agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
@@ -15,7 +15,8 @@ classifiers = [
 ]
 dependencies = [
     "fustor-core",
-    "fustor-fusion-sdk",
+    "fastapi>=0.109.0",
+    "pydantic>=2.0.0",
 ]
 
 [[project.authors]]
@@ -23,14 +24,12 @@ name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [project.urls]
-Homepage = "https://github.com/excelwang/fustor/tree/master/packages/sender-http"
+Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/receiver-http"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
-# New entry point for V2 architecture
-[project.entry-points."fustor_agent.drivers.senders"]
-fusion = "fustor_sender_http:HTTPSender"
-
-
+# Entry point for receiver discovery
+[project.entry-points."fustor.receivers"]
+http = "fustor_receiver_http:HTTPReceiver"
 
 [tool.setuptools_scm]
 root = "../.."
