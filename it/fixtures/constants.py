@@ -55,7 +55,7 @@ if SESSION_TIMEOUT < 3 * HEARTBEAT_INTERVAL:
     SESSION_TIMEOUT = 3 * HEARTBEAT_INTERVAL + 1.0
 
 # FS Specific Thresholds
-# Source: packages/source-fs/src/fustor_source_fs/driver.py
+# Source: extensions/source-fs/src/fustor_source_fs/driver.py
 THROTTLE_INTERVAL_SEC = scaled_duration(5.0, min_val=0.1) # Prod: 5s -> Test: 0.25s
 
 # Test Specific Logic (No direct Prod equivalent found in source-fs, treated as test params)

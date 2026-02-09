@@ -6,8 +6,8 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 # Setup paths
-sys.path.insert(0, os.path.abspath("packages/core/src"))
-sys.path.insert(0, os.path.abspath("packages/view-fs/src"))
+sys.path.insert(0, os.path.abspath("core/src"))
+sys.path.insert(0, os.path.abspath("extensions/view-fs/src"))
 
 from fustor_view_fs.state import FSState
 from fustor_view_fs.arbitrator import FSArbitrator

@@ -72,7 +72,7 @@
 ### 3.1 核心包
 
 ```
-packages/
+extensions/
 ├── fustor-core/                     # 核心抽象层
 │   └── src/fustor_core/
 │       ├── common/                  # 通用工具 (原 fustor-common)
@@ -103,7 +103,7 @@ packages/
 ### 3.2 Schema 包
 
 ```
-packages/
+extensions/
 ├── fustor-schema-fs/                # 文件系统 Schema
 │   └── src/fustor_schema_fs/
 │       ├── __init__.py
@@ -114,7 +114,7 @@ packages/
 ### 3.3 Handler 包 (Source/View)
 
 ```
-packages/
+extensions/
 ├── fustor-source-fs/                # FS Source Driver
 ├── fustor-source-oss/               # OSS Source Driver
 ├── fustor-view-fs/                  # FS View Driver (含一致性逻辑)
@@ -128,7 +128,7 @@ packages/
 ### 3.4 Transport 包 (Sender/Receiver)
 
 ```
-packages/
+extensions/
 ├── fustor-sender-http/              # HTTP Sender (原 pusher-fusion)
 ├── fustor-sender-grpc/              # gRPC Sender (新增)
 ├── fustor-receiver-http/            # HTTP Receiver (从 fusion 抽取)

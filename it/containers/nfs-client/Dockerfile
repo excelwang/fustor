@@ -13,7 +13,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy the entire monorepo (context is project root)
 COPY agent /app/agent
-COPY packages /app/packages
+COPY core /app/core
+COPY agent-sdk /app/agent-sdk
+COPY fusion-sdk /app/fusion-sdk
+COPY extensions /app/extensions
 
 # Set fake version for setuptools-scm (since .git is not copied)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
@@ -21,13 +24,13 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 # Install Fustor Agent and dependencies (all pip deps declared in package pyproject.toml)
 RUN pip install --no-cache-dir \
     python-dotenv \
-    /app/packages/core \
-    /app/packages/agent-sdk \
-    /app/packages/fusion-sdk \
-    /app/packages/schema-fs \
-    /app/packages/source-fs \
-    /app/packages/sender-http \
-    /app/packages/sender-echo \
+    /app/core \
+    /app/agent-sdk \
+    /app/fusion-sdk \
+    /app/extensions/schema-fs \
+    /app/extensions/source-fs \
+    /app/extensions/sender-http \
+    /app/extensions/sender-echo \
     /app/agent
 
 

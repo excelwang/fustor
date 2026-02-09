@@ -11,18 +11,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Copy monorepo components (context is project root)
 COPY fusion /app/fusion
-COPY packages /app/packages
+COPY core /app/core
+COPY fusion-sdk /app/fusion-sdk
+COPY extensions /app/extensions
 
 # Set fake version for setuptools-scm (since .git is not copied)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 
 # Install Fustor packages (all pip dependencies declared in package pyproject.toml)
 RUN pip install --no-cache-dir \
-    /app/packages/core \
-    /app/packages/fusion-sdk \
-    /app/packages/schema-fs \
-    /app/packages/view-fs \
-    /app/packages/receiver-http \
+    /app/core \
+    /app/fusion-sdk \
+    /app/extensions/schema-fs \
+    /app/extensions/view-fs \
+    /app/extensions/receiver-http \
     /app/fusion
 
 

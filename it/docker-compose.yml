@@ -45,10 +45,10 @@ services:
       - fusion-data:/data/fusion
       - ./config/views-config:/root/.fustor/views-config
       - ../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
-      - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
-      - ../packages/fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
-      - ../packages/view-fs/src/fustor_view_fs:/usr/local/lib/python3.11/site-packages/fustor_view_fs
-      - ../packages/receiver-http/src/fustor_receiver_http:/usr/local/lib/python3.11/site-packages/fustor_receiver_http
+      - ../core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
+      - ../fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../extensions/view-fs/src/fustor_view_fs:/usr/local/lib/python3.11/site-packages/fustor_view_fs
+      - ../extensions/receiver-http/src/fustor_receiver_http:/usr/local/lib/python3.11/site-packages/fustor_receiver_http
 
     ports:
       - "18102:8102"
@@ -85,12 +85,12 @@ services:
     volumes:
       - agent-a-data:/data/agent
       - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
-      - ../packages/source-fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
-      - ../packages/sender-http/src/fustor_sender_http:/usr/local/lib/python3.11/site-packages/fustor_sender_http
-      - ../packages/sender-echo/src/fustor_sender_echo:/usr/local/lib/python3.11/site-packages/fustor_sender_echo
-      - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
-      - ../packages/agent-sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
-      - ../packages/fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../extensions/source-fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
+      - ../extensions/sender-http/src/fustor_sender_http:/usr/local/lib/python3.11/site-packages/fustor_sender_http
+      - ../extensions/sender-echo/src/fustor_sender_echo:/usr/local/lib/python3.11/site-packages/fustor_sender_echo
+      - ../core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
+      - ../agent-sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
+      - ../fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18100:8100"
     networks:
@@ -129,12 +129,12 @@ services:
     volumes:
       - agent-b-data:/data/agent
       - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
-      - ../packages/source-fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
-      - ../packages/sender-http/src/fustor_sender_http:/usr/local/lib/python3.11/site-packages/fustor_sender_http
-      - ../packages/sender-echo/src/fustor_sender_echo:/usr/local/lib/python3.11/site-packages/fustor_sender_echo
-      - ../packages/core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
-      - ../packages/agent-sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
-      - ../packages/fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
+      - ../extensions/source-fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
+      - ../extensions/sender-http/src/fustor_sender_http:/usr/local/lib/python3.11/site-packages/fustor_sender_http
+      - ../extensions/sender-echo/src/fustor_sender_echo:/usr/local/lib/python3.11/site-packages/fustor_sender_echo
+      - ../core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
+      - ../agent-sdk/src/fustor_agent_sdk:/usr/local/lib/python3.11/site-packages/fustor_agent_sdk
+      - ../fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
     ports:
       - "18103:8100"
     networks:
