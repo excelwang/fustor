@@ -171,10 +171,23 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
         logger.error(f"FATAL: Agent A did not become ready. Relevant Logs:\n{logs}")
         raise RuntimeError(f"Agent A did not become ready (can_realtime=True) within {AGENT_READY_TIMEOUT} seconds")
     
-    sessions = fusion_client.get_sessions()
-    leader = next((s for s in sessions if "client-a" in s.get("agent_id", "")), None)
+    logger.info("Waiting for Agent A to become LEADER...")
+    timeout = 10
+    start_time = time.time()
+    leader = None
+    while time.time() - start_time < timeout:
+        sessions = fusion_client.get_sessions()
+        leader = next((s for s in sessions if "client-a" in s.get("agent_id", "")), None)
+        if leader and leader.get("role") == "leader":
+            break
+        time.sleep(0.5)
+    
     if not leader or leader.get("role") != "leader":
-        raise RuntimeError(f"Agent A registered but not as leader ({leader.get('role') if leader else 'not found'})")
+        role = leader.get("role") if leader else "not found"
+        # If still follower, dump sessions to help debug
+        all_sessions = fusion_client.get_sessions()
+        logger.error(f"Agent A found as {role}. Active sessions: {all_sessions}")
+        raise RuntimeError(f"Agent A registered but did not become leader within {timeout}s (current role: {role})")
     
     logger.info(f"Agent A successfully became leader and is ready: {leader.get('agent_id')}")
 
