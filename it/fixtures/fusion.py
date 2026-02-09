@@ -15,7 +15,7 @@ if str(_it_dir) not in sys.path:
     sys.path.insert(0, str(_it_dir))
 
 from utils import FusionClient
-from .constants import EXTREME_TIMEOUT, POLL_INTERVAL
+from .constants import EXTREME_TIMEOUT, POLL_INTERVAL, TEST_VIEW_ID, TEST_API_KEY
 
 logger = logging.getLogger("fustor_test")
 
@@ -24,10 +24,8 @@ logger = logging.getLogger("fustor_test")
 def test_view() -> dict:
     """Return static test view info."""
     return {
-        "id": "integration-test-ds",
-        "name": "integration-test-ds",
-        "allow_concurrent_push": True,
-        "session_timeout_seconds": 3
+        "id": TEST_VIEW_ID,
+        "name": TEST_VIEW_ID
     }
 
 # Backward compatibility alias
@@ -38,8 +36,8 @@ test_view = test_view
 def test_api_key(test_view) -> dict:
     """Return static API key info."""
     return {
-        "key": "test-api-key-123",
-        "view_id": "integration-test-ds",
+        "key": TEST_API_KEY,
+        "view_id": TEST_VIEW_ID,
         "name": "integration-test-key"
     }
 
@@ -51,7 +49,7 @@ def fusion_client(docker_env, test_api_key) -> FusionClient:
     
     Waits for Fusion to become ready and sync its configuration cache.
     """
-    client = FusionClient(base_url="http://localhost:18102", view_id="integration-test-ds")
+    client = FusionClient(base_url="http://localhost:18102", view_id=TEST_VIEW_ID)
     client.set_api_key(test_api_key["key"])
     
     # Wait for Fusion to be ready to accept requests

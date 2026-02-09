@@ -7,6 +7,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     faketime \
+    gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy monorepo components (context is project root)
@@ -30,6 +31,12 @@ RUN pip install --no-cache-dir \
 
 # Create data directory
 RUN mkdir -p /data/fusion
+
+# Copy and set up entrypoint
+COPY it/containers/fustor-services/entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]
 
 # Default command 
 CMD ["fustor-fusion", "start"]

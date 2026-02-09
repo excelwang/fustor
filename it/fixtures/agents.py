@@ -76,8 +76,9 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
     config_dir = f"{home_dir}/.fustor"
     logger.info(f"Using config directory: {config_dir}")
 
+    agent_config_dir = f"{config_dir}/agent-config"
     # Ensure config dir exists
-    docker_manager.exec_in_container(container_name, ["mkdir", "-p", config_dir])
+    docker_manager.exec_in_container(container_name, ["mkdir", "-p", agent_config_dir])
 
     docker_manager.create_file_in_container(
         container_name,
@@ -85,47 +86,20 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
         content=agent_id
     )
 
-    # 1. Sources Config
-    sources_config = f"""
-shared-fs:
-  driver: "fs"
-  uri: "{mount_point}"
-  credential:
-    user: "unused"
-  disabled: false
-  driver_params:
-    throttle_interval_sec: {THROTTLE_INTERVAL_SEC}
-"""
-    docker_manager.create_file_in_container(container_name, f"{config_dir}/sources-config.yaml", sources_config)
-
-    # 2. Senders Config
-    senders_config = f"""
-fusion:
-  driver: "fusion"
-  uri: "{fusion_endpoint}"
-  credential:
-    key: "{api_key}"
-  disabled: false
-  driver_params:
-    view_id: {view_id}
-    api_version: "pipe"
-"""
-    docker_manager.create_file_in_container(container_name, f"{config_dir}/senders-config.yaml", senders_config)
-
-    # 3. Pipes Config
-    pipes_dir = f"{config_dir}/agent-pipes-config"
-    docker_manager.exec_in_container(container_name, ["mkdir", "-p", pipes_dir])
+    # Create the target config file using envsubst
+    # We pass all necessary variables to the container's environment for envsubst to pick up
+    cmd = (
+        f"export MOUNT_POINT='{mount_point}' "
+        f"FUSION_ENDPOINT='{fusion_endpoint}' "
+        f"API_KEY='{api_key}' "
+        f"THROTTLE_INTERVAL_SEC='{THROTTLE_INTERVAL_SEC}' "
+        f"AUDIT_INTERVAL='{AUDIT_INTERVAL}' "
+        f"SENTINEL_INTERVAL='{SENTINEL_INTERVAL}' "
+        f"HEARTBEAT_INTERVAL='{HEARTBEAT_INTERVAL}' && "
+        "envsubst < /config/agent-config/default.yaml > /root/.fustor/agent-config/default.yaml"
+    )
     
-    pipes_config = f"""
-id: "pipe-task-1"
-source: "shared-fs"
-sender: "fusion"
-disabled: false
-audit_interval_sec: {AUDIT_INTERVAL}
-sentinel_interval_sec: {SENTINEL_INTERVAL}
-heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
-"""
-    docker_manager.create_file_in_container(container_name, f"{pipes_dir}/pipe-task-1.yaml", pipes_config)
+    docker_manager.exec_in_container(container_name, ["sh", "-c", cmd])
     
     
     logger.info(f"Starting agent in {container_name} in DAEMON mode (-D)")

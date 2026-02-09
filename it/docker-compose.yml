@@ -41,9 +41,12 @@ services:
       FUSTOR_LOG_LEVEL: "DEBUG"
       # Use home directory for config
       FUSTOR_HOME: "/root/.fustor"
+      # Inject Test Config Vars for envsubst
+      TEST_VIEW_ID: "integration-test-ds"
+      TEST_API_KEY: "test-api-key-123"
     volumes:
       - fusion-data:/data/fusion
-      - ./config/fusion-config:/root/.fustor/fusion-config
+      - ./config/fusion-config:/config/fusion-config
       - ../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
       - ../core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
       - ../fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk

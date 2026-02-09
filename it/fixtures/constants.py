@@ -18,6 +18,8 @@ MOUNT_POINT = "/mnt/shared"
 FUSION_PORT = 8102
 FUSION_HOST = "fustor-fusion"
 FUSION_ENDPOINT = f"http://{FUSION_HOST}:{FUSION_PORT}"
+TEST_VIEW_ID = "integration-test-ds"
+TEST_API_KEY = "test-api-key-123"
 
 # --- Time Scaling Logic ---
 # Defaults to 1.0 (no scaling). Set FUSTOR_TIME_SCALE < 1.0 to speed up tests.

@@ -8,11 +8,11 @@ receivers:
     port: 8102
     session_timeout_seconds: 3600
     api_keys:
-      - key: "test-api-key-123"
-        pipe_id: "integration-test-ds"
+      - key: "${TEST_API_KEY}"
+        pipe_id: "${TEST_VIEW_ID}"
 
 views:
-  integration-test-ds:
+  ${TEST_VIEW_ID}:
     driver: fs
     driver_params:
       hot_file_threshold: 60.0
@@ -20,6 +20,6 @@ views:
         tombstone_ttl_seconds: 0.5
 
 pipes:
-  integration-test-ds:
+  ${TEST_VIEW_ID}:
     receiver: http-main
-    views: [integration-test-ds]
+    views: [${TEST_VIEW_ID}]

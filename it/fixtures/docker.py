@@ -105,10 +105,11 @@ def docker_env():
                 break
     
     # --- Configuration Hook ---
-    # Fusion configuration is now handled via volume mount:
-    # ./config/fusion-config -> /root/.fustor/fusion-config
-    # This aligns with the unified configuration standard.
-    logger.info("Fusion configuration managed via volume mount (/root/.fustor/fusion-config)")
+    # Fusion configuration logic:
+    # 1. Templates mounted to /config/fusion-config (read-only from host ./config/fusion-config)
+    # 2. Entrypoint runs `envsubst` to inject test variables (TEST_VIEW_ID, TEST_API_KEY)
+    # 3. Processed configs written to /root/.fustor/fusion-config (Fusion's active config dir)
+    logger.info("Fusion config: envsubst(/config/fusion-config) -> /root/.fustor/fusion-config")
 
     # 5. Reload Fusion
 
