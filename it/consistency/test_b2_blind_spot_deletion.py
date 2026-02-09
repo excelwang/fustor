@@ -7,6 +7,7 @@ Test B2: Blind-spot file deletion detected by Audit.
 import pytest
 import time
 
+import os
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
 from ..fixtures.constants import (
@@ -49,7 +50,8 @@ class TestBlindSpotFileDeletion:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         assert found is not None, "File should appear via realtime event"
         
         # Step 2: Delete file from blind-spot client
@@ -62,7 +64,7 @@ class TestBlindSpotFileDeletion:
         # Step 4: Wait for Audit to detect deletion
         wait_for_audit()
         
-        assert fusion_client.wait_for_file_not_in_tree(test_file, timeout=SHORT_TIMEOUT), \
+        assert fusion_client.wait_for_file_not_in_tree(test_file_rel, timeout=SHORT_TIMEOUT), \
             "File should be removed after Audit detects blind-spot deletion"
 
     def test_blind_spot_deletion_added_to_blind_spot_list(
@@ -84,7 +86,8 @@ class TestBlindSpotFileDeletion:
             test_file,
             content="for blind delete list test"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
+        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)
         
@@ -99,7 +102,7 @@ class TestBlindSpotFileDeletion:
             blind_spot_list = fusion_client.get_blind_spot_list()
             deletion_entries = [
                 item for item in blind_spot_list
-                if item.get("path") == test_file and item.get("type") == "deletion"
+                if item.get("path") == test_file_rel and item.get("type") == "deletion"
             ]
             if deletion_entries:
                 found = True

@@ -7,7 +7,8 @@ Test A2: Second Agent becomes Follower with IO isolation.
 import pytest
 import time
 
-from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_B
+import os
+from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, MOUNT_POINT
 from ..fixtures.constants import (
     VIEW_READY_TIMEOUT,
     AGENT_B_READY_TIMEOUT,
@@ -95,7 +96,10 @@ class TestFollowerIOIsolation:
         # Create a warmup file and wait for it to be seen. This confirms inotify is ready.
         warmup_file = f"{MOUNT_POINT}/warmup_follower_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_B, warmup_file, "warmup")
-        if not fusion_client.wait_for_file_in_tree(warmup_file, timeout=SHORT_TIMEOUT):
+        
+        # Check against relative path since Source-FS emits relative keys
+        warmup_rel = os.path.relpath(warmup_file, MOUNT_POINT)
+        if not fusion_client.wait_for_file_in_tree(warmup_rel, timeout=SHORT_TIMEOUT):
             pytest.fail("Follower Agent B failed to detect warmup file. FS Driver might not be ready.")
         
         # Create file on follower's mount
@@ -109,10 +113,12 @@ class TestFollowerIOIsolation:
         # We poll to observe the arrival as soon as possible
         found = None
         start = time.time()
+        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        
         while time.time() - start < LONG_TIMEOUT:
             # Short-circuit if found
             found = fusion_client.wait_for_file_in_tree(
-                file_path=test_file,
+                file_path=test_file_rel,
                 timeout=SHORT_TIMEOUT
             )
             if found:
@@ -127,7 +133,7 @@ class TestFollowerIOIsolation:
         start = time.time()
         flags = {}
         while time.time() - start < MEDIUM_TIMEOUT:
-            flags = fusion_client.check_file_flags(test_file)
+            flags = fusion_client.check_file_flags(test_file_rel)
             if flags.get("agent_missing") is False:
                 cleared = True
                 break

@@ -7,6 +7,7 @@ Test B3: Blind-spot file modification detected by Audit.
 import pytest
 import time
 
+import os
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT, AUDIT_INTERVAL
 from ..fixtures.constants import (
@@ -42,7 +43,8 @@ class TestBlindSpotFileModification:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
+        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
         assert found is not None, "File should appear via realtime event"
         
         # Record original mtime from Fusion
@@ -69,7 +71,7 @@ class TestBlindSpotFileModification:
         # Step 3: Before Audit, Fusion mtime should be unchanged
         # NOTE: This assertion is flaky because an asynchronous Audit cycle might run 
         # immediately after the modification. We log the state instead of asserting.
-        tree = fusion_client.get_tree(path=test_file, max_depth=0)
+        tree = fusion_client.get_tree(path=test_file_rel, max_depth=0)
         mtime_before_audit = tree.get("modified_time")
         if mtime_before_audit != original_mtime:
             print(f"DEBUG: Fusion mtime updated early! Original: {original_mtime}, Now: {mtime_before_audit}")
@@ -85,7 +87,7 @@ class TestBlindSpotFileModification:
         success = False
         mtime_after_audit = 0
         while time.time() - start < 10:
-            tree_after = fusion_client.get_tree(path=test_file, max_depth=0)
+            tree_after = fusion_client.get_tree(path=test_file_rel, max_depth=0)
             mtime_after_audit = tree_after.get("modified_time")
             if abs(mtime_after_audit - new_fs_mtime) < 0.001:
                 success = True
@@ -115,10 +117,11 @@ class TestBlindSpotFileModification:
             test_file,
             content="original"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+        test_file_rel = os.path.relpath(test_file, MOUNT_POINT)
+        fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         
         # Initial file should not have agent_missing
-        flags_initial = fusion_client.check_file_flags(test_file)
+        flags_initial = fusion_client.check_file_flags(test_file_rel)
         assert flags_initial["agent_missing"] is False
         
         # Modify from blind-spot
@@ -137,5 +140,5 @@ class TestBlindSpotFileModification:
         wait_for_audit()
         
         # Check agent_missing flag after modification
-        assert fusion_client.wait_for_flag(test_file, "agent_missing", True, timeout=SHORT_TIMEOUT), \
+        assert fusion_client.wait_for_flag(test_file_rel, "agent_missing", True, timeout=SHORT_TIMEOUT), \
             "agent_missing flag should be set after blind modification"
