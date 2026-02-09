@@ -14,6 +14,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 from fustor_core.transport import Sender
+from fustor_core.exceptions import FusionConnectionError
 from fustor_core.event import EventBase
 from fustor_core.exceptions import SessionObsoletedError
 
@@ -96,7 +97,7 @@ class HTTPSender(Sender):
 
         except httpx.ConnectError as e:
             self.logger.warning(f"Failed to create session (Connection Error): {e}")
-            raise RuntimeError(f"Failed to create session with Fusion service: {e}") from e
+            raise FusionConnectionError(f"Failed to create session with Fusion service: {e}") from e
         except httpx.HTTPStatusError as e:
             self.logger.error(f"Failed to create session: HTTP {e.response.status_code} - {e.response.text}")
             raise RuntimeError(f"Failed to create session with Fusion service: HTTP {e.response.status_code} - {e.response.text}") from e

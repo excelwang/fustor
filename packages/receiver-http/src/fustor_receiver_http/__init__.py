@@ -113,7 +113,7 @@ class HTTPReceiver(Receiver):
         
         # Session timeout configuration
         self.session_timeout_seconds = config.get("session_timeout_seconds", 30) if config else 30
-        print(f"DEBUG_PRINT: HTTPReceiver {receiver_id} at {id(self)} __init__ config={config}, determined_timeout={self.session_timeout_seconds}")
+
         
         # Create routers
         self._session_router = self._create_session_router()
@@ -214,7 +214,7 @@ class HTTPReceiver(Receiver):
             
             # Use client-requested timeout if provided, otherwise fallback to receiver config
             session_timeout_seconds = payload.session_timeout_seconds or receiver.session_timeout_seconds
-            print(f"DEBUG_PRINT: Handler in {id(receiver)}: payload.timeout={payload.session_timeout_seconds}, receiver.timeout={receiver.session_timeout_seconds}, final={session_timeout_seconds}")
+
             
             if receiver._on_session_created:
                 try:

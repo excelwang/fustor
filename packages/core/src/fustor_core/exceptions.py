@@ -79,3 +79,11 @@ class TransientSourceBufferFullError(Exception):
 
     """Raised by MemoryEventBus when its buffer is full and the source is transient."""
     pass
+
+
+class FusionConnectionError(FustorException):
+    """Raised when there is a connection error with the Fusion service."""
+    status_code = 503
+    
+    def __init__(self, detail: str = "Failed to connect to Fusion", context: Optional[Dict[str, Any]] = None):
+        super().__init__(detail=detail, context=context)

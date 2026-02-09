@@ -215,7 +215,8 @@ class SenderHandlerAdapter(SenderHandler):
         # -1 means "start from now" which might cause loss.
         # Given D-04 concerns data integrity, we should default to 0 (replay is safer than loss) 
         # or error out if critical. But for now, 0 seems appropriate default if not supported.
-        logger.warning(f"Sender {self.id} does not support get_latest_committed_index. Defaulting to 0.")
+        # This is expected for some sender types (like Echo or legacy wrappers)
+        logger.debug(f"Sender {self.id} does not support get_latest_committed_index. Defaulting to 0.")
         return 0
 
     async def test_connection(self, **kwargs) -> Tuple[bool, str]:

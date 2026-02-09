@@ -10,8 +10,7 @@ from fustor_core.pipeline import Pipeline, PipelineState
 from fustor_core.pipeline.handler import SourceHandler
 from fustor_core.pipeline.sender import SenderHandler
 from fustor_core.models.states import PipelineInstanceDTO
-from fustor_core.exceptions import SessionObsoletedError
-from fustor_core.exceptions import SessionObsoletedError
+from fustor_core.exceptions import SessionObsoletedError, FusionConnectionError
 from fustor_core.pipeline.mapper import EventMapper
 from fustor_core.common.metrics import get_metrics
 
@@ -336,15 +335,12 @@ class AgentPipeline(Pipeline):
                         except Exception as e:
                             logger.warning(f"Pipeline {self.id}: Failed to fetch committed index: {e}. Defaulting to 0/Latest.")
 
+                    except FusionConnectionError:
+                        # Re-raise FusionConnectionError to be handled by outer loop
+                        raise
                     except RuntimeError as e:
-                        # Handle known connection errors without full traceback
-                        if "Failed to create session" in str(e):
-                            logger.error(f"Pipeline {self.id} control loop error: Session creation failed: {e}")
-                            # Raise to trigger backoff logic in outer loop
-                            raise
-                        else:
-                            logger.error(f"Pipeline {self.id}: Detailed session creation error: {e}", exc_info=True)
-                            raise
+                        logger.error(f"Pipeline {self.id}: Detailed session creation error: {e}", exc_info=True)
+                        raise
                     except Exception as e:
                         logger.error(f"Pipeline {self.id}: Detailed session creation error: {e}", exc_info=True)
                         raise RuntimeError(f"Session creation failed: {e}")
@@ -406,6 +402,32 @@ class AgentPipeline(Pipeline):
                 # Yield to prevent busy loop if reconnection fails repeatedly
                 await asyncio.sleep(0.1)
                 continue
+
+            except FusionConnectionError as e:
+                # Handle connection errors gracefully without noise
+                self._consecutive_errors += 1
+                backoff = self._calculate_backoff(self._consecutive_errors)
+                
+                # Log state change as WARNING (default behavior for ERROR state) but suppress explicit error log
+                self._set_state(PipelineState.ERROR | PipelineState.RECONNECTING, 
+                                f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
+                
+                # Cleanup session on connection failure
+                if self.has_active_session():
+                    try:
+                        await self._cancel_all_tasks()
+                        await self.on_session_closed(self.session_id)
+                    except Exception as e2:
+                        logger.debug(f"Error during cleanup after session loss: {e2}")
+
+                await asyncio.sleep(backoff)
+
+            except RuntimeError as e:
+                # Handle generic RuntimeErrors
+                backoff = self._handle_error(e, "control")
+                self._set_state(PipelineState.ERROR | PipelineState.RECONNECTING, 
+                                f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
+                await asyncio.sleep(backoff)
 
             except Exception as e:
                 backoff = self._handle_error(e, "control")
