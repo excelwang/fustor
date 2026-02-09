@@ -17,7 +17,8 @@ Example:
     views:
       fs-group-1:
         driver: fs
-        base_path: /data/target
+        driver_params:
+          hot_file_threshold: 60.0
     pipes:
       ingest-main:
         receiver: http-main
@@ -52,8 +53,7 @@ class ReceiverConfig(BaseModel):
 class ViewConfig(BaseModel):
     """Configuration for a view."""
     driver: str = "fs"
-    base_path: str = ""
-    extra: Dict[str, Any] = {}
+    driver_params: Dict[str, Any] = {}
 
 
 class FusionPipeConfig(BaseModel):

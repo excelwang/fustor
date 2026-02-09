@@ -57,8 +57,7 @@ class FusionClient:
             headers={"X-API-Key": self.api_key},
             timeout=self.timeout
         )
-        
-        # Use only new pipe-based paths
+        # Set API paths (unified pipe-based only)
         self._session_path = "/api/v1/pipe/session"
         self._events_path = "/api/v1/pipe/ingest"
         self._consistency_path = "/api/v1/pipe/consistency"

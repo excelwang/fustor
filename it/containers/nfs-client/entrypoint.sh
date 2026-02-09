@@ -17,43 +17,51 @@ echo "NFS mounted at ${MOUNT_POINT}"
 if [ "${AGENT_ENABLED}" = "true" ]; then
     echo "Starting Fustor Agent (${AGENT_ID})..."
     
-    # Create agent config directory (AgentConfigLoader expects this location)
+    # Create agent config directory
     mkdir -p /root/.fustor/agent-config
-    cat > /root/.fustor/agent-config/default.yaml << EOF
-# Unified Agent Config for ${AGENT_ID}
-
+    
+    # Copy and process config template with environment variable substitution
+    # The config file is mounted from it/config/agent-config/default.yaml
+    if [ -f "/config/agent-config/default.yaml" ]; then
+        # Substitute environment variables in the config
+        envsubst < /config/agent-config/default.yaml > /root/.fustor/agent-config/default.yaml
+        echo "Agent config loaded from mounted volume"
+    else
+        # Fallback: generate minimal config inline
+        cat > /root/.fustor/agent-config/default.yaml <<EOF
+# Minimal Agent Config for ${AGENT_ID}
 sources:
   shared-fs:
     driver: fs
     uri: "${MOUNT_POINT}"
     credential:
-      key: ""
+      type: passwd
+      user: root
+      password: ""
     disabled: false
-    driver_params:
-      scan_interval: 60
-      audit_interval: 300
 
 senders:
   fusion-main:
-    driver: fusion
+    driver: http
     uri: "${FUSION_ENDPOINT}"
     credential:
-      key: "${API_KEY:-integration-test-key}"
+      type: api_key
+      key: "${API_KEY:-test-api-key-123}"
     disabled: false
-    driver_params:
-      view_id: "${VIEW_ID:-integration-test-ds}"
 
 pipes:
-  main-sync:
+  "${PIPE_ID:-integration-test-ds}":
     source: shared-fs
     sender: fusion-main
     disabled: false
-    audit_interval_sec: 300
-    sentinel_interval_sec: 120
-    heartbeat_interval_sec: 10
+    audit_interval_sec: 300.0
+    sentinel_interval_sec: 120.0
+    heartbeat_interval_sec: 10.0
 EOF
-
-    # Start agent in foreground (will load from default.yaml automatically)
+        echo "Agent config generated from fallback template"
+    fi
+    
+    # Start agent in foreground
     echo "Starting Fustor Agent (${AGENT_ID}) in foreground..."
     exec fustor-agent start
 fi

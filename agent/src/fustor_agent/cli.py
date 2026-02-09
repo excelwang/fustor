@@ -64,7 +64,7 @@ def start(configs, daemon, verbose, no_console_log):
         fustor-agent start                    # Start all from default.yaml
         fustor-agent start research-sync      # Start single pipe
         fustor-agent start pipe-a pipe-b      # Start multiple pipes
-        fustor-agent start ./custom.yaml      # Start from file path
+        fustor-agent start custom.yaml        # Start from managed file
     """
     log_level = "DEBUG" if verbose else "INFO"
     setup_logging(

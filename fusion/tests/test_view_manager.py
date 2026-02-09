@@ -29,10 +29,8 @@ async def test_view_manager_initialization():
     
     # Mock view_configs.get_by_view to return a mock config
     mock_config = ViewConfig(
-        id="test-view",
-        view_id="1", # Now called view_id in Config
         driver="mock",
-        extra={"param1": "val1"}
+        driver_params={"param1": "val1"}
     )
     
     with patch("fustor_fusion.config.unified.fusion_config.get_view", return_value=mock_config), \

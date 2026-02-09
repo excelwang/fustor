@@ -72,12 +72,7 @@ class SenderHandlerAdapter(SenderHandler):
     async def initialize(self) -> None:
         """Initialize the handler (connect the underlying sender)."""
         if not self._connected:
-            # Try both initialize and connect for maximum compatibility
-            if hasattr(self._sender, 'initialize'):
-                await self._sender.initialize()
-            elif hasattr(self._sender, 'connect'):
-                await self._sender.connect()
-                
+            await self._sender.connect()
             self._connected = True
             logger.debug(f"SenderHandlerAdapter {self.id} initialized")
     
@@ -109,13 +104,13 @@ class SenderHandlerAdapter(SenderHandler):
             **kwargs
         )
         
-        # Determine if result is (session_id, metadata) tuple or legacy dict
-        if isinstance(result, tuple) and len(result) == 2:
+        # Handle both dict return and tuple return (for compatibility)
+        if isinstance(result, tuple):
             session_id, session_data = result
         else:
-            # Fallback for legacy drivers or unusual returns
-            session_id = result.get("session_id", "") if isinstance(result, dict) else ""
-            session_data = result if isinstance(result, dict) else {}
+            # Sender returns dict directly
+            session_data = result
+            session_id = session_data.get("session_id", f"sess-{task_id}")
 
         metadata = {
             "role": session_data.get("role", "follower"),

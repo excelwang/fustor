@@ -77,9 +77,6 @@ class SenderConfig(BaseModel):
     disabled: bool = Field(default=True, description="是否禁用此配置")
     validation_error: Optional[str] = Field(None, exclude=True)
     driver_params: Dict[str, Any] = Field(default_factory=dict, description="驱动专属参数")
-    # API version for FusionSDK compatibility ('v1' or 'v2')
-    api_version: str = Field(default='v2', pattern='^v[12]$', description="API version (v1 or v2)")
-    
     model_config = ConfigDict(extra='ignore')
 
 

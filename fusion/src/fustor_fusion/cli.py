@@ -64,7 +64,10 @@ def start(configs, reload, port, host, daemon, verbose, no_console_log):
     """
     Start Fusion and pipe(s).
     
-    If no configs specified, starts all pipes listed in default.yaml.
+    Examples:
+        fustor-fusion start                   # Start all from default.yaml
+        fustor-fusion start ingest-main       # Start single pipe
+        fustor-fusion start custom.yaml       # Start from managed file
     """
     log_level = "DEBUG" if verbose else "INFO"
     setup_logging(

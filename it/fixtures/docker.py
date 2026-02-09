@@ -104,54 +104,11 @@ def docker_env():
                 docker_manager.up(build=True, wait=True)
                 break
     
-    # Inject Fusion Configuration
-    logger.info("Injecting static configuration into Fusion...")
-    
-    # 1. Create .fustor directory
-    docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/views-config"])
-    
-    # 2. Inject Receivers Config (v2: renamed from 'views')
-    receivers_config = f"""
-http-main:
-  driver: "http"
-  port: 8102
-  api_keys:
-    - key: "test-api-key-123"
-      pipe_id: "integration-test-ds"
-  session_timeout_seconds: {SESSION_TIMEOUT}
-  allow_concurrent_push: true
-"""
-    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/receivers-config.yaml", receivers_config)
-    
-    # 3. Inject View Config
-    view_config = f"""
-id: "integration-test-ds"
-view_id: "integration-test-ds"
-driver: "fs"
-disabled: false
-driver_params:
-  uri: "/mnt/shared-view"
-  hot_file_threshold: {HOT_FILE_THRESHOLD}
-  consistency:
-    tombstone_ttl_seconds: {TEST_TOMBSTONE_TTL}
-"""
-    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/views-config/integration-test-ds.yaml", view_config)
-    
-    # 4. Inject Fusion Pipe Config (V2 binding)
-    pipe_config = f"""
-id: "integration-test-ds"
-receiver: "http-main"
-views:
-  - "integration-test-ds"
-enabled: true
-
-session_timeout_seconds: {SESSION_TIMEOUT}
-allow_concurrent_push: true
-extra:
-  view_id: "integration-test-ds"
-"""
-    docker_manager.exec_in_container(CONTAINER_FUSION, ["mkdir", "-p", "/root/.fustor/fusion-pipes-config"])
-    docker_manager.create_file_in_container(CONTAINER_FUSION, "/root/.fustor/fusion-pipes-config/integration-test-ds.yaml", pipe_config)
+    # --- Configuration Hook ---
+    # Fusion configuration is now handled via volume mount:
+    # ./config/fusion-config -> /root/.fustor/fusion-config
+    # This aligns with the unified configuration standard.
+    logger.info("Fusion configuration managed via volume mount (/root/.fustor/fusion-config)")
 
     # 5. Reload Fusion
 

@@ -43,7 +43,7 @@ services:
       FUSTOR_HOME: "/root/.fustor"
     volumes:
       - fusion-data:/data/fusion
-      - ./config/views-config:/root/.fustor/fusion-config
+      - ./config/fusion-config:/root/.fustor/fusion-config
       - ../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
       - ../core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
       - ../fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
@@ -80,10 +80,12 @@ services:
       AGENT_ID: "agent-a"
       AGENT_PORT: "8100"
       FUSION_ENDPOINT: "http://fusion:8102"
+      API_KEY: "test-api-key-123"
       LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
       FAKETIME: "+2 hours"
     volumes:
       - agent-a-data:/data/agent
+      - ./config/agent-config:/config/agent-config
       - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
       - ../extensions/source-fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
       - ../extensions/sender-http/src/fustor_sender_http:/usr/local/lib/python3.11/site-packages/fustor_sender_http
@@ -124,10 +126,12 @@ services:
       AGENT_ID: "agent-b"
       AGENT_PORT: "8100"
       FUSION_ENDPOINT: "http://fusion:8102"
+      API_KEY: "test-api-key-123"
       LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
       FAKETIME: "-1h"
     volumes:
       - agent-b-data:/data/agent
+      - ./config/agent-config:/config/agent-config
       - ../agent/src/fustor_agent:/usr/local/lib/python3.11/site-packages/fustor_agent
       - ../extensions/source-fs/src/fustor_source_fs:/usr/local/lib/python3.11/site-packages/fustor_source_fs
       - ../extensions/sender-http/src/fustor_sender_http:/usr/local/lib/python3.11/site-packages/fustor_sender_http

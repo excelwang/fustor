@@ -53,25 +53,23 @@ def setup_pipe_routers():
     
     # Actually, let's rely on get_receiver handling config ID lookup
     if not receiver:
-         # Try to find valid receiver from loaded configs
-         receivers = fusion_config.get_all_receivers()
-         for rid, rcfg in receivers.items():
+         # Try to find valid receiver from loaded configs (even if not yet instantiated by active pipe)
+         receivers_cfg = fusion_config.get_all_receivers()
+         for rid, rcfg in receivers_cfg.items():
              if rcfg.driver == 'http':
                  receiver = runtime_objects.pipe_manager.get_receiver(rid)
                  if receiver: break
+    
     if receiver and hasattr(receiver, "get_session_router"):
-        logger.info("Mounting Session and Ingestion routers from HTTPReceiver")
+        logger.info(f"Mounting Session and Ingestion routers from HTTPReceiver ({receiver.id})")
         pipe_router.include_router(receiver.get_session_router(), prefix="/session")
         pipe_router.include_router(receiver.get_ingestion_router(), prefix="/ingest")
         success = True
             
     if not success:
-        logger.warning("HTTPReceiver not found, falling back to legacy routers")
-        # Fallback to legacy
-        pipe_router.include_router(session_router, prefix="/session")
-        # pipe_router.include_router(ingestion_router, prefix="/ingest") # Legacy removed
+        logger.error("HTTPReceiver not found! Pipe API will be incomplete.")
     
-    # Consistency router is common for both or handles its own delegation
+    # Consistency router handles its own delegation
     pipe_router.include_router(consistency_router)
     
     # 2. Add Management endpoints for debugging/monitoring

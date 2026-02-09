@@ -1,0 +1,37 @@
+# Agent Configuration for Integration Tests
+# Uses Unified Config V2 format
+# Location: it/config/agent-config/default.yaml
+
+sources:
+  shared-fs:
+    driver: fs
+    uri: "${MOUNT_POINT:-/mnt/nfs}"
+    credential:
+      type: passwd
+      user: root
+      password: ""
+    disabled: false
+    # driver_params for fs-specific settings only
+    driver_params: {}
+
+senders:
+  fusion-main:
+    driver: http
+    uri: "${FUSION_ENDPOINT:-http://fusion:8102}"
+    credential:
+      type: api_key
+      key: "${API_KEY:-test-api-key-123}"
+    disabled: false
+    # driver_params for http-specific settings only
+    driver_params:
+      timeout: 30.0
+
+pipes:
+  integration-test-ds:
+    source: shared-fs
+    sender: fusion-main
+    disabled: false
+    # Universal sync parameters
+    audit_interval_sec: 300.0
+    sentinel_interval_sec: 120.0
+    heartbeat_interval_sec: 10.0

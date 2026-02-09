@@ -102,9 +102,8 @@ class ViewManager:
                     self.logger.error(f"Driver type '{driver_type}' not found for view '{view_name}'. Available: {list(available_drivers.keys())}")
                     continue
                 
-                # ViewConfig V2 puts extra params in 'extra' dict commonly, or we might add specific fields
-                # For now assume 'driver_params' might be in extra, or pass extra as config
-                driver_params = config.extra
+                # ViewConfig V2 puts driver-specific params in 'driver_params' dict
+                driver_params = config.driver_params
                 
                 try:
                     driver_instance = driver_cls(
