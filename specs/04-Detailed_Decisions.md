@@ -269,3 +269,19 @@
 | 改动 | Before | After |
 |------|--------|-------|
 | 摄取基路径 | `/api/v1/ingest` | `/api/v1/pipe` |
+## 11. Implementation Decisions
+
+### 11.1 Atomic Write Integrity
+
+| # | Question | Decision |
+|---|---|---|
+| 11.1.1 | How to represent partial vs complete writes? | **Use `is_atomic_write` field in Data Schema** |
+
+**Alternatives Considered**:
+A) Add new `EventType.PARTIAL_UPDATE` and `EventType.COMPLETE_UPDATE`
+B) Use `is_atomic_write` boolean field in `FSRow` schema
+
+**Rationale for (B)**:
+1.  **Layering Violation**: Atomic write semantics (stream open/close) are specific to File Systems. Core EventType should remain generic (CRUD).
+2.  **Schema Evolution**: Adding fields to the domain schema is the standard way to handle domain-specific metadata.
+3.  **Backward Compatibility**: Old Consumers simply ignore the extra field, whereas unknown EventTypes would cause crashes.

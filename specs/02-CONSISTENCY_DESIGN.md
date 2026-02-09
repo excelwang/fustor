@@ -145,7 +145,7 @@ Fusion 通过 `FSState` 类维护以下状态：
 | `modified_time` | `float` | 最后修改时间（来自存储系统的 mtime） |
 | `size` | `int` | 文件大小（字节） |
 | `last_updated_at` | `float` | Fusion 本地物理时间戳，记录最后确认时刻 |
-| `integrity_suspect` | `bool` | 是否为可疑热文件 |
+| `integrity_suspect` | `bool` | 是否为可疑热文件 (由原子写标记或时效判定) |
 | `known_by_agent` | `bool` | 是否被 Realtime 事件确认 |
 | `audit_skipped` | `bool` | (仅目录) 是否在审计中因静默被跳过 |
 
@@ -180,9 +180,12 @@ self.state.tombstone_list = {
 - **结构**：`Dict[Path, Tuple[ExpiryMonotonic, RecordedMtime]]`
   - `ExpiryMonotonic`: TTL 到期时刻（基于 `time.monotonic()`）
   - `RecordedMtime`: 加入名单时记录的文件 mtime
-- **来源**：任何 Snapshot/Audit 发现 `(LogicalWatermark - mtime) < hot_file_threshold` 的文件
+- **来源**：
+  1. **原子写完整性 (Atomic Write Integrity)**: 当 `is_atomic_write=False` (部分写入/Modify事件) 时，文件立即进入 Suspect List
+  2. **时效判定 (Temporal Check)**: 任何 Snapshot/Audit 发现 `(LogicalWatermark - mtime) < hot_file_threshold` 的文件
 - **稳定性判定模型 (Stability-based Model)**：
-  - **实时移除**：收到文件 Realtime Update/Delete 时立即从名单移除并清除标记
+  1. **原子写清除**：收到 `is_atomic_write=True` (Close/Create) 事件时，**立即移除** Suspect 标记
+  2. **实时移除**：收到文件 Realtime Delete 时立即从名单移除
   - **物理过期检查**：后台任务定期检查物理 TTL 已到期的条目
     - **稳定 (Stable)**：TTL到期时，若 `node.mtime == recorded_mtime`，则判定为"已校准"，正式移除。此判定不考虑 logical age (hot/cold)，以兼容 mtime 跳向未来的文件能快速清除标记。
     - **活跃 (Active/Hot)**：若 mtime 发生变化，**续期**一个完整 TTL 周期，并更新 `recorded_mtime`
@@ -221,8 +224,18 @@ if event.message_source == MessageSource.REALTIME:
         node.known_by_agent = True
         
         # 一致性状态维护
-        suspect_list.pop(path, None)
-        node.integrity_suspect = False
+        is_atomic = payload.get('is_atomic_write', True)
+        if is_atomic:
+            # Clean write (Close/Create) -> Clear suspect
+            suspect_list.pop(path, None)
+            node.integrity_suspect = False
+        else:
+            # Partial write (Modify) -> Mark/Renew suspect
+            # 即使是 update 也可能是 partial write
+            expiry = time.monotonic() + self.hot_file_threshold
+            suspect_list[path] = (expiry, mtime)
+            node.integrity_suspect = True
+
         blind_spot_deletions.discard(path)
         blind_spot_additions.discard(path)
     
@@ -437,6 +450,22 @@ Fusion 收到反馈后通过 `driver.update_suspect()` 执行稳定性判定。�
 | 全局级 | Blind-spot List 非空 | `has_blind_spot: true` (通过 `/views/{view_id}/tree/stats`) |
 | 文件级 | 文件在 Suspect List 中 | `integrity_suspect: true` |
 | 盲区查询 | 需获取详细盲区文件列表 | 使用 `/views/{view_id}/tree/blind-spots` API |
+
+### 9.1 主动查询 (Real-Time Query)
+
+用户可通过 API 强制触发实时扫描：
+
+```http
+GET /api/v1/views/{view_id}/tree?path=/data/logs&force-real-time=true
+```
+
+**处理流程**：
+1. Fusion 接收请求，挂起 HTTP 响应
+2.通过 Heartbeat Response 向 Leader Agent 下发 `scan` 命令
+3. Agent 执行 `scan_path("/data/logs")` 并推送事件
+4. Fusion 接收事件更新视图
+5. (可选) Fusion 返回更新后的结果或超时
+```
 
 ---
 

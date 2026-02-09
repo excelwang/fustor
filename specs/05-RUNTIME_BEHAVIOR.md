@@ -70,3 +70,19 @@ Leader 的选举完全由 Fusion 端控制，采用非抢占式的锁机制。
 ### 3.2 架构分离
 - **FSScanner**: 负责 IO 和遍历 (无状态)。
 - **FSDriver**: 负责策略 (Policy)、排序 (Sorting) 和 调度 (Scheduling)。
+
+---
+
+## 4. Command Execution (命令执行)
+
+Fusion can issue commands to the Agent via the Heartbeat response channel.
+
+### 4.1 Execution Priority
+- **High Priority**: Commands (like `scan`) are processed immediately after the Heartbeat response is received.
+- **Concurrency**: Commands are typically executed as asynchronous tasks, running in parallel with the main Event Loop.
+
+### 4.2 Supported Commands
+- **`scan`**: Triggers a recursive file system scan for a specific path.
+    - **Trigger**: User requests `force-real-time=true` in Fusion View API.
+    - **Behavior**: Agent performs an immediate `FSScanner` walk of the target path.
+    - **Events**: Generated events are pushed to Fusion, updating the View state in real-time.
