@@ -15,10 +15,10 @@ class LogicalClock:
     A robust logical clock that advances based on a UNIFIED statistical analysis 
     of Fusion Local Time vs Observed Mtime skew.
     
-    It implements a Dual-Track Time System:
-    - BaseLine: Driven by Fusion physical time minus Global Skew (Mode).
-    - Trust Window: Allows fast-forwarding to mtime if within safe range (+1s).
-    - Safeguard: Lower bounded by local physical time time.time() ONLY when uninitialized.
+    It implements a simplified time system:
+    - Watermark = Fusion_Physical_Time - Mode_Skew
+    - Skew is calculated as the mode of (reference_time - mtime) samples
+    - Completely immune to mtime manipulation (touch -d future)
     """
     
     def __init__(self, initial_time: float = 0.0):
@@ -33,7 +33,6 @@ class LogicalClock:
 
         
         # --- Unified Global Clock State ---
-        self._trust_window = 1.0  # seconds
         
         # Global Sample Buffer (Last 10,000 events)
         self._global_buffer: Deque[int] = deque(maxlen=10000)
