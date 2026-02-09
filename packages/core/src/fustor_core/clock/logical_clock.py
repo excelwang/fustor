@@ -57,6 +57,10 @@ class LogicalClock:
         # This makes the system immune to Agent local clock errors (Faketime/NTP drift).
         reference_time = time.time()
         
+        # DEBUG SKEW
+
+
+        
         with self._lock:
             # --- Special Case: Deletion/Metadata event (observed_mtime is None) ---
             if observed_mtime is None:
@@ -180,6 +184,14 @@ class LogicalClock:
             
     def get_watermark(self) -> float:
         return self.now()
+
+    def get_skew(self) -> float:
+        """
+        Return the current estimated Global Skew (Mode).
+        Returns 0.0 if not yet calibrated.
+        """
+        with self._lock:
+             return float(self._get_global_skew_locked() or 0.0)
     
     def reset(self, value: float = 0.0) -> None:
         with self._lock:

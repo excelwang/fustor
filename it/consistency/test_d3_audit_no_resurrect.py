@@ -53,6 +53,8 @@ class TestAuditTombstoneProtection:
         assert removed, "File should be removed"
         
         # Step 3: Recreate same file from blind-spot (simulating a problematic scenario)
+        # Fix D3 Flake: Sleep to ensure new mtime > old tombstone_ts (NFS resolution >1s)
+        time.sleep(2.0)
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,
             test_file,

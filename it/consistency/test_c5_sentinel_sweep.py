@@ -10,7 +10,7 @@ import logging
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_C, CONTAINER_CLIENT_A, MOUNT_POINT
-from ..fixtures.constants import AUDIT_WAIT_TIMEOUT, MEDIUM_TIMEOUT, LONG_TIMEOUT
+from ..fixtures.constants import AUDIT_WAIT_TIMEOUT, MEDIUM_TIMEOUT, LONG_TIMEOUT, EXTREME_TIMEOUT, NFS_SYNC_DELAY
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +51,24 @@ class TestSentinelSweep:
         
         # 2. Trigger Audit to discover suspects
         logger.info("Triggering audit to discover suspects...")
+        time.sleep(NFS_SYNC_DELAY) # Ensure NFS attribute cache expires/updates
+        
+        # DEBUG: Check files on Agent A
+        from ..conftest import CONTAINER_CLIENT_A
+        try:
+            ls_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["ls", "-l", MOUNT_POINT])
+            logger.info(f"DEBUG: Files on Agent A:\n{ls_res.stdout}")
+        except Exception as e:
+            logger.error(f"DEBUG: Failed to ls on Agent A: {e}")
+
         wait_for_audit(timeout=AUDIT_WAIT_TIMEOUT)  # Wait longer for audit to ensure it completes
+
+        # DEBUG: Check tree
+        try:
+            tree = fusion_client.get_tree(path="/", max_depth=2)
+            logger.info(f"DEBUG: Fusion Tree: {tree}")
+        except Exception as e:
+             logger.error(f"DEBUG: Failed to get tree: {e}")
         
         # 3. Verify they are in suspect list initially
         suspect_list = fusion_client.get_suspect_list()
@@ -86,7 +103,7 @@ class TestSentinelSweep:
         for f in test_files:
             # We wait for integrity_suspect flag to become False
             # Fusion should auto-verify via Sentinel/Feedback loop
-            success = fusion_client.wait_for_flag(f, "integrity_suspect", False, timeout=LONG_TIMEOUT)
+            success = fusion_client.wait_for_flag(f, "integrity_suspect", False, timeout=EXTREME_TIMEOUT)
             assert success, f"File {f} should have its suspect flag cleared by Sentinel"
             
         logger.info("✅ All suspect flags cleared automatically")

@@ -60,7 +60,7 @@ class TestBlindSpotFileDeletion:
         # We relax this check to focus on eventual consistency.
         
         # Step 4: Wait for Audit to detect deletion
-        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        wait_for_audit()
         
         assert fusion_client.wait_for_file_not_in_tree(test_file, timeout=SHORT_TIMEOUT), \
             "File should be removed after Audit detects blind-spot deletion"
@@ -89,7 +89,7 @@ class TestBlindSpotFileDeletion:
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)
         
         # Wait for Audit completion
-        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        wait_for_audit()
         
         # Check blind-spot list for deletion record
         # Poll since events might be processed shortly after marker appearance

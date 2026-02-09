@@ -185,5 +185,9 @@ class TestClockSkewTolerance:
         flags = fusion_client.check_file_flags(file_path_normal)
         logger.info(f"Post-jump normal file flags: {flags}")
         
-        assert flags["integrity_suspect"] is False, \
-            f"File from past relative to Watermark ({logical_now}) should not be suspect"
+        # With Skew Normalization (Physical Age), the file is identified as PHYSICALLY FRESH (0s old).
+        # Logical Age = 2h (Old), Physical Age = 0s (Fresh).
+        # age = min(2h, 0s) = 0s.
+        # So it SHOULD be Suspect.
+        assert flags["integrity_suspect"] is True, \
+            f"File from Local Present (Physical Age ~0) should be suspect despite Logical Clock Jump ({logical_now})"

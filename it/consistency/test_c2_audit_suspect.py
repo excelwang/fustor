@@ -42,7 +42,7 @@ class TestAuditTriggersSuspect:
         
         # Wait for Audit to discover
         # Wait for Audit completion
-        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        wait_for_audit()
         
         # File should appear
         found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
@@ -76,7 +76,7 @@ class TestAuditTriggersSuspect:
         )
         
         # Wait for Audit completion
-        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        wait_for_audit()
         
         # Now wait for the file itself
         fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)

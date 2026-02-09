@@ -147,7 +147,7 @@ heartbeat_interval_sec: {HEARTBEAT_INTERVAL}
         time.sleep(0.5)
 
 
-@pytest.fixture
+@pytest.fixture(scope="function")
 def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     """
     Ensure agents are running and healthy.

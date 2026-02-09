@@ -109,35 +109,64 @@ class FSViewProvider(FSViewBase):
         - Active (mtime changed) -> renew TTL
         """
         async with self._global_semaphore:
-            self.state.logical_clock.update(mtime)
+            # Fix: Do NOT sample skew from Sentinel feedback (often old files).
+            # This prevents polluting the Skew Histogram with "Lag" from passive verification.
+            self.state.logical_clock.update(mtime, can_sample_skew=False)
+            
             node = self.state.get_node(path)
             if not node: return
 
             old_mtime = node.modified_time
-            node.modified_time = mtime
+            # Keep mtime as reported for now, but we might normalize it if skewed
+            
             watermark = self.state.logical_clock.get_watermark()
+            skew = self.state.logical_clock.get_skew()
             
-            is_stable = abs(old_mtime - mtime) < 1e-6
-            is_hot = (watermark - mtime) < self.hot_file_threshold
+            # Stability Check: Allow match on Raw Mtime OR Skew-Corrected Mtime
+            # Agent A (Skewed +2h) reports mtime=+2h. True mtime=0h. Skew=-2h.
+            # check 1: 0 == 2? False.
+            # check 2: 0 == 2 + (-2)? True.
+            is_raw_stable = abs(old_mtime - mtime) < 1e-6
+            is_skew_stable = abs(old_mtime - (mtime + skew)) < 1e-6
             
-            self.logger.debug(f"SENT_CHECK: {path} mtime={mtime:.1f} stable={is_stable} hot={is_hot} wm={watermark:.1f}")
+            if is_skew_stable and not is_raw_stable:
+                self.logger.info(f"Sentinel reported SKEWED mtime for {path} (Reported: {mtime}, Skew: {skew}, Corrected: {mtime+skew}). Treating as STABLE.")
+                # Normalize the mtime to the stable one for updates
+                mtime = old_mtime
+                is_stable = True
+            else:
+                is_stable = is_raw_stable
+
+            # Age Calculation Strategy (Align with Arbitrator)
+            # age = min(LogicalAge, PhysicalAge)
+            logical_age = watermark - mtime
+            physical_age = (watermark + skew) - mtime
+            age = min(logical_age, physical_age)
+            
+            # Hot Check
+            is_hot = age < self.hot_file_threshold
+            
+            self.logger.debug(f"SENT_CHECK: {path} mtime={mtime:.1f} stable={is_stable} hot={is_hot} age={age:.1f}")
 
             if path not in self.state.suspect_list:
                 # Not in suspect list - nothing to do
                 return
                 
             if is_stable:
-                # Stable: Update recorded_mtime so TTL cleanup knows it's been verified
-                # The actual clearing happens in cleanup_expired_suspects when TTL expires
-                expiry, _ = self.state.suspect_list[path]
-                self.state.suspect_list[path] = (expiry, mtime)
-                self.logger.debug(f"Suspect VERIFIED stable: {path} (awaiting TTL expiry)")
+                # Stable!
+                # If verified stable, we trust the agent's check and CLEAR it 
+                # even if it's technically "Hot" (recent).
+                # The agent said "I checked this RIGHT NOW and it matches".
+                self.logger.info(f"Suspect VERIFIED stable (Active via Sentinel): {path}. Clearing immediately.")
+                self.state.suspect_list.pop(path, None)
+                node.integrity_suspect = False
             else:
-                # Active: Renew TTL and update baseline mtime
+                # Active: Renew TTL
                 expiry = time.monotonic() + self.hot_file_threshold
                 self.state.suspect_list[path] = (expiry, mtime)
                 heapq.heappush(self.state.suspect_heap, (expiry, path))
                 self.logger.debug(f"Suspect RENEWED (active): {path}")
+
 
     async def get_data_view(self, **kwargs) -> dict:
         """Required by the ViewDriver ABC."""

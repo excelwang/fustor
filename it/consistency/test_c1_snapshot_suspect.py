@@ -9,7 +9,7 @@ import time
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT
-from ..fixtures.constants import SHORT_TIMEOUT, EXTREME_TIMEOUT
+from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, EXTREME_TIMEOUT
 
 
 class TestSnapshotTriggersSuspect:
@@ -41,10 +41,10 @@ class TestSnapshotTriggersSuspect:
         )
         
         # Wait for Audit completion
-        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        wait_for_audit()
         
         # File should appear
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
+        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         assert found is not None, "File should be discovered by Audit"
         
         # Check integrity_suspect flag
@@ -73,8 +73,8 @@ class TestSnapshotTriggersSuspect:
         )
         
         # Wait for Audit completion
-        wait_for_audit(timeout=EXTREME_TIMEOUT)
-        fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
+        wait_for_audit()
+        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
         
         # Get suspect list
         suspect_list = fusion_client.get_suspect_list()

@@ -96,7 +96,7 @@ def docker_env():
         logger.info("Environment hash matches. Reusing existing running containers.")
         # Optional: Fast health check
         for container in [CONTAINER_NFS_SERVER, CONTAINER_FUSION]:
-            if not docker_manager.wait_for_health(container, timeout=SHORT_TIMEOUT):
+            if not docker_manager.wait_for_health(container, timeout=CONTAINER_HEALTH_TIMEOUT):
                 logger.warning(f"Container {container} unhealthy. Repairing...")
                 docker_manager.up(build=True, wait=True)
                 break

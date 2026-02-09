@@ -57,7 +57,7 @@ class TestBlindSpotFileCreation:
                 f"If found immediately, it must be blind spot (agent_missing=True) eventually."
         
         # Wait for Audit completion
-        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        wait_for_audit()
         
         # Now check if the original blind-spot file was discovered
         found_after_audit = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
@@ -87,7 +87,7 @@ class TestBlindSpotFileCreation:
         )
         
         # Wait for Audit completion
-        wait_for_audit(timeout=EXTREME_TIMEOUT)
+        wait_for_audit()
         
         # Check blind-spot list for file (poll to be safe)
         start = time.time()

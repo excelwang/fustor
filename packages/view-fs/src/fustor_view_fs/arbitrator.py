@@ -3,7 +3,7 @@ import os
 import time
 import heapq
 import logging
-import time
+
 from typing import Any, Dict, Tuple, Optional
 from fustor_core.event import MessageSource, EventType
 from .state import FSState
@@ -116,7 +116,7 @@ class FSArbitrator:
             
             # Check if this is "New activity" after deletion
             # Use translated watermark for arbitration instead of raw index
-            if watermark > (tombstone_ts + self.TOMBSTONE_EPSILON) or mtime > (tombstone_ts + self.TOMBSTONE_EPSILON):
+            if mtime > (tombstone_ts + self.TOMBSTONE_EPSILON):
                 self.logger.info(f"TOMBSTONE_CLEARED for {path}")
                 self.state.tombstone_list.pop(path, None)
             else:
@@ -169,8 +169,21 @@ class FSArbitrator:
             self.logger.debug(f"REALTIME_DONE for {path}. Now agent_known={node.known_by_agent}, missing={path in self.state.blind_spot_additions}")
         else:
             # Manage Suspect List (Hot Data)
+            # Use Logical Watermark as the stable reference for data age calculations.
+            # This follows Spec §6.2 to avoid mixing raw physical clocks that may drift.
+            # However, to handle Clock Skew (where Leader is ahead), we also check Physical Age.
+            # We derive Physical Age by normalizing Watermark with the Global Skew.
+            # This avoids direct reliance on 'time.time()' in favor of the Synchronized Logical Clock.
             watermark = self.state.logical_clock.get_watermark()
-            age = watermark - mtime
+            skew = self.state.logical_clock.get_skew()
+            
+            logical_age = watermark - mtime
+            # Physical Watermark = Watermark + Skew (since Skew = Ref - Observed => Ref = Observed + Skew)
+            # Actually Skew = Reference(Physical) - Observed(LogicalSource)
+            # So Physical = Logical + Skew.
+            physical_age = (watermark + skew) - mtime
+            
+            age = min(logical_age, physical_age)
             mtime_changed = (existing is None) or (abs(old_mtime - mtime) > self.FLOAT_EPSILON)
             
             is_snapshot = (source == MessageSource.SNAPSHOT)
@@ -185,7 +198,9 @@ class FSArbitrator:
                     if not getattr(node, 'known_by_agent', False) or (is_realtime and mtime_changed):
                         node.integrity_suspect = True
                         if path not in self.state.suspect_list:
-                            remaining_life = self.hot_file_threshold - age
+                            # Cap remaining_life to ensure even future-skewed files 
+                            # are checked periodically for stability (Spec §4.3)
+                            remaining_life = min(self.hot_file_threshold, self.hot_file_threshold - age)
                             expiry = time.monotonic() + max(0.0, remaining_life)
                             self.state.suspect_list[path] = (expiry, mtime)
                             heapq.heappush(self.state.suspect_heap, (expiry, path))

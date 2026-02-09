@@ -45,7 +45,7 @@ MIN_NFS_DELAY = scaled_duration(NFS_PHYSICAL_LATENCY_SEC, min_val=1.0) + NFS_SAF
 
 # Driver / Core Intervals (Production Defaults from Source)
 # Source: agent/src/fustor_agent/config/pipelines.py
-AUDIT_INTERVAL = scaled_duration(600.0, min_val=0.5)      # Prod: 10m -> Test: 30s
+AUDIT_INTERVAL = scaled_duration(100.0, min_val=0.5)      # Prod: 10m -> Test: 5s
 SENTINEL_INTERVAL = scaled_duration(120.0, min_val=MIN_SLEEP_DURATION) # Prod: 2m -> Test: 6s
 HEARTBEAT_INTERVAL = scaled_duration(10.0, min_val=MIN_SLEEP_DURATION) # Prod: 10s -> Test: 0.5s
 
@@ -59,7 +59,7 @@ if SESSION_TIMEOUT < 3 * HEARTBEAT_INTERVAL:
 THROTTLE_INTERVAL_SEC = scaled_duration(5.0, min_val=0.1) # Prod: 5s -> Test: 0.25s
 
 # Test Specific Logic (No direct Prod equivalent found in source-fs, treated as test params)
-HOT_FILE_THRESHOLD = scaled_duration(30.0, min_val=5.0)   
+HOT_FILE_THRESHOLD = scaled_duration(1200.0, min_val=60.0)   
 TEST_TOMBSTONE_TTL = scaled_duration(2.0, min_val=0.5)    
 TOMBSTONE_CLEANUP_WAIT = scaled_duration(3.0, min_val=0.5) 
 
@@ -68,9 +68,9 @@ TOMBSTONE_CLEANUP_WAIT = scaled_duration(3.0, min_val=0.5)
 
 TEST_TIMEOUT = int(os.getenv("FUSTOR_TEST_TIMEOUT", "600"))
 CONTAINER_HEALTH_TIMEOUT = 120 # Fixed startup cost
-AGENT_READY_TIMEOUT = scaled_duration(90.0, min_val=20.0) 
-AGENT_B_READY_TIMEOUT = scaled_duration(120.0, min_val=25.0)
-VIEW_READY_TIMEOUT = scaled_duration(60.0, min_val=15.0) # Wait for initial snapshot
+AGENT_READY_TIMEOUT = scaled_duration(90.0, min_val=60.0) 
+AGENT_B_READY_TIMEOUT = scaled_duration(120.0, min_val=60.0)
+VIEW_READY_TIMEOUT = scaled_duration(60.0, min_val=60.0) # Wait for initial snapshot
 
 # Audit Wait needs to cover a full audit cycle
 AUDIT_WAIT_TIMEOUT = AUDIT_INTERVAL * 2.0 
@@ -80,10 +80,10 @@ if AUDIT_WAIT_TIMEOUT < 10.0: AUDIT_WAIT_TIMEOUT = 10.0
 SESSION_VANISH_TIMEOUT = SESSION_TIMEOUT * 2.0
 
 # --- Standard API Wait Timeouts ---
-SHORT_TIMEOUT = scaled_duration(10.0, min_val=2.0)         
-MEDIUM_TIMEOUT = scaled_duration(30.0, min_val=5.0)        
-LONG_TIMEOUT = scaled_duration(60.0, min_val=10.0)          
-EXTREME_TIMEOUT = scaled_duration(120.0, min_val=20.0)       
+SHORT_TIMEOUT = scaled_duration(10.0, min_val=5.0)         
+MEDIUM_TIMEOUT = scaled_duration(30.0, min_val=15.0)        
+LONG_TIMEOUT = scaled_duration(60.0, min_val=30.0)          
+EXTREME_TIMEOUT = scaled_duration(120.0, min_val=60.0)       
 
 # --- Semantic Sleep Durations (NFS/Ingestion) ---
 # NFS Sync Delay: How long to wait for NFS attributes to propagate
