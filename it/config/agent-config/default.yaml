@@ -5,22 +5,18 @@
 sources:
   shared-fs:
     driver: fs
-    uri: "${MOUNT_POINT:-/mnt/nfs}"
-    credential:
-      type: passwd
-      user: root
-      password: ""
+    uri: "${MOUNT_POINT}"
+    # credential not required for fs driver
     disabled: false
     # driver_params for fs-specific settings only
     driver_params: {}
 
 senders:
   fusion-main:
-    driver: http
-    uri: "${FUSION_ENDPOINT:-http://fusion:8102}"
+    driver: fusion
+    uri: "${FUSION_ENDPOINT}"
     credential:
-      type: api_key
-      key: "${API_KEY:-test-api-key-123}"
+      key: "${API_KEY}"
     disabled: false
     # driver_params for http-specific settings only
     driver_params:

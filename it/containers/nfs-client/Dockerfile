@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     procps \
     faketime \
+    gettext-base \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy the entire monorepo (context is project root)

@@ -53,7 +53,7 @@ class FieldMapping(BaseModel):
 class SourceConfig(BaseModel):
     driver: str
     uri: str
-    credential: Credential
+    credential: Optional[Credential] = None
     max_queue_size: int = Field(default=1000, gt=0, description="事件缓冲区的最大尺寸")
     max_retries: int = Field(default=10, gt=0, description="驱动在读取事件失败时的最大重试次数")
     retry_delay_sec: int = Field(default=5, gt=0, description="驱动重试前的等待秒数")
@@ -69,7 +69,7 @@ class SenderConfig(BaseModel):
     """
     driver: str
     uri: str = Field(..., description="目标端点URL")
-    credential: Credential
+    credential: Optional[Credential] = None
     batch_size: int = Field(default=1000, ge=1, description="每批消息最大条目")
     max_retries: int = Field(default=10, gt=0, description="推送失败时的最大重试次数")
     retry_delay_sec: int = Field(default=5, gt=0, description="推送重试前的等待秒数")

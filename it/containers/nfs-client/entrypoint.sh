@@ -24,41 +24,12 @@ if [ "${AGENT_ENABLED}" = "true" ]; then
     # The config file is mounted from it/config/agent-config/default.yaml
     if [ -f "/config/agent-config/default.yaml" ]; then
         # Substitute environment variables in the config
+        # Uses gettext-base (envsubst) installed in Dockerfile
         envsubst < /config/agent-config/default.yaml > /root/.fustor/agent-config/default.yaml
-        echo "Agent config loaded from mounted volume"
+        echo "Agent config loaded and processed from mounted volume"
     else
-        # Fallback: generate minimal config inline
-        cat > /root/.fustor/agent-config/default.yaml <<EOF
-# Minimal Agent Config for ${AGENT_ID}
-sources:
-  shared-fs:
-    driver: fs
-    uri: "${MOUNT_POINT}"
-    credential:
-      type: passwd
-      user: root
-      password: ""
-    disabled: false
-
-senders:
-  fusion-main:
-    driver: http
-    uri: "${FUSION_ENDPOINT}"
-    credential:
-      type: api_key
-      key: "${API_KEY:-test-api-key-123}"
-    disabled: false
-
-pipes:
-  "${PIPE_ID:-integration-test-ds}":
-    source: shared-fs
-    sender: fusion-main
-    disabled: false
-    audit_interval_sec: 300.0
-    sentinel_interval_sec: 120.0
-    heartbeat_interval_sec: 10.0
-EOF
-        echo "Agent config generated from fallback template"
+        echo "ERROR: Agent config file not found at /config/agent-config/default.yaml"
+        exit 1
     fi
     
     # Start agent in foreground

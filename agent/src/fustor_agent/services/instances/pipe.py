@@ -131,13 +131,15 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
             sender_driver_class = self.sender_driver_service._get_driver_by_type(sender_config.driver)
             
             # Extract sender config and credentials
+            # Extract sender config and credentials
             sender_credentials = {}
-            if hasattr(sender_config.credential, "model_dump"):
-                sender_credentials = sender_config.credential.model_dump()
-            elif hasattr(sender_config.credential, "dict"):
-                sender_credentials = sender_config.credential.dict()
-            elif sender_config.credential:
-                sender_credentials = dict(sender_config.credential)
+            if sender_config.credential:
+                if hasattr(sender_config.credential, "model_dump"):
+                    sender_credentials = sender_config.credential.model_dump()
+                elif hasattr(sender_config.credential, "dict"):
+                    sender_credentials = sender_config.credential.dict()
+                else:
+                    sender_credentials = dict(sender_config.credential)
 
             sender_driver_config = {
                 "batch_size": sender_config.batch_size,

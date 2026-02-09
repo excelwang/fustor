@@ -86,7 +86,9 @@ class SenderDriverService(SenderDriverServiceInterface):
         driver_class = self._get_driver_by_type(config.driver)
         
         # Standard signature: (sender_id: str, endpoint: str, credential: Dict, config: Dict)
-        cred_dict = config.credential.model_dump() if hasattr(config.credential, 'model_dump') else config.credential
+        cred_dict = {}
+        if config.credential:
+            cred_dict = config.credential.model_dump() if hasattr(config.credential, 'model_dump') else config.credential
         # driver_params maps to config
         return driver_class(
             sender_id=id,
