@@ -311,7 +311,7 @@ class TestViewManagerAdapterProcessing:
 
 
 class TestViewManagerAdapterStats:
-    """Test ViewManagerAdapter stats and providers."""
+    """Test ViewManagerAdapter stats and driver_instances."""
     
     def test_get_stats(self, manager_adapter):
         """get_stats should return aggregated stats."""

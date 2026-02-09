@@ -154,18 +154,19 @@ class FSViewProvider(FSViewBase):
                 
             if is_stable:
                 # Stable!
-                # If verified stable, we trust the agent's check and CLEAR it 
-                # even if it's technically "Hot" (recent).
-                # The agent said "I checked this RIGHT NOW and it matches".
-                self.logger.info(f"Suspect VERIFIED stable (Active via Sentinel): {path}. Clearing immediately.")
-                self.state.suspect_list.pop(path, None)
-                node.integrity_suspect = False
+                # Per Spec §4.3: Stable files stay in suspect_list awaiting TTL expiry.
+                # Do NOT clear immediately even if verified by Sentinel, to ensure
+                # the "Cool-off" period is fully honored for hot files.
+                self.logger.debug(f"Suspect VERIFIED stable (Sentinel): {path}. Waiting for cool-off.")
             else:
-                # Active: Renew TTL
+                # Active: Renew TTL and update node state
+                node.modified_time = mtime
+                node.integrity_suspect = True
+                
                 expiry = time.monotonic() + self.hot_file_threshold
                 self.state.suspect_list[path] = (expiry, mtime)
                 heapq.heappush(self.state.suspect_heap, (expiry, path))
-                self.logger.debug(f"Suspect RENEWED (active): {path}")
+                self.logger.info(f"Suspect RENEWED (mismatch via Sentinel): {path} (Mtime: {mtime})")
 
 
     async def get_data_view(self, **kwargs) -> dict:

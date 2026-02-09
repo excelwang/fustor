@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 
 class FSViewBase(ViewDriver):
     """
-    Base class for FS View Providers, inheriting from the core ViewDriver ABC.
+    Base class for FS View Drivers, inheriting from the core ViewDriver ABC.
     Provides shared state and concurrency primitives.
     """
     
