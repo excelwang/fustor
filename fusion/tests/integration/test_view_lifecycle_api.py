@@ -80,9 +80,9 @@ async def test_view_api_start_stop_lifecycle(client, view_config_file):
     
     # 2. Start View
     with patch("fustor_fusion_sdk.loaders.load_view") as mock_load:
-        MockProvider = AsyncMock()
-        MockProviderClass = MagicMock(return_value=MockProvider)
-        mock_load.return_value = MockProviderClass
+        MockDriver = AsyncMock()
+        MockDriverClass = MagicMock(return_value=MockDriver)
+        mock_load.return_value = MockDriverClass
         
         resp = await client.post(f"/api/v1/management/views/{view_unit_id}/start")
         assert resp.status_code == 200
@@ -115,10 +115,10 @@ async def test_view_stop_terminates_session(client, view_config_file):
     view_group_id = "1"
     
     with patch("fustor_fusion_sdk.loaders.load_view") as mock_load:
-        MockProvider = AsyncMock()
-        MockProvider.initialize = AsyncMock()
-        MockProviderClass = MagicMock(return_value=MockProvider)
-        mock_load.return_value = MockProviderClass
+        MockDriver = AsyncMock()
+        MockDriver.initialize = AsyncMock()
+        MockDriverClass = MagicMock(return_value=MockDriver)
+        mock_load.return_value = MockDriverClass
         
         # Start view
         await client.post(f"/api/v1/management/views/{view_unit_id}/start")

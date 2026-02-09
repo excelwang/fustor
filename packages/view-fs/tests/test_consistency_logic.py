@@ -1,6 +1,6 @@
 import pytest
 import time
-from fustor_view_fs import FSViewProvider
+from fustor_view_fs import FSViewDriver
 from fustor_core.event import EventBase, EventType, MessageSource, UpdateEvent, DeleteEvent
 
 @pytest.mark.asyncio
@@ -11,7 +11,7 @@ async def test_arbitration_logic():
     fixed_time = 1000000.0
     
     with patch('time.time', return_value=fixed_time):
-        parser = FSViewProvider(id="test_view", view_id="1")
+        parser = FSViewDriver(id="test_view", view_id="1")
 
         # 1. Snapshot event (old data)
         old_time = fixed_time - 1000
@@ -55,7 +55,7 @@ async def test_arbitration_logic():
 
 @pytest.mark.asyncio
 async def test_audit_sentinel_logic():
-    parser = FSViewProvider(id="test_view", view_id="1")
+    parser = FSViewDriver(id="test_view", view_id="1")
     
     # 1. Init clock to now so last_audit_start is meaningful
     now = time.time()
@@ -102,7 +102,7 @@ async def test_audit_sentinel_logic():
 
 @pytest.mark.asyncio
 async def test_auto_audit_start():
-    parser = FSViewProvider(id="test_view", view_id="1")
+    parser = FSViewDriver(id="test_view", view_id="1")
     assert parser.state.last_audit_start is None
     
     now_ms = int(time.time() * 1000)
@@ -117,7 +117,7 @@ async def test_auto_audit_start():
 @pytest.mark.asyncio
 async def test_parent_mtime_check():
     """Test Section 5.3: Parent Mtime Check for Audit events."""
-    parser = FSViewProvider(id="test_view", view_id="1")
+    parser = FSViewDriver(id="test_view", view_id="1")
     
     # 1. First, establish a parent directory in memory via Realtime
     parent_realtime_mtime = time.time()
@@ -166,7 +166,7 @@ async def test_parent_mtime_check():
 @pytest.mark.asyncio
 async def test_audit_missing_file_detection():
     """Test Section 5.3 Scenario 2: Detecting files missing from audit."""
-    parser = FSViewProvider(id="test_view", view_id="1")
+    parser = FSViewDriver(id="test_view", view_id="1")
     
     # 1. Create initial state via Realtime: parent dir + 2 files
     now = time.time()

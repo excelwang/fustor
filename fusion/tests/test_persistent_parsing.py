@@ -13,7 +13,7 @@ async def test_persistent_parsing():
     
     print("The implementation includes:")
     print("- ViewDriver ABC in fustor-core for interface definition")
-    print("- FSViewProvider from fustor-view-fs for file system views")
+    print("- FSViewDriver from fustor-view-fs for file system views")
     print("- Dynamic discovery via entry points")
     print("- In-memory consistent view with consistency arbitration")
     

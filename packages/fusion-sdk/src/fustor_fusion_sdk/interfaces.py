@@ -52,9 +52,9 @@ class SessionManagerInterface(Protocol):
     async def stop_periodic_cleanup(self):
         ...
 
-class ViewProvider(Protocol):
+class ViewDriver(Protocol):
     """
-    Interface for a View Provider driver.
+    Interface for a View Driver.
     Views expose content via specific protocols (e.g. FUSE/NFS).
     """
     def __init__(self, id: str, view_id: str, **kwargs):

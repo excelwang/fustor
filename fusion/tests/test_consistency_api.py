@@ -31,7 +31,7 @@ def mock_view_manager():
 @pytest.mark.asyncio
 @pytest.mark.asyncio
 async def test_audit_start_endpoint(client, mock_view_manager):
-    """Test that the audit start endpoint calls handle_audit_start on the provider."""
+    """Test that the audit start endpoint calls handle_audit_start on the driver."""
     mock_get, manager = mock_view_manager
     
     driver_instance = AsyncMock()
@@ -49,7 +49,7 @@ async def test_audit_start_endpoint(client, mock_view_manager):
 
 @pytest.mark.asyncio
 async def test_audit_end_endpoint(client, mock_view_manager):
-    """Test that the audit end endpoint calls handle_audit_end on the provider."""
+    """Test that the audit end endpoint calls handle_audit_end on the driver."""
     mock_get, manager = mock_view_manager
     
     driver_instance = AsyncMock()

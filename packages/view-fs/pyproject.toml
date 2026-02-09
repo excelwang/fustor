@@ -1,7 +1,7 @@
 [project]
 name = "fustor-view-fs"
 dynamic = ["version"]
-description = "Fustor FS Consistent View Provider"
+description = "Fustor FS Consistent View Driver"
 license = "MIT"
 dependencies = [
     "fustor-core",
@@ -32,7 +32,7 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/packages/view-fs"
 "Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 [project.entry-points."fustor.view_drivers"]
-fs = "fustor_view_fs:FSViewProvider"
+fs = "fustor_view_fs:FSViewDriver"
 
 [project.entry-points."fustor.view_api"]
 fs = "fustor_view_fs:create_fs_router"

@@ -3,12 +3,12 @@ import time
 import asyncio
 from unittest.mock import MagicMock
 import heapq
-from fustor_view_fs import FSViewProvider
+from fustor_view_fs import FSViewDriver
 from fustor_core.event import UpdateEvent, MessageSource, EventType
 
 @pytest.fixture
 def parser():
-    p = FSViewProvider(id="test_view", view_id="1")
+    p = FSViewDriver(id="test_view", view_id="1")
     p.hot_file_threshold = 30.0
     # Reset clock to a small value so 1000.0 is considered "hot" (vs time.time())
     p._logical_clock.reset(0.001)

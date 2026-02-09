@@ -2,12 +2,12 @@ import pytest
 import asyncio
 import time
 import unittest
-from fustor_view_fs import FSViewProvider
+from fustor_view_fs import FSViewDriver
 from fustor_core.event import UpdateEvent, MessageSource, DeleteEvent
 
 @pytest.fixture
 def parser():
-    return FSViewProvider(id="test_view", view_id="1")
+    return FSViewDriver(id="test_view", view_id="1")
 
 # ... (Previous tests unchanged) ...
 

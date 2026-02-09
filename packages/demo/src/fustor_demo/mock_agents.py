@@ -99,7 +99,7 @@ def mock_oss_add_dataset_link(project_id: str, dataset_name: str, public_url: st
         path=f"/{project_id}/public_datasets/{dataset_name}",
         url=public_url,
         extra_metadata={
-            "provider": "GSA/OMIX Public Data",
+            "driver": "GSA/OMIX Public Data",
             "version": "1.0",
             "access_level": "public"
         }

@@ -426,7 +426,7 @@ POST /api/v1/ingest/consistency/sentinel/feedback
      Body: {"type": "suspect_update", "updates": [{"path": "...", "mtime": 123.0, "status": "exists"}, ...]}
 ```
 
-Fusion 收到反馈后通过 `provider.update_suspect()` 执行稳定性判定。若反馈证明文件稳定，则立即清除可疑标记（加速收敛）。
+Fusion 收到反馈后通过 `driver.update_suspect()` 执行稳定性判定。若反馈证明文件稳定，则立即清除可疑标记（加速收敛）。
 
 ---
 
@@ -506,7 +506,7 @@ while suspect_heap and suspect_heap[0][0] <= time.monotonic():
 
 ### 11.4 并发控制
 
-`FSViewProvider` 使用两级并发控制：
+`FSViewDriver` 使用两级并发控制：
 - **全局信号量** (`_global_semaphore`): 限制并发事件处理数量
 - **全局独占锁** (`_global_exclusive_lock`): 用于 Audit Start/End 等需要独占访问的操作
 

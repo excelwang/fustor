@@ -135,7 +135,7 @@ def setup_view_routers():
                     checker = make_readiness_checker(view_name)
                     
                     router = create_func(
-                        get_provider_func=get_driver_instance_for_instance,
+                        get_driver_func=get_driver_instance_for_instance,
                         check_snapshot_func=checker,
                         get_view_id_dep=get_view_id_from_api_key
                     )
@@ -160,7 +160,7 @@ def setup_view_routers():
                 checker = make_readiness_checker(name)
                 
                 router = create_func(
-                    get_provider_func=get_driver_instance_fallback,
+                    get_driver_func=get_driver_instance_fallback,
                     check_snapshot_func=checker,
                     get_view_id_dep=get_view_id_from_api_key
                 )

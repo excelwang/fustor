@@ -12,7 +12,7 @@ from unittest.mock import MagicMock, AsyncMock
 from fustor_view_fs.state import FSState
 from fustor_view_fs.tree import TreeManager
 from fustor_view_fs.audit import AuditManager
-from fustor_view_fs.provider import FSViewProvider
+from fustor_view_fs.driver import FSViewDriver
 
 
 class TestTombstoneTTLCleanup:
@@ -79,58 +79,58 @@ class TestBlindSpotSessionReset:
     """Test Blind-spot list clearing on session start."""
 
     @pytest.fixture
-    def provider(self):
-        return FSViewProvider(id="test_view", view_id="1")
+    def driver(self):
+        return FSViewDriver(id="test_view", view_id="1")
 
     @pytest.mark.asyncio
-    async def test_blind_spot_additions_cleared_on_session_start(self, provider):
+    async def test_blind_spot_additions_cleared_on_session_start(self, driver):
         """
         验证: 新 Session 开始时清空 blind_spot_additions
         参考: CONSISTENCY_DESIGN.md §4.4
         """
         # Setup: 添加一些盲区条目
-        provider.state.blind_spot_additions.add("/blind_file_1.txt")
-        provider.state.blind_spot_additions.add("/blind_file_2.txt")
+        driver.state.blind_spot_additions.add("/blind_file_1.txt")
+        driver.state.blind_spot_additions.add("/blind_file_2.txt")
         
-        assert len(provider.state.blind_spot_additions) == 2
+        assert len(driver.state.blind_spot_additions) == 2
         
         # Action: 启动新 Session
-        await provider.on_session_start()
+        await driver.on_session_start()
         
         # Assert: 盲区列表被清空
-        assert len(provider.state.blind_spot_additions) == 0, \
+        assert len(driver.state.blind_spot_additions) == 0, \
             "Blind-spot additions should be cleared on session start"
 
     @pytest.mark.asyncio
-    async def test_blind_spot_deletions_cleared_on_session_start(self, provider):
+    async def test_blind_spot_deletions_cleared_on_session_start(self, driver):
         """
         验证: 新 Session 开始时清空 blind_spot_deletions
         """
         # Setup: 添加一些盲区删除条目
-        provider.state.blind_spot_deletions.add("/deleted_blind_1.txt")
-        provider.state.blind_spot_deletions.add("/deleted_blind_2.txt")
+        driver.state.blind_spot_deletions.add("/deleted_blind_1.txt")
+        driver.state.blind_spot_deletions.add("/deleted_blind_2.txt")
         
-        assert len(provider.state.blind_spot_deletions) == 2
+        assert len(driver.state.blind_spot_deletions) == 2
         
         # Action: 启动新 Session
-        await provider.on_session_start()
+        await driver.on_session_start()
         
         # Assert: 盲区删除列表被清空
-        assert len(provider.state.blind_spot_deletions) == 0, \
+        assert len(driver.state.blind_spot_deletions) == 0, \
             "Blind-spot deletions should be cleared on session start"
 
     @pytest.mark.asyncio
-    async def test_audit_state_also_cleared_on_session_start(self, provider):
+    async def test_audit_state_also_cleared_on_session_start(self, driver):
         """
         验证: 新 Session 开始时同时清空 audit 状态
         """
         # Setup: 设置 audit 状态
-        provider.state.last_audit_start = time.time()
-        provider.state.audit_seen_paths.add("/some/path")
+        driver.state.last_audit_start = time.time()
+        driver.state.audit_seen_paths.add("/some/path")
         
         # Action: 启动新 Session
-        await provider.on_session_start()
+        await driver.on_session_start()
         
         # Assert: audit 状态被清空
-        assert provider.state.last_audit_start is None
-        assert len(provider.state.audit_seen_paths) == 0
+        assert driver.state.last_audit_start is None
+        assert len(driver.state.audit_seen_paths) == 0

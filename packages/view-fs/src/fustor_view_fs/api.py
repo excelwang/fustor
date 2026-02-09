@@ -19,12 +19,12 @@ class SuspectUpdateRequest(BaseModel):
     updates: List[Dict[str, Any]]  # List of {"path": str, "mtime": float}
 
 
-def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
+def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep):
     """
     Factory function to create the FS router with proper dependencies.
     
     Args:
-        get_provider_func: Async function to get the FSViewProvider for a view
+        get_driver_func: Async function to get the FSViewDriver for a view
         check_snapshot_func: Async function to check snapshot status (includes Core + Live logic)
         get_view_id_dep: FastAPI dependency to get view_id from API key
 
@@ -51,12 +51,12 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
         if dry_run:
             return ORJSONResponse(content={"message": "dry-run", "view_id": view_id})
 
-        provider = await get_provider_func(view_id)
-        if not provider:
-            return ORJSONResponse(content={"detail": "Provider not initialized"}, status_code=503)
+        driver = await get_driver_func(view_id)
+        if not driver:
+            return ORJSONResponse(content={"detail": "Driver not initialized"}, status_code=503)
         
         effective_recursive = recursive if max_depth is None else True
-        result = await provider.get_directory_tree(path, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
+        result = await driver.get_directory_tree(path, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
         
         if result is None:
             return ORJSONResponse(content={"detail": "路径未找到或尚未同步"}, status_code=404)
@@ -69,10 +69,10 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
     ) -> list:
         """搜索匹配模式的文件。"""
         await check_snapshot_func(view_id)
-        provider = await get_provider_func(view_id)
-        if not provider:
+        driver = await get_driver_func(view_id)
+        if not driver:
             return []
-        return await provider.search_files(pattern)
+        return await driver.search_files(pattern)
 
     @router.get("/stats", summary="获取文件系统统计指标")
     async def get_directory_stats_api(
@@ -80,10 +80,10 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
     ) -> Dict[str, Any]:
         """获取当前目录结构的统计信息。"""
         await check_snapshot_func(view_id)
-        provider = await get_provider_func(view_id)
-        if not provider:
-            return {"error": "Provider not initialized"}
-        return await provider.get_directory_stats()
+        driver = await get_driver_func(view_id)
+        if not driver:
+            return {"error": "Driver not initialized"}
+        return await driver.get_directory_stats()
 
     @router.delete("/reset", 
         summary="Reset directory tree structure",
@@ -99,20 +99,20 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
             await reset_views(view_id)
             return
         except (ImportError, Exception):
-            # Fallback to provider-specific reset if fustor_fusion not available
-            provider = await get_provider_func(view_id)
-            if provider:
-                await provider.reset()
+            # Fallback to driver-specific reset if fustor_fusion not available
+            driver = await get_driver_func(view_id)
+            if driver:
+                await driver.reset()
 
     @router.get("/suspect-list", summary="Get Suspect List for Sentinel Sweep")
     async def get_suspect_list_api(
         view_id: str = Depends(get_view_id_dep)
     ) -> List[Dict[str, Any]]:
         """Get the current Suspect List for this view."""
-        provider = await get_provider_func(view_id)
-        if not provider:
+        driver = await get_driver_func(view_id)
+        if not driver:
             return []
-        suspect_list = await provider.get_suspect_list()
+        suspect_list = await driver.get_suspect_list()
         return [{"path": path, "suspect_until": ts} for path, ts in suspect_list.items()]
 
     @router.put("/suspect-list", summary="Update Suspect List from Sentinel Sweep")
@@ -121,16 +121,16 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
         view_id: str = Depends(get_view_id_dep)
     ) -> Dict[str, Any]:
         """Update suspect files with their current mtimes from Agent's Sentinel Sweep."""
-        provider = await get_provider_func(view_id)
-        if not provider:
-            raise HTTPException(status_code=404, detail="View Provider not initialized")
+        driver = await get_driver_func(view_id)
+        if not driver:
+            raise HTTPException(status_code=404, detail="View Driver not initialized")
         
         updated_count = 0
         for item in request.updates:
             path = item.get("path")
             mtime = item.get("mtime") or item.get("current_mtime")
             if path and mtime is not None:
-                await provider.update_suspect(path, float(mtime))
+                await driver.update_suspect(path, float(mtime))
                 updated_count += 1
         
         return {"view_id": view_id, "updated_count": updated_count, "status": "ok"}
@@ -140,10 +140,10 @@ def create_fs_router(get_provider_func, check_snapshot_func, get_view_id_dep):
         view_id: str = Depends(get_view_id_dep)
     ) -> Dict[str, Any]:
         """Get the current Blind-spot List for this view."""
-        provider = await get_provider_func(view_id)
-        if not provider:
-            return {"error": "Provider not initialized"}
-        return await provider.get_blind_spot_list()
+        driver = await get_driver_func(view_id)
+        if not driver:
+            return {"error": "Driver not initialized"}
+        return await driver.get_blind_spot_list()
 
     return router
 
