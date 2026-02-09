@@ -32,23 +32,79 @@ class SourcesConfigLoader:
     
     def __init__(self, config_path: Optional[Path] = None):
         if config_path is None:
-            config_path = get_fustor_home_dir() / "sources-config.yaml"
+            home = get_fustor_home_dir()
+            # Default to directory, but fall back to legacy file if directory doesn't exist
+            dir_path = home / "sources-config"
+            file_path = home / "sources-config.yaml"
+            
+            if dir_path.exists() and dir_path.is_dir():
+                config_path = dir_path
+            elif file_path.exists():
+                config_path = file_path
+            else:
+                 # Default to directory for new installs
+                config_path = dir_path
+
         self.path = Path(config_path)
         self._sources: Dict[str, SourceConfig] = {}
         self._loaded = False
     
     def load(self) -> Dict[str, SourceConfig]:
-        """Load configuration from YAML file."""
+        """Load configuration from YAML file or directory."""
         if not self.path.exists():
             logger.warning(f"Sources config not found at {self.path}")
             self._loaded = True
             return {}
         
+        self._sources.clear()
+        
+        if self.path.is_dir():
+            return self._load_from_dir()
+        else:
+            return self._load_from_file()
+
+    def _load_from_dir(self) -> Dict[str, SourceConfig]:
+        """Load configs from a directory of YAML files."""
+        for yaml_file in self.path.glob("*.yaml"):
+            try:
+                with open(yaml_file) as f:
+                    data = yaml.safe_load(f)
+                
+                if not data:
+                    logger.warning(f"Empty config file: {yaml_file}")
+                    continue
+                
+                # Infer ID from filename if not present (though we typically use filename as ID concept)
+                # But for SourceConfig which doesn't have ID in model, we rely on the dict key concept.
+                # In directory mode, we'll use the filename stem as the ID.
+                s_id = yaml_file.stem
+                
+                try:
+                    # Validate ID early
+                    errors = validate_url_safe_id(s_id, "source id")
+                    if errors:
+                        logger.error(f"Invalid source ID {s_id} (from filename): {'; '.join(errors)}")
+                        continue
+                    
+                    # Create config model
+                    config = SourceConfig(**data)
+                    self._sources[s_id] = config
+                    logger.debug(f"Loaded source config: {s_id}")
+                except Exception as e:
+                    logger.error(f"Failed to parse source {s_id} from {yaml_file}: {e}")
+                    
+            except Exception as e:
+                logger.error(f"Failed to load source config from {yaml_file}: {e}")
+        
+        self._loaded = True
+        logger.info(f"Loaded {len(self._sources)} sources from {self.path}")
+        return self._sources
+
+    def _load_from_file(self) -> Dict[str, SourceConfig]:
+        """Load configs from a single legacy YAML file."""
         try:
             with open(self.path) as f:
                 data = yaml.safe_load(f) or {}
-            
-            self._sources.clear()
             
             # Ensure data is a dict
             if not isinstance(data, dict):

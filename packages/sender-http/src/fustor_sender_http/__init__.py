@@ -94,6 +94,9 @@ class HTTPSender(Sender):
                 self.logger.error("Failed to create session: Empty response.")
                 raise RuntimeError("Failed to create session with Fusion service: Empty response.")
 
+        except httpx.ConnectError as e:
+            self.logger.warning(f"Failed to create session (Connection Error): {e}")
+            raise RuntimeError(f"Failed to create session with Fusion service: {e}") from e
         except httpx.HTTPStatusError as e:
             self.logger.error(f"Failed to create session: HTTP {e.response.status_code} - {e.response.text}")
             raise RuntimeError(f"Failed to create session with Fusion service: HTTP {e.response.status_code} - {e.response.text}") from e

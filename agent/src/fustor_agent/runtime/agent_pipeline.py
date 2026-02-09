@@ -336,6 +336,15 @@ class AgentPipeline(Pipeline):
                         except Exception as e:
                             logger.warning(f"Pipeline {self.id}: Failed to fetch committed index: {e}. Defaulting to 0/Latest.")
 
+                    except RuntimeError as e:
+                        # Handle known connection errors without full traceback
+                        if "Failed to create session" in str(e):
+                            logger.error(f"Pipeline {self.id} control loop error: Session creation failed: {e}")
+                            # Raise to trigger backoff logic in outer loop
+                            raise
+                        else:
+                            logger.error(f"Pipeline {self.id}: Detailed session creation error: {e}", exc_info=True)
+                            raise
                     except Exception as e:
                         logger.error(f"Pipeline {self.id}: Detailed session creation error: {e}", exc_info=True)
                         raise RuntimeError(f"Session creation failed: {e}")
