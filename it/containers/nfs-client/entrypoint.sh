@@ -17,37 +17,45 @@ echo "NFS mounted at ${MOUNT_POINT}"
 if [ "${AGENT_ENABLED}" = "true" ]; then
     echo "Starting Fustor Agent (${AGENT_ID})..."
     
-    # Create agent configuration
-    mkdir -p /data/agent
-    cat > /data/agent/config.yaml << EOF
-agent:
-  id: "${AGENT_ID}"
-  host: "0.0.0.0"
-  port: ${AGENT_PORT}
-  data_dir: "/data/agent"
+    # Create agent config directory (AgentConfigLoader expects this location)
+    mkdir -p /root/.fustor/agent-config
+    cat > /root/.fustor/agent-config/default.yaml << EOF
+# Unified Agent Config for ${AGENT_ID}
 
 sources:
-  - name: "shared-fs"
-    driver: "source-fs"
-    config:
-      watch_paths:
-        - "${MOUNT_POINT}"
+  shared-fs:
+    driver: fs
+    uri: "${MOUNT_POINT}"
+    credential:
+      key: ""
+    disabled: false
+    driver_params:
       scan_interval: 60
       audit_interval: 300
 
 senders:
-  - name: "fusion"
-    driver: "fusion"
-    config:
-      endpoint: "${FUSION_ENDPOINT}"
-      credential:
-        key: "${API_KEY}"
-      view_id: "${VIEW_ID}"
+  fusion-main:
+    driver: fusion
+    uri: "${FUSION_ENDPOINT}"
+    credential:
+      key: "${API_KEY:-integration-test-key}"
+    disabled: false
+    driver_params:
+      view_id: "${VIEW_ID:-integration-test-ds}"
+
+pipes:
+  main-sync:
+    source: shared-fs
+    sender: fusion-main
+    disabled: false
+    audit_interval_sec: 300
+    sentinel_interval_sec: 120
+    heartbeat_interval_sec: 10
 EOF
 
-    # Start agent in foreground
+    # Start agent in foreground (will load from default.yaml automatically)
     echo "Starting Fustor Agent (${AGENT_ID}) in foreground..."
-    exec fustor-agent start --config /data/agent/config.yaml
+    exec fustor-agent start
 fi
 
 # Keep container running if Agent was not started

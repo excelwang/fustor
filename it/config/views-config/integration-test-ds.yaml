@@ -1,10 +1,27 @@
+# Fusion Configuration for Integration Tests
+# Uses Unified Config V2 format
 
-id: "integration-test-ds"
-view_id: "integration-test-ds"
-driver: "fs"
-disabled: false
-driver_params:
-  uri: "/mnt/shared-view"
-  hot_file_threshold: 60.0
-  consistency:
-    tombstone_ttl_seconds: 0.5
+receivers:
+  http-main:
+    driver: http
+    bind_host: "0.0.0.0"
+    port: 8102
+    session_timeout_seconds: 3600
+    api_keys:
+      - key: "integration-test-key"
+        pipe_id: "main-sync"
+
+views:
+  integration-test-ds:
+    driver: fs
+    disabled: false
+    driver_params:
+      uri: "/mnt/shared-view"
+      hot_file_threshold: 60.0
+      consistency:
+        tombstone_ttl_seconds: 0.5
+
+pipes:
+  ingest-main:
+    receiver: http-main
+    views: [integration-test-ds]

@@ -36,7 +36,7 @@ class FusionClient:
         self, 
         base_url: str, 
         api_key: str, 
-        api_version: str = "legacy",
+        api_version: str = "pipe",
         timeout: float = 30.0
     ):
         """
@@ -45,7 +45,7 @@ class FusionClient:
         Args:
             base_url: The base URL of the Fusion service
             api_key: API key for authentication
-            api_version: API version to use ("pipe" uses /api/v1/pipe, "legacy" uses /api/v1/ingest)
+            api_version: API version (ignored, always uses pipe API)
             timeout: Request timeout in seconds
         """
         self.base_url = base_url
@@ -58,17 +58,10 @@ class FusionClient:
             timeout=self.timeout
         )
         
-        # Set API paths based on version
-        if api_version == "legacy":
-            # Legacy paths for backward compatibility
-            self._session_path = "/api/v1/ingest/sessions"
-            self._events_path = "/api/v1/ingest/events"
-            self._consistency_path = "/api/v1/ingest/consistency"
-        else:
-            # New pipe-based paths (recommended)
-            self._session_path = "/api/v1/pipe/session"
-            self._events_path = "/api/v1/pipe/ingest"
-            self._consistency_path = "/api/v1/pipe/consistency"
+        # Use only new pipe-based paths
+        self._session_path = "/api/v1/pipe/session"
+        self._events_path = "/api/v1/pipe/ingest"
+        self._consistency_path = "/api/v1/pipe/consistency"
 
     async def create_session(
         self, 

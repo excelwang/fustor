@@ -43,7 +43,7 @@ class HTTPSender(Sender):
         
         # Extended configuration
         timeout = self.config.get("timeout", 30.0)
-        api_version = self.config.get("api_version", "legacy")
+        api_version = self.config.get("api_version", "pipe")
         
         self.client = FusionClient(
             base_url=endpoint, 

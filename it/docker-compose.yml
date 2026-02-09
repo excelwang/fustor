@@ -33,7 +33,7 @@ services:
       context: ..
       dockerfile: it/containers/fustor-services/Dockerfile
     container_name: fustor-fusion
-    command: [ "fustor-fusion", "start", "-h", "0.0.0.0" ]
+    command: [ "fustor-fusion", "start", "-h", "0.0.0.0", "-p", "8102" ]
     environment:
       FUSTOR_FUSION_HOST: "0.0.0.0"
       FUSTOR_FUSION_PORT: "8102"
@@ -43,7 +43,7 @@ services:
       FUSTOR_HOME: "/root/.fustor"
     volumes:
       - fusion-data:/data/fusion
-      - ./config/views-config:/root/.fustor/views-config
+      - ./config/views-config:/root/.fustor/fusion-config
       - ../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
       - ../core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
       - ../fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
@@ -76,7 +76,7 @@ services:
       NFS_PATH: "/exports"
       MOUNT_POINT: "/mnt/shared"
       MOUNT_OPTIONS: "actimeo=1,nolock"
-      AGENT_ENABLED: "false"
+      AGENT_ENABLED: "true"
       AGENT_ID: "agent-a"
       AGENT_PORT: "8100"
       FUSION_ENDPOINT: "http://fusion:8102"
@@ -120,7 +120,7 @@ services:
       NFS_PATH: "/exports"
       MOUNT_POINT: "/mnt/shared"
       MOUNT_OPTIONS: "actimeo=1,nolock"
-      AGENT_ENABLED: "false"
+      AGENT_ENABLED: "true"
       AGENT_ID: "agent-b"
       AGENT_PORT: "8100"
       FUSION_ENDPOINT: "http://fusion:8102"
