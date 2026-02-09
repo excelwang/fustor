@@ -7,18 +7,32 @@ from fustor_fusion.view_state_manager import view_state_manager
 
 # 模拟 API Key 认证，直接返回 view_id = 1
 async def mock_get_view_id():
-    return 1
+    return "1"
 
 @pytest_asyncio.fixture
 async def client():
     # 覆盖认证依赖
     from fustor_fusion.auth.dependencies import get_view_id_from_api_key
-    app.dependency_overrides[get_view_id_from_api_key] = mock_get_view_id
+    app.dependency_overrides[get_view_id_from_api_key] = lambda: "1"
     
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        c.headers["X-API-Key"] = "test-key"
         yield c
     
     app.dependency_overrides.clear()
+
+@pytest_asyncio.fixture(autouse=True)
+async def mock_view_deps():
+    """每个测试前 Mock ViewManager 和相关驱动"""
+    from unittest.mock import MagicMock, AsyncMock, patch
+    mock_vm = MagicMock()
+    mock_driver = MagicMock()
+    mock_driver.is_ready = True
+    mock_vm.driver_instances = {"test_driver": mock_driver}
+    
+    with patch("fustor_fusion.api.views.get_cached_view_manager", new_callable=AsyncMock) as mock_get:
+        mock_get.return_value = mock_vm
+        yield mock_vm, mock_driver
 
 @pytest_asyncio.fixture(autouse=True)
 async def clean_state():

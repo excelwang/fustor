@@ -21,6 +21,7 @@ async def client():
     # Clear view managers before and after test
     view_managers.clear()
     async with app.router.lifespan_context(app):
+        view_managers.clear()
         async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
             yield c
     view_managers.clear()

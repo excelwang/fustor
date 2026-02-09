@@ -77,49 +77,49 @@ class MockViewManager:
     
     def __init__(self, view_id: str = "1"):
         self.view_id = view_id
-        self.providers: Dict[str, MockViewDriver] = {
+        self.driver_instances: Dict[str, MockViewDriver] = {
             "fs": MockViewDriver(view_id="fs-view"),
             "db": MockViewDriver(view_id="db-view"),
         }
         self._initialized = False
     
-    async def initialize_providers(self) -> None:
+    async def initialize_driver_instances(self) -> None:
         self._initialized = True
-        for p in self.providers.values():
+        for p in self.driver_instances.values():
             await p.initialize()
     
     async def process_event(self, event: Any) -> Dict[str, Dict]:
         results = {}
-        for name, provider in self.providers.items():
-            success = await provider.process_event(event)
+        for name, driver_instance in self.driver_instances.items():
+            success = await driver_instance.process_event(event)
             results[name] = {"success": success}
         return results
     
-    def get_data_view(self, provider_name: str, **kwargs) -> Any:
-        provider = self.providers.get(provider_name)
-        if provider:
+    def get_data_view(self, driver_id: str, **kwargs) -> Any:
+        driver_instance = self.driver_instances.get(driver_id)
+        if driver_instance:
             # Simulate sync call for testing
-            return {"events_count": len(provider.events_processed)}
+            return {"events_count": len(driver_instance.events_processed)}
         return None
     
     def on_session_start(self) -> None:
-        for p in self.providers.values():
+        for p in self.driver_instances.values():
             p.session_starts += 1
     
     def on_session_close(self) -> None:
-        for p in self.providers.values():
+        for p in self.driver_instances.values():
             p.session_closes += 1
     
-    def get_available_providers(self) -> List[str]:
-        return list(self.providers.keys())
+    def get_available_driver_ids(self) -> List[str]:
+        return list(self.driver_instances.keys())
     
-    def get_provider(self, name: str):
-        return self.providers.get(name)
+    def get_driver_instance(self, name: str):
+        return self.driver_instances.get(name)
     
     def get_aggregated_stats(self) -> Dict[str, Any]:
         return {
             name: p.get_stats()
-            for name, p in self.providers.items()
+            for name, p in self.driver_instances.items()
         }
 
 
@@ -267,7 +267,7 @@ class TestViewManagerAdapterLifecycle:
     
     @pytest.mark.asyncio
     async def test_initialize(self, manager_adapter, mock_manager):
-        """initialize() should call manager's initialize_providers."""
+        """initialize() should call manager's initialize_driver_instances."""
         await manager_adapter.initialize()
         assert mock_manager._initialized
 
@@ -290,24 +290,24 @@ class TestViewManagerAdapterProcessing:
         )
         result = await manager_adapter.process_event(event)
         
-        assert result is True  # At least one provider succeeded
-        assert len(mock_manager.providers["fs"].events_processed) == 1
-        assert len(mock_manager.providers["db"].events_processed) == 1
+        assert result is True  # At least one driver instance succeeded
+        assert len(mock_manager.driver_instances["fs"].events_processed) == 1
+        assert len(mock_manager.driver_instances["db"].events_processed) == 1
     
     @pytest.mark.asyncio
-    async def test_get_data_view_with_provider(self, manager_adapter):
-        """get_data_view should query specific provider."""
-        view = await manager_adapter.get_data_view(provider="fs")
+    async def test_get_data_view_with_driver(self, manager_adapter):
+        """get_data_view should query specific driver instance."""
+        view = await manager_adapter.get_data_view(driver_id="fs")
         
         assert "events_count" in view
     
     @pytest.mark.asyncio
-    async def test_get_data_view_without_provider(self, manager_adapter):
-        """get_data_view without provider should list providers."""
+    async def test_get_data_view_without_driver(self, manager_adapter):
+        """get_data_view without driver instance ID should list driver instances."""
         view = await manager_adapter.get_data_view()
         
-        assert "providers" in view
-        assert "fs" in view["providers"]
+        assert "driver_instances" in view
+        assert "fs" in view["driver_instances"]
 
 
 class TestViewManagerAdapterStats:
@@ -319,16 +319,16 @@ class TestViewManagerAdapterStats:
         assert "fs" in stats
         assert "db" in stats
     
-    def test_get_available_providers(self, manager_adapter):
-        """get_available_providers should list all providers."""
-        providers = manager_adapter.get_available_providers()
-        assert "fs" in providers
-        assert "db" in providers
+    def test_get_available_driver_ids(self, manager_adapter):
+        """get_available_driver_ids should list all driver instances."""
+        driver_ids = manager_adapter.get_available_driver_ids()
+        assert "fs" in driver_ids
+        assert "db" in driver_ids
     
-    def test_get_provider(self, manager_adapter, mock_manager):
-        """get_provider should return specific provider."""
-        provider = manager_adapter.get_provider("fs")
-        assert provider is mock_manager.providers["fs"]
+    def test_get_driver_instance(self, manager_adapter, mock_manager):
+        """get_driver_instance should return specific driver instance."""
+        driver_instance = manager_adapter.get_driver_instance("fs")
+        assert driver_instance is mock_manager.driver_instances["fs"]
 
 
 class TestConvenienceFunctions:

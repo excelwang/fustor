@@ -8,13 +8,18 @@ from fustor_fusion.main import app
 from fustor_fusion.auth.dependencies import get_view_id_from_api_key
 from fustor_fusion.view_manager.manager import ViewManager
 
-# Override auth dependency
-app.dependency_overrides[get_view_id_from_api_key] = lambda: "1"
+# Note: No longer setting override here, moving to fixture
 
 @pytest.fixture
 def client():
-    with TestClient(app) as c:
+    # Override auth dependency
+    from fustor_fusion.auth.dependencies import get_view_id_from_api_key
+    app.dependency_overrides[get_view_id_from_api_key] = lambda: "1"
+    
+    with TestClient(app, headers={"X-API-Key": "test"}) as c:
         yield c
+        
+    app.dependency_overrides.clear()
 
 @pytest.fixture
 def mock_view_manager():
@@ -29,25 +34,27 @@ async def test_audit_start_endpoint(client, mock_view_manager):
     """Test that the audit start endpoint calls handle_audit_start on the provider."""
     mock_get, manager = mock_view_manager
     
-    provider = AsyncMock()
+    driver_instance = AsyncMock()
     # Mock iterator and getter
-    manager.get_available_providers.return_value = ["file_directory"]
-    manager.get_provider.return_value = provider
+    manager.get_available_driver_ids.return_value = ["file_directory"]
+    manager.get_driver_instance.return_value = driver_instance
     
     response = client.post("/api/v1/pipe/consistency/audit/start")
+    if response.status_code != 200:
+        print(f"DEBUG: 422 error details: {response.json()}")
     
     assert response.status_code == 200
     assert response.json()["status"] == "audit_started"
-    provider.handle_audit_start.assert_called_once()
+    driver_instance.handle_audit_start.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_audit_end_endpoint(client, mock_view_manager):
     """Test that the audit end endpoint calls handle_audit_end on the provider."""
     mock_get, manager = mock_view_manager
     
-    provider = AsyncMock()
-    manager.get_available_providers.return_value = ["file_directory"]
-    manager.get_provider.return_value = provider
+    driver_instance = AsyncMock()
+    manager.get_available_driver_ids.return_value = ["file_directory"]
+    manager.get_driver_instance.return_value = driver_instance
     
     # Patch queue / processing manager to simulate drained queue
     # Patch runtime_objects to simulate drained queue via pipeline manager
@@ -65,17 +72,17 @@ async def test_audit_end_endpoint(client, mock_view_manager):
     
     assert response.status_code == 200
     assert response.json()["status"] == "audit_ended"
-    provider.handle_audit_end.assert_called_once()
+    driver_instance.handle_audit_end.assert_called_once()
 
 @pytest.mark.asyncio
 async def test_get_sentinel_tasks_with_suspects(client, mock_view_manager):
     """Test that sentinel tasks are returned when suspects exist."""
     mock_get, manager = mock_view_manager
     
-    provider = AsyncMock()
-    provider.get_suspect_list = AsyncMock(return_value={"/file1.txt": 123.0, "/file2.txt": 456.0})
-    manager.get_available_providers.return_value = ["file_directory"]
-    manager.get_provider.return_value = provider
+    driver_instance = AsyncMock()
+    driver_instance.get_suspect_list = AsyncMock(return_value={"/file1.txt": 123.0, "/file2.txt": 456.0})
+    manager.get_available_driver_ids.return_value = ["file_directory"]
+    manager.get_driver_instance.return_value = driver_instance
     
     response = client.get("/api/v1/pipe/consistency/sentinel/tasks")
     
@@ -90,10 +97,10 @@ async def test_get_sentinel_tasks_empty(client, mock_view_manager):
     """Test that empty dict is returned when no suspects."""
     mock_get, manager = mock_view_manager
     
-    provider = AsyncMock()
-    provider.get_suspect_list = AsyncMock(return_value={})
-    manager.get_available_providers.return_value = ["file_directory"]
-    manager.get_provider.return_value = provider
+    driver_instance = AsyncMock()
+    driver_instance.get_suspect_list = AsyncMock(return_value={})
+    manager.get_available_driver_ids.return_value = ["file_directory"]
+    manager.get_driver_instance.return_value = driver_instance
     
     response = client.get("/api/v1/pipe/consistency/sentinel/tasks")
     
@@ -105,9 +112,9 @@ async def test_submit_sentinel_feedback(client, mock_view_manager):
     """Test submitting sentinel feedback updates suspects."""
     mock_get, manager = mock_view_manager
     
-    provider = AsyncMock()
-    manager.get_available_providers.return_value = ["file_directory"]
-    manager.get_provider.return_value = provider
+    driver_instance = AsyncMock()
+    manager.get_available_driver_ids.return_value = ["file_directory"]
+    manager.get_driver_instance.return_value = driver_instance
     
     response = client.post("/api/v1/pipe/consistency/sentinel/feedback", json={
         "type": "suspect_update",
@@ -118,4 +125,4 @@ async def test_submit_sentinel_feedback(client, mock_view_manager):
     
     assert response.status_code == 200
     assert response.json()["status"] == "processed"
-    provider.update_suspect.assert_called_once_with("/file1.txt", 999.0)
+    driver_instance.update_suspect.assert_called_once_with("/file1.txt", 999.0)

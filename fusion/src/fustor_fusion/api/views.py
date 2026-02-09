@@ -128,14 +128,14 @@ def setup_view_routers():
             
             if create_func:
                 try:
-                    # Create context-bound provider getter and readiness checker
-                    async def get_provider_for_instance(view_id: str, _key=view_name):
-                        return await get_view_provider(view_id, _key)
+                    # Create context-bound driver instance getter and readiness checker
+                    async def get_driver_instance_for_instance(view_id: str, _key=view_name):
+                        return await get_view_driver_instance(view_id, _key)
                     
                     checker = make_readiness_checker(view_name)
                     
                     router = create_func(
-                        get_provider_func=get_provider_for_instance,
+                        get_provider_func=get_driver_instance_for_instance,
                         check_snapshot_func=checker,
                         get_view_id_dep=get_view_id_from_api_key
                     )
@@ -154,13 +154,13 @@ def setup_view_routers():
         for name, create_func in available_factories.items():
             try:
                 # Fallback uses driver name as the lookup key
-                async def get_provider_fallback(view_id: str, _key=name):
-                    return await get_view_provider(view_id, _key)
+                async def get_driver_instance_fallback(view_id: str, _key=name):
+                    return await get_view_driver_instance(view_id, _key)
                 
                 checker = make_readiness_checker(name)
                 
                 router = create_func(
-                    get_provider_func=get_provider_fallback,
+                    get_provider_func=get_driver_instance_fallback,
                     check_snapshot_func=checker,
                     get_view_id_dep=get_view_id_from_api_key
                 )

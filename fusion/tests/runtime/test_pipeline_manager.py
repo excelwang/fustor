@@ -79,7 +79,7 @@ class TestPipelineManager:
              await pipeline_manager.initialize_pipelines()
              
              assert "pipe-1" in pipeline_manager._pipelines
-             mock_get_vm.assert_called_with('1')
+             mock_get_vm.assert_called_with('view1')
 
     @pytest.mark.asyncio
     async def test_callbacks(self, pipeline_manager):

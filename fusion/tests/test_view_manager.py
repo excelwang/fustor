@@ -25,7 +25,7 @@ class MockViewDriver(ViewDriver):
 
 @pytest.mark.asyncio
 async def test_view_manager_initialization():
-    """Test that ViewManager correctly instantiates and initializes providers."""
+    """Test that ViewManager correctly instantiates and initializes driver instances."""
     
     # Mock view_configs.get_by_view to return a mock config
     mock_config = ViewConfig(
@@ -39,19 +39,16 @@ async def test_view_manager_initialization():
          patch("fustor_fusion.view_manager.manager._load_view_drivers", return_value={"mock": MockViewDriver}):
         
         vm = ViewManager(view_id="1")
-        await vm.initialize_providers()
+        await vm.initialize_driver_instances()
         
-        assert "test-view" in vm.providers
-        provider = vm.providers["test-view"]
-        assert isinstance(provider, MockViewDriver)
-        assert provider.id == "test-view"
-        assert provider.view_id == "1"
-        assert provider.config == {"param1": "val1"}
-        # Note: initialize() is NOT called in ViewManager.initialize_providers() currently.
-        # It's called in main.py auto-start logic. 
-        # But wait, should it be called in ViewManager?
-        # In the refactored main.py, it IS called.
-        # Let's check ViewManager.initialize_providers again.
+        assert "test-view" in vm.driver_instances
+        driver_instance = vm.driver_instances["test-view"]
+        assert isinstance(driver_instance, MockViewDriver)
+        assert driver_instance.id == "test-view"
+        assert driver_instance.view_id == "1"
+        assert driver_instance.config == {"param1": "val1"}
+        # Note: initialize() IS called in ViewManager.initialize_driver_instances()
+        assert driver_instance.initialized is True
 
 @pytest.mark.asyncio
 async def test_view_driver_abc_initialization():
