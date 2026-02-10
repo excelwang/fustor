@@ -105,20 +105,38 @@ class PipeSessionBridge:
             allow_concurrent_push = getattr(self._pipe, 'allow_concurrent_push', True)
 
         from fustor_fusion.view_state_manager import view_state_manager
-        # Note: view_state_manager should handle string IDs too
+        
+        # We need to handle ALL views associated with this pipe
+        all_view_ids = {view_id} # Start with primary
+        if hasattr(self._pipe, '_view_handlers'):
+            for h in self._pipe._view_handlers.values():
+                h_view_id = getattr(h, 'view_id', None)
+                if not h_view_id and hasattr(h, 'manager'):
+                    h_view_id = getattr(h.manager, 'view_id', None)
+                if h_view_id:
+                    all_view_ids.add(str(h_view_id))
+
+        is_leader = False
+        # Try to become leader for the primary view first
         is_leader = await view_state_manager.try_become_leader(view_id, session_id)
         
-        if not is_leader and not allow_concurrent_push:
-            # Check if there's an actual active leader session
-            leader_sid = await view_state_manager.get_leader(view_id)
-            if leader_sid:
-                logger.warning(f"Rejecting session {session_id} for view {view_id}: Locked by leader {leader_sid}")
-                raise ValueError(f"View {view_id} is currently locked by session {leader_sid}. Concurrent push is disabled.")
+        # For all views, we need to ensure we have a role and respect concurrent push
+        for v_id in all_view_ids:
+            v_is_leader = await view_state_manager.try_become_leader(v_id, session_id)
+            
+            if v_id == view_id:
+                is_leader = v_is_leader
+            
+            if not v_is_leader and not allow_concurrent_push:
+                leader_sid = await view_state_manager.get_leader(v_id)
+                if leader_sid:
+                    logger.warning(f"Rejecting session {session_id} for view {v_id}: Locked by leader {leader_sid}")
+                    raise ValueError(f"View {v_id} is currently locked by session {leader_sid}. Concurrent push is disabled.")
 
-        if is_leader:
-            await view_state_manager.set_authoritative_session(view_id, session_id)
-            if not allow_concurrent_push:
-                await view_state_manager.lock_for_session(view_id, session_id)
+            if v_is_leader:
+                await view_state_manager.set_authoritative_session(v_id, session_id)
+                if not allow_concurrent_push:
+                    await view_state_manager.lock_for_session(v_id, session_id)
         
         # Create in legacy SessionManager
         await self._session_manager.create_session_entry(

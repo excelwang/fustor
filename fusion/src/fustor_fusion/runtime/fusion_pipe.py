@@ -447,8 +447,22 @@ class FusionPipe(Pipe):
             from ..view_state_manager import view_state_manager
             # Only leader can signal snapshot end
             if await view_state_manager.is_leader(self.view_id, session_id):
+                # Mark primary view complete
                 await view_state_manager.set_snapshot_complete(self.view_id, session_id)
-                logger.info(f"Pipe {self.id}: Received snapshot end signal from leader session {session_id}. Marking snapshot as complete.")
+                logger.info(f"Pipe {self.id}: Received snapshot end signal from leader session {session_id}. Marking primary view {self.view_id} as complete.")
+                
+                # Also mark all other handlers' views as complete if they are different
+                for h_id, handler in self._view_handlers.items():
+                    # Check common adapter patterns
+                    h_view_id = getattr(handler, 'view_id', None)
+                    if not h_view_id and hasattr(handler, 'manager'):
+                        h_view_id = getattr(handler.manager, 'view_id', None)
+                    if not h_view_id and hasattr(handler, '_vm'):
+                        h_view_id = getattr(handler._vm, 'view_id', None)
+                    
+                    if h_view_id and str(h_view_id) != str(self.view_id):
+                        await view_state_manager.set_snapshot_complete(str(h_view_id), session_id)
+                        logger.info(f"Pipe {self.id}: Also marking view {h_view_id} as complete.")
             else:
                 logger.warning(f"Pipe {self.id}: Received snapshot end signal from non-leader session {session_id}. Ignored.")
 
