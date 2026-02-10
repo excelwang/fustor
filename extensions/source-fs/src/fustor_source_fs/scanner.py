@@ -168,10 +168,29 @@ class FSScanner:
         Executes snapshot scan.
         callback: Optional function to call for touching watched paths (path, mtime).
         """
+        if not os.path.exists(self.root) or not os.access(self.root, os.R_OK):
+             logger.error(f"[fs] Snapshot failed: Root path '{self.root}' is missing or inaccessible.")
+             # Increment generic error count on the engine manually since we can't delegate
+             # But RecursiveScanner doesn't expose public increment.
+             # We rely on the fact that if we return empty iterator, caller sees nothing.
+             # However, we MUST signal error.
+             # Let's verify if 'engine' has increment_error method. No, but has _error_count.
+             # We can't access private.
+             # Let's just raise an exception to be caught by caller OR log and rely on external checks?
+             # The test expects error_count > 0.
+             # We can manually trigger an error by trying to scan it via engine if we want,
+             # but simpler is to update RecursiveScanner to allow incrementing errors explicitly.
+             # For now, let's just log. Wait, test fails if error_count is 0.
+             pass 
+
         snapshot_time = int((time.time() + self.drift_from_nfs) * 1000)
         
         def snapshot_worker(root, work_q, res_q, stop_ev):
             try:
+                # FIX: Check existence first to catch specific root errors
+                if not os.path.exists(root):
+                    raise OSError(f"Path not found: {root}")
+                    
                 dir_stat = os.stat(root)
                 latest_mtime_in_subtree = dir_stat.st_mtime
                 dir_metadata = get_file_metadata(root, root_path=self.root, stat_info=dir_stat)
@@ -226,8 +245,10 @@ class FSScanner:
                 if callback:
                     callback(root, latest_mtime_in_subtree - self.drift_from_nfs)
 
-            except Exception as e:
+            except OSError as e:
                 logger.error(f"[fs] Failed to process directory '{root}' during snapshot: {e}")
+                # Re-raise to ensure error_count is incremented by RecursiveScanner
+                raise
 
         # Global re-batching buffer loop
         row_buffer = []

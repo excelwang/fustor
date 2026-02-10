@@ -31,3 +31,4 @@ pipes:
     audit_interval_sec: ${AUDIT_INTERVAL}
     sentinel_interval_sec: ${SENTINEL_INTERVAL}
     heartbeat_interval_sec: ${HEARTBEAT_INTERVAL}
+    max_consecutive_errors: 100

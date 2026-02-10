@@ -1,16 +1,18 @@
+# it/consistency/test_a3_component_crash_isolation.py
 """
 Test A3: Component Crash Isolation.
 
 验证各个组件（Source, Pipe, Receiver, View）及其内部模块的崩溃隔离性。
 确保局部故障不会导致整个系统或数据链崩溃。
 
-参考文档: CONSISTENCY_DESIGN.md - Reliability & Fault Tolerance
+参考文档: specs/05-Stability.md
 """
 import pytest
 import time
 import os
 import requests
-import json
+import subprocess
+
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_FUSION, MOUNT_POINT
 from ..fixtures.constants import (
@@ -19,6 +21,7 @@ from ..fixtures.constants import (
     LONG_TIMEOUT,
     POLL_INTERVAL
 )
+
 
 class TestComponentCrashIsolation:
     """Test system resilience against specific component crashes."""
@@ -33,39 +36,49 @@ class TestComponentCrashIsolation:
     ):
         """
         Scenario: Source Component (Driver) Partial Failure.
-        验证 Source Component (FSDriver) 在遇到不可读目录（Permission Error）时，
-        能够隔离错误，继续监控其他目录，且不导致 Agent 崩溃。
+        验证 FSDriver 在遇到 PermissionError 时隔离错误、继续监控其他目录。
+        Spec 依据: specs/05-Stability.md §1.2
         """
         # 1. Setup healthy state
         base_dir = f"{MOUNT_POINT}/source_isolation_{int(time.time())}"
         readable_dir = f"{base_dir}/readable"
         unreadable_dir = f"{base_dir}/unreadable"
-        
+
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["mkdir", "-p", readable_dir])
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["mkdir", "-p", unreadable_dir])
-        
+
         docker_manager.create_file_in_container(CONTAINER_CLIENT_A, f"{readable_dir}/file1.txt", "content1")
         docker_manager.create_file_in_container(CONTAINER_CLIENT_A, f"{unreadable_dir}/file2.txt", "content2")
-        
+
         # Make one directory unreadable
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["chmod", "000", unreadable_dir])
-        
-        # 2. Trigger Scan/Audit
-        # Wait for audit to ensure scanner runs over the structure
+
+        # 2. Trigger Audit
         wait_for_audit()
-        
-        # 3. Verify Isolation
-        # Readable file should be present
+
+        # 3. Verify Isolation — readable file should still be synced
         assert fusion_client.wait_for_file_in_tree(
-            f"/{os.path.relpath(readable_dir, MOUNT_POINT)}/file1.txt", 
+            f"/{os.path.relpath(readable_dir, MOUNT_POINT)}/file1.txt",
             timeout=SHORT_TIMEOUT
         ), "Readable file should be synced despite sibling permission error"
-        
-        # Agent should be alive
-        check_agent = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["pgrep", "-f", "fustor-agent"])
-        assert check_agent.returncode == 0, "Agent process should survive source driver permission errors"
-        
-        # Cleanup (restore permissions to delete)
+
+        # 4. Agent should be alive (use PID file for reliable detection)
+        check_agent = docker_manager.exec_in_container(
+            CONTAINER_CLIENT_A,
+            ["sh", "-c", "kill -0 $(cat /root/.fustor/agent.pid)"]
+        )
+        assert check_agent.returncode == 0, \
+            "Agent 进程应在遇到 PermissionError 后存活 (specs/05-Stability.md §1.2)"
+
+        # 5. Verify error was logged (Spec requires "记录错误并跳过")
+        logs_res = docker_manager.exec_in_container(
+            CONTAINER_CLIENT_A, ["cat", "/root/.fustor/agent.log"]
+        )
+        logs = (logs_res.stdout + logs_res.stderr).lower()
+        assert "permission" in logs or "error" in logs, \
+            "Agent 应记录 PermissionError 到日志 (specs/05-Stability.md §1.2)"
+
+        # Cleanup
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["chmod", "755", unreadable_dir])
 
     def test_sender_pipe_isolation_network_partition(
@@ -76,45 +89,43 @@ class TestComponentCrashIsolation:
         clean_shared_dir
     ):
         """
-        Scenario: Sender/Pipe Component Isolation (Network/Fusion Unavailable).
-        验证当 Receiver (Fusion) 不可用时，Sender/Pipe 组件：
-        1. 不会崩溃
-        2. 能够缓冲/重试事件
-        3. 在连接恢复后自动恢复数据同步
+        Scenario: Sender/Pipe Component Isolation (Fusion 不可用).
+        验证 Agent Pipe 在 Fusion 不可用时不崩溃，恢复后自动续传。
+        Spec 依据: specs/05-Stability.md §1.1 (连接重试: 指数退避)
         """
         assert fusion_client.wait_for_view_ready(timeout=MEDIUM_TIMEOUT)
-        
-        # 1. Simulate Network Partition / Receiver Down
-        print("DEBUG: Pausing Fusion container to simulate network timeout/unavailability...")
-        docker_manager.exec_in_container(CONTAINER_FUSION, ["kill", "-STOP", "1"]) # Pause main process
-        # Or use docker pause, but keeping consistent with exec usage
-        subprocess_cmd = ["docker", "pause", CONTAINER_FUSION]
-        import subprocess
-        subprocess.run(subprocess_cmd, check=True)
-        
-        try:
-            # 2. Generate Events while Receiver is Down
-            # These should be buffered in Agent Pipe
-            test_file = f"{MOUNT_POINT}/sender_isolation_{int(time.time())}.txt"
-            docker_manager.create_file_in_container(CONTAINER_CLIENT_A, test_file, "buffered content")
-            
-            # Wait a bit to ensure Sender tries and fails
-            time.sleep(10)
-            
-            # 3. Verify Agent is still running (Pipe didn't crash due to connection error)
-            check_agent = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["pgrep", "-f", "fustor-agent"])
-            assert check_agent.returncode == 0, "Agent should survive Fusion unavailability"
-            
-        finally:
-            # 4. Restore Receiver
-            print("DEBUG: Unpausing Fusion container...")
-            subprocess.run(["docker", "unpause", CONTAINER_FUSION], check=True)
-        
-        # 5. Verify Data Recovery
-        # The buffered event should eventually be sent
+
+        # 提前定义变量，避免 NameError
+        test_file = f"{MOUNT_POINT}/sender_isolation_{int(time.time())}.txt"
         test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
+
+        # 1. 暂停 Fusion 容器（只用 docker pause，不要 kill -STOP）
+        subprocess.run(["docker", "pause", CONTAINER_FUSION], check=True)
+
+        try:
+            # 2. 在 Fusion 不可用期间产生事件
+            docker_manager.create_file_in_container(
+                CONTAINER_CLIENT_A, test_file, "buffered content"
+            )
+
+            # 等待足够时间让 Sender 尝试发送并失败
+            time.sleep(10)
+
+            # 3. 验证 Agent 进程存活（Pipe 未因连接错误而崩溃）
+            check_agent = docker_manager.exec_in_container(
+                CONTAINER_CLIENT_A,
+                ["sh", "-c", "cat /root/.fustor/agent.pid && kill -0 $(cat /root/.fustor/agent.pid)"]
+            )
+            assert check_agent.returncode == 0, \
+                "Agent 进程应在 Fusion 不可用时存活 (specs/05-Stability.md §1.1)"
+
+        finally:
+            # 4. 恢复 Fusion
+            subprocess.run(["docker", "unpause", CONTAINER_FUSION], check=True)
+
+        # 5. 验证数据恢复 — Pipe 应在 Fusion 恢复后自动重传缓冲事件
         assert fusion_client.wait_for_file_in_tree(test_file_rel, timeout=LONG_TIMEOUT), \
-            "Pipe should resume sending buffered events after Receiver recovers"
+            "Pipe 应在 Fusion 恢复后续传缓冲事件 (specs/05-Stability.md §1.1)"
 
     def test_receiver_isolation_malformed_payload(
         self,
@@ -124,45 +135,43 @@ class TestComponentCrashIsolation:
         clean_shared_dir
     ):
         """
-        Scenario: Receiver Component (Fusion Ingest) Isolation.
-        验证 Receiver 在接收到畸形数据包时：
-        1. 能够正确拒绝（400/500）
-        2. Fusion 服务本身不崩溃
-        3. 正常的后续请求仍能处理
+        Scenario: Receiver 接收畸形数据后不崩溃。
+        Spec 依据: specs/05-Stability.md §1.2 (异常隔离)
         """
         assert fusion_client.wait_for_view_ready(timeout=MEDIUM_TIMEOUT)
-        
-        # 1. Send Malformed Data to Fusion Receiver API manually
-        # Accessing Fusion API from Host
-        import requests
-        base_url = "http://localhost:8080" # Assuming port mapping from docker-compose
-        
-        # Need a valid session_id to pass auth check if any, or just hit an endpoint
-        # Sending garbage JSON
-        try:
-            resp = requests.post(f"{base_url}/api/v1/ingest", data="GARBAGE_NOT_JSON", headers={"Content-Type": "application/json"})
-            assert resp.status_code in [400, 500, 415], f"Receiver should reject garbage, got {resp.status_code}"
-        except Exception as e:
-            # Might fail if port not mapped to host, assuming test runs on host/network with access
-            print(f"DEBUG: Could not hit Fusion API directly: {e}")
-            
-        # Try sending valid JSON but invalid schema
-        try:
-            resp = requests.post(f"{base_url}/api/v1/ingest", json={"invalid": "schema"})
-            assert resp.status_code in [400, 422, 500], f"Receiver should reject invalid schema, got {resp.status_code}"
-        except Exception:
-            pass
-            
-        # 2. Verify Fusion is Still Healthy
-        # Normal agent operations should still work
-        test_file = f"{MOUNT_POINT}/receiver_isolation_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, test_file, "content")
-        
-        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
-        assert fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT), \
-            "Fusion Receiver should continue processing valid requests after malformed input"
 
-    def test_view_component_logic_error_isolation(
+        # 使用 fusion_client 的 base_url（已在 conftest 中配置正确端口）
+        base_url = fusion_client.base_url
+
+        # --- 测试 1: 发送完全无效的 JSON ---
+        resp = requests.post(
+            f"{base_url}/api/v1/pipe/ingest",
+            data="THIS_IS_NOT_JSON",
+            headers={"Content-Type": "application/json"},
+            timeout=5
+        )
+        # 不用 try/except：如果连接失败说明测试环境有问题，应立即暴露
+        assert resp.status_code in [400, 422, 500], \
+            f"畸形数据应被拒绝, 实际返回: {resp.status_code} {resp.text}"
+
+        # --- 测试 2: 发送合法 JSON 但 Schema 不匹配 ---
+        resp = requests.post(
+            f"{base_url}/api/v1/pipe/ingest",
+            json={"invalid_field": "no_session_id", "garbage": True},
+            timeout=5
+        )
+        assert resp.status_code in [400, 422, 500], \
+            f"Schema 不匹配应被拒绝, 实际返回: {resp.status_code} {resp.text}"
+
+        # --- 验证: Fusion 在接受畸形数据后仍能正常处理合法请求 ---
+        test_file = f"{MOUNT_POINT}/receiver_isolation_{int(time.time())}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, test_file, "content")
+
+        assert fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT), \
+            "Fusion 应在处理畸形请求后继续正常工作 (specs/05-Stability.md §1.2)"
+
+    def test_view_component_empty_and_oversized_batch_isolation(
         self,
         docker_env,
         fusion_client,
@@ -170,34 +179,26 @@ class TestComponentCrashIsolation:
         clean_shared_dir
     ):
         """
-        Scenario: View Component Isolation (Logical State Integrity).
-        验证当 View 收到不一致或冲突的逻辑状态时（如 'future' 时间戳），
-        View 能够隔离该错误，保持整体状态一致性，不崩溃。
+        Scenario: View 收到空事件批次或异常结构 Batch 时不崩溃。
+        Spec 依据: specs/05-Stability.md §4
+        替换原 test_view_component_logic_error_isolation（与 test_i 重复）。
         """
-        # 1. Inject 'Logic Bomb' - File with Future Mtime (via manual touch in container)
-        # This tests how Arbitrator/View handles "impossible" timestamps which might cause logic errors
-        # in clock calculations if not isolated.
-        
-        future_file = f"{MOUNT_POINT}/future_file_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, future_file, "future")
-        
-        # Manually set mtime to far future (e.g., year 2050)
-        future_time = 2524608000 # 2050-01-01
-        docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["touch", "-d", "@2524608000", future_file])
-        
-        # 2. Wait for it to sync (View should accept or reject, but NOT crash)
-        future_file_rel = "/" + os.path.relpath(future_file, MOUNT_POINT)
-        
-        # It might be accepted (system dependent), but critical check is Crash isolation
-        try:
-            fusion_client.wait_for_file_in_tree(future_file_rel, timeout=SHORT_TIMEOUT)
-        except:
-            pass # It's okay if it's rejected
-            
-        # 3. Verify Fusion View is still functioning for normal files
-        normal_file = f"{MOUNT_POINT}/normal_file_after_future_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, normal_file, "normal")
-        
-        normal_file_rel = "/" + os.path.relpath(normal_file, MOUNT_POINT)
-        assert fusion_client.wait_for_file_in_tree(normal_file_rel, timeout=MEDIUM_TIMEOUT), \
-            "View should continue processing normal updates after handling logical anomalies"
+        assert fusion_client.wait_for_view_ready(timeout=MEDIUM_TIMEOUT)
+        base_url = fusion_client.base_url
+
+        # --- 测试 1: 空 Batch (边界条件) ---
+        resp = requests.post(
+            f"{base_url}/api/v1/pipe/ingest",
+            json={"session_id": "fake-session", "events": []},
+            timeout=5
+        )
+        # 允许 400（拒绝）或 200（空操作），但不允许 500（崩溃）
+        assert resp.status_code != 500, \
+            f"空 Batch 不应导致 500 错误, 实际: {resp.status_code}"
+
+        # --- 验证 Fusion 仍正常工作 ---
+        test_file = f"{MOUNT_POINT}/batch_isolation_{int(time.time())}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_A, test_file, "ok")
+        assert fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT), \
+            "Fusion 应在处理异常 Batch 后继续正常工作"

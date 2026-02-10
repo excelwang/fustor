@@ -117,8 +117,10 @@ class FusionPipe(Pipe):
         # Handler fault isolation
         self._handler_errors: Dict[str, int] = {}  # Per-handler error counts
         self._disabled_handlers: set = set()  # Handlers disabled due to repeated failures
+        self._disabled_handlers_timestamps: Dict[str, float] = {} # Timestamp when handler was disabled
         self.HANDLER_TIMEOUT = config.get("handler_timeout", 30.0)  # Seconds
         self.MAX_HANDLER_ERRORS = config.get("max_handler_errors", 50)  # Before disabling
+        self.HANDLER_RECOVERY_INTERVAL = config.get("handler_recovery_interval", 60.0) # Seconds cooldown
     
     def register_view_handler(self, handler: ViewHandler) -> None:
         """
@@ -242,9 +244,10 @@ class FusionPipe(Pipe):
         - Error containment: One handler's failure doesn't affect others
         """
         for handler_id, handler in self._view_handlers.items():
-            # Skip disabled handlers
+            # Skip disabled handlers unless they have recovered
             if handler_id in self._disabled_handlers:
-                continue
+                if not self._attempt_handler_recovery(handler_id):
+                    continue
                 
             try:
                 if hasattr(handler, 'process_event'):
@@ -260,9 +263,23 @@ class FusionPipe(Pipe):
                     except asyncio.TimeoutError:
                         self._record_handler_error(handler_id, f"Timeout after {self.HANDLER_TIMEOUT}s")
                         logger.error(f"Handler {handler_id} timed out processing event")
+                        logger.error(f"Handler {handler_id} timed out processing event")
             except Exception as e:
                 self._record_handler_error(handler_id, str(e))
                 logger.error(f"Error in handler {handler_id}: {e}", exc_info=True)
+
+    def _attempt_handler_recovery(self, handler_id: str) -> bool:
+        """Check if a disabled handler can be re-enabled."""
+        last_disabled = self._disabled_handlers_timestamps.get(handler_id, 0)
+        if time.time() - last_disabled > self.HANDLER_RECOVERY_INTERVAL:
+            self._disabled_handlers.remove(handler_id)
+            # Reset error count to give it a fresh start
+            self._handler_errors[handler_id] = 0
+            if handler_id in self._disabled_handlers_timestamps:
+                del self._disabled_handlers_timestamps[handler_id]
+            logger.info(f"Handler {handler_id} re-enabled after cooldown period.")
+            return True
+        return False
     
     def _record_handler_error(self, handler_id: str, reason: str) -> None:
         """Record a handler error and disable if threshold exceeded."""
@@ -272,6 +289,7 @@ class FusionPipe(Pipe):
         if self._handler_errors[handler_id] >= self.MAX_HANDLER_ERRORS:
             if handler_id not in self._disabled_handlers:
                 self._disabled_handlers.add(handler_id)
+                self._disabled_handlers_timestamps[handler_id] = time.time()
                 logger.warning(
                     f"Handler {handler_id} disabled after {self._handler_errors[handler_id]} errors. "
                     f"Last error: {reason}"
@@ -402,10 +420,16 @@ class FusionPipe(Pipe):
         
         # Convert dict events to EventBase if needed
         processed_events = []
+        from pydantic import ValidationError
+        
         for event in events:
             if isinstance(event, dict):
-                ev = EventBase.model_validate(event)
-                processed_events.append(ev)
+                try:
+                    ev = EventBase.model_validate(event)
+                    processed_events.append(ev)
+                except ValidationError as e:
+                    logger.warning(f"Pipe {self.id}: Skipping malformed event in batch: {e}")
+                    self.statistics["errors"] += 1
             else:
                 processed_events.append(event)
         

@@ -141,6 +141,14 @@ class MemoryEventBus:
         self.error_message = error
         self._producer_can_put.set()
 
+    def recover(self):
+        """Recover the bus from a failed state."""
+        logger.info(f"Recovering Bus '{self.id}' from failed state.")
+        self.failed = False
+        self.error_message = None
+        if len(self.buffer) < self.capacity:
+            self._producer_can_put.set()
+
     async def subscribe(self, pipe_id: str, initial_position: int, fields_mapping: List[FieldMapping]):
         async with self.lock:
             if pipe_id in self.subscribers:

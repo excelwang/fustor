@@ -4,7 +4,9 @@ AgentPipe orchestrates the flow: Source -> Sender
 import asyncio
 import logging
 import threading
+import time
 from typing import Optional, Any, Dict, List, TYPE_CHECKING, Iterator
+
 
 from fustor_core.pipe import Pipe, PipeState
 from fustor_core.pipe.handler import SourceHandler
@@ -100,7 +102,7 @@ class AgentPipe(Pipe):
         self.follower_standby_interval = config.get("follower_standby_interval", 1.0) # Delay while in follower mode
         self.role_check_interval = config.get("role_check_interval", 1.0)      # How often to check for role changes
         self.error_retry_interval = config.get("error_retry_interval", 5.0)    # Initial backoff delay
-        self.max_consecutive_errors = config.get("max_consecutive_errors", 5)  # Threshold for warning
+        self.max_consecutive_errors = int(config.get("max_consecutive_errors", 5))  # Threshold for warning (ensure int)
         self.backoff_multiplier = config.get("backoff_multiplier", 2.0)        # Exponential backoff factor
         self.max_backoff_seconds = config.get("max_backoff_seconds", 60.0)     # Max backoff delay cap
         self.session_timeout_seconds = config.get("session_timeout_seconds") # Session expiration timeout (optional)
@@ -133,23 +135,26 @@ class AgentPipe(Pipe):
         )
         return backoff
 
-    def _handle_error(self, error: Exception, loop_name: str) -> float:
+
+    def _handle_loop_error(self, error: Exception, loop_name: str) -> float:
         """Common error handling for loops: increment counter, alert if needed, return backoff."""
         self._consecutive_errors += 1
         backoff = self._calculate_backoff(self._consecutive_errors)
         
+        # Log error with retry info
         if self._consecutive_errors >= self.max_consecutive_errors:
             logger.critical(
                 f"Pipe {self.id} {loop_name} loop reached threshold of {self._consecutive_errors} "
                 f"consecutive errors. Moving to terminal ERROR state."
             )
-            # Move to terminal error
+            # Move to terminal error - NO RECONNECTING flag
             self._set_state(PipeState.ERROR, f"Max retries ({self.max_consecutive_errors}) exceeded: {error}")
-            return backoff
         else:
             logger.error(f"Pipe {self.id} {loop_name} loop error: {error}. Retrying in {backoff}s...")
             
         return backoff
+    
+
     
     async def _update_role_from_response(self, response: Dict[str, Any]) -> None:
         """Update role and heartbeat timer based on server response."""
@@ -287,15 +292,14 @@ class AgentPipe(Pipe):
         self._sentinel_task = None
     
     async def _run_control_loop(self) -> None:
-        """
-        Main control loop that manages pipestate transitions.
+        """Main control loop for session management and error recovery."""
+        logger.info(f"Pipe {self.id}: Control loop started")
         
-        State machine:
-        1. Wait for LEADER role
-        """
         self._set_state(PipeState.RUNNING, "Waiting for role assignment...")
         while self.is_running():
-            logger.debug(f"Pipe {self.id}: Control loop iteration starting (Role: {self.current_role}, Session: {self.session_id}, Errors: {self._consecutive_errors})")
+            # Debug state
+            if self._consecutive_errors > 0:
+                logger.debug(f"Pipe {self.id}: Control loop iteration starting (Role: {self.current_role}, Session: {self.session_id}, Errors: {self._consecutive_errors})")
             
             # If we have consecutive errors, we MUST backoff here to avoid tight loops
             if self._consecutive_errors > 0:
@@ -412,37 +416,22 @@ class AgentPipe(Pipe):
                 await asyncio.sleep(0.1)
                 continue
 
-            except FusionConnectionError as e:
-                # Handle connection errors gracefully without noise
-                self._consecutive_errors += 1
-                backoff = self._calculate_backoff(self._consecutive_errors)
-                
-                # Log state change as WARNING (default behavior for ERROR state) but suppress explicit error log
-                self._set_state(PipeState.ERROR | PipeState.RECONNECTING, 
-                                f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
-                
-                # Cleanup session on connection failure
-                if self.has_active_session():
-                    try:
-                        await self._cancel_all_tasks()
-                        await self.on_session_closed(self.session_id)
-                    except Exception as e2:
-                        logger.debug(f"Error during cleanup after session loss: {e2}")
-
-                await asyncio.sleep(backoff)
-
             except RuntimeError as e:
-                # Handle generic RuntimeErrors
-                backoff = self._handle_error(e, "control")
-                self._set_state(PipeState.ERROR | PipeState.RECONNECTING, 
-                                f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
+                backoff = self._handle_loop_error(e, "control")
+                
+                # If NOT terminal, add RECONNECTING
+                if not (self.state & PipeState.ERROR):
+                    self._set_state(PipeState.ERROR | PipeState.RECONNECTING, 
+                                    f"RuntimeError (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
                 await asyncio.sleep(backoff)
 
             except Exception as e:
-                backoff = self._handle_error(e, "control")
+                backoff = self._handle_loop_error(e, "control")
                 
-                self._set_state(PipeState.ERROR | PipeState.RECONNECTING, 
-                                f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
+                # If NOT terminal, add RECONNECTING
+                if not (self.state & PipeState.ERROR):
+                     self._set_state(PipeState.ERROR | PipeState.RECONNECTING, 
+                                     f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
                 
                 # If session failed, ensure it's cleared so we try to recreate it
                 if self.has_active_session():
@@ -532,7 +521,7 @@ class AgentPipe(Pipe):
                 await self._handle_fatal_error(e)
                 break
             except Exception as e:
-                backoff = self._handle_error(e, "heartbeat")
+                backoff = self._handle_loop_error(e, "heartbeat")
                 # Don't kill the loop for transient heartbeat errors
                 # But use backoff instead of just fixed interval if failing
                 await asyncio.sleep(max(self.heartbeat_interval_sec, backoff))
@@ -711,7 +700,7 @@ class AgentPipe(Pipe):
                 await self._handle_fatal_error(e)
                 break
             except Exception as e:
-                backoff = self._handle_error(e, "audit")
+                backoff = self._handle_loop_error(e, "audit")
                 await asyncio.sleep(backoff)
     
     async def _run_audit_sync(self) -> None:
@@ -746,7 +735,7 @@ class AgentPipe(Pipe):
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                backoff = self._handle_error(e, "sentinel")
+                backoff = self._handle_loop_error(e, "sentinel")
                 await asyncio.sleep(backoff)
     
     async def _run_sentinel_check(self) -> None:
