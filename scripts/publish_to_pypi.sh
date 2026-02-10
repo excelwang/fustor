@@ -56,20 +56,18 @@ publish_package() {
 # --- Phase 1: Foundation (No Internal Dependencies) ---
 echo "--- Phase 1: Publishing Foundation Packages ---"
 publish_package "core" "fustor-core"
-# common and event-model seem to be part of core or missing, removing explicit publish if not found locally, 
-# but assuming they might come back or were virtual. based on actual dirs, just core exists.
-# Keeping them commented out or check if they exist? Listing dir showed only core.
-# I will comment them out for now to avoid errors, or assume they are inside core.
+publish_package "extensions/schema-fs" "fustor-schema-fs"
 
 # --- Phase 2: Clients & Basic Connectors ---
 echo "--- Phase 2: Publishing Clients & Basic Connectors ---"
 
 publish_package "extensions/sender-echo" "fustor-sender-echo"
-publish_package "extensions/sender-openapi" "fustor-pusher-openapi"
+publish_package "extensions/sender-openapi" "fustor-sender-openapi"
 publish_package "extensions/source-elasticsearch" "fustor-source-elasticsearch"
 publish_package "extensions/source-mysql" "fustor-source-mysql"
 publish_package "extensions/source-oss" "fustor-source-oss"
 publish_package "extensions/view-fs" "fustor-view-fs"
+publish_package "extensions/receiver-http" "fustor-receiver-http"
 
 # --- Phase 3: SDKs & Advanced Connectors ---
 echo "--- Phase 3: Publishing SDKs & Advanced Connectors ---"
