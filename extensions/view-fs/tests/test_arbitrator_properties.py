@@ -27,7 +27,7 @@ class MockEvent:
 @pytest.fixture
 def fs_state():
     state = FSState("test-view-prop")
-    state.logical_clock.reset(500.0)
+    state.logical_clock.reset(1000.0)
     return state
 
 @pytest.fixture
@@ -125,8 +125,10 @@ async def test_tombstone_effectiveness(arbitrator, fs_state):
     """
     from unittest.mock import patch
     
-    # Patch time.time() to match the clock.reset(500.0) in fixture
-    with patch('time.time', return_value=500.0):
+    # Patch time.time() to be in the same domain as test mtimes (~1000-1020)
+    # The value must be >= (tombstone_logical_ts - 5.0) to avoid triggering
+    # the Physical Fallback override. Tombstone logical_ts ≈ base_time + 10 = 1010.
+    with patch('time.time', return_value=1010.0):
         path = "/tombstone_test.txt"
         base_time = 1000.0
         

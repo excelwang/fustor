@@ -11,8 +11,9 @@ from fustor_core.event import MessageSource, EventType, EventBase
 @pytest.fixture
 def fs_state():
     state = FSState("test-view")
-    # Reset to a fixed small value for predictable tests
-    state.logical_clock.reset(500.0)
+    # Reset clock. The reset value should be in the same domain as test mtimes
+    # to avoid triggering the Physical Fallback override in tombstone logic.
+    state.logical_clock.reset(2000.0)
     return state
 
 @pytest.fixture
@@ -56,10 +57,11 @@ async def test_arbitrator_realtime_upsert(arbitrator, fs_state):
 
 @pytest.mark.asyncio
 async def test_arbitrator_tombstone_protection(arbitrator, fs_state):
-    # Patch time.time() to match the clock.reset(500.0) in fixture
-    # This is needed because get_watermark() uses BaseLine = time.time() - skew
+    # Patch time.time() to be in the same domain as our test mtimes.
+    # IMPORTANT: The value must be close to the mtimes (~2000) to avoid
+    # triggering the Physical Fallback override (arbitrator.py L132).
     from unittest.mock import patch
-    with patch('time.time', return_value=500.0):
+    with patch('time.time', return_value=2000.0):
         # 1. Delete in realtime (creates tombstone)
         delete_event = MockEvent(
             EventType.DELETE,
@@ -69,7 +71,7 @@ async def test_arbitrator_tombstone_protection(arbitrator, fs_state):
         await arbitrator.process_event(delete_event)
         assert "/ghost.txt" in fs_state.tombstone_list
         
-        # 2. Older snapshot event (should be blocked)
+        # 2. Older snapshot event (should be blocked by tombstone)
         snapshot_event = MockEvent(
             EventType.INSERT,
             [{"path": "/ghost.txt", "size": 500, "modified_time": 1500.0}],
@@ -78,13 +80,12 @@ async def test_arbitrator_tombstone_protection(arbitrator, fs_state):
         await arbitrator.process_event(snapshot_event)
         assert fs_state.get_node("/ghost.txt") is None
         
-        # 3. Newer snapshot event after tombstone (should clear tombstone and progress)
-        # Using index as reference timestamp (simulating newer logical event)
+        # 3. Newer snapshot event (should clear tombstone — Reincarnation)
         new_snapshot_event = MockEvent(
             EventType.INSERT,
             [{"path": "/ghost.txt", "size": 500, "modified_time": 2500.0}],
             source=MessageSource.SNAPSHOT,
-            index=2500.0 # 2500s (Seconds)
+            index=2500.0
         )
         await arbitrator.process_event(new_snapshot_event)
         assert "/ghost.txt" not in fs_state.tombstone_list

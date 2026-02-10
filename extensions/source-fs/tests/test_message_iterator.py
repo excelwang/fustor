@@ -142,12 +142,15 @@ def test_iterator_ignores_old_events(tmp_path: Path, message_iterator_runner):
 
     # Run the iterator, starting from NOW.
     runner(start_pos_offset=0.0)
-    time.sleep(0.1) # Extra buffer to ensure start_position is in the past
+    # Wait for _perform_pre_scan_and_schedule() + watchdog observer startup
+    # The pre-scan can take a few hundred ms on slow CI systems
+    time.sleep(0.5)
 
     # Create a new file, which should be after the start_position
     new_file = tmp_path / "new.txt"
     new_file.write_text("fresh")
-    time.sleep(0.5)
+    # Wait for inotify event processing + queue consumption
+    time.sleep(1.0)
 
     # Assert
     assert len(events) >= 1
