@@ -470,20 +470,6 @@ Fusion 收到反馈后通过 `driver.update_suspect()` 执行稳定性判定。�
 | 文件级 | 文件在 Suspect List 中 | `integrity_suspect: true` |
 | 盲区查询 | 需获取详细盲区文件列表 | 使用 `/views/{view_id}/tree/blind-spots` API |
 
-### 9.2 Standard Response Format (标准响应格式)
-
-核心数据接口 (如 `/tree`) **必须** 使用信封结构包裹返回结果，以支持元数据扩展：
-
-```json
-{
-  "data": { ... core_domain_object ... },
-  "scan_pending": boolean,  // True if a realtime scan was triggered and pending
-  "meta": { ... }           // Optional additional metadata
-}
-```
-
-客户端SDK负责自动解包 `data` 字段，向上层应用提供纯净的领域对象。
-
 ### 9.1 主动查询 (Real-Time Query)
 
 用户可通过 API 强制触发实时扫描：
@@ -499,6 +485,20 @@ GET /api/v1/views/{view_id}/tree?path=/data/logs&force-real-time=true
 4. Fusion 接收事件更新视图
 5. (可选) Fusion 返回更新后的结果或超时
 ```
+
+### 9.2 Standard Response Format (标准响应格式)
+
+核心数据接口 (如 `/tree`) **必须** 使用信封结构包裹返回结果，以支持元数据扩展：
+
+```json
+{
+  "data": { ... core_domain_object ... },
+  "scan_pending": boolean,  // True if a realtime scan was triggered and pending
+  "meta": { ... }           // Optional additional metadata
+}
+```
+
+客户端SDK负责自动解包 `data` 字段，向上层应用提供纯净的领域对象。
 
 ---
 

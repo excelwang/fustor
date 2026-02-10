@@ -51,20 +51,21 @@ def test_backoff_calculation():
     assert pipe._calculate_backoff(3) == 4.0
     assert pipe._calculate_backoff(10) == 10.0 # Maxed out
 
-def test_handle_error_counter(mock_source, mock_sender, reliability_config):
+def test_handle_loop_error_counter(mock_source, mock_sender, reliability_config):
     pipe = AgentPipe("test", "t1", reliability_config, mock_source, mock_sender)
     
-    backoff = pipe._handle_error(Exception("Test 1"), "test-loop")
+    backoff = pipe._handle_loop_error(Exception("Test 1"), "test-loop")
     assert pipe._consecutive_errors == 1
     assert backoff == 0.01
     
-    backoff = pipe._handle_error(Exception("Test 2"), "test-loop")
+    backoff = pipe._handle_loop_error(Exception("Test 2"), "test-loop")
     assert pipe._consecutive_errors == 2
     assert backoff == 0.02
     
-    backoff = pipe._handle_error(Exception("Test 3"), "test-loop")
+    backoff = pipe._handle_loop_error(Exception("Test 3"), "test-loop")
     assert pipe._consecutive_errors == 3
-    assert backoff == 0.04
+    # At threshold (3), backoff is capped to max_backoff_seconds
+    assert backoff == reliability_config["max_backoff_seconds"]
 
 @pytest.mark.asyncio
 async def test_heartbeat_loop_uses_backoff(mock_source, mock_sender, reliability_config, mocker):
@@ -74,7 +75,7 @@ async def test_heartbeat_loop_uses_backoff(mock_source, mock_sender, reliability
     
     # Mock sleep to capture backoff value
     mock_sleep = mocker.patch("asyncio.sleep", AsyncMock())
-    spy_handle = mocker.spy(pipe, "_handle_error")
+    spy_handle = mocker.spy(pipe, "_handle_loop_error")
     
     # We want to run exactly one iteration
     # To do this safely, we can make the second iteration exit
@@ -108,7 +109,7 @@ async def test_audit_loop_uses_backoff(mock_source, mock_sender, reliability_con
     # Let's make the FIRST sleep (initial delay) fail
     mock_sleep.side_effect = [Exception("Sleep Err"), None]
     
-    spy_handle = mocker.spy(pipe, "_handle_error")
+    spy_handle = mocker.spy(pipe, "_handle_loop_error")
     
     # Use a function side effect to handle repeated calls
     loop_count = 0
@@ -133,12 +134,12 @@ def test_alert_threshold(mock_source, mock_sender, reliability_config, caplog):
     pipe = AgentPipe("test", "t1", reliability_config, mock_source, mock_sender)
     
     # 1. Error 1 & 2 -> no warning
-    pipe._handle_error(Exception("E1"), "test")
-    pipe._handle_error(Exception("E2"), "test")
+    pipe._handle_loop_error(Exception("E1"), "test")
+    pipe._handle_loop_error(Exception("E2"), "test")
     assert "reached threshold" not in caplog.text
     
     # 3. Error 3 -> warning logged
-    pipe._handle_error(Exception("E3"), "test")
+    pipe._handle_loop_error(Exception("E3"), "test")
     assert "reached threshold" in caplog.text
 
 @pytest.mark.asyncio

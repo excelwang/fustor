@@ -31,6 +31,7 @@ from fustor_core.pipe import Pipe, PipeState
 from fustor_core.pipe.handler import ViewHandler
 from fustor_core.event import EventBase
 from fustor_core.common.metrics import get_metrics
+from pydantic import ValidationError
 
 if TYPE_CHECKING:
     from fustor_core.pipe.context import PipeContext
@@ -263,7 +264,6 @@ class FusionPipe(Pipe):
                     except asyncio.TimeoutError:
                         self._record_handler_error(handler_id, f"Timeout after {self.HANDLER_TIMEOUT}s")
                         logger.error(f"Handler {handler_id} timed out processing event")
-                        logger.error(f"Handler {handler_id} timed out processing event")
             except Exception as e:
                 self._record_handler_error(handler_id, str(e))
                 logger.error(f"Error in handler {handler_id}: {e}", exc_info=True)
@@ -420,22 +420,25 @@ class FusionPipe(Pipe):
         
         # Convert dict events to EventBase if needed
         processed_events = []
-        from pydantic import ValidationError
+        skipped_count = 0
         
         for event in events:
             if isinstance(event, dict):
                 try:
                     ev = EventBase.model_validate(event)
                     processed_events.append(ev)
-                except ValidationError as e:
+                except Exception as e:
                     logger.warning(f"Pipe {self.id}: Skipping malformed event in batch: {e}")
                     self.statistics["errors"] += 1
+                    skipped_count += 1
             else:
                 processed_events.append(event)
         
+        if skipped_count > 0:
+            logger.warning(f"Pipe {self.id}: Skipped {skipped_count}/{len(events)} malformed events in batch")
+        
         # Queue for processing
-        self.statistics["events_received"] += len(events)
-        get_metrics().counter("fustor.fusion.events_received", len(events), {"pipe": self.id, "source": source_type})
+        get_metrics().counter("fustor.fusion.events_received", len(processed_events), {"pipe": self.id, "source": source_type})
         await self._event_queue.put(processed_events)
         
         # Handle snapshot completion signal
@@ -451,7 +454,8 @@ class FusionPipe(Pipe):
 
         return {
             "success": True,
-            "count": len(events),
+            "count": len(processed_events),
+            "skipped": skipped_count,
             "source_type": source_type,
         }
 

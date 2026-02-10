@@ -2,12 +2,12 @@
 """
 U1: max_consecutive_errors 触发后 Pipe 的行为。
 
-
 被测代码: agent/src/fustor_agent/runtime/agent_pipe.py → _handle_loop_error() + _run_control_loop()
 
 验证重点:
-1. 连续错误达到阈值时，Pipe 进入终态 (ERROR) 并停止循环。
+1. 连续错误达到阈值时，Pipe 进入 ERROR | RUNNING (非终态)，保持自愈能力。
 2. 错误未达阈值时恢复，计数器重置。
+3. 达到阈值后使用最大退避时间继续重试。
 """
 import pytest
 import asyncio
@@ -35,35 +35,43 @@ def pipe_with_low_max_errors():
     return pipe, src, snd
 
 
-class TestPipeTerminalError:
-    """验证 Pipe 在达到 max_consecutive_errors 后的行为。"""
+class TestPipeErrorThreshold:
+    """验证 Pipe 在达到 max_consecutive_errors 后的自愈行为。"""
 
     @pytest.mark.asyncio
-    async def test_handle_error_sets_error_state_at_threshold(
+    async def test_handle_error_sets_non_terminal_state_at_threshold(
         self, pipe_with_low_max_errors
     ):
         """
-        验证: 达到错误阈值时，_handle_loop_error 设置 PipeState.ERROR。
+        验证: 达到错误阈值时，_handle_loop_error 设置 ERROR | RUNNING | RECONNECTING (非终态)。
+        Spec: 05-Stability.md §4 — "不崩溃"
         """
         pipe, _, _ = pipe_with_low_max_errors
         pipe.max_consecutive_errors = 3
         
-        # Simulate N errors
         for i in range(pipe.max_consecutive_errors):
             pipe._handle_loop_error(Exception(f"Error {i+1}"), "test")
             
-        assert pipe.state == PipeState.ERROR, \
-            "_handle_error 应在 max_consecutive_errors 处设置 ERROR"
+        # ERROR 位应已设置
+        assert pipe.state & PipeState.ERROR, \
+            "_handle_loop_error 应在 max_consecutive_errors 处设置 ERROR 位"
+        # RUNNING 位应保留 — 非终态
+        assert pipe.state & PipeState.RUNNING, \
+            "RUNNING 位必须保留，确保 control loop 不退出 (自愈)"
+        # RECONNECTING 位应设置
+        assert pipe.state & PipeState.RECONNECTING, \
+            "RECONNECTING 位应在达到阈值时设置"
 
     @pytest.mark.asyncio
-    async def test_pipe_exits_after_max_errors(
+    async def test_pipe_stays_alive_after_max_errors(
         self, pipe_with_low_max_errors
     ):
         """
-        验证: 达到 max_consecutive_errors 后，Pipe 进入 ERROR 态并停止运行。
+        验证: 达到 max_consecutive_errors 后，Pipe 仍然存活 (is_running() == True)，
+        并以最大退避时间继续重试。
+        Spec: 05-Stability.md §4 — "不崩溃"
         """
         pipe, src, snd = pipe_with_low_max_errors
-        # Force value to ensure config isn't ignored/overridden
         pipe.max_consecutive_errors = 3
         
         snd.create_session = AsyncMock(
@@ -71,12 +79,11 @@ class TestPipeTerminalError:
         )
 
         await pipe.start()
-        # 等待足够时间让 3 次错误 + 退避完成
         await asyncio.sleep(1.0)
 
-        # 修复验证: Pipe 应停止 (is_running() == False)
-        assert not pipe.is_running(), \
-            "Pipe 应在达到 max_consecutive_errors 后停止运行 (进入终态 ERROR)"
+        # Pipe 应仍在运行 (自愈模式)
+        assert pipe.is_running(), \
+            "Pipe 应在达到 max_consecutive_errors 后仍保持运行 (自愈)"
 
         # 错误计数确实已超过阈值
         assert pipe._consecutive_errors >= pipe.max_consecutive_errors, \
@@ -86,11 +93,26 @@ class TestPipeTerminalError:
         assert pipe.state & PipeState.ERROR, \
             "ERROR 位应已设置"
 
-        # RECONNECTING 位不应设置
-        assert not (pipe.state & PipeState.RECONNECTING), \
-            "RECONNECTING 位不应在终态设置"
-
         await pipe.stop()
+
+    @pytest.mark.asyncio
+    async def test_backoff_capped_at_max_after_threshold(
+        self, pipe_with_low_max_errors
+    ):
+        """
+        验证: 达到阈值后，backoff 被固定为 max_backoff_seconds。
+        """
+        pipe, _, _ = pipe_with_low_max_errors
+        pipe.max_consecutive_errors = 3
+        pipe.max_backoff_seconds = 0.05
+        
+        # 触发恰好达到阈值
+        for i in range(pipe.max_consecutive_errors):
+            backoff = pipe._handle_loop_error(Exception(f"Error {i+1}"), "test")
+        
+        # 最后一次 backoff 应为 max_backoff_seconds
+        assert backoff == pipe.max_backoff_seconds, \
+            f"达到阈值后 backoff 应为 max_backoff_seconds ({pipe.max_backoff_seconds}), 实际为 {backoff}"
 
     @pytest.mark.asyncio
     async def test_pipe_recovers_if_errors_clear_before_threshold(

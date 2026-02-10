@@ -4,9 +4,12 @@ U7: 当根目录不可访问时，Snapshot 扫描的行为。
 
 被测代码: extensions/source-fs/src/fustor_source_fs/scanner.py → FSScanner.scan_snapshot()
 
-已知 BUG: snapshot_worker 中 os.stat(root) 的 OSError 只被 log，不被传播。
-error_count 属性是 RecursiveScanner 级别的 worker 错误计数，
-但 snapshot_worker 内部的 per-directory error 不增加该计数。
+验证重点:
+1. 根目录不存在时，scan_snapshot 抛出 OSError (由调用方决定如何处理)。
+2. 权限被拒时，scan_snapshot 抛出 OSError。
+3. 调用方 (如 AgentPipe) 负责捕获并进行自愈。
+
+Spec: 05-Stability.md §1.2 — "单个文件失败不影响任务"，但根目录不可达是全局性错误。
 """
 import pytest
 import os
@@ -15,27 +18,24 @@ from fustor_source_fs.scanner import FSScanner
 
 class TestSnapshotRootFailure:
 
-    def test_snapshot_on_nonexistent_root_returns_empty(self):
+    def test_snapshot_on_nonexistent_root_raises_error(self):
         """
-        验证修复后: 根目录不存在时，返回空列表，但 error_count > 0。
+        验证: 根目录不存在时，scan_snapshot 抛出 OSError。
+        调用方应捕获此异常并决定是否重试。
         """
         scanner = FSScanner(root="/nonexistent/path/that/does/not/exist")
 
-        events = list(scanner.scan_snapshot(
-            event_schema="test",
-            batch_size=100
-        ))
+        with pytest.raises(OSError, match="missing or inaccessible"):
+            list(scanner.scan_snapshot(
+                event_schema="test",
+                batch_size=100
+            ))
 
-        assert len(events) == 0, "不存在的根目录应产生 0 个事件"
-        # 修复验证: error_count 应增加
-        assert scanner.engine.error_count > 0, \
-            "error_count 应计入 snapshot_worker 内部的 OSError"
-
-    def test_snapshot_on_permission_denied_root_reports_error(
+    def test_snapshot_on_permission_denied_root_raises_error(
         self, tmp_path
     ):
         """
-        验证修复后: 权限被拒的根目录应报告错误。
+        验证: 权限被拒的根目录，scan_snapshot 抛出 OSError。
         """
         restricted_dir = tmp_path / "restricted"
         restricted_dir.mkdir()
@@ -44,13 +44,27 @@ class TestSnapshotRootFailure:
 
         try:
             scanner = FSScanner(root=str(restricted_dir))
-            events = list(scanner.scan_snapshot(
-                event_schema="test",
-                batch_size=100
-            ))
 
-            # 修复验证: error_count 应增加
-            assert scanner.engine.error_count > 0, \
-                "PermissionError 应增加 error_count"
+            with pytest.raises(OSError, match="missing or inaccessible"):
+                list(scanner.scan_snapshot(
+                    event_schema="test",
+                    batch_size=100
+                ))
         finally:
             os.chmod(str(restricted_dir), 0o755)
+
+    def test_snapshot_on_valid_root_works_normally(self, tmp_path):
+        """
+        验证: 正常根目录下 scan_snapshot 不抛异常。
+        """
+        (tmp_path / "hello.txt").write_text("world")
+        scanner = FSScanner(root=str(tmp_path))
+
+        events = list(scanner.scan_snapshot(
+            event_schema="test",
+            batch_size=100
+        ))
+
+        assert len(events) > 0, "有效根目录应产生事件"
+        assert scanner.engine.error_count == 0, \
+            "无错误时 error_count 应为 0"

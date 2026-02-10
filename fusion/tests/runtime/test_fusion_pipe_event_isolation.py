@@ -75,7 +75,8 @@ class TestProcessEventIsolation:
         result = await pipe.process_events(batch, session_id="sess-1")
         
         assert result["success"] is True
-        assert result["count"] == 3  # Count includes skipped? Implementation returns len(events)
+        assert result["count"] == 2  # Only successfully processed events
+        assert result["skipped"] == 1  # 1 malformed event skipped
         
         # 验证 Handler 确实收到了 2 个事件
         # wait for async processing

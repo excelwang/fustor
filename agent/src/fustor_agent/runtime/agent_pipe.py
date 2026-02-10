@@ -137,18 +137,29 @@ class AgentPipe(Pipe):
 
 
     def _handle_loop_error(self, error: Exception, loop_name: str) -> float:
-        """Common error handling for loops: increment counter, alert if needed, return backoff."""
+        """Common error handling for loops: increment counter, alert if needed, return backoff.
+        
+        NOTE: This method intentionally does NOT set a terminal ERROR state.
+        Even after max_consecutive_errors, the pipe stays in RUNNING | ERROR
+        so the control loop can continue retrying with max backoff.
+        This ensures self-healing when the upstream issue resolves.
+        (Spec: 05-Stability.md §4 — "不崩溃")
+        """
         self._consecutive_errors += 1
         backoff = self._calculate_backoff(self._consecutive_errors)
         
-        # Log error with retry info
         if self._consecutive_errors >= self.max_consecutive_errors:
             logger.critical(
                 f"Pipe {self.id} {loop_name} loop reached threshold of {self._consecutive_errors} "
-                f"consecutive errors. Moving to terminal ERROR state."
+                f"consecutive errors. Continuing with max backoff ({self.max_backoff_seconds}s)."
             )
-            # Move to terminal error - NO RECONNECTING flag
-            self._set_state(PipeState.ERROR, f"Max retries ({self.max_consecutive_errors}) exceeded: {error}")
+            # Keep RUNNING so control loop does NOT exit — pipe can self-heal
+            self._set_state(
+                PipeState.RUNNING | PipeState.ERROR | PipeState.RECONNECTING,
+                f"Max retries ({self.max_consecutive_errors}) exceeded: {error}"
+            )
+            # Cap at max backoff from here on
+            backoff = self.max_backoff_seconds
         else:
             logger.error(f"Pipe {self.id} {loop_name} loop error: {error}. Retrying in {backoff}s...")
             
@@ -258,6 +269,14 @@ class AgentPipe(Pipe):
         # Reset state flags for new session
         self._initial_snapshot_done = False
         self.is_realtime_ready = False
+        
+        # Recover bus if it was in a failed state from a previous error cycle
+        if self._bus and getattr(self._bus, 'failed', False):
+            try:
+                logger.info(f"Pipe {self.id}: Recovering EventBus from failed state for new session")
+                self._bus.recover()
+            except Exception as e:
+                logger.warning(f"Pipe {self.id}: Bus recovery failed: {e}")
         
         self._heartbeat_task = None
         if self._heartbeat_task is None or self._heartbeat_task.done():
@@ -419,19 +438,19 @@ class AgentPipe(Pipe):
             except RuntimeError as e:
                 backoff = self._handle_loop_error(e, "control")
                 
-                # If NOT terminal, add RECONNECTING
-                if not (self.state & PipeState.ERROR):
-                    self._set_state(PipeState.ERROR | PipeState.RECONNECTING, 
+                # Update detailed status if not overridden by critical error
+                if self._consecutive_errors < self.max_consecutive_errors:
+                    self._set_state(PipeState.RUNNING | PipeState.ERROR | PipeState.RECONNECTING, 
                                     f"RuntimeError (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
                 await asyncio.sleep(backoff)
 
             except Exception as e:
                 backoff = self._handle_loop_error(e, "control")
                 
-                # If NOT terminal, add RECONNECTING
-                if not (self.state & PipeState.ERROR):
-                     self._set_state(PipeState.ERROR | PipeState.RECONNECTING, 
-                                     f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
+                # Update detailed status if not overridden by critical error
+                if self._consecutive_errors < self.max_consecutive_errors:
+                    self._set_state(PipeState.RUNNING | PipeState.ERROR | PipeState.RECONNECTING, 
+                                    f"Error (retry {self._consecutive_errors}, backoff {backoff}s): {e}")
                 
                 # If session failed, ensure it's cleared so we try to recreate it
                 if self.has_active_session():
