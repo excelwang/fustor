@@ -131,11 +131,13 @@ async def lifespan(app: FastAPI):
 
     # --- Register Routers ---
     from .api.pipe import pipe_router
+    from .api.session import session_router
     from .api.management import router as management_router
     from .api.views import view_router
 
     api_v1 = APIRouter()
     api_v1.include_router(pipe_router, prefix="/pipe")
+    api_v1.include_router(session_router, prefix="/pipe/session")
     api_v1.include_router(view_router, prefix="/views")
     api_v1.include_router(management_router)
     
