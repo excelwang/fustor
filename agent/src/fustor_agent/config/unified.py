@@ -42,14 +42,12 @@ class AgentPipeConfig(BaseModel):
     # Sync intervals
     audit_interval_sec: float = 600.0
     sentinel_interval_sec: float = 120.0
-    heartbeat_interval_sec: float = 10.0
     
     # Reliability configuration
     error_retry_interval: float = 5.0
     max_consecutive_errors: int = 5
     backoff_multiplier: float = 2.0
     max_backoff_seconds: float = 60.0
-    session_timeout_seconds: Optional[int] = None
     
     # Field mapping
     fields_mapping: List[Dict[str, Any]] = []

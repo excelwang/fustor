@@ -90,8 +90,10 @@ class AgentPipe(Pipe):
         self._audit_task: Optional[asyncio.Task] = None
         self._sentinel_task: Optional[asyncio.Task] = None
         
-        # Configuration
-        self.heartbeat_interval_sec = config.get("heartbeat_interval_sec", 10) # Seconds between heartbeats
+        # Configuration (Timeouts and Heartbeats are managed by Fusion and updated in on_session_created)
+        self.session_timeout_seconds = 30
+        self.heartbeat_interval_sec = 10.0
+        
         self.audit_interval_sec = config.get("audit_interval_sec", 600)       # Seconds between audit cycles (0 to disable)
         self.sentinel_interval_sec = config.get("sentinel_interval_sec", 120) # Seconds between sentinel checks (0 to disable)
         self.batch_size = config.get("batch_size", 100)
@@ -105,7 +107,6 @@ class AgentPipe(Pipe):
         self.max_consecutive_errors = int(config.get("max_consecutive_errors", 5))  # Threshold for warning (ensure int)
         self.backoff_multiplier = config.get("backoff_multiplier", 2.0)        # Exponential backoff factor
         self.max_backoff_seconds = config.get("max_backoff_seconds", 60.0)     # Max backoff delay cap
-        self.session_timeout_seconds = config.get("session_timeout_seconds") # Session expiration timeout (optional)
         
 
         

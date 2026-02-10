@@ -152,7 +152,7 @@ class PipeManager:
 
     def _resolve_target_pipes(self, config_list: Optional[List[str]]) -> List[str]:
         if config_list is None:
-            return list(fusion_config.get_default_pipes().keys())
+            return list(fusion_config.get_all_pipes().keys())
         
         targets = []
         for item in config_list:

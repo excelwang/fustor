@@ -71,8 +71,8 @@ class App:
     def _resolve_target_pipes(self, config_list: Optional[List[str]]) -> List[str]:
         """Resolve which pipe IDs to start."""
         if config_list is None:
-            # Default behavior: pipes from default.yaml
-            return list(agent_config.get_default_pipes().keys())
+            # Default behavior: all pipes from all yaml files
+            return list(agent_config.get_all_pipes().keys())
         
         targets = []
         for item in config_list:
