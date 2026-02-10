@@ -108,9 +108,11 @@ async def test_sentinel_sweep_verification_flow(parser):
     """
     now = 5000.0 # Fixed base time
     parser.hot_file_threshold = 1.0 # 1 second for test
+    parser.arbitrator.hot_file_threshold = 1.0 # Ensure arbitrator also uses 1.0
     
     # 1. Audit discovery of hot file -> Mark Suspect
-    with unittest.mock.patch('time.time', return_value=now):
+    with unittest.mock.patch('time.time', return_value=now), \
+         unittest.mock.patch('time.monotonic', return_value=now):
         # Reset clock to match mocked time, otherwise it holds real system time (huge age)
         parser.state.logical_clock.reset(now)
         
@@ -132,13 +134,18 @@ async def test_sentinel_sweep_verification_flow(parser):
     await parser.update_suspect("/hot/file.txt", now)
     
     # 3. Verify: Cleared immediately
-    assert node.integrity_suspect is False
-    assert "/hot/file.txt" not in parser._suspect_list
+    # 3. Verify: NOT cleared immediately (Wait for TTL)
+    # Changed in C6 fix: Stable checks do NOT clear immediately to handle active writers.
+    assert node.integrity_suspect is True
+    assert "/hot/file.txt" in parser._suspect_list
     
-    # 4. cleanup should do nothing more
+    # 4. cleanup should expire it after TTL
     with unittest.mock.patch('time.monotonic', return_value=now + 10.0):
+        # Mtime is stable, so subsequent cleanup after TTL should remove it
         processed = parser._cleanup_expired_suspects_unlocked()
-        assert processed == 0
+        assert processed == 1
+        assert node.integrity_suspect is False
+        assert "/hot/file.txt" not in parser._suspect_list
 
 @pytest.mark.asyncio
 async def test_sentinel_sweep_mtime_mismatch(parser):

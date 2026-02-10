@@ -134,4 +134,4 @@ async def test_submit_sentinel_feedback(client, mock_view_manager):
     
     assert response.status_code == 200
     assert response.json()["status"] == "processed"
-    driver_instance.update_suspect.assert_called_once_with("/file1.txt", 999.0)
+    driver_instance.update_suspect.assert_called_once_with("/file1.txt", 999.0, size=None)

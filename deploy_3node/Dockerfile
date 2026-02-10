@@ -10,15 +10,22 @@ RUN pip install uv
 
 WORKDIR /app
 
-# Install Fustor components from PyPI
-# According to DEPLOYMENT_FS.md, these are the required packages:
+# Copy the entire project to build from source
+COPY . .
+
+# Install Fustor components from source
+# Including benchmark this time
 RUN uv pip install --system \
-    fustor-fusion==0.8.9 \
-    fustor-view-fs==0.8.9 \
-    fustor-agent==0.8.9 \
-    fustor-source-fs==0.8.9 \
-    fustor-sender-http==0.8.9 \
-    fustor-receiver-http==0.8.9
+    ./core \
+    ./agent-sdk \
+    ./fusion-sdk \
+    ./fusion \
+    ./agent \
+    ./benchmark \
+    ./extensions/view-fs \
+    ./extensions/source-fs \
+    ./extensions/sender-http \
+    ./extensions/receiver-http
 
 # Create necessary directories
 RUN mkdir -p /root/.fustor/fusion-config \

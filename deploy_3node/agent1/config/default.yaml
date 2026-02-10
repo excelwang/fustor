@@ -1,7 +1,7 @@
 sources:
   nfs-source:
     driver: fs
-    uri: "/data"
+    uri: "/data/fustor-benchmark-run/data"
 
 senders:
   fusion-main:
