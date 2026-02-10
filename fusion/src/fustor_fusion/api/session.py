@@ -24,6 +24,8 @@ session_router = APIRouter(tags=["Session Management"])
 # Default configuration values
 DEFAULT_SESSION_TIMEOUT = 30
 DEFAULT_ALLOW_CONCURRENT_PUSH = False
+DEFAULT_AUDIT_INTERVAL = 600.0
+DEFAULT_SENTINEL_INTERVAL = 120.0
 
 
 class CreateSessionPayload(BaseModel):
@@ -42,11 +44,15 @@ def _get_session_config(pipe_id: str) -> Dict[str, Any]:
         return {
             "session_timeout_seconds": pipe.session_timeout_seconds,
             "allow_concurrent_push": pipe.allow_concurrent_push,
+            "audit_interval_sec": pipe.audit_interval_sec,
+            "sentinel_interval_sec": pipe.sentinel_interval_sec,
         }
         
     return {
         "session_timeout_seconds": DEFAULT_SESSION_TIMEOUT,
         "allow_concurrent_push": DEFAULT_ALLOW_CONCURRENT_PUSH,
+        "audit_interval_sec": DEFAULT_AUDIT_INTERVAL,
+        "sentinel_interval_sec": DEFAULT_SENTINEL_INTERVAL,
     }
 
 
@@ -89,7 +95,7 @@ async def _should_allow_new_session(
             return False
 
 
-@session_router.post("/", summary="Create new pipesession")
+@session_router.post("", summary="Create new pipesession")
 async def create_session(
     payload: CreateSessionPayload,
     request: Request,
@@ -160,7 +166,9 @@ async def create_session(
         "role": role,
         "is_leader": is_leader,
         "suggested_heartbeat_interval_seconds": session_timeout_seconds // 2,
-        "session_timeout_seconds": session_timeout_seconds
+        "session_timeout_seconds": session_timeout_seconds,
+        "audit_interval_sec": session_config.get("audit_interval_sec"),
+        "sentinel_interval_sec": session_config.get("sentinel_interval_sec"),
     }
 
 

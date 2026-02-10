@@ -31,3 +31,5 @@ pipes:
   ${TEST_VIEW_ID}:
     receiver: http-main
     views: [${TEST_VIEW_ID}]
+    audit_interval_sec: ${AUDIT_INTERVAL}
+    sentinel_interval_sec: ${SENTINEL_INTERVAL}

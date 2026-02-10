@@ -36,6 +36,8 @@ class CreateSessionResponse(BaseModel):
     session_id: str
     role: str  # 'leader' or 'follower'
     session_timeout_seconds: int
+    audit_interval_sec: Optional[float] = None
+    sentinel_interval_sec: Optional[float] = None
     message: str
 
 
@@ -66,6 +68,9 @@ class SessionInfo:
     created_at: float
     last_heartbeat: float
     can_realtime: bool = False
+    source_uri: Optional[str] = None
+    audit_interval_sec: Optional[float] = None
+    sentinel_interval_sec: Optional[float] = None
 
     @property
     def pipe_id(self) -> str:
@@ -282,6 +287,8 @@ class HTTPReceiver(Receiver):
                         session_id=session_info.session_id,
                         role=session_info.role,
                         session_timeout_seconds=session_timeout_seconds,
+                        audit_interval_sec=session_info.audit_interval_sec,
+                        sentinel_interval_sec=session_info.sentinel_interval_sec,
                         message="Session created successfully"
                     )
                 except Exception as e:

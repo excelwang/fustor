@@ -26,7 +26,7 @@ from .constants import (
     MOUNT_POINT, 
     AUDIT_INTERVAL,
     SENTINEL_INTERVAL,
-    FUSION_ENDPOINT,
+    RECEIVER_ENDPOINT,
     HEARTBEAT_INTERVAL,
     THROTTLE_INTERVAL_SEC,
     AGENT_READY_TIMEOUT,
@@ -56,7 +56,7 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
     except Exception as e:
         logger.debug(f"Container {container_name} already running or could not be started: {e}")
 
-    fusion_endpoint = FUSION_ENDPOINT
+    fusion_endpoint = RECEIVER_ENDPOINT
     
     # Generate unique agent ID
     agent_id = f"{container_name.replace('fustor-nfs-', '')}-{os.urandom(2).hex()}"

@@ -104,12 +104,16 @@ uv pip install fustor-agent fustor-source-fs fustor-sender-http
 配置文件路径: `~/.fustor/fusion-config/fs_setup.yaml`
 
 ```yaml
+# 0. 全局配置 (可选)
+session_cleanup_interval: 60.0 # [默认] 过期会话清理周期(秒)
+
 # 1. 配置 HTTP 接收器
 receivers:
   http-receiver:
     driver: http
-    bind_host: "0.0.0.0"
+    bind_host: "0.0.0.0"       # [默认]
     port: 18888                # Agent 推送数据的端口
+    disabled: false            # [默认]
     api_keys:
       - key: "fs-sync-secret-key"    # 鉴权密钥
         pipe_id: "fs-sync-pipe"      # 绑定管道 ID
@@ -120,8 +124,8 @@ views:
     driver: fs
     disabled: false
     driver_params:
-      hot_file_threshold: 60.0
-      max_tree_items: 100000   # 防止单次返回数据过大导致响应缓慢(默认 10W)
+      hot_file_threshold: 60.0 # [默认 30.0] 热文件判定阈值
+      max_tree_items: 100000   # [默认] 防止单次返回数据过大导致响应缓慢
 
 # 3. 绑定管道 (Pipe)
 pipes:
@@ -129,7 +133,8 @@ pipes:
     receiver: http-receiver  # 数据入口
     views:                   # 数据出口
       - backup-view
-    session_timeout_seconds: 3600  # 会话超时时间 (也控制 Agent 掉线后的清除时间)
+    allow_concurrent_push: true    # [默认] 允许 Agent 并发推送
+    session_timeout_seconds: 3600  # [默认] 会话超时时间 (也控制 Agent 掉线后的清除时间)
 ```
 
 > [!TIP]
@@ -152,16 +157,26 @@ pipes:
 配置文件路径: `~/.fustor/agent-config/source_node_a.yaml`
 
 ```yaml
+# 0. 全局配置
+# heartbeat_interval_sec: 10.0 # [默认]
+
 sources:
   nfs-source-a:
     driver: fs
     uri: "/mnt/data/project_share"
     disabled: false
+    max_queue_size: 1000       # [默认] 内部缓冲大小
+    max_retries: 10            # [默认] 读取失败重试次数
+    driver_params:
+      file_pattern: "*"        # [默认] 监听所有文件
+      min_monitoring_window_days: 30.0 # [默认] 监控最近30天的文件
 
 senders:
   fusion-main:
     driver: fusion
     uri: "http://<FUSION_IP>:18888"  # 指向 Fusion 的 Receiver 端口
+    batch_size: 1000           # [默认] 批量发送大小
+    timeout_sec: 30            # [默认] 请求超时
     credential:
       key: "fs-sync-secret-key"
 
@@ -169,11 +184,10 @@ pipes:
   sync-job:
     source: nfs-source-a
     sender: fusion-main
-    
-    # 策略配置
-    audit_interval_sec: 600.0
-    sentinel_interval_sec: 60.0
-    session_timeout_seconds: 3600
+    session_timeout_seconds: 30 # 向服务端请求的会话超时时间 (建议 3x 心跳间隔)
+    # 可靠性配置
+    error_retry_interval: 5.0     # [默认] 错误重试间隔
+    max_consecutive_errors: 5     # [默认] 连续错误阈值
 ```
 
 ### 服务器 B (Agent-2)
@@ -188,6 +202,7 @@ sources:
     driver: fs
     uri: "/home/admin/mnt/share"
     disabled: false
+    # ... 其他参数使用默认值
 
 senders:
   fusion-main:
@@ -200,11 +215,7 @@ pipes:
   sync-job:
     source: nfs-source-b
     sender: fusion-main
-    
-    # 策略配置保持与 A 一致
-    audit_interval_sec: 600.0
-    sentinel_interval_sec: 60.0
-    session_timeout_seconds: 3600
+    session_timeout_seconds: 30
 ```
 
 ---

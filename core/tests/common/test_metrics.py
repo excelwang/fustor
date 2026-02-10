@@ -12,7 +12,7 @@ def test_noop_metrics_does_not_crash():
     # No assertion needed, just checking it doesn't raise exception
 
 def test_logging_metrics(caplog):
-    caplog.set_level(logging.INFO)
+    caplog.set_level(logging.DEBUG)
     m = LoggingMetrics("test_logger")
     
     m.counter("test.counter", 1, tags={"env": "prod"})

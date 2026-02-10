@@ -54,6 +54,7 @@ Fustor 支持灵活的部署架构，以适应不同的业务需求（如单点�
         views:
           - realtime-view  # 用于高性能查询 (内存限制较小)
           - archive-view   # 用于全量备份 (内存限制较大)
+        allow_concurrent_push: true # 推荐开启并发推送
     ```
 
 ## 2. 性能调优与限制 (Performance Tuning)
@@ -72,7 +73,7 @@ Fustor 支持灵活的部署架构，以适应不同的业务需求（如单点�
           # 限制单次 API 响应最多返回 50 万个条目
           # 超过此限制时，API 将返回 400 错误，提示用户缩小查询范围 (如查询特定子目录)
           max_tree_items: 500000 
-          hot_file_threshold: 60.0
+          hot_file_threshold: 60.0 # [默认 30.0]
     ```
 
 ### 2.2 内核参数调优 (Inotify)
@@ -88,7 +89,7 @@ Fustor 支持灵活的部署架构，以适应不同的业务需求（如单点�
 
 ### 2.3 网络与并发 (Pipe Tuning)
 *   **allow_concurrent_push**:
-    *   在 `pipes` 配置中设置 `allow_concurrent_push: true`。
+    *   在 Fusion `pipes` 配置中设置 `allow_concurrent_push: true` (默认即为 true)。
     *   允许 Agent 并发推送事件，极大提高大量小文件变更时的同步吞吐量。
 *   **session_timeout_seconds**:
     *   建议设置为 `3600` (1小时) 或更长。
@@ -96,7 +97,7 @@ Fustor 支持灵活的部署架构，以适应不同的业务需求（如单点�
 
 ### 2.4 配置热管理 (Reload)
 在集群模式下，频繁重启服务会带来不必要的扫描。利用 `reload` 命令可以实现“零停机”更新：
-- **调整日志级别**: 集群出现异常时，可通过重载将 `logging.level` 设为 `DEBUG`。
+- **调整日志级别**: 集群出现异常时，可通过重载将 `logging` 设为 `"DEBUG"`。
 - **增量新增管道**: 在不影响现有同步流的情况下，通过更新 YAML 并 `fustor-fusion reload` 来新增接收视图。
 
 ---

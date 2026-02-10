@@ -266,6 +266,21 @@ class AgentPipe(Pipe):
         suggested_interval = kwargs.get("suggested_heartbeat_interval_seconds")
         if suggested_interval:
             self.heartbeat_interval_sec = suggested_interval
+        
+        # Update sync policy from server response (authoritative)
+        server_audit = kwargs.get("audit_interval_sec")
+        if server_audit is not None:
+            old_audit = self.audit_interval_sec
+            self.audit_interval_sec = float(server_audit)
+            if old_audit != self.audit_interval_sec:
+                logger.info(f"Pipe {self.id}: Audit interval updated by server: {old_audit} -> {self.audit_interval_sec}")
+
+        server_sentinel = kwargs.get("sentinel_interval_sec")
+        if server_sentinel is not None:
+             old_sentinel = self.sentinel_interval_sec
+             self.sentinel_interval_sec = float(server_sentinel)
+             if old_sentinel != self.sentinel_interval_sec:
+                 logger.info(f"Pipe {self.id}: Sentinel interval updated by server: {old_sentinel} -> {self.sentinel_interval_sec}")
             
         # Reset state flags for new session
         self._initial_snapshot_done = False

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field, field_validator, RootModel, ConfigDict
+from pydantic import BaseModel, Field, field_validator, RootModel, ConfigDict, model_validator
 from typing import List, Optional, Union, TypeAlias, Dict, Any
 from fustor_core.exceptions import ConfigError, NotFoundError
 
@@ -8,10 +8,17 @@ class GlobalLoggingConfig(BaseModel):
     level: str = Field(default="INFO", description="日志级别")
     format: str = Field(default="%(asctime)s - %(name)s - %(levelname)s - %(message)s", description="日志格式")
 
+    @model_validator(mode='before')
+    @classmethod
+    def check_string_input(cls, data: Any) -> Any:
+        if isinstance(data, str):
+            return {'level': data}
+        return data
+
 class FusionGlobalConfig(BaseModel):
     host: str = Field(default="0.0.0.0", description="管理 API 监听地址")
     port: int = Field(default=8101, description="管理 API 监听端口")
-    session_cleanup_interval: float = Field(default=300.0, description="会话清理间隔(秒)")
+    session_cleanup_interval: float = Field(default=60.0, description="会话清理间隔(秒)")
 
 class AgentGlobalConfig(BaseModel):
     # Agent typically doesn't listen on a port anymore, but we can store other globals

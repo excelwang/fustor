@@ -15,9 +15,11 @@ CONTAINER_NFS_SERVER = "fustor-nfs-server"
 MOUNT_POINT = "/mnt/shared"
 
 # Fusion API connection
-FUSION_PORT = 8102
+FUSION_PORT = 8102  # Main API port (Management)
+RECEIVER_PORT = 18888  # Receiver port (Data)
 FUSION_HOST = "fustor-fusion"
 FUSION_ENDPOINT = f"http://{FUSION_HOST}:{FUSION_PORT}"
+RECEIVER_ENDPOINT = f"http://{FUSION_HOST}:{RECEIVER_PORT}"
 TEST_VIEW_ID = "integration-test-ds"
 TEST_API_KEY = "test-api-key-123"
 

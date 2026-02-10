@@ -40,6 +40,8 @@ class TestUnifiedPipesConfig:
     def test_get_enabled_pipes(self, config_dir):
         """Should return only enabled pipes."""
         (config_dir / "pipes.yaml").write_text(yaml.dump({
+            "sources": {"s": {"driver": "src", "uri": "file:///tmp"}},
+            "senders": {"d": {"driver": "dst", "uri": "http://localhost"}},
             "pipes": {
                 "enabled": {"source": "s", "sender": "d"},
                 "disabled": {"source": "s", "sender": "d", "disabled": True}

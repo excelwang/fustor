@@ -58,17 +58,16 @@ uv pip install fustor-fusion fustor-view-fs
 
 ```yaml
 # 0. 全局设置 (可选)
-logging:
-  level: "INFO"
-fusion:
-  port: 8101              # 管理 API 端口
+logging: "INFO"         # 日志级别: DEBUG, INFO, WARNING, ERROR, CRITICAL
+host: "0.0.0.0"         # 管理 API 绑定地址
+port: 8101              # 管理 API 端口
 
 # 1. 定义接收器 (Receiver): 用于接收 Agent 推送的数据
 receivers:
   http-main:
     driver: http          # 使用 HTTP 协议
     bind_host: "0.0.0.0"
-    port: 18888           # 数据端口
+    port: 18888           # 数据接收端口 (不同于管理端口)
     api_keys:
       - key: "my-secure-api-key"   # 设置鉴权 Key，Agent 端需匹配
         pipe_id: "research-sync"   # 绑定到指定的 Pipe ID
@@ -79,7 +78,7 @@ views:
     driver: fs            # 使用文件系统驱动
     disabled: false
     driver_params:
-      hot_file_threshold: 60.0
+      hot_file_threshold: 60.0 # 热文件判定阈值(秒)
 
 # 3. 定义管道 (Pipe): 将接收器与视图绑定
 pipes:
@@ -87,7 +86,8 @@ pipes:
     receiver: http-main   # 引用上面的 receiver id
     views:                # 数据写入哪些视图
       - research-view
-    session_timeout_seconds: 3600
+    allow_concurrent_push: true    # 允许并发推送
+    session_timeout_seconds: 30  # 会话超时时间
 ```
 
 
@@ -121,27 +121,32 @@ uv pip install fustor-agent fustor-source-fs fustor-sender-http
 
 ### 4.2 配置
 
-在 `~/.fustor/agent-config/` 目录下创建配置文件（例如 `deployment.yaml`）。
+在 `~/.fustor/agent-config/` 目录下创建配置文件（例如 `default.yaml`）。
 
 # 样例配置 (`~/.fustor/agent-config/default.yaml`):
 
 ```yaml
 # 0. 全局设置 (可选)
-logging:
-  level: "INFO"
+logging: "INFO"
 
 # 1. 定义数据源 (Source): 监控本地数据
 sources:
   local-research-files:
     driver: fs            # 使用文件系统驱动
     uri: "/mnt/data/source_files"  # 需要监控的本地绝对路径
+    max_queue_size: 1000  # 本地事件缓冲区大小
     disabled: false
+    driver_params:
+      file_pattern: "*"   # 监听文件模式
+      min_monitoring_window_days: 30.0 # 最小监控窗口(天)
 
 # 2. 定义发送器 (Sender): 推送目标
 senders:
   fusion-server:
     driver: fusion        # 使用 Fusion HTTP 驱动
     uri: "http://<FUSION_SERVER_IP>:18888"  # Fusion 服务器接收端口
+    batch_size: 1000      # 批量发送条数
+    timeout_sec: 30       # 请求超时时间
     credential:
       key: "my-secure-api-key" # 必须与 Fusion 配置中的 key 一致
 
@@ -150,10 +155,9 @@ pipes:
   research-sync-task:
     source: local-research-files  # 引用 source id
     sender: fusion-server         # 引用 sender id
-    
-    # 同步策略配置
-    audit_interval_sec: 36000.0     # 每10小时进行一次全量审计
-    sentinel_interval_sec: 120.0  # 哨兵扫描间隔
+    # 错误重试配置
+    error_retry_interval: 5.0     # 初始重试间隔
+    max_consecutive_errors: 5     # 最大连续错误数
 ```
 
 ### 4.3 启动
@@ -190,3 +194,80 @@ fustor-agent reload
 *   **Agent 报错 "Connection refused"**: 检查 `senders` 配置中的 IP 和端口是否正确，确保 Fusion 服务器防火墙允许 18888 端口（Receiver 端口）通过。
 *   **Fusion 报错 "Unauthorized"**: 检查 Agent 的 `api_key` 是否与 Fusion `receivers` 配置中的 Key 完全一致。
 *   **配置未生效**: 确保配置文件扩展名为 `.yaml`。对于非 `default.yaml` 的配置，如果在启动时未明确指定文件，需在修改后运行 `reload` 命令或手动重启。默认情况下，`start` 不带参数仅会激活 `default.yaml` 中的管道。
+
+---
+
+## 6. 配置参数详解 (Configuration Reference)
+
+### 6.1 通用全局参数 (Global)
+
+| 参数路径 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `logging` | string/dict | `"INFO"` | 日志级别或详细配置 |
+| `host` | string | `"0.0.0.0"` | (Fusion) 管理 API 监听地址 |
+| `port` | int | `8101` | (Fusion) 管理 API 监听端口 |
+| `session_cleanup_interval` | float | `60.0` | (Fusion) 会话清理间隔(秒) |
+| `heartbeat_interval_sec` | float | `10.0` | (Agent) 心跳间隔(秒) |
+
+
+### 6.2 Fusion 配置参数
+
+**接收器 (`receivers` 节)**
+| 参数名 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `driver` | string | (无默认值) | 驱动类型，通常为 `"http"` |
+| `bind_host` | string | `"0.0.0.0"` | 数据接收服务绑定地址 |
+| `port` | int | `8102` | 数据接收服务端口 |
+| `disabled` | bool | `false` | 是否禁用此接收器 |
+| `api_keys` | list | `[]` | 鉴权密钥列表，每项包含 `key` 和 `pipe_id` |
+
+**视图 (`views` 节)**
+| 参数名 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `driver` | string | `"fs"` | 视图驱动类型 |
+| `disabled` | bool | `false` | 是否禁用此视图 |
+| `driver_params` | dict | `{}` | 驱动特定参数 |
+
+**Fusion 管道 (`pipes` 节)**
+| 参数名 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `receiver` | string | (必填) | 关联的 Receiver ID |
+| `views` | list[str] | `[]` | 数据分发的目标 View ID 列表 |
+| `allow_concurrent_push` | bool | `true` | 是否允许 Agent 并发推送数据 |
+| `session_timeout_seconds` | int | `30` | 会话超时时间(秒) |
+
+### 6.3 Agent 配置参数
+
+**数据源 (`sources` 节)**
+| 参数名 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `driver` | string | (必填) | 驱动类型，如 `"fs"` |
+| `uri` | string | (必填) | 数据源连接 URI (如文件路径) |
+| `max_queue_size` | int | `1000` | 内部事件缓冲队列最大长度 |
+| `max_retries` | int | `10` | 驱动读取失败重试次数 |
+| `retry_delay_sec` | int | `5` | 驱动重试等待时间(秒) |
+| `disabled` | bool | `false` | 是否禁用此源 |
+| `driver_params` | dict | `{}` | 驱动专属参数 |
+
+**发送器 (`senders` 节)**
+| 参数名 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `driver` | string | (必填) | 驱动类型，如 `"fusion"` |
+| `uri` | string | (必填) | 目标地址 URI |
+| `batch_size` | int | `1000` | 批量发送的最大事件数 |
+| `max_retries` | int | `10` | 发送失败重试次数 |
+| `retry_delay_sec` | int | `5` | 发送重试等待时间(秒) |
+| `timeout_sec` | int | `30` | 网络请求超时时间(秒) |
+| `disabled` | bool | `false` | 是否禁用此发送器 |
+
+**Agent 管道 (`pipes` 节)**
+| 参数名 | 类型 | 默认值 | 说明 |
+| :--- | :--- | :--- | :--- |
+| `source` | string | (必填) | 关联的 Source ID |
+| `sender` | string | (必填) | 关联的 Sender ID |
+| `error_retry_interval` | float | `5.0` | 管道级错误后的重试初始退避(秒) |
+| `max_consecutive_errors`| int | `5` | 触发严重告警的连续错误次数阈值 |
+| `backoff_multiplier` | float | `2.0` | 重试退避指数倍数 |
+| `max_backoff_seconds` | float | `60.0` | 最大重试退避时间(秒) |
+| `session_timeout_seconds` | float | `30.0` | (可选) 会话超时建议值 |
+| `disabled` | bool | `false` | 是否禁用此管道 |

@@ -53,6 +53,9 @@ class TestPipeManager:
         rec_cfg = receiver_cfg
         
         mock_receivers_config.get_all_pipes.return_value = {"pipe-1": pipe_cfg}
+        # FIX: Mock get_enabled_pipes so the pipe is selected for initialization
+        mock_receivers_config.get_enabled_pipes.return_value = {"pipe-1": pipe_cfg}
+        
         mock_receivers_config.resolve_pipe_refs.return_value = {
             "pipe": pipe_cfg,
             "receiver": rec_cfg,
@@ -93,6 +96,9 @@ class TestPipeManager:
         rec_cfg.session_timeout_seconds = 30
         
         mock_receivers_config.get_all_pipes.return_value = {"pipe-1": pipe_cfg}
+        # FIX: Mock get_enabled_pipes so the pipe is selected for initialization
+        mock_receivers_config.get_enabled_pipes.return_value = {"pipe-1": pipe_cfg}
+        
         view_cfg = MagicMock()
         view_cfg.disabled = False
         mock_receivers_config.resolve_pipe_refs.return_value = {

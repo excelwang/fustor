@@ -63,7 +63,11 @@ class FusionPipeConfig(BaseModel):
     receiver: str  # Reference to receiver ID
     views: List[str] = []  # References to view IDs
     allow_concurrent_push: bool = True
-    session_timeout_seconds: int = 3600
+    session_timeout_seconds: int = 30
+    
+    # Sync Policy (Pushed to Agent)
+    audit_interval_sec: float = 600.0
+    sentinel_interval_sec: float = 120.0
 
 
 class FusionConfigLoader:
@@ -126,6 +130,25 @@ class FusionConfigLoader:
                 data = yaml.safe_load(f) or {}
             
             file_key = path.name
+            
+            # 1. Global settings (Flattened or Nested)
+            if "logging" in data:
+                # GlobalLoggingConfig validator handles string vs dict
+                self.logging = GlobalLoggingConfig(**data["logging"])
+
+            # Handle flattened Fusion globals (host, port, etc.) directly from root
+            # Prioritize root-level keys, fallback to nested 'fusion' block
+            fusion_data = data.get("fusion", {})
+            if not isinstance(fusion_data, dict):
+                 fusion_data = {}
+            
+            # Merge root-level overrides into fusion_data definition
+            for key in ["host", "port", "session_cleanup_interval"]:
+                if key in data:
+                    fusion_data[key] = data[key]
+            
+            if fusion_data:
+                self.fusion = self.fusion.model_copy(update=fusion_data)
             
             # Merge receivers
             for r_id, r_data in data.get("receivers", {}).items():

@@ -286,8 +286,16 @@ class PipeManager:
                 source_uri=source_uri
             )
             self._session_to_pipe[session_id] = pipe_id
+            
+            # Fetch sync policy from config
+            p_cfg = fusion_config.get_pipe(pipe_id)
+            audit_interval = p_cfg.audit_interval_sec if p_cfg else None
+            sentinel_interval = p_cfg.sentinel_interval_sec if p_cfg else None
+            
             info = SessionInfo(session_id, task_id, pipe_id, result["role"], time.time(), time.time())
             info.source_uri = source_uri
+            info.audit_interval_sec = audit_interval
+            info.sentinel_interval_sec = sentinel_interval
             return info
 
     async def _on_event_received(self, session_id, events, source_type, is_end):

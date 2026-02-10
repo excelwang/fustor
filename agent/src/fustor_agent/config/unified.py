@@ -42,6 +42,7 @@ class AgentPipeConfig(BaseModel):
     audit_interval_sec: float = 600.0
     sentinel_interval_sec: float = 120.0
     heartbeat_interval_sec: float = 10.0
+    session_timeout_seconds: Optional[float] = None  # Session timeout hint for the server
     
     # Reliability configuration
     error_retry_interval: float = 5.0
@@ -125,6 +126,14 @@ class AgentConfigLoader:
             
             file_key = path.name
             
+            # 1. Global settings
+            if "logging" in data:
+                 # GlobalLoggingConfig validator handles string vs dict
+                self.logging = GlobalLoggingConfig(**data["logging"])
+            
+            if "agent" in data:
+                self.agent = self.agent.model_copy(update=data["agent"])
+
             # Merge sources
             for src_id, src_data in data.get("sources", {}).items():
                 if src_id in self._sources:
@@ -203,9 +212,18 @@ class AgentConfigLoader:
         self.ensure_loaded()
         enabled = {}
         for pid, pcfg in self._pipes.items():
+            if pcfg.disabled:
+                continue
+                
             source = self.get_source(pcfg.source)
-            if source and not source.disabled:
-                enabled[pid] = pcfg
+            if not source or source.disabled:
+                continue
+                
+            sender = self.get_sender(pcfg.sender)
+            if not sender or sender.disabled:
+                continue
+                
+            enabled[pid] = pcfg
         return enabled
     
     def resolve_pipe_refs(self, pipe_id: str) -> Optional[Dict[str, Any]]:
