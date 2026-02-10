@@ -71,6 +71,10 @@ class PipeSessionBridge:
         
         # Map session_id -> view_id (for legacy compatibility)
         self._session_view_map: Dict[str, str] = {}
+        
+        # Performance: Cache authoritative leader status per view
+        # {view_id: set(session_id)}
+        self._leader_cache: Dict[str, set] = {}
     
     async def create_session(
         self,
@@ -135,6 +139,7 @@ class PipeSessionBridge:
 
             if v_is_leader:
                 await view_state_manager.set_authoritative_session(v_id, session_id)
+                self._leader_cache.setdefault(v_id, set()).add(session_id)
                 if not allow_concurrent_push:
                     await view_state_manager.lock_for_session(v_id, session_id)
         
@@ -217,11 +222,15 @@ class PipeSessionBridge:
                     "session_id": session_id
                 }
             
-            # 2. Try to become leader (Follower promotion)
+            # 2. Try to become leader (Follower promotion) if not known leader
             from fustor_fusion.view_state_manager import view_state_manager
-            is_leader = await view_state_manager.try_become_leader(view_id, session_id)
-            if is_leader:
-                await view_state_manager.set_authoritative_session(view_id, session_id)
+            
+            is_known_leader = session_id in self._leader_cache.get(view_id, set())
+            if not is_known_leader:
+                is_leader = await view_state_manager.try_become_leader(view_id, session_id)
+                if is_leader:
+                    await view_state_manager.set_authoritative_session(view_id, session_id)
+                    self._leader_cache.setdefault(view_id, set()).add(session_id)
         
         # 3. Get final status from pipe
         role = await self._pipe.get_session_role(session_id)
@@ -261,6 +270,10 @@ class PipeSessionBridge:
             
             if session_id in self._session_view_map:
                 del self._session_view_map[session_id]
+            
+            # Remove from leader cache
+            if view_id in self._leader_cache and session_id in self._leader_cache[view_id]:
+                self._leader_cache[view_id].discard(session_id)
         
         # Close in Pipe
         await self._pipe.on_session_closed(session_id)

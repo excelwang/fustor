@@ -10,7 +10,7 @@ from fustor_view_fs.driver import FSViewDriver
 async def mock_check_snapshot(view_id: str):
     pass # Always pass
 
-def mock_get_view_id():
+async def mock_get_view_id():
     return "1"
 
 # Setup App with Router
@@ -53,7 +53,7 @@ async def test_tree_default_recursive(app_client):
         ]
     }
     
-    response = client.get("/tree", params={"path": "/"})
+    response = client.get("/tree", params={"path": "/", "view_id": "1"})
     assert response.status_code == 200
     data = response.json()
     
@@ -71,7 +71,7 @@ async def test_tree_non_recursive(app_client):
     client, driver = app_client
     driver.get_directory_tree.return_value = {"path": "/", "children": []}
     
-    response = client.get("/tree", params={"path": "/", "recursive": "false"})
+    response = client.get("/tree", params={"path": "/", "recursive": "false", "view_id": "1"})
     assert response.status_code == 200
     
     # Verify recursive=False passed
@@ -82,7 +82,7 @@ async def test_tree_max_depth(app_client):
     client, driver = app_client
     driver.get_directory_tree.return_value = {"path": "/", "children": []}
     
-    response = client.get("/tree", params={"path": "/", "max_depth": 2})
+    response = client.get("/tree", params={"path": "/", "max_depth": 2, "view_id": "1"})
     assert response.status_code == 200
     
     driver.get_directory_tree.assert_called_with("/", recursive=True, max_depth=2, only_path=False)
@@ -92,7 +92,7 @@ async def test_tree_only_path(app_client):
     client, driver = app_client
     driver.get_directory_tree.return_value = {"path": "/"}
     
-    response = client.get("/tree", params={"path": "/", "only_path": "true"})
+    response = client.get("/tree", params={"path": "/", "only_path": "true", "view_id": "1"})
     assert response.status_code == 200
     
     driver.get_directory_tree.assert_called_with("/", recursive=True, max_depth=None, only_path=True)

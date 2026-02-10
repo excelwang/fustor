@@ -574,6 +574,16 @@ class FusionPipe(Pipe):
         """
         return self._cached_leader_session
     
+    async def wait_for_drain(self, timeout: float = None) -> bool:
+        """Wait until the event queue is empty."""
+        if self._event_queue.empty():
+            return True
+        try:
+            await asyncio.wait_for(self._queue_drained.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     def __str__(self) -> str:
         return f"FusionPipe({self.id}, state={self.state.name})"
 

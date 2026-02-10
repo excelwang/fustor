@@ -32,6 +32,7 @@ class TestPipeManager:
         receiver_cfg.driver = "http"
         receiver_cfg.bind_host = "127.0.0.1"
         receiver_cfg.port = 8101
+        receiver_cfg.disabled = False
         receiver_cfg.session_timeout_seconds = 30
         receiver_cfg.api_keys = []
         
@@ -45,12 +46,13 @@ class TestPipeManager:
         
         pipe_cfg = MagicMock()
         pipe_cfg.enabled = True
+        pipe_cfg.disabled = False
         pipe_cfg.receiver = "http-main"
         pipe_cfg.views = []
         
         rec_cfg = receiver_cfg
         
-        mock_receivers_config.get_default_pipes.return_value = {"pipe-1": pipe_cfg}
+        mock_receivers_config.get_all_pipes.return_value = {"pipe-1": pipe_cfg}
         mock_receivers_config.resolve_pipe_refs.return_value = {
             "pipe": pipe_cfg,
             "receiver": rec_cfg,
@@ -79,20 +81,24 @@ class TestPipeManager:
         # Mock pipe config
         pipe_cfg = MagicMock()
         pipe_cfg.enabled = True
+        pipe_cfg.disabled = False
         pipe_cfg.views = ["view1"]
         pipe_cfg.receiver = "http-main"
         
         rec_cfg = MagicMock()
         rec_cfg.driver = "http"
         rec_cfg.port = 8102
+        rec_cfg.disabled = False
         rec_cfg.api_keys = []
         rec_cfg.session_timeout_seconds = 30
         
-        mock_receivers_config.get_default_pipes.return_value = {"pipe-1": pipe_cfg}
+        mock_receivers_config.get_all_pipes.return_value = {"pipe-1": pipe_cfg}
+        view_cfg = MagicMock()
+        view_cfg.disabled = False
         mock_receivers_config.resolve_pipe_refs.return_value = {
             "pipe": pipe_cfg,
             "receiver": rec_cfg,
-            "views": {"view1": MagicMock()} # Need a view
+            "views": {"view1": view_cfg} # Need a view
         }
         
         # Mock dependencies

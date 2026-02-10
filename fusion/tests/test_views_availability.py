@@ -7,13 +7,13 @@ from fustor_fusion.view_state_manager import view_state_manager
 
 # 模拟 API Key 认证，直接返回 view_id = 1
 async def mock_get_view_id():
-    return "1"
+    return "test"
 
 @pytest_asyncio.fixture
 async def client():
     # 覆盖认证依赖
     from fustor_fusion.auth.dependencies import get_view_id_from_api_key
-    app.dependency_overrides[get_view_id_from_api_key] = lambda: "1"
+    app.dependency_overrides[get_view_id_from_api_key] = lambda: "test"
     
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         c.headers["X-API-Key"] = "test-key"
@@ -37,7 +37,8 @@ async def mock_view_deps():
 @pytest_asyncio.fixture(autouse=True)
 async def clean_state():
     """每个测试前清空状态管理器"""
-    await view_state_manager.clear_state(1)
+    await view_state_manager.clear_state("test")
+    await view_state_manager.clear_state("test_driver")
     yield
 
 @pytest.mark.asyncio
@@ -52,7 +53,8 @@ async def test_api_unavailable_initially(client):
 @pytest.mark.asyncio
 async def test_api_unavailable_during_sync_phase(client):
     """验证同步进行中（有权威但未完成）返回 503"""
-    await view_state_manager.set_authoritative_session(1, "session-1")
+    await view_state_manager.set_authoritative_session("test", "session-1")
+    await view_state_manager.set_authoritative_session("test_driver", "session-1")
     
     response = await client.get("/api/v1/views/test/status_check")
     assert response.status_code == 503
@@ -61,8 +63,10 @@ async def test_api_unavailable_during_sync_phase(client):
 async def test_api_available_after_sync_phase_complete(client):
     """验证同步完成后接口正常工作"""
     session_id = "session-1"
-    await view_state_manager.set_authoritative_session(1, session_id)
-    await view_state_manager.set_snapshot_complete(1, session_id)
+    await view_state_manager.set_authoritative_session("test", session_id)
+    await view_state_manager.set_snapshot_complete("test", session_id)
+    await view_state_manager.set_authoritative_session("test_driver", session_id)
+    await view_state_manager.set_snapshot_complete("test_driver", session_id)
     
     response = await client.get("/api/v1/views/test/status_check")
     assert response.status_code == 200
@@ -74,18 +78,22 @@ async def test_api_re_locks_on_new_session(client):
     session_new = "session-new"
     
     # 1. 旧会话完成，接口可用
-    await view_state_manager.set_authoritative_session(1, session_old)
-    await view_state_manager.set_snapshot_complete(1, session_old)
+    await view_state_manager.set_authoritative_session("test", session_old)
+    await view_state_manager.set_snapshot_complete("test", session_old)
+    await view_state_manager.set_authoritative_session("test_driver", session_old)
+    await view_state_manager.set_snapshot_complete("test_driver", session_old)
     
     res = await client.get("/api/v1/views/test/status_check")
     assert res.status_code == 200
     
     # 2. 新会话启动，接口应立即变为 503
-    await view_state_manager.set_authoritative_session(1, session_new)
+    await view_state_manager.set_authoritative_session("test", session_new)
+    await view_state_manager.set_authoritative_session("test_driver", session_new)
     response = await client.get("/api/v1/views/test/status_check")
     assert response.status_code == 503
     
     # 3. 新会话完成后重新可用
-    await view_state_manager.set_snapshot_complete(1, session_new)
+    await view_state_manager.set_snapshot_complete("test", session_new)
+    await view_state_manager.set_snapshot_complete("test_driver", session_new)
     res = await client.get("/api/v1/views/test/status_check")
     assert res.status_code == 200

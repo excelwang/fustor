@@ -5,6 +5,7 @@ Consistency management API for audit cycles and sentinel checks.
 from fastapi import APIRouter, Depends, status, HTTPException
 import logging
 import asyncio
+import time
 from typing import Dict, Any, List
 
 from ..auth.dependencies import get_view_id_from_api_key
@@ -61,37 +62,27 @@ async def signal_audit_end(
     elapsed = 0.0
     
 
-    while elapsed < max_wait:
-        queue_size = 0
-        pm = runtime_objects.pipe_manager
-        if pm:
-            pipes = pm.get_pipes()
-            for p in pipes.values():
-                 if hasattr(p, 'view_id') and p.view_id == view_id:
-                     dto = await p.get_dto()
-                     queue_size += dto.get('queue_size', 0)
+    # Replace busy-wait with Event-based wait
+    pm = runtime_objects.pipe_manager
+    if pm:
+        wait_tasks = []
+        pipes = pm.get_pipes()
+        for p in pipes.values():
+                if hasattr(p, 'view_id') and p.view_id == view_id:
+                    if hasattr(p, 'wait_for_drain'):
+                        wait_tasks.append(p.wait_for_drain(timeout=max_wait))
         
-        if queue_size == 0:
-            await asyncio.sleep(wait_interval)
-            # Check again to ensure stability
-            recheck_queue = 0
-            if pm:
-                pipes = pm.get_pipes()
-                for p in pipes.values():
-                     if hasattr(p, 'view_id') and p.view_id == view_id:
-                         dto = await p.get_dto()
-                         recheck_queue += dto.get('queue_size', 0)
-            
-            if recheck_queue == 0:
-                break
-        
-        await asyncio.sleep(wait_interval)
-        elapsed += wait_interval
+        if wait_tasks:
+            logger.info(f"Waiting for {len(wait_tasks)} pipes to drain before audit end...")
+            # Wait for all relevant pipes to drain
+            start_time = time.time()
+            results = await asyncio.gather(*wait_tasks, return_exceptions=True)
+            elapsed = time.time() - start_time
     
     if elapsed >= max_wait:
-        logger.warning(f"Audit end signal timeout waiting for queue drain: queue={queue_size}")
+        logger.warning(f"Audit end signal timeout waiting for pipe drain (waited {max_wait}s)")
     else:
-        logger.info(f"Queue drained for audit end (waited {elapsed:.2f}s), proceeding with missing item detection")
+        logger.info(f"Pipes drained for audit end (waited {elapsed:.2f}s), proceeding with missing item detection")
 
     view_manager = await get_cached_view_manager(view_id)
     driver_ids = view_manager.get_available_driver_ids()
