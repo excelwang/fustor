@@ -16,7 +16,8 @@ class ServiceManager:
         # 系统环境主目录 (FUSTOR_HOME)
         self.env_dir = os.path.join(self.run_dir, ".fustor")
         
-        self.fusion_port = base_port + 2
+        self.fusion_port = base_port + 2 # Management API
+        self.ingest_port = base_port + 3 # Data Receiver
         self.agent_port = base_port
         
         self.fusion_process = None
@@ -42,38 +43,35 @@ class ServiceManager:
             f.write(f"FUSTOR_HOME={self.env_dir}\n")
             f.write(f"FUSTOR_LOG_LEVEL=DEBUG\n")
         
-        # V2: Inject Receivers Config for Fusion (replacing views-config)
+        # V2: Unified Config for Fusion
+        os.makedirs(os.path.join(self.env_dir, "fusion-config"), exist_ok=True)
         self.api_key = "bench-api-key-123456"
-        receivers_config = {
+        fusion_config = {
             "receivers": {
                 "bench-http": {
                     "driver": "http",
-                    "port": self.fusion_port,
+                    "port": self.ingest_port,
                     "host": "0.0.0.0",
-                    "api_keys": {
-                        self.api_key: {
-                            "role": "admin",
-                            "view_mappings": ["bench-view"]
-                        }
-                    }
+                    "api_keys": [
+                        {"key": self.api_key, "pipe_id": "bench-pipe"}
+                    ]
+                }
+            },
+            "views": {
+                "bench-view": {
+                    "driver": "fs",
+                    "driver_params": {"hot_file_threshold": 30.0}
+                }
+            },
+            "pipes": {
+                "bench-pipe": {
+                    "receiver": "bench-http",
+                    "views": ["bench-view"]
                 }
             }
         }
-        with open(os.path.join(self.env_dir, "receivers-config.yaml"), "w") as f:
-            yaml.dump(receivers_config, f)
-        
-        # Inject View Config for Fusion
-        os.makedirs(os.path.join(self.env_dir, "views-config"), exist_ok=True)
-        view_config = {
-            "bench-view": {
-                "view_id": 1,
-                "driver": "fs",
-                "disabled": False,
-                "driver_params": {"uri": "/tmp/bench-view"}
-            }
-        }
-        with open(os.path.join(self.env_dir, "views-config/bench-view.yaml"), "w") as f:
-            yaml.dump(view_config, f)
+        with open(os.path.join(self.env_dir, "fusion-config/default.yaml"), "w") as f:
+            yaml.dump(fusion_config, f)
 
     def _wait_for_service(self, url: str, name: str, timeout: int = 30):
         click.echo(f"Waiting for {name} at {url}...")
@@ -124,57 +122,40 @@ class ServiceManager:
         if os.path.exists(agent_pid):
             os.remove(agent_pid)
 
-        # 1. Sources Config
-        sources_config = {
-            "bench-fs": {
-                "driver": "fs",
-                "uri": self.data_dir,
-                "credential": {"key": "dummy"}, 
-                "disabled": False,
-                "is_transient": True,
-                "driver_params": {
-                    "max_queue_size": 100000,
-                    "max_retries": 1,
-                    "min_monitoring_window_days": 1
+        # V2: Unified Config for Agent
+        os.makedirs(os.path.join(self.env_dir, "agent-config"), exist_ok=True)
+        agent_config = {
+            "sources": {
+                "bench-fs": {
+                    "driver": "fs",
+                    "uri": self.data_dir,
+                    "driver_params": {
+                        "max_queue_size": 100000,
+                        "min_monitoring_window_days": 1
+                    }
+                }
+            },
+            "senders": {
+                "bench-fusion": {
+                    "driver": "fusion",
+                    "uri": f"http://127.0.0.1:{self.ingest_port}",
+                    "credential": {"key": api_key}
+                }
+            },
+            "pipes": {
+                "bench-pipe": {
+                    "source": "bench-fs",
+                    "sender": "bench-fusion",
+                    "audit_interval_sec": kwargs.get("audit_interval", 0),
+                    "sentinel_interval_sec": kwargs.get("sentinel_interval", 0)
                 }
             }
         }
-        with open(os.path.join(self.env_dir, "sources-config.yaml"), "w") as f:
-            yaml.dump(sources_config, f)
-
-        # 2. Senders Config
-        senders_config = {
-            "bench-fusion": {
-                "driver": "http",
-                "endpoint": f"http://127.0.0.1:{self.fusion_port}",
-                "credential": {"key": api_key},
-                "disabled": False,
-                "config": {
-                    "batch_size": 1000,
-                    "max_retries": 10,
-                    "retry_delay_sec": 5
-                }
-            }
-        }
-        with open(os.path.join(self.env_dir, "senders-config.yaml"), "w") as f:
-            yaml.dump(senders_config, f)
-
-        # 3. Pipes Config
-        os.makedirs(os.path.join(self.env_dir, "agent-pipes-config"), exist_ok=True)
-        pipe_config = {
-            "pipe_id": "bench-pipe",
-            "source": "bench-fs",
-            "sender": "bench-fusion",
-            "disabled": False,
-            "audit_interval_sec": kwargs.get("audit_interval", 0),
-            "sentinel_interval_sec": kwargs.get("sentinel_interval", 0)
-        }
-        with open(os.path.join(self.env_dir, "agent-pipes-config/bench-pipe.yaml"), "w") as f:
-            yaml.dump(pipe_config, f)
+        with open(os.path.join(self.env_dir, "agent-config/default.yaml"), "w") as f:
+            yaml.dump(agent_config, f)
             
         cmd = [
-            "fustor-agent", "start",
-            "-p", str(self.agent_port)
+            "fustor-agent", "start"
         ]
         log_file = open(os.path.join(self.env_dir, "agent.log"), "a")
         env = os.environ.copy()
@@ -185,7 +166,8 @@ class ServiceManager:
         self.agent_process = p
         self.processes.append(p)
         
-        self._wait_for_service(f"http://localhost:{self.agent_port}/", "Agent")
+        # Agent has no HTTP management API in V2, so we just wait a bit or check logs
+        time.sleep(2)
 
     def check_agent_logs(self, lines=100):
         log_path = os.path.join(self.env_dir, "agent.log")
@@ -253,16 +235,18 @@ class ServiceManager:
         return None
 
     def trigger_agent_audit(self, pipe_id="bench-pipe"):
-        """Triggers audit for a pipe instance via Agent API."""
-        url = f"http://localhost:{self.agent_port}/api/instances/pipes/{pipe_id}/_actions/trigger_audit"
-        res = requests.post(url)
+        """Triggers audit for a view via Fusion API."""
+        url = f"http://localhost:{self.fusion_port}/api/v1/pipe/consistency/audit/start"
+        headers = {"X-API-Key": self.api_key}
+        res = requests.post(url, headers=headers)
         res.raise_for_status()
         return res.json()
 
     def trigger_agent_sentinel(self, pipe_id="bench-pipe"):
-        """Triggers sentinel for a pipe instance via Agent API."""
-        url = f"http://localhost:{self.agent_port}/api/instances/pipes/{pipe_id}/_actions/trigger_sentinel"
-        res = requests.post(url)
+        """Sentinel check is passive in V2, but we can check tasks."""
+        url = f"http://localhost:{self.fusion_port}/api/v1/pipe/consistency/sentinel/tasks"
+        headers = {"X-API-Key": self.api_key}
+        res = requests.get(url, headers=headers)
         res.raise_for_status()
         return res.json()
 

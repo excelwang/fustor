@@ -266,9 +266,9 @@ class FSDriver(SourceDriver):
             self.watch_manager.touch(p, relative_mtime, is_recursive_upward=False)
 
         # Handle single file case or directory
-        logger.info(f"[{stream_id}] Checking path on disk: {path}")
+        logger.debug(f"[{stream_id}] Checking path on disk: {path}")
         if os.path.isfile(path):
-            logger.info(f"[{stream_id}] Path is a file, yielding single event")
+            logger.debug(f"[{stream_id}] Path is a file, yielding single event")
             try:
                 stat = os.stat(path)
                 meta = get_file_metadata(path, root_path=self.uri, stat_info=stat)

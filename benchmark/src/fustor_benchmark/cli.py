@@ -19,11 +19,12 @@ def cli():
 @click.option("--integrity-interval", default=60.0, help="Wait interval (seconds) for OS Integrity check (simulating NFS sync).")
 @click.option("--fusion-api", help="External Fusion API URL (skips local setup).")
 @click.option("--api-key", help="API Key for external Fusion API.")
+@click.option("--view-id", default="bench-view", help="View ID to query.")
 @click.option("--base-port", default=18100, help="Base port for benchmark microservices.")
-def query(target_dir, concurrency, num_requests, target_depth, integrity_interval, fusion_api, api_key, base_port):
+def query(target_dir, concurrency, num_requests, target_depth, integrity_interval, fusion_api, api_key, view_id, base_port):
     """Executes the automated metadata query & performance benchmark."""
     run_dir = os.path.abspath(DEFAULT_RUN_DIR)
-    runner = BenchmarkRunner(run_dir, target_dir, fusion_api, api_key, base_port=base_port)
+    runner = BenchmarkRunner(run_dir, target_dir, fusion_api, api_key, base_port=base_port, view_id=view_id)
     runner.run(
         concurrency=concurrency, 
         reqs=num_requests, 
@@ -33,11 +34,12 @@ def query(target_dir, concurrency, num_requests, target_depth, integrity_interva
 
 @cli.command()
 @click.argument("target-dir", type=click.Path(exists=True))
+@click.option("--view-id", default="bench-view", help="View ID to query.")
 @click.option("--base-port", default=18100, help="Base port for benchmark microservices.")
-def fs_scan(target_dir, base_port):
+def fs_scan(target_dir, view_id, base_port):
     """Executes the file system scanning (Pre-scan, Snapshot, Audit, Sentinel) benchmarks."""
     run_dir = os.path.abspath(DEFAULT_RUN_DIR)
-    runner = BenchmarkRunner(run_dir, target_dir, base_port=base_port)
+    runner = BenchmarkRunner(run_dir, target_dir, base_port=base_port, view_id=view_id)
     runner.run_fs_scan()
 
 @cli.command()

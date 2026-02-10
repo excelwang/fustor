@@ -17,12 +17,13 @@ from .tasks import (
 from .reporter import calculate_stats, generate_html_report, generate_fs_scan_report
 
 class BenchmarkRunner:
-    def __init__(self, run_dir, target_dir, fusion_api_url=None, api_key=None, base_port=18100):
+    def __init__(self, run_dir, target_dir, fusion_api_url=None, api_key=None, base_port=18100, view_id="bench-view"):
         self.run_dir = os.path.abspath(run_dir)
         self.env_dir = os.path.join(self.run_dir, ".fustor")
         self.data_dir = os.path.abspath(target_dir)
         self.external_api_url = fusion_api_url.rstrip('/') if fusion_api_url else None
         self.external_api_key = api_key
+        self.view_id = view_id
         self.services = ServiceManager(self.run_dir, base_port=base_port) 
         self.services.data_dir = self.data_dir
         self.generator = DataGenerator(self.data_dir)
@@ -35,7 +36,7 @@ class BenchmarkRunner:
         headers = {"X-API-Key": api_key}
         
         try:
-            res = requests.get(f"{fusion_url}/api/v1/views/bench-view/tree", params={"path": "/", "max_depth": max_fetch_depth, "only_path": "true"}, headers=headers, timeout=30)
+            res = requests.get(f"{fusion_url}/api/v1/views/{self.view_id}/tree", params={"path": "/", "max_depth": max_fetch_depth, "only_path": "true"}, headers=headers, timeout=30)
             if res.status_code != 200: return ["/"]
             tree_data = res.json()
             targets = []
@@ -112,7 +113,7 @@ class BenchmarkRunner:
     def run_concurrent_fusion(self, api_key, targets, concurrency=20, requests_count=100):
         click.echo(f"Running Concurrent Fusion API: {concurrency} workers, {requests_count} reqs...")
         fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
-        headers = {"X-API-Key": api_key}
+        headers = {"X-API-Key": api_key, "X-View-ID": self.view_id}
         shuffled_targets = list(targets); random.shuffle(shuffled_targets)
         tasks = [shuffled_targets[i % len(shuffled_targets)] for i in range(requests_count)]
         latencies = []
@@ -127,7 +128,7 @@ class BenchmarkRunner:
     def run_concurrent_fusion_dry_run(self, api_key, targets, concurrency=20, requests_count=100):
         click.echo(f"Running Concurrent Fusion Dry-run: {concurrency} workers, {requests_count} reqs...")
         fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
-        headers = {"X-API-Key": api_key}
+        headers = {"X-API-Key": api_key, "X-View-ID": self.view_id}
         shuffled_targets = list(targets); random.shuffle(shuffled_targets)
         tasks = [shuffled_targets[i % len(shuffled_targets)] for i in range(requests_count)]
         latencies = []
@@ -159,7 +160,7 @@ class BenchmarkRunner:
         while True:
             elapsed = time.time() - start_wait
             try:
-                res = requests.get(f"{fusion_url}/api/v1/views/bench-view/tree", params={"path": "/", "max_depth": 1, "only_path": "true"}, headers=headers, timeout=5)
+                res = requests.get(f"{fusion_url}/api/v1/views/{self.view_id}/tree", params={"path": "/", "max_depth": 1, "only_path": "true"}, headers=headers, timeout=5)
                 if res.status_code == 200:
                     click.echo(f"  [Fusion] READY after {elapsed:.1f}s.")
                     break
@@ -192,7 +193,7 @@ class BenchmarkRunner:
             fusion_stats = self.run_concurrent_fusion(api_key, targets, concurrency, reqs)
             
             fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
-            res_stats = requests.get(f"{fusion_url}/api/v1/views/bench-view/stats", headers={"X-API-Key": api_key})
+            res_stats = requests.get(f"{fusion_url}/api/v1/views/{self.view_id}/stats", headers={"X-API-Key": api_key})
             stats_data = res_stats.json() if res_stats.status_code == 200 else {}
             final_results = {
                 "metadata": {"total_files_in_scope": stats_data.get("total_files", 0), "total_directories_in_scope": stats_data.get("total_directories", 0), "source_path": self.data_dir, "api_endpoint": fusion_url, "integrity_interval": integrity_interval},
@@ -348,7 +349,7 @@ class BenchmarkRunner:
             
             # Get total entries for the report
             fusion_url = self.external_api_url or f"http://localhost:{self.services.fusion_port}"
-            res_stats = requests.get(f"{fusion_url}/api/v1/views/bench-view/stats", headers={"X-API-Key": api_key})
+            res_stats = requests.get(f"{fusion_url}/api/v1/views/{self.view_id}/stats", headers={"X-API-Key": api_key})
             stats_data = res_stats.json() if res_stats.status_code == 200 else {}
             total_entries = stats_data.get("total_files", 0) + stats_data.get("total_directories", 0)
 
