@@ -2,6 +2,12 @@
 # Uses Unified Config V2 format
 # Location: it/config/agent-config/default.yaml
 
+logging:
+  level: "${FUSTOR_LOG_LEVEL}"
+
+agent:
+  heartbeat_interval_sec: ${HEARTBEAT_INTERVAL}
+
 sources:
   shared-fs:
     driver: fs
@@ -26,9 +32,7 @@ pipes:
   integration-test-ds:
     source: shared-fs
     sender: fusion-main
-    disabled: false
     # Universal sync parameters
     audit_interval_sec: ${AUDIT_INTERVAL}
     sentinel_interval_sec: ${SENTINEL_INTERVAL}
-    heartbeat_interval_sec: ${HEARTBEAT_INTERVAL}
     max_consecutive_errors: 100

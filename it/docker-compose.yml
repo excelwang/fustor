@@ -33,11 +33,10 @@ services:
       context: ..
       dockerfile: it/containers/fustor-services/Dockerfile
     container_name: fustor-fusion
-    command: [ "fustor-fusion", "start", "-h", "0.0.0.0", "-p", "8102" ]
+    command: [ "fustor-fusion", "start" ]
     environment:
       FUSTOR_FUSION_HOST: "0.0.0.0"
       FUSTOR_FUSION_PORT: "8102"
-      FUSTOR_FUSION_DATA_DIR: "/data/fusion"
       FUSTOR_LOG_LEVEL: "DEBUG"
       # Use home directory for config
       FUSTOR_HOME: "/root/.fustor"
@@ -83,9 +82,12 @@ services:
       MOUNT_OPTIONS: "actimeo=1,nolock"
       AGENT_ENABLED: "false"
       AGENT_ID: "agent-a"
-      AGENT_PORT: "8100"
-      FUSION_ENDPOINT: "http://fusion:8102"
+      FUSION_ENDPOINT: "http://fusion:18888" # Points to Fusion Receiver Port
       API_KEY: "test-api-key-123"
+      FUSTOR_LOG_LEVEL: "DEBUG"
+      HEARTBEAT_INTERVAL: "5.0"
+      AUDIT_INTERVAL: "60.0"
+      SENTINEL_INTERVAL: "30.0"
       LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
       FAKETIME: "+2 hours"
     volumes:
@@ -129,9 +131,12 @@ services:
       MOUNT_OPTIONS: "actimeo=1,nolock"
       AGENT_ENABLED: "false"
       AGENT_ID: "agent-b"
-      AGENT_PORT: "8100"
-      FUSION_ENDPOINT: "http://fusion:8102"
+      FUSION_ENDPOINT: "http://fusion:18888" # Points to Fusion Receiver Port
       API_KEY: "test-api-key-123"
+      FUSTOR_LOG_LEVEL: "DEBUG"
+      HEARTBEAT_INTERVAL: "5.0"
+      AUDIT_INTERVAL: "60.0"
+      SENTINEL_INTERVAL: "30.0"
       LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
       FAKETIME: "-1h"
     volumes:

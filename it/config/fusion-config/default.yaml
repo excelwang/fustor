@@ -1,11 +1,18 @@
 # Fusion Configuration for Integration Tests
 # Uses Unified Config V2 format
 
+logging:
+  level: "${FUSTOR_LOG_LEVEL}"
+
+fusion:
+  host: "${FUSTOR_FUSION_HOST}"
+  port: ${FUSTOR_FUSION_PORT} # Should be 8102 as per docker-compose
+
 receivers:
   http-main:
     driver: http
     bind_host: "0.0.0.0"
-    port: 8102
+    port: 18888 # Use a separate port for data to avoid conflict with management
     session_timeout_seconds: ${TEST_SESSION_TIMEOUT}
     api_keys:
       - key: "${TEST_API_KEY}"
@@ -14,6 +21,7 @@ receivers:
 views:
   ${TEST_VIEW_ID}:
     driver: fs
+    disabled: false
     driver_params:
       hot_file_threshold: 60.0
       consistency:
