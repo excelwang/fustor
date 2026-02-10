@@ -32,7 +32,7 @@ class FSViewDriver(FSViewBase):
 
     async def process_event(self, event: Any) -> bool:
         """Entry point for all events (Realtime, Snapshot, Audit)."""
-        async with self._global_semaphore:
+        async with self._global_read_lock():
             return await self.arbitrator.process_event(event)
 
     async def handle_audit_start(self):
@@ -47,7 +47,7 @@ class FSViewDriver(FSViewBase):
 
     async def cleanup_expired_suspects(self):
         """Periodic background task to clear 'hot' status from stable files."""
-        async with self._global_semaphore:
+        async with self._global_read_lock():
             return self.arbitrator.cleanup_expired_suspects()
 
     async def on_session_start(self):
@@ -81,24 +81,24 @@ class FSViewDriver(FSViewBase):
     # --- Query Delegation ---
 
     async def get_directory_tree(self, path: str = "/", **kwargs) -> Optional[Dict[str, Any]]:
-        async with self._global_semaphore:
+        async with self._global_read_lock():
             return self.query.get_directory_tree(path=path, **kwargs)
 
     async def get_blind_spot_list(self) -> Dict[str, Any]:
-        async with self._global_semaphore:
+        async with self._global_read_lock():
             return self.query.get_blind_spot_list()
 
     async def get_suspect_list(self) -> Dict[str, float]:
-        async with self._global_semaphore:
+        async with self._global_read_lock():
              suspects = {path: expires_at for path, (expires_at, _) in self.state.suspect_list.items()}
              return suspects
 
     async def search_files(self, query: str) -> List[Dict[str, Any]]:
-        async with self._global_semaphore:
+        async with self._global_read_lock():
             return self.query.search_files(query)
 
     async def get_directory_stats(self) -> Dict[str, Any]:
-        async with self._global_semaphore:
+        async with self._global_read_lock():
             return self.query.get_stats()
 
     async def update_suspect(self, path: str, mtime: float):
@@ -108,7 +108,7 @@ class FSViewDriver(FSViewBase):
         - Stable (mtime unchanged) + TTL expired -> clear suspect (handled by cleanup_expired_suspects)
         - Active (mtime changed) -> renew TTL
         """
-        async with self._global_semaphore:
+        async with self._global_read_lock():
             # Fix: Do NOT sample skew from Sentinel feedback (often old files).
             # This prevents polluting the Skew Histogram with "Lag" from passive verification.
             self.state.logical_clock.update(mtime, can_sample_skew=False)
@@ -177,7 +177,7 @@ class FSViewDriver(FSViewBase):
         """
         from fustor_fusion.core.session_manager import session_manager
         
-        async with self._global_semaphore:
+        async with self._global_read_lock():
             # 1. Find the authoritative session (Leader)
             lead_session_id = await self.arbitrator.get_leader_session_id()
             if not lead_session_id:

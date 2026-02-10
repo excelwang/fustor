@@ -9,16 +9,25 @@ logger = logging.getLogger(__name__)
 class SessionManager:
     """
     Robust In-memory Session Manager.
-    Uses a single background task for expiration to ensure reliability and avoid task proliferation.
+    Uses per-view locks for fine-grained concurrency and a single background
+    task for expiration cleanup.
     """
     
     def __init__(self, default_session_timeout: int = 30):
         # {view_id: {session_id: SessionInfo}}
         self._sessions: Dict[str, Dict[str, SessionInfo]] = {}
-        self._lock = asyncio.Lock()
+        self._view_locks: Dict[str, asyncio.Lock] = {}
         self._default_session_timeout = default_session_timeout
         self._cleanup_task: Optional[asyncio.Task] = None
         self._is_removing: Set[str] = set() # Set of session_ids currently being removed
+
+    def _get_view_lock(self, view_id: str) -> asyncio.Lock:
+        """获取 per-view 锁（惰性创建）。"""
+        lock = self._view_locks.get(view_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._view_locks[view_id] = lock
+        return lock
 
     async def create_session_entry(self, view_id: str, session_id: str, 
                                  task_id: Optional[str] = None, 
@@ -29,7 +38,7 @@ class SessionManager:
         view_id = str(view_id)
         timeout = session_timeout_seconds or self._default_session_timeout
         
-        async with self._lock:
+        async with self._get_view_lock(view_id):
             if view_id not in self._sessions:
                 self._sessions[view_id] = {}
             
@@ -59,7 +68,7 @@ class SessionManager:
     async def queue_command(self, view_id: str, session_id: str, command: Dict[str, Any]) -> bool:
         """Queue a command for the agent to pick up on next heartbeat."""
         view_id = str(view_id)
-        async with self._lock:
+        async with self._get_view_lock(view_id):
             if view_id in self._sessions and session_id in self._sessions[view_id]:
                 session_info = self._sessions[view_id][session_id]
                 if session_info.pending_commands is None:
@@ -79,7 +88,7 @@ class SessionManager:
     async def complete_scan(self, view_id: str, session_id: str, path: str) -> bool:
         """Mark a scan as complete."""
         view_id = str(view_id)
-        async with self._lock:
+        async with self._get_view_lock(view_id):
             if view_id in self._sessions and session_id in self._sessions[view_id]:
                 session_info = self._sessions[view_id][session_id]
                 if session_info.pending_scans and path in session_info.pending_scans:
@@ -90,7 +99,7 @@ class SessionManager:
     async def has_pending_scan(self, view_id: str, path: str) -> bool:
         """Check if any session has a pending scan for the given path."""
         view_id = str(view_id)
-        async with self._lock:
+        async with self._get_view_lock(view_id):
             if view_id in self._sessions:
                 for session_info in self._sessions[view_id].values():
                     if session_info.pending_scans and path in session_info.pending_scans:
@@ -106,7 +115,7 @@ class SessionManager:
         """
         view_id = str(view_id)
         commands = []
-        async with self._lock:
+        async with self._get_view_lock(view_id):
             if view_id in self._sessions and session_id in self._sessions[view_id]:
                 session_info = self._sessions[view_id][session_id]
                 session_info.last_activity = time.monotonic()
@@ -124,17 +133,23 @@ class SessionManager:
 
     async def get_session_info(self, view_id: str, session_id: str) -> Optional[SessionInfo]:
         view_id = str(view_id)
-        async with self._lock:
-            return self._sessions.get(view_id, {}).get(session_id)
+        # Lock-free read: dict.get is atomic in CPython
+        view_sessions = self._sessions.get(view_id)
+        if view_sessions:
+            return view_sessions.get(session_id)
+        return None
 
     async def get_view_sessions(self, view_id: str) -> Dict[str, SessionInfo]:
         view_id = str(view_id)
-        async with self._lock:
-            return self._sessions.get(view_id, {}).copy()
+        # Lock-free read + copy for snapshot isolation
+        view_sessions = self._sessions.get(view_id)
+        if view_sessions:
+            return view_sessions.copy()
+        return {}
 
     async def get_all_active_sessions(self) -> Dict[str, Dict[str, SessionInfo]]:
-        async with self._lock:
-            return {vid: s.copy() for vid, s in self._sessions.items()}
+        # Snapshot copy of top-level dict; each view dict is also copied
+        return {vid: s.copy() for vid, s in self._sessions.items()}
 
     async def remove_session(self, view_id: str, session_id: str) -> bool:
         """Public API to remove a session."""
@@ -146,7 +161,8 @@ class SessionManager:
 
     async def clear_all_sessions(self, view_id: str) -> bool:
         view_id = str(view_id)
-        async with self._lock:
+        # Collect session IDs under lock, then terminate each outside
+        async with self._get_view_lock(view_id):
             if view_id not in self._sessions:
                 return False
             sids = list(self._sessions[view_id].keys())
@@ -161,7 +177,7 @@ class SessionManager:
         Consolidated session termination logic.
         Handles state removal, role release, and promotion.
         """
-        async with self._lock:
+        async with self._get_view_lock(view_id):
             if session_id in self._is_removing:
                 return False # Already being removed
             
@@ -201,7 +217,7 @@ class SessionManager:
             
             # 3. Handle Promotion if leader left
             if is_leader:
-                async with self._lock:
+                async with self._get_view_lock(view_id):
                     remaining_sessions = list(self._sessions.get(view_id, {}).keys())
                 
                 for rsid in remaining_sessions:
@@ -212,8 +228,7 @@ class SessionManager:
             
             return True
         finally:
-            async with self._lock:
-                self._is_removing.discard(session_id)
+            self._is_removing.discard(session_id)
 
     async def _check_if_view_live(self, view_id: str) -> bool:
         from ..view_manager.manager import get_cached_view_manager
@@ -245,15 +260,15 @@ class SessionManager:
         now = time.monotonic()
         expired = []
         
-        async with self._lock:
-            for vid, sessions in self._sessions.items():
-                for sid, si in sessions.items():
-                    if sid in self._is_removing:
-                        continue
-                    
-                    elapsed = now - si.last_activity
-                    if elapsed >= si.session_timeout_seconds:
-                        expired.append((vid, sid))
+        # Scan all views for expired sessions (lock-free reads for checking)
+        for vid, sessions in list(self._sessions.items()):
+            for sid, si in list(sessions.items()):
+                if sid in self._is_removing:
+                    continue
+                
+                elapsed = now - si.last_activity
+                if elapsed >= si.session_timeout_seconds:
+                    expired.append((vid, sid))
         
         for vid, sid in expired:
             await self._terminate_session_internal(vid, sid, "expired")

@@ -3,6 +3,7 @@
 Data Views API Router Generator.
 """
 import logging
+import time
 from typing import Callable, Any, Optional, Dict
 from fastapi import APIRouter, HTTPException, Depends, status
 from importlib.metadata import entry_points
@@ -12,6 +13,18 @@ from ..view_manager.manager import get_cached_view_manager
 from ..config.unified import fusion_config
 
 logger = logging.getLogger(__name__)
+
+# Config cache to avoid reloading YAML on every request
+_config_cache_time: float = 0.0
+_CONFIG_CACHE_TTL: float = 5.0  # seconds
+
+def _reload_config_if_stale():
+    """Reload config at most once per TTL period."""
+    global _config_cache_time
+    now = time.monotonic()
+    if now - _config_cache_time > _CONFIG_CACHE_TTL:
+        fusion_config.reload()
+        _config_cache_time = now
 
 # Base router for all view-related endpoints
 view_router = APIRouter(tags=["Data Views"])
@@ -40,8 +53,8 @@ async def get_view_driver_instance(view_id: str, lookup_key: str):
 def make_metadata_limit_checker(view_name: str) -> Callable:
     """Creates a dependency that ensures a request doesn't exceed metadata limits."""
     async def check_limit(view_id: str = Depends(get_view_id_from_api_key)):
-        # Ensure latest config is loaded
-        fusion_config.reload()
+        # Ensure latest config is loaded (with TTL caching)
+        _reload_config_if_stale()
         # Get view config
         view_cfg = fusion_config.get_view(view_name)
         if not view_cfg:

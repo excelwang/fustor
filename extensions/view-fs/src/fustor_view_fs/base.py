@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from fustor_core.drivers import ViewDriver
 from fustor_core.clock import LogicalClock
 from .nodes import DirectoryNode, FileNode
+from .rwlock import AsyncRWLock
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,10 @@ class FSViewBase(ViewDriver):
     """
     Base class for FS View Drivers, inheriting from the core ViewDriver ABC.
     Provides shared state and concurrency primitives.
+    
+    Concurrency Model:
+    - Read operations (queries, process_event) use read_lock (concurrent).
+    - Write operations (audit_start/end, reset, session_start) use write_lock (exclusive).
     """
     
     def __init__(self, id: str, view_id: str, config: Optional[Dict[str, Any]] = None, hot_file_threshold: float = 30.0):
@@ -31,9 +36,8 @@ class FSViewBase(ViewDriver):
         self.logger = logging.getLogger(f"fustor_view.fs.{view_id}")
         self.hot_file_threshold = float(threshold)
         
-        # Concurrency management
-        self._MAX_READERS = 1000
-        self._global_semaphore = asyncio.Semaphore(self._MAX_READERS)
+        # Concurrency management: AsyncRWLock replaces Semaphore×1000
+        self._rwlock = AsyncRWLock()
         self._segment_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 
     def _get_segment_lock(self, path: str) -> asyncio.Lock:
@@ -46,11 +50,12 @@ class FSViewBase(ViewDriver):
 
     @asynccontextmanager
     async def _global_exclusive_lock(self):
-        """Context manager to acquire the global semaphore exclusively."""
-        for _ in range(self._MAX_READERS):
-            await self._global_semaphore.acquire()
-        try:
+        """Acquire exclusive write lock (blocks all readers)."""
+        async with self._rwlock.write_lock():
             yield
-        finally:
-            for _ in range(self._MAX_READERS):
-                self._global_semaphore.release()
+
+    @asynccontextmanager
+    async def _global_read_lock(self):
+        """Acquire shared read lock (concurrent with other readers)."""
+        async with self._rwlock.read_lock():
+            yield

@@ -103,7 +103,9 @@ class FusionPipe(Pipe):
         # Processing task
         self._processing_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
-        self._event_queue: asyncio.Queue = asyncio.Queue()
+        self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
+        self._queue_drained = asyncio.Event()  # Signaled when queue becomes empty
+        self._queue_drained.set()  # Initially empty
         
         # Statistics
         self.statistics = {
@@ -226,6 +228,10 @@ class FusionPipe(Pipe):
                 get_metrics().histogram("fustor.fusion.processing_latency", duration, {"pipe": self.id})
                 
                 self._event_queue.task_done()
+                
+                # Signal queue drain if empty
+                if self._event_queue.empty():
+                    self._queue_drained.set()
                 
             except asyncio.CancelledError:
                 logger.debug(f"Processing loop cancelled for pipe {self.id}")
@@ -414,9 +420,8 @@ class FusionPipe(Pipe):
         if not self.is_running():
             return {"success": False, "error": "Pipe not running"}
         
-        async with self._lock:
-            self.statistics["events_received"] += len(events)
-            logger.debug(f"Pipe {self.id}: Received {len(events)} events from {session_id} (source={source_type})")
+        self.statistics["events_received"] += len(events)
+        logger.debug(f"Pipe {self.id}: Received {len(events)} events from {session_id} (source={source_type})")
         
         # Convert dict events to EventBase if needed
         processed_events = []
@@ -439,6 +444,8 @@ class FusionPipe(Pipe):
         
         # Queue for processing
         get_metrics().counter("fustor.fusion.events_received", len(processed_events), {"pipe": self.id, "source": source_type})
+        # Clear drain event since we're adding work
+        self._queue_drained.clear()
         await self._event_queue.put(processed_events)
         
         # Handle snapshot completion signal
@@ -502,18 +509,18 @@ class FusionPipe(Pipe):
         sessions = await session_manager.get_view_sessions(self.view_id)
         leader = await view_state_manager.get_leader(self.view_id)
         
-        async with self._lock:
-            return {
-                "id": self.id,
-                "view_id": self.view_id,
-                "state": self.state.name if hasattr(self.state, 'name') else str(self.state),
-                "info": self.info,
-                "view_handlers": self.get_available_views(),
-                "active_sessions": len(sessions),
-                "leader_session": leader,
-                "statistics": self.statistics.copy(),
-                "queue_size": self._event_queue.qsize(),
-            }
+        # Lock-free: all reads are safe in asyncio single-thread model
+        return {
+            "id": self.id,
+            "view_id": self.view_id,
+            "state": self.state.name if hasattr(self.state, 'name') else str(self.state),
+            "info": self.info,
+            "view_handlers": self.get_available_views(),
+            "active_sessions": len(sessions),
+            "leader_session": leader,
+            "statistics": self.statistics.copy(),
+            "queue_size": self._event_queue.qsize(),
+        }
     
     async def get_aggregated_stats(self) -> Dict[str, Any]:
         """Get aggregated statistics from all view handlers."""

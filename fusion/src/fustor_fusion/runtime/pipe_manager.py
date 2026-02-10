@@ -28,8 +28,17 @@ class PipeManager:
         self._receivers: Dict[str, Receiver] = {} # Keyed by signature (driver, port)
         self._bridges: Dict[str, Any] = {}
         self._session_to_pipe: Dict[str, str] = {}
-        self._lock = asyncio.Lock()
+        self._init_lock = asyncio.Lock()  # Only for initialization/start/stop
+        self._pipe_locks: Dict[str, asyncio.Lock] = {}  # Per-pipe locks for session ops
         self._target_pipe_ids: List[str] = []
+    
+    def _get_pipe_lock(self, pipe_id: str) -> asyncio.Lock:
+        """获取 per-pipe 锁（惰性创建）。"""
+        lock = self._pipe_locks.get(pipe_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._pipe_locks[pipe_id] = lock
+        return lock
     
     async def initialize_pipes(self, config_list: Optional[List[str]] = None):
         """
@@ -44,7 +53,7 @@ class PipeManager:
         self._target_pipe_ids = self._resolve_target_pipes(config_list)
         
         initialized_count = 0
-        async with self._lock:
+        async with self._init_lock:
             for p_id in self._target_pipe_ids:
                 try:
                     resolved = fusion_config.resolve_pipe_refs(p_id)
@@ -167,7 +176,7 @@ class PipeManager:
         return targets
 
     async def start(self):
-        async with self._lock:
+        async with self._init_lock:
             for p_id, pipe in self._pipes.items():
                 await pipe.start()
             for r_sig, receiver in self._receivers.items():
@@ -175,7 +184,7 @@ class PipeManager:
             logger.info("Fusion components started")
     
     async def stop(self):
-        async with self._lock:
+        async with self._init_lock:
             for r_sig, receiver in self._receivers.items():
                 await receiver.stop()
             for p_id, pipe in self._pipes.items():
@@ -207,11 +216,13 @@ class PipeManager:
 
     # --- Receiver Callbacks (UNCHANGED) ---
     async def _on_session_created(self, session_id, task_id, pipe_id, client_info, session_timeout_seconds):
-        async with self._lock:
-            pipe = self._pipes.get(pipe_id)
-            if not pipe: raise ValueError(f"Pipe {pipe_id} not found")
-            bridge = self._bridges.get(pipe_id)
-            # Create session via bridge (legacy compat)
+        # Lock-free lookup (pipes dict is stable after init)
+        pipe = self._pipes.get(pipe_id)
+        if not pipe: raise ValueError(f"Pipe {pipe_id} not found")
+        bridge = self._bridges.get(pipe_id)
+        
+        # Per-pipe lock for session creation
+        async with self._get_pipe_lock(pipe_id):
             source_uri = client_info.get("source_uri") if client_info else None
             result = await bridge.create_session(
                 task_id=task_id, 
@@ -221,7 +232,6 @@ class PipeManager:
                 source_uri=source_uri
             )
             self._session_to_pipe[session_id] = pipe_id
-            # Return updated SessionInfo with source_uri
             info = SessionInfo(session_id, task_id, pipe_id, result["role"], time.time(), time.time())
             info.source_uri = source_uri
             return info
@@ -243,9 +253,9 @@ class PipeManager:
         return {"status": "error"}
 
     async def _on_session_closed(self, session_id):
-        async with self._lock:
-            pipe_id = self._session_to_pipe.pop(session_id, None)
-            if pipe_id:
+        pipe_id = self._session_to_pipe.pop(session_id, None)
+        if pipe_id:
+            async with self._get_pipe_lock(pipe_id):
                 bridge = self._bridges.get(pipe_id)
                 if bridge: await bridge.close_session(session_id)
 
