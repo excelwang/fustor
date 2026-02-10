@@ -191,7 +191,10 @@ async def heartbeat(
     if not is_locked_by_session:
         await view_state_manager.lock_for_session(view_id, session_id)
     
-    success, commands = await session_manager.keep_session_alive(view_id, session_id, client_ip=request.client.host)
+    payload = await request.json()
+    can_realtime = payload.get("can_realtime", False)
+    
+    success, commands = await session_manager.keep_session_alive(view_id, session_id, client_ip=request.client.host, can_realtime=can_realtime)
     if not success:  # Should match session existence check above, but for safety
         logger.warning(f"Session {session_id} not found during heartbeat update (race condition?)")
     
@@ -253,6 +256,7 @@ async def list_sessions(
         session_data = {
             "session_id": session_id,
             "task_id": session_info.task_id,
+            "agent_id": session_info.task_id.split(":")[0] if session_info.task_id and ":" in session_info.task_id else session_info.task_id,
             
             "client_ip": session_info.client_ip,
             "source_uri": session_info.source_uri,
