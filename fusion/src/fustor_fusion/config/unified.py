@@ -46,7 +46,6 @@ class ReceiverConfig(BaseModel):
     driver: str = "http"
     bind_host: str = "0.0.0.0"
     port: int = 8102
-    session_timeout_seconds: int = 3600
     api_keys: List[APIKeyConfig] = []
 
 

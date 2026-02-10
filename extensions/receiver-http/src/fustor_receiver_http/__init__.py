@@ -2,13 +2,16 @@
 Fustor HTTP Receiver - Transport layer for Fusion to receive events from Agents.
 
 This package implements the HTTP transport protocol for receiving events
-on the Fusion side. It provides FastAPI routers that can be mounted into
-the Fusion application.
+on the Fusion side. Each HTTPReceiver starts its own independent HTTP server
+on its configured port.
 """
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional, Callable, Awaitable
 from dataclasses import dataclass
 import uuid
+
+import uvicorn
 
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from pydantic import BaseModel
@@ -95,7 +98,7 @@ class HTTPReceiver(Receiver):
         self,
         receiver_id: str,
         bind_host: str = "0.0.0.0",
-        port: int = 8101,
+        port: int = 8102,
         credentials: Optional[Dict[str, Any]] = None,
         config: Optional[Dict[str, Any]] = None
     ):
@@ -112,14 +115,19 @@ class HTTPReceiver(Receiver):
         self._api_key_to_pipe: Dict[str, str] = {}
         self._api_key_cache: Dict[str, str] = {}
         
-        
         # Session timeout configuration
         self.session_timeout_seconds = config.get("session_timeout_seconds", 30) if config else 30
-
         
         # Create routers
         self._session_router = self._create_session_router()
         self._ingestion_router = self._create_ingestion_router()
+        
+        # Build the standalone FastAPI app for this receiver
+        self._app = self._create_app()
+        
+        # Server lifecycle
+        self._server: Optional[uvicorn.Server] = None
+        self._serve_task: Optional[asyncio.Task] = None
     
     def register_callbacks(
         self,
@@ -173,13 +181,49 @@ class HTTPReceiver(Receiver):
             
         return None
     
+    def _create_app(self):
+        """Create a standalone FastAPI app for this receiver."""
+        from fastapi import FastAPI
+        receiver_app = FastAPI(
+            title=f"Fustor Receiver ({self.id})",
+            version="1.0.0",
+        )
+        
+        api_router = APIRouter(prefix="/api/v1/pipe")
+        api_router.include_router(self._session_router, prefix="/session")
+        api_router.include_router(self._ingestion_router, prefix="/ingest")
+        receiver_app.include_router(api_router)
+        
+        return receiver_app
+
     async def start(self) -> None:
-        """Start the receiver (routers are mounted externally)."""
-        self.logger.info(f"HTTP Receiver {self.id} ready on {self.get_address()}")
+        """Start the receiver's own HTTP server on its configured port."""
+        config = uvicorn.Config(
+            app=self._app,
+            host=self.bind_host,
+            port=self.port,
+            log_level="info",
+        )
+        self._server = uvicorn.Server(config)
+        self._serve_task = asyncio.create_task(self._server.serve())
+        self.logger.info(f"HTTP Receiver {self.id} started on {self.get_address()}")
     
     async def stop(self) -> None:
-        """Stop the receiver gracefully."""
+        """Stop the receiver's HTTP server gracefully."""
         self.logger.info(f"HTTP Receiver {self.id} stopping")
+        if self._server:
+            self._server.should_exit = True
+        if self._serve_task:
+            try:
+                await asyncio.wait_for(self._serve_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self.logger.warning(f"HTTP Receiver {self.id} shutdown timed out, cancelling")
+                self._serve_task.cancel()
+            except Exception:
+                pass
+            self._serve_task = None
+        self._server = None
+        self.logger.info(f"HTTP Receiver {self.id} stopped")
     
     def get_session_router(self) -> APIRouter:
         """Get the session management router."""
@@ -188,6 +232,10 @@ class HTTPReceiver(Receiver):
     def get_ingestion_router(self) -> APIRouter:
         """Get the event ingestion router."""
         return self._ingestion_router
+    
+    def get_app(self):
+        """Get the standalone FastAPI app."""
+        return self._app
     
     def _create_session_router(self) -> APIRouter:
         """Create the session management router."""

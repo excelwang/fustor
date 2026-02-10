@@ -68,7 +68,6 @@ class PipeManager:
                                 receiver_id=r_id,
                                 bind_host=r_cfg.bind_host,
                                 port=r_cfg.port,
-                                config={"session_timeout_seconds": r_cfg.session_timeout_seconds}
                             )
                             receiver.register_callbacks(
                                 on_session_created=self._on_session_created,
@@ -130,6 +129,17 @@ class PipeManager:
                     
                 except Exception as e:
                     logger.error(f"Failed to initialize pipe {p_id}: {e}", exc_info=True)
+            
+            # Mount consistency router onto each HTTP receiver's app
+            # so Agent can reach sentinel/audit endpoints via the receiver port
+            from ..api.consistency import consistency_router
+            from fastapi import APIRouter
+            for r_sig, receiver in self._receivers.items():
+                if isinstance(receiver, HTTPReceiver) and hasattr(receiver, 'get_app'):
+                    consistency_api = APIRouter(prefix="/api/v1/pipe")
+                    consistency_api.include_router(consistency_router)
+                    receiver.get_app().include_router(consistency_api)
+                    logger.info(f"Mounted consistency router on receiver {receiver.id}")
             
         return {"initialized": initialized_count}
 

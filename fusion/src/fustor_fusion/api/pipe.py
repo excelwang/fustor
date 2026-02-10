@@ -27,8 +27,10 @@ pipe_router = APIRouter(tags=["Pipe"])
 
 def setup_pipe_routers():
     """
-    Mount routers from HTTPReceiver into the pipe_router, 
-    falling back to legacy routers if configured.
+    Setup pipe management routers on the main Fusion app.
+    
+    Note: Session and Ingestion routers are no longer mounted here.
+    They are served by each HTTPReceiver on its own independent port.
     
     This is called during application lifespan startup.
     """
@@ -38,36 +40,6 @@ def setup_pipe_routers():
     if runtime_objects.pipe_manager is None:
         logger.error("setup_pipe_routers called before pipe_manager initialized!")
         return False
-        
-    success = False
-    
-    # Get the default HTTP receiver (e.g., 'http-main')
-    # Try looking up by common ID first
-    receiver = runtime_objects.pipe_manager.get_receiver("http-main")
-    
-    # If not found, try to find ANY http receiver
-    if not receiver:
-        # scan for http receiver
-        # accessing private _receivers is risky, assume get_receiver handles it or add get_http_receiver
-        pass
-    
-    # Actually, let's rely on get_receiver handling config ID lookup
-    if not receiver:
-         # Try to find valid receiver from loaded configs (even if not yet instantiated by active pipe)
-         receivers_cfg = fusion_config.get_all_receivers()
-         for rid, rcfg in receivers_cfg.items():
-             if rcfg.driver == 'http':
-                 receiver = runtime_objects.pipe_manager.get_receiver(rid)
-                 if receiver: break
-    
-    if receiver and hasattr(receiver, "get_session_router"):
-        logger.info(f"Mounting Session and Ingestion routers from HTTPReceiver ({receiver.id})")
-        pipe_router.include_router(receiver.get_session_router(), prefix="/session")
-        pipe_router.include_router(receiver.get_ingestion_router(), prefix="/ingest")
-        success = True
-            
-    if not success:
-        logger.error("HTTPReceiver not found! Pipe API will be incomplete.")
     
     # Consistency router handles its own delegation
     pipe_router.include_router(consistency_router)
@@ -116,7 +88,7 @@ def setup_pipe_routers():
         
         return {"active_sessions": all_sessions, "count": len(all_sessions)}
 
-    return success
+    return True
 
 # NOTE: We no longer mount routers here at module level.
 # They are mounted via setup_pipe_routers() in main.py lifespan.
