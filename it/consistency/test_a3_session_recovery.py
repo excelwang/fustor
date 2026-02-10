@@ -66,11 +66,15 @@ class TestSessionRecovery:
         assert new_session_id is not None, "Agent A did not create a new session"
         assert new_session_id != old_session_id, "Agent A should have a DIFFERENT session ID"
         
-        # 5. Verify it has a valid role
-        # We allow both Leader and Follower roles here because in a race condition 
-        # or multi-agent test environment, the recovered agent might not immediately 
-        # regain leadership if another agent is present or election is in progress.
-        role = next(s["role"] for s in fusion_client.get_sessions() if s["session_id"] == new_session_id)
+        # 5. Verify it has a valid role and system availability (Proposal B.2)
+        all_sessions = fusion_client.get_sessions()
+        recovered_a = next((s for s in all_sessions if s["session_id"] == new_session_id), None)
+        assert recovered_a is not None
+        role = recovered_a.get("role")
         assert role in ["leader", "follower"], f"Recovered session should have a valid role, but got {role}"
         
-        logger.info("✅ Session recovery verified successfully")
+        # Verify cluster health: at least one leader must exist
+        leaders = [s for s in all_sessions if s.get("role") == "leader"]
+        assert len(leaders) >= 1, f"Cluster must have at least one Leader after recovery. Sessions: {all_sessions}"
+
+        logger.info("✅ Session recovery verified successfully with strict availability checks")

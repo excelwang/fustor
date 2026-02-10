@@ -3,7 +3,7 @@ import pytest
 import time
 from it.utils.docker_manager import DockerManager
 from it.utils.fusion_client import FusionClient
-from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, INGESTION_DELAY
+from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, EXTREME_TIMEOUT, INGESTION_DELAY, HOT_FILE_THRESHOLD
 
 logger = logging.getLogger("fustor_test")
 
@@ -63,19 +63,21 @@ async def test_future_timestamp_visibility(
     relative_path = "future_file.txt"
     relative_slash_path = "/future_file.txt"
     
-    # Get current physical time from Agent A
-    res = containers.exec_in_container("fustor-nfs-client-a", ["date", "+%s"])
-    agent_now = float(res.stdout.strip())
+    # Get current physical time from Client C (which has no skew)
+    # Using Client C ensures we create a "mini future" relative to Fusion's reference time.
+    res = containers.exec_in_container("fustor-nfs-client-c", ["date", "+%s"])
+    base_now = float(res.stdout.strip())
     
     # Set Future Mtime = Now + SHORT_TIMEOUT
-    future_time = agent_now + SHORT_TIMEOUT
-    future_time_str = time.strftime('%Y%m%d%H%M.%S', time.localtime(future_time))
+    future_time = base_now + SHORT_TIMEOUT
+    # Use gmtime because containers are typically in UTC, whereas host might be in local TZ
+    future_time_str = time.strftime('%Y%m%d%H%M.%S', time.gmtime(future_time))
     
-    logger.info(f"Step 1: Creating Future File {test_path} at T+{SHORT_TIMEOUT}s")
+    logger.info(f"Step 1: Creating Future File {test_path} at T+{SHORT_TIMEOUT}s (relative to normal time, UTC string: {future_time_str})")
     
     # Create file with future timestamp
-    # Note: docker exec uses absolute path in container
-    containers.exec_in_container("fustor-nfs-client-a", ["touch", "-t", future_time_str, test_path])
+    # Note: touch -t uses [[CC]YY]MMDDhhmm[.ss]
+    containers.exec_in_container("fustor-nfs-client-c", ["touch", "-t", future_time_str, test_path])
     
     # 2. Wait for ingestion reliably
     logger.info("Step 2: Waiting for ingestion...")
@@ -104,9 +106,9 @@ async def test_future_timestamp_visibility(
         logger.info("Verified: Node is initially SUSPECT.")
 
     # 4. Wait for Time to Pass (Catch Up)
-    # We need to wait > SHORT_TIMEOUT for physical time to cross future_time.
-    wait_time = MEDIUM_TIMEOUT
-    logger.info(f"Step 3: Waiting {wait_time}s for time to catch up...")
+    # We need to wait > HOT_FILE_THRESHOLD (60s) + SHORT_TIMEOUT (5s) + Safety Buffer
+    wait_time = HOT_FILE_THRESHOLD + SHORT_TIMEOUT + 5
+    logger.info(f"Step 3: Waiting {wait_time}s for time to catch up and cross threshold...")
     time.sleep(wait_time)
     
     # NOTE: We need to trigger an event to update the clock!

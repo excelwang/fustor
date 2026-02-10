@@ -73,6 +73,8 @@ class TestTombstoneCleanup:
             
             # Step 2-3: Use a marker file to detect Audit completion
             # Audit End triggers the cleanup
+            # Marker MUST be in the root directory to ensure the parent (root) mtime changes,
+            # triggering Audit to scan the tree. Ref: specs/02-CONSISTENCY_DESIGN.md §3.1
             marker_file = f"{MOUNT_POINT}/audit_marker_d4_{int(time.time())}.txt"
             marker_file_rel = "/" + os.path.relpath(marker_file, MOUNT_POINT)
             

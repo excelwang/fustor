@@ -50,11 +50,29 @@ self.watch_manager.schedule(path, lru_timestamp)
 
 **效果**：即使 NFS 上某个孤岛文件跳变到 2050 年，该文件在 Agent 内部也只会自保（计算出的归一化年龄依然是正常的），而不会导致全树的归一化年龄被拉大而导致其他文件被提前踢出缓存。
 
-### 3.2 职责限制
+### 3.2 统一时间参考要求 (Unified Time Reference Requirement)
+**CRITICAL**:
 
-Agent 侧的时钟逻辑**仅用于本地资源管理**，不驱动全局逻辑。Agent 发送的消息始终携带：
-- 原始 `mtime`
-- 采集时的物理观察时刻（`index` 字段，毫秒级物理时间戳）
+Agent 内部的所有事件生成组件（Scanner, Watcher, Poller）**必须统一使用**经过漂移补偿的影子参考时间（Shadow Reference Time），即 `Time + Drift`。
+
+**禁止行为 (Split-Brain Timer)**:
+- 禁止 Snapshot Scanner 和 Realtime Watcher 使用 不同类型的时间戳（如Realtime模型使用Raw Time，而Snapshot模型使用Drift补偿后的Time）。
+- **后果**: 如果 Agent 时钟滞后于 NFS (`Drift > 0`)，切换到 Realtime 模式时，事件时间戳会从"未来"跳变回"现在"。
+- **故障现象**: Agent 内部的总线（EventBus）会检测到索引回退（Index Regression），并根据单调递增原则**丢弃**这些合法的实时事件，导致数据丢失。
+
+**正确实现**:
+所有事件的 `index` 字段生成逻辑必须一致：
+```python
+event_index = int((time.time() + self.drift_from_nfs) * 1000)
+```
+
+### 3.3 职责限制
+
+Agent 侧的时钟逻辑主要用于本地资源管理 (LRU) 和 **维持内部事件单调性**，但也通过 `index` 字段将校准后的时间传递给 Fusion。
+
+Agent 发送的消息携带：
+- 原始 `mtime` (NFS 及其逻辑时间)
+- 校准后的 `index` (Shadow Reference Time，毫秒级)
 
 ---
 

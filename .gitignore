@@ -7,7 +7,6 @@ wheels/
 *.egg-info
 .pytest_cache
 fustor-benchmark-run
-refactored-legacy-version
 # Virtual environments
 .venv
 
@@ -26,3 +25,5 @@ uv.lock
 *.db
 it/.env_state
 .agent/skills
+bug_list.md
+it/proposals

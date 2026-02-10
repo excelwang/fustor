@@ -44,6 +44,14 @@
 | **视图即真相** | Fusion 内存树是经过仲裁后的最终状态 |
 | **IO 可控** | 只有 Leader Agent 执行 Snapshot/Audit |
 
+### 1.4 Path Normalization Contract (路径归一化契约)
+
+为确保多 Agent (尤其是 Shared Storage 场景) 视图的一致合并，所有 Source Driver **必须** 遵循以下路径生成规则：
+1.  **Relative Path**: 输出路径必须相对于配置的 `root_path` / `uri`。
+2.  **Leading Slash**: 归一化后的路径必须以 `/` 开头 (例如 `/foo/bar.txt`)。
+    - Agent A (`/mnt/data`) 和 Agent B (`/home/user/share`) 监控同一 NFS 目录时，必须都能生成相同的 `/foo/bar.txt` 键值。
+3.  **Consistency**: Realtime, Snapshot, Audit 三种模式生成的路径必须完全一致。
+
 ---
 
 ## 2. 架构：Leader/Follower 模式
@@ -401,6 +409,17 @@ for path in audit_seen_paths:
 | **陈旧证据保护** | `Physical Time` | `if node.last_updated_at > audit_start: skip_deletion` |
 | **Suspect TTL 过期** | `Monotonic Time` | `if time.monotonic() > expiry_monotonic: check_stability` |
 
+### 6.3 NFS Clock Drift Compensation (NFS 时钟漂移补偿)
+
+由于 Agent 运行在物理机上的时钟可能与 NFS Server 的时钟（即文件 mtime 的来源）存在偏差，为了保证物理时间戳（index）与逻辑时间戳（mtime）的可比性，Source Driver 必须执行漂移补偿。
+
+**机制 (Shadow Reference Frame)**：
+- **Sampling**: Agent 启动时执行 Pre-scan，收集所有目录的 recursive mtime。
+- **Reference Selection**: 选取 P99 分位的 mtime 作为 `latest_mtime_stable` (排除未来时间或极端异常值)。
+- **Drift Calculation**: `drift = latest_mtime_stable - time.time()`。这里假设最活跃的目录 mtime 极其接近 NFS Server 当前时间。
+- **Correction**: 生成事件时，物理时间戳 `index` = `(time.time() + drift) * 1000`。
+- **目的**: 确保 Fusion 收到的事件 `index` 大致对齐到 NFS 的时间轴，防止因 Agent 时钟大幅落后导致事件被误判为"陈旧"而被丢弃。
+
 ---
 
 ## 7. 审计生命周期
@@ -450,6 +469,20 @@ Fusion 收到反馈后通过 `driver.update_suspect()` 执行稳定性判定。�
 | 全局级 | Blind-spot List 非空 | `has_blind_spot: true` (通过 `/views/{view_id}/tree/stats`) |
 | 文件级 | 文件在 Suspect List 中 | `integrity_suspect: true` |
 | 盲区查询 | 需获取详细盲区文件列表 | 使用 `/views/{view_id}/tree/blind-spots` API |
+
+### 9.2 Standard Response Format (标准响应格式)
+
+核心数据接口 (如 `/tree`) **必须** 使用信封结构包裹返回结果，以支持元数据扩展：
+
+```json
+{
+  "data": { ... core_domain_object ... },
+  "scan_pending": boolean,  // True if a realtime scan was triggered and pending
+  "meta": { ... }           // Optional additional metadata
+}
+```
+
+客户端SDK负责自动解包 `data` 字段，向上层应用提供纯净的领域对象。
 
 ### 9.1 主动查询 (Real-Time Query)
 

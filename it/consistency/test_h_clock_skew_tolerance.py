@@ -13,10 +13,9 @@ import time
 import logging
 from ..utils import docker_manager
 from ..conftest import (
-    CONTAINER_CLIENT_A, 
-    CONTAINER_CLIENT_B, 
     MOUNT_POINT
 )
+from ..utils.path_utils import to_view_path
 from ..fixtures.constants import (
     EXTREME_TIMEOUT, 
     LONG_TIMEOUT, 
@@ -90,7 +89,7 @@ class TestClockSkewTolerance:
         import os.path
         filename = f"audit_discovery_{int(time.time())}.txt"
         file_path = f"{MOUNT_POINT}/{filename}"
-        file_rel = "/" + os.path.relpath(file_path, MOUNT_POINT)
+        file_rel = to_view_path(file_path)
         
         # 1. Create file from Client C (No Agent)
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path, "from_c")
@@ -125,7 +124,7 @@ class TestClockSkewTolerance:
         import os.path
         filename = f"past_rt_{int(time.time())}.txt"
         file_path = f"{MOUNT_POINT}/{filename}"
-        file_rel = "/" + os.path.relpath(file_path, MOUNT_POINT)
+        file_rel = to_view_path(file_path)
         
         # 1. Create file via Client C (Host time)
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path, "orig")
@@ -141,7 +140,21 @@ class TestClockSkewTolerance:
         flags = fusion_client.check_file_flags(file_rel)
         assert flags["integrity_suspect"] is False, "Realtime update should clear suspect status"
 
-    def test_logical_clock_jumps_forward_and_remains_stable(
+        # 5. Explicit Regression Test for Split-Brain Timer (Proposal A.1)
+        # Verify that a brand new file from the skewed agent correctly reaches Fusion.
+        probe_file = f"lag_probe_{int(time.time())}.txt"
+        probe_path = f"{MOUNT_POINT}/{probe_file}"
+        probe_rel = "/" + probe_file
+        
+        logger.info(f"Creating Realtime Probe from lagging Agent B: {probe_file}")
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_B, probe_path, "probe")
+        
+        # This will fail if Agent B drops the event due to Index Regression (Part A.1)
+        assert fusion_client.wait_for_file_in_tree(probe_rel, timeout=MEDIUM_TIMEOUT) is not None, \
+            "Realtime event from lagging Agent B was dropped (possible Split-Brain Timer regression)"
+        logger.info("Verified: Realtime events from lagging Agent survive skew.")
+
+    def test_logical_clock_remains_stable_despite_skew(
         self,
         docker_env,
         fusion_client,
@@ -150,54 +163,56 @@ class TestClockSkewTolerance:
         wait_for_audit
     ):
         """
-        验证逻辑时钟处理跳跃式的未来更新。
+        验证逻辑时钟不受 Agent 时钟偏移的影响而跳变。
         
         场景：
-          1. Agent A (+2h) 创建一个文件，推动逻辑时钟跳变。
-          2. 然后在 Client C (正常时间) 创建一个文件。
-        预期：
-          - 逻辑时钟水位线由于 Agent A 的文件而推进。
-          - 后续正常文件被视为"旧"的（Age ~ 2h），不会标记为 suspect。
+          1. Agent A (+2h) 创建一个文件。由于 Source-FS 修正了 drift，事件 index 应接近物理时间。
+          2. 验证 Logical Clock 仍接近 Host 物理时间 (未被推向未来)。
+          3. Client C (正常时间) 创建一个文件。
+          4. 验证该文件被正确视为"新鲜" (Age ~ 0) 并标记为 Suspect (安全)。
         """
         import os.path
         # 1. Agent A (+2h) creates a file
-        filename_a = f"jump_trigger_{int(time.time())}.txt"
+        filename_a = f"stable_trigger_{int(time.time())}.txt"
         file_path_a = f"{MOUNT_POINT}/{filename_a}"
-        file_path_a_rel = "/" + os.path.relpath(file_path_a, MOUNT_POINT)
+        file_path_a_rel = to_view_path(file_path_a)
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["touch", file_path_a])
         
-        # Wait for discovery to ensure clock jumped
+        # Wait for discovery
         assert fusion_client.wait_for_file_in_tree(file_path_a_rel, timeout=LONG_TIMEOUT) is not None
         
         stats = fusion_client.get_stats()
         logical_now = stats.get("logical_now", 0)
         host_now = time.time()
         logger.info(f"Watermark after A: {logical_now}, Host Physical: {host_now}")
-        assert logical_now > host_now + 7100, "Logical Clock should have jumped forward via Agent A's mtime"
+        
+        # The drift fix ensures Index ~ Physical Time. So Logical Clock shouldn't jump +7200s.
+        # Allow some small skew/latency (e.g. 60s).
+        diff = logical_now - host_now
+        assert diff < 600, f"Logical Clock jumped too far forwards ({diff}s). Drift fix failed?"
+        assert diff > -600, f"Logical Clock lagged too far behind ({diff}s)."
         
         # 2. Now create a NORMAL file (Host time) from Client C
-        normal_file = f"cold_file_{int(time.time())}.txt"
+        normal_file = f"fresh_file_{int(time.time())}.txt"
         file_path_normal = f"{MOUNT_POINT}/{normal_file}"
-        file_path_normal_rel = "/" + os.path.relpath(file_path_normal, MOUNT_POINT)
+        file_path_normal_rel = to_view_path(file_path_normal)
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path_normal, "normal")
         
         # 3. Wait for Audit to discover it
-        # (We use a marker to be sure audit finished after the file was created)
-        audit_marker = f"marker_jump_{int(time.time())}.txt"
+        audit_marker = f"marker_stable_{int(time.time())}.txt"
         audit_marker_path = f"{MOUNT_POINT}/{audit_marker}"
-        audit_marker_rel = "/" + os.path.relpath(audit_marker_path, MOUNT_POINT)
+        audit_marker_rel = to_view_path(audit_marker_path)
         
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, audit_marker_path, "marker")
         assert fusion_client.wait_for_file_in_tree(audit_marker_rel, timeout=EXTREME_TIMEOUT) is not None
         
-        # 4. Verify the normal file is NOT suspect
+        # 4. Verify the normal file IS suspect (Because it's fresh!)
+        # Previous test expected Not Suspect because Logical Age was 2h.
+        # Now Logical Age is 0s. Physical Age is 0s.
+        # Age < Threshold -> Suspect.
         assert fusion_client.wait_for_file_in_tree(file_path_normal_rel) is not None
         flags = fusion_client.check_file_flags(file_path_normal_rel)
-        logger.info(f"Post-jump normal file flags: {flags}")
+        logger.info(f"Normal file flags: {flags}")
         
-        # With Skew Normalization (Physical Age), the file is identified as PHYSICALLY FRESH (0s old).
-        # Logical Age = 2h (Old), Physical Age = 0s (Fresh).
-        # age = min(2h, 0s) = 0s.
-        # So it SHOULD be Suspect.
         assert flags["integrity_suspect"] is True, \
-            f"File from Local Present (Physical Age ~0) should be suspect despite Logical Clock Jump ({logical_now})"
+            "Fresh file should be suspect (Logical Clock remained stable, did not age the file artificially)"

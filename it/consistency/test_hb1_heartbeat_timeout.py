@@ -51,18 +51,20 @@ class TestHeartbeatTimeout:
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["sh", "-c", "kill -STOP $(cat /root/.fustor/agent.pid)"])
         
         # 3. Wait for session timeout in Fusion
-        # Fusion timeout is SESSION_TIMEOUT. Wait SESSION_VANISH_TIMEOUT to be safe.
-        logger.info(f"Waiting {SESSION_VANISH_TIMEOUT}s for session to expire in Fusion...")
-        time.sleep(SESSION_VANISH_TIMEOUT)
+        # Fusion timeout is SESSION_TIMEOUT. Replace hard sleep with polling.
+        logger.info(f"Polling for session {old_session_id} to expire in Fusion...")
         
-        # Verify session is gone from Fusion's perspective
-        sessions_after = fusion_client.get_sessions()
-        if old_session_id in [s["session_id"] for s in sessions_after]:
-            logger.warning(f"Session {old_session_id} still exists in Fusion. Waiting a bit more...")
-            time.sleep(SESSION_VANISH_TIMEOUT)
-            sessions_after = fusion_client.get_sessions()
+        from ..utils.wait_helpers import wait_for_condition
+        
+        def is_session_expired():
+            sessions = fusion_client.get_sessions()
+            return old_session_id not in [s["session_id"] for s in sessions]
             
-        assert old_session_id not in [s["session_id"] for s in sessions_after], "Session should have expired"
+        wait_for_condition(
+            is_session_expired, 
+            timeout=SESSION_VANISH_TIMEOUT * 2, 
+            fail_msg=f"Session {old_session_id} did not expire within timeout"
+        )
         
         # 4. Resume Agent A
         logger.info(f"Resuming container {CONTAINER_CLIENT_A}...")
@@ -79,12 +81,13 @@ class TestHeartbeatTimeout:
             logs_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/agent.log"])
             logs = logs_res.stdout + logs_res.stderr
             
-            # Aggressive Fast-Fail
-            critical_errors = ["Traceback", "SyntaxError", "AttributeError", "FATAL", "Exception"]
-            for err in critical_errors:
-                if err in logs:
+            # Aggressive Fast-Fail (BUT skip known non-fatal exceptions)
+            # Ref: Proposal B.1 - Avoid false positives on expected recovery exceptions
+            fatal_patterns = ["SyntaxError", "AttributeError", "FATAL", "Unhandled exception", "Traceback (most recent call last)"]
+            for pattern in fatal_patterns:
+                if pattern in logs:
                     logger.error(f"Agent A CRITICAL ERROR detected in agent.log:\n{logs}")
-                    pytest.fail(f"Agent A failed with {err}")
+                    pytest.fail(f"Agent A failed with {pattern}")
             
             # Check if process is still alive
             ps_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["ps", "aux"])
@@ -93,7 +96,6 @@ class TestHeartbeatTimeout:
                 pytest.fail("Agent A process died during recovery")
 
             sessions = fusion_client.get_sessions()
-            logger.debug(f"Current Fusion sessions: {[s.get('agent_id') for s in sessions]}")
             agent_a_sessions = [s for s in sessions if "client-a" in s.get("agent_id", "")]
             if agent_a_sessions:
                 new_session_id = agent_a_sessions[0]["session_id"]
@@ -102,13 +104,16 @@ class TestHeartbeatTimeout:
                     break
             time.sleep(POLL_INTERVAL)
             
-        if new_session_id is None:
-            # DUMP LOG FILE ON FAILURE
-            logs_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/agent.log"])
-            logs = logs_res.stdout + logs_res.stderr
-            logger.error(f"FATAL: Agent A did not recover. Dumping agent.log:\n{logs}")
-            
         assert new_session_id is not None, "Agent A did not create a new session after timeout"
         assert new_session_id != old_session_id, "Agent A should have a DIFFERENT session ID"
         
-        logger.info("✅ Heartbeat timeout recovery verified successfully")
+        # 6. Verify Cluster Health (Proposal B.1)
+        recovered_sessions = fusion_client.get_sessions()
+        recovered_a = next((s for s in recovered_sessions if s["session_id"] == new_session_id), None)
+        assert recovered_a is not None
+        assert recovered_a.get("role") in ["leader", "follower"], f"Recovered session should have a valid role, got {recovered_a.get('role')}"
+        
+        leaders = [s for s in recovered_sessions if s.get("role") == "leader"]
+        assert len(leaders) >= 1, f"Cluster must have at least one Leader after recovery. Sessions: {recovered_sessions}"
+        
+        logger.info("✅ Heartbeat timeout recovery verified successfully with strict health checks")

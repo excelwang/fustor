@@ -21,7 +21,7 @@ from fustor_core.models.config import SourceConfig
 from fustor_core.event import EventBase, UpdateEvent, DeleteEvent, MessageSource
 
 from .components import _WatchManager, safe_path_handling
-from .event_handler import OptimizedWatchEventHandler, get_file_metadata
+from .event_handler import OptimizedWatchEventHandler, get_file_metadata, _get_relative_path
 from .scanner import FSScanner
 
 logger = logging.getLogger("fustor_agent.driver.fs")
@@ -269,7 +269,7 @@ class FSDriver(SourceDriver):
                 stat = os.stat(path)
                 meta = get_file_metadata(path, root_path=self.uri, stat_info=stat)
                 yield UpdateEvent(
-                    key=os.path.relpath(path, self.uri),
+                    key=_get_relative_path(path, self.uri),
                     schema="fs",
                     rows=[meta]
                 )
