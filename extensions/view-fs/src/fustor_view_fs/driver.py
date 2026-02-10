@@ -16,6 +16,8 @@ class FSViewDriver(FSViewBase):
     Coordinates various components to maintain a fused, consistent view 
     of the FS using Smart Merge arbitration logic.
     """
+    target_schema = "fs"
+
     def __init__(self, id: str, view_id: str, config: Optional[Dict[str, Any]] = None):
         super().__init__(id, view_id, config) 
         

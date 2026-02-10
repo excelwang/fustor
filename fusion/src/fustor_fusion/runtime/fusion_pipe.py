@@ -243,14 +243,16 @@ class FusionPipe(Pipe):
     
     async def _dispatch_to_handlers(self, event: EventBase) -> None:
         """
-        Dispatch an event to all registered view handlers with fault isolation.
-        
-        Features:
-        - Timeout protection: Handlers that take too long are timed out
-        - Per-handler degradation: Repeatedly failing handlers are disabled
-        - Error containment: One handler's failure doesn't affect others
+        Dispatch an event to matching view handlers with fault isolation.
         """
         for handler_id, handler in self._view_handlers.items():
+            # 1. Schema Routing Check
+            # If handler has a specific schema_name, it must match the event's schema.
+            # Empty schema_name means it's a generic handler (like ViewManagerAdapter).
+            if handler.schema_name and handler.schema_name != event.event_schema:
+                if handler.schema_name != "view-manager": # Special case for aggregator
+                    continue
+
             # Skip disabled handlers unless they have recovered
             if handler_id in self._disabled_handlers:
                 if not self._attempt_handler_recovery(handler_id):

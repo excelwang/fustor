@@ -153,6 +153,16 @@ class SourceHandlerAdapter(SourceHandler):
         if hasattr(self._driver, 'perform_sentinel_check'):
             return self._driver.perform_sentinel_check(task_batch)
         return {}
+
+    def scan_path(self, path: str, recursive: bool = True) -> Iterator[Any]:
+        """
+        Perform on-demand scan using the driver.
+        
+        Delegates to the underlying driver's scan_path method.
+        """
+        if hasattr(self._driver, 'scan_path'):
+            return self._driver.scan_path(path, recursive=recursive)
+        return iter([])
     
     def is_transient(self) -> bool:
         """

@@ -24,7 +24,8 @@ async def test_heartbeat_failure_backoff(mock_source, mock_sender, pipe_config):
         {"role": "leader"},
         RuntimeError("Transient error"),
         RuntimeError("Transient error"),
-        {"role": "leader"}
+        RuntimeError("Transient error"),
+        RuntimeError("Transient error"),
     ])
     
     pipe = AgentPipe(

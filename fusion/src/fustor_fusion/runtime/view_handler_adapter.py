@@ -148,22 +148,6 @@ class ViewDriverAdapter(ViewHandler):
 class ViewManagerAdapter(ViewHandler):
     """
     Adapts the entire ViewManager to a single ViewHandler interface.
-    
-    This is useful when you want to treat the ViewManager's multi-driver
-    routing as a single handler in the FusionPipe.
-    
-    Example usage:
-        from fustor_fusion.view_manager.manager import ViewManager
-        
-        manager = ViewManager(view_id="1")
-        await manager.initialize_driver_instances()
-        
-        handler = ViewManagerAdapter(manager)
-        
-        # Use as a single handler
-        pipe = FusionPipe(
-            view_handlers=[handler]
-        )
     """
     
     def __init__(
@@ -171,18 +155,12 @@ class ViewManagerAdapter(ViewHandler):
         view_manager: "ViewManager",
         config: Optional[Dict[str, Any]] = None
     ):
-        """
-        Initialize the adapter.
-        
-        Args:
-            view_manager: The ViewManager instance
-            config: Optional configuration overrides
-        """
         super().__init__(
             handler_id=f"view-manager-{view_manager.view_id}",
             config=config or {}
         )
         self._manager = view_manager
+        # "view-manager" acts as a wildcard schema in FusionPipe routing
         self.schema_name = "view-manager"
     
     @property

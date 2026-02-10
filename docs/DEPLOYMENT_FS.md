@@ -158,7 +158,6 @@ pipes:
 
 ```yaml
 # 0. 全局配置
-# heartbeat_interval_sec: 10.0 # [默认]
 
 sources:
   nfs-source-a:

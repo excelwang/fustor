@@ -30,6 +30,9 @@ class FSDriver(SourceDriver):
     _instances: Dict[str, 'FSDriver'] = {}
     _lock = threading.Lock()
     
+    # Schema metadata
+    schema_name = "fs"
+    
     # FS driver doesn't require discovery as fields are fixed metadata.
     require_schema_discovery = False
 
@@ -73,7 +76,8 @@ class FSDriver(SourceDriver):
         )
         self.event_handler = OptimizedWatchEventHandler(
             self.event_queue, 
-            self.watch_manager
+            self.watch_manager,
+            event_schema=self.schema_name
         )
         self.watch_manager.event_handler = self.event_handler
         self._pre_scan_completed = False
@@ -171,7 +175,7 @@ class FSDriver(SourceDriver):
         def touch_callback(path, relative_mtime):
             self.watch_manager.touch(path, relative_mtime, is_recursive_upward=False)
 
-        yield from scanner.scan_snapshot(self.uri, batch_size=batch_size, callback=touch_callback)
+        yield from scanner.scan_snapshot(self.schema_name, batch_size=batch_size, callback=touch_callback)
         
         logger.info(f"[{stream_id}] Snapshot scan completed.")
 
@@ -227,7 +231,7 @@ class FSDriver(SourceDriver):
         file_pattern = self.config.driver_params.get("file_pattern", "*")
 
         scanner = FSScanner(self.uri, num_workers=self._executor._max_workers, file_pattern=file_pattern)
-        yield from scanner.scan_audit(self.uri, mtime_cache or {}, batch_size=batch_size)
+        yield from scanner.scan_audit(self.schema_name, mtime_cache or {}, batch_size=batch_size)
         logger.info(f"[{stream_id}] Audit scan completed.")
 
     def scan_path(self, path: str, recursive: bool = True) -> Iterator[EventBase]:
@@ -262,7 +266,7 @@ class FSDriver(SourceDriver):
             self.watch_manager.touch(p, relative_mtime, is_recursive_upward=False)
 
         if recursive:
-            yield from scanner.scan_snapshot(path, batch_size=100, callback=touch_callback)
+            yield from scanner.scan_snapshot(self.schema_name, batch_size=100, callback=touch_callback)
         else:
             # Non-recursive: only return directory metadata itself
             try:
@@ -270,7 +274,8 @@ class FSDriver(SourceDriver):
                 meta = get_file_metadata(path, root_path=self.uri, stat_info=stat)
                 yield UpdateEvent(
                     key=_get_relative_path(path, self.uri),
-                    schema="fs",
+                    event_schema=self.schema_name,
+                    table="files",
                     rows=[meta]
                 )
             except Exception as e:

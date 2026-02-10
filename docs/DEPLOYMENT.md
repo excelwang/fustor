@@ -207,7 +207,6 @@ fustor-agent reload
 | `host` | string | `"0.0.0.0"` | (Fusion) 管理 API 监听地址 |
 | `port` | int | `8101` | (Fusion) 管理 API 监听端口 |
 | `session_cleanup_interval` | float | `60.0` | (Fusion) 会话清理间隔(秒) |
-| `heartbeat_interval_sec` | float | `10.0` | (Agent) 心跳间隔(秒) |
 
 
 ### 6.2 Fusion 配置参数

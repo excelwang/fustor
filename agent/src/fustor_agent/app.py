@@ -121,11 +121,12 @@ class App:
         # 1. Get or create event bus for source
         # Use source ID from config for sharing
         source_id = pipe_cfg.source
+        task_id = f"{self.agent_id}:{pipe_id}"
         
         bus_runtime, _ = await self.event_bus_service.get_or_create_bus_for_subscriber(
             source_id=source_id,
             source_config=source_cfg,
-            pipe_id=pipe_id,
+            pipe_id=task_id,
             required_position=0,
             fields_mapping=pipe_cfg.fields_mapping
         )
@@ -178,7 +179,7 @@ class App:
         await pipe.stop()
         
         # Release subscriber from bus
-        await self.event_bus_service.release_subscriber(pipe.bus.id, pipe_id)
+        await self.event_bus_service.release_subscriber(pipe.bus.id, pipe.task_id)
         
         del self.pipe_runtime[pipe_id]
         self.logger.info(f"Pipe '{pipe_id}' stopped and resources released")

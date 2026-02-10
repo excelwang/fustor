@@ -123,6 +123,17 @@ class SourceHandler(Handler):
         """
         return {}
 
+    def scan_path(self, path: str, recursive: bool = True) -> Iterator[EventBase]:
+        """
+        On-demand scan of a specific path.
+        
+        Optional - default returns empty iterator.
+        
+        Returns:
+            Iterator yielding events for the specified path
+        """
+        return iter([])
+
 
 class ViewHandler(Handler):
     """

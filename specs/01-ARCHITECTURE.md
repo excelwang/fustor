@@ -406,7 +406,6 @@ sender: fusion-http
 enabled: true
 audit_interval_sec: 600
 sentinel_interval_sec: 120
-heartbeat_interval_sec: 10
 ```
 
 ### 7.2 Fusion 配置

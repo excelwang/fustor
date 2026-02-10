@@ -54,6 +54,7 @@ class HeartbeatResponse(BaseModel):
     role: Optional[str] = None
     message: Optional[str] = None
     can_realtime: Optional[bool] = None
+    commands: Optional[List[Dict[str, Any]]] = None
 
 
 # --- Session Handler Protocol ---
@@ -330,7 +331,8 @@ class HTTPReceiver(Receiver):
                     return HeartbeatResponse(
                         status=result.get("status", "ok"),
                         role=result.get("role"),
-                        message=result.get("message")
+                        message=result.get("message"),
+                        commands=result.get("commands")
                     )
                 except HTTPException:
                     raise

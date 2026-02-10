@@ -146,6 +146,14 @@ class ViewManager:
         results = {}
         
         for driver_id, driver_instance in self.driver_instances.items():
+            # Schema Routing: 
+            # 1. If driver specifies target_schema, check if it matches event_schema
+            # 2. If target_schema is empty, broadcast (legacy/generic behavior)
+            target = getattr(driver_instance, "target_schema", "")
+            if target and target != event.event_schema:
+                # Skip this driver for this event
+                continue
+
             try:
                 result = await driver_instance.process_event(event)
                 results[driver_id] = result

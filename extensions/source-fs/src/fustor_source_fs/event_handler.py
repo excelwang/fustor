@@ -52,10 +52,11 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
     Event handler that processes watchdog events immediately using dedicated
     on_* methods, which is the idiomatic way to use watchdog.
     """
-    def __init__(self, event_queue: queue.Queue, watch_manager: _WatchManager):
+    def __init__(self, event_queue: queue.Queue, watch_manager: _WatchManager, event_schema: str = "fs"):
         super().__init__()
         self.event_queue = event_queue
         self.watch_manager = watch_manager
+        self.event_schema = event_schema
         # Path -> last_sent_time mapping to throttle on_modified for files
         self.last_modified_sent: Dict[str, float] = {}
         self.throttle_interval = float(getattr(watch_manager, 'throttle_interval', 5.0))
@@ -93,7 +94,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 rel_del_path = _get_relative_path(del_path, self.watch_manager.root_path)
                 row = {FSSchemaFields.PATH: rel_del_path}
                 delete_event = DeleteEvent(
-                    event_schema=self.watch_manager.root_path,
+                    event_schema=self.event_schema,
                     table="files",
                     rows=[row],
                     fields=list(row.keys()),
@@ -105,7 +106,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 metadata = get_file_metadata(add_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     update_event = UpdateEvent(
-                        event_schema=self.watch_manager.root_path,
+                        event_schema=self.event_schema,
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
@@ -121,7 +122,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 rel_del_path = _get_relative_path(subdir_del_path, self.watch_manager.root_path)
                 row = {FSSchemaFields.PATH: rel_del_path}
                 delete_event = DeleteEvent(
-                    event_schema=self.watch_manager.root_path,
+                    event_schema=self.event_schema,
                     table="files",
                     rows=[row],
                     fields=list(row.keys()),
@@ -132,7 +133,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 metadata = get_file_metadata(subdir_add_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     update_event = UpdateEvent(
-                        event_schema=self.watch_manager.root_path,
+                        event_schema=self.event_schema,
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
@@ -147,7 +148,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 metadata = get_file_metadata(event.src_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     update_event = UpdateEvent(
-                        event_schema=self.watch_manager.root_path,
+                        event_schema=self.event_schema,
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
@@ -170,7 +171,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             rel_path = _get_relative_path(event.src_path, self.watch_manager.root_path)
             row = {FSSchemaFields.PATH: rel_path}
             delete_event = DeleteEvent(
-                event_schema=self.watch_manager.root_path,
+                event_schema=self.event_schema,
                 table="files",
                 rows=[row],
                 fields=list(row.keys()),
@@ -199,7 +200,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
             rel_src_path = _get_relative_path(event.src_path, self.watch_manager.root_path)
             delete_row = {FSSchemaFields.PATH: rel_src_path}
             delete_event = DeleteEvent(
-                event_schema=self.watch_manager.root_path,
+                event_schema=self.event_schema,
                 table="files",
                 rows=[delete_row],
                 fields=list(delete_row.keys()),
@@ -220,7 +221,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 metadata = get_file_metadata(event.dest_path, root_path=self.watch_manager.root_path)
                 if metadata:
                     update_event = UpdateEvent(
-                        event_schema=self.watch_manager.root_path,
+                        event_schema=self.event_schema,
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
@@ -255,7 +256,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 if metadata:
                     metadata["is_atomic_write"] = False  # Mark as dirty (partial write)
                     update_event = UpdateEvent(
-                        event_schema=self.watch_manager.root_path,
+                        event_schema=self.event_schema,
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
@@ -277,7 +278,7 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
                 if metadata:
                     metadata["is_atomic_write"] = True # Mark as clean (write finished)
                     update_event = UpdateEvent(
-                        event_schema=self.watch_manager.root_path,
+                        event_schema=self.event_schema,
                         table="files",
                         rows=[metadata],
                         fields=list(metadata.keys()),
