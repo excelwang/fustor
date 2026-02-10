@@ -74,9 +74,9 @@ async def run_bus_message_sync(pipe: "AgentPipe") -> None:
     try:
         while pipe.is_running() or (pipe.state & PipeState.RECONNECTING):
             # 1. Fetch from bus
-            # Use pipe.id for bus operations to match subscription ID
+            # Use pipe.task_id for bus operations to match subscription ID
             events = await pipe._bus.internal_bus.get_events_for(
-                pipe.id, 
+                pipe.task_id, 
                 pipe.batch_size, 
                 timeout=0.2  # 200ms poll timeout
             )
@@ -102,17 +102,17 @@ async def run_bus_message_sync(pipe: "AgentPipe") -> None:
                 pipe.statistics["events_pushed"] += len(events)
                 get_metrics().counter("fustor.agent.events_pushed", len(events), {"pipe": pipe.id, "phase": "realtime_bus"})
                 
-                # Commit to bus using pipe.id
+                # Commit to bus using pipe.task_id
                 if pipe._bus_service:
                     await pipe._bus_service.commit_and_handle_split(
                         pipe._bus.id, 
-                        pipe.id, 
+                        pipe.task_id, 
                         len(events), 
                         events[-1].index,
                         pipe.config.get("fields_mapping", [])
                     )
                 else:
-                    await pipe._bus.internal_bus.commit(pipe.id, len(events), events[-1].index)
+                    await pipe._bus.internal_bus.commit(pipe.task_id, len(events), events[-1].index)
             else:
                 logger.warning(f"Pipe {pipe.id}: Failed to send bus events")
                 await asyncio.sleep(1.0) # Wait before retry

@@ -92,7 +92,7 @@ class AgentPipe(Pipe):
         
         # Configuration (Timeouts and Heartbeats are managed by Fusion and updated in on_session_created)
         self.session_timeout_seconds = 30
-        self.heartbeat_interval_sec = 10.0
+        self.heartbeat_interval_sec = config.get("heartbeat_interval_sec", 10.0)
         
         self.audit_interval_sec = config.get("audit_interval_sec", 600)       # Seconds between audit cycles (0 to disable)
         self.sentinel_interval_sec = config.get("sentinel_interval_sec", 120) # Seconds between sentinel checks (0 to disable)

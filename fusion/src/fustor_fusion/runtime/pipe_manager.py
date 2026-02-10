@@ -243,7 +243,8 @@ class PipeManager:
             if pipe:
                 res = await pipe.process_events(events, session_id, source_type, is_end=is_end)
                 return res.get("success", False)
-        return False
+        # Session not found or pipe gone
+        raise ValueError(f"Session {session_id} not found or expired")
 
     async def _on_heartbeat(self, session_id, can_realtime=False):
         pipe_id = self._session_to_pipe.get(session_id)

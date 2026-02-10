@@ -43,6 +43,34 @@ async def lifespan(app: FastAPI):
     # Initialize pipes based on targets
     await pm.initialize_pipes(config_list)
     
+    # Check for port conflicts and attach receivers if needed
+    current_port_env = os.environ.get("FUSTOR_FUSION_PORT", "8102")
+    try:
+        current_port = int(current_port_env)
+    except ValueError:
+        current_port = 8102
+        
+    logger.info(f"Checking for port conflicts. Main port: {current_port} (Env: {current_port_env})")
+    
+    from fustor_receiver_http import HTTPReceiver
+    
+    logger.info(f"Current receivers in PM: {list(pm._receivers.keys())}")
+    
+    for sig, receiver in pm._receivers.items():
+        logger.info(f"Checking receiver {receiver.id}: type={type(receiver)}, port={receiver.port}")
+        if isinstance(receiver, HTTPReceiver) and receiver.port == current_port:
+            logger.info(f"Receiver {receiver.id} matches main port {current_port} - attaching routers to main app")
+            
+            # Attach routers to main app to serve on the same port
+            app.include_router(receiver.get_session_router(), prefix="/api/v1/pipe/session")
+            app.include_router(receiver.get_ingestion_router(), prefix="/api/v1/pipe/ingest")
+            
+            # Disable standalone start/stop for this receiver
+            async def noop(): 
+                logger.info(f"Skipping start for attached receiver {receiver.id}")
+            receiver.start = noop
+            receiver.stop = noop
+    
     # Setup Pipe API routers
     from .api.pipe import setup_pipe_routers
     setup_pipe_routers()

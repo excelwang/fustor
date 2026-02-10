@@ -376,6 +376,12 @@ class HTTPReceiver(Receiver):
                         )
                 except HTTPException:
                     raise
+                except ValueError as e:
+                    # Handle specific logic errors (e.g. Session not found) as 404/400
+                    raise HTTPException(
+                        status_code=status.HTTP_404_NOT_FOUND,
+                        detail=str(e)
+                    )
                 except Exception as e:
                     receiver.logger.error(f"Event ingestion failed: {e}")
                     raise HTTPException(

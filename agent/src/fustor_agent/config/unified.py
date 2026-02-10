@@ -42,6 +42,7 @@ class AgentPipeConfig(BaseModel):
     # Sync intervals
     audit_interval_sec: float = 600.0
     sentinel_interval_sec: float = 120.0
+    heartbeat_interval_sec: float = 10.0
     
     # Reliability configuration
     error_retry_interval: float = 5.0

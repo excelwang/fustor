@@ -144,8 +144,9 @@ class TestComponentCrashIsolation:
         base_url = fusion_client.base_url
 
         # --- 测试 1: 发送完全无效的 JSON ---
+        # Use fake session ID to target the actual endpoint
         resp = requests.post(
-            f"{base_url}/api/v1/pipe/ingest",
+            f"{base_url}/api/v1/pipe/ingest/fake-session/events",
             data="THIS_IS_NOT_JSON",
             headers={"Content-Type": "application/json"},
             timeout=5
@@ -156,7 +157,7 @@ class TestComponentCrashIsolation:
 
         # --- 测试 2: 发送合法 JSON 但 Schema 不匹配 ---
         resp = requests.post(
-            f"{base_url}/api/v1/pipe/ingest",
+            f"{base_url}/api/v1/pipe/ingest/fake-session/events",
             json={"invalid_field": "no_session_id", "garbage": True},
             timeout=5
         )
@@ -187,8 +188,9 @@ class TestComponentCrashIsolation:
         base_url = fusion_client.base_url
 
         # --- 测试 1: 空 Batch (边界条件) ---
+        # Use fake session ID to target the actual endpoint
         resp = requests.post(
-            f"{base_url}/api/v1/pipe/ingest",
+            f"{base_url}/api/v1/pipe/ingest/fake-session/events",
             json={"session_id": "fake-session", "events": []},
             timeout=5
         )

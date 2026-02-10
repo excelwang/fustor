@@ -2,4 +2,4 @@
 trigger: always_on
 ---
 
-Debug时如果日志尾部看不到错误信息，注意尝试grep error|error|fatal|exception|exit (case insensitive) 再找找看。要先grep再tail, 不要先tail再grep。
+pytest 集成测试时，要跳过已经成功的测试！！并且遇到第一个失败的测试就停止继续测试，进行debug！！debug修复用例后，再继续测下一个！因为我们的集成测试特别耗时。
