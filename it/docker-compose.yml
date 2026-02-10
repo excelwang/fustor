@@ -44,8 +44,8 @@ services:
       TEST_VIEW_ID: "integration-test-ds"
       TEST_API_KEY: "test-api-key-123"
       TEST_SESSION_TIMEOUT: "5"
-      AUDIT_INTERVAL: "5.0"
-      SENTINEL_INTERVAL: "10.0"
+      AUDIT_INTERVAL: "10.0"
+      SENTINEL_INTERVAL: "5.0"
     volumes:
       - fusion-data:/data/fusion
       - ./config/fusion-config:/config/fusion-config
@@ -87,9 +87,6 @@ services:
       FUSION_ENDPOINT: "http://fusion:18888" # Points to Fusion Receiver Port
       API_KEY: "test-api-key-123"
       FUSTOR_LOG_LEVEL: "DEBUG"
-      HEARTBEAT_INTERVAL: "5.0"
-      AUDIT_INTERVAL: "60.0"
-      SENTINEL_INTERVAL: "30.0"
       LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
       FAKETIME: "+2 hours"
     volumes:
@@ -136,9 +133,6 @@ services:
       FUSION_ENDPOINT: "http://fusion:18888" # Points to Fusion Receiver Port
       API_KEY: "test-api-key-123"
       FUSTOR_LOG_LEVEL: "DEBUG"
-      HEARTBEAT_INTERVAL: "5.0"
-      AUDIT_INTERVAL: "60.0"
-      SENTINEL_INTERVAL: "30.0"
       LD_PRELOAD: "/usr/lib/x86_64-linux-gnu/faketime/libfaketime.so.1"
       FAKETIME: "-1h"
     volumes:

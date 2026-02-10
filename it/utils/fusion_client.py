@@ -146,18 +146,21 @@ class FusionClient:
 
     def get_sessions(self) -> list[dict]:
         """Get all active sessions."""
-        resp = self.session.get(f"{self.base_url}/api/v1/pipe/session/")
+        resp = self.session.get(f"{self.base_url}/api/v1/pipe/session")
+        if resp.status_code == 404:
+            # Fallback for old servers (with slash)
+            resp = self.session.get(f"{self.base_url}/api/v1/pipe/session/")
         resp.raise_for_status()
         return resp.json().get("active_sessions", [])
 
     def terminate_session(self, session_id: str) -> dict:
         """Terminate an active session."""
-        # Try new V2 path first: DELETE /session/{session_id}
+        # Primary: DELETE /session/{session_id}
         resp = self.session.delete(f"{self.base_url}/api/v1/pipe/session/{session_id}")
         if resp.status_code == 404:
-            # Fallback to legacy path: DELETE /session/ with header
+            # Fallback for old servers: DELETE /session with header
             resp = self.session.delete(
-                f"{self.base_url}/api/v1/pipe/session/",
+                f"{self.base_url}/api/v1/pipe/session",
                 headers={"Session-ID": session_id}
             )
         resp.raise_for_status()

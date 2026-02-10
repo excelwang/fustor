@@ -172,11 +172,11 @@ async def create_session(
     }
 
 
-@session_router.post("/heartbeat", tags=["Session Management"], summary="Session heartbeat keepalive")
+@session_router.post("/{session_id}/heartbeat", tags=["Session Management"], summary="Session heartbeat keepalive")
 async def heartbeat(
+    session_id: str,
     request: Request,
     view_id: str = Depends(get_view_id_from_api_key),
-    session_id: str = Header(..., description="Session ID"),
 ):
     view_id = str(view_id)
     si = await session_manager.get_session_info(view_id, session_id)
@@ -211,10 +211,10 @@ async def heartbeat(
     }
 
 
-@session_router.delete("/", tags=["Session Management"], summary="End session")
+@session_router.delete("/{session_id}", tags=["Session Management"], summary="End session")
 async def end_session(
+    session_id: str,
     view_id: str = Depends(get_view_id_from_api_key),
-    session_id: str = Header(..., description="Session ID"),
 ):
     view_id = str(view_id)
     success = await session_manager.terminate_session(view_id, session_id)
@@ -241,7 +241,7 @@ async def end_session(
     }
 
 
-@session_router.get("/", tags=["Session Management"], summary="List active sessions")
+@session_router.get("", tags=["Session Management"], summary="List active sessions")
 async def list_sessions(
     view_id: str = Depends(get_view_id_from_api_key),
 ):

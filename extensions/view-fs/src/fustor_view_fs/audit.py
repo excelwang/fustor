@@ -38,18 +38,20 @@ class AuditManager:
         if self.state.last_audit_start is None:
             return
 
-        # 1. Tombstone Cleanup (Spec §4.2: TTL cleanup at Audit-End)
+        # 1. Tombstone Cleanup
+        # Rule: Only clean expired tombstones by TTL (Spec §4.2)
         tombstone_ttl = getattr(self.state, 'tombstone_ttl_seconds', 3600.0)
-        cutoff_time = time.time() - tombstone_ttl
+        cutoff_time_ttl = time.time() - tombstone_ttl
+        
         before = len(self.state.tombstone_list)
         
         self.state.tombstone_list = {
             path: (l_ts, p_ts) for path, (l_ts, p_ts) in self.state.tombstone_list.items()
-            if p_ts >= cutoff_time
+            if p_ts >= cutoff_time_ttl
         }
         tombstones_cleaned = before - len(self.state.tombstone_list)
         if tombstones_cleaned > 0:
-            self.logger.info(f"Tombstone CLEANUP (Audit-End): removed {tombstones_cleaned} items (TTL > {tombstone_ttl}s).")
+            self.logger.info(f"Tombstone CLEANUP (Audit-End): removed {tombstones_cleaned} items (Before Audit or TTL expired).")
 
         # 2. Optimized Missing File Detection
         missing_count = 0
