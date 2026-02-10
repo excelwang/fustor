@@ -234,9 +234,12 @@ class FusionClient:
                 exists = tree.get("name") is not None or tree.get("path") is not None
                 if exists == should_exist:
                     return True
-            except requests.HTTPError:
-                if not should_exist:
+            except requests.HTTPError as e:
+                # Only treat 404 as "File Gone"
+                if not should_exist and e.response.status_code == 404:
                     return True
+                # For other errors (500, 503), let loop continue (retry)
+                # print(f"wait_for_file error: {e}") # Optional debug
             time.sleep(interval)
         return False
 
