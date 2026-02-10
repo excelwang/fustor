@@ -145,7 +145,7 @@ class HTTPSender(Sender):
             )
             
             if success:
-                self.logger.info(f"[{source_type}] Sent {len(events)} events ({total_rows} rows).")
+                self.logger.debug(f"[{source_type}] Sent {len(events)} events ({total_rows} rows).")
                 return {"success": True}
             else:
                 self.logger.error(f"[{source_type}] Failed to send {len(events)} events.")

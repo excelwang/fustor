@@ -52,7 +52,7 @@ class SenderConfigService(BaseConfigService[SenderConfig], SenderConfigServiceIn
         ]
 
         if not obsolete_ids:
-            logger.info("No obsolete sender configurations to clean up.")
+            logger.debug("No obsolete sender configurations to clean up.")
             return []
 
         logger.info(f"Found {len(obsolete_ids)} obsolete sender configurations to clean up: {obsolete_ids}")

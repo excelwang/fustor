@@ -242,7 +242,7 @@ class HTTPReceiver(Receiver):
         router = APIRouter(tags=["Session"])
         receiver = self  # Capture self for closures
         
-        @router.post("/", response_model=CreateSessionResponse)
+        @router.post("", response_model=CreateSessionResponse)
         async def create_session(
             payload: CreateSessionRequest,
             request: Request,
@@ -306,7 +306,7 @@ class HTTPReceiver(Receiver):
             except Exception:
                 can_realtime = False
 
-            logger.info(f"Received heartbeat for session {session_id}, can_realtime={can_realtime}")
+            logger.debug(f"Received heartbeat for session {session_id}, can_realtime={can_realtime}")
 
             if receiver._on_heartbeat:
                 try:

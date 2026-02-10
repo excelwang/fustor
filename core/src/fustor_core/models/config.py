@@ -11,6 +11,7 @@ class GlobalLoggingConfig(BaseModel):
 class FusionGlobalConfig(BaseModel):
     host: str = Field(default="0.0.0.0", description="管理 API 监听地址")
     port: int = Field(default=8101, description="管理 API 监听端口")
+    session_cleanup_interval: float = Field(default=300.0, description="会话清理间隔(秒)")
 
 class AgentGlobalConfig(BaseModel):
     # Agent typically doesn't listen on a port anymore, but we can store other globals
@@ -114,6 +115,7 @@ class PipeConfig(BaseModel):
     max_consecutive_errors: int = Field(default=5, ge=1, description="最大连续错误次数(触发告警)")
     backoff_multiplier: float = Field(default=2.0, ge=1.0, description="指数退避倍数")
     max_backoff_seconds: float = Field(default=60, ge=1.0, description="最大退避时间(秒)")
+    disabled: bool = Field(default=False, description="是否禁用此配置")
 
 
 class SourceConfigDict(RootModel[Dict[str, SourceConfig]]):
@@ -242,5 +244,15 @@ class AppConfig(BaseModel):
         if not sender_config:
             raise NotFoundError(f"Dependency sender '{config.sender}' not found for pipe '{id}'.")
             
-        return not source_config.disabled and not sender_config.disabled
+        return not source_config.disabled and not sender_config.disabled and not config.disabled
+
+    def check_pipe_is_disabled(self, id: str) -> bool:
+        """
+        Check if a Pipe is disabled.
+        A pipe is disabled if:
+        1. It is explicitly disabled.
+        2. Its source is disabled.
+        3. Its sender is disabled.
+        """
+        return not self.check_pipe_is_active(id)
 

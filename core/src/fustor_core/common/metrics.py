@@ -52,15 +52,15 @@ class LoggingMetrics(Metrics):
 
     def counter(self, name: str, value: float = 1.0, tags: Optional[Dict[str, str]] = None) -> None:
         tag_str = self._format_tags(tags)
-        self.logger.info(f"METRIC counter {name} +{value} {tag_str}")
+        self.logger.debug(f"METRIC counter {name} +{value} {tag_str}")
 
     def gauge(self, name: str, value: float, tags: Optional[Dict[str, str]] = None) -> None:
         tag_str = self._format_tags(tags)
-        self.logger.info(f"METRIC gauge {name} ={value} {tag_str}")
+        self.logger.debug(f"METRIC gauge {name} ={value} {tag_str}")
 
     def histogram(self, name: str, value: float, tags: Optional[Dict[str, str]] = None) -> None:
         tag_str = self._format_tags(tags)
-        self.logger.info(f"METRIC histogram {name} : {value} {tag_str}")
+        self.logger.debug(f"METRIC histogram {name} : {value} {tag_str}")
 
 _GLOBAL_METRICS: Metrics = NoOpMetrics()
 

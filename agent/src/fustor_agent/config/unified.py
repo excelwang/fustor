@@ -49,6 +49,8 @@ class AgentPipeConfig(BaseModel):
     backoff_multiplier: float = 2.0
     max_backoff_seconds: float = 60.0
     
+    disabled: bool = False
+    
     # Field mapping
     fields_mapping: List[Dict[str, Any]] = []
 

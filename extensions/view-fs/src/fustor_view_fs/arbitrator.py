@@ -86,7 +86,7 @@ class FSArbitrator:
             logical_ts = self.state.logical_clock.get_watermark()
             physical_ts = time.time()
             self.state.tombstone_list[path] = (logical_ts, physical_ts)
-            self.logger.info(f"Tombstone CREATED for {path} (Logical: {logical_ts}, Physical: {physical_ts})")
+            self.logger.debug(f"Tombstone CREATED for {path} (Logical: {logical_ts}, Physical: {physical_ts})")
             
             self.state.suspect_list.pop(path, None)
             alt_path = path[1:] if path.startswith('/') else '/' + path
@@ -103,7 +103,7 @@ class FSArbitrator:
             existing = self.state.get_node(path)
             if existing and mtime is not None:
                 if existing.modified_time > mtime:
-                    self.logger.info(f"AUDIT_DELETE_STALE: Ignoring delete for {path} (Memory: {existing.modified_time} > Audit: {mtime})")
+                    self.logger.debug(f"AUDIT_DELETE_STALE: Ignoring delete for {path} (Memory: {existing.modified_time} > Audit: {mtime})")
                     return
 
             await self.tree_manager.delete_node(path)
@@ -132,10 +132,10 @@ class FSArbitrator:
             if not is_newer_logical and tombstone_ts > (now + 5.0):
                  is_newer_physical = mtime > (tombstone_physical_ts + self.TOMBSTONE_EPSILON)
                  if is_newer_physical:
-                     self.logger.info(f"TOMBSTONE_OVERRULED_BY_PHYSICAL: {path} (Mtime: {mtime} > PhyTS: {tombstone_physical_ts})")
+                     self.logger.debug(f"TOMBSTONE_OVERRULED_BY_PHYSICAL: {path} (Mtime: {mtime} > PhyTS: {tombstone_physical_ts})")
 
             if is_newer_logical or is_newer_physical:
-                self.logger.info(f"TOMBSTONE_CLEARED for {path}")
+                self.logger.debug(f"TOMBSTONE_CLEARED for {path}")
                 self.state.tombstone_list.pop(path, None)
             else:
                 self.logger.debug(f"TOMBSTONE_BLOCK: {path}")
@@ -199,7 +199,7 @@ class FSArbitrator:
                 node.integrity_suspect = True
                 self.logger.debug(f"Partial Write (Suspect): {path}")
 
-            self.logger.info(f"DEBUG_BLIND: Discarding {path} from blind_spots. Current additions: {list(self.state.blind_spot_additions)}")
+            self.logger.debug(f"DEBUG_BLIND: Discarding {path} from blind_spots. Current additions: {list(self.state.blind_spot_additions)}")
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
             # Defensive: try alternate path format (slash vs no-slash) to handle potential mismatch
@@ -281,10 +281,10 @@ class FSArbitrator:
                 new_expiry = now_mono + self.hot_file_threshold
                 self.state.suspect_list[path] = (new_expiry, node.modified_time)
                 heapq.heappush(self.state.suspect_heap, (new_expiry, path))
-                self.logger.info(f"Suspect RENEWED (Active): {path}")
+                self.logger.debug(f"Suspect RENEWED (Active): {path}")
             else:
                 # Stable! Cool-off complete
-                self.logger.info(f"Suspect EXPIRED (Stable): {path}")
+                self.logger.debug(f"Suspect EXPIRED (Stable): {path}")
                 self.state.suspect_list.pop(path, None)
                 node.integrity_suspect = False
             processed += 1

@@ -101,7 +101,7 @@ async def create_session(
     
     # Use client-requested timeout if provided, otherwise fallback to server config
     session_timeout_seconds = payload.session_timeout_seconds or session_config["session_timeout_seconds"]
-    logger.info(f"DEBUG: Session timeout determined: {session_timeout_seconds}")
+    logger.debug(f"Session timeout determined: {session_timeout_seconds}")
 
     session_id = str(uuid.uuid4())
     

@@ -83,7 +83,7 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
         ]
 
         if not obsolete_ids:
-            logger.info("No obsolete source configurations to clean up.")
+            logger.debug("No obsolete source configurations to clean up.")
             return []
 
         logger.info(f"Found {len(obsolete_ids)} obsolete source configurations to clean up: {obsolete_ids}")

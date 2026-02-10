@@ -85,7 +85,7 @@ class MemoryEventBus:
                 event.index = self._next_event_index
                 self._next_event_index += 1
             self.buffer.append(event)
-            logger.info(f"Bus '{self.id}': Put event with index {event.index}. Buffer size: {len(self.buffer)}/{self.capacity}")
+            logger.debug(f"Bus '{self.id}': Put event with index {event.index}. Buffer size: {len(self.buffer)}/{self.capacity}")
             if len(self.buffer) < self.capacity:
                 self._producer_can_put.set()
             self._consumer_can_get.set()
@@ -251,7 +251,7 @@ class MemoryEventBus:
                 if new_position > state['last_consumed_index']:
                     state['last_consumed_index'] = new_position
                     state['last_seen_position'] = new_position
-                    logger.info(f"Bus '{self.id}': Subscriber '{pipe_id}' position updated to {new_position}.")
+                    logger.debug(f"Bus '{self.id}': Subscriber '{pipe_id}' position updated to {new_position}.")
                     self._update_low_watermark()
             else:
                 logger.warning(f"Bus '{self.id}': Attempted to update position for non-existent subscriber '{pipe_id}'.")

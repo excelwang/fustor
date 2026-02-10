@@ -37,7 +37,10 @@ async def lifespan(app: FastAPI):
     fusion_config.ensure_loaded()
     
     # 2. Setup Logging from config
+    from fustor_core.common import get_fustor_home_dir
+    log_path = get_fustor_home_dir() / "logs" / "fusion.log"
     logging_config.setup_logging(
+        log_file_path=str(log_path),
         base_logger_name="fustor_fusion",
         level=fusion_config.logging.level.upper(),
         console_output=True
@@ -116,7 +119,7 @@ async def lifespan(app: FastAPI):
         logger.warning(f"Could not register SIGHUP handler: {e}")
 
     # Start periodic session cleanup
-    cleanup_interval = fusion_config.runtime.session_cleanup_interval
+    cleanup_interval = fusion_config.fusion.session_cleanup_interval
     logger.info(f"Starting session cleanup (Interval: {cleanup_interval}s)")
     await session_manager.start_periodic_cleanup(cleanup_interval)
 
