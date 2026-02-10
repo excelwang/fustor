@@ -91,7 +91,11 @@ print("FTP server process ending")
         stop_event = threading.Event()
         
         def run_monitor():
-            start_time = int(time.time() * 1000)
+            # Apply a 1-second safety buffer to start_time.
+            # This accounts for potential negative drift compensation in the Agent,
+            # which might make "current" event indices appear slightly behind
+            # the local system clock (e.g. index = (time.time() + drift) * 1000).
+            start_time = int((time.time() - 1.0) * 1000)
             # Use the new interface that returns only the iterator
             iterator = driver.get_message_iterator(start_position=start_time, stop_event=stop_event)
             for event in iterator:
