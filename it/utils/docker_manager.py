@@ -224,9 +224,14 @@ class DockerManager:
         logger.error(f"❌ Container {container} did not become healthy within {timeout}s (last: {last_status})")
         return False
 
-    def stop_container(self, container: str) -> None:
-        """Stop a specific container."""
-        subprocess.run(["docker", "stop", container], check=True)
+    def stop_container(self, container: str, timeout: int = 10) -> None:
+        """Stop a specific container.
+        
+        Args:
+            container: Container name
+            timeout: Seconds to wait before killing (0 for immediate kill, simulates crash)
+        """
+        subprocess.run(["docker", "stop", "-t", str(timeout), container], check=True)
 
     def start_container(self, container: str) -> None:
         """Start a stopped container."""

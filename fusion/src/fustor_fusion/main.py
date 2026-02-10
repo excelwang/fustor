@@ -33,9 +33,6 @@ async def lifespan(app: FastAPI):
     from .runtime.pipe_manager import pipe_manager as pm
     runtime_objects.pipe_manager = pm
     
-    # 1. Load configuration
-    fusion_config.ensure_loaded()
-    
     # 2. Setup Logging from config
     from fustor_core.common import get_fustor_home_dir
     log_path = get_fustor_home_dir() / "logs" / "fusion.log"
@@ -125,24 +122,6 @@ async def lifespan(app: FastAPI):
 
     # Note: View auto-start is now handled by PipeManager via pipe config
     
-    # Setup View routers
-    from .api.views import setup_view_routers
-    setup_view_routers()
-
-    # --- Register Routers ---
-    from .api.pipe import pipe_router
-    from .api.session import session_router
-    from .api.management import router as management_router
-    from .api.views import view_router
-
-    api_v1 = APIRouter()
-    api_v1.include_router(pipe_router, prefix="/pipe")
-    api_v1.include_router(session_router, prefix="/pipe/session")
-    api_v1.include_router(view_router, prefix="/views")
-    api_v1.include_router(management_router)
-    
-    app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
-
     logger.info("Application lifespan initialization complete. READY.")
     yield # Ready
 
@@ -159,6 +138,27 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(lifespan=lifespan, title="Fusion Storage Engine API", version="1.0.0")
     ui_dir = os.path.dirname(__file__)
+
+    # 1. Load configuration
+    fusion_config.ensure_loaded()
+
+    # 2. Setup View routers
+    from .api.views import setup_view_routers
+    setup_view_routers()
+
+    # --- Register Routers ---
+    from .api.pipe import pipe_router
+    from .api.session import session_router
+    from .api.management import router as management_router
+    from .api.views import view_router
+
+    api_v1 = APIRouter()
+    api_v1.include_router(pipe_router, prefix="/pipe")
+    api_v1.include_router(session_router, prefix="/pipe/session")
+    api_v1.include_router(view_router, prefix="/views")
+    api_v1.include_router(management_router)
+    
+    app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
 
     @app.get("/", tags=["Root"])
     async def read_web_api_root():

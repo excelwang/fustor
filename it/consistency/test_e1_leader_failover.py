@@ -50,27 +50,30 @@ class TestLeaderFailover:
         if follower_session:
             assert follower_session.get("role") == "follower", "Agent B should be follower initially"
         
-        # Stop Agent A container (simulate crash)
-        docker_manager.stop_container(CONTAINER_CLIENT_A)
+        # Stop Agent A container immediately (simulate crash, no grace period)
+        docker_manager.stop_container(CONTAINER_CLIENT_A, timeout=0)
         
         try:
-            # Wait for session timeout (typically 30-60 seconds)
-            timeout_wait = MEDIUM_TIMEOUT  # Wait longer than session timeout (4s in docker-compose)
-            print(f"Waiting {timeout_wait}s for leader session timeout...")
-            time.sleep(timeout_wait)
-            
-            # Check that Agent B is now the leader
-            sessions_after = fusion_client.get_sessions()
+            # Poll for Agent B to become the new leader
+            # Session timeout is 5s (from docker-compose), cleanup runs every 1s
+            # So we need to wait at most ~6-7s, but use MEDIUM_TIMEOUT for safety
+            timeout_wait = MEDIUM_TIMEOUT
+            print(f"Waiting up to {timeout_wait}s for leader failover...")
             
             new_leader = None
-            for s in sessions_after:
-                if s.get("role") == "leader":
-                    new_leader = s
+            start = time.time()
+            while time.time() - start < timeout_wait:
+                sessions_after = fusion_client.get_sessions()
+                for s in sessions_after:
+                    if s.get("role") == "leader" and s.get("agent_id", "").startswith("client-b"):
+                        new_leader = s
+                        break
+                if new_leader:
                     break
+                time.sleep(1.0)
             
-            assert new_leader is not None, "A new leader should be elected"
-            assert new_leader.get("agent_id", "").startswith("client-b"), \
-                f"Agent B should become leader, got {new_leader.get('agent_id')}"
+            assert new_leader is not None, \
+                f"Agent B should become leader within {timeout_wait}s. Sessions: {fusion_client.get_sessions()}"
             
             # Verify new leader has proper permissions
             assert new_leader.get("can_snapshot") is True, \
@@ -114,7 +117,7 @@ class TestLeaderFailover:
         assert found is not None
         
         # Stop leader
-        docker_manager.stop_container(CONTAINER_CLIENT_A)
+        docker_manager.stop_container(CONTAINER_CLIENT_A, timeout=0)
         
         # Diagnostic: Check if B can see the file
         output = docker_manager.exec_in_container(CONTAINER_CLIENT_B, ["ls", "-l", MOUNT_POINT])

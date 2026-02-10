@@ -18,6 +18,7 @@ import subprocess
 import time
 
 from fustor_core.common import setup_logging, get_fustor_home_dir
+from .config.unified import agent_config
 
 # Define common paths
 HOME_FUSTOR_DIR = get_fustor_home_dir()
@@ -242,18 +243,19 @@ def status(pipe_id):
 @cli.command()
 def reload():
     """Reload configuration by sending SIGHUP to the daemon."""
-    if not PID_FILE.exists():
+    if not os.path.exists(PID_FILE):
         click.echo("Agent is not running.")
         return
     
     try:
-        pid = int(PID_FILE.read_text().strip())
+        with open(PID_FILE, 'r') as f:
+            pid = int(f.read().strip())
         import os
         import signal
         os.kill(pid, signal.SIGHUP)
         click.echo(click.style("✓ Reload signal sent (SIGHUP)", fg="green"))
     except ProcessLookupError:
         click.echo(click.style("✗ Process not found. Deleting stale PID file.", fg="red"))
-        PID_FILE.unlink()
+        os.remove(PID_FILE)
     except Exception as e:
         click.echo(click.style(f"✗ Failed to reload: {e}", fg="red"))

@@ -91,7 +91,9 @@ class AgentPipe(Pipe):
         self._sentinel_task: Optional[asyncio.Task] = None
         
         # Configuration (Timeouts and Heartbeats are managed by Fusion and updated in on_session_created)
-        self.session_timeout_seconds = 30
+        # Default to None: let Fusion server decide the timeout from its own config.
+        # Agent-side config can override if explicitly set.
+        self.session_timeout_seconds = config.get("session_timeout_seconds", 30)
         self.heartbeat_interval_sec = config.get("heartbeat_interval_sec", 10.0)
         
         self.audit_interval_sec = config.get("audit_interval_sec", 600)       # Seconds between audit cycles (0 to disable)

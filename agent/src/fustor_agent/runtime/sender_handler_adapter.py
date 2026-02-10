@@ -87,7 +87,7 @@ class SenderHandlerAdapter(SenderHandler):
         self,
         task_id: str,
         source_type: str,
-        session_timeout_seconds: int = 30,
+        session_timeout_seconds: Optional[int] = None,
         **kwargs
     ) -> Tuple[str, Dict[str, Any]]:
         """

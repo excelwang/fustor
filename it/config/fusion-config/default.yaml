@@ -31,5 +31,6 @@ pipes:
   ${TEST_VIEW_ID}:
     receiver: http-main
     views: [${TEST_VIEW_ID}]
+    session_timeout_seconds: ${TEST_SESSION_TIMEOUT}
     audit_interval_sec: ${AUDIT_INTERVAL}
     sentinel_interval_sec: ${SENTINEL_INTERVAL}
