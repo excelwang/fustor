@@ -60,7 +60,8 @@ async def test_future_timestamp_visibility(
     
     # 1. Setup path
     test_path = "/mnt/shared/future_file.txt"
-    relative_path = test_path.lstrip("/")
+    relative_path = "future_file.txt"
+    relative_slash_path = "/future_file.txt"
     
     # Get current physical time from Agent A
     res = containers.exec_in_container("fustor-nfs-client-a", ["date", "+%s"])
@@ -73,17 +74,19 @@ async def test_future_timestamp_visibility(
     logger.info(f"Step 1: Creating Future File {test_path} at T+{SHORT_TIMEOUT}s")
     
     # Create file with future timestamp
+    # Note: docker exec uses absolute path in container
     containers.exec_in_container("fustor-nfs-client-a", ["touch", "-t", future_time_str, test_path])
     
     # 2. Wait for ingestion reliably
     logger.info("Step 2: Waiting for ingestion...")
-    exists = fusion_client.wait_for_file(test_path, timeout=SHORT_TIMEOUT)
+    # Fusion client uses relative path
+    exists = fusion_client.wait_for_file(relative_slash_path, timeout=SHORT_TIMEOUT)
     assert exists, "Node should exist in tree (ingestion timed out)"
     
     # 3. Check Initial State (Should be Suspect)
     # Because Clock (Now) < FutureMtime (Now+10)
     # Age < 0 < 30s
-    node = fusion_client.get_node(test_path)
+    node = fusion_client.get_node(relative_slash_path)
     assert node, "Node should exist in tree"
     
     logger.info(f"Node State 1: mtime={node.get('modified_time')}, suspect={node.get('integrity_suspect')}")
@@ -136,10 +139,10 @@ async def test_future_timestamp_visibility(
     # So yes, Sentinel should clear it.
     
     logger.info("Step 4: Checking Final State after catch-up...")
-    node_final = fusion_client.get_node(test_path)
+    node_final = fusion_client.get_node(relative_slash_path)
     
     if node_final is None:
-        logger.error(f"Node {test_path} not found in tree. Dumping partial tree...")
+        logger.error(f"Node {relative_slash_path} not found in tree. Dumping partial tree...")
         try:
             tree_dump = fusion_client.get_tree("/", max_depth=2)
             logger.error(f"Tree Dump: {tree_dump}")

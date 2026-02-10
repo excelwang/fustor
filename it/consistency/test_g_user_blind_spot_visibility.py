@@ -34,8 +34,10 @@ class TestBlindSpotVisibility:
           - /blind-spots API 返回该文件
           - agent_missing_count > 0
         """
+        import os
         filename = f"blind_file_{int(time.time())}.txt"
         file_path = f"{MOUNT_POINT}/{filename}"
+        file_rel = "/" + os.path.relpath(file_path, MOUNT_POINT)
         
         # 1. Create file in Blind Spot
         docker_manager.create_file_in_container(
@@ -48,7 +50,9 @@ class TestBlindSpotVisibility:
         marker = f"{MOUNT_POINT}/marker_g1_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker)
         wait_for_audit()
-        fusion_client.wait_for_file_in_tree(marker)
+        
+        marker_rel = "/" + os.path.relpath(marker, MOUNT_POINT)
+        fusion_client.wait_for_file_in_tree(marker_rel)
         
         # 3. Query API
         # We might need to retry a few times as API state might lag slightly behind tree structure or vice versa
@@ -72,7 +76,8 @@ class TestBlindSpotVisibility:
         # Find our file
         found = False
         for f in blind_spots["additions"]:
-            if f["path"] == file_path:
+            # API might return path as relative or absolute, but logic suggests relative
+            if f["path"] == file_rel or f["path"] == file_path:
                 found = True
                 break
         
@@ -81,7 +86,7 @@ class TestBlindSpotVisibility:
         # Given we want to fix it if it's broken:
         if not found:
              logger.warning("Blind spot file NOT found in list. Re-verifying...")
-             assert found, f"File {file_path} should be in blind spot list"
+             assert found, f"File {file_rel} should be in blind spot list"
 
     # @pytest.mark.skip(reason="NFS attribute caching prevents reliable detection of deletions in integration test environment")
     def test_blind_spot_deletion_reporting(
@@ -101,12 +106,17 @@ class TestBlindSpotVisibility:
           - /blind-spots API 的 deletions 列表中包含该文件
         """
         # Use subdirectory to isolate mtime changes
+        import os 
         subdir = f"{MOUNT_POINT}/del_test_dir_{int(time.time())}"
+        subdir_rel = "/" + os.path.relpath(subdir, MOUNT_POINT)
+        
         # Use Client A to create directory so Agent A sets up watchers
+        # Use docker exec list (not manager) for manual control or just manager
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["mkdir", "-p", subdir])
         
         filename = f"to_be_deleted.txt"
         file_path = f"{subdir}/{filename}"
+        file_rel = f"{subdir_rel}/{filename}"
         
         # 1. Provide a file (using Client A so it's immediately known via Realtime/Audit)
         # This avoids the "Blind Spot Addition" delay, allowing us to focus on Deletion.
@@ -116,7 +126,7 @@ class TestBlindSpotVisibility:
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["touch", f"{MOUNT_POINT}/root_force_scan_g2_{int(time.time())}"])
         
         wait_for_audit() # Ensure it's known
-        assert fusion_client.wait_for_file_in_tree(file_path) is not None
+        assert fusion_client.wait_for_file_in_tree(file_rel) is not None
         
         # 2. Delete in Blind Spot
         docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["rm", file_path])
@@ -135,8 +145,10 @@ class TestBlindSpotVisibility:
         # Need another marker to ensure audit cycle passed
         marker = f"{subdir}/marker_g2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker)
+        
+        marker_rel = f"{subdir_rel}/marker_g2_{int(time.time())}.txt"
         time.sleep(STRESS_DELAY) # Give more time for NFS sync
-        assert fusion_client.wait_for_file_in_tree(marker, timeout=AUDIT_WAIT_TIMEOUT) is not None
+        assert fusion_client.wait_for_file_in_tree(marker_rel, timeout=AUDIT_WAIT_TIMEOUT) is not None
         
         # 4. Check API with polling - Deletion list is cleared at start of each audit, so we need to catch it "stable"
         found_deletion = False
@@ -144,13 +156,13 @@ class TestBlindSpotVisibility:
         deletions = []
         while time.time() - start_poll < MEDIUM_TIMEOUT:
             blind_spots = fusion_client.get_blind_spots()
-            deletions = blind_spots.get("deletions", [])
+            deletions = [d.get('path', d) if isinstance(d, dict) else d for d in blind_spots.get("deletions", [])]
             # deletions is a list of Strings (paths) or dicts? 
             # Code says: self._blind_spot_deletions is a Set[str]. list() converts to [str].
-            if file_path in deletions:
+            if file_rel in deletions or file_path in deletions:
                 found_deletion = True
                 break
             time.sleep(POLL_INTERVAL)
             
-        assert found_deletion, f"Deleted file {file_path} should be in blind spot deletions list. Last detected: {deletions}"
+        assert found_deletion, f"Deleted file {file_rel} should be in blind spot deletions list. Last detected: {deletions}"
 

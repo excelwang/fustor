@@ -38,9 +38,11 @@ class TestPipeBasicOperations:
         leader = containers["leader"]
         
         # Create a unique test file
+        import os.path
         timestamp = int(time.time() * 1000)
         file_name = f"pipe_test_{timestamp}.txt"
         test_file = f"{MOUNT_POINT}/{file_name}"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # Create file from leader container
         docker_env.exec_in_container(
@@ -51,7 +53,7 @@ class TestPipeBasicOperations:
         
         # Wait for Fusion to detect it
         # Note: Paths in Fusion tree are absolute as seen by the Agent
-        success = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
+        success = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
         assert success, f"File {file_name} not found in tree after sync at {test_file}"
         
         logger.info("File created and detected successfully")
@@ -72,9 +74,11 @@ class TestPipeBasicOperations:
         leader = containers["leader"]
         
         # Create initial file
+        import os.path
         timestamp = int(time.time() * 1000)
         file_name = f"modify_test_{timestamp}.txt"
         test_file = f"{MOUNT_POINT}/{file_name}"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         docker_env.exec_in_container(
             leader,
@@ -82,7 +86,7 @@ class TestPipeBasicOperations:
         )
         
         # Wait for initial sync
-        assert fusion_client.wait_for_file_in_tree(test_file), f"Initial file {test_file} not detected"
+        assert fusion_client.wait_for_file_in_tree(test_file_rel), f"Initial file {test_file} not detected"
         
         # Modify file
         docker_env.exec_in_container(
@@ -94,7 +98,7 @@ class TestPipeBasicOperations:
         # Wait for sync and verify
         # Note: In V2, we check it's still there and potentially mtime
         time.sleep(INGESTION_DELAY)
-        found = fusion_client.wait_for_file_in_tree(file_path=test_file, timeout=SHORT_TIMEOUT)
+        found = fusion_client.wait_for_file_in_tree(file_path=test_file_rel, timeout=SHORT_TIMEOUT)
         
         assert found, f"File {file_name} not found after modification at {test_file}"
         logger.info(f"✅ File modification detected")
@@ -115,9 +119,11 @@ class TestPipeBasicOperations:
         leader = containers["leader"]
         
         # Create file first
+        import os.path
         timestamp = int(time.time() * 1000)
         file_name = f"delete_test_{timestamp}.txt"
         test_file = f"{MOUNT_POINT}/{file_name}"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         docker_env.exec_in_container(
             leader,
@@ -125,7 +131,7 @@ class TestPipeBasicOperations:
         )
         
         # Wait for initial sync
-        assert fusion_client.wait_for_file_in_tree(file_path=test_file, timeout=SHORT_TIMEOUT)
+        assert fusion_client.wait_for_file_in_tree(file_path=test_file_rel, timeout=SHORT_TIMEOUT)
         
         # Delete file
         docker_env.exec_in_container(
@@ -139,7 +145,7 @@ class TestPipeBasicOperations:
         
         # Verify file is removed from tree
         removed = fusion_client.wait_for_file_not_in_tree(
-            file_path=test_file,
+            file_path=test_file_rel,
             timeout=MEDIUM_TIMEOUT
         )
         

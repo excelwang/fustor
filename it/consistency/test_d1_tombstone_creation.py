@@ -33,7 +33,9 @@ class TestRealtimeDeleteTombstone:
           - 文件从内存树移除
           - 文件路径记录在 Tombstone 中
         """
+        import os
         test_file = f"{MOUNT_POINT}/tombstone_create_test_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # Step 1: Create file
         docker_manager.create_file_in_container(
@@ -43,14 +45,14 @@ class TestRealtimeDeleteTombstone:
         )
         
         # Wait for sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+        found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         assert found is not None, "File should appear in Fusion"
         
         # Step 2: Delete file via Agent
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
         # Step 3 & 4: Wait and Verify file is removed from tree
-        removed = fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False)
+        removed = fusion_client.wait_for_file(test_file_rel, timeout=MEDIUM_TIMEOUT, should_exist=False)
         assert removed, "File should be removed from tree after Realtime DELETE"
 
     def test_deleted_file_in_tombstone_list(
@@ -66,7 +68,9 @@ class TestRealtimeDeleteTombstone:
         注意: 这需要一个 API 来查询 Tombstone List。
         如果没有公开 API，可以通过验证 Audit 不会复活来间接验证。
         """
+        import os
         test_file = f"{MOUNT_POINT}/tombstone_list_check_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # Create and delete
         docker_manager.create_file_in_container(
@@ -74,13 +78,13 @@ class TestRealtimeDeleteTombstone:
             test_file,
             content="for tombstone list check"
         )
-        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+        fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
         # The file should be in tombstone.
         # Verify indirectly by waiting for the tree to reflect deletion
-        removed = fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False)
+        removed = fusion_client.wait_for_file(test_file_rel, timeout=MEDIUM_TIMEOUT, should_exist=False)
         assert removed, "File should be removed from tree"
         
         # Tombstone existence is verified by subsequent tests (D2, D3)

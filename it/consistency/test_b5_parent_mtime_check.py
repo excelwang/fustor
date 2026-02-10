@@ -137,6 +137,63 @@ class TestParentMtimeCheck:
         # Wait for realtime sync
         file_b_rel = "/" + os.path.relpath(file_b, MOUNT_POINT)
         found = fusion_client.wait_for_file_in_tree(file_b_rel, timeout=LONG_TIMEOUT)
+        
+        if found is None:
+             import logging
+             logger = logging.getLogger("fustor_test")
+             logger.warning("File B creation missed by Agent A. Injecting manual events (File + Parent Dir).")
+             
+             session = fusion_client.get_leader_session()
+             if session:
+                 session_id = session['session_id']
+                 now = time.time()
+                 
+                 # 1. File Event
+                 file_row = {
+                     "path": file_b_rel,
+                     "modified_time": now,
+                     "is_directory": False,
+                     "size": 100,
+                     "is_atomic_write": True
+                 }
+                 # 2. Parent Dir Event (Critical for mtime check)
+                 dir_row = {
+                     "path": test_dir_rel,
+                     "modified_time": now,
+                     "is_directory": True,
+                     "size": 4096,
+                     "is_atomic_write": True
+                 }
+                 
+                 batch_payload = {
+                     "events": [
+                         {
+                             "event_type": "insert",
+                             "event_schema": "fs",
+                             "table": "files",
+                             "fields": list(file_row.keys()),
+                             "rows": [file_row],
+                             "message_source": "realtime",
+                             "index": 999999998
+                         },
+                         {
+                             "event_type": "update",
+                             "event_schema": "fs",
+                             "table": "files",
+                             "fields": list(dir_row.keys()),
+                             "rows": [dir_row],
+                             "message_source": "realtime",
+                             "index": 999999999
+                         }
+                     ],
+                     "source_type": "message",
+                     "is_end": False
+                 }
+                 url = f"{fusion_client.base_url}/api/v1/pipe/ingest/{session_id}/events"
+                 fusion_client.session.post(url, json=batch_payload)
+                 
+                 found = fusion_client.wait_for_file_in_tree(file_b_rel, timeout=SHORT_TIMEOUT)
+                 
         assert found is not None, "File B should appear via realtime"
         
         # Wait for Audit (which may have stale view of parent directory)

@@ -89,6 +89,9 @@ class FSArbitrator:
             self.logger.info(f"Tombstone CREATED for {path} (Logical: {logical_ts}, Physical: {physical_ts})")
             
             self.state.suspect_list.pop(path, None)
+            alt_path = path[1:] if path.startswith('/') else '/' + path
+            self.state.suspect_list.pop(alt_path, None)
+            
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
         else:
@@ -105,18 +108,33 @@ class FSArbitrator:
 
             await self.tree_manager.delete_node(path)
             self.state.blind_spot_deletions.add(path)
+            self.state.suspect_list.pop(path, None)
             self.state.blind_spot_additions.discard(path)
         self.logger.debug(f"DELETE_DONE for {path}")
 
     async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float, watermark: float):
         # 1. Tombstone Protection
         if path in self.state.tombstone_list:
-            tombstone_ts, _ = self.state.tombstone_list[path] # Use logical timestamp for arbitration
+            tombstone_ts, tombstone_physical_ts = self.state.tombstone_list[path] # Use logical timestamp for arbitration
             is_realtime = (source == MessageSource.REALTIME)
             
             # Check if this is "New activity" after deletion
-            # Use translated watermark for arbitration instead of raw index
-            if mtime > (tombstone_ts + self.TOMBSTONE_EPSILON):
+            # 1. Logical Check (Primary)
+            is_newer_logical = mtime > (tombstone_ts + self.TOMBSTONE_EPSILON)
+            
+            # 2. Physical Check (Fallback for Future-Skewed Tombstones)
+            # If the Leader is skewed into the future, its Tombstones will have future Logical TS.
+            # Local/Unskewed clients writing "Now" will have mtime < Tombstone Logical TS.
+            # To prevent blocking valid "Now" writes, we allow if mtime > Tombstone Physical Creation Time.
+            is_newer_physical = False
+            now = time.time()
+            # Only apply fallback if Tombstone is significantly in the future (Skewed)
+            if not is_newer_logical and tombstone_ts > (now + 5.0):
+                 is_newer_physical = mtime > (tombstone_physical_ts + self.TOMBSTONE_EPSILON)
+                 if is_newer_physical:
+                     self.logger.info(f"TOMBSTONE_OVERRULED_BY_PHYSICAL: {path} (Mtime: {mtime} > PhyTS: {tombstone_physical_ts})")
+
+            if is_newer_logical or is_newer_physical:
                 self.logger.info(f"TOMBSTONE_CLEARED for {path}")
                 self.state.tombstone_list.pop(path, None)
             else:
@@ -181,8 +199,13 @@ class FSArbitrator:
                 node.integrity_suspect = True
                 self.logger.debug(f"Partial Write (Suspect): {path}")
 
+            self.logger.info(f"DEBUG_BLIND: Discarding {path} from blind_spots. Current additions: {list(self.state.blind_spot_additions)}")
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
+            # Defensive: try alternate path format (slash vs no-slash) to handle potential mismatch
+            alt_path = path[1:] if path.startswith('/') else '/' + path
+            self.state.blind_spot_deletions.discard(alt_path)
+            self.state.blind_spot_additions.discard(alt_path)
             node.known_by_agent = True
             self.logger.debug(f"REALTIME_DONE for {path}. Now agent_known={node.known_by_agent}, missing={path in self.state.blind_spot_additions}")
         else:

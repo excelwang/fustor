@@ -66,7 +66,8 @@ async def test_atomic_write_happy_path(tmp_path):
         while not event_queue.empty():
             e = event_queue.get()
             temp_queue.append(e)
-            if e.rows[0]['path'] == test_probe:
+            # Expect relative path
+            if e.rows[0]['path'] == "/" + os.path.basename(test_probe):
                 probe_events.append(e)
         
         # Put back events for verification
@@ -77,11 +78,12 @@ async def test_atomic_write_happy_path(tmp_path):
             pass
             
         if not probe_events:
-            print("DIAGNOSTIC FAILURE: No events received for simple file creation!")
+            print(f"DIAGNOSTIC FAILURE: No events received for simple file creation! Expected path: /{os.path.basename(test_probe)}")
             # If this fails, inotify is broken/not working on this path.
             # We might fallback to polling or skip?
             # But the requirement is integration test for checks.
             # If environment is broken, we should know.
+            print(f"DIAGNOSTIC: Dump of first 5 events: {[e.rows[0]['path'] for e in temp_queue[:5]]}")
         else:
             print(f"DIAGNOSTIC SUCCESS: Received events for probe: {probe_events}")
             
@@ -109,8 +111,9 @@ async def test_atomic_write_happy_path(tmp_path):
             events.append(event_queue.get())
         
         # Check for Update on target (moved file)
-        target_events = [e for e in events if e.rows[0]['path'] == target_file]
-        assert target_events, f"Should have received event for moved file. Got events: {events}"
+        target_rel_path = "/" + os.path.basename(target_file)
+        target_events = [e for e in events if e.rows[0]['path'] == target_rel_path]
+        assert target_events, f"Should have received event for moved file {target_rel_path}. Got events: {[e.rows[0]['path'] for e in events]}"
         
         # Check flag - moved files should be atomic (no explicit is_atomic_write=False set)
         latest_event = target_events[-1]
@@ -143,10 +146,11 @@ async def test_atomic_write_happy_path(tmp_path):
         while not event_queue.empty():
             events.append(event_queue.get())
             
-        mod_events = [e for e in events if e.event_type == EventType.UPDATE and e.rows[0]['path'] == partial_file]
+        partial_rel_path = "/" + os.path.basename(partial_file)
+        mod_events = [e for e in events if e.event_type == EventType.UPDATE and e.rows[0]['path'] == partial_rel_path]
         
         dirty_events = [e for e in mod_events if e.rows[0].get("is_atomic_write") is False]
-        assert dirty_events, f"Should have received at least one dirty event. Events: {mod_events}"
+        assert dirty_events, f"Should have received at least one dirty event for {partial_rel_path}. Events: {mod_events}"
         logger.info("VERIFIED: Modification produces is_atomic_write=False")
         
         # Cleanup B (Close)
@@ -158,7 +162,7 @@ async def test_atomic_write_happy_path(tmp_path):
         while not event_queue.empty():
             events.append(event_queue.get())
             
-        close_events = [e for e in events if e.event_type == EventType.UPDATE and e.rows[0]['path'] == partial_file]
+        close_events = [e for e in events if e.event_type == EventType.UPDATE and e.rows[0]['path'] == partial_rel_path]
         clean_events = [e for e in close_events if e.rows[0].get("is_atomic_write") is True]
         
         assert clean_events, "Should receive clean event after close"

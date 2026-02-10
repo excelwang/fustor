@@ -32,7 +32,9 @@ class TestSnapshotTombstoneProtection:
         预期:
           - 文件不会在删除后重新出现
         """
+        import os
         test_file = f"{MOUNT_POINT}/snapshot_tombstone_test_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # Step 1: Create file via Agent A
         docker_manager.create_file_in_container(
@@ -42,14 +44,14 @@ class TestSnapshotTombstoneProtection:
         )
         
         # Wait for realtime sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+        found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         assert found is not None, "File should be synced"
         
         # Step 2: Delete via Agent A (creates Tombstone)
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_A, test_file)
         
         # Wait for DELETE event and Verify file is gone
-        removed = fusion_client.wait_for_file(test_file, timeout=MEDIUM_TIMEOUT, should_exist=False)
+        removed = fusion_client.wait_for_file(test_file_rel, timeout=MEDIUM_TIMEOUT, should_exist=False)
         assert removed, "File should be deleted"
         
         # Step 3: Now, if Agent B's snapshot sees the file (due to NFS cache)
@@ -59,7 +61,7 @@ class TestSnapshotTombstoneProtection:
         
         # Step 4: Verify file is still gone (not resurrected)
         tree_after = fusion_client.get_tree(path="/", max_depth=-1)
-        found_after = fusion_client._find_in_tree(tree_after, test_file)
+        found_after = fusion_client._find_in_tree(tree_after, test_file_rel)
         
         assert found_after is None, \
             "Tombstoned file should NOT be resurrected by Snapshot"
@@ -74,6 +76,7 @@ class TestSnapshotTombstoneProtection:
         """
         场景: 快速创建删除场景，验证 Tombstone 保护生效
         """
+        import os
         test_files = [
             f"{MOUNT_POINT}/rapid_{int(time.time()*1000)}_{i}.txt" for i in range(5)
         ]
@@ -95,7 +98,8 @@ class TestSnapshotTombstoneProtection:
         
         # Wait for delete events to be processed
         for f in test_files:
-            assert fusion_client.wait_for_file(f, timeout=MEDIUM_TIMEOUT, should_exist=False), \
+            f_rel = "/" + os.path.relpath(f, MOUNT_POINT)
+            assert fusion_client.wait_for_file(f_rel, timeout=MEDIUM_TIMEOUT, should_exist=False), \
                 f"File {f} should be removed after rapid delete"
         
         # Give a small buffer for potential racing snapshots to be blocked by Tombstone
@@ -104,5 +108,6 @@ class TestSnapshotTombstoneProtection:
         # All files should remain deleted
         tree = fusion_client.get_tree(path="/", max_depth=-1)
         for f in test_files:
-            assert fusion_client._find_in_tree(tree, f) is None, \
+            f_rel = "/" + os.path.relpath(f, MOUNT_POINT)
+            assert fusion_client._find_in_tree(tree, f_rel) is None, \
                 f"File {f} should not be resurrected"

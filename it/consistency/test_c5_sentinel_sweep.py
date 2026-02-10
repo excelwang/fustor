@@ -36,10 +36,12 @@ class TestSentinelSweep:
         """
         logger.info("Starting automated sentinel flow test")
         
+        import os
         test_files = [
             f"{MOUNT_POINT}/sentinel_auto_{i}_{int(time.time())}.txt"
             for i in range(3)
         ]
+        test_files_rel = ["/" + os.path.relpath(f, MOUNT_POINT) for f in test_files]
         
         # 1. Create files from blind-spot (Client C uses NFS Server time)
         for f in test_files:
@@ -75,36 +77,36 @@ class TestSentinelSweep:
         suspect_paths = [item.get("path") for item in suspect_list]
         logger.info(f"Suspect list: {suspect_paths}")
         
-        for f in test_files:
-            if f in suspect_paths:
-                logger.info(f"File {f} is correctly in suspect list.")
+        for f_rel in test_files_rel:
+            if f_rel in suspect_paths:
+                logger.info(f"File {f_rel} is correctly in suspect list.")
             else:
                 # Race Condition Handling: Sentinel might have already processed it!
-                logger.warning(f"File {f} absent from suspect list. Checking if already processed...")
-                node = fusion_client.get_node(f)
+                logger.warning(f"File {f_rel} absent from suspect list. Checking if already processed...")
+                node = fusion_client.get_node(f_rel)
                 if node:
                     is_suspect = node.get("integrity_suspect", False)
-                    logger.info(f"Node Status for {f}: suspect={is_suspect}")
+                    logger.info(f"Node Status for {f_rel}: suspect={is_suspect}")
                     
                     if not is_suspect:
-                        logger.info(f"File {f} was already verified or processed! Marking as success.")
+                        logger.info(f"File {f_rel} was already verified or processed! Marking as success.")
                         continue
                 else:
                     # Node missing from tree - this is unexpected if it's not in suspect list either
                     # But it could have been deleted?
-                    logger.warning(f"File {f} not found in tree (get_node returned None) and not in suspect list.")
+                    logger.warning(f"File {f_rel} not found in tree (get_node returned None) and not in suspect list.")
                         
-                assert f in suspect_paths, f"File {f} must be suspect initially, or already processed"
+                assert f_rel in suspect_paths, f"File {f_rel} must be suspect initially, or already processed"
             
         logger.info(f"Found {len(suspect_list)} items in suspect list. Waiting for Sentinel to process...")
 
         # 4. Wait for Sentinel to automatically process them
         logger.info("Waiting for Sentinel to clear suspect flags...")
-        for f in test_files:
+        for f_rel in test_files_rel:
             # We wait for integrity_suspect flag to become False
             # Fusion should auto-verify via Sentinel/Feedback loop
-            success = fusion_client.wait_for_flag(f, "integrity_suspect", False, timeout=EXTREME_TIMEOUT)
-            assert success, f"File {f} should have its suspect flag cleared by Sentinel"
+            success = fusion_client.wait_for_flag(f_rel, "integrity_suspect", False, timeout=EXTREME_TIMEOUT)
+            assert success, f"File {f_rel} should have its suspect flag cleared by Sentinel"
             
         logger.info("✅ All suspect flags cleared automatically")
 

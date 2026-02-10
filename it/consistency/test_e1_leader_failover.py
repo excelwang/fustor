@@ -98,7 +98,9 @@ class TestLeaderFailover:
         """
         场景: Leader 故障转移后，数据完整性得到保持
         """
+        import os
         test_file = f"/mnt/shared/failover_data_test_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # Create file before failover
         docker_manager.create_file_in_container(
@@ -108,7 +110,7 @@ class TestLeaderFailover:
         )
         
         # Wait for sync
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+        found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         assert found is not None
         
         # Stop leader
@@ -142,7 +144,7 @@ class TestLeaderFailover:
             # or at least not delete it if it was already synced.
             # Wait for the file to be present in Fusion's tree (giving it time for Agent B audit)
             found_after = fusion_client.wait_for_file_in_tree(
-                file_path=test_file,
+                file_path=test_file_rel,
                 timeout=EXTREME_TIMEOUT  # Allow time for Agent B promotion + Audit cycle
             )
             

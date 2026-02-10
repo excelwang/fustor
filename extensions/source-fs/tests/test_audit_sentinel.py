@@ -43,7 +43,9 @@ def test_audit_iterator_detects_changes(fsdriver, tmp_path):
         event, mtime_map = event_tuple
         if event and hasattr(event, "rows"):
             for row in event.rows:
-                if row['path'] == str(file1):
+                # Expect relative path
+                expected_path = "/" + file1.name
+                if row['path'] == expected_path:
                     found = True
     assert found, "Modified file should be detected by audit"
 
@@ -60,11 +62,13 @@ def test_audit_iterator_skips_unchanged(fsdriver, tmp_path):
     iterator = fsdriver.get_audit_iterator(mtime_cache=mtime_cache)
     results = list(iterator)
     
+    expected_path = "/" + file1.name
     for event_tuple in results:
         event, mtime_map = event_tuple
         if event and hasattr(event, "rows"):
             for row in event.rows:
-                assert row['path'] != str(file1)
+                assert row['path'] != expected_path
+                assert row['path'] != str(file1) # Should effectively be covered by above, but safe to keep strict
 
 def test_perform_sentinel_check_verify_files(fsdriver, tmp_path):
     """Test that sentinel check correctly verifies file existence and gets mtime."""

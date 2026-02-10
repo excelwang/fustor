@@ -6,6 +6,7 @@ Test C1: Snapshot/Audit triggers Suspect marking for recent files.
 """
 import pytest
 import time
+import os
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT
@@ -32,6 +33,7 @@ class TestSnapshotTriggersSuspect:
           - 文件在 Audit 后，带有 integrity_suspect 标记
         """
         test_file = f"{MOUNT_POINT}/snapshot_suspect_test_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # Create file from blind-spot
         docker_manager.create_file_in_container(
@@ -44,11 +46,11 @@ class TestSnapshotTriggersSuspect:
         wait_for_audit()
         
         # File should appear
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+        found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         assert found is not None, "File should be discovered by Audit"
         
         # Check integrity_suspect flag
-        flags = fusion_client.check_file_flags(test_file)
+        flags = fusion_client.check_file_flags(test_file_rel)
         assert flags["integrity_suspect"] is True, \
             "Recent file (mtime < 10 min) should be marked as integrity_suspect"
 
@@ -64,6 +66,7 @@ class TestSnapshotTriggersSuspect:
         场景: 刚创建的文件应出现在 Suspect List 中
         """
         test_file = f"{MOUNT_POINT}/suspect_list_test_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # Create file from blind-spot
         docker_manager.create_file_in_container(
@@ -74,12 +77,12 @@ class TestSnapshotTriggersSuspect:
         
         # Wait for Audit completion
         wait_for_audit()
-        fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+        fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         
         # Get suspect list
         suspect_list = fusion_client.get_suspect_list()
         
         # File should be in the list
         paths_in_list = [item.get("path") for item in suspect_list]
-        assert test_file in paths_in_list, \
-            f"File {test_file} should be in suspect list"
+        assert test_file_rel in paths_in_list, \
+            f"File {test_file_rel} should be in suspect list {paths_in_list}"

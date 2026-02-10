@@ -99,21 +99,24 @@ fields_mapping:
              pytest.fail(f"Agent A failed to become leader. Current sessions: {fusion_client.get_sessions()}")
         
         # 3. Create a file with specific size
+        import os.path
         timestamp = int(time.time() * 1000)
         file_name = f"mapping_test_{timestamp}.txt"
         test_file = f"{MOUNT_POINT}/{file_name}"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         expected_size = 1234
         
         # Create file with 1234 bytes
+        # Use dd for cleaner file creation
         docker_env.exec_in_container(
             leader,
-            ["sh", "-c", f"head -c {expected_size} /dev/zero > {test_file}"]
+            ["sh", "-c", f"dd if=/dev/zero of={test_file} bs={expected_size} count=1"]
         )
         logger.info(f"Created test file with size {expected_size}: {test_file}")
         
         # 4. Wait for Fusion to detect it
         # FSDriver should use absolute paths by default (matching schema 'Absolute file path')
-        expected_path_in_tree = test_file
+        expected_path_in_tree = test_file_rel
         success = fusion_client.wait_for_file_in_tree(expected_path_in_tree, timeout=MEDIUM_TIMEOUT)
         assert success, f"File {expected_path_in_tree} not found in tree. Tree: {fusion_client.get_tree()}"
         

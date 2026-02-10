@@ -34,14 +34,18 @@ class TestLargeFileWriting:
           
         注意: 本测试不验证 Suspect 自动过期，因为清除需要 Realtime 事件。
         """
+        import os
         filename = f"large_writing_file_{int(time.time())}.log"
         file_path = f"{MOUNT_POINT}/{filename}"
+        file_rel = "/" + os.path.relpath(file_path, MOUNT_POINT)
         
         # 1. Start a background process using subprocess.Popen to keep it running
         import subprocess
         
         # Write for 15 seconds (longer than audit interval)
         write_cmd = f"for i in $(seq 1 15); do echo 'chunk $i' >> {file_path}; sleep 1; done"
+        
+        # Note: using docker directly instead of docker_manager to allow asynchronous/background process
         docker_cmd = ["docker", "exec", CONTAINER_CLIENT_C, "sh", "-c", write_cmd]
         
         # Start the writer process
@@ -56,18 +60,18 @@ class TestLargeFileWriting:
             wait_for_audit()
         
             # 3. Check status - should be Suspect
-            found = fusion_client.wait_for_file_in_tree(file_path, timeout=SHORT_TIMEOUT)
+            found = fusion_client.wait_for_file_in_tree(file_rel, timeout=SHORT_TIMEOUT)
             assert found is not None, "File should be discovered by Audit"
             
-            flags = fusion_client.check_file_flags(file_path)
+            flags = fusion_client.check_file_flags(file_rel)
             assert flags["integrity_suspect"] is True, \
                 "Writing file from blind-spot should be marked as suspect"
             
-            # 4. Wait a bit more (file still being written)
-            time.sleep(STRESS_DELAY)
+            # 4. Wait for NEXT audit to pick up changes
+            wait_for_audit()
             
             # 5. Check again - should STILL be suspect (mtime keeps updating during write)
-            flags = fusion_client.check_file_flags(file_path)
+            flags = fusion_client.check_file_flags(file_rel)
             assert flags["integrity_suspect"] is True, \
                 "File being actively written should remain suspect"
             

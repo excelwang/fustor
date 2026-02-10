@@ -71,9 +71,10 @@ def test_realtime_file_creation(tmp_path: Path, message_iterator_runner):
     # Assert
     assert len(events) >= 1
     # Check all events (might be multiple due to on_modified)
+    expected_path = "/" + file_path.name
     for event in events:
         assert isinstance(event, UpdateEvent)
-        assert event.rows[0]['path'] == str(file_path)
+        assert event.rows[0]['path'] == expected_path
     
     # Final event should have correct size
     assert events[-1].rows[0]['size'] == 5
@@ -93,7 +94,9 @@ def test_realtime_file_deletion(tmp_path: Path, message_iterator_runner):
     time.sleep(0.5)
     assert len(events) == 1
     event = events[0]
+    expected_path = "/" + file_path.name
     assert isinstance(event, DeleteEvent)
+    assert event.rows[0]['path'] == expected_path
 
 
 def test_realtime_file_move(tmp_path: Path, message_iterator_runner):
@@ -115,8 +118,12 @@ def test_realtime_file_move(tmp_path: Path, message_iterator_runner):
 
     assert len(delete_events) == 1
     assert len(update_events) == 1
-    assert delete_events[0].rows[0]['path'] == str(src_path)
-    assert update_events[0].rows[0]['path'] == str(dest_path)
+    
+    expected_src = "/" + src_path.name
+    expected_dest = "/" + dest_path.name
+    
+    assert delete_events[0].rows[0]['path'] == expected_src
+    assert update_events[0].rows[0]['path'] == expected_dest
 
 
 def test_iterator_ignores_old_events(tmp_path: Path, message_iterator_runner):
@@ -146,5 +153,6 @@ def test_iterator_ignores_old_events(tmp_path: Path, message_iterator_runner):
     assert len(events) >= 1
     # The last event should be the creation of the new file
     assert isinstance(events[-1], UpdateEvent)
-    assert events[-1].rows[0]['path'] == str(new_file)
+    expected_path = "/" + new_file.name
+    assert events[-1].rows[0]['path'] == expected_path
 

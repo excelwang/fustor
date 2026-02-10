@@ -85,7 +85,11 @@ class TestNewLeaderResumesDuties:
                 "Agent B should be the new leader"
             
             # Create file from blind-spot
+            # Create file from blind-spot
+            import os
             test_file = f"{MOUNT_POINT}/new_leader_audit_test_{int(time.time()*1000)}.txt"
+            test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
+            
             docker_manager.create_file_in_container(
                 CONTAINER_CLIENT_C,
                 test_file,
@@ -95,12 +99,14 @@ class TestNewLeaderResumesDuties:
             # Wait for new leader's Audit to find the file
             # Use marker file approach for more reliable audit cycle detection
             marker_file = f"{MOUNT_POINT}/audit_marker_e2_{int(time.time()*1000)}.txt"
+            marker_file_rel = "/" + os.path.relpath(marker_file, MOUNT_POINT)
+            
             docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_file, content="marker")
             time.sleep(STRESS_DELAY)
-            assert fusion_client.wait_for_file_in_tree(marker_file, timeout=LONG_TIMEOUT) is not None
+            assert fusion_client.wait_for_file_in_tree(marker_file_rel, timeout=LONG_TIMEOUT) is not None
             
             # File should be discovered by new leader's Audit
-            found = fusion_client.wait_for_file_in_tree(test_file, timeout=MEDIUM_TIMEOUT)
+            found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
             
             assert found is not None, \
                 "New leader should discover blind-spot file via Audit"
@@ -109,7 +115,7 @@ class TestNewLeaderResumesDuties:
             start = time.time()
             flag_set = False
             while time.time() - start < LONG_TIMEOUT:
-                flags = fusion_client.check_file_flags(test_file)
+                flags = fusion_client.check_file_flags(test_file_rel)
                 if flags["agent_missing"] is True:
                     flag_set = True
                     break
@@ -179,7 +185,10 @@ class TestNewLeaderResumesDuties:
                 pytest.fail("View failed to become ready after failover in test_new_leader_performs_snapshot")
             
             # Create new file while B is leader
+            import os
             new_file = f"{test_dir}/after_failover.txt"
+            new_file_rel = "/" + os.path.relpath(new_file, MOUNT_POINT)
+            
             docker_manager.create_file_in_container(
                 CONTAINER_CLIENT_B,
                 new_file,
@@ -187,7 +196,7 @@ class TestNewLeaderResumesDuties:
             )
             
             # New leader B should sync this via realtime
-            found = fusion_client.wait_for_file_in_tree(new_file, timeout=MEDIUM_TIMEOUT)
+            found = fusion_client.wait_for_file_in_tree(new_file_rel, timeout=MEDIUM_TIMEOUT)
             
             assert found is not None, \
                 f"New leader should sync files via realtime, got sessions: {fusion_client.get_sessions()}"

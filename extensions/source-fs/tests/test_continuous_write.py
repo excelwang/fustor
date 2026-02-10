@@ -76,7 +76,9 @@ def test_events_during_incomplete_write(tmp_path: Path, message_iterator_runner)
     # Check that the event refers to the correct file
     last_event = events[-1]
     assert isinstance(last_event, UpdateEvent)
-    assert last_event.rows[0]['path'] == str(file_path)
+    # Expect relative path with leading slash
+    expected_path = "/" + file_path.name
+    assert last_event.rows[0]['path'] == expected_path
 
     # Act: Continue writing to the file
     file_handle.write("\nadditional content")
@@ -94,7 +96,7 @@ def test_events_during_incomplete_write(tmp_path: Path, message_iterator_runner)
     assert len(events) >= 1
     final_event = events[-1]
     assert isinstance(final_event, UpdateEvent)
-    assert final_event.rows[0]['path'] == str(file_path)
+    assert final_event.rows[0]['path'] == expected_path
     # Total size should be around 15 + 1 + 18 = 34
     assert final_event.rows[0]['size'] >= 15
 
@@ -124,9 +126,10 @@ def test_multiple_writes_generate_single_event(tmp_path: Path, message_iterator_
     assert len(events) >= 1, f"Expected at least 1 event after multiple writes, but got {len(events)}"
     
     # Verify that the events refer to the correct file
+    expected_path = "/" + file_path.name
     for event in events:
         assert isinstance(event, UpdateEvent)
-        assert event.rows[0]['path'] == str(file_path)
+        assert event.rows[0]['path'] == expected_path
     
     # The last event should have the full size
     assert events[-1].rows[0]['size'] > 0
@@ -162,4 +165,5 @@ def test_append_mode_writes_generate_single_event(tmp_path: Path, message_iterat
     # Last event should be the final state
     final_event = events[-1]
     assert isinstance(final_event, UpdateEvent)
-    assert final_event.rows[0]['path'] == str(file_path)
+    expected_path = "/" + file_path.name
+    assert final_event.rows[0]['path'] == expected_path

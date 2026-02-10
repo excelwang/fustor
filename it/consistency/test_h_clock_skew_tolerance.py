@@ -87,8 +87,10 @@ class TestClockSkewTolerance:
           - Agent A 通过审计发现该文件。
           - 由于该文件是新出现的且 mtime 与当前水位线接近（Age < threshold），应标记为 suspect。
         """
+        import os.path
         filename = f"audit_discovery_{int(time.time())}.txt"
         file_path = f"{MOUNT_POINT}/{filename}"
+        file_rel = "/" + os.path.relpath(file_path, MOUNT_POINT)
         
         # 1. Create file from Client C (No Agent)
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path, "from_c")
@@ -103,10 +105,10 @@ class TestClockSkewTolerance:
         wait_for_audit()
         
         # 3. Wait for discovery via Audit/Scan from Agent A (Leader)
-        assert fusion_client.wait_for_file_in_tree(file_path, timeout=EXTREME_TIMEOUT) is not None
+        assert fusion_client.wait_for_file_in_tree(file_rel, timeout=EXTREME_TIMEOUT) is not None
         
         # 3. Verify suspect flag
-        flags = fusion_client.check_file_flags(file_path)
+        flags = fusion_client.check_file_flags(file_rel)
         logger.info(f"Audit discovered file flags: {flags}")
         assert flags["integrity_suspect"] is True, "New file discovered via Audit should be suspect"
 
@@ -120,21 +122,23 @@ class TestClockSkewTolerance:
         """
         验证落后 Agent 的实时修改能正常同步并由于时间较旧而清除 suspect。
         """
+        import os.path
         filename = f"past_rt_{int(time.time())}.txt"
         file_path = f"{MOUNT_POINT}/{filename}"
+        file_rel = "/" + os.path.relpath(file_path, MOUNT_POINT)
         
         # 1. Create file via Client C (Host time)
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path, "orig")
         
         # 2. Wait for it to be suspect (if discovered via audit by A) or just wait for it to appear
-        assert fusion_client.wait_for_file_in_tree(file_path) is not None
+        assert fusion_client.wait_for_file_in_tree(file_rel) is not None
         
         # 3. Agent B (落后 1h) 修改文件。实时事件会清除 suspect。
         docker_manager.exec_in_container(CONTAINER_CLIENT_B, ["sh", "-c", f"echo 'mod' >> {file_path}"])
         
         # 4. Verify suspect is cleared
         time.sleep(INGESTION_DELAY)
-        flags = fusion_client.check_file_flags(file_path)
+        flags = fusion_client.check_file_flags(file_rel)
         assert flags["integrity_suspect"] is False, "Realtime update should clear suspect status"
 
     def test_logical_clock_jumps_forward_and_remains_stable(
@@ -155,13 +159,15 @@ class TestClockSkewTolerance:
           - 逻辑时钟水位线由于 Agent A 的文件而推进。
           - 后续正常文件被视为"旧"的（Age ~ 2h），不会标记为 suspect。
         """
+        import os.path
         # 1. Agent A (+2h) creates a file
         filename_a = f"jump_trigger_{int(time.time())}.txt"
         file_path_a = f"{MOUNT_POINT}/{filename_a}"
+        file_path_a_rel = "/" + os.path.relpath(file_path_a, MOUNT_POINT)
         docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["touch", file_path_a])
         
         # Wait for discovery to ensure clock jumped
-        assert fusion_client.wait_for_file_in_tree(file_path_a, timeout=LONG_TIMEOUT) is not None
+        assert fusion_client.wait_for_file_in_tree(file_path_a_rel, timeout=LONG_TIMEOUT) is not None
         
         stats = fusion_client.get_stats()
         logical_now = stats.get("logical_now", 0)
@@ -172,17 +178,21 @@ class TestClockSkewTolerance:
         # 2. Now create a NORMAL file (Host time) from Client C
         normal_file = f"cold_file_{int(time.time())}.txt"
         file_path_normal = f"{MOUNT_POINT}/{normal_file}"
+        file_path_normal_rel = "/" + os.path.relpath(file_path_normal, MOUNT_POINT)
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path_normal, "normal")
         
         # 3. Wait for Audit to discover it
         # (We use a marker to be sure audit finished after the file was created)
         audit_marker = f"marker_jump_{int(time.time())}.txt"
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, f"{MOUNT_POINT}/{audit_marker}", "marker")
-        assert fusion_client.wait_for_file_in_tree(f"{MOUNT_POINT}/{audit_marker}", timeout=EXTREME_TIMEOUT) is not None
+        audit_marker_path = f"{MOUNT_POINT}/{audit_marker}"
+        audit_marker_rel = "/" + os.path.relpath(audit_marker_path, MOUNT_POINT)
+        
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, audit_marker_path, "marker")
+        assert fusion_client.wait_for_file_in_tree(audit_marker_rel, timeout=EXTREME_TIMEOUT) is not None
         
         # 4. Verify the normal file is NOT suspect
-        assert fusion_client.wait_for_file_in_tree(file_path_normal) is not None
-        flags = fusion_client.check_file_flags(file_path_normal)
+        assert fusion_client.wait_for_file_in_tree(file_path_normal_rel) is not None
+        flags = fusion_client.check_file_flags(file_path_normal_rel)
         logger.info(f"Post-jump normal file flags: {flags}")
         
         # With Skew Normalization (Physical Age), the file is identified as PHYSICALLY FRESH (0s old).

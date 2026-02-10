@@ -1,4 +1,5 @@
 import pytest
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, ANY
 import time
@@ -87,26 +88,32 @@ def test_snapshot_finds_files_and_generates_events(fs_config, tmp_path: Path, mo
                 assert 'is_directory' in row # Ensure the flag is always present
 
         # Assert all expected items (files and directories) were processed
+        # Helper for relative path
+        def rel(p):
+            r = "/" + os.path.relpath(p, tmp_path).lstrip("/")
+            return "/" if r == "/." else r
+
         expected_paths = {
-            str(tmp_path),
-            str(dir1_path),
-            str(test1_file),
-            str(test2_file),
-            str(test3_file)
+            rel(tmp_path),
+            rel(dir1_path),
+            rel(test1_file),
+            rel(test2_file),
+            rel(test3_file)
         }
         assert all_processed_paths == expected_paths
 
         # Assert correct types
-        assert str(tmp_path) in all_dir_paths
-        assert str(dir1_path) in all_dir_paths
-        assert str(test1_file) in all_file_paths
-        assert str(test2_file) in all_file_paths
-        assert str(test3_file) in all_file_paths
+        assert rel(tmp_path) in all_dir_paths
+        assert rel(dir1_path) in all_dir_paths
+        assert rel(test1_file) in all_file_paths
+        assert rel(test2_file) in all_file_paths
+        assert rel(test3_file) in all_file_paths
         assert len(all_dir_paths) == 2
         assert len(all_file_paths) == 3
 
         # Verify watch_manager.touch calls
-        # Expected calls: tmp_path, dir1_path
+        # touch calls use absolute paths because they are internal to driver/watch_manager
+        # So we keep checking absolute paths for touched_paths
         touched_paths = {call_arg.args[0] for call_arg in mock_watch_manager.touch.call_args_list}
         assert str(tmp_path) in touched_paths
         assert str(dir1_path) in touched_paths

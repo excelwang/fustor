@@ -6,7 +6,7 @@ receivers:
     driver: http
     bind_host: "0.0.0.0"
     port: 8102
-    session_timeout_seconds: 3600
+    session_timeout_seconds: ${TEST_SESSION_TIMEOUT}
     api_keys:
       - key: "${TEST_API_KEY}"
         pipe_id: "${TEST_VIEW_ID}"

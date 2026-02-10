@@ -31,7 +31,9 @@ class TestApiSuspectVisibility:
           - API 返回该文件
           - API 返回中包含 `integrity_suspect: true`
         """
+        import os
         test_file = f"{MOUNT_POINT}/api_suspect_test_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # 1. create file in blind spot (Client C)
         # Use a future timestamp to guarantee it's considered "hot" and thus suspect
@@ -53,16 +55,17 @@ class TestApiSuspectVisibility:
         wait_for_audit()
         
         # Verify marker found -> Audit cycle completed
-        assert fusion_client.wait_for_file_in_tree(marker_file) is not None
+        marker_file_rel = "/" + os.path.relpath(marker_file, MOUNT_POINT)
+        assert fusion_client.wait_for_file_in_tree(marker_file_rel) is not None
         
         # 3. Check API response for the test file
         # It should be found
-        found_node = fusion_client.wait_for_file_in_tree(test_file)
+        found_node = fusion_client.wait_for_file_in_tree(test_file_rel)
         assert found_node is not None, "File should be discovered by Audit"
         
         # It should be flagged as Suspect because it's new (Hot)
         # Check flags via check_file_flags helper (which calls get_tree)
-        flags = fusion_client.check_file_flags(test_file)
+        flags = fusion_client.check_file_flags(test_file_rel)
         
         assert flags["integrity_suspect"] is True, \
             f"New file from blind spot should be marked as suspect. Flags: {flags}, Node: {found_node}"
@@ -90,7 +93,10 @@ class TestApiSuspectVisibility:
           - API 返回中 `integrity_suspect` 变为 `false`
         """
         # Create a file
+        import os
         test_file = f"{MOUNT_POINT}/stabilize_test_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
+        
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,
             test_file,
@@ -99,10 +105,10 @@ class TestApiSuspectVisibility:
         
         # Wait for Audit discovery
         wait_for_audit()
-        assert fusion_client.wait_for_file_in_tree(test_file) is not None
+        assert fusion_client.wait_for_file_in_tree(test_file_rel) is not None
         
         # Verify initial suspect state
-        assert fusion_client.check_file_flags(test_file)["integrity_suspect"] is True
+        assert fusion_client.check_file_flags(test_file_rel)["integrity_suspect"] is True
         
         # Wait for TTL expiry
         logger_name = "fustor_test"
@@ -118,7 +124,7 @@ class TestApiSuspectVisibility:
         start = time.time()
         cleared = False
         while time.time() - start < MEDIUM_TIMEOUT:
-            if fusion_client.check_file_flags(test_file)["integrity_suspect"] is False:
+            if fusion_client.check_file_flags(test_file_rel)["integrity_suspect"] is False:
                 cleared = True
                 break
             time.sleep(INGESTION_DELAY)

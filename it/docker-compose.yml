@@ -44,6 +44,7 @@ services:
       # Inject Test Config Vars for envsubst
       TEST_VIEW_ID: "integration-test-ds"
       TEST_API_KEY: "test-api-key-123"
+      TEST_SESSION_TIMEOUT: "5"
     volumes:
       - fusion-data:/data/fusion
       - ./config/fusion-config:/config/fusion-config

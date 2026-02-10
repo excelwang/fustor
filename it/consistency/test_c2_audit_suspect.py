@@ -6,6 +6,7 @@ Test C2: Audit triggers Suspect marking for blind-spot recent files.
 """
 import pytest
 import time
+import os
 
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_C, MOUNT_POINT
@@ -32,6 +33,7 @@ class TestAuditTriggersSuspect:
           - 文件同时具有 agent_missing: true 和 integrity_suspect: true
         """
         test_file = f"{MOUNT_POINT}/audit_suspect_test_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # Create file from blind-spot client
         docker_manager.create_file_in_container(
@@ -45,11 +47,11 @@ class TestAuditTriggersSuspect:
         wait_for_audit()
         
         # File should appear
-        found = fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
+        found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
         assert found is not None, "Blind-spot file should be discovered by Audit"
         
         # Check both flags
-        flags = fusion_client.check_file_flags(test_file)
+        flags = fusion_client.check_file_flags(test_file_rel)
         
         assert flags["agent_missing"] is True, \
             "Blind-spot file should be marked agent_missing"
@@ -68,6 +70,7 @@ class TestAuditTriggersSuspect:
         场景: Audit 发现的可疑文件应同时出现在 Suspect List 中
         """
         test_file = f"{MOUNT_POINT}/audit_suspect_list_{int(time.time()*1000)}.txt"
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         docker_manager.create_file_in_container(
             CONTAINER_CLIENT_C,
@@ -79,10 +82,10 @@ class TestAuditTriggersSuspect:
         wait_for_audit()
         
         # Now wait for the file itself
-        fusion_client.wait_for_file_in_tree(test_file, timeout=SHORT_TIMEOUT)
+        fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
         
         suspect_list = fusion_client.get_suspect_list()
         paths = [item.get("path") for item in suspect_list]
         
-        assert test_file in paths, \
-            "Audit-discovered recent file should be in suspect list"
+        assert test_file_rel in paths, \
+            f"Audit-discovered recent file should be in suspect list {paths}"
