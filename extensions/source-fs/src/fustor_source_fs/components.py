@@ -159,6 +159,8 @@ class _WatchManager:
         while not self._stop_event.is_set():
             try:
                 raw_events = self.inotify.read_events()
+                if raw_events:
+                    logger.debug(f"Inotify received {len(raw_events)} raw events.")
 
                 # Pre-process to identify paired moves and avoid duplicate events.
                 paired_move_from_paths = set()
