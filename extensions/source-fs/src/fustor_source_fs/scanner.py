@@ -164,7 +164,9 @@ class FSScanner:
     def scan_snapshot(self, 
                       event_schema: str, 
                       batch_size: int = 100, 
-                      callback: Callable[[str, float], None] = None) -> Iterator[EventBase]:
+                      callback: Callable[[str, float], None] = None,
+                      initial_path: str = None,
+                      message_source: MessageSource = MessageSource.SNAPSHOT) -> Iterator[EventBase]:
         """
         Executes snapshot scan.
         callback: Optional function to call for touching watched paths (path, mtime).
@@ -190,7 +192,7 @@ class FSScanner:
                     table="files",
                     rows=[dir_metadata],
                     fields=list(dir_metadata.keys()),
-                    message_source=MessageSource.SNAPSHOT,
+                    message_source=message_source,
                     index=snapshot_time
                 ))
 
@@ -213,7 +215,7 @@ class FSScanner:
                                         table="files",
                                         rows=local_batch,
                                         fields=list(local_batch[0].keys()),
-                                        message_source=MessageSource.SNAPSHOT,
+                                        message_source=message_source,
                                         index=snapshot_time
                                     ))
                                     local_batch = []
@@ -226,7 +228,7 @@ class FSScanner:
                         table="files",
                         rows=local_batch,
                         fields=list(local_batch[0].keys()),
-                        message_source=MessageSource.SNAPSHOT,
+                        message_source=message_source,
                         index=snapshot_time
                     ))
                 
@@ -241,7 +243,7 @@ class FSScanner:
 
         # Global re-batching buffer loop
         row_buffer = []
-        for item in self.engine.scan_parallel(snapshot_worker):
+        for item in self.engine.scan_parallel(snapshot_worker, initial_item=initial_path):
             if isinstance(item, UpdateEvent):
                 # We might want to re-batch here if we want strictly batch_size chunks,
                 # but UpdateEvents are already batched by directory.
@@ -253,7 +255,7 @@ class FSScanner:
                         table="files",
                         rows=row_buffer[:batch_size],
                         fields=list(row_buffer[0].keys()),
-                        message_source=MessageSource.SNAPSHOT,
+                        message_source=message_source,
                         index=snapshot_time
                     )
                     row_buffer = row_buffer[batch_size:]
@@ -271,7 +273,9 @@ class FSScanner:
     def scan_audit(self, 
                    event_schema: str, 
                    mtime_cache: Dict[str, float], 
-                   batch_size: int = 100) -> Iterator[Tuple[Optional[UpdateEvent], Dict[str, float]]]:
+                   batch_size: int = 100,
+                   initial_path: str = None,
+                   message_source: MessageSource = MessageSource.AUDIT) -> Iterator[Tuple[Optional[UpdateEvent], Dict[str, float]]]:
         """
         Executes audit scan.
         """
@@ -321,7 +325,7 @@ class FSScanner:
                                             table="files",
                                             rows=local_batch,
                                             fields=list(local_batch[0].keys()),
-                                            message_source=MessageSource.AUDIT,
+                                            message_source=message_source,
                                             index=audit_time
                                         ), {root: current_dir_mtime}))
                                         local_batch = []
@@ -334,7 +338,7 @@ class FSScanner:
                         table="files",
                         rows=local_batch,
                         fields=list(local_batch[0].keys()),
-                        message_source=MessageSource.AUDIT,
+                        message_source=message_source,
                         index=audit_time
                     ), {root: current_dir_mtime}))
                 elif not is_silent:
@@ -347,5 +351,5 @@ class FSScanner:
             except Exception as e:
                 logger.error(f"[fs] Failed to process directory '{root}' during audit: {e}")
 
-        for result in self.engine.scan_parallel(audit_worker, initial_item=(self.root, None)):
+        for result in self.engine.scan_parallel(audit_worker, initial_item=(initial_path if initial_path else self.root, None)):
             yield result

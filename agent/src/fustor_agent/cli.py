@@ -67,7 +67,14 @@ def start(configs, daemon, verbose, no_console_log):
         fustor-agent start pipe-a pipe-b      # Start multiple pipes
         fustor-agent start custom.yaml        # Start from managed file
     """
-    log_level = "DEBUG" if verbose else "INFO"
+    # Determine log level: command line flag takes precedence over config file
+    if verbose:
+        log_level = "DEBUG"
+    else:
+        # Load config to see if a level is specified there
+        agent_config.ensure_loaded()
+        log_level = agent_config.logging.level if hasattr(agent_config, "logging") else "INFO"
+
     setup_logging(
         log_file_path=AGENT_LOG_FILE,
         base_logger_name="fustor_agent",
@@ -75,17 +82,6 @@ def start(configs, daemon, verbose, no_console_log):
         console_output=(not no_console_log)
     )
     logger = logging.getLogger("fustor_agent")
-
-    # Override logging level from config if not verbose
-    if not verbose:
-        agent_config.ensure_loaded()
-        log_level = agent_config.logging.level
-        setup_logging(
-            log_file_path=AGENT_LOG_FILE,
-            base_logger_name="fustor_agent",
-            level=log_level.upper(),
-            console_output=(not no_console_log)
-        )
 
     if daemon:
         pid = _is_running()

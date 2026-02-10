@@ -265,18 +265,45 @@ class FSDriver(SourceDriver):
             # Update watch manager to keep it fresh
             self.watch_manager.touch(p, relative_mtime, is_recursive_upward=False)
 
+        # Handle single file case or directory
+        logger.info(f"[{stream_id}] Checking path on disk: {path}")
+        if os.path.isfile(path):
+            logger.info(f"[{stream_id}] Path is a file, yielding single event")
+            try:
+                stat = os.stat(path)
+                meta = get_file_metadata(path, root_path=self.uri, stat_info=stat)
+                relative_path = _get_relative_path(path, self.uri)
+                self.watch_manager.touch(path, stat.st_mtime - self.drift_from_nfs, is_recursive_upward=False)
+                yield UpdateEvent(
+                    event_schema=self.schema_name,
+                    table="files",
+                    rows=[meta],
+                    fields=list(meta.keys()),
+                    message_source=MessageSource.REALTIME,
+                    index=int(time.time() * 1000)
+                )
+            except Exception as e:
+                logger.warning(f"[{stream_id}] Failed to scan single file {path}: {e}")
+            return
+        
+        if not os.path.exists(path):
+            logger.warning(f"[{stream_id}] Path does not exist on disk: {path}")
+            return
+
         if recursive:
-            yield from scanner.scan_snapshot(self.schema_name, batch_size=100, callback=touch_callback)
+            yield from scanner.scan_snapshot(self.schema_name, batch_size=100, callback=touch_callback, initial_path=path, message_source=MessageSource.REALTIME)
         else:
             # Non-recursive: only return directory metadata itself
             try:
                 stat = os.stat(path)
                 meta = get_file_metadata(path, root_path=self.uri, stat_info=stat)
                 yield UpdateEvent(
-                    key=_get_relative_path(path, self.uri),
                     event_schema=self.schema_name,
                     table="files",
-                    rows=[meta]
+                    rows=[meta],
+                    fields=list(meta.keys()),
+                    message_source=MessageSource.REALTIME,
+                    index=int(time.time() * 1000)
                 )
             except Exception as e:
                 logger.error(f"[{stream_id}] Error scanning path: {e}")

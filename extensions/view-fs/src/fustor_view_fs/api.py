@@ -76,14 +76,20 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep, chec
         effective_recursive = recursive if max_depth is None else True
         result = await driver.get_directory_tree(path, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
         
-        if result is None:
-            return ORJSONResponse(content={"detail": "路径未找到或尚未同步"}, status_code=404)
-        
         # Check if there's a pending scan for this path
         scan_pending = False
         if force_real_time:
             from fustor_fusion.core.session_manager import session_manager
             scan_pending = await session_manager.has_pending_scan(view_id, path)
+
+        if result is None:
+            if scan_pending:
+                return ORJSONResponse(content={
+                    "data": None,
+                    "scan_pending": True,
+                    "message": "Path not found, but a scan has been triggered and is pending."
+                }, status_code=200)
+            return ORJSONResponse(content={"detail": "路径未找到或尚未同步"}, status_code=404)
         
         return ORJSONResponse(content={
             "data": result,

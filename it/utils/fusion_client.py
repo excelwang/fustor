@@ -56,17 +56,22 @@ class FusionClient:
         max_depth: int = -1,
         only_path: bool = False,
         dry_run: bool = False,
+        force_real_time: bool = False,
         silence_503: bool = False
     ) -> dict[str, Any]:
         """Get file tree from Fusion."""
+        params = {
+            "path": path,
+            "max_depth": max_depth,
+            "only_path": only_path,
+            "dry_run": dry_run
+        }
+        if force_real_time:
+            params["force_real_time"] = "true"
+
         resp = self.session.get(
             f"{self.base_url}/api/v1/views/{self.view_id}/tree",
-            params={
-                "path": path,
-                "max_depth": max_depth,
-                "only_path": only_path,
-                "dry_run": dry_run
-            }
+            params=params
         )
         try:
             resp.raise_for_status()
@@ -219,6 +224,11 @@ class FusionClient:
             return tree
         except (requests.HTTPError, Exception):
             return None
+
+    def api_request(self, method: str, path: str, **kwargs) -> requests.Response:
+        """Make a raw API request to Fusion."""
+        url = f"{self.base_url}/api/v1/{path}"
+        return self.session.request(method, url, **kwargs)
 
     # ============ Utility Methods ============
 

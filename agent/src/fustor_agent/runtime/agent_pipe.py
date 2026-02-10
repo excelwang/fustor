@@ -904,11 +904,6 @@ class AgentPipe(Pipe):
             
         except Exception as e:
             logger.error(f"Pipe {self.id}: On-demand scan failed: {e}")
-        else:
-            logger.info(
-                f"Pipe {self.id}: Remapped to new bus {new_bus.id} "
-                f"(from {old_bus_id})"
-            )
 
     @property
     def bus(self) -> Optional["EventBusInstanceRuntime"]:

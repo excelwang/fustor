@@ -241,6 +241,14 @@ class DockerManager:
         """Restart a container."""
         subprocess.run(["docker", "restart", container], check=True)
 
+    def pause_container(self, container: str) -> None:
+        """Pause a container."""
+        subprocess.run(["docker", "pause", container], check=True)
+
+    def unpause_container(self, container: str) -> None:
+        """Unpause a container."""
+        subprocess.run(["docker", "unpause", container], check=True)
+
     def create_file_in_container(
         self,
         container: str,
