@@ -19,7 +19,7 @@ class SuspectUpdateRequest(BaseModel):
     updates: List[Dict[str, Any]]  # List of {"path": str, "mtime": float}
 
 
-def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep):
+def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep, check_metadata_limit_func=None):
     """
     Factory function to create the FS router with proper dependencies.
     
@@ -27,15 +27,22 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep):
         get_driver_func: Async function to get the FSViewDriver for a view
         check_snapshot_func: Async function to check snapshot status (includes Core + Live logic)
         get_view_id_dep: FastAPI dependency to get view_id from API key
+        check_metadata_limit_func: Optional FastAPI dependency to check metadata limits
 
     Returns:
         Configured FastAPI APIRouter
     """
     router = APIRouter(tags=["Filesystem Views"])
     
+    # Common dependencies for read operations
+    read_deps = [Depends(check_snapshot_func)]
+    if check_metadata_limit_func:
+        read_deps.append(Depends(check_metadata_limit_func))
+
     @router.get("/tree", 
         summary="获取文件系统树结构", 
-        response_class=ORJSONResponse
+        response_class=ORJSONResponse,
+        dependencies=read_deps
     )
     async def get_directory_tree_api(
         path: str = Query("/", description="要检索的目录路径 (默认: '/')"),
@@ -47,7 +54,7 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep):
         view_id: str = Depends(get_view_id_dep)
     ) -> Optional[Dict[str, Any]]:
         """获取指定路径起始的目录结构树。"""
-        await check_snapshot_func(view_id)
+        # Note: snapshot check and metadata limit check are handled by dependencies
         
         if dry_run:
             return ORJSONResponse(content={"message": "dry-run", "view_id": view_id})
@@ -83,13 +90,15 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep):
             "scan_pending": scan_pending
         })
 
-    @router.get("/search", summary="基于模式搜索文件")
+    @router.get("/search", 
+        summary="基于模式搜索文件",
+        dependencies=read_deps
+    )
     async def search_files_api(
         pattern: str = Query(..., description="要搜索的路径匹配模式 (例如: '*.log' 或 '/data/res*')"),
         view_id: str = Depends(get_view_id_dep)
     ) -> list:
         """搜索匹配模式的文件。"""
-        await check_snapshot_func(view_id)
         driver = await get_driver_func(view_id)
         if not driver:
             return []

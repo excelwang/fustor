@@ -37,6 +37,50 @@ async def get_view_driver_instance(view_id: str, lookup_key: str):
             
     return driver_instance
 
+def make_metadata_limit_checker(view_name: str) -> Callable:
+    """Creates a dependency that ensures a request doesn't exceed metadata limits."""
+    async def check_limit(view_id: str = Depends(get_view_id_from_api_key)):
+        # Ensure latest config is loaded
+        fusion_config.reload()
+        # Get view config
+        view_cfg = fusion_config.get_view(view_name)
+        if not view_cfg:
+            return True
+            
+        # max_tree_items is specific to view-fs, so we look in driver_params
+        params = view_cfg.driver_params
+        limit = params.get("max_tree_items", 100000)
+        
+        if limit <= 0: # 0 or negative means unlimited
+            return True
+            
+        # Get current stats from driver
+        manager = await get_cached_view_manager(view_name)
+        # We need a driver instance to get stats
+        driver_instance = None
+        if manager.driver_instances:
+            driver_instance = list(manager.driver_instances.values())[0]
+            
+        if driver_instance:
+            stats = await driver_instance.get_directory_stats()
+            item_count = stats.get("item_count", 0)
+            
+            if item_count > limit:
+                logger.warning(f"Metadata check failed for view '{view_name}': {item_count} items (limit: {limit})")
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "error": "Metadata retrieval limit exceeded",
+                        "view": view_name,
+                        "current_count": item_count,
+                        "limit": limit,
+                        "suggestion": "Try a more specific path or reduce recursion depth."
+                    }
+                )
+        return True
+    return check_limit
+
+
 def make_readiness_checker(view_name: str) -> Callable:
     """Creates a dependency that ensures a view is ready before allowing API access."""
     async def check_ready(view_id: str = Depends(get_view_id_from_api_key)):
@@ -134,16 +178,18 @@ def setup_view_routers():
                         return await get_view_driver_instance(_key, _key)
                     
                     checker = make_readiness_checker(view_name)
+                    limit_checker = make_metadata_limit_checker(view_name)
                     
                     router = create_func(
                         get_driver_func=get_driver_instance_for_instance,
                         check_snapshot_func=checker,
-                        get_view_id_dep=get_view_id_from_api_key
+                        get_view_id_dep=get_view_id_from_api_key,
+                        check_metadata_limit_func=limit_checker
                     )
                     
                     # Register with prefix matching the view_name (e.g., test-fs)
                     view_router.include_router(router, prefix=f"/{view_name}")
-                    logger.info(f"Registered view API routes: {view_name} (driver: {driver_name}) at prefix /{view_name}")
+                    logger.info(f"Registered view API routes: {view_name} (driver: {driver_name}) at prefix /{view_name} WITH LIMIT CHECKER")
                     registered_count += 1
                 except Exception as e:
                     logger.error(f"Error registering view API routes '{view_name}': {e}", exc_info=True)
@@ -159,11 +205,13 @@ def setup_view_routers():
                     return await get_view_driver_instance(_key, _key)
                 
                 checker = make_readiness_checker(name)
+                limit_checker = make_metadata_limit_checker(name)
                 
                 router = create_func(
                     get_driver_func=get_driver_instance_fallback,
                     check_snapshot_func=checker,
-                    get_view_id_dep=get_view_id_from_api_key
+                    get_view_id_dep=get_view_id_from_api_key,
+                    check_metadata_limit_func=limit_checker
                 )
                 
                 view_router.include_router(router, prefix=f"/{name}")
