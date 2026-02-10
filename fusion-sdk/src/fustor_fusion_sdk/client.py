@@ -161,6 +161,19 @@ class FusionClient:
             logger.error(f"An error occurred during heartbeat: {e}")
             return None
 
+    async def terminate_session(self, session_id: str) -> bool:
+        """
+        Terminates the given session on the Fusion service.
+        """
+        try:
+            # HTTPReceiver expects the session_id in the URL path: DELETE /api/v1/pipe/session/{session_id}
+            response = await self.client.delete(f"{self._session_path}/{session_id}")
+            response.raise_for_status()
+            return True
+        except Exception as e:
+            logger.error(f"An error occurred while terminating session {session_id}: {e}")
+            return False
+
     async def signal_audit_start(self, source_id: int) -> bool:
         """Signals the start of an audit cycle."""
         try:
