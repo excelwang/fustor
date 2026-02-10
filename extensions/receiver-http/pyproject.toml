@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fustor-receiver-http"
-version = "0.8.8"
+version = "0.8.9"
 description = "Fustor HTTP Receiver - Transport layer for Fusion to receive events from Agents"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -30,7 +30,6 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/receiver-
 http = "fustor_receiver_http:HTTPReceiver"
 
 
-root = "../.."
 
 [tool.setuptools.packages.find]
 where = ["src"]

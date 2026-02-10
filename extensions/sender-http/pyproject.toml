@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fustor-sender-http"
-version = "0.8.8"
+version = "0.8.9"
 description = "Fustor HTTP Sender - Transport layer for Agent to Fusion communication"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -31,7 +31,6 @@ fusion = "fustor_sender_http:HTTPSender"
 
 
 
-root = "../.."
 
 [tool.setuptools.packages.find]
 where = ["src"]
