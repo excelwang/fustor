@@ -1,11 +1,10 @@
 [project]
 name = "fustor-sender-echo"
-version = "0.8.3.3"
+version = "0.8.8"
 description = "Echo sender driver for Fustor"
 requires-python = ">= 3.10"
 dependencies = [
-    "fustor-core",
-]
+    "fustor-core"]
 authors = [
     { name = "Fustor Team" }
 ]
@@ -25,4 +24,4 @@ license = "MIT"
 echo = "fustor_sender_echo:EchoDriver"
 
 [tool.setuptools.packages.find]
-where = [ "src",]
+where = [ "src"]

@@ -1,18 +1,16 @@
 [project]
 name = "fustor-source-fs"
-dynamic = ["version"]
+version = "0.8.8"
 description = "Fustor Agent FS Source Driver"
 license = "MIT"
 dependencies = ["fustor-core", "fustor-schema-fs", "watchdog"]
 
 [build-system]
-requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = [ "setuptools>=61.0" ]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools_scm]
+
 root = "../.."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/source-fs"

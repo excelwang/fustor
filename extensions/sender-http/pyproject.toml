@@ -1,22 +1,20 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=61.0" ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fustor-sender-http"
-dynamic = ["version"]
+version = "0.8.8"
 description = "Fustor HTTP Sender - Transport layer for Agent to Fusion communication"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
-]
+    "Operating System :: OS Independent"]
 dependencies = [
     "fustor-core",
-    "fustor-fusion-sdk",
-]
+    "fustor-fusion-sdk"]
 
 [[project.authors]]
 name = "Huajin Wang"
@@ -32,10 +30,8 @@ fusion = "fustor_sender_http:HTTPSender"
 
 
 
-[tool.setuptools_scm]
+
 root = "../.."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,21 +1,19 @@
 [project]
 name = "fustor-source-mysql"
-dynamic = ["version"]
+version = "0.8.8"
 description = "A MySQL source for Fustor Agent"
 requires-python = ">=3.11"
-dependencies = [ "fustor-core", "aiomysql>=0.2.0", "mysql-replication>=1.0.9",]
+dependencies = [ "fustor-core", "aiomysql>=0.2.0", "mysql-replication>=1.0.9"]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [build-system]
-requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = [ "setuptools>=61.0" ]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools_scm]
+
 root = "../.."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/source-mysql"
@@ -24,10 +22,10 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/source-my
 license = "MIT"
 
 [project.optional-dependencies]
-dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0",]
+dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0"]
 
 [project.entry-points."fustor_agent.drivers.sources"]
 mysql = "fustor_source_mysql:MysqlDriver"
 
 [tool.setuptools.packages.find]
-where = [ "src",]
+where = [ "src"]

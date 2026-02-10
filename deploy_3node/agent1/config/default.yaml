@@ -1,0 +1,16 @@
+sources:
+  nfs-source:
+    driver: fs
+    uri: "/data"
+
+senders:
+  fusion-main:
+    driver: fusion
+    uri: "http://fusion-node:28888"
+    credential:
+      key: "fs-sync-secret-key"
+
+pipes:
+  sync-job:
+    source: nfs-source
+    sender: fusion-main

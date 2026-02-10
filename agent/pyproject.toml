@@ -1,6 +1,6 @@
 [project]
 name = "fustor-agent"
-dynamic = ["version"]
+version = "0.8.8"
 description = "realtime data sync agent for various data sources"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -10,13 +10,8 @@ name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [build-system]
-requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = [ "setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools_scm]
-root = ".."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/agent"
@@ -25,14 +20,10 @@ Homepage = "https://github.com/excelwang/fustor/agent"
 license = "MIT"
 
 [project.optional-dependencies]
-dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0", "pytest-mock>=3.0.0",]
+dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0", "pytest-mock>=3.0.0"]
 
 [project.scripts]
-
 fustor-agent = "fustor_agent.cli:cli"
 
-
-
 [tool.setuptools.packages.find]
-
-where = [ "src",]
+where = [ "src"]

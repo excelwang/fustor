@@ -14,33 +14,17 @@ fi
 
 echo "Starting PyPI publishing process for Fustor monorepo..."
 
-# 1. Ensure Git state is clean (No uncommitted changes)
-if [[ $(git status --porcelain) ]]; then
-    echo "Error: Git working directory is not clean. Please commit or stash changes before publishing."
-    echo "This is critical to prevent 'dirty' version tags."
+# 1. Determine Unified Version from core/pyproject.toml
+# Since we no longer use setuptools-scm, the static version in pyproject.toml is the source of truth.
+PUBLISH_VERSION=$(grep '^version = ' core/pyproject.toml | cut -d'"' -f2)
+
+if [ -z "$PUBLISH_VERSION" ]; then
+    echo "Error: Could not determine version from core/pyproject.toml"
     exit 1
 fi
-
-# 2. Determine Unified Version
-# We use the latest git tag as the source of truth for all packages in this run.
-# If not on a tag, we fail (Production safety).
-CURRENT_TAG=$(git describe --tags --exact-match 2>/dev/null || echo "")
-
-if [ -z "$CURRENT_TAG" ]; then
-    echo "Error: Current commit is not tagged. Production releases must be initiated from a Git Tag."
-    echo "Please tag your commit: git tag -a v0.8.4 -m 'Release v0.8.4' && git push --tags"
-    # For development/testing, you can skip this check by commenting it out, 
-    # but the pretended version might be less predictable.
-    exit 1
-fi
-
-# Strip 'v' prefix if present for Python versioning standards
-PUBLISH_VERSION=$(echo "$CURRENT_TAG" | sed 's/^v//')
-export SETUPTOOLS_SCM_PRETEND_VERSION="$PUBLISH_VERSION"
 
 echo "----------------------------------------------------"
 echo "Unified Release Version: $PUBLISH_VERSION"
-echo "Git Tag: $CURRENT_TAG"
 echo "----------------------------------------------------"
 
 # Function to build and publish a package
@@ -59,7 +43,7 @@ publish_package() {
     # Cleanup old artifacts
     rm -rf dist/ build/ *.egg-info
 
-    # Build using uv (respecting the PRETEND_VERSION)
+    # Build using uv
     echo "Building $package_name@$PUBLISH_VERSION..."
     uv build --out-dir dist
 

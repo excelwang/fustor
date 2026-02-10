@@ -1,0 +1,36 @@
+services:
+  fusion-node:
+    build:
+      context: ..
+      dockerfile: deploy_3node/Dockerfile
+    image: fustor-cluster:latest
+    container_name: fusion-node
+    ports:
+      - "28101:28101"
+      - "28888:28888"
+    volumes:
+      - ./fusion/config:/root/.fustor/fusion-config
+      - ./logs/fusion:/root/.fustor/logs
+    command: ["fustor-fusion", "start", "-p", "28101", "-h", "0.0.0.0"]
+
+  agent1:
+    image: fustor-cluster:latest
+    container_name: agent1
+    volumes:
+      - ./agent1/config:/root/.fustor/agent-config
+      - ./agent1/data:/data
+      - ./logs/agent1:/root/.fustor/logs
+    depends_on:
+      - fusion-node
+    command: ["fustor-agent", "start"]
+
+  agent2:
+    image: fustor-cluster:latest
+    container_name: agent2
+    volumes:
+      - ./agent2/config:/root/.fustor/agent-config
+      - ./agent2/data:/data
+      - ./logs/agent2:/root/.fustor/logs
+    depends_on:
+      - fusion-node
+    command: ["fustor-agent", "start"]

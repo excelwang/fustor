@@ -1,6 +1,6 @@
 [project]
 name = "fustor-fusion"
-dynamic = ["version"]
+version = "0.8.8"
 description = "Fusion service for Fustor"
 requires-python = ">=3.11"
 dependencies = [
@@ -10,26 +10,19 @@ dependencies = [
     "greenlet==3.2.2",
     "pydantic>=2.0.0",
     "pydantic-settings",
-
     "httpx",
     "orjson",
     "fustor-core",
     "fustor-receiver-http",
     "fustor-fusion-sdk",
-    "fustor-view-fs",
-]
+    "fustor-view-fs"]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [build-system]
-requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = [ "setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools_scm]
-root = ".."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/fusion"
@@ -38,10 +31,10 @@ Homepage = "https://github.com/excelwang/fustor/fusion"
 license = "MIT"
 
 [project.optional-dependencies]
-dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0",]
+dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0"]
 
 [project.scripts]
 fustor-fusion = "fustor_fusion.cli:cli"
 
 [tool.setuptools.packages.find]
-where = [ "src",]
+where = [ "src"]

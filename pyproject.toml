@@ -55,21 +55,18 @@ pythonpath = [
     "extensions/view-fs/src"
 ]
 markers = [
-    "timeout: mark test to timeout after X seconds",
-]
+    "timeout: mark test to timeout after X seconds"]
 testpaths = [
     "agent/tests",
     "fusion/tests",
     "core/tests",
-    "extensions/*/tests",
-]
+    "extensions/*/tests"]
 addopts = "-v --tb=short"
 asyncio_mode = "strict"
 norecursedirs = ["it"]
 filterwarnings = [
     "ignore:pythonjsonlogger.jsonlogger:DeprecationWarning",
-    "ignore:'crypt' is deprecated and slated for removal:DeprecationWarning:passlib.utils",
-]
+    "ignore:'crypt' is deprecated and slated for removal:DeprecationWarning:passlib.utils"]
 
 [dependency-groups]
 dev = [
@@ -83,8 +80,7 @@ dev = [
     "ruff>=0.9.0",
     "mypy>=1.14.0",
     "types-pyyaml",
-    "types-requests",
-]
+    "types-requests"]
 
 [tool.ruff]
 line-length = 120

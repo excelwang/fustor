@@ -1,18 +1,15 @@
 [project]
 name = "fustor-demo"
-dynamic = ["version"]
+version = "0.8.8"
 description = "Fustor Bio-Fusion Demo for unified directory service"
 dependencies = ["fastapi[all]>=0.104.1", "uvicorn>=0.23.2", "fustor-core", "pydantic>=2.0.0", "httpx>=0.25.0"]
 requires-python = ">=3.11"
 
 [build-system]
-requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = [ "setuptools>=61.0" ]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools_scm]
-root = ".."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
+
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/demo"
@@ -21,4 +18,4 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/demo"
 license = "MIT"
 
 [tool.setuptools.packages.find]
-where = [ "src",]
+where = [ "src"]

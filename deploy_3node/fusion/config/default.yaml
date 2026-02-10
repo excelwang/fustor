@@ -1,0 +1,20 @@
+receivers:
+  http-receiver:
+    driver: http
+    host: 0.0.0.0
+    port: 28888
+    api_keys:
+      - key: "fs-sync-secret-key"
+        pipe_id: "fs-sync-pipe"
+
+views:
+  backup-view:
+    driver: fs
+    driver_params:
+      hot_file_threshold: 60.0
+
+pipes:
+  fs-sync-pipe:
+    receiver: http-receiver
+    views:
+      - backup-view

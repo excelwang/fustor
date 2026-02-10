@@ -1,27 +1,21 @@
 [project]
 name = "fustor-core"
-dynamic = ["version"]
+version = "0.8.8"
 description = "Core foundation for Fustor - event models, pipe/transport abstractions, and common utilities"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.11.7",
     "colorlog>=6.0.0",
     "pyyaml>=6.0",
-    "python-json-logger>=2.0.0",
-]
+    "python-json-logger>=2.0.0"]
 
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
-
-[tool.setuptools_scm]
-root = ".."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/core"
@@ -34,13 +28,11 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
-    "pytest-asyncio>=0.23.0",
-]
+    "pytest-asyncio>=0.23.0"]
 # Optional grpc support
 grpc = [
     "grpcio>=1.60.0",
-    "grpcio-tools>=1.60.0",
-]
+    "grpcio-tools>=1.60.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

@@ -1,18 +1,16 @@
 [project]
 name = "fustor-source-oss"
-dynamic = ["version"]
+version = "0.8.8"
 description = "Fustor Source Driver for S3-compatible object storage (OSS)"
-dependencies = [ "boto3>=1.28.0,<2.0.0", "fustor-core", "pydantic>=2.0.0,<3.0.0",]
+dependencies = [ "boto3>=1.28.0,<2.0.0", "fustor-core", "pydantic>=2.0.0,<3.0.0"]
 requires-python = ">=3.11"
 
 [build-system]
-requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = [ "setuptools>=61.0" ]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools_scm]
+
 root = "../.."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/source-oss"
@@ -24,10 +22,10 @@ license = "MIT"
 source_oss = "fustor_source_oss.driver:OssSourceDriver"
 
 [tool.pytest.ini_options]
-pythonpath = [ "src",]
-testpaths = [ "tests",]
+pythonpath = [ "src"]
+testpaths = [ "tests"]
 addopts = "--ignore=tests/integration"
 asyncio_default_fixture_loop_scope = "function"
 
 [tool.setuptools.packages.find]
-where = [ "src",]
+where = [ "src"]

@@ -1,6 +1,6 @@
 [project]
 name = "fustor-schema-fs"
-dynamic = ["version"]
+version = "0.8.8"
 description = "Fustor File System Schema - Contract between source-fs and view-fs"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -12,13 +12,11 @@ name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=61.0" ]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools_scm]
+
 root = "../.."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/schema-fs"
@@ -26,12 +24,10 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/schema-fs
 
 [project.optional-dependencies]
 models = [
-    "pydantic>=2.0.0",
-]
+    "pydantic>=2.0.0"]
 dev = [
     "pytest>=8.0.0",
-    "pydantic>=2.0.0",
-]
+    "pydantic>=2.0.0"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

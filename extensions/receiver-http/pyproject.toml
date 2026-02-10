@@ -1,23 +1,21 @@
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=61.0" ]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "fustor-receiver-http"
-dynamic = ["version"]
+version = "0.8.8"
 description = "Fustor HTTP Receiver - Transport layer for Fusion to receive events from Agents"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Operating System :: OS Independent",
-]
+    "Operating System :: OS Independent"]
 dependencies = [
     "fustor-core",
     "fastapi>=0.109.0",
-    "pydantic>=2.0.0",
-]
+    "pydantic>=2.0.0"]
 
 [[project.authors]]
 name = "Huajin Wang"
@@ -31,10 +29,8 @@ Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/receiver-
 [project.entry-points."fustor.receivers"]
 http = "fustor_receiver_http:HTTPReceiver"
 
-[tool.setuptools_scm]
+
 root = "../.."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 [tool.setuptools.packages.find]
 where = ["src"]

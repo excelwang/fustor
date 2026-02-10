@@ -1,6 +1,6 @@
 [project]
 name = "fustor-benchmark"
-dynamic = ["version"]
+version = "0.8.8"
 description = "Performance benchmarking tool for Fustor platform"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -8,20 +8,16 @@ dependencies = [
     "click>=8.1.7",
     "requests>=2.31.0",
     "pyyaml>=6.0.1",
-    "psutil>=5.9.0",
-]
+    "psutil>=5.9.0"]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [build-system]
-requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = ["setuptools>=61.0" ]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools_scm]
-root = ".."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
+
 
 [project.scripts]
 fustor-benchmark = "fustor_benchmark.cli:cli"

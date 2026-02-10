@@ -1,21 +1,19 @@
 [project]
 name = "fustor-sender-openapi"
-dynamic = ["version"]
+version = "0.8.8"
 description = "An OpenAPI sender for Fustor Agent"
 requires-python = ">=3.11"
-dependencies = [ "fustor-core",]
+dependencies = [ "fustor-core"]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
 
 [build-system]
-requires = [ "setuptools>=61.0", "setuptools-scm>=8.0"]
+requires = [ "setuptools>=61.0" ]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools_scm]
+
 root = "../.."
-version_scheme = "post-release"
-local_scheme = "dirty-tag"
 
 ["project.urls"]
 Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/sender-openapi"
@@ -29,4 +27,4 @@ openapi = "fustor_sender_openapi:OpenApiDriver"
 
 
 [tool.setuptools.packages.find]
-where = [ "src",]
+where = [ "src"]
