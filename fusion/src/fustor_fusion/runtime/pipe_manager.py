@@ -8,8 +8,6 @@ from typing import Dict, List, Optional, Any, Tuple
 from fustor_core.transport import Receiver, ReceiverRegistry
 from fustor_receiver_http import SessionInfo # Kept for registration of 'http' driver and type info
 from .fusion_pipe import FusionPipe
-from .session_bridge import create_session_bridge
-from .view_handler_adapter import create_view_handler_from_manager
 from ..config.unified import fusion_config, FusionPipeConfig
 from ..view_manager.manager import get_cached_view_manager
 
@@ -110,6 +108,7 @@ class PipeManager:
                             # We might need to pass v_cfg details to view manager if it's dynamic
                             # For now, assuming view manager loads its own config or we use existing pattern
                             vm = await get_cached_view_manager(v_id)
+                            from .view_handler_adapter import create_view_handler_from_manager
                             handler = create_view_handler_from_manager(vm)
                             view_handlers.append(handler)
                         except Exception as e:
@@ -136,6 +135,7 @@ class PipeManager:
                     )
                     
                     self._pipes[p_id] = pipe
+                    from .session_bridge import create_session_bridge
                     self._bridges[p_id] = create_session_bridge(pipe)
                     
                     logger.info(f"Initialized Fusion Pipe: {p_id} with {len(view_handlers)} views")

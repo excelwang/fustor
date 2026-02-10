@@ -57,7 +57,7 @@ class TestHandlerDegradation:
         for i in range(pipe.MAX_HANDLER_ERRORS + 5):
             event = EventBase(
                 event_type=EventType.INSERT,
-                event_schema="s", table="t",
+                event_schema="flakey", table="t",
                 rows=[{"id": i}], fields=["id"], index=i
             )
             await pipe._dispatch_to_handlers(event)
@@ -90,7 +90,7 @@ class TestHandlerDegradation:
         for i in range(5):
             event = EventBase(
                 event_type=EventType.INSERT,
-                event_schema="s", table="t",
+                event_schema="flakey", table="t",
                 rows=[{"id": i}], fields=["id"], index=i
             )
             await pipe._dispatch_to_handlers(event)
@@ -105,7 +105,7 @@ class TestHandlerDegradation:
         for i in range(10, 20):
             event = EventBase(
                 event_type=EventType.INSERT,
-                event_schema="s", table="t",
+                event_schema="flakey", table="t",
                 rows=[{"id": i}], fields=["id"], index=i
             )
             await pipe._dispatch_to_handlers(event)

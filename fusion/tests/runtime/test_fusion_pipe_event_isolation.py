@@ -15,7 +15,7 @@ from fustor_fusion.runtime import FusionPipe
 
 class MockViewHandler:
     """简化的 ViewHandler Mock。"""
-    schema_name = "mock"
+    schema_name = "test"
 
     def __init__(self):
         self.id = "mock-view"

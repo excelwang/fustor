@@ -25,40 +25,37 @@ from .consistency import consistency_router
 # Create unified pipe router
 pipe_router = APIRouter(tags=["Pipe"])
 
+# Consistency router handles its own delegation
+pipe_router.include_router(consistency_router)
+
+# 2. Add Management endpoints for debuging/monitoring
+@pipe_router.get("/pipes", tags=["Pipe Management"])
+async def list_pipes():
+    """List all managed pipes."""
+    if runtime_objects.pipe_manager is None:
+        raise HTTPException(status_code=503, detail="Pipe Manager not initialized")
+    pipes = runtime_objects.pipe_manager.get_pipes()
+    return {pid: await p.get_dto() for pid, p in pipes.items()}
+
+@pipe_router.get("/pipes/{pipe_id}", tags=["Pipe Management"])
+async def get_pipe_info(pipe_id: str):
+    """Get detailed information about a specific pipe."""
+    if runtime_objects.pipe_manager is None:
+        raise HTTPException(status_code=503, detail="Pipe Manager not initialized")
+    pipe = runtime_objects.pipe_manager.get_pipe(pipe_id)
+    if not pipe:
+        raise HTTPException(status_code=404, detail="Pipe not found")
+    return await pipe.get_dto()
+
 def setup_pipe_routers():
     """
-    Setup pipe management routers on the main Fusion app.
-    
-    Note: Session and Ingestion routers are no longer mounted here.
-    They are served by each HTTPReceiver on its own independent port.
-    
-    This is called during application lifespan startup.
+    Legacy setup function. 
+    Now that routes are defined at module level strategies, this is a no-op 
+    or just a verification step.
     """
-    # 1. Clear existing routes to avoid duplicates if called multiple times (e.g. during tests)
-    pipe_router.routes = []
-    
     if runtime_objects.pipe_manager is None:
         logger.error("setup_pipe_routers called before pipe_manager initialized!")
         return False
-    
-    # Consistency router handles its own delegation
-    pipe_router.include_router(consistency_router)
-    
-    # 2. Add Management endpoints for debugging/monitoring
-    @pipe_router.get("/pipes", tags=["Pipe Management"])
-    async def list_pipes():
-        """List all managed pipes."""
-        pipes = runtime_objects.pipe_manager.get_pipes()
-        return {pid: await p.get_dto() for pid, p in pipes.items()}
-
-    @pipe_router.get("/pipes/{pipe_id}", tags=["Pipe Management"])
-    async def get_pipe_info(pipe_id: str):
-        """Get detailed information about a specific pipe."""
-        pipe = runtime_objects.pipe_manager.get_pipe(pipe_id)
-        if not pipe:
-            raise HTTPException(status_code=404, detail="Pipe not found")
-        return await pipe.get_dto()
-    
     return True
 
 # NOTE: We no longer mount routers here at module level.

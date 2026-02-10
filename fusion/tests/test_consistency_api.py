@@ -7,19 +7,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fustor_fusion.main import app
 from fustor_fusion.auth.dependencies import get_view_id_from_api_key
 from fustor_fusion.view_manager.manager import ViewManager
+from fustor_fusion.api.pipe import setup_pipe_routers
+from fustor_fusion import runtime_objects
 
 # Note: No longer setting override here, moving to fixture
 
-@pytest.fixture
-def client():
-    # Override auth dependency
-    from fustor_fusion.auth.dependencies import get_view_id_from_api_key
-    app.dependency_overrides[get_view_id_from_api_key] = lambda: "1"
-    
-    with TestClient(app, headers={"X-API-Key": "test"}) as c:
-        yield c
-        
-    app.dependency_overrides.clear()
+# Note: client fixture moved below to depend on mocking
 
 @pytest.fixture
 def mock_view_manager():
@@ -27,6 +20,22 @@ def mock_view_manager():
         manager = MagicMock(spec=ViewManager)
         mock.return_value = manager
         yield mock, manager
+
+@pytest.fixture
+def client(mock_view_manager):
+    # Setup mock pipe manager to ensure routers are registered
+    with patch("fustor_fusion.runtime_objects.pipe_manager") as mock_pm:
+        mock_pm.get_pipes.return_value = {}
+        # Force router setup with the mock PM
+        setup_pipe_routers()
+        
+        # Override auth dependency
+        app.dependency_overrides[get_view_id_from_api_key] = lambda: "1"
+        
+        with TestClient(app, headers={"X-API-Key": "test"}) as c:
+            yield c
+            
+        app.dependency_overrides.clear()
 
 @pytest.mark.asyncio
 @pytest.mark.asyncio
