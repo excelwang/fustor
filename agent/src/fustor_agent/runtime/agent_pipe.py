@@ -93,7 +93,7 @@ class AgentPipe(Pipe):
         # Configuration (Timeouts and Heartbeats are managed by Fusion and updated in on_session_created)
         # Default to None: let Fusion server decide the timeout from its own config.
         # Agent-side config can override if explicitly set.
-        self.session_timeout_seconds = config.get("session_timeout_seconds", 30)
+        self.session_timeout_seconds = config.get("session_timeout_seconds") or None
         self.heartbeat_interval_sec = config.get("heartbeat_interval_sec", 10.0)
         
         self.audit_interval_sec = config.get("audit_interval_sec", 600)       # Seconds between audit cycles (0 to disable)
@@ -268,6 +268,16 @@ class AgentPipe(Pipe):
         suggested_interval = kwargs.get("suggested_heartbeat_interval_seconds")
         if suggested_interval:
             self.heartbeat_interval_sec = suggested_interval
+        
+        # Auto-adjust heartbeat based on session timeout from server
+        # Heartbeat must be significantly shorter than session timeout to prevent expiry
+        server_timeout = kwargs.get("session_timeout_seconds")
+        if server_timeout and not suggested_interval:
+            # Use timeout/3 as heartbeat interval (gives 2 chances before expiry)
+            auto_interval = max(1.0, server_timeout / 3.0)
+            if auto_interval < self.heartbeat_interval_sec:
+                logger.info(f"Pipe {self.id}: Auto-adjusting heartbeat interval: {self.heartbeat_interval_sec} -> {auto_interval}s (session_timeout={server_timeout}s)")
+                self.heartbeat_interval_sec = auto_interval
         
         # Update sync policy from server response (authoritative)
         server_audit = kwargs.get("audit_interval_sec")

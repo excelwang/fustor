@@ -154,7 +154,7 @@ pipes:
 *   **角色**: 主采集节点 (Primary)
 *   **挂载点**: `/mnt/data/project_share`
 
-配置文件路径: `~/.fustor/agent-config/source_node_a.yaml`
+配置文件路径: `~/.fustor/agent-config/default.yaml`
 
 ```yaml
 # 0. 全局配置
@@ -194,7 +194,7 @@ pipes:
 *   **角色**: 备采集节点 (Secondary) / 协同节点
 *   **挂载点**: `/home/admin/mnt/share` (注意：挂载路径与 A 不同，但内容一致)
 
-配置文件路径: `~/.fustor/agent-config/source_node_b.yaml`
+配置文件路径: `~/.fustor/agent-config/default.yaml`
 
 ```yaml
 sources:

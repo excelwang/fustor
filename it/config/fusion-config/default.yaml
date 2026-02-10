@@ -7,6 +7,7 @@ logging:
 fusion:
   host: "${FUSTOR_FUSION_HOST}"
   port: ${FUSTOR_FUSION_PORT} # Should be 8102 as per docker-compose
+  session_cleanup_interval: 1  # Fast cleanup for integration tests (default 60s is too slow)
 
 receivers:
   http-main:

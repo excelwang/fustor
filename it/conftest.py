@@ -61,26 +61,36 @@ from fixtures.leadership import wait_for_audit, reset_leadership
 def reset_fusion_state(fusion_client, clean_shared_dir):
     """
     Aggressively reset environment before each test:
-    1. Kill all agents in containers
-    2. Clean up agent pid/state files
-    3. Reset Fusion state via API
+    1. Kill all agents in ALL containers (and wait for death)
+    2. Reset Fusion state via API (clears sessions, views)
+    3. Verify no stale sessions remain
     """
     containers = [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]
     
-    # 1. Kill agents and clean up local state
+    # 1. Kill agents and clean up local state in ALL containers
     for container in containers:
         docker_manager.cleanup_agent_state(container)
-            
-    # 2. Reset Fusion state
+    
+    # Small delay to ensure all agent processes are fully dead
+    # and their last heartbeats/requests have been processed
+    time.sleep(1.0)
+    
+    # 2. Reset Fusion state (AFTER agents are dead, so no re-registration)
     try:
         fusion_client.reset()
         
         # Wait for all stale sessions to vanish
         logger.debug("Waiting for sessions to vanish after reset...")
-        for _ in range(10):
-            if not fusion_client.get_sessions():
+        for _ in range(15):
+            sessions = fusion_client.get_sessions()
+            if not sessions:
                 break
+            logger.debug(f"Still {len(sessions)} sessions remaining, waiting...")
             time.sleep(1)
+        else:
+            remaining = fusion_client.get_sessions()
+            if remaining:
+                logger.warning(f"Sessions still exist after reset wait: {[s.get('agent_id') for s in remaining]}")
         
         # Wait for View to be READY (Initial snapshot complete)
         time.sleep(1.0)
@@ -96,7 +106,7 @@ def reset_fusion_state(fusion_client, clean_shared_dir):
     except Exception as e:
         logger.debug(f"Fusion reset failed: {e}")
     
-    # 4. Clear logs
+    # 3. Clear logs
     for container in containers + [CONTAINER_FUSION]:
         try:
             log_path = "/root/.fustor/agent.log" if "client" in container else "/root/.fustor/fusion.log"

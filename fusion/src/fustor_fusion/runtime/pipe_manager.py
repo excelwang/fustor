@@ -69,11 +69,14 @@ class PipeManager:
                     
                     if r_sig not in self._receivers:
                         r_id = f"recv_{r_cfg.driver}_{r_cfg.port}"
-                        if r_cfg.driver == "http":
+                        if r_cfg.driver == "http": #todo should be configured
                             receiver = HTTPReceiver(
                                 receiver_id=r_id,
                                 bind_host=r_cfg.bind_host,
                                 port=r_cfg.port,
+                                config={
+                                    "session_timeout_seconds": p_cfg.session_timeout_seconds,
+                                },
                             )
                             receiver.register_callbacks(
                                 on_session_created=self._on_session_created,

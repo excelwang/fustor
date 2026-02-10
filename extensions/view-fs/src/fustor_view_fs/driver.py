@@ -176,10 +176,11 @@ class FSViewDriver(FSViewBase):
         Triggers a real-time scan on the agent side by queuing a command.
         """
         from fustor_fusion.core.session_manager import session_manager
+        from fustor_fusion.view_state_manager import view_state_manager
         
         async with self._global_read_lock():
             # 1. Find the authoritative session (Leader)
-            lead_session_id = await self.arbitrator.get_leader_session_id()
+            lead_session_id = await view_state_manager.get_leader_session_id(self.view_id)
             if not lead_session_id:
                 # Fallback: check any active session if leader not explicitly set
                 active_sessions = await session_manager.get_view_sessions(self.view_id)
