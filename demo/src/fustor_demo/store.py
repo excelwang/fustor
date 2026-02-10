@@ -37,43 +37,64 @@ class DemoStore:
             event_data["project_id"] = project_id
 
         if project_id not in self._projects:
+            # Determine project name: prefer explicit project_name if provided
+            proj_name = event_data.get("project_name")
+            if not proj_name:
+                # Fallback to name if it's a project creation event (source_type=mysql)
+                if event_data.get("source_type") == "mysql":
+                    proj_name = event_data.get("name")
+                else:
+                    proj_name = project_id.replace("_", " ").title()
+
             self._projects[project_id] = {
                 "id": project_id,
-                "name": event_data.get("project_name", project_id.replace("_", " ").title()),
+                "name": proj_name,
                 "type": "directory",
-                "source_type": "mysql" if project_id != "unassigned" else "system", # Assume projects are from MySQL
+                "source_type": "mysql" if project_id != "unassigned" else "system",
                 "path": f"/{project_id}",
                 "items": [],
                 "last_modified": datetime.now(timezone.utc).isoformat()
             }
         
-        # Add the item to the project's items list
-        # Ensure it's not a duplicate based on event_data['id']
-        # This is a very simplified deduplication. In a real app, you'd update existing items.
-        existing_item_ids = {item["id"] for item in self._projects[project_id]["items"]}
-        if event_data["id"] not in existing_item_ids:
-            self._projects[project_id]["items"].append(copy.deepcopy(event_data))
-            # Sort items for consistent display
-            self._projects[project_id]["items"].sort(key=lambda x: x.get("path", x.get("name", "")))
-        else:
-            # Update existing item
-            for i, item in enumerate(self._projects[project_id]["items"]):
-                if item["id"] == event_data["id"]:
-                    self._projects[project_id]["items"][i] = copy.deepcopy(event_data)
-                    break
+        # Add or update item in the project
+        # Using item path as a logical unique identifier within a project if possible
+        item_id = event_data.get("id")
+        existing_items = self._projects[project_id]["items"]
+        
+        found = False
+        for i, item in enumerate(existing_items):
+            if item["id"] == item_id:
+                # Update existing item
+                existing_items[i] = copy.deepcopy(event_data)
+                found = True
+                break
+        
+        if not found:
+            # Add new item
+            existing_items.append(copy.deepcopy(event_data))
+            
+        # Sort items for consistent display: Projects first (if nested), then by path
+        existing_items.sort(key=lambda x: (0 if x["type"] == "directory" else 1, x.get("path", x.get("name", ""))))
+        
+        # Update project last_modified time
+        self._projects[project_id]["last_modified"] = datetime.now(timezone.utc).isoformat()
 
 
     def get_unified_directory(self, project_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """
         Retrieves the unified directory structure.
-        If project_id is None, returns all top-level projects.
+        If project_id is "ALL", returns all projects and all items.
         If project_id is specified, returns items within that project.
         """
-        if project_id == "ALL": # Special case for all top-level projects
-            # Return top-level projects, sorted by name
+        if project_id == "ALL": 
+            # Return everything: all projects and all nested items
+            all_items = []
+            for proj in self._projects.values():
+                all_items.append(copy.deepcopy(proj))
+                all_items.extend(copy.deepcopy(proj["items"]))
             return sorted(
-                [copy.deepcopy(proj) for proj in self._projects.values() if proj["type"] == "directory"],
-                key=lambda x: x["name"]
+                all_items,
+                key=lambda x: (x.get("project_id", ""), x.get("path", x.get("name", "")))
             )
         elif project_id and project_id in self._projects:
             # Return items within a specific project

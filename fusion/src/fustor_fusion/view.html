@@ -561,15 +561,10 @@
     <script>
         (function () {
             // --- 配置与状态 ---
-            const API_BASE = '/api/v1/ingest/events';
-            // 注意：这里使用 MOCK 开关。如果后端准备好了，设为 false。
-            const MOCK_MODE = false;
-
             const state = {
                 apiKey: localStorage.getItem('fustor_api_key') || '',
                 isConnected: false,
                 pollingInterval: null,
-                sources: [], // 存储当前活跃源
                 lastSourceIds: ''
             };
 
@@ -613,11 +608,7 @@
             function connect() {
                 updateStatus(true, '连接中...');
                 if (state.pollingInterval) clearInterval(state.pollingInterval);
-
-                // 立即执行一次
                 fetchStats();
-
-                // 启动轮询
                 state.pollingInterval = setInterval(fetchStats, 3000);
                 state.isConnected = true;
             }
@@ -632,71 +623,56 @@
                 }
             }
 
-            // --- 数据获取 (Mock / Real) ---
+            // --- 数据获取 (Real) ---
             async function fetchStats() {
                 try {
-                    let data;
-                    if (MOCK_MODE) {
-                        // 模拟 API 延迟
-                        await new Promise(r => setTimeout(r, 300));
-                        data = getMockData();
-                    } else {
-                        const res = await fetch(`${API_BASE}/stats`, {
-                            headers: {
-                                'accept': 'application/json',
-                                'x-api-key': state.apiKey
-                            }
-                        });
-                        if (!res.ok) throw new Error('API Error');
-                        data = await res.json();
-                    }
+                    const headers = {
+                        'accept': 'application/json',
+                        'x-api-key': state.apiKey
+                    };
 
-                    render(data);
+                    // 1. 获取 Session 信息 (拓扑图数据)
+                    const sessionRes = await fetch('/api/v1/pipe/session/', { headers });
+                    if (!sessionRes.ok) throw new Error('Session API Error');
+                    const sessionData = await sessionRes.json();
+                    const viewId = sessionData.view_id;
+
+                    // 2. 获取 View 真实指标 (文件数量)
+                    const viewStatsRes = await fetch(`/api/v1/views/${viewId}/stats`, { headers });
+                    const viewStats = viewStatsRes.ok ? await viewStatsRes.json() : {};
+
+                    // 3. 构造渲染对象
+                    const combinedData = {
+                        total_volume: viewStats.item_count || 0,
+                        max_latency_ms: viewStats.latency_ms || 0,
+                        oldest_item_info: {
+                            path: viewStats.oldest_item_path || 'N/A',
+                            age_seconds: viewStats.staleness_seconds || 0
+                        },
+                        sessions: sessionData.active_sessions || []
+                    };
+
+                    console.log('Combined Dashboard Data:', combinedData);
+                    render(combinedData);
                     updateStatus(true, '实时监控中');
                 } catch (e) {
                     console.error(e);
-                    updateStatus(false, '连接失败');
+                    updateStatus(false, '连接失败: ' + e.message);
                 }
-            }
-
-            // --- 模拟数据生成器 ---
-            function getMockData() {
-                // 模拟数据波动
-                const baseVolume = 145200;
-                const randomInc = Math.floor(Math.random() * 10);
-                const latencyBase = 120;
-                const latencyNoise = Math.floor(Math.random() * 200) - 50; // -50 to 150
-
-                return {
-                    // 模拟返回的活跃源列表
-                    sources: [
-                        { id: 'mysql_core_db', type: 'DB' },
-                        { id: 'oss_img_bucket', type: 'OSS' },
-                        { id: 'fs_logs_watcher', type: 'FS' }
-                    ],
-                    metrics: {
-                        total_volume: baseVolume + randomInc + Date.now() % 1000, // Fake increment
-                        latency_ms: Math.max(10, latencyBase + latencyNoise),
-                        oldest_item: {
-                            path: '/data/archive/logs/2024/01',
-                            age_days: 42
-                        }
-                    }
-                };
             }
 
             // --- 渲染逻辑 ---
             function render(data) {
-                renderMetrics(data.metrics);
-                renderTopology(data.sources);
+                renderMetrics(data);
+                renderTopology(data.sessions);
             }
 
             function renderMetrics(metrics) {
                 // 1. Volume
-                els.valVolume.textContent = metrics.total_volume.toLocaleString();
+                els.valVolume.textContent = (metrics.total_volume || 0).toLocaleString();
 
                 // 2. Latency
-                const lat = metrics.latency_ms;
+                const lat = Math.round(metrics.max_latency_ms || 0);
                 els.valLatency.textContent = lat;
 
                 let badgeClass = 'good';
@@ -709,16 +685,21 @@
                 els.valLatency.style.color = badgeClass === 'good' ? 'var(--color-text-main)' : (badgeClass === 'warn' ? 'var(--color-warning)' : 'var(--color-error)');
 
                 // 3. Staleness
-                const stale = metrics.oldest_item || { age_days: 0, path: '等待数据...' };
-                els.valStalenessDays.textContent = stale.age_days;
-                els.valStalenessPath.textContent = stale.path;
+                const oldest = metrics.oldest_item_info || { age_seconds: 0, path: '等待数据...' };
+                const ageDays = (oldest.age_seconds / 86400).toFixed(1);
+                els.valStalenessDays.textContent = ageDays;
+                els.valStalenessPath.textContent = oldest.path;
 
-                const staleColor = stale.age_days > 30 ? 'var(--color-warning)' : 'var(--color-text-main)';
+                const staleColor = oldest.age_seconds > 2592000 ? 'var(--color-warning)' : 'var(--color-text-main)';
                 els.valStalenessDays.style.color = staleColor;
             }
 
-            function renderTopology(sources) {
-                // 检查源列表是否变化，如果没变就不重绘 DOM 以保持动画流畅
+            function renderTopology(sessions) {
+                const sources = sessions.map(s => ({
+                    id: s.task_id.split(':')[0] || s.task_id,
+                    role: s.role
+                }));
+                
                 const sourceIds = sources.map(s => s.id).join(',');
                 if (state.lastSourceIds === sourceIds) return;
                 state.lastSourceIds = sourceIds;
@@ -726,19 +707,17 @@
                 els.sourcesLeft.innerHTML = '';
                 els.sourcesRight.innerHTML = '';
 
-                // 清空连线
                 while (els.flowCanvas.firstChild) {
                     els.flowCanvas.removeChild(els.flowCanvas.firstChild);
                 }
 
-                // 分配源到左右
                 sources.forEach((s, idx) => {
                     const node = document.createElement('div');
                     node.className = 'source-node active';
                     node.id = `source-node-${idx}`;
                     node.innerHTML = `
-                        <span class="source-icon">📦</span>
-                        <span class="source-name">${s.id}</span>
+                        <span class="source-icon">${s.role === 'leader' ? '⭐' : '📦'}</span>
+                        <span class="source-name" title="${s.id}">${s.id.substring(0,8)}</span>
                     `;
 
                     if (idx % 2 === 0) {
@@ -748,7 +727,6 @@
                     }
                 });
 
-                // 重绘连线 (需要等待 DOM 布局完成)
                 requestAnimationFrame(drawFlowLines);
             }
 
@@ -764,7 +742,6 @@
                 const sourceNodes = document.querySelectorAll('.source-node');
                 sourceNodes.forEach(node => {
                     const nodeRect = node.getBoundingClientRect();
-                    // 找最近的边缘点
                     const isLeft = nodeRect.left < centerRect.left;
 
                     const startPoint = {
@@ -772,37 +749,30 @@
                         y: nodeRect.top + nodeRect.height / 2
                     };
 
-                    // 转换为相对于 container 的坐标
                     const x1 = startPoint.x - containerRect.left;
                     const y1 = startPoint.y - containerRect.top;
                     const x2 = (isLeft ? centerRect.left : centerRect.right) - containerRect.left;
                     const y2 = centerPoint.y - containerRect.top;
 
-                    // 创建连线 (SVG 或 CSS 变换)
-                    // 这里为了简单演示，使用带动画的 CSS 粒子
                     createParticleFlow(x1, y1, x2, y2);
                 });
             }
 
             function createParticleFlow(x1, y1, x2, y2) {
-                // 计算角度和距离
                 const dx = x2 - x1;
                 const dy = y2 - y1;
                 const dist = Math.sqrt(dx * dx + dy * dy);
                 const angle = Math.atan2(dy, dx) * 180 / Math.PI;
 
-                // 容器
                 const lineContainer = document.createElement('div');
-                lineContainer.className = 'flow-line-container';
                 lineContainer.style.position = 'absolute';
                 lineContainer.style.left = `${x1}px`;
                 lineContainer.style.top = `${y1}px`;
                 lineContainer.style.width = `${dist}px`;
-                lineContainer.style.height = '2px'; // 厚度
+                lineContainer.style.height = '2px';
                 lineContainer.style.transform = `rotate(${angle}deg)`;
                 lineContainer.style.transformOrigin = '0 0';
 
-                // 背景线
                 const bgLine = document.createElement('div');
                 bgLine.style.width = '100%';
                 bgLine.style.height = '100%';
@@ -810,27 +780,19 @@
                 bgLine.style.opacity = '0.1';
                 lineContainer.appendChild(bgLine);
 
-                // 粒子
                 const particle = document.createElement('div');
                 particle.className = 'flow-particle';
-                // 调整粒子动画，使其在直线上运动
                 particle.style.position = 'absolute';
                 particle.style.left = '0';
-                particle.style.top = '-2px'; // 居中
-                particle.style.animation = `flowParticle 1.5s linear infinite`;
-
-                // 动态注入 keyframes 也可以，或者直接利用 left 0->100%
-                // 这里复用 CSS 中的 flow 定义，但需要 offset-path 支持较差，改用 left
-                particle.style.offsetPath = 'none'; // 覆盖默认
-                particle.style.animation = 'none';
-                // 使用 JS 简单动画或更通用的 CSS left 动画
+                particle.style.top = '-2px';
+                
                 particle.animate([
                     { left: '0%', opacity: 0 },
                     { opacity: 1, offset: 0.1 },
                     { opacity: 1, offset: 0.9 },
                     { left: '100%', opacity: 0 }
                 ], {
-                    duration: 1500 + Math.random() * 1000, // 随机速度
+                    duration: 1500 + Math.random() * 1000,
                     iterations: Infinity
                 });
 
@@ -838,18 +800,14 @@
                 els.flowCanvas.appendChild(lineContainer);
             }
 
-            // 窗口大小改变时重绘连线
             window.addEventListener('resize', () => {
-                // 清空旧线
                 while (els.flowCanvas.firstChild) {
                     els.flowCanvas.removeChild(els.flowCanvas.firstChild);
                 }
                 drawFlowLines();
             });
 
-            // 启动
             init();
-
         })();
     </script>
 </body>

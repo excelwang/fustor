@@ -12,9 +12,10 @@ API Structure:
 - /api/v1/pipe/consistency - Consistency checks (signals)
 """
 import logging
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Depends
 from .. import runtime_objects
 from ..config.unified import fusion_config
+from ..auth.dependencies import get_view_id_from_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,24 @@ async def get_pipe_info(pipe_id: str):
     if not pipe:
         raise HTTPException(status_code=404, detail="Pipe not found")
     return await pipe.get_dto()
+
+@pipe_router.get("/stats", tags=["Pipe Management"])
+async def get_global_stats(
+    view_id: str = Depends(get_view_id_from_api_key)
+):
+    """Get synchronization process metrics for the authorized pipe."""
+    if runtime_objects.pipe_manager is None:
+        raise HTTPException(status_code=503, detail="Pipe Manager not initialized")
+    
+    pipe = runtime_objects.pipe_manager.get_pipe(view_id)
+    if not pipe:
+        return {"events_received": 0, "events_processed": 0, "active_sessions": 0}
+    
+    return {
+        "events_received": pipe.statistics.get("events_received", 0),
+        "events_processed": pipe.statistics.get("events_processed", 0),
+        "errors": pipe.statistics.get("errors", 0)
+    }
 
 def setup_pipe_routers():
     """

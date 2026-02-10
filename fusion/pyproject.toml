@@ -10,7 +10,7 @@ dependencies = [
     "greenlet==3.2.2",
     "pydantic>=2.0.0",
     "pydantic-settings",
-    "aiosqlite",
+
     "httpx",
     "orjson",
     "fustor-core",

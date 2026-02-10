@@ -5,6 +5,8 @@ from typing import List, Dict, Any, Optional
 import os
 import logging
 import asyncio
+from contextlib import asynccontextmanager
+import httpx
 
 from fustor_core.event import EventBase, EventType
 
@@ -19,6 +21,11 @@ from fustor_demo.mock_agents import (
 
 from fustor_demo.auto_generator import generator
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger("fustor_demo")
 
 # Get the directory where main.py is located
@@ -29,30 +36,66 @@ static_dir = os.path.join(current_dir, "static")
 if not os.path.exists(static_dir):
     os.makedirs(static_dir)
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Start the auto generator
+    logger.info("Starting auto data generator...")
+    await generator.start()
+    yield
+    # Shutdown: Stop the auto generator
+    logger.info("Stopping auto data generator...")
+    await generator.stop()
+
 app = FastAPI(
     title="Fustor Bio-Fusion Demo API",
     description="Demonstrates unified directory service from 5 heterogeneous data sources.",
     version="0.1.0",
+    lifespan=lifespan
 )
-
-@app.on_event("startup")
-async def startup_event():
-    await generator.start()
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    await generator.stop()
 
 # Mount static files to serve the frontend UI
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+FUSION_REAL_API = "http://localhost:8101"
+REAL_API_KEY = "fs-sync-secret-key"
 
 @app.get("/", response_class=HTMLResponse, include_in_schema=False)
 async def serve_demo_ui():
     """Serve the main HTML page for the demo UI."""
     html_file_path = os.path.join(static_dir, "index.html")
     if not os.path.exists(html_file_path):
-        raise HTTPException(status_code=404, detail="Demo UI (index.html) not found. Please ensure it's in the static directory.")
+        raise HTTPException(status_code=404, detail="Demo UI (index.html) not found.")
     return FileResponse(html_file_path)
+
+@app.get("/cluster", response_class=HTMLResponse, include_in_schema=False)
+async def serve_cluster_ui():
+    """Serve the Cluster Topology Dashboard."""
+    html_file_path = os.path.join(static_dir, "cluster.html")
+    if not os.path.exists(html_file_path):
+        raise HTTPException(status_code=404, detail="Cluster UI not found.")
+    return FileResponse(html_file_path)
+
+@app.get("/api/real_cluster_state")
+async def get_real_cluster_state():
+    """Fetch real session and view data from the dockerized Fusion service."""
+    async with httpx.AsyncClient() as client:
+        headers = {"X-API-Key": REAL_API_KEY}
+        try:
+            # 1. 获取 Session (节点状态)
+            session_res = await client.get(f"{FUSION_REAL_API}/api/v1/pipe/session/", headers=headers)
+            sessions = session_res.json()
+            
+            # 2. 获取文件树 (变更数据)
+            tree_res = await client.get(f"{FUSION_REAL_API}/api/v1/views/fs-sync-pipe/tree?path=/", headers=headers)
+            tree = tree_res.json()
+            
+            return {
+                "sessions": sessions.get("active_sessions", []),
+                "tree": tree.get("data", {}).get("children", [])
+            }
+        except Exception as e:
+            logger.error(f"Failed to fetch real cluster data: {e}")
+            return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.get("/api/unified_directory", response_model=List[Dict[str, Any]])
 async def get_unified_directory(
@@ -111,4 +154,4 @@ if __name__ == "__main__":
     uvicorn_logger = logging.getLogger("uvicorn.access")
     uvicorn_logger.setLevel(logging.DEBUG)
 
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=9001, log_level="info")

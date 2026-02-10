@@ -141,6 +141,9 @@ class TestSessionKeepAlive:
         create_result = await session_bridge.create_session(task_id="agent:sync")
         session_id = create_result["session_id"]
         
+        # Configure mock to return expected tuple (alive, commands)
+        mock_session_manager.keep_session_alive.return_value = (True, [])
+
         # Keep alive
         result = await session_bridge.keep_alive(session_id, client_ip="192.168.1.1")
         

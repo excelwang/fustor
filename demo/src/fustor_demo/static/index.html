@@ -95,7 +95,10 @@
                     </div>
                     <div class="card-body">
                         <div class="input-group mb-3">
-                            <input type="text" class="form-control" v-model="nfsHotProjectId" placeholder="Project ID">
+                            <select class="form-select" v-model="nfsHotProjectId">
+                                <option disabled value="">Select Project</option>
+                                <option v-for="proj in currentProjects" :value="proj.id">{{ proj.name }}</option>
+                            </select>
                             <input type="text" class="form-control" v-model="nfsHotFilename" placeholder="Filename">
                             <input type="number" class="form-control" v-model.number="nfsHotSize" placeholder="Size (MB)">
                             <button class="btn btn-primary" @click="triggerMock('nfs_hot_file', {project_id: nfsHotProjectId, filename: nfsHotFilename, size_mb: nfsHotSize})">Add File</button>
@@ -110,7 +113,10 @@
                     </div>
                     <div class="card-body">
                         <div class="input-group mb-3">
-                            <input type="text" class="form-control" v-model="nfsColdProjectId" placeholder="Project ID">
+                            <select class="form-select" v-model="nfsColdProjectId">
+                                <option disabled value="">Select Project</option>
+                                <option v-for="proj in currentProjects" :value="proj.id">{{ proj.name }}</option>
+                            </select>
                             <input type="text" class="form-control" v-model="nfsColdFilename" placeholder="Filename">
                             <input type="number" class="form-control" v-model.number="nfsColdSize" placeholder="Size (GB)">
                             <button class="btn btn-primary" @click="triggerMock('nfs_cold_file', {project_id: nfsColdProjectId, filename: nfsColdFilename, size_gb: nfsColdSize})">Archive File</button>
@@ -125,7 +131,10 @@
                     </div>
                     <div class="card-body">
                         <div class="input-group mb-3">
-                            <input type="text" class="form-control" v-model="ossProjectId" placeholder="Project ID">
+                            <select class="form-select" v-model="ossProjectId">
+                                <option disabled value="">Select Project</option>
+                                <option v-for="proj in currentProjects" :value="proj.id">{{ proj.name }}</option>
+                            </select>
                             <input type="text" class="form-control" v-model="ossDatasetName" placeholder="Dataset Name">
                             <input type="text" class="form-control" v-model="ossPublicUrl" placeholder="Public URL">
                             <button class="btn btn-primary" @click="triggerMock('oss_dataset', {project_id: ossProjectId, dataset_name: ossDatasetName, public_url: ossPublicUrl})">Add Dataset Link</button>
@@ -140,7 +149,10 @@
                     </div>
                     <div class="card-body">
                         <div class="input-group mb-3">
-                            <input type="text" class="form-control" v-model="esProjectId" placeholder="Project ID">
+                            <select class="form-select" v-model="esProjectId">
+                                <option disabled value="">Select Project</option>
+                                <option v-for="proj in currentProjects" :value="proj.id">{{ proj.name }}</option>
+                            </select>
                             <input type="text" class="form-control" v-model="esTitle" placeholder="Title">
                             <input type="text" class="form-control" v-model="esPubmedId" placeholder="PubMed ID">
                             <button class="btn btn-primary" @click="triggerMock('es_publication', {project_id: esProjectId, title: esTitle, pubmed_id: esPubmedId})">Add Publication</button>
@@ -245,16 +257,16 @@
 
                     // Mock agent input fields
                     mysqlProjectName: 'Project_Gamma',
-                    nfsHotProjectId: 'project_alpha',
+                    nfsHotProjectId: '',
                     nfsHotFilename: 'sequencing_results.fastq',
                     nfsHotSize: 100,
-                    nfsColdProjectId: 'project_alpha',
+                    nfsColdProjectId: '',
                     nfsColdFilename: 'archived_run_001.bam',
                     nfsColdSize: 50,
-                    ossProjectId: 'project_alpha',
+                    ossProjectId: '',
                     ossDatasetName: 'public_ref_genome.fasta',
                     ossPublicUrl: 'https://public-data.oss.com/ref_genome.fasta',
-                    esProjectId: 'project_alpha',
+                    esProjectId: '',
                     esTitle: 'New Cancer Marker Discovery',
                     esPubmedId: '38123456',
                 };
@@ -367,6 +379,15 @@
                         }
                     });
                     this.currentProjects = Object.values(uniqueProjects);
+
+                    // Auto-select first project for mock inputs if none selected
+                    if (this.currentProjects.length > 0) {
+                        const firstId = this.currentProjects[0].id;
+                        if (!this.nfsHotProjectId) this.nfsHotProjectId = firstId;
+                        if (!this.nfsColdProjectId) this.nfsColdProjectId = firstId;
+                        if (!this.ossProjectId) this.ossProjectId = firstId;
+                        if (!this.esProjectId) this.esProjectId = firstId;
+                    }
                 }
             },
             mounted() {

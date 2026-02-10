@@ -50,6 +50,7 @@ def mock_mysql_create_project(project_name: str) -> Dict[str, Any]:
             "created_by": "System"
         }
     )
+    event["project_name"] = project_name
     demo_store.add_event(event)
     return event
 

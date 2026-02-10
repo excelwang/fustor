@@ -58,6 +58,7 @@ services:
 
     ports:
       - "18102:8102"
+      - "18889:18888"
     networks:
       - fustor-net
     healthcheck:

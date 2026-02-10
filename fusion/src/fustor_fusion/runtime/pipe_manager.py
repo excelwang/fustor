@@ -253,6 +253,10 @@ class PipeManager:
     def get_pipes(self) -> Dict[str, FusionPipe]:
         return self._pipes.copy()
 
+    def get_pipe(self, pipe_id: str) -> Optional[FusionPipe]:
+        """Get a specific pipe instance by ID."""
+        return self._pipes.get(pipe_id)
+
     def get_receiver(self, receiver_id: str) -> Optional[Receiver]:
         """
         Get receiver by ID (e.g. 'http-main') or internal signature ID.

@@ -140,8 +140,10 @@ class TestComponentCrashIsolation:
         """
         assert fusion_client.wait_for_view_ready(timeout=MEDIUM_TIMEOUT)
 
-        # 使用 fusion_client 的 base_url（已在 conftest 中配置正确端口）
-        base_url = fusion_client.base_url
+        # Use exposed receiver port (18889) for ingestion tests
+        # because main API port (8102) does not have ingestion routes attached
+        # when receiver port != main port.
+        base_url = "http://localhost:18889"
 
         # --- 测试 1: 发送完全无效的 JSON ---
         # Use fake session ID to target the actual endpoint
@@ -185,7 +187,8 @@ class TestComponentCrashIsolation:
         替换原 test_view_component_logic_error_isolation（与 test_i 重复）。
         """
         assert fusion_client.wait_for_view_ready(timeout=MEDIUM_TIMEOUT)
-        base_url = fusion_client.base_url
+        # Use exposed receiver port (18889)
+        base_url = "http://localhost:18889"
 
         # --- 测试 1: 空 Batch (边界条件) ---
         # Use fake session ID to target the actual endpoint

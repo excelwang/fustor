@@ -7,6 +7,12 @@ import asyncio
 from fustor_fusion.main import app
 from fustor_fusion.api.session import get_view_id_from_api_key  # Using view_id internally
 
+@pytest.fixture(scope="session", autouse=True)
+def prevent_logging_reconfiguration():
+    """Prevent the application from reconfiguring logging during tests."""
+    with patch("fustor_core.common.logging_config.setup_logging"):
+        yield
+
 @pytest_asyncio.fixture(scope="function")
 async def async_client() -> AsyncClient:
     from fustor_fusion.auth.dependencies import get_view_id_from_api_key
