@@ -149,7 +149,8 @@ class FSScanner:
                 
             except Exception as e:
                 logger.error(f"[fs] Failed to scan directory '{root}': {e}")
-                # We don't yield success here, relying on engine error count or we could yield error info
+                # Re-raise to ensure error_count is incremented by RecursiveScanner
+                raise
 
         # Execute parallel scan and aggregate
         for result in self.engine.scan_parallel(pre_scan_worker):
