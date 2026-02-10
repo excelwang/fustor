@@ -120,6 +120,7 @@ views:
     driver: fs
     driver_params:
       hot_file_threshold: 60.0
+      max_tree_items: 100000   # 防止单次返回数据过大导致响应缓慢(默认 10W)
 
 # 3. 绑定管道 (Pipe)
 pipes:
