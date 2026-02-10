@@ -100,11 +100,21 @@ class PipeSessionBridge:
         session_id = session_id or str(uuid.uuid4())
         view_id = str(self._pipe.view_id)
         
-        logger.info(f"DEBUG: Bridge creating session {session_id} for view {view_id}, timeout={session_timeout_seconds}")
-        
+        # Use pipe config if not explicitly overridden
+        if allow_concurrent_push is None:
+            allow_concurrent_push = getattr(self._pipe, 'allow_concurrent_push', True)
+
         from fustor_fusion.view_state_manager import view_state_manager
         # Note: view_state_manager should handle string IDs too
         is_leader = await view_state_manager.try_become_leader(view_id, session_id)
+        
+        if not is_leader and not allow_concurrent_push:
+            # Check if there's an actual active leader session
+            leader_sid = await view_state_manager.get_leader(view_id)
+            if leader_sid:
+                logger.warning(f"Rejecting session {session_id} for view {view_id}: Locked by leader {leader_sid}")
+                raise ValueError(f"View {view_id} is currently locked by session {leader_sid}. Concurrent push is disabled.")
+
         if is_leader:
             await view_state_manager.set_authoritative_session(view_id, session_id)
             if not allow_concurrent_push:
