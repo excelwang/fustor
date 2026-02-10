@@ -118,6 +118,7 @@ receivers:
 views:
   backup-view:
     driver: fs
+    disabled: false
     driver_params:
       hot_file_threshold: 60.0
       max_tree_items: 100000   # 防止单次返回数据过大导致响应缓慢(默认 10W)
@@ -130,6 +131,9 @@ pipes:
       - backup-view
     session_timeout_seconds: 3600  # 会话超时时间 (也控制 Agent 掉线后的清除时间)
 ```
+
+> [!TIP]
+> **热重载**: 如果你修改了配置（如增加了 API Key 或更改了 View 参数），只需执行 `fustor-fusion reload` 即可增量生效。
 
 ---
 
@@ -152,6 +156,7 @@ sources:
   nfs-source-a:
     driver: fs
     uri: "/mnt/data/project_share"
+    disabled: false
 
 senders:
   fusion-main:
@@ -165,8 +170,7 @@ pipes:
     source: nfs-source-a
     sender: fusion-main
     
-    # 心跳与审计策略
-    heartbeat_interval_sec: 5.0
+    # 策略配置
     audit_interval_sec: 600.0
     sentinel_interval_sec: 60.0
     session_timeout_seconds: 3600
@@ -183,6 +187,7 @@ sources:
   nfs-source-b:
     driver: fs
     uri: "/home/admin/mnt/share"
+    disabled: false
 
 senders:
   fusion-main:
@@ -197,7 +202,6 @@ pipes:
     sender: fusion-main
     
     # 策略配置保持与 A 一致
-    heartbeat_interval_sec: 5.0
     audit_interval_sec: 600.0
     sentinel_interval_sec: 60.0
     session_timeout_seconds: 3600
@@ -222,7 +226,7 @@ fustor-agent start -D
 # 在服务器 B
 fustor-agent start -D
 ```
-*此时，先启动的 Agent 通常会成为 Leader，负责全量快照。后启动的 Agent 自动作为 Follower，提供冗余的实时监听。*
+*此时，通过 `reload` 命令可以随时调整集群参数。*
 
 ### 步骤 3: 验证同步与合并
 

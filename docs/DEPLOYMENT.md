@@ -24,11 +24,13 @@ Fustor 使用统一的主目录来存放配置、日志和持久化数据。
 *   **默认路径**: `~/.fustor`
 *   **自定义路径**: 可通过环境变量 `FUSTOR_HOME` 指定其他路径。
 
-**建议的目录结构：**
+*   **建议的目录结构：**
 ```text
 ~/.fustor/
-├── fusion-config/       # Fusion 服务端配置文件 (*.yaml)
-├── agent-config/        # Agent 采集端配置文件 (*.yaml)
+├── fusion-config/       # Fusion 服务端配置文件
+│   └── default.yaml     # 核心配置文件，包含全局设置和默认
+├── agent-config/        # Agent 采集端配置文件
+│   └── default.yaml     # 核心配置文件，包含日志和全局设置
 ├── logs/                # 运行日志
 └── data/                # 持久化数据存储
 ```
@@ -52,9 +54,15 @@ uv pip install fustor-fusion fustor-view-fs
 
 在 `~/.fustor/fusion-config/` 目录下创建配置文件（例如 `default.yaml`）。该目录下所有 `.yaml` 文件会被合并加载，支持跨文件引用。
 
-**样例配置 (`~/.fustor/fusion-config/default.yaml`):**
+# 样例配置 (`~/.fustor/fusion-config/default.yaml`):
 
 ```yaml
+# 0. 全局设置 (可选)
+logging:
+  level: "INFO"
+fusion:
+  port: 8101              # 管理 API 端口
+
 # 1. 定义接收器 (Receiver): 用于接收 Agent 推送的数据
 receivers:
   http-main:
@@ -69,6 +77,7 @@ receivers:
 views:
   research-view:
     driver: fs            # 使用文件系统驱动
+    disabled: false
     driver_params:
       hot_file_threshold: 60.0
 
@@ -81,11 +90,15 @@ pipes:
     session_timeout_seconds: 3600
 ```
 
+
 ### 3.3 启动
 
 ```bash
-# 前台启动（查看日志）
+# 前台启动（加载且仅加载 default.yaml 中的配置）
 fustor-fusion start
+
+# 启动特定配置文件中的 Pipes
+fustor-fusion start my-custom-pipes.yaml
 
 # 或后台启动
 fustor-fusion start -D
@@ -110,14 +123,19 @@ uv pip install fustor-agent fustor-source-fs fustor-sender-http
 
 在 `~/.fustor/agent-config/` 目录下创建配置文件（例如 `deployment.yaml`）。
 
-**样例配置 (`~/.fustor/agent-config/deployment.yaml`):**
+# 样例配置 (`~/.fustor/agent-config/default.yaml`):
 
 ```yaml
+# 0. 全局设置 (可选)
+logging:
+  level: "INFO"
+
 # 1. 定义数据源 (Source): 监控本地数据
 sources:
   local-research-files:
     driver: fs            # 使用文件系统驱动
     uri: "/mnt/data/source_files"  # 需要监控的本地绝对路径
+    disabled: false
 
 # 2. 定义发送器 (Sender): 推送目标
 senders:
@@ -134,41 +152,41 @@ pipes:
     sender: fusion-server         # 引用 sender id
     
     # 同步策略配置
-    heartbeat_interval_sec: 10.0
-    audit_interval_sec: 600.0     # 每10分钟进行一次全量审计
+    audit_interval_sec: 36000.0     # 每10小时进行一次全量审计
     sentinel_interval_sec: 120.0  # 哨兵扫描间隔
-    session_timeout_seconds: 3600
 ```
 
 ### 4.3 启动
 
 ```bash
-# 前台启动
+# 前台启动 (仅加载 default.yaml)
 fustor-agent start
 
-# 或后台启动
+# 后台启动
 fustor-agent start -D
 ```
 
 ---
 
-## 5. 验证部署
+## 5. 配置热重载 (Hot Reload)
 
-1.  **检查进程**: 确保 `fustor-fusion` 和 `fustor-agent` 进程均已存活。
-2.  **检查日志**:
-    *   Fusion 日志应显示 `[INFO] HTTP Receiver recv_http_18888 started on 0.0.0.0:18888`。
-    *   Agent 日志应显示 `[INFO] Session created: ...`，表明已成功连接到 Fusion。
-3.  **功能验证**:
-    *   在 Agent 监控的目录 (`/mnt/data/source_files`) 下创建一个新文件 `test.txt`。
-    *   查询 Fusion 的视图 API (假设在本地验证)：
-        ```bash
-        curl -H "X-API-Key: my-secure-api-key" \
-             "http://localhost:8101/api/v1/views/research-view/tree?path=/"
-        ```
-    *   你应该能看到 JSON 响应中包含了 `test.txt` 的信息。
+Fustor 支持在不重启服务的情况下动态更新配置。
 
-## 6. 常见问题排查
+### 5.1 使用 CLI 触发
+当你修改了 YAML 配置文件后，可以运行以下命令让正在运行的守护进程重新加载配置：
+
+```bash
+# 重载 Fusion 配置
+fustor-fusion reload
+
+# 重载 Agent 配置
+fustor-agent reload
+```
+
+### 5.2 运行机制
+*   **信号触发**: CLI 命令本质上是向后台进程发送了 `SIGHUP` 信号。
+*   **增量更新**: 系统会计算配置差异，自动启动新增加的管道，停止已禁用的组件关联的管道，并更新全局参数（如日志级别），整个过程中已存在的活动连接不受影响。
 
 *   **Agent 报错 "Connection refused"**: 检查 `senders` 配置中的 IP 和端口是否正确，确保 Fusion 服务器防火墙允许 18888 端口（Receiver 端口）通过。
 *   **Fusion 报错 "Unauthorized"**: 检查 Agent 的 `api_key` 是否与 Fusion `receivers` 配置中的 Key 完全一致。
-*   **配置未生效**: 确保配置文件扩展名为 `.yaml` 且位于正确的 `*-config/` 子目录下。重启服务以加载新配置。
+*   **配置未生效**: 确保配置文件扩展名为 `.yaml`。对于非 `default.yaml` 的配置，如果在启动时未明确指定文件，需在修改后运行 `reload` 命令或手动重启。默认情况下，`start` 不带参数仅会激活 `default.yaml` 中的管道。
