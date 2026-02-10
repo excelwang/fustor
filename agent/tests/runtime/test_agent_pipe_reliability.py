@@ -28,7 +28,6 @@ def mock_sender():
 @pytest.fixture
 def reliability_config():
     return {
-        "heartbeat_interval_sec": 0.01,
         "audit_interval_sec": 0.01,
         "sentinel_interval_sec": 0.01,
         "error_retry_interval": 0.01,
@@ -71,7 +70,7 @@ def test_handle_loop_error_counter(mock_source, mock_sender, reliability_config)
 async def test_heartbeat_loop_uses_backoff(mock_source, mock_sender, reliability_config, mocker):
     mock_sender.send_heartbeat.side_effect = Exception("HB error")
     pipe = AgentPipe("test", "t1", reliability_config, mock_source, mock_sender)
-    pipe.session_id = "sess-1"
+    await pipe.on_session_created("sess-1", role="leader", session_timeout_seconds=0.3)
     
     # Mock sleep to capture backoff value
     mock_sleep = mocker.patch("asyncio.sleep", AsyncMock())
@@ -145,7 +144,7 @@ def test_alert_threshold(mock_source, mock_sender, reliability_config, caplog):
 @pytest.mark.asyncio
 async def test_heartbeat_recovery_resets_counter(mock_source, mock_sender, reliability_config, mocker):
     pipe = AgentPipe("test", "t1", reliability_config, mock_source, mock_sender)
-    pipe.session_id = "sess-1"
+    await pipe.on_session_created("sess-1", role="leader", session_timeout_seconds=0.3)
     pipe._consecutive_errors = 5
     
     # Mock sleep to exit after one successful HB

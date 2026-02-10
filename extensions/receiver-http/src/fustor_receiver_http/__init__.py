@@ -242,6 +242,10 @@ class HTTPReceiver(Receiver):
         """Get the standalone FastAPI app."""
         return self._app
     
+    def mount_router(self, router: Any) -> None:
+        """Mount an additional router onto this receiver's standalone FastAPI app."""
+        self._app.include_router(router)
+    
     def _create_session_router(self) -> APIRouter:
         """Create the session management router."""
         router = APIRouter(tags=["Session"])
@@ -434,3 +438,8 @@ __all__ = [
     "HeartbeatResponse",
     "create_http_receiver",
 ]
+
+# Register with global registry
+from fustor_core.transport import ReceiverRegistry
+ReceiverRegistry.register("http", HTTPReceiver)
+

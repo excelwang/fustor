@@ -94,8 +94,7 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
         f"API_KEY='{api_key}' "
         f"THROTTLE_INTERVAL_SEC='{THROTTLE_INTERVAL_SEC}' "
         f"AUDIT_INTERVAL='{AUDIT_INTERVAL}' "
-        f"SENTINEL_INTERVAL='{SENTINEL_INTERVAL}' "
-        f"HEARTBEAT_INTERVAL='{HEARTBEAT_INTERVAL}' && "
+        f"SENTINEL_INTERVAL='{SENTINEL_INTERVAL}' && "
         "envsubst < /config/agent-config/default.yaml > /root/.fustor/agent-config/default.yaml"
     )
     

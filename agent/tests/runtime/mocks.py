@@ -63,7 +63,7 @@ class MockSenderHandler(SenderHandler):
         session_timeout_seconds: int = 30, **kwargs
     ) -> Tuple[str, Dict[str, Any]]:
         self.session_created = True
-        return self.session_id, {"role": self.role, "suggested_heartbeat_interval_seconds": 0.1}
+        return self.session_id, {"role": self.role, "session_timeout_seconds": session_timeout_seconds}
     
     async def send_heartbeat(self, session_id: str, **kwargs) -> Dict[str, Any]:
         self.heartbeat_calls += 1

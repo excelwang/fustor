@@ -180,7 +180,6 @@ class PipeSessionBridge:
             "session_id": session_id,
             "role": role,
             "session_timeout_seconds": timeout,
-            "suggested_heartbeat_interval_seconds": timeout // 2,
         }
     
     async def keep_alive(
@@ -201,6 +200,7 @@ class PipeSessionBridge:
             Heartbeat response with role, tasks, etc.
         """
         view_id = self._session_view_map.get(session_id)
+        commands = []
         
         if view_id is None:
             # Try to get it from pipe as fallback
@@ -214,7 +214,7 @@ class PipeSessionBridge:
             # If pipe knows it, then we are fine (maybe bridge map lost it but pipe has it)
         else:
             # 1. Update legacy SessionManager
-            alive = await self._session_manager.keep_session_alive(
+            alive, commands = await self._session_manager.keep_session_alive(
                 view_id=view_id,
                 session_id=session_id,
                 client_ip=client_ip,
@@ -256,8 +256,8 @@ class PipeSessionBridge:
             "role": role,
             "session_id": session_id,
             "can_realtime": can_realtime,
-            "suggested_heartbeat_interval_seconds": timeout // 2,
-            "status": "ok"
+            "status": "ok",
+            "commands": commands
         }
     
     async def close_session(self, session_id: str) -> bool:

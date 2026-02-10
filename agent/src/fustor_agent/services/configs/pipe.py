@@ -45,8 +45,7 @@ class PipeConfigService(BaseConfigService[PipeConfig], PipeConfigServiceInterfac
             disabled=y_cfg.disabled,
             fields_mapping=fields_mapping,
             audit_interval_sec=y_cfg.audit_interval_sec,
-            sentinel_interval_sec=y_cfg.sentinel_interval_sec,
-            heartbeat_interval_sec=y_cfg.heartbeat_interval_sec
+            sentinel_interval_sec=y_cfg.sentinel_interval_sec
         )
 
     def get_config(self, id: str) -> Optional[PipeConfig]:

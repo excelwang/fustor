@@ -41,7 +41,6 @@ class AgentPipeConfig(BaseModel):
     # Sync intervals
     audit_interval_sec: float = 600.0
     sentinel_interval_sec: float = 120.0
-    heartbeat_interval_sec: float = 10.0
     session_timeout_seconds: Optional[float] = None  # Session timeout hint for the server
     
     # Reliability configuration

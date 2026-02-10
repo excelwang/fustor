@@ -5,7 +5,7 @@ A Receiver is responsible for accepting events over a transport protocol
 (HTTP, gRPC, etc.) on the Fusion side.
 """
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional, Callable, Awaitable
+from typing import Any, Dict, List, Optional, Callable, Awaitable, Type
 import logging
 
 logger = logging.getLogger(__name__)
@@ -106,6 +106,36 @@ class Receiver(ABC):
         """Get the receiver's address as a string."""
         return f"{self.bind_host}:{self.port}"
     
+    # --- Extension points for PipeManager ---
+    # Subclasses MUST implement these to enable driver-agnostic orchestration.
+    
+    @abstractmethod
+    def register_callbacks(self, **callbacks) -> None:
+        """
+        Register event processing callbacks.
+        
+        Concrete receivers define which callbacks they accept.
+        Common callbacks: on_session_created, on_event_received,
+        on_heartbeat, on_session_closed, on_scan_complete.
+        """
+        raise NotImplementedError
+    
+    @abstractmethod
+    def register_api_key(self, api_key: str, pipe_id: str) -> None:
+        """
+        Register an API key for authenticating requests to a specific pipe.
+        """
+        raise NotImplementedError
+    
+    def mount_router(self, router: Any) -> None:
+        """
+        Mount an additional router onto this receiver's app.
+        
+        Default is no-op. HTTP-based receivers override this to
+        add extra API endpoints (e.g. consistency routes).
+        """
+        pass
+    
     # --- Session lifecycle hooks ---
     
     async def on_session_created(
@@ -128,3 +158,45 @@ class Receiver(ABC):
         Override to perform cleanup.
         """
         pass
+
+
+class ReceiverRegistry:
+    """
+    Registry for Receiver driver implementations.
+    
+    Usage:
+        # In receiver-http extension:
+        ReceiverRegistry.register("http", HTTPReceiver)
+        
+        # In PipeManager:
+        receiver = ReceiverRegistry.create("http", receiver_id=..., ...)
+    """
+    
+    _drivers: Dict[str, Type[Receiver]] = {}
+    
+    @classmethod
+    def register(cls, driver_name: str, receiver_class: Type[Receiver]) -> None:
+        """Register a receiver class for a driver name."""
+        cls._drivers[driver_name] = receiver_class
+        logger.info(f"Registered receiver driver: {driver_name} -> {receiver_class.__name__}")
+    
+    @classmethod
+    def create(cls, driver_name: str, **kwargs) -> Receiver:
+        """
+        Create a receiver instance by driver name.
+        
+        Raises KeyError if the driver is not registered.
+        """
+        if driver_name not in cls._drivers:
+            available = list(cls._drivers.keys())
+            raise KeyError(
+                f"Unknown receiver driver '{driver_name}'. "
+                f"Available: {available}. "
+                f"Ensure the driver extension is installed."
+            )
+        return cls._drivers[driver_name](**kwargs)
+    
+    @classmethod
+    def available_drivers(cls) -> List[str]:
+        """List registered driver names."""
+        return list(cls._drivers.keys())

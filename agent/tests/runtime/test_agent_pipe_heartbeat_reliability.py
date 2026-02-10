@@ -8,7 +8,6 @@ from .mocks import MockSourceHandler, MockSenderHandler
 @pytest.fixture
 def pipe_config():
     return {
-        "heartbeat_interval_sec": 0.05,
         "error_retry_interval": 0.01,
         "max_consecutive_errors": 2,
         "backoff_multiplier": 2.0,
@@ -33,9 +32,8 @@ async def test_heartbeat_failure_backoff(mock_source, mock_sender, pipe_config):
         mock_source, mock_sender
     )
     
-    # Manually start session
-    pipe.session_id = "test-session"
-    pipe.current_role = "leader"
+    # Manually start session with very short timeout to get fast heartbeat
+    await pipe.on_session_created("test-session", role="leader", session_timeout_seconds=0.1)
     
     hb_task = asyncio.create_task(pipe._run_heartbeat_loop())
     
@@ -67,8 +65,7 @@ async def test_heartbeat_session_obsolete_recovery(mock_source, mock_sender, pip
         mock_source, mock_sender
     )
     
-    pipe.session_id = "sess-old"
-    pipe.current_role = "leader"
+    await pipe.on_session_created("sess-old", role="leader", session_timeout_seconds=0.1)
     
     hb_task = asyncio.create_task(pipe._run_heartbeat_loop())
     

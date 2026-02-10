@@ -31,7 +31,6 @@ class TestAgentPipeInit:
     def test_config_parsing(self, agent_pipe, pipe_config):
         """Configuration should be parsed correctly."""
         assert agent_pipe.batch_size == pipe_config["batch_size"]
-        assert agent_pipe.heartbeat_interval_sec == pipe_config["heartbeat_interval_sec"]
     
     def test_dto(self, agent_pipe):
         """get_dto should return pipe info."""

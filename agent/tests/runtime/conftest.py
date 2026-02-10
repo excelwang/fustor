@@ -24,11 +24,11 @@ def mock_sender():
 def pipe_config():
     return {
         "batch_size": 5,
-        "heartbeat_interval_sec": 0.1,
         "audit_interval_sec": 0.5,
         "sentinel_interval_sec": 0,
         "control_loop_interval": 0.1,
         "role_check_interval": 0.1,
         "follower_standby_interval": 0.1,
         "error_retry_interval": 0.1,
+        "session_timeout_seconds": 0.3,
     }

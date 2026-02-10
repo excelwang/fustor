@@ -24,7 +24,6 @@ def pipe_with_low_max_errors():
     src = MockSourceHandler()
     snd = MockSenderHandler()
     config = {
-        "heartbeat_interval_sec": 0.01,
         "error_retry_interval": 0.01,
         "backoff_multiplier": 1.5,
         "max_backoff_seconds": 0.05,

@@ -22,7 +22,6 @@ async def test_agent_command_execution():
     
     # 2. Initialize Pipe
     config = {
-        "heartbeat_interval_sec": 0.1,
         "control_loop_interval": 0.1
     }
     pipe = AgentPipe("pipe-1", "task-1", config, mock_source, mock_sender)

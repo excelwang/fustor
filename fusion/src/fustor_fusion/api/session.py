@@ -165,7 +165,6 @@ async def create_session(
         "session_id": session_id,
         "role": role,
         "is_leader": is_leader,
-        "suggested_heartbeat_interval_seconds": session_timeout_seconds // 2,
         "session_timeout_seconds": session_timeout_seconds,
         "audit_interval_sec": session_config.get("audit_interval_sec"),
         "sentinel_interval_sec": session_config.get("sentinel_interval_sec"),

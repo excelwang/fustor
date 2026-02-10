@@ -5,9 +5,8 @@ import time
 import os
 from typing import Dict, List, Optional, Any, Tuple
 
-from fustor_core.transport import Receiver
-from fustor_core.event import EventBase
-from fustor_receiver_http import HTTPReceiver, SessionInfo
+from fustor_core.transport import Receiver, ReceiverRegistry
+from fustor_receiver_http import SessionInfo # Kept for registration of 'http' driver and type info
 from .fusion_pipe import FusionPipe
 from .session_bridge import create_session_bridge
 from .view_handler_adapter import create_view_handler_from_manager
@@ -64,37 +63,40 @@ class PipeManager:
                         logger.warning(f"Pipe '{p_id}' skipped because receiver '{p_cfg.receiver}' is disabled")
                         continue
 
-                    # 1. Initialize/Get Receiver (Shared by port for HTTP)
+                    # 1. Initialize/Get Receiver (Shared by driver + port)
                     r_sig = (r_cfg.driver, r_cfg.port)
                     
                     if r_sig not in self._receivers:
                         r_id = f"recv_{r_cfg.driver}_{r_cfg.port}"
-                        if r_cfg.driver == "http": #todo should be configured
-                            receiver = HTTPReceiver(
-                                receiver_id=r_id,
-                                bind_host=r_cfg.bind_host,
-                                port=r_cfg.port,
-                                config={
-                                    "session_timeout_seconds": p_cfg.session_timeout_seconds,
-                                },
-                            )
-                            receiver.register_callbacks(
-                                on_session_created=self._on_session_created,
-                                on_event_received=self._on_event_received,
-                                on_heartbeat=self._on_heartbeat,
-                                on_session_closed=self._on_session_closed,
-                                on_scan_complete=self._on_scan_complete
-                            )
-                            self._receivers[r_sig] = receiver
-                            logger.info(f"Initialized shared HTTP Receiver on port {r_cfg.port}")
+                        
+                        # Use Registry to create the concrete receiver instance (driver-agnostic)
+                        receiver = ReceiverRegistry.create(
+                            r_cfg.driver,
+                            receiver_id=r_id,
+                            bind_host=r_cfg.bind_host,
+                            port=r_cfg.port,
+                            config={
+                                "session_timeout_seconds": p_cfg.session_timeout_seconds,
+                            }
+                        )
+                        
+                        receiver.register_callbacks(
+                            on_session_created=self._on_session_created,
+                            on_event_received=self._on_event_received,
+                            on_heartbeat=self._on_heartbeat,
+                            on_session_closed=self._on_session_closed,
+                            on_scan_complete=self._on_scan_complete
+                        )
+                        self._receivers[r_sig] = receiver
+                        logger.info(f"Initialized shared {r_cfg.driver.upper()} Receiver on port {r_cfg.port}")
                     
                     receiver = self._receivers[r_sig]
-                    # Register API keys for this specific pipe on the shared receiver
-                    if isinstance(receiver, HTTPReceiver):
-                        for ak in r_cfg.api_keys:
-                            # Only register keys relevant to this pipe
-                            if ak.pipe_id == p_id:
-                                receiver.register_api_key(ak.key, ak.pipe_id)
+                    
+                    # 2. Register API keys for this specific pipe on the shared receiver
+                    for ak in r_cfg.api_keys:
+                        # Only register keys relevant to this pipe
+                        if ak.pipe_id == p_id:
+                            receiver.register_api_key(ak.key, ak.pipe_id)
 
                     # 2. Initialize Views
                     view_handlers = []
@@ -142,16 +144,16 @@ class PipeManager:
                 except Exception as e:
                     logger.error(f"Failed to initialize pipe {p_id}: {e}", exc_info=True)
             
-            # Mount consistency router onto each HTTP receiver's app
-            # so Agent can reach sentinel/audit endpoints via the receiver port
+            # Mount consistency router onto each receiver
+            # so Agent can reach sentinel/audit endpoints via the same port
             from ..api.consistency import consistency_router
             from fastapi import APIRouter
             for r_sig, receiver in self._receivers.items():
-                if isinstance(receiver, HTTPReceiver) and hasattr(receiver, 'get_app'):
-                    consistency_api = APIRouter(prefix="/api/v1/pipe")
-                    consistency_api.include_router(consistency_router)
-                    receiver.get_app().include_router(consistency_api)
-                    logger.info(f"Mounted consistency router on receiver {receiver.id}")
+                consistency_api = APIRouter(prefix="/api/v1/pipe")
+                consistency_api.include_router(consistency_router)
+                # Use generic mount_router interface
+                receiver.mount_router(consistency_api)
+                logger.info(f"Mounted consistency router on receiver {receiver.id}")
             
         return {"initialized": initialized_count}
 

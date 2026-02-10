@@ -50,7 +50,6 @@ Example Usage:
         task_id="agent-1:my-pipe",
         config={
             "batch_size": 100,
-            "heartbeat_interval_sec": 10,
         },
         source_handler=source_handler,
         sender_handler=sender_handler,

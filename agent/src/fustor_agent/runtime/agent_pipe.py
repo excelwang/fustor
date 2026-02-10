@@ -94,7 +94,7 @@ class AgentPipe(Pipe):
         # Default to None: let Fusion server decide the timeout from its own config.
         # Agent-side config can override if explicitly set.
         self.session_timeout_seconds = config.get("session_timeout_seconds") or None
-        self.heartbeat_interval_sec = config.get("heartbeat_interval_sec", 10.0)
+        self.heartbeat_interval_sec = 3.0  # Default until session is established
         
         self.audit_interval_sec = config.get("audit_interval_sec", 600)       # Seconds between audit cycles (0 to disable)
         self.sentinel_interval_sec = config.get("sentinel_interval_sec", 120) # Seconds between sentinel checks (0 to disable)
@@ -264,20 +264,15 @@ class AgentPipe(Pipe):
         self.session_id = session_id
         self.current_role = kwargs.get("role", "follower")
         
-        # Use suggested heartbeat interval from server if available
-        suggested_interval = kwargs.get("suggested_heartbeat_interval_seconds")
-        if suggested_interval:
-            self.heartbeat_interval_sec = suggested_interval
-        
         # Auto-adjust heartbeat based on session timeout from server
         # Heartbeat must be significantly shorter than session timeout to prevent expiry
         server_timeout = kwargs.get("session_timeout_seconds")
-        if server_timeout and not suggested_interval:
+        if server_timeout:
             # Use timeout/3 as heartbeat interval (gives 2 chances before expiry)
-            auto_interval = max(1.0, server_timeout / 3.0)
-            if auto_interval < self.heartbeat_interval_sec:
-                logger.info(f"Pipe {self.id}: Auto-adjusting heartbeat interval: {self.heartbeat_interval_sec} -> {auto_interval}s (session_timeout={server_timeout}s)")
-                self.heartbeat_interval_sec = auto_interval
+            # This is now the ONLY way heartbeat interval is determined.
+            auto_interval = max(0.1, server_timeout / 3.0)
+            logger.info(f"Pipe {self.id}: Calculated heartbeat interval: {auto_interval}s based on session_timeout={server_timeout}s")
+            self.heartbeat_interval_sec = auto_interval
         
         # Update sync policy from server response (authoritative)
         server_audit = kwargs.get("audit_interval_sec")

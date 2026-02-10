@@ -22,7 +22,7 @@ class FusionGlobalConfig(BaseModel):
 
 class AgentGlobalConfig(BaseModel):
     # Agent typically doesn't listen on a port anymore, but we can store other globals
-    heartbeat_interval_sec: float = Field(default=10.0, description="默认心跳间隔")
+    pass
 
 # --- Credentials and Mappings ---
 

@@ -19,7 +19,6 @@ def pipe_with_session():
     snd = MockSenderHandler()
     snd.role = "leader"
     config = {
-        "heartbeat_interval_sec": 0.01,
         "control_loop_interval": 0.05,
         "error_retry_interval": 0.01,
         "max_consecutive_errors": 10,  # 高阈值避免终态

@@ -6,7 +6,7 @@ logging:
   level: "${FUSTOR_LOG_LEVEL}"
 
 agent:
-  heartbeat_interval_sec: ${HEARTBEAT_INTERVAL}
+  # empty
 
 sources:
   shared-fs:
