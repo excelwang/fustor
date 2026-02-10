@@ -1,38 +1,37 @@
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
 [project]
 name = "fustor-schema-fs"
-version = "0.8.3.3"
+dynamic = ["version"]
 description = "Fustor File System Schema - Contract between source-fs and view-fs"
 readme = "README.md"
-requires-python = ">=3.10"
-license = {text = "MIT"}
-authors = [
-    {name = "Fustor Team"}
-]
-keywords = ["fustor", "schema", "filesystem"]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-]
-
-# No required runtime dependencies - core schema is pure data definition
-# Pydantic models are optional for type-safe validation
+requires-python = ">=3.11"
+license = "MIT"
 dependencies = ["fustor-core"]
+
+[[project.authors]]
+name = "Huajin Wang"
+email = "wanghuajin999@163.com"
+
+[build-system]
+requires = ["setuptools>=61.0", "setuptools-scm>=8.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools_scm]
+root = "../.."
+version_scheme = "post-release"
+local_scheme = "dirty-tag"
+
+["project.urls"]
+Homepage = "https://github.com/excelwang/fustor/tree/master/extensions/schema-fs"
+"Bug Tracker" = "https://github.com/excelwang/fustor/issues"
 
 [project.optional-dependencies]
 models = [
     "pydantic>=2.0.0",
 ]
 dev = [
-    "pytest>=7.0.0",
+    "pytest>=8.0.0",
     "pydantic>=2.0.0",
 ]
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/fustor_schema_fs"]
+[tool.setuptools.packages.find]
+where = ["src"]
