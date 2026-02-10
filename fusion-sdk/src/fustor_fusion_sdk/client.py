@@ -82,7 +82,7 @@ class FusionClient:
         # Remove None values
         payload = {k: v for k, v in payload.items() if v is not None}
         
-        response = await self.client.post(f"{self._session_path}", json=payload)
+        response = await self.client.post(f"{self._session_path}/", json=payload)
         response.raise_for_status()
         return response.json()
 

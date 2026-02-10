@@ -247,7 +247,7 @@ class HTTPReceiver(Receiver):
         router = APIRouter(tags=["Session"])
         receiver = self  # Capture self for closures
         
-        @router.post("", response_model=CreateSessionResponse)
+        @router.post("/", response_model=CreateSessionResponse)
         async def create_session(
             payload: CreateSessionRequest,
             request: Request,

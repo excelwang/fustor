@@ -59,35 +59,6 @@ def setup_pipe_routers():
             raise HTTPException(status_code=404, detail="Pipe not found")
         return await pipe.get_dto()
     
-    @pipe_router.get("/session/", tags=["Pipe"])
-    async def list_active_sessions():
-        """
-        List all active sessions across all view_ids.
-        Mainly for integration tests and monitoring.
-        """
-        from ..core.session_manager import session_manager
-        from ..view_state_manager import view_state_manager
-        
-        all_sessions = []
-        sessions_by_view = await session_manager.get_all_active_sessions()
-        for view_id, sessions in sessions_by_view.items():
-            for sid, si in sessions.items():
-                is_leader = await view_state_manager.is_leader(view_id, sid)
-                all_sessions.append({
-                    "session_id": sid,
-                    "task_id": si.task_id,
-                    "agent_id": si.task_id, # IT tests expect agent_id
-                    "source_uri": si.source_uri,
-                    "view_id": view_id,
-                    "role": "leader" if is_leader else "follower",
-                    "can_snapshot": is_leader,
-                    "can_audit": is_leader,
-                    "can_realtime": si.can_realtime,
-                    "can_send": True
-                })
-        
-        return {"active_sessions": all_sessions, "count": len(all_sessions)}
-
     return True
 
 # NOTE: We no longer mount routers here at module level.

@@ -95,7 +95,7 @@ async def _should_allow_new_session(
             return False
 
 
-@session_router.post("", summary="Create new pipesession")
+@session_router.post("/", summary="Create new pipesession")
 async def create_session(
     payload: CreateSessionPayload,
     request: Request,
@@ -241,7 +241,7 @@ async def end_session(
     }
 
 
-@session_router.get("", tags=["Session Management"], summary="List active sessions")
+@session_router.get("/", tags=["Session Management"], summary="List active sessions")
 async def list_sessions(
     view_id: str = Depends(get_view_id_from_api_key),
 ):
