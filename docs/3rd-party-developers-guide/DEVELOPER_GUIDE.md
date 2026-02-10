@@ -34,7 +34,7 @@
 
 ## 2. 技术栈
 - **核心框架**: FastAPI, SQLAlchemy 2.0 (Async), Pydantic v2
-- **数据库**: PostgreSQL 15+ (生产), SQLite (开发/测试)
+- **数据库**: PostgreSQL 15+ (Fusion), JSON File State (Agent)
 - **包管理**: uv
 
 ## 3. 测试
