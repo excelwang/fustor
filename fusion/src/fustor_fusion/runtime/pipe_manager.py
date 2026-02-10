@@ -5,7 +5,7 @@ import time
 import os
 from typing import Dict, List, Optional, Any, Tuple
 
-from fustor_core.transport import Receiver, ReceiverRegistry
+from fustor_core.transport.receiver import Receiver, ReceiverRegistry
 from fustor_receiver_http import SessionInfo # Kept for registration of 'http' driver and type info
 from .fusion_pipe import FusionPipe
 from ..config.unified import fusion_config, FusionPipeConfig

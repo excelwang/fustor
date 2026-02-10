@@ -30,3 +30,4 @@ it/proposals
 fustor_home
 fustor_home_agent2
 deploy
+docker_deploy/

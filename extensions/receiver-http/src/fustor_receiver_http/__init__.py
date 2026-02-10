@@ -442,6 +442,6 @@ __all__ = [
 ]
 
 # Register with global registry
-from fustor_core.transport import ReceiverRegistry
+from fustor_core.transport.receiver import ReceiverRegistry
 ReceiverRegistry.register("http", HTTPReceiver)
 

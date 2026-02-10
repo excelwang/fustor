@@ -333,6 +333,7 @@ class FSDriver(SourceDriver):
                 return {
                     "path": path,
                     "mtime": stat_info.st_mtime,
+                    "size": stat_info.st_size,
                     "status": "exists"
                 }
             except FileNotFoundError:

@@ -103,12 +103,12 @@ class FSViewDriver(FSViewBase):
         async with self._global_read_lock():
             return self.query.get_stats()
 
-    async def update_suspect(self, path: str, mtime: float):
+    async def update_suspect(self, path: str, mtime: float, size: Optional[int] = None):
         """Update suspect status from sentinel feedback.
         
         Per Spec §4.3 Stability-based Model:
-        - Stable (mtime unchanged) + TTL expired -> clear suspect (handled by cleanup_expired_suspects)
-        - Active (mtime changed) -> renew TTL
+        - Stable (mtime unchanged AND size unchanged) + TTL expired -> clear suspect
+        - Active (mtime changed OR size changed) -> renew TTL
         """
         async with self._global_read_lock():
             # Fix: Do NOT sample skew from Sentinel feedback (often old files).
@@ -131,13 +131,24 @@ class FSViewDriver(FSViewBase):
             is_raw_stable = abs(old_mtime - mtime) < 1e-6
             is_skew_stable = abs(old_mtime - (mtime + skew)) < 1e-6
             
+            is_mtime_stable = False
             if is_skew_stable and not is_raw_stable:
                 self.logger.info(f"Sentinel reported SKEWED mtime for {path} (Reported: {mtime}, Skew: {skew}, Corrected: {mtime+skew}). Treating as STABLE.")
                 # Normalize the mtime to the stable one for updates
                 mtime = old_mtime
-                is_stable = True
+                is_mtime_stable = True
             else:
-                is_stable = is_raw_stable
+                is_mtime_stable = is_raw_stable
+
+            # Check size stability if provided
+            is_size_stable = True
+            if size is not None and hasattr(node, "size"):
+                # If node has size, check it.
+                # Note: node.size might be None? usually not for files.
+                if node.size is not None:
+                     is_size_stable = (node.size == size)
+            
+            is_stable = is_mtime_stable and is_size_stable
 
             # Age Calculation Strategy (Align with Arbitrator)
             # age = min(LogicalAge, PhysicalAge)
@@ -165,12 +176,14 @@ class FSViewDriver(FSViewBase):
             else:
                 # Active: Update node and renew TTL
                 node.modified_time = mtime
+                if size is not None:
+                     node.size = size
                 node.integrity_suspect = True
                 
                 expiry = time.monotonic() + self.hot_file_threshold
                 self.state.suspect_list[path] = (expiry, mtime)
                 heapq.heappush(self.state.suspect_heap, (expiry, path))
-                self.logger.info(f"Suspect RENEWED (mismatch via Sentinel): {path} (Mtime: {mtime})")
+                self.logger.info(f"Suspect RENEWED (mismatch via Sentinel): {path} (Mtime: {mtime}, Size: {size})")
 
 
     async def trigger_realtime_scan(self, path: str, recursive: bool = True) -> bool:

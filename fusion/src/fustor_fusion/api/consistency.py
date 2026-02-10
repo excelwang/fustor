@@ -162,8 +162,9 @@ async def submit_sentinel_feedback(
                     for item in updates:
                         path = item.get('path')
                         mtime = item.get('mtime')
+                        size = item.get('size')
                         if path and mtime is not None:
-                            await driver_instance.update_suspect(path, float(mtime))
+                            await driver_instance.update_suspect(path, float(mtime), size=size)
                             count_for_driver += 1
                     if count_for_driver > 0:
                         processed_count += 1
