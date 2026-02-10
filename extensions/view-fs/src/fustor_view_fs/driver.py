@@ -167,12 +167,10 @@ class FSViewDriver(FSViewBase):
                 
             if is_stable:
                 # Stable!
-                # If verified stable, we trust the agent's check and CLEAR it 
-                # even if it's technically "Hot" (recent).
-                # The agent said "I checked this RIGHT NOW and it matches".
-                self.logger.info(f"Suspect VERIFIED stable (Active via Sentinel): {path}. Clearing immediately.")
-                self.state.suspect_list.pop(path, None)
-                node.integrity_suspect = False
+                # Do NOT clear immediately. We must wait for TTL to expire to prove stability over time.
+                # Just log and let cleanup_expired_suspects handle it.
+                self.logger.debug(f"Sentinel check STABLE (Active via Sentinel): {path}. Keeping suspect until TTL.")
+                return
             else:
                 # Active: Update node and renew TTL
                 node.modified_time = mtime
@@ -184,6 +182,7 @@ class FSViewDriver(FSViewBase):
                 self.state.suspect_list[path] = (expiry, mtime)
                 heapq.heappush(self.state.suspect_heap, (expiry, path))
                 self.logger.info(f"Suspect RENEWED (mismatch via Sentinel): {path} (Mtime: {mtime}, Size: {size})")
+
 
 
     async def trigger_realtime_scan(self, path: str, recursive: bool = True) -> bool:
