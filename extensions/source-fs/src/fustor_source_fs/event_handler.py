@@ -63,7 +63,9 @@ class OptimizedWatchEventHandler(FileSystemEventHandler):
     def _get_index(self, mtime=None):
         # Index is now purely based on physical time to avoid logical clock contamination
         # from NFS future mtimes during event generation.
-        return int(time.time() * 1000)
+        # However, we MUST compensate for local clock drift relative to NFS/Fusion
+        drift = getattr(self.watch_manager, 'drift_from_nfs', 0.0)
+        return int((time.time() + drift) * 1000)
 
     def _touch_recursive_bottom_up(self, path: str):
         """Recursively touches a directory and its contents from bottom-up."""

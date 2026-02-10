@@ -168,7 +168,7 @@ class FSScanner:
         Executes snapshot scan.
         callback: Optional function to call for touching watched paths (path, mtime).
         """
-        snapshot_time = int(time.time() * 1000)
+        snapshot_time = int((time.time() + self.drift_from_nfs) * 1000)
         
         def snapshot_worker(root, work_q, res_q, stop_ev):
             try:
@@ -265,7 +265,7 @@ class FSScanner:
         """
         Executes audit scan.
         """
-        audit_time = int(time.time() * 1000)
+        audit_time = int((time.time() + self.drift_from_nfs) * 1000)
         
         def audit_worker(item, work_q, res_q, stop_ev):
             root, _parent_path = item
