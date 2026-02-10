@@ -8,12 +8,9 @@ from typing import Optional, List
 import sys
 import logging
 
-# Configure basic logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    stream=sys.stdout
-)
+# --- Configuration and Core Imports ---
+from .config.unified import fusion_config
+from fustor_core.common import logging_config
 
 logger = logging.getLogger(__name__)
 
@@ -36,21 +33,33 @@ async def lifespan(app: FastAPI):
     from .runtime.pipe_manager import pipe_manager as pm
     runtime_objects.pipe_manager = pm
     
-    # Read target configs from environment (set by CLI)
+    # 1. Load configuration
+    fusion_config.ensure_loaded()
+    
+    # 2. Setup Logging from config
+    logging_config.setup_logging(
+        base_logger_name="fustor_fusion",
+        level=fusion_config.logging.level.upper(),
+        console_output=True
+    )
+    
+    # Read target configs from environment (deprecated, but kept for migration)
     config_env = os.environ.get("FUSTOR_FUSION_CONFIGS")
     config_list = config_env.split(",") if config_env else None
     
-    # Initialize pipes based on targets
+    # 3. Initialize pipes based on targets (if list is None, uses get_enabled_pipes from default.yaml)
     await pm.initialize_pipes(config_list)
     
-    # Check for port conflicts and attach receivers if needed
-    current_port_env = os.environ.get("FUSTOR_FUSION_PORT", "8102")
-    try:
-        current_port = int(current_port_env)
-    except ValueError:
-        current_port = 8102
-        
-    logger.info(f"Checking for port conflicts. Main port: {current_port} (Env: {current_port_env})")
+    # 4. Check for port conflicts and synchronize with global config
+    current_port = fusion_config.fusion.port
+    current_port_env = os.environ.get("FUSTOR_FUSION_PORT")
+    if current_port_env:
+        try:
+            current_port = int(current_port_env)
+        except ValueError:
+            pass
+            
+    logger.info(f"Port configuration: {current_port} (Source: {'Env' if current_port_env else 'YAML'})")
     
     from fustor_receiver_http import HTTPReceiver
     
@@ -93,9 +102,21 @@ async def lifespan(app: FastAPI):
             
     suspect_cleanup_task = asyncio.create_task(periodic_suspect_cleanup())
     
+    # Setup SIGHUP for reload
+    def handle_reload():
+        logger.info("Received SIGHUP - initiating hot reload")
+        asyncio.create_task(pm.reload())
+    
+    try:
+        loop = asyncio.get_running_loop()
+        import signal
+        if hasattr(signal, 'SIGHUP'):
+            loop.add_signal_handler(signal.SIGHUP, handle_reload)
+    except Exception as e:
+        logger.warning(f"Could not register SIGHUP handler: {e}")
+
     # Start periodic session cleanup
-    # We use a default interval since receivers are now per-pipe
-    cleanup_interval = 10
+    cleanup_interval = fusion_config.runtime.session_cleanup_interval
     logger.info(f"Starting session cleanup (Interval: {cleanup_interval}s)")
     await session_manager.start_periodic_cleanup(cleanup_interval)
 

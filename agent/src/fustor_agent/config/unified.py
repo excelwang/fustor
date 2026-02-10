@@ -25,10 +25,10 @@ import yaml
 import logging
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Set
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, Field
 
 from fustor_core.common import get_fustor_home_dir
-from fustor_core.models.config import SourceConfig, SenderConfig
+from fustor_core.models.config import SourceConfig, SenderConfig, GlobalLoggingConfig, AgentGlobalConfig
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +37,6 @@ class AgentPipeConfig(BaseModel):
     """Configuration for a single Agent pipe."""
     source: str  # Reference to source ID
     sender: str  # Reference to sender ID
-    disabled: bool = False
     
     # Sync intervals
     audit_interval_sec: float = 600.0
@@ -56,6 +55,8 @@ class AgentPipeConfig(BaseModel):
 
 class UnifiedAgentConfig(BaseModel):
     """Unified configuration containing all components."""
+    logging: GlobalLoggingConfig = Field(default_factory=GlobalLoggingConfig)
+    agent: AgentGlobalConfig = Field(default_factory=AgentGlobalConfig)
     sources: Dict[str, Dict[str, Any]] = {}
     senders: Dict[str, Dict[str, Any]] = {}
     pipes: Dict[str, AgentPipeConfig] = {}
@@ -75,6 +76,10 @@ class AgentConfigLoader:
         
         self.dir = Path(config_dir)
         
+        # Global settings
+        self.logging = GlobalLoggingConfig()
+        self.agent = AgentGlobalConfig()
+
         # Merged namespace
         self._sources: Dict[str, SourceConfig] = {}
         self._senders: Dict[str, SenderConfig] = {}
@@ -87,6 +92,8 @@ class AgentConfigLoader:
     
     def load_all(self) -> None:
         """Load and merge all YAML files from config directory."""
+        self.logging = GlobalLoggingConfig()
+        self.agent = AgentGlobalConfig()
         self._sources.clear()
         self._senders.clear()
         self._pipes.clear()
@@ -138,6 +145,13 @@ class AgentConfigLoader:
             
             self._pipes_by_file[file_key] = pipe_ids
             
+            # Load global settings if this is default.yaml
+            if file_key == "default.yaml":
+                if "logging" in data:
+                    self.logging = GlobalLoggingConfig(**data["logging"])
+                if "agent" in data:
+                    self.agent = AgentGlobalConfig(**data["agent"])
+            
         except Exception as e:
             logger.error(f"Failed to load config from {path}: {e}")
     
@@ -180,9 +194,17 @@ class AgentConfigLoader:
         return self.get_pipes_from_file("default.yaml")
     
     def get_enabled_pipes(self) -> Dict[str, AgentPipeConfig]:
-        """Get all enabled (not disabled) pipes."""
+        """
+        Get all enabled pipes.
+        In Agent, a pipe is enabled if its source is enabled.
+        """
         self.ensure_loaded()
-        return {k: v for k, v in self._pipes.items() if not v.disabled}
+        enabled = {}
+        for pid, pcfg in self._pipes.items():
+            source = self.get_source(pcfg.source)
+            if source and not source.disabled:
+                enabled[pid] = pcfg
+        return enabled
     
     def resolve_pipe_refs(self, pipe_id: str) -> Optional[Dict[str, Any]]:
         """Resolve a pipe's source and sender references to actual configs."""
@@ -206,6 +228,20 @@ class AgentConfigLoader:
             "sender": sender,
         }
     
+    def get_diff(self, old_pipe_ids: Set[str]) -> Dict[str, Set[str]]:
+        """
+        Compare current enabled pipes with a set of old pipe IDs.
+        Returns:
+            dict: {
+                "added": set of new pipe IDs that should be started,
+                "removed": set of old pipe IDs that should be stopped
+            }
+        """
+        current_enabled = set(self.get_enabled_pipes().keys())
+        added = current_enabled - old_pipe_ids
+        removed = old_pipe_ids - current_enabled
+        return {"added": added, "removed": removed}
+
     def reload(self) -> None:
         """Force reload all configurations."""
         self._loaded = False

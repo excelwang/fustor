@@ -71,8 +71,14 @@ class App:
     def _resolve_target_pipes(self, config_list: Optional[List[str]]) -> List[str]:
         """Resolve which pipe IDs to start."""
         if config_list is None:
-            # Default behavior: all pipes from all yaml files
-            return list(agent_config.get_all_pipes().keys())
+            # Default behavior: only pipes from default.yaml
+            all_default = agent_config.get_default_pipes()
+            targets = []
+            for pid, pcfg in all_default.items():
+                source = agent_config.get_source(pcfg.source)
+                if source and not source.disabled:
+                    targets.append(pid)
+            return targets
         
         targets = []
         for item in config_list:
@@ -112,10 +118,6 @@ class App:
         source_cfg = resolved['source']
         sender_cfg = resolved['sender']
         
-        if pipe_cfg.disabled:
-            self.logger.info(f"Pipe '{pipe_id}' is disabled, skipping")
-            return
-
         # 1. Get or create event bus for source
         # Use source ID from config for sharing
         source_id = pipe_cfg.source
@@ -194,7 +196,49 @@ class App:
         await self.event_bus_service.release_all_unused_buses()
         await self._save_state()
         self.logger.info("Application shutdown complete")
-    
+
+    async def reload_config(self):
+        """
+        Reload configuration from disk and synchronize running pipes.
+        Triggered by SIGHUP.
+        """
+        self.logger.info("Reloading configuration...")
+        agent_config.reload()
+        
+        # Get diff between currently running pipes and new enabled pipes
+        # Note: We only auto-reload pipes that were either in the original startup list 
+        # or are in default.yaml if no list was provided.
+        # For simplicity, we diff against ALL enabled pipes now, 
+        # but a production implementation might restrict this to the original 'namespace'.
+        
+        current_running_ids = set(self.pipe_runtime.keys())
+        diff = agent_config.get_diff(current_running_ids)
+        
+        added = diff["added"]
+        removed = diff["removed"]
+        
+        if not added and not removed:
+            self.logger.info("No configuration changes affecting pipes.")
+            return
+            
+        self.logger.info(f"Config change detected: added={added}, removed={removed}")
+        
+        # 1. Stop removed pipes
+        for pid in removed:
+            try:
+                await self._stop_pipe(pid)
+            except Exception as e:
+                self.logger.error(f"Error stopping pipe '{pid}' during reload: {e}")
+                
+        # 2. Start added pipes
+        for pid in added:
+            try:
+                await self._start_pipe(pid)
+            except Exception as e:
+                self.logger.error(f"Failed to start added pipe '{pid}' during reload: {e}")
+        
+        self.logger.info("Configuration reload complete.")
+
     async def _save_state(self):
         """Save runtime state to file."""
         try:

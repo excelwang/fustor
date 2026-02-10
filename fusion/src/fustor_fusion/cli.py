@@ -7,6 +7,7 @@ Commands:
   fustor-fusion stop [configs...]   # Stop pipe(s) or the entire fusion
   fustor-fusion list                # List running pipes
   fustor-fusion status [pipe]       # Show status
+  fustor-fusion reload              # Reload configuration (SIGHUP)
 """
 import click
 import asyncio
@@ -19,6 +20,7 @@ import subprocess
 import time
 
 from fustor_core.common import setup_logging, get_fustor_home_dir
+from .config.unified import fusion_config
 
 # Define standard directories and file names for fusion
 HOME_FUSTOR_DIR = get_fustor_home_dir()
@@ -55,8 +57,8 @@ def cli():
 @cli.command()
 @click.argument("configs", nargs=-1)
 @click.option("--reload", is_flag=True, help="Enable auto-reloading (foreground only).")
-@click.option("-p", "--port", default=8101, help="Port to run the server on.")
-@click.option("-h", "--host", default="0.0.0.0", help="Host to bind the server to.")
+@click.option("-p", "--port", type=int, help="Port to run the management server on.")
+@click.option("-h", "--host", help="Host to bind the server to.")
 @click.option("-D", "--daemon", is_flag=True, help="Run as background daemon.")
 @click.option("-V", "--verbose", is_flag=True, help="Enable DEBUG logging.")
 @click.option("--no-console-log", is_flag=True, hidden=True)
@@ -65,11 +67,17 @@ def start(configs, reload, port, host, daemon, verbose, no_console_log):
     Start Fusion and pipe(s).
     
     Examples:
-        fustor-fusion start                   # Start all from default.yaml
+        fustor-fusion start                   # Start all enabled from default.yaml
         fustor-fusion start ingest-main       # Start single pipe
         fustor-fusion start custom.yaml       # Start from managed file
     """
-    log_level = "DEBUG" if verbose else "INFO"
+    fusion_config.ensure_loaded()
+    
+    # Use YAML defaults if not overridden by CLI args
+    host = host or fusion_config.fusion.host
+    port = port or fusion_config.fusion.port
+    
+    log_level = "DEBUG" if verbose else fusion_config.logging.level
     setup_logging(
         log_file_path=FUSION_LOG_FILE,
         base_logger_name="fustor_fusion",
@@ -88,8 +96,8 @@ def start(configs, reload, port, host, daemon, verbose, no_console_log):
         
         cmd = [sys.executable, sys.argv[0], "start", "--no-console-log"]
         if verbose: cmd.append("--verbose")
-        if port != 8101: cmd.extend(["--port", str(port)])
-        if host != "0.0.0.0": cmd.extend(["--host", host])
+        if port: cmd.extend(["--port", str(port)])
+        if host: cmd.extend(["--host", host])
         cmd.extend(configs)
         
         try:
@@ -174,56 +182,37 @@ def stop(configs):
         except OSError as e:
             click.echo(click.style(f"Error: {e}", fg="red"))
     else:
-        if not pid:
-            click.echo("Fusion is not running. Cannot stop individual pipes.")
-            return
-        
-        import requests
-        for config in configs:
-            try:
-                response = requests.post(
-                    f"http://localhost:8101/api/v1/management/pipes/{config}/stop",
-                    timeout=10
-                )
-                if response.ok:
-                    click.echo(click.style(f"[{config}] ✓ Stopped", fg="green"))
-                else:
-                    detail = response.json().get("detail", "Unknown error")
-                    click.echo(click.style(f"[{config}] ✗ {detail}", fg="red"))
-            except Exception as e:
-                click.echo(click.style(f"[{config}] ✗ {e}", fg="red"))
+        # Hot-stop specific pipes/configs via API is deprecated in favor of 'reload'
+        click.echo("Individual pipe stopping via CLI is deprecated. Please modify config and use 'reload'.")
 
 
 @cli.command("list")
 def list_pipes():
-    """List all running pipes in Fusion."""
-    pid = _is_running()
-    if not pid:
-        click.echo("Fusion is not running.")
-        return
+    """List all pipes defined in configuration."""
+    fusion_config.ensure_loaded()
+    pipes = fusion_config.get_all_pipes()
     
-    import requests
-    try:
-        response = requests.get("http://localhost:8101/api/v1/management/pipes", timeout=10)
-        if response.ok:
-            pipes = response.json()
-            if not pipes:
-                click.echo("No pipes configured.")
-                return
-            click.echo(f"{'ID':<30} {'STATUS':<15} {'VIEWS':<20}")
-            click.echo("-" * 65)
-            for p in pipes:
-                status_color = "green" if p.get("running") else "yellow"
-                views = ", ".join(p.get("views", []))
-                click.echo(
-                    f"{p['id']:<30} "
-                    f"{click.style('RUNNING' if p.get('running') else 'STOPPED', fg=status_color):<15} "
-                    f"{views:<20}"
-                )
-        else:
-            click.echo(click.style(f"Error: {response.text}", fg="red"))
-    except Exception as e:
-        click.echo(click.style(f"Error: {e}", fg="red"))
+    if not pipes:
+        click.echo("No pipes defined.")
+        return
+
+    click.echo(f"{'PIPE ID':<30} {'STATUS':<15} {'VIEWS':<20}")
+    click.echo("-" * 65)
+    
+    for pid, pcfg in pipes.items():
+        # Check if enabled based on views
+        has_enabled_view = False
+        for v_id in pcfg.views:
+            view = fusion_config.get_view(v_id)
+            if view and not view.disabled:
+                has_enabled_view = True
+                break
+        
+        recv = fusion_config.get_receiver(pcfg.receiver)
+        recv_enabled = recv and not recv.disabled
+        
+        status = "ENABLED" if (has_enabled_view and recv_enabled) else "DISABLED"
+        click.echo(f"{pid:<30} {status:<15} {', '.join(pcfg.views):<20}")
 
 
 @cli.command()
@@ -233,20 +222,54 @@ def status(pipe_id):
     pid = _is_running()
     if not pid:
         click.echo("Fusion Status: " + click.style("STOPPED", fg="red"))
-        return
-    
-    click.echo("Fusion Status: " + click.style(f"RUNNING (PID: {pid})", fg="green"))
+    else:
+        click.echo("Fusion Status: " + click.style(f"RUNNING (PID: {pid})", fg="green"))
     
     if pipe_id:
-        import requests
-        try:
-            response = requests.get(f"http://localhost:8101/api/v1/management/pipes/{pipe_id}", timeout=10)
-            if response.ok:
-                data = response.json()
-                click.echo(f"\nPipe: {pipe_id}")
-                click.echo(f"  Running: {data.get('running')}")
-                click.echo(f"  Views: {', '.join(data.get('views', []))}")
-            else:
-                click.echo(click.style(f"Pipe '{pipe_id}' not found.", fg="yellow"))
-        except Exception as e:
-            click.echo(click.style(f"Error: {e}", fg="red"))
+        fusion_config.ensure_loaded()
+        pipe = fusion_config.get_pipe(pipe_id)
+        if not pipe:
+            click.echo(click.style(f"Pipe '{pipe_id}' not found.", fg="yellow"))
+            return
+            
+        click.echo(f"\nPipe ID: {pipe_id}")
+        click.echo(f"  Receiver: {pipe.receiver}")
+        click.echo(f"  Views:    {', '.join(pipe.views)}")
+        
+        # Check if enabled based on views
+        has_enabled_view = False
+        for v_id in pipe.views:
+            view = fusion_config.get_view(v_id)
+            if view and not view.disabled:
+                has_enabled_view = True
+                break
+        
+        recv = fusion_config.get_receiver(pipe.receiver)
+        recv_enabled = recv and not recv.disabled
+        
+        status_str = "ENABLED" if (has_enabled_view and recv_enabled) else "DISABLED"
+        click.echo(f"  Status:   {status_str} (Config)")
+
+
+@cli.command()
+def reload():
+    """Reload configuration by sending SIGHUP to the Fusion daemon."""
+    if not os.path.exists(FUSION_PID_FILE):
+        click.echo("Fusion is not running.")
+        return
+    
+    try:
+        with open(FUSION_PID_FILE, 'r') as f:
+            pid = int(f.read().strip())
+        import signal
+        os.kill(pid, signal.SIGHUP)
+        click.echo(click.style("✓ Reload signal sent (SIGHUP)", fg="green"))
+    except ProcessLookupError:
+        click.echo(click.style("✗ Process not found. Deleting stale PID file.", fg="red"))
+        os.remove(FUSION_PID_FILE)
+    except Exception as e:
+        click.echo(click.style(f"✗ Failed to reload: {e}", fg="red"))
+
+
+if __name__ == "__main__":
+    cli()

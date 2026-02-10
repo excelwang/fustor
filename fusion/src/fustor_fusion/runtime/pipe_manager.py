@@ -60,9 +60,6 @@ class PipeManager:
                     p_cfg = resolved['pipe']
                     r_cfg = resolved['receiver']
                     
-                    if p_cfg.disabled:
-                        continue
-                    
                     if r_cfg.disabled:
                         logger.warning(f"Pipe '{p_id}' skipped because receiver '{p_cfg.receiver}' is disabled")
                         continue
@@ -157,7 +154,8 @@ class PipeManager:
 
     def _resolve_target_pipes(self, config_list: Optional[List[str]]) -> List[str]:
         if config_list is None:
-            return list(fusion_config.get_all_pipes().keys())
+            # Default behavior: only enabled pipes from default.yaml
+            return list(fusion_config.get_enabled_pipes().keys())
         
         targets = []
         for item in config_list:
@@ -186,6 +184,66 @@ class PipeManager:
             for p_id, pipe in self._pipes.items():
                 await pipe.stop()
             logger.info("Fusion components stopped")
+
+    async def reload(self):
+        """
+        Reload configuration and synchronize running pipes.
+        Triggered by SIGHUP or management API.
+        """
+        logger.info("Reloading Fusion configuration...")
+        fusion_config.reload()
+        
+        async with self._init_lock:
+            current_pipe_ids = set(self._pipes.keys())
+            diff = fusion_config.get_diff(current_pipe_ids)
+            
+            added = diff["added"]
+            removed = diff["removed"]
+            
+            if not added and not removed:
+                logger.info("No configuration changes affecting pipes.")
+                return
+                
+            logger.info(f"Config change detected: added={added}, removed={removed}")
+            
+            # 1. Stop removed pipes
+            for p_id in removed:
+                pipe = self._pipes.pop(p_id, None)
+                if pipe:
+                    await pipe.stop()
+                    self._bridges.pop(p_id, None)
+                    logger.info(f"Pipe '{p_id}' stopped during reload")
+            
+            # 2. Re-initialize and start added pipes
+            if added:
+                # We reuse initialize_pipes but only for the added set
+                await self.initialize_pipes(list(added))
+                for p_id in added:
+                    if p_id in self._pipes:
+                        await self._pipes[p_id].start()
+            
+            # 3. Clean up unused receivers
+            active_receiver_sigs = set()
+            for p_id in self._pipes:
+                resolved = fusion_config.resolve_pipe_refs(p_id)
+                if resolved:
+                    r_cfg = resolved['receiver']
+                    active_receiver_sigs.add((r_cfg.driver, r_cfg.port))
+            
+            for sig in list(self._receivers.keys()):
+                if sig not in active_receiver_sigs:
+                    receiver = self._receivers.pop(sig)
+                    await receiver.stop()
+                    logger.info(f"Stopped and removed unused receiver: {sig}")
+            
+            # Start any new receivers that were just initialized but not started
+            for sig, receiver in self._receivers.items():
+                # We don't have a reliable 'is_running' on Receiver yet, 
+                # but calling start() again should be idempotent or we can track it.
+                # For now, just start all.
+                await receiver.start()
+
+        logger.info("Fusion configuration reload complete.")
 
     def get_pipes(self) -> Dict[str, FusionPipe]:
         return self._pipes.copy()

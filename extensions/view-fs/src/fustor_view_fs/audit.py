@@ -82,6 +82,9 @@ class AuditManager:
                     await self.tree_manager.delete_node(path)
                     self.state.blind_spot_deletions.add(path)
                     self.state.blind_spot_additions.discard(path)
+                    
+                    # Also clear from suspect list if deleted via Missing Item Detection
+                    self.state.suspect_list.pop(path, None)
             except Exception as e:
                 self.logger.error(f"Error during missing item deletion: {e}")
                 # We continue to ensure state cleanup

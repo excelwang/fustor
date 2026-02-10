@@ -29,9 +29,9 @@ import yaml
 import logging
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Set
-from pydantic import BaseModel
-
+from pydantic import BaseModel, Field
 from fustor_core.common import get_fustor_home_dir
+from fustor_core.models.config import GlobalLoggingConfig, FusionGlobalConfig
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +62,6 @@ class FusionPipeConfig(BaseModel):
     """Configuration for a single Fusion pipe."""
     receiver: str  # Reference to receiver ID
     views: List[str] = []  # References to view IDs
-    disabled: bool = False
     allow_concurrent_push: bool = True
     session_timeout_seconds: int = 3600
 
@@ -81,6 +80,10 @@ class FusionConfigLoader:
         
         self.dir = Path(config_dir)
         
+        # Global settings
+        self.logging = GlobalLoggingConfig()
+        self.fusion = FusionGlobalConfig()
+
         # Merged namespace
         self._receivers: Dict[str, ReceiverConfig] = {}
         self._views: Dict[str, ViewConfig] = {}
@@ -93,6 +96,8 @@ class FusionConfigLoader:
     
     def load_all(self) -> None:
         """Load and merge all YAML files from config directory."""
+        self.logging = GlobalLoggingConfig()
+        self.fusion = FusionGlobalConfig()
         self._receivers.clear()
         self._views.clear()
         self._pipes.clear()
@@ -144,6 +149,13 @@ class FusionConfigLoader:
             
             self._pipes_by_file[file_key] = pipe_ids
             
+            # Load global settings if this is default.yaml
+            if file_key == "default.yaml":
+                if "logging" in data:
+                    self.logging = GlobalLoggingConfig(**data["logging"])
+                if "fusion" in data:
+                    self.fusion = FusionGlobalConfig(**data["fusion"])
+            
         except Exception as e:
             logger.error(f"Failed to load config from {path}: {e}")
     
@@ -186,9 +198,36 @@ class FusionConfigLoader:
         return self.get_pipes_from_file("default.yaml")
     
     def get_enabled_pipes(self) -> Dict[str, FusionPipeConfig]:
-        """Get all enabled pipes."""
+        """
+        Get all enabled pipes.
+        In Fusion, a pipe is enabled if its receiver is enabled 
+        AND at least one of its views is enabled.
+        """
         self.ensure_loaded()
-        return {k: v for k, v in self._pipes.items() if not v.disabled}
+        enabled = {}
+        for pid, pcfg in self._pipes.items():
+            receiver = self.get_receiver(pcfg.receiver)
+            if not receiver or receiver.disabled:
+                continue
+            
+            # At least one view must be enabled
+            has_enabled_view = False
+            for v_id in pcfg.views:
+                view = self.get_view(v_id)
+                if view and not view.disabled:
+                    has_enabled_view = True
+                    break
+            
+            if has_enabled_view:
+                enabled[pid] = pcfg
+        return enabled
+
+    def get_diff(self, old_pipe_ids: Set[str]) -> Dict[str, Set[str]]:
+        """Compare current enabled pipes with a set of old pipe IDs."""
+        current_enabled = set(self.get_enabled_pipes().keys())
+        added = current_enabled - old_pipe_ids
+        removed = old_pipe_ids - current_enabled
+        return {"added": added, "removed": removed}
     
     def resolve_pipe_refs(self, pipe_id: str) -> Optional[Dict[str, Any]]:
         """Resolve a pipe's receiver and view references."""

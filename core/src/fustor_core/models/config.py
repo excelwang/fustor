@@ -2,6 +2,22 @@ from pydantic import BaseModel, Field, field_validator, RootModel, ConfigDict
 from typing import List, Optional, Union, TypeAlias, Dict, Any
 from fustor_core.exceptions import ConfigError, NotFoundError
 
+# --- Global Configurations ---
+
+class GlobalLoggingConfig(BaseModel):
+    level: str = Field(default="INFO", description="日志级别")
+    format: str = Field(default="%(asctime)s - %(name)s - %(levelname)s - %(message)s", description="日志格式")
+
+class FusionGlobalConfig(BaseModel):
+    host: str = Field(default="0.0.0.0", description="管理 API 监听地址")
+    port: int = Field(default=8101, description="管理 API 监听端口")
+
+class AgentGlobalConfig(BaseModel):
+    # Agent typically doesn't listen on a port anymore, but we can store other globals
+    heartbeat_interval_sec: float = Field(default=10.0, description="默认心跳间隔")
+
+# --- Credentials and Mappings ---
+
 class PasswdCredential(BaseModel):
     model_config = ConfigDict(extra='forbid')
 
@@ -88,7 +104,6 @@ class PipeConfig(BaseModel):
     """
     source: str = Field(..., description="数据源的配置 ID")
     sender: str = Field(..., description="发送器的配置 ID")
-    disabled: bool = Field(default=False, description="是否禁用此配置")
     fields_mapping: List[FieldMapping] = Field(default_factory=list)
     # Consistency-related intervals (Section 7 of CONSISTENCY_DESIGN)
     audit_interval_sec: float = Field(default=600.0, ge=0, description="审计扫描间隔(秒)，0表示禁用，默认10分钟")
@@ -115,6 +130,10 @@ class AppConfig(BaseModel):
     Application configuration containing sources, senders, and pipes.
     """
     model_config = ConfigDict(populate_by_name=True)
+
+    logging: GlobalLoggingConfig = Field(default_factory=GlobalLoggingConfig)
+    fusion: FusionGlobalConfig = Field(default_factory=FusionGlobalConfig)
+    agent: AgentGlobalConfig = Field(default_factory=AgentGlobalConfig)
 
     sources: SourceConfigDict = Field(default_factory=SourceConfigDict)
     senders: SenderConfigDict = Field(default_factory=SenderConfigDict)
@@ -203,13 +222,17 @@ class AppConfig(BaseModel):
             raise NotFoundError(f"Pipe config with id '{id}' not found.")
         return self.get_pipes().pop(id)
 
-    def check_pipe_is_disabled(self, id: str) -> bool:
+    def check_pipe_is_active(self, id: str) -> bool:
+        """
+        检查 Pipe 是否处于活动状态。
+        由于 Pipe 是被动调起的，其活动状态取决于关联的组件：
+        1. Source 必须处于非禁用状态 (Agent 端标准)
+        2. Sender 必须处于非禁用状态
+        3. (在 Fusion 端) 如果存在关联 Views，则至少一个 View 必须启用 (此逻辑通常由驱动/管理器在运行时判断)
+        """
         config = self.get_pipe(id)
         if not config:
             raise NotFoundError(f"Pipe with id '{id}' not found.")
-        
-        if config.disabled:
-            return True
         
         source_config = self.sources.root.get(config.source)
         if not source_config:
@@ -219,5 +242,5 @@ class AppConfig(BaseModel):
         if not sender_config:
             raise NotFoundError(f"Dependency sender '{config.sender}' not found for pipe '{id}'.")
             
-        return source_config.disabled or sender_config.disabled
+        return not source_config.disabled and not sender_config.disabled
 

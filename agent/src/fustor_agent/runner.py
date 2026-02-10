@@ -29,8 +29,16 @@ async def run_agent(config_list: Optional[List[str]] = None):
         logger.info(f"Received signal {sig.name}, initiating shutdown...")
         stop_event.set()
 
+    def handle_reload(sig):
+        logger.info(f"Received signal {sig.name}, reloading configuration...")
+        asyncio.create_task(app.reload_config())
+
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda s=sig: handle_signal(s))
+    
+    # Try SIGHUP if available (Unix)
+    if hasattr(signal, 'SIGHUP'):
+        loop.add_signal_handler(signal.SIGHUP, lambda s=signal.SIGHUP: handle_reload(s))
 
     try:
         await app.startup()

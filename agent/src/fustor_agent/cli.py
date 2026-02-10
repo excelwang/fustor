@@ -75,6 +75,17 @@ def start(configs, daemon, verbose, no_console_log):
     )
     logger = logging.getLogger("fustor_agent")
 
+    # Override logging level from config if not verbose
+    if not verbose:
+        agent_config.ensure_loaded()
+        log_level = agent_config.logging.level
+        setup_logging(
+            log_file_path=AGENT_LOG_FILE,
+            base_logger_name="fustor_agent",
+            level=log_level.upper(),
+            console_output=(not no_console_log)
+        )
+
     if daemon:
         pid = _is_running()
         if pid:
@@ -177,62 +188,31 @@ def stop(configs):
             if os.path.exists(PID_FILE):
                 os.remove(PID_FILE)
     else:
-        # Hot-stop specific pipes via API
-        if not pid:
-            click.echo("Agent is not running. Cannot stop individual pipes.")
-            return
-        
-        import requests
-        for config in configs:
-            try:
-                response = requests.post(
-                    f"http://localhost:8103/api/v1/pipes/{config}/stop",
-                    timeout=10
-                )
-                if response.ok:
-                    click.echo(click.style(f"[{config}] ✓ Stopped", fg="green"))
-                else:
-                    detail = response.json().get("detail", "Unknown error")
-                    click.echo(click.style(f"[{config}] ✗ {detail}", fg="red"))
-            except requests.exceptions.ConnectionError:
-                click.echo(click.style("Cannot connect to Agent.", fg="red"))
-                break
-            except Exception as e:
-                click.echo(click.style(f"[{config}] ✗ {e}", fg="red"))
+        # Hot-stop specific pipes is deprecated via API
+        # User should use 'reload' after modifying config
+        click.echo("Individual pipe stopping via CLI is deprecated. Please modify config and use 'reload'.")
+        return
 
 
 @cli.command("list")
 def list_pipes():
-    """List all pipes and their status."""
-    pid = _is_running()
-    if not pid:
-        click.echo("Agent is not running.")
-        return
+    """List all pipes defined in configuration."""
+    agent_config.ensure_loaded()
+    pipes = agent_config.get_all_pipes()
     
-    import requests
-    try:
-        response = requests.get("http://localhost:8103/api/v1/pipes", timeout=10)
-        if response.ok:
-            pipes = response.json()
-            if not pipes:
-                click.echo("No pipes configured.")
-                return
-            
-            click.echo(f"{'ID':<30} {'STATUS':<15} {'SOURCE':<20}")
-            click.echo("-" * 65)
-            for p in pipes:
-                status_color = "green" if p.get("running") else "yellow"
-                click.echo(
-                    f"{p['id']:<30} "
-                    f"{click.style(p.get('state', 'UNKNOWN'), fg=status_color):<15} "
-                    f"{p.get('source', 'N/A'):<20}"
-                )
-        else:
-            click.echo(click.style(f"Error: {response.text}", fg="red"))
-    except requests.exceptions.ConnectionError:
-        click.echo(click.style("Cannot connect to Agent.", fg="red"))
-    except Exception as e:
-        click.echo(click.style(f"Error: {e}", fg="red"))
+    if not pipes:
+        click.echo("No pipes defined.")
+        return
+
+    click.echo(f"{'PIPE ID':<30} {'STATUS':<15} {'SOURCE':<20}")
+    click.echo("-" * 65)
+    
+    # We don't have real-time runtime status without API, 
+    # but we can show if they are 'enabled' by checking source status
+    for pid, pcfg in pipes.items():
+        source = agent_config.get_source(pcfg.source)
+        status = "ENABLED" if (source and not source.disabled) else "DISABLED"
+        click.echo(f"{pid:<30} {status:<15} {pcfg.source:<20}")
 
 
 @cli.command()
@@ -243,24 +223,37 @@ def status(pipe_id):
     
     if not pid:
         click.echo("Agent Status: " + click.style("STOPPED", fg="red"))
-        return
-    
-    click.echo("Agent Status: " + click.style(f"RUNNING (PID: {pid})", fg="green"))
+    else:
+        click.echo("Agent Status: " + click.style(f"RUNNING (PID: {pid})", fg="green"))
     
     if pipe_id:
-        import requests
-        try:
-            response = requests.get(
-                f"http://localhost:8103/api/v1/pipes/{pipe_id}",
-                timeout=10
-            )
-            if response.ok:
-                data = response.json()
-                click.echo(f"\nPipe: {pipe_id}")
-                click.echo(f"  State: {data.get('state', 'UNKNOWN')}")
-                click.echo(f"  Source: {data.get('source', 'N/A')}")
-                click.echo(f"  Sender: {data.get('sender', 'N/A')}")
-            else:
-                click.echo(click.style(f"Pipe '{pipe_id}' not found.", fg="yellow"))
-        except Exception as e:
-            click.echo(click.style(f"Error: {e}", fg="red"))
+        agent_config.ensure_loaded()
+        pipe = agent_config.get_pipe(pipe_id)
+        if not pipe:
+            click.echo(click.style(f"Pipe '{pipe_id}' not found.", fg="yellow"))
+            return
+            
+        click.echo(f"\nPipe ID: {pipe_id}")
+        click.echo(f"  Source: {pipe.source}")
+        click.echo(f"  Sender: {pipe.sender}")
+        source = agent_config.get_source(pipe.source)
+        click.echo(f"  Status: {'ENABLED' if (source and not source.disabled) else 'DISABLED'} (Config)")
+
+@cli.command()
+def reload():
+    """Reload configuration by sending SIGHUP to the daemon."""
+    if not PID_FILE.exists():
+        click.echo("Agent is not running.")
+        return
+    
+    try:
+        pid = int(PID_FILE.read_text().strip())
+        import os
+        import signal
+        os.kill(pid, signal.SIGHUP)
+        click.echo(click.style("✓ Reload signal sent (SIGHUP)", fg="green"))
+    except ProcessLookupError:
+        click.echo(click.style("✗ Process not found. Deleting stale PID file.", fg="red"))
+        PID_FILE.unlink()
+    except Exception as e:
+        click.echo(click.style(f"✗ Failed to reload: {e}", fg="red"))

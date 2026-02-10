@@ -88,7 +88,6 @@ class FSArbitrator:
             self.state.tombstone_list[path] = (logical_ts, physical_ts)
             self.logger.info(f"Tombstone CREATED for {path} (Logical: {logical_ts}, Physical: {physical_ts})")
             
-            self.logger.info(f"DEBUG_SUSPECT_POP: Removing {path} from suspect_list. Current keys: {list(self.state.suspect_list.keys())}")
             self.state.suspect_list.pop(path, None)
             alt_path = path[1:] if path.startswith('/') else '/' + path
             self.state.suspect_list.pop(alt_path, None)
