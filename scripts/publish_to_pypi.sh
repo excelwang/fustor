@@ -74,9 +74,8 @@ publish_package() {
         echo "[DRY-RUN] Would publish $package_name to PyPI."
     else
         echo "Uploading $package_name to PyPI..."
-        # We use --skip-existing to allow the script to be re-run if it fails midway
-        # without failing on already uploaded packages.
-        uv publish --skip-existing dist/*
+        # Use --check-url to avoid re-uploading existing versions
+        uv publish --check-url https://pypi.org/simple/ dist/*
     fi
 
     if [ $? -ne 0 ]; then
