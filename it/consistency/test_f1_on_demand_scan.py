@@ -65,12 +65,18 @@ class TestOnDemandScan:
         found = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=MEDIUM_TIMEOUT)
         assert found, "File should appear after forced on-demand scan"
         
-        # 5. 验证 agent_missing 标志为 False
+        # 5. 验证 agent_missing 标志被清除
+        print("[Test] Verifying agent_missing flag is cleared...")
         # 强制扫描产生的事件应该被视为由于同步产生的，会清除 agent_missing
-        flags = fusion_client.check_file_flags(test_file_rel)
-        assert flags.get("agent_missing") is False, f"Flag agent_missing should be False, got {flags}"
+        assert fusion_client.wait_for_flag(test_file_rel, "agent_missing", False, timeout=SHORT_TIMEOUT), \
+            f"Flag agent_missing should be False"
         
-        # 6. 白盒验证：检查 Agent 日志中是否有 On-Demand Scan 的记录
+        # 6. 验证 integrity_suspect 标志被清除 (因为是 REALTIME 且 atomic)
+        print("[Test] Verifying integrity_suspect flag is cleared...")
+        assert fusion_client.wait_for_flag(test_file_rel, "integrity_suspect", False, timeout=SHORT_TIMEOUT), \
+            f"Flag integrity_suspect should be False"
+        
+        # 7. 白盒验证：检查 Agent 日志中是否有 On-Demand Scan 的记录
         print("[Test] Verifying agent logs for on-demand scan record...")
         agent_log = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/agent.log"]).stdout
         assert "Executing on-demand scan" in agent_log, "Log should contain 'Executing on-demand scan'"
