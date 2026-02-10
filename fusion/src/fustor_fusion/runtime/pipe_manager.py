@@ -34,11 +34,7 @@ class PipeManager:
     
     def _get_pipe_lock(self, pipe_id: str) -> asyncio.Lock:
         """获取 per-pipe 锁（惰性创建）。"""
-        lock = self._pipe_locks.get(pipe_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._pipe_locks[pipe_id] = lock
-        return lock
+        return self._pipe_locks.setdefault(pipe_id, asyncio.Lock())
     
     async def initialize_pipes(self, config_list: Optional[List[str]] = None):
         """

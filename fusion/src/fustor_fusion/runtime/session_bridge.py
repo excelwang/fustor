@@ -75,6 +75,11 @@ class PipeSessionBridge:
         # Performance: Cache authoritative leader status per view
         # {view_id: set(session_id)}
         self._leader_cache: Dict[str, set] = {}
+        
+        # Heartbeat counter for periodic leader validation
+        # Every N heartbeats, verify cache against actual VSM state
+        self._heartbeat_count: Dict[str, int] = {}  # session_id -> count
+        self._LEADER_VERIFY_INTERVAL = 5  # Verify every N heartbeats
     
     async def create_session(
         self,
@@ -226,6 +231,17 @@ class PipeSessionBridge:
             from fustor_fusion.view_state_manager import view_state_manager
             
             is_known_leader = session_id in self._leader_cache.get(view_id, set())
+            
+            # Periodic validation: every N heartbeats, verify cache against actual state
+            count = self._heartbeat_count.get(session_id, 0) + 1
+            self._heartbeat_count[session_id] = count
+            if is_known_leader and count % self._LEADER_VERIFY_INTERVAL == 0:
+                actual_leader = await view_state_manager.is_leader(view_id, session_id)
+                if not actual_leader:
+                    logger.info(f"Leader cache stale for {session_id} on view {view_id}, clearing")
+                    self._leader_cache.get(view_id, set()).discard(session_id)
+                    is_known_leader = False
+            
             if not is_known_leader:
                 is_leader = await view_state_manager.try_become_leader(view_id, session_id)
                 if is_leader:
@@ -274,6 +290,9 @@ class PipeSessionBridge:
             # Remove from leader cache
             if view_id in self._leader_cache and session_id in self._leader_cache[view_id]:
                 self._leader_cache[view_id].discard(session_id)
+            
+            # Remove heartbeat counter
+            self._heartbeat_count.pop(session_id, None)
         
         # Close in Pipe
         await self._pipe.on_session_closed(session_id)

@@ -23,11 +23,7 @@ class SessionManager:
 
     def _get_view_lock(self, view_id: str) -> asyncio.Lock:
         """获取 per-view 锁（惰性创建）。"""
-        lock = self._view_locks.get(view_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._view_locks[view_id] = lock
-        return lock
+        return self._view_locks.setdefault(view_id, asyncio.Lock())
 
     async def create_session_entry(self, view_id: str, session_id: str, 
                                  task_id: Optional[str] = None, 

@@ -48,7 +48,15 @@ class AsyncRWLock:
     
     @asynccontextmanager
     async def write_lock(self):
-        """Acquire exclusive write access."""
+        """Acquire exclusive write access.
+        
+        TODO: This implementation relies on asyncio's single-threaded execution model.
+        Between releasing self._lock after setting _writer_waiting and acquiring it again
+        after _can_write fires, no other coroutine can interleave because asyncio schedules
+        Event.wait() wakeups deterministically (one at a time). If migrating to multi-threaded
+        asyncio (e.g., uvloop + thread pool executors), this must be redesigned to use a
+        proper mutex or asyncio.Condition to prevent two writers from entering simultaneously.
+        """
         async with self._lock:
             self._writer_waiting = True
             self._can_read.clear()            # Block new readers

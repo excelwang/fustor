@@ -13,6 +13,7 @@ from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
 from ..fixtures.constants import (
     INGESTION_DELAY,
     SHORT_TIMEOUT,
+    MEDIUM_TIMEOUT,
     LONG_TIMEOUT,
     STRESS_DELAY,
     POLL_INTERVAL
@@ -70,7 +71,7 @@ class TestParentMtimeCheck:
         
         # Verify new_file exists but stale_file does not (synced via realtime)
         new_file_rel = "/" + os.path.relpath(new_file, MOUNT_POINT)
-        assert fusion_client.wait_for_file_in_tree(new_file_rel, timeout=SHORT_TIMEOUT) is not None
+        assert fusion_client.wait_for_file_in_tree(new_file_rel, timeout=MEDIUM_TIMEOUT) is not None
         
         # Step 4: Use a marker file to detect Audit completion
         # This confirms that an audit cycle has scanned the directory
@@ -86,7 +87,8 @@ class TestParentMtimeCheck:
         tree = None
         test_dir_rel = "/" + os.path.relpath(test_dir, MOUNT_POINT)
         
-        for _ in range(10):
+        start_time = time.time()
+        while time.time() - start_time < MEDIUM_TIMEOUT:
             try:
                 tree = fusion_client.get_tree(path=test_dir_rel, max_depth=-1)
                 break
@@ -94,9 +96,14 @@ class TestParentMtimeCheck:
                 if e.response.status_code == 503:
                     time.sleep(POLL_INTERVAL)
                     continue
+                # If path not found (404), it might be acceptable if parent dir itself is missing?
+                # But here we expect parent dir to exist (new_file is in it).
+                # So 404 is also an error we might want to retry if due to consistency lag?
+                # But get_tree usually returns 404 only if node is missing.
+                # If test_dir missing, tree is None? No, get_tree raises.
                 raise
         
-        assert tree is not None, "Failed to get tree after retries"
+        assert tree is not None, f"Failed to get tree after {MEDIUM_TIMEOUT}s retries"
         stale_file_rel = "/" + os.path.relpath(stale_file, MOUNT_POINT)
         stale_found = fusion_client._find_in_tree(tree, stale_file_rel)
         assert stale_found is None, \

@@ -42,14 +42,8 @@ class ViewStateManager:
         self._view_locks: Dict[str, asyncio.Lock] = {}
     
     def _get_view_lock(self, view_id: str) -> asyncio.Lock:
-        """获取 per-view 锁（惰性创建）。
-        在 asyncio 单线程模型下，dict.__setitem__ 在同一 event loop tick 内不会竞争。
-        """
-        lock = self._view_locks.get(view_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._view_locks[view_id] = lock
-        return lock
+        """获取 per-view 锁（惰性创建）。"""
+        return self._view_locks.setdefault(view_id, asyncio.Lock())
 
     def _ensure_state(self, view_id_str: str) -> ViewState:
         """确保 ViewState 存在（内部使用，调用者应持有 per-view 锁）。"""
