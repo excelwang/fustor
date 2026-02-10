@@ -109,17 +109,16 @@ receivers:
   http-receiver:
     driver: http
     bind_host: "0.0.0.0"
-    port: 8102
+    port: 18888                # Agent 推送数据的端口
     api_keys:
       - key: "fs-sync-secret-key"    # 鉴权密钥
-        pipe_id: "fs-sync-pipe"      # 绑定管道 ID，对应下方的 pipes 定义
+        pipe_id: "fs-sync-pipe"      # 绑定管道 ID
 
 # 2. 配置 FS 视图 (View-FS)
 views:
   backup-view:
     driver: fs
     driver_params:
-      # 内存中判定文件是否为“活跃写入中”的时间窗口（秒）
       hot_file_threshold: 60.0
 
 # 3. 绑定管道 (Pipe)
@@ -128,7 +127,7 @@ pipes:
     receiver: http-receiver  # 数据入口
     views:                   # 数据出口
       - backup-view
-    enabled: true
+    session_timeout_seconds: 3600  # 会话超时时间 (也控制 Agent 掉线后的清除时间)
 ```
 
 ---
@@ -151,17 +150,14 @@ pipes:
 sources:
   nfs-source-a:
     driver: fs
-    config:
-      # [Key Point] Server A 的本地挂载路径
-      uri: "/mnt/data/project_share"
-      recursive: true
+    uri: "/mnt/data/project_share"
 
 senders:
   fusion-main:
     driver: fusion
-    endpoint: "http://<FUSION_IP>:8102"
+    uri: "http://<FUSION_IP>:18888"  # 指向 Fusion 的 Receiver 端口
     credential:
-      api_key: "fs-sync-secret-key"
+      key: "fs-sync-secret-key"
 
 pipes:
   sync-job:
@@ -172,6 +168,7 @@ pipes:
     heartbeat_interval_sec: 5.0
     audit_interval_sec: 600.0
     sentinel_interval_sec: 60.0
+    session_timeout_seconds: 3600
 ```
 
 ### 服务器 B (Agent-2)
@@ -184,18 +181,14 @@ pipes:
 sources:
   nfs-source-b:
     driver: fs
-    config:
-      # [Key Point] Server B 的本地挂载路径，完全独立于 A
-      # Agent 会自动将其转化为相对路径推送到 Fusion
-      uri: "/home/admin/mnt/share"
-      recursive: true
+    uri: "/home/admin/mnt/share"
 
 senders:
   fusion-main:
     driver: fusion
-    endpoint: "http://<FUSION_IP>:8102"
+    uri: "http://<FUSION_IP>:18888"
     credential:
-      api_key: "fs-sync-secret-key"
+      key: "fs-sync-secret-key"
 
 pipes:
   sync-job:
@@ -206,6 +199,7 @@ pipes:
     heartbeat_interval_sec: 5.0
     audit_interval_sec: 600.0
     sentinel_interval_sec: 60.0
+    session_timeout_seconds: 3600
 ```
 
 ---
@@ -246,7 +240,7 @@ fustor-agent start -D
 
     ```bash
     curl -H "X-API-Key: fs-sync-secret-key" \
-         "http://localhost:8102/api/v1/views/backup-view/tree?path=/"
+         "http://localhost:8101/api/v1/views/backup-view/tree?path=/"
     ```
 
     **预期的 JSON 响应**:

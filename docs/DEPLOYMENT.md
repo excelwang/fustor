@@ -60,13 +60,12 @@ receivers:
   http-main:
     driver: http          # 使用 HTTP 协议
     bind_host: "0.0.0.0"
-    port: 8102
+    port: 18888           # 数据端口
     api_keys:
       - key: "my-secure-api-key"   # 设置鉴权 Key，Agent 端需匹配
         pipe_id: "research-sync"   # 绑定到指定的 Pipe ID
 
 # 2. 定义视图 (View): 定义数据的存储和展示方式
-# 注意：FS 视图是纯内存索引，不持久化存储文件实体
 views:
   research-view:
     driver: fs            # 使用文件系统驱动
@@ -79,7 +78,7 @@ pipes:
     receiver: http-main   # 引用上面的 receiver id
     views:                # 数据写入哪些视图
       - research-view
-    enabled: true
+    session_timeout_seconds: 3600
 ```
 
 ### 3.3 启动
@@ -118,17 +117,15 @@ uv pip install fustor-agent fustor-source-fs fustor-sender-http
 sources:
   local-research-files:
     driver: fs            # 使用文件系统驱动
-    config:
-      uri: "/mnt/data/source_files"  # 需要监控的本地绝对路径
-      recursive: true
+    uri: "/mnt/data/source_files"  # 需要监控的本地绝对路径
 
 # 2. 定义发送器 (Sender): 推送目标
 senders:
   fusion-server:
     driver: fusion        # 使用 Fusion HTTP 驱动
-    endpoint: "http://<FUSION_SERVER_IP>:8102"  # Fusion 服务器地址
+    uri: "http://<FUSION_SERVER_IP>:18888"  # Fusion 服务器接收端口
     credential:
-      api_key: "my-secure-api-key" # 必须与 Fusion 配置中的 key 一致
+      key: "my-secure-api-key" # 必须与 Fusion 配置中的 key 一致
 
 # 3. 定义同步管道 (Pipe): 绑定源与目标
 pipes:
@@ -140,6 +137,7 @@ pipes:
     heartbeat_interval_sec: 10.0
     audit_interval_sec: 600.0     # 每10分钟进行一次全量审计
     sentinel_interval_sec: 120.0  # 哨兵扫描间隔
+    session_timeout_seconds: 3600
 ```
 
 ### 4.3 启动
@@ -158,19 +156,19 @@ fustor-agent start -D
 
 1.  **检查进程**: 确保 `fustor-fusion` 和 `fustor-agent` 进程均已存活。
 2.  **检查日志**:
-    *   Fusion 日志应显示 `[INFO] Receiver http-main listening on 0.0.0.0:8102`。
+    *   Fusion 日志应显示 `[INFO] HTTP Receiver recv_http_18888 started on 0.0.0.0:18888`。
     *   Agent 日志应显示 `[INFO] Session created: ...`，表明已成功连接到 Fusion。
 3.  **功能验证**:
     *   在 Agent 监控的目录 (`/mnt/data/source_files`) 下创建一个新文件 `test.txt`。
     *   查询 Fusion 的视图 API (假设在本地验证)：
         ```bash
         curl -H "X-API-Key: my-secure-api-key" \
-             "http://localhost:8102/api/v1/views/research-view/tree?path=/"
+             "http://localhost:8101/api/v1/views/research-view/tree?path=/"
         ```
     *   你应该能看到 JSON 响应中包含了 `test.txt` 的信息。
 
 ## 6. 常见问题排查
 
-*   **Agent 报错 "Connection refused"**: 检查 `senders` 配置中的 IP 和端口是否正确，确保 Fusion 服务器防火墙允许 8102 端口通过。
+*   **Agent 报错 "Connection refused"**: 检查 `senders` 配置中的 IP 和端口是否正确，确保 Fusion 服务器防火墙允许 18888 端口（Receiver 端口）通过。
 *   **Fusion 报错 "Unauthorized"**: 检查 Agent 的 `api_key` 是否与 Fusion `receivers` 配置中的 Key 完全一致。
 *   **配置未生效**: 确保配置文件扩展名为 `.yaml` 且位于正确的 `*-config/` 子目录下。重启服务以加载新配置。

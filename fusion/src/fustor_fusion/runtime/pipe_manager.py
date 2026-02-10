@@ -55,7 +55,11 @@ class PipeManager:
                     p_cfg = resolved['pipe']
                     r_cfg = resolved['receiver']
                     
-                    if not p_cfg.enabled:
+                    if p_cfg.disabled:
+                        continue
+                    
+                    if r_cfg.disabled:
+                        logger.warning(f"Pipe '{p_id}' skipped because receiver '{p_cfg.receiver}' is disabled")
                         continue
 
                     # 1. Initialize/Get Receiver (Shared by port for HTTP)
@@ -91,6 +95,9 @@ class PipeManager:
                     view_handlers = []
                     # resolved['views'] is a dict {view_id: ViewConfig}
                     for v_id, v_cfg in resolved['views'].items():
+                        if v_cfg.disabled:
+                            logger.warning(f"View '{v_id}' for pipe '{p_id}' is disabled, skipping")
+                            continue
                         try:
                             # The view manager handles the actual FS/View logic based on group_id (view_id)
                             # We might need to pass v_cfg details to view manager if it's dynamic

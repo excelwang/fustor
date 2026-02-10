@@ -23,6 +23,7 @@ Example:
       ingest-main:
         receiver: http-main
         views: [fs-group-1]
+        disabled: false
 """
 import yaml
 import logging
@@ -47,19 +48,21 @@ class ReceiverConfig(BaseModel):
     bind_host: str = "0.0.0.0"
     port: int = 8102
     api_keys: List[APIKeyConfig] = []
+    disabled: bool = False
 
 
 class ViewConfig(BaseModel):
     """Configuration for a view."""
     driver: str = "fs"
     driver_params: Dict[str, Any] = {}
+    disabled: bool = False
 
 
 class FusionPipeConfig(BaseModel):
     """Configuration for a single Fusion pipe."""
     receiver: str  # Reference to receiver ID
     views: List[str] = []  # References to view IDs
-    enabled: bool = True
+    disabled: bool = False
     allow_concurrent_push: bool = True
     session_timeout_seconds: int = 3600
 
@@ -185,7 +188,7 @@ class FusionConfigLoader:
     def get_enabled_pipes(self) -> Dict[str, FusionPipeConfig]:
         """Get all enabled pipes."""
         self.ensure_loaded()
-        return {k: v for k, v in self._pipes.items() if v.enabled}
+        return {k: v for k, v in self._pipes.items() if not v.disabled}
     
     def resolve_pipe_refs(self, pipe_id: str) -> Optional[Dict[str, Any]]:
         """Resolve a pipe's receiver and view references."""

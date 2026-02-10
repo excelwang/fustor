@@ -57,7 +57,7 @@ class SourceConfig(BaseModel):
     max_queue_size: int = Field(default=1000, gt=0, description="事件缓冲区的最大尺寸")
     max_retries: int = Field(default=10, gt=0, description="驱动在读取事件失败时的最大重试次数")
     retry_delay_sec: int = Field(default=5, gt=0, description="驱动重试前的等待秒数")
-    disabled: bool = Field(default=True, description="是否禁用此配置")
+    disabled: bool = Field(default=False, description="是否禁用此配置")
     validation_error: Optional[str] = Field(None, exclude=True)
     driver_params: Dict[str, Any] = Field(default_factory=dict, description="驱动专属参数")
 
@@ -74,7 +74,7 @@ class SenderConfig(BaseModel):
     max_retries: int = Field(default=10, gt=0, description="推送失败时的最大重试次数")
     retry_delay_sec: int = Field(default=5, gt=0, description="推送重试前的等待秒数")
     timeout_sec: int = Field(default=30, gt=0, description="网络请求超时(秒)")
-    disabled: bool = Field(default=True, description="是否禁用此配置")
+    disabled: bool = Field(default=False, description="是否禁用此配置")
     validation_error: Optional[str] = Field(None, exclude=True)
     driver_params: Dict[str, Any] = Field(default_factory=dict, description="驱动专属参数")
     model_config = ConfigDict(extra='ignore')
@@ -88,7 +88,7 @@ class PipeConfig(BaseModel):
     """
     source: str = Field(..., description="数据源的配置 ID")
     sender: str = Field(..., description="发送器的配置 ID")
-    disabled: bool = Field(default=True, description="是否禁用此配置")
+    disabled: bool = Field(default=False, description="是否禁用此配置")
     fields_mapping: List[FieldMapping] = Field(default_factory=list)
     # Consistency-related intervals (Section 7 of CONSISTENCY_DESIGN)
     audit_interval_sec: float = Field(default=600.0, ge=0, description="审计扫描间隔(秒)，0表示禁用，默认10分钟")
