@@ -40,12 +40,13 @@ async def get_view_driver_instance(view_id: str, lookup_key: str):
 def make_readiness_checker(view_name: str) -> Callable:
     """Creates a dependency that ensures a view is ready before allowing API access."""
     async def check_ready(view_id: str = Depends(get_view_id_from_api_key)):
-        manager = await get_cached_view_manager(view_id)
+        # Note: view_id from auth is actually pipe_id. Use view_name (from closure) for lookups.
+        manager = await get_cached_view_manager(view_name)
         driver_instance = manager.driver_instances.get(view_name)
         
         # 1. Check Global Snapshot Status (via ViewStateManager)
         from ..view_state_manager import view_state_manager
-        is_snapshot_complete = await view_state_manager.is_snapshot_complete(view_id)
+        is_snapshot_complete = await view_state_manager.is_snapshot_complete(view_name)
         if not is_snapshot_complete:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -130,7 +131,7 @@ def setup_view_routers():
                 try:
                     # Create context-bound driver instance getter and readiness checker
                     async def get_driver_instance_for_instance(view_id: str, _key=view_name):
-                        return await get_view_driver_instance(view_id, _key)
+                        return await get_view_driver_instance(_key, _key)
                     
                     checker = make_readiness_checker(view_name)
                     
@@ -155,7 +156,7 @@ def setup_view_routers():
             try:
                 # Fallback uses driver name as the lookup key
                 async def get_driver_instance_fallback(view_id: str, _key=name):
-                    return await get_view_driver_instance(view_id, _key)
+                    return await get_view_driver_instance(_key, _key)
                 
                 checker = make_readiness_checker(name)
                 
