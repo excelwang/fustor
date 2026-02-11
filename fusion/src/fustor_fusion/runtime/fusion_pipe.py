@@ -476,6 +476,16 @@ class FusionPipe(Pipe):
             else:
                 logger.warning(f"Pipe {self.id}: Received snapshot end signal from non-leader session {session_id}. Ignored.")
 
+        # Handle audit completion signal
+        if source_type == "audit" and is_end:
+            logger.info(f"Pipe {self.id}: Received AUDIT end signal from session {session_id}. Triggering audit finalization.")
+            for handler in self._view_handlers.values():
+                if hasattr(handler, 'handle_audit_end'):
+                    try:
+                        await handler.handle_audit_end()
+                    except Exception as e:
+                        logger.error(f"Pipe {self.id}: Error in handle_audit_end for {handler}: {e}")
+
         return {
             "success": True,
             "count": len(processed_events),

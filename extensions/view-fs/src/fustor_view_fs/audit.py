@@ -30,7 +30,7 @@ class AuditManager:
         
         self.logger.info(f"Audit started at local time {now}. late_start={is_late_start}")
 
-    async def handle_end(self):
+    async def handle_end(self): #todo ask only end message?
         """Finalizes audit cycle, performs Tombstone cleanup and Missing Item Detection.
         
         Per Spec §4.2 and §7: Tombstone TTL cleanup happens at Audit-End.
@@ -56,32 +56,39 @@ class AuditManager:
         # 2. Optimized Missing File Detection
         missing_count = 0
         if self.state.audit_seen_paths:
+            self.logger.info(f"AuditManager: Processing {len(self.state.audit_seen_paths)} seen paths for missing item detection.")
             paths_to_delete = []
             for path in self.state.audit_seen_paths:
                 dir_node = self.state.directory_path_map.get(path)
                 
                 # If directory was NOT skipped (i.e. it was fully scanned)
-                if dir_node and not getattr(dir_node, 'audit_skipped', False):
-                    for child_name, child_node in list(dir_node.children.items()):
-                        if child_node.path not in self.state.audit_seen_paths:
-                            # Child not seen in audit, let's check if it should be deleted
-                            
-                            # Skip if protected by a newer Tombstone
-                            if child_node.path in self.state.tombstone_list:
-                                continue
-                            
-                            # Stale Evidence Protection: If node updated AFTER audit started, don't delete
-                            if child_node.last_updated_at > self.state.last_audit_start:
-                                self.logger.debug(f"Preserving node from audit deletion (Stale): {child_node.path}")
+                if dir_node:
+                    audit_skipped = getattr(dir_node, 'audit_skipped', False)
+                    self.logger.debug(f"Checking directory {path}: audit_skipped={audit_skipped}, children={len(dir_node.children)}")
+                    if not audit_skipped:
+                        for child_name, child_node in list(dir_node.children.items()):
+                            if child_node.path in self.state.audit_seen_paths:
                                 continue
 
-                            # Safety: Never delete the root directory
-                            if child_node.path == "/":
-                                self.logger.warning("Safety: Audit attempt to delete root directory blocked.")
-                                continue
-
-                            self.logger.info(f"Blind-spot deletion detected: {child_node.path} (Parent: {path})")
-                            paths_to_delete.append(child_node.path)
+                            if child_node.path not in self.state.audit_seen_paths:
+                                # Child not seen in audit, let's check if it should be deleted
+                                
+                                # Skip if protected by a newer Tombstone
+                                if child_node.path in self.state.tombstone_list:
+                                    continue
+                                
+                                # Stale Evidence Protection: If node updated AFTER audit started, don't delete
+                                if child_node.last_updated_at > self.state.last_audit_start:
+                                    self.logger.debug(f"Preserving node from audit deletion (Stale): {child_node.path}")
+                                    continue
+    
+                                # Safety: Never delete the root directory
+                                if child_node.path == "/":
+                                    self.logger.warning("Safety: Audit attempt to delete root directory blocked.")
+                                    continue
+    
+                                self.logger.info(f"Blind-spot deletion detected: {child_node.path} (Parent: {path})")
+                                paths_to_delete.append(child_node.path)
             
             try:
                 missing_count = len(paths_to_delete)

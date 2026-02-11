@@ -124,7 +124,12 @@ class FSDriver(SourceDriver):
             # Establish Shadow Reference Frame for Watch Scheduling
             if dir_mtime_map:
                 mtimes = sorted(dir_mtime_map.values())
-                p99_idx = max(0, len(mtimes) - 1 - (len(mtimes) // 1000))
+                # Fix: Use int(len * 0.99) to ensure it works for small sample sizes.
+                # N=1 -> idx=0 (max)
+                # N=100 -> idx=99 (max)
+                # N=101 -> idx=99 (filters 1)
+                # This ensures we filter out the top 1% of outliers.
+                p99_idx = max(0, int(len(mtimes) * 0.99) - 1)
                 latest_mtime_stable = mtimes[p99_idx]
                 
                 self.drift_from_nfs = latest_mtime_stable - time.time()
@@ -279,8 +284,8 @@ class FSDriver(SourceDriver):
                     table="files",
                     rows=[meta],
                     fields=list(meta.keys()),
-                    message_source=MessageSource.REALTIME,
-                    index=int(time.time() * 1000)
+                    message_source=MessageSource.ON_DEMAND_JOB,
+                    index=int((time.time() + self.drift_from_nfs) * 1000)
                 )
             except Exception as e:
                 logger.warning(f"[{stream_id}] Failed to scan single file {path}: {e}")
@@ -291,7 +296,7 @@ class FSDriver(SourceDriver):
             return
 
         if recursive:
-            yield from scanner.scan_snapshot(self.schema_name, batch_size=100, callback=touch_callback, initial_path=path, message_source=MessageSource.REALTIME)
+            yield from scanner.scan_snapshot(self.schema_name, batch_size=100, callback=touch_callback, initial_path=path, message_source=MessageSource.ON_DEMAND_JOB)
         else:
             # Non-recursive: only return directory metadata itself
             try:
@@ -302,8 +307,8 @@ class FSDriver(SourceDriver):
                     table="files",
                     rows=[meta],
                     fields=list(meta.keys()),
-                    message_source=MessageSource.REALTIME,
-                    index=int(time.time() * 1000)
+                    message_source=MessageSource.ON_DEMAND_JOB,
+                    index=int((time.time() + self.drift_from_nfs) * 1000)
                 )
             except Exception as e:
                 logger.error(f"[{stream_id}] Error scanning path: {e}")

@@ -52,10 +52,17 @@ class TestRealtimeRemovesSuspect:
             "New file from Audit should be marked as suspect"
         
         # Step 2: Trigger Realtime Update from Agent A
-        docker_manager.modify_file_in_container(
+        # Step 2: Trigger Realtime Update from Agent A using Python to ensure clear events
+        # echo >> file might be too fast or optimized by shell/overlayfs
+        python_cmd = (
+            f"with open('{test_file}', 'a') as f: "
+            f"    f.write('additional content via realtime\\n'); "
+            f"    f.flush(); "
+            f"    import os; os.fsync(f.fileno())"
+        )
+        docker_manager.exec_in_container(
             CONTAINER_CLIENT_A,
-            test_file,
-            append_content="additional content via realtime"
+            ["python3", "-c", python_cmd]
         )
         # Step 3: Wait for Realtime event to be processed and flag cleared
         assert fusion_client.wait_for_flag(test_file_rel, "integrity_suspect", False, timeout=MEDIUM_TIMEOUT), \

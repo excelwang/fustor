@@ -281,7 +281,7 @@ class FSScanner:
                 table="files",
                 rows=row_buffer,
                 fields=list(row_buffer[0].keys()),
-                message_source=MessageSource.SNAPSHOT,
+                message_source=message_source,
                 index=snapshot_time
             )
 

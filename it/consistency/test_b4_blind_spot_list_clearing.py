@@ -72,6 +72,13 @@ class TestBlindSpotListPersistence:
         # Trigger next Audit
         marker_2 = f"{MOUNT_POINT}/audit_marker_b4_p2_{int(time.time())}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, marker_2, content="marker")
+        time.sleep(1.0) # wait for write to propagate
+        from ..conftest import CONTAINER_CLIENT_A
+        try:
+             docker_manager.sync_nfs_cache(CONTAINER_CLIENT_A)
+        except Exception:
+             pass 
+             
         time.sleep(SESSION_VANISH_TIMEOUT) # Increased NFS cache wait
         marker_2_rel = "/" + os.path.relpath(marker_2, MOUNT_POINT)
         assert fusion_client.wait_for_file_in_tree(marker_2_rel, timeout=AUDIT_WAIT_TIMEOUT)

@@ -121,12 +121,20 @@ class TreeManager:
             while stack:
                 curr = stack.pop()
                 self.state.directory_path_map.pop(curr.path, None)
+                self.state.suspect_list.pop(curr.path, None)
+
+                if hasattr(self.state, 'blind_spot_additions'):
+                    self.state.blind_spot_additions.discard(curr.path)
+
                 for child in curr.children.values():
                     if isinstance(child, DirectoryNode):
                         stack.append(child)
                     else:
                         self.state.file_path_map.pop(child.path, None)
-            
+                        self.state.suspect_list.pop(child.path, None) # Clear suspect list
+                        if hasattr(self.state, 'blind_spot_additions'):
+                            self.state.blind_spot_additions.discard(child.path)
+
             # Remove from parent's children
             parent = self.state.directory_path_map.get(parent_path)
             if parent:
@@ -134,6 +142,10 @@ class TreeManager:
 
         elif file_node:
             self.state.file_path_map.pop(path, None)
+            self.state.suspect_list.pop(path, None) # Clear suspect list
+            if hasattr(self.state, 'blind_spot_additions'):
+                self.state.blind_spot_additions.discard(path)
+
             parent = self.state.directory_path_map.get(parent_path)
             if parent:
                 parent.children.pop(name, None)

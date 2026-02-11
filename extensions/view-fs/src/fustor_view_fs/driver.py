@@ -132,6 +132,7 @@ class FSViewDriver(FSViewBase):
             is_skew_stable = abs(old_mtime - (mtime + skew)) < 1e-6
             
             is_mtime_stable = False
+
             if is_skew_stable and not is_raw_stable:
                 self.logger.info(f"Sentinel reported SKEWED mtime for {path} (Reported: {mtime}, Skew: {skew}, Corrected: {mtime+skew}). Treating as STABLE.")
                 # Normalize the mtime to the stable one for updates
