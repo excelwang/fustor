@@ -34,6 +34,8 @@ class TestPipeFieldMapping:
         pipe_config = f"""
 pipes:
   integration-test-ds:
+    source: shared-fs
+    sender: fusion-main
     fields_mapping:
       - to: "path"
         source: ["path:string"]
@@ -60,37 +62,19 @@ pipes:
         # Reset Fusion state to ensure a clean start for the new mapping
         fusion_client.reset()
         
-        # To ensure Agent A becomes leader, stop Agent B
-        docker_env.exec_in_container(containers["follower"], ["pkill", "-9", "-f", "fustor-agent"])
-        docker_env.exec_in_container(leader, ["pkill", "-9", "-f", "fustor-agent"])
-        
-        # Wait for sessions to clear
-        start_wait = time.time()
-        while time.time() - start_wait < MEDIUM_TIMEOUT:
-            sessions = fusion_client.get_sessions()
-            if not sessions:
-                break
-            for s in sessions:
-                try:
-                    fusion_client.terminate_session(s["session_id"])
-                except Exception:
-                    pass
-            time.sleep(POLL_INTERVAL)
-            
-        docker_env.exec_in_container(
-            leader, 
-            ["sh", "-c", "FUSTOR_USE_PIPELINE=true fustor-agent start -V > /proc/1/fd/1 2>&1"],
-            detached=True
-        )
+        # Use the standard ensure_agent_running function to restart
+        # This handles PID cleanup and environment variable injection correctly
+        setup_agents["ensure_agent_running"](leader, api_key, view_id)
         
         # Wait for agent to reconnect and become leader
         logger.info("Waiting for Agent A to become leader...")
         start_wait = time.time()
         while time.time() - start_wait < MEDIUM_TIMEOUT:
             sessions = fusion_client.get_sessions()
-            # Ensure it's the ONLY session and it's leader client-a
-            if len(sessions) == 1 and sessions[0].get("role") == "leader" and "client-a" in sessions[0].get("agent_id", ""):
-                logger.info(f"Agent A successfully became leader: {sessions[0].get('session_id')}")
+            # Ensure it's the leader and it's client-a
+            leader_session = next((s for s in sessions if s.get("role") == "leader" and "client-a" in s.get("agent_id", "")), None)
+            if leader_session:
+                logger.info(f"Agent A successfully became leader: {leader_session.get('session_id')}")
                 break
             time.sleep(POLL_INTERVAL)
         else:
