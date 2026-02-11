@@ -92,14 +92,10 @@ Fustor 将后端存储（如 NFS, S3, Local FS）抽象为 **View (视图)**。�
 - **查询任务详情**: `GET /api/v1/views/{view_id}/jobs/{job_id}`
   - 获取任务进度百分比及各 Agent 的完成情况。
 
-### 4.3 视图动态管理 (Management)
-对于高级管理员，Fusion 提供了动态启动/停止视图的能力，无需重启服务。
+### 4.3 视图驱动状态 (Management)
+对于高级管理员，Fusion 提供了查询当前加载的视图驱动状态的接口。
 
-- **列出所有运行中的视图**: `GET /api/v1/management/views`
-- **动态启动视图**: `POST /api/v1/management/views/{view_id}/start`
-  - 需确保 `fusion-config/` 下已有对应的 YAML 配置文件。
-- **停止视图**: `POST /api/v1/management/views/{view_id}/stop`
-  - 停止后对应的索引将被卸载，Agent 会话也会同步终止。
+- **列出所有运行中的视图驱动**: `GET /api/v1/management/views`
 
 ---
 
