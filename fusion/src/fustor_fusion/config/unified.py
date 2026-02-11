@@ -55,6 +55,7 @@ class ViewConfig(BaseModel):
     """Configuration for a view."""
     driver: str = "fs"
     driver_params: Dict[str, Any] = {}
+    api_keys: List[str] = [] # Dedicated keys for querying this view
     disabled: bool = False
 
 

@@ -120,6 +120,10 @@ class FSScanner:
         # Define the worker logic
         def pre_scan_worker(root, work_q, res_q, stop_ev):
             try:
+                if not os.path.exists(root):
+                    logger.warning(f"[fs] Pre-scan: root path '{root}' does not exist.")
+                    return
+
                 latest_mtime = os.path.getmtime(root)
                 local_subdirs = []
                 local_total = 1
@@ -172,7 +176,8 @@ class FSScanner:
         callback: Optional function to call for touching watched paths (path, mtime).
         """
         if not os.path.exists(self.root) or not os.access(self.root, os.R_OK):
-            raise OSError(f"Snapshot failed: Root path '{self.root}' is missing or inaccessible")
+            logger.warning(f"[fs] Snapshot skipped: Root path '{self.root}' is missing or inaccessible")
+            return
 
         snapshot_time = int((time.time() + self.drift_from_nfs) * 1000)
         
@@ -279,6 +284,10 @@ class FSScanner:
         """
         Executes audit scan.
         """
+        if not os.path.exists(self.root) or not os.access(self.root, os.R_OK):
+            logger.warning(f"[fs] Audit skipped: Root path '{self.root}' is missing or inaccessible")
+            return
+
         audit_time = int((time.time() + self.drift_from_nfs) * 1000)
         
         def audit_worker(item, work_q, res_q, stop_ev):

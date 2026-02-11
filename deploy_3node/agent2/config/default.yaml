@@ -8,7 +8,7 @@ senders:
     driver: fusion
     uri: "http://fusion-node:28888"
     credential:
-      key: "agent-1-key"
+      key: "agent-2-key"
 
 pipes:
   sync-job:

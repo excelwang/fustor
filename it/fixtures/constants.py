@@ -22,6 +22,7 @@ FUSION_ENDPOINT = f"http://{FUSION_HOST}:{FUSION_PORT}"
 RECEIVER_ENDPOINT = f"http://{FUSION_HOST}:{RECEIVER_PORT}"
 TEST_VIEW_ID = "integration-test-ds"
 TEST_API_KEY = "test-api-key-123"
+TEST_QUERY_KEY = "test-query-key-456"
 
 # --- Time Scaling Logic ---
 # Defaults to 1.0 (no scaling). Set FUSTOR_TIME_SCALE < 1.0 to speed up tests.

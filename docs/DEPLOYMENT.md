@@ -44,10 +44,8 @@ Fusion 是 Fustor 的核心存储引擎，负责接收数据并提供查询视�
 ### 3.1 安装
 
 ```bash
-# 使用 pip 安装 Fusion 主程序及标准文件系统视图驱动
-pip install fustor-fusion fustor-view-fs
-# 或者使用 uv
-uv pip install fustor-fusion fustor-view-fs
+# 使用 uv 安装 Fusion 主程序及标准组件
+uv pip install fustor-fusion fustor-view-fs fustor-receiver-http
 ```
 
 ### 3.2 配置
@@ -69,7 +67,7 @@ receivers:
     bind_host: "0.0.0.0"
     port: 18888           # 数据接收端口 (不同于管理端口)
     api_keys:
-      - key: "my-secure-api-key"   # 设置鉴权 Key，Agent 端需匹配
+      - key: "agent-ingestion-key" # 用于推送数据的 Key
         pipe_id: "research-sync"   # 绑定到指定的 Pipe ID
 
 # 2. 定义视图 (View): 定义数据的存储和展示方式
@@ -79,6 +77,8 @@ views:
     disabled: false
     driver_params:
       hot_file_threshold: 60.0 # 热文件判定阈值(秒)
+    api_keys:
+      - "view-query-key"  # 专门用于查询该视图的 Key (v0.8.9+)
 
 # 3. 定义管道 (Pipe): 将接收器与视图绑定
 pipes:
@@ -114,8 +114,6 @@ Agent 部署在数据源所在的机器上，负责监听数据源变更并推�
 
 ```bash
 # 安装 Agent 主程序及相关驱动
-pip install fustor-agent fustor-source-fs fustor-sender-http
-# 或者使用 uv
 uv pip install fustor-agent fustor-source-fs fustor-sender-http
 ```
 
@@ -148,7 +146,7 @@ senders:
     batch_size: 1000      # 批量发送条数
     timeout_sec: 30       # 请求超时时间
     credential:
-      key: "my-secure-api-key" # 必须与 Fusion 配置中的 key 一致
+      key: "agent-ingestion-key" # 必须与 Fusion receivers 配置中的 key 一致
 
 # 3. 定义同步管道 (Pipe): 绑定源与目标
 pipes:
@@ -226,6 +224,7 @@ fustor-agent reload
 | `driver` | string | `"fs"` | 视图驱动类型 |
 | `disabled` | bool | `false` | 是否禁用此视图 |
 | `driver_params` | dict | `{}` | 驱动特定参数 |
+| `api_keys` | list[str] | `[]` | **(v0.8.9+)** 专门用于查询该视图的 API Key 列表 |
 
 **Fusion 管道 (`pipes` 节)**
 | 参数名 | 类型 | 默认值 | 说明 |

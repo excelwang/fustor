@@ -11,21 +11,28 @@ async def get_view_id_from_api_key(x_api_key: str = Header(..., alias="X-API-Key
     """
     Validates API key and returns pipe/view ID.
     
-    Uses receivers-config.yaml for API key management.
+    Priority:
+    1. Dedicated View Query Keys (views.[id].api_keys)
+    2. Receiver/Agent Push Keys (kept for backward compatibility, but limited to associated views)
     """
     logger.debug(f"Received X-API-Key: {x_api_key[:8]}...")
     
     try:
-        # Validate against all configured receivers
-        # Unified config doesn't have a single validate_api_key, we need to check all receivers
+        # 1. Check Dedicated View Query Keys
+        views = fusion_config.get_all_views()
+        for v_id, v_config in views.items():
+            if x_api_key in v_config.api_keys:
+                logger.debug(f"Authorized via dedicated view key for: {v_id}")
+                return str(v_id)
+
+        # 2. Fallback: Validate against all configured receivers
         receivers = fusion_config.get_all_receivers()
-        
         for r_id, r_config in receivers.items():
             for api_key_config in r_config.api_keys:
                 if api_key_config.key == x_api_key:
-                    # Found matching key
+                    # Found matching agent key
                     view_id = api_key_config.pipe_id
-                    logger.debug(f"Resolved view_id: {view_id}")
+                    logger.debug(f"Authorized via receiver key for: {view_id}")
                     return str(view_id)
         
         # If loop finishes without return

@@ -4,17 +4,25 @@ receivers:
     host: 0.0.0.0
     port: 28888
     api_keys:
-      - key: "fs-sync-secret-key"
-        pipe_id: "fs-sync-pipe"
+      - key: "agent-1-key"
+        pipe_id: "pipe-1"
+      - key: "agent-2-key"
+        pipe_id: "pipe-2"
 
 views:
-  backup-view:
+  fs-sync-pipe:
     driver: fs
     driver_params:
       hot_file_threshold: 60.0
+    api_keys:
+      - "view-query-key"
 
 pipes:
-  fs-sync-pipe:
+  pipe-1:
     receiver: http-receiver
     views:
-      - backup-view
+      - fs-sync-pipe
+  pipe-2:
+    receiver: http-receiver
+    views:
+      - fs-sync-pipe

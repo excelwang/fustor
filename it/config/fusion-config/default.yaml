@@ -23,6 +23,8 @@ views:
   ${TEST_VIEW_ID}:
     driver: fs
     disabled: false
+    api_keys:
+      - "test-query-key-456" # Dedicated query key
     driver_params:
       hot_file_threshold: 60.0
       consistency:

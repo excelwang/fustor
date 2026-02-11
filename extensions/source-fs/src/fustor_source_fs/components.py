@@ -146,7 +146,13 @@ class _WatchManager:
                 if self.inotify is None:
                     # Directly use the low-level Inotify class
                     # We watch the root path non-recursively just to initialize the instance.
-                    self.inotify = Inotify(safe_path_encode(self.root_path), recursive=False)
+                    try:
+                        self.inotify = Inotify(safe_path_encode(self.root_path), recursive=False)
+                        logger.info(f"[fs] Inotify successfully initialized for root path '{self.root_path}'.")
+                    except (FileNotFoundError, OSError):
+                        logger.warning(f"[fs] Root path '{self.root_path}' does not exist or is inaccessible. Inotify will be initialized lazily when path appears.")
+                        return # Stay in None state
+
 
     def _get_current_time(self) -> float:
         """Returns the current time (Agent physical time)."""
@@ -156,7 +162,18 @@ class _WatchManager:
         """
         The core event loop that reads from inotify and dispatches events.
         """
+        last_warn_time = 0
         while not self._stop_event.is_set():
+            if self.inotify is None:
+                self._ensure_inotify()
+                if self.inotify is None:
+                    now = time.time()
+                    if now - last_warn_time > 60: # Log every minute
+                        logger.warning(f"[fs] Inotify not yet initialized for {self.root_path}. Waiting for directory...")
+                        last_warn_time = now
+                    time.sleep(1.0) # Wait for directory to appear
+                    continue
+
             try:
                 raw_events = self.inotify.read_events()
                 if raw_events:
@@ -290,8 +307,11 @@ class _WatchManager:
 
             try:
                 self._ensure_inotify()
-                self.inotify.add_watch(safe_path_encode(path))
-                self.lru_cache.put(path, WatchEntry(timestamp_to_use))
+                if self.inotify:
+                    self.inotify.add_watch(safe_path_encode(path))
+                    self.lru_cache.put(path, WatchEntry(timestamp_to_use))
+                else:
+                    logger.debug(f"[fs] Postponing watch for {path} as inotify is not yet ready.")
             except OSError as e:
                 # Catch ENOENT (2) - File not found, likely deleted before we could watch it
                 # Catch ENOTDIR (20) - Not a directory (can happen if a file replaced a dir)
@@ -344,7 +364,8 @@ class _WatchManager:
             paths_to_remove_from_lru = [p for p in list(self.lru_cache.cache.keys()) if p == path or p.startswith(path + os.sep)]
             for p in paths_to_remove_from_lru:
                 try:
-                    self.inotify.remove_watch(safe_path_encode(p))
+                    if self.inotify:
+                        self.inotify.remove_watch(safe_path_encode(p))
                 except (KeyError, OSError) as e:
                     logger.warning(f"Error removing watch during recursive unschedule for {p}: {e}")
                 self.lru_cache.remove(p)
@@ -378,11 +399,12 @@ class _WatchManager:
                 self._ensure_inotify()
                 
                 # Re-add existing watches from LRU cache if we had to recreate inotify
-                for path in self.lru_cache.cache.keys():
-                    try:
-                        self.inotify.add_watch(safe_path_encode(path))
-                    except OSError as e:
-                        logger.warning(f"Failed to re-add watch for {path}: {e}")
+                if self.inotify:
+                    for path in self.lru_cache.cache.keys():
+                        try:
+                            self.inotify.add_watch(safe_path_encode(path))
+                        except OSError as e:
+                            logger.warning(f"Failed to re-add watch for {path}: {e}")
 
             self._stop_event.clear()
             self.inotify_thread = threading.Thread(target=self._event_processing_loop, daemon=True)
@@ -396,7 +418,8 @@ class _WatchManager:
             # We don't join here to avoid potential deadlock with the event processing loop 
             # if it's waiting for a lock we're holding.
             # The daemon status ensures it will be cleaned up if the main process exits.
-        self.inotify.close()  # This will interrupt the blocking read_events() call
-        if self.inotify_thread.is_alive():
+        if self.inotify:
+            self.inotify.close()  # This will interrupt the blocking read_events() call
+        if self.inotify_thread and self.inotify_thread.is_alive():
             self.inotify_thread.join(timeout=5.0)
         logger.info("WatchManager: Inotify event thread stopped.")

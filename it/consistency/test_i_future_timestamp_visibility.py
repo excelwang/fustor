@@ -77,7 +77,7 @@ async def test_future_timestamp_visibility(
     
     # Create file with future timestamp
     # Note: touch -t uses [[CC]YY]MMDDhhmm[.ss]
-    containers.exec_in_container("fustor-nfs-client-c", ["touch", "-t", future_time_str, test_path])
+    containers.exec_in_container("fustor-nfs-client-a", ["touch", "-t", future_time_str, test_path])
     
     # 2. Wait for ingestion reliably
     logger.info("Step 2: Waiting for ingestion...")

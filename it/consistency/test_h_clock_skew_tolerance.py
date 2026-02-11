@@ -23,7 +23,9 @@ from ..fixtures.constants import (
     CONTAINER_FUSION,
     CONTAINER_CLIENT_A,
     CONTAINER_CLIENT_B,
-    CONTAINER_CLIENT_C
+    CONTAINER_CLIENT_B,
+    CONTAINER_CLIENT_C,
+    MEDIUM_TIMEOUT
 )
 
 logger = logging.getLogger("fustor_test")
