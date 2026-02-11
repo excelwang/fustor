@@ -92,7 +92,8 @@ class RecursiveScanner:
                 worker_func(item, self._work_queue, self._results_queue, self._stop_event)
             except Exception as e:
                 self._error_count += 1
-                logger.exception(f"Scanner worker encountered an unhandled error on item '{item}': {e}. Skipping item.")
+                logger.warning(f"Scanner worker skipped item '{item}': {e}")
+                # logger.exception(f"Scanner worker encountered an unhandled error on item '{item}': {e}. Skipping item.")
             finally:
                 with self._map_lock:
                     self._pending_dirs -= 1
@@ -150,7 +151,7 @@ class FSScanner:
                                 st = entry.stat(follow_symlinks=False)
                                 latest_mtime = max(latest_mtime, st.st_mtime)
                         except Exception as e:
-                            logger.warning(f"[fs] Error scanning entry '{entry.path}': {e}. Skipping entry.")
+                            logger.warning(f"[fs] Skipped scanning entry '{entry.path}': {e}")
 
                 # Yield results instead of updating shared state directly
                 res_q.put({
@@ -161,7 +162,7 @@ class FSScanner:
                 })
                 
             except Exception as e:
-                logger.error(f"[fs] Failed to scan directory '{root}': {e}")
+                logger.warning(f"[fs] Skipped directory '{root}' in pre-scan: {e}")
                 # Re-raise to ensure error_count is incremented by RecursiveScanner
                 raise
 
@@ -234,7 +235,7 @@ class FSScanner:
                                     ))
                                     local_batch = []
                         except Exception as e:
-                            logger.warning(f"[fs] Error statting entry '{entry.path}' during snapshot: {e}. Skipping.")
+                            logger.warning(f"[fs] Skipped entry '{entry.path}' during snapshot: {e}")
                 
                 if local_batch:
                     res_q.put(UpdateEvent(
@@ -251,7 +252,7 @@ class FSScanner:
                     callback(root, latest_mtime_in_subtree - self.drift_from_nfs)
 
             except Exception as e:
-                logger.error(f"[fs] Failed to process directory '{root}' during snapshot: {e}")
+                logger.warning(f"[fs] Skipped directory '{root}' during snapshot: {e}")
                 # Re-raise to ensure error_count is incremented by RecursiveScanner
                 raise
 
@@ -371,7 +372,7 @@ class FSScanner:
                     work_q.put((sd, root))
 
             except Exception as e:
-                logger.error(f"[fs] Failed to process directory '{root}' during audit: {e}")
+                logger.warning(f"[fs] Skipped directory '{root}' during audit: {e}")
 
         for result in self.engine.scan_parallel(audit_worker, initial_item=(initial_path if initial_path else self.root, None)):
             yield result

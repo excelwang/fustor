@@ -24,8 +24,9 @@ from .config.unified import fusion_config
 
 # Define standard directories and file names for fusion
 HOME_FUSTOR_DIR = get_fustor_home_dir()
+LOG_DIR = os.path.join(HOME_FUSTOR_DIR, "logs")
 FUSION_PID_FILE = os.path.join(HOME_FUSTOR_DIR, "fusion.pid")
-FUSION_LOG_FILE = os.path.join(HOME_FUSTOR_DIR, "fusion.log")
+FUSION_LOG_FILE = os.path.join(LOG_DIR, "fusion.log")
 
 
 def _is_running():
@@ -124,6 +125,7 @@ def start(configs, reload, port, host, daemon, verbose, no_console_log):
 
     try:
         os.makedirs(HOME_FUSTOR_DIR, exist_ok=True)
+        os.makedirs(LOG_DIR, exist_ok=True)
         with open(FUSION_PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
 

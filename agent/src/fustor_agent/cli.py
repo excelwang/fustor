@@ -22,7 +22,8 @@ from .config.unified import agent_config
 
 # Define common paths
 HOME_FUSTOR_DIR = get_fustor_home_dir()
-AGENT_LOG_FILE = os.path.join(HOME_FUSTOR_DIR, "agent.log")
+LOG_DIR = os.path.join(HOME_FUSTOR_DIR, "logs")
+AGENT_LOG_FILE = os.path.join(LOG_DIR, "agent.log")
 PID_FILE = os.path.join(HOME_FUSTOR_DIR, "agent.pid")
 
 
@@ -133,6 +134,7 @@ def start(configs, daemon, verbose, no_console_log):
 
     try:
         os.makedirs(HOME_FUSTOR_DIR, exist_ok=True)
+        os.makedirs(LOG_DIR, exist_ok=True)
         with open(PID_FILE, 'w') as f:
             f.write(str(os.getpid()))
 

@@ -7,6 +7,7 @@ from fustor_core.exceptions import ConfigError, NotFoundError
 class GlobalLoggingConfig(BaseModel):
     level: str = Field(default="INFO", description="日志级别")
     format: str = Field(default="%(asctime)s - %(name)s - %(levelname)s - %(message)s", description="日志格式")
+    dir: Optional[str] = Field(default=None, description="日志目录，默认为 $FUSTOR_HOME/logs")
 
     @model_validator(mode='before')
     @classmethod
@@ -18,7 +19,7 @@ class GlobalLoggingConfig(BaseModel):
 class FusionGlobalConfig(BaseModel):
     host: str = Field(default="0.0.0.0", description="管理 API 监听地址")
     port: int = Field(default=8101, description="管理 API 监听端口")
-    session_cleanup_interval: float = Field(default=60.0, description="会话清理间隔(秒)")
+    session_cleanup_interval: float = Field(default=5.0, description="会话清理间隔(秒)")
 
 
 
