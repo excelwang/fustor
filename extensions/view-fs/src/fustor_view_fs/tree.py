@@ -18,6 +18,8 @@ class TreeManager:
 
     async def update_node(self, payload: Dict[str, Any], path: str):
         """Update or create a node in the tree based on event payload."""
+        if not path.startswith('/'):
+            path = '/' + path
         path = os.path.normpath(path).rstrip('/') if path != '/' else '/'
         parent_path = os.path.normpath(os.path.dirname(path))
         name = os.path.basename(path)
@@ -93,6 +95,12 @@ class TreeManager:
     async def delete_node(self, path: str):
         """Recursively remove a node from the tree maps and parent children."""
         path = os.path.normpath(path).rstrip('/') if path != '/' else '/'
+        
+        # Safety: Never delete the root directory
+        if path == '/':
+            self.logger.warning("Safety check: attempt to delete root directory blocked.")
+            return
+
         parent_path = os.path.normpath(os.path.dirname(path))
         name = os.path.basename(path)
 

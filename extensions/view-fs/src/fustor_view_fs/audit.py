@@ -75,7 +75,12 @@ class AuditManager:
                                 self.logger.debug(f"Preserving node from audit deletion (Stale): {child_node.path}")
                                 continue
 
-                            self.logger.info(f"Blind-spot deletion detected: {child_node.path}")
+                            # Safety: Never delete the root directory
+                            if child_node.path == "/":
+                                self.logger.warning("Safety: Audit attempt to delete root directory blocked.")
+                                continue
+
+                            self.logger.info(f"Blind-spot deletion detected: {child_node.path} (Parent: {path})")
                             paths_to_delete.append(child_node.path)
             
             try:

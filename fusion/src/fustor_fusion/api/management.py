@@ -154,3 +154,26 @@ async def list_views():
         result[v_group_id] = list(vm.driver_instances.keys())
     
     return {"running_views": result}
+
+
+@router.get("/finds")
+async def list_finds():
+    """List all realtime find jobs."""
+    from ..core.session_manager import session_manager
+    return {"finds": session_manager.get_find_jobs()}
+
+
+@router.get("/finds/{find_id}")
+async def get_find_status(find_id: str):
+    """Get status of a specific find job."""
+    from ..core.session_manager import session_manager
+    jobs = session_manager.get_find_jobs()
+    job = next((j for j in jobs if j["find_id"] == find_id), None)
+    
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Find job '{find_id}' not found"
+        )
+    
+    return job

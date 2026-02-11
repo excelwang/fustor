@@ -292,6 +292,9 @@ class FSArbitrator:
 
     def _normalize_path(self, raw_path: str) -> str:
         if not raw_path: return ""
+        # Ensure leading slash
+        if not raw_path.startswith('/'):
+            raw_path = '/' + raw_path
         return os.path.normpath(raw_path).rstrip('/') if raw_path != '/' else '/'
 
     def _get_message_source(self, event: Any) -> MessageSource:

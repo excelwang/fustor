@@ -91,7 +91,8 @@ class Sender(ABC):
         self, 
         events: List[EventBase], 
         source_type: str = "message",
-        is_end: bool = False
+        is_end: bool = False,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Send a batch of events to Fusion.
@@ -101,6 +102,7 @@ class Sender(ABC):
             events: List of events to send
             source_type: Type of events ('message', 'snapshot', 'audit')
             is_end: Whether this is the last batch for this source_type
+            metadata: Optional additional metadata
             
         Returns:
             Response from receiver
@@ -109,7 +111,7 @@ class Sender(ABC):
         tags = {"sender_id": self.id, "source_type": source_type}
         
         try:
-            result = await self._send_events_impl(events, source_type, is_end)
+            result = await self._send_events_impl(events, source_type, is_end, metadata)
             
             # Record success metrics
             duration_ms = (time.perf_counter() - start_time) * 1000
@@ -128,7 +130,8 @@ class Sender(ABC):
         self, 
         events: List[EventBase], 
         source_type: str,
-        is_end: bool
+        is_end: bool,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Actual implementation of sending events.

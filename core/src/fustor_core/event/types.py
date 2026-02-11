@@ -19,7 +19,9 @@ class MessageSource(str, Enum):
     - REALTIME: Events from real-time monitoring (e.g., inotify, CDC)
     - SNAPSHOT: Events from initial full scan
     - AUDIT: Events from periodic consistency check
+    - ON_DEMAND_FIND: Data found via on-demand user scan
     """
     REALTIME = "realtime"
     SNAPSHOT = "snapshot"
     AUDIT = "audit"
+    ON_DEMAND_FIND = "on_demand_find"

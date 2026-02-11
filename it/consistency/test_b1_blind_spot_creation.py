@@ -40,6 +40,11 @@ class TestBlindSpotFileCreation:
             content="created from blind spot"
         )
         
+        # Step 1.1: Create a trigger file to ensure directory mtime change is noticed
+        # This prevents Smart Audit from skipping the scan if it already scanned the dir recently.
+        trigger_file = f"{MOUNT_POINT}/audit_trigger_{int(time.time()*1000)}.txt"
+        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, trigger_file, "trigger")
+
         # Step 2: Check if file appeared
         time.sleep(INGESTION_DELAY)
         # Check presence first

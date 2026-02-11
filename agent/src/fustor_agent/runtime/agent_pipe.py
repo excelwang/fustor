@@ -856,21 +856,22 @@ class AgentPipe(Pipe):
         """Handle 'scan' command."""
         path = cmd.get("path")
         recursive = cmd.get("recursive", True)
+        find_id = cmd.get("find_id")
         
         if not path:
             return
 
-        logger.info(f"Pipe {self.id}: Executing on-demand scan for '{path}' (recursive={recursive})")
+        logger.info(f"Pipe {self.id}: Executing realtime find (id={find_id}) for '{path}' (recursive={recursive})")
         
         # Check if source handler supports scan_path
         if hasattr(self.source_handler, "scan_path"):
             # Execute scan in background to not block heartbeat/control loop
-            asyncio.create_task(self._run_on_demand_scan(path, recursive))
+            asyncio.create_task(self._run_on_demand_find(path, recursive, find_id))
         else:
-            logger.warning(f"Pipe {self.id}: Source handler does not support 'scan_path'")
+            logger.warning(f"Pipe {self.id}: Source handler does not support 'scan_path' for realtime find")
 
-    async def _run_on_demand_scan(self, path: str, recursive: bool):
-        """Run the actual scan task."""
+    async def _run_on_demand_find(self, path: str, recursive: bool, find_id: Optional[str] = None):
+        """Run the actual find task."""
         try:
             # We use the source handler to get events and push them immediately
             # This bypasses the normal message/snapshot loop but uses the same sender
@@ -885,22 +886,26 @@ class AgentPipe(Pipe):
                 batch.append(event)
                 if len(batch) >= self.batch_size:
                     mapped_batch = self.map_batch(batch)
-                    await self.sender_handler.send_batch(self.session_id, mapped_batch, {"phase": "message"})
+                    await self.sender_handler.send_batch(self.session_id, mapped_batch, {"phase": "on_demand_find"})
                     count += len(batch)
                     batch = []
             
             if batch:
                 mapped_batch = self.map_batch(batch)
-                await self.sender_handler.send_batch(self.session_id, mapped_batch, {"phase": "message"})
+                await self.sender_handler.send_batch(self.session_id, mapped_batch, {"phase": "on_demand_find"})
                 count += len(batch)
             
-            # Notify Fusion that scan is complete
+            # Notify Fusion that find is complete
+            metadata = {"scan_path": path}
+            if find_id:
+                metadata["find_id"] = find_id
+                
             await self.sender_handler.send_batch(self.session_id, [], {
-                "phase": "scan_complete",
-                "scan_path": path
+                "phase": "find_complete",
+                "metadata": metadata
             })
                 
-            logger.info(f"Pipe {self.id}: On-demand scan complete for '{path}'. Sent {count} events.")
+            logger.info(f"Pipe {self.id}: Realtime find complete (id={find_id}) for '{path}'. Sent {count} events.")
             
         except Exception as e:
             logger.error(f"Pipe {self.id}: On-demand scan failed: {e}")

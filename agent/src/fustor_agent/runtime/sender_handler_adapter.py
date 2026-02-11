@@ -158,6 +158,8 @@ class SenderHandlerAdapter(SenderHandler):
             "audit": "audit",
             "sentinel": "message",
             "message": "message",
+            "on_demand_find": "on_demand_find",
+            "find_complete": "on_demand_find",
         }
         source_type = source_type_map.get(phase, "message")
         
@@ -171,7 +173,8 @@ class SenderHandlerAdapter(SenderHandler):
             response = await self._sender.send_events(
                 events=events,
                 source_type=source_type,
-                is_end=is_final
+                is_end=is_final,
+                metadata=context.get("metadata")
             ) or {}
         else:
             raise AttributeError(f"Sender {self.id} has no 'send_events' method (legacy 'push' is no longer supported)")
