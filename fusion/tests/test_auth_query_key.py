@@ -1,6 +1,6 @@
 import pytest
 from fastapi import HTTPException
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, patch, AsyncMock
 from fustor_fusion.auth.dependencies import get_view_id_from_api_key
 from fustor_fusion.config.unified import ViewConfig, ReceiverConfig, APIKeyConfig
 
@@ -109,7 +109,6 @@ receivers:
 async def test_auth_dependency_integration():
     """验证 FastAPI 依赖项在实际请求中的工作情况（不使用 dependency_overrides）。"""
     from httpx import AsyncClient, ASGITransport
-    from unittest.mock import AsyncMock
     from fustor_fusion.main import app
     from fustor_fusion.config.unified import ViewConfig
     
