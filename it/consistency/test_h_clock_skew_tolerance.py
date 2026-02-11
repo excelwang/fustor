@@ -174,6 +174,41 @@ class TestClockSkewTolerance:
           4. 验证该文件被正确视为"新鲜" (Age ~ 0) 并标记为 Suspect (安全)。
         """
         import os.path
+        
+        # 0. Warmup: Anchor the Logical Clock with "Trusted" events from Agent C (Unskewed)
+        # The Logical Clock uses a statistical Mode algorithm. If it starts cold and sees ONLY Agent A (+2h),
+        # it will sync to +2h. We need to establish a "Majority" of correct events first.
+        logger.info("Step 0: Warning up Logical Clock with unskewed events...")
+        for i in range(5):
+            warmup_file = f"warmup_{int(time.time())}_{i}.txt"
+            docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["touch", f"{MOUNT_POINT}/{warmup_file}"])
+        
+        # Wait for ingestion of at least one to ensure clock is updated
+        # (Assuming Agent C events are picked up via Audit or if we had a trusted agent. 
+        # Client C has NO agent, so it relies on Audit from A/B.
+        # Wait... Audit from A/B will report C's files.
+        # If A audits, it reports stats.mtime = T (correct).
+        # A's local time is T+2h.
+        # If A audits, does it preserve mtime? Yes.
+        # So Arbitrator receives T.
+        # But A might send the event with `timestamp=T+2h`? No, Arbitrator uses payload.mtime.
+        # So Audit from A *should* provide correct mtime T.
+        
+        # To be safe, let's use Agent B (-1h) which is closer, or just rely on the fact that mtime on disk is correct.
+        # Ideally we want a Realtime Agent with correct time, but we only have A(+2h) and B(-1h).
+        # Fusion time is correct.
+        
+        # Let's use Agent B (-1h) to create some events? -1h is better than +2h.
+        # Or just trust that Audit of C's files will provide correct mtimes.
+        
+        # Actually, let's look at `test_clock_skew_environment_setup`.
+        # We need the mode to be centered around 0 skew.
+        # Skew = Ref(T) - Obs(mtime).
+        # If A audits C's file: mtime=T. Ref=T. Skew=0.
+        # So yes, Audit of C's files works!
+        
+        wait_for_audit()
+        
         # 1. Agent A (+2h) creates a file
         filename_a = f"stable_trigger_{int(time.time())}.txt"
         file_path_a = f"{MOUNT_POINT}/{filename_a}"
