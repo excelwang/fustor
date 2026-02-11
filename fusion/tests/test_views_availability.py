@@ -44,11 +44,10 @@ async def clean_state():
 @pytest.mark.asyncio
 async def test_api_unavailable_initially(client):
     """验证初始状态下接口返回 503"""
-    """验证初始状态下接口返回 503"""
     # Use generic status check endpoint
     response = await client.get("/api/v1/views/test/status_check")
     assert response.status_code == 503
-    assert "Initial snapshot sync phase in progress" in response.json()["detail"]
+    assert "No active leader session" in response.json()["detail"]
 
 @pytest.mark.asyncio
 async def test_api_unavailable_during_sync_phase(client):
@@ -58,6 +57,7 @@ async def test_api_unavailable_during_sync_phase(client):
     
     response = await client.get("/api/v1/views/test/status_check")
     assert response.status_code == 503
+    assert "Initial snapshot sync phase in progress" in response.json()["detail"]
 
 @pytest.mark.asyncio
 async def test_api_available_after_sync_phase_complete(client):
