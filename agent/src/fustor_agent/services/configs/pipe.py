@@ -36,7 +36,7 @@ class PipeConfigService(BaseConfigService[PipeConfig], PipeConfigServiceInterfac
     def _convert_yaml_to_model(self, y_cfg: AgentPipeConfig) -> PipeConfig:
         """Convert YAML configuration to internal model."""
         fields_mapping = [
-            FieldMapping(to=m.to, source=m.source, required=m.required)
+            FieldMapping(to=m["to"], source=m["source"], required=m.get("required", False))
             for m in y_cfg.fields_mapping
         ]
         return PipeConfig(

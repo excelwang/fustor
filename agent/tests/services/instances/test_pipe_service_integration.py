@@ -66,9 +66,20 @@ async def test_pipe_instance_service_integration(integration_configs, tmp_path: 
     app_config.add_pipe("test_pipe", pipe_config)
 
     from unittest.mock import patch
+    from fustor_agent.config.unified import AgentPipeConfig
+
     with patch("fustor_agent.services.configs.pipe.agent_config") as mock_agent_config:
-        mock_agent_config.get_all_pipes.return_value = {}
-        mock_agent_config.get_pipe.return_value = None
+        agent_pipe_config = AgentPipeConfig(
+            source="test_source",
+            sender="test_sender",
+            disabled=False,
+            fields_mapping=[
+                {"to": "target.file_path", "source": ["fs.files.file_path:0"]},
+                {"to": "target.size", "source": ["fs.files.size:0"]}
+            ]
+        )
+        mock_agent_config.get_all_pipes.return_value = {"test_pipe": agent_pipe_config}
+        mock_agent_config.get_pipe.return_value = agent_pipe_config
         
         # Initialize Services
         source_cfg_svc = SourceConfigService(app_config)
