@@ -7,7 +7,7 @@ from ..config.unified import fusion_config
 logger = logging.getLogger(__name__)
 
 
-async def get_view_id_from_api_key(x_api_key: str = Header(..., alias="X-API-Key")) -> str:
+async def get_view_id_from_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")) -> str:
     """
     Validates API key and returns pipe/view ID.
     
@@ -15,6 +15,12 @@ async def get_view_id_from_api_key(x_api_key: str = Header(..., alias="X-API-Key
     1. Dedicated View Query Keys (views.[id].api_keys)
     2. Receiver/Agent Push Keys (kept for backward compatibility, but limited to associated views)
     """
+    if not x_api_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="X-API-Key header is missing"
+        )
+
     logger.debug(f"Received X-API-Key: {x_api_key[:8]}...")
     
     try:

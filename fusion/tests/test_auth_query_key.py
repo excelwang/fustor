@@ -45,6 +45,15 @@ async def test_auth_invalid_key_raises_401():
         assert excinfo.value.detail == "Invalid or inactive X-API-Key"
 
 @pytest.mark.asyncio
+async def test_auth_missing_key_raises_401():
+    """验证缺失 API Key 会抛出 401 异常。"""
+    with pytest.raises(HTTPException) as excinfo:
+        await get_view_id_from_api_key(None)
+    
+    assert excinfo.value.status_code == 401
+    assert "missing" in excinfo.value.detail.lower()
+
+@pytest.mark.asyncio
 async def test_auth_multiple_views_dedicated_keys():
     """验证多个 View 拥有各自的 dedicated keys 时能正确路由。"""
     view1 = ViewConfig(api_keys=["key1"])
@@ -95,3 +104,39 @@ receivers:
     assert receiver is not None
     assert receiver.api_keys[0].key == "agent-key"
     assert receiver.api_keys[0].pipe_id == "view-1"
+
+@pytest.mark.asyncio
+async def test_auth_dependency_integration():
+    """验证 FastAPI 依赖项在实际请求中的工作情况（不使用 dependency_overrides）。"""
+    from httpx import AsyncClient, ASGITransport
+    from unittest.mock import AsyncMock
+    from fustor_fusion.main import app
+    from fustor_fusion.config.unified import ViewConfig
+    
+    # 模拟配置
+    mock_view = ViewConfig(api_keys=["integration-test-key"])
+    
+    with patch("fustor_fusion.auth.dependencies.fusion_config") as mock_config:
+        mock_config.get_all_views.return_value = {"test-view": mock_view}
+        mock_config.get_all_receivers.return_value = {}
+        
+        # 确保 dependency_overrides 是空的（或者至少没有覆盖我们要测试的那个）
+        app.dependency_overrides.clear()
+        
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            # 1. 无 Key 访问 -> 401
+            response = await client.get("/api/v1/pipe/session/")
+            assert response.status_code == 401
+            
+            # 2. 错误 Key 访问 -> 401
+            response = await client.get("/api/v1/pipe/session/", headers={"X-API-Key": "wrong-key"})
+            assert response.status_code == 401
+            
+            # 3. 正确 Key 访问
+            with patch("fustor_fusion.api.session.session_manager", new_callable=MagicMock) as mock_sm:
+                mock_sm.get_view_sessions = AsyncMock(return_value={})
+                
+                response = await client.get("/api/v1/pipe/session/", headers={"X-API-Key": "integration-test-key"})
+                # 认证通过且 mock 成功返回
+                assert response.status_code == 200
+                assert response.json()["view_id"] == "test-view"
