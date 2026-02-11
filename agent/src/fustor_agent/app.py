@@ -123,12 +123,19 @@ class App:
         source_id = pipe_cfg.source
         task_id = f"{self.agent_id}:{pipe_id}"
         
+        # Convert fields_mapping to FieldMapping objects for EventBus
+        from fustor_core.models.config import FieldMapping
+        field_mappings = [
+            FieldMapping(**m) if isinstance(m, dict) else m 
+            for m in pipe_cfg.fields_mapping
+        ]
+
         bus_runtime, _ = await self.event_bus_service.get_or_create_bus_for_subscriber(
             source_id=source_id,
             source_config=source_cfg,
             pipe_id=task_id,
             required_position=0,
-            fields_mapping=pipe_cfg.fields_mapping
+            fields_mapping=field_mappings
         )
         
         # 2. Create sender driver
