@@ -327,23 +327,24 @@ class FSDriver(SourceDriver):
         Verifies the existence and mtime of the given file paths.
         Used for Sentinel Sweep.
         """
-        def verify_single(path):
+        def verify_single(rel_path):
+            full_path = os.path.join(self.uri, rel_path.lstrip("/"))
             try:
-                stat_info = os.stat(path)
+                stat_info = os.stat(full_path)
                 return {
-                    "path": path,
+                    "path": rel_path,
                     "mtime": stat_info.st_mtime,
                     "size": stat_info.st_size,
                     "status": "exists"
                 }
             except FileNotFoundError:
                 return {
-                    "path": path,
+                    "path": rel_path,
                     "mtime": 0.0,
                     "status": "missing"
                 }
             except Exception as e:
-                logger.warning(f"[fs] Error verifying file {path}: {e}")
+                logger.warning(f"[fs] Error verifying file {full_path} (rel: {rel_path}): {e}")
                 return None
 
         # Process in parallel using the driver's executor
