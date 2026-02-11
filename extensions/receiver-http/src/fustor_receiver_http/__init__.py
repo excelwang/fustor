@@ -365,7 +365,7 @@ class HTTPReceiver(Receiver):
             """Ingest a batch of events."""
             
             # Handle job_complete or on_demand_job notification
-            if batch.source_type in ("job_complete", "on_demand_job", "find_complete", "on_demand_find", "scan_complete") and batch.metadata:
+            if batch.source_type in ("job_complete", "on_demand_job", "find_complete", "on_demand_jon", "scan_complete") and batch.metadata:
                 scan_path = batch.metadata.get("scan_path")
                 job_id = batch.metadata.get("job_id")
                 receiver.logger.info(f"Received job_complete for session {session_id}, path: {scan_path}, id: {job_id}")

@@ -34,7 +34,11 @@ class EchoDriver(Sender):
         self.logger.info(f"Echo Sender {self.id} ready.")
 
     async def _send_events_impl(
-        self, events: List[Any], source_type: str = "realtime", is_end: bool = False
+        self, 
+        events: List[Any], 
+        source_type: str = "realtime", 
+        is_end: bool = False,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Dict:
         """
         Implementation of echo sending.

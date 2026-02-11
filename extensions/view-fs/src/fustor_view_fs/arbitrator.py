@@ -37,12 +37,16 @@ class FSArbitrator:
         message_source = self._get_message_source(event)
         is_realtime = (message_source == MessageSource.REALTIME)
         is_audit = (message_source == MessageSource.AUDIT)
+        is_snapshot = (message_source == MessageSource.SNAPSHOT)
+        is_on_demand = (message_source == MessageSource.ON_DEMAND_JOB)
+        
+        # Compensation sources are those that find data already on disk (not live events)
+        is_compensation = is_audit or is_snapshot or is_on_demand
         
         if is_audit and self.state.last_audit_start is None:
             self.state.last_audit_start = time.time()
             self.logger.info(f"Auto-detected Audit Start at local time: {self.state.last_audit_start}")
 
-        
         rows_processed = 0
         for payload in event.rows:
             path = self._normalize_path(payload.get('path') or payload.get('file_path'))
@@ -51,17 +55,9 @@ class FSArbitrator:
             rows_processed += 1
             if rows_processed % 100 == 0: await asyncio.sleep(0)
 
-            # Update clock with row mtime. For deletions, mtime might be None.
             mtime = payload.get('modified_time')
-            
-            # Use Fusion Local Time for Clock Synchronization
-            # We explicitly ignore 'event.index' (Agent Time) here to avoid polluting
-            # the Global Skew with Agent-specific clock drifts (e.g. faketime).
-            # The LogicalClock will calculate skew = FusionTime - mtime.
-            # providing a simplified, consistent time base (Reception Time).
             self.state.logical_clock.update(mtime, can_sample_skew=is_realtime)
             
-            # Update latency (Lag) based on current watermark
             watermark = self.state.logical_clock.get_watermark()
             effective_mtime_for_lag = mtime if mtime is not None else watermark
             self.state.last_event_latency = max(0.0, (watermark - effective_mtime_for_lag) * 1000.0)
@@ -82,11 +78,9 @@ class FSArbitrator:
         if is_realtime:
             await self.tree_manager.delete_node(path)
             
-            # Watermark has been updated in the caller loop using logical_clock.update()
             logical_ts = self.state.logical_clock.get_watermark()
             physical_ts = time.time()
             self.state.tombstone_list[path] = (logical_ts, physical_ts)
-            self.logger.debug(f"Tombstone CREATED for {path} (Logical: {logical_ts}, Physical: {physical_ts})")
             
             self.state.suspect_list.pop(path, None)
             alt_path = path[1:] if path.startswith('/') else '/' + path
@@ -95,71 +89,51 @@ class FSArbitrator:
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
         else:
-            # Audit/Snapshot delete logic
+            # Audit/Snapshot/OnDemand find delete logic
             if path in self.state.tombstone_list:
-                self.logger.debug(f"AUDIT_DELETE_BLOCKED_BY_TOMBSTONE for {path}")
                 return
             
             existing = self.state.get_node(path)
             if existing and mtime is not None:
                 if existing.modified_time > mtime:
-                    self.logger.debug(f"AUDIT_DELETE_STALE: Ignoring delete for {path} (Memory: {existing.modified_time} > Audit: {mtime})")
                     return
 
             await self.tree_manager.delete_node(path)
             self.state.blind_spot_deletions.add(path)
             self.state.suspect_list.pop(path, None)
             self.state.blind_spot_additions.discard(path)
-        self.logger.debug(f"DELETE_DONE for {path}")
 
     async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float, watermark: float):
         # 1. Tombstone Protection
         if path in self.state.tombstone_list:
-            tombstone_ts, tombstone_physical_ts = self.state.tombstone_list[path] # Use logical timestamp for arbitration
-            is_realtime = (source == MessageSource.REALTIME)
+            tombstone_ts, tombstone_physical_ts = self.state.tombstone_list[path]
             
-            # Check if this is "New activity" after deletion
-            # 1. Logical Check (Primary)
             is_newer_logical = mtime > (tombstone_ts + self.TOMBSTONE_EPSILON)
-            
-            # 2. Physical Check (Fallback for Future-Skewed Tombstones)
-            # If the Leader is skewed into the future, its Tombstones will have future Logical TS.
-            # Local/Unskewed clients writing "Now" will have mtime < Tombstone Logical TS.
-            # To prevent blocking valid "Now" writes, we allow if mtime > Tombstone Physical Creation Time.
             is_newer_physical = False
             now = time.time()
-            # Only apply fallback if Tombstone is significantly in the future (Skewed)
             if not is_newer_logical and tombstone_ts > (now + 5.0):
                  is_newer_physical = mtime > (tombstone_physical_ts + self.TOMBSTONE_EPSILON)
-                 if is_newer_physical:
-                     self.logger.debug(f"TOMBSTONE_OVERRULED_BY_PHYSICAL: {path} (Mtime: {mtime} > PhyTS: {tombstone_physical_ts})")
 
             if is_newer_logical or is_newer_physical:
-                self.logger.debug(f"TOMBSTONE_CLEARED for {path}")
                 self.state.tombstone_list.pop(path, None)
             else:
-                self.logger.debug(f"TOMBSTONE_BLOCK: {path}")
                 return
 
         # 2. Smart Merge Arbitration
         existing = self.state.get_node(path)
-        is_audit = (source == MessageSource.AUDIT)
         is_realtime = (source == MessageSource.REALTIME)
+        is_compensation = (source in (MessageSource.AUDIT, MessageSource.SNAPSHOT, MessageSource.ON_DEMAND_JOB))
         
-        if not is_realtime:
-            # Snapshot/Audit arbitration
+        if is_compensation:
             if existing:
-                # If mtime is not newer, ignore (unless audit_skipped which we use for heartbeats/protection)
                 if not payload.get('audit_skipped') and existing.modified_time >= mtime:
                     return
             
-            if is_audit and existing is None:
-                # Rule 3: Parent Mtime Check
+            if source == MessageSource.AUDIT and existing is None:
                 parent_path = payload.get('parent_path')
                 parent_mtime_audit = payload.get('parent_mtime')
                 memory_parent = self.state.directory_path_map.get(parent_path)
                 if memory_parent and memory_parent.modified_time > (parent_mtime_audit or 0):
-                    # Memory parent is newer than what audit saw -> audit result is stale
                     return
 
         # Capture state before update for arbitration
@@ -171,85 +145,52 @@ class FSArbitrator:
         node = self.state.get_node(path)
         if not node: return
 
-        # Fix: Only Realtime events should update last_updated_at (Stale Evidence Protection)
-        # Snapshot/Audit events should NOT update this timestamp
         if not is_realtime and old_last_updated_at > 0:
             node.last_updated_at = old_last_updated_at
 
         # 3. Blind Spot and Suspect Management
         if is_realtime:
-            self.logger.debug(f"REALTIME_EVENT for {path}. Current blind_spot_additions: {path in self.state.blind_spot_additions}")
-            
-            # Atomic Write Check:
-            # If the event is NOT an atomic write (e.g. IN_MODIFY), we treat it as "Partial/Dirty".
-            # We MUST maintain the SUSPECT status to ensure it eventually gets verified if the stream stops.
             is_atomic = payload.get('is_atomic_write', True)
-            
             if is_atomic:
-                # Clean write (Close/Create) -> Clear suspect
                 self.state.suspect_list.pop(path, None)
-                node.old_suspect_state = False # Cleanup partial state
+                node.old_suspect_state = False
                 node.integrity_suspect = False
             else:
-                # Partial write (Modify) -> Mark/Renew suspect
-                # We set a TTL so that if we never get the Close event, Sentinel will check it.
                 expiry = time.monotonic() + self.hot_file_threshold
                 self.state.suspect_list[path] = (expiry, mtime)
                 heapq.heappush(self.state.suspect_heap, (expiry, path))
                 node.integrity_suspect = True
-                self.logger.debug(f"Partial Write (Suspect): {path}")
 
-            self.logger.debug(f"DEBUG_BLIND: Discarding {path} from blind_spots. Current additions: {list(self.state.blind_spot_additions)}")
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
-            # Defensive: try alternate path format (slash vs no-slash) to handle potential mismatch
-            alt_path = path[1:] if path.startswith('/') else '/' + path
-            self.state.blind_spot_deletions.discard(alt_path)
-            self.state.blind_spot_additions.discard(alt_path)
             node.known_by_agent = True
-            self.logger.debug(f"REALTIME_DONE for {path}. Now agent_known={node.known_by_agent}, missing={path in self.state.blind_spot_additions}")
         else:
-            # Manage Suspect List (Hot Data)
-            # Use Logical Watermark as the stable reference for data age calculations.
-            # This follows Spec §6.2 to avoid mixing raw physical clocks that may drift.
-            # However, to handle Clock Skew (where Leader is ahead), we also check Physical Age.
-            # We derive Physical Age by normalizing Watermark with the Global Skew.
-            # This avoids direct reliance on 'time.time()' in favor of the Synchronized Logical Clock.
+            # Compensation (Audit/Snapshot/OnDemand find)
             watermark = self.state.logical_clock.get_watermark()
             skew = self.state.logical_clock.get_skew()
             
             logical_age = watermark - mtime
-            # Physical Watermark = Watermark + Skew (since Skew = Ref - Observed => Ref = Observed + Skew)
-            # Actually Skew = Reference(Physical) - Observed(LogicalSource)
-            # So Physical = Logical + Skew.
             physical_age = (watermark + skew) - mtime
-            
             age = min(logical_age, physical_age)
             mtime_changed = (existing is None) or (abs(old_mtime - mtime) > self.FLOAT_EPSILON)
             
-            is_snapshot = (source == MessageSource.SNAPSHOT)
-            self.logger.debug(f"NON_REALTIME {path} source={source} mtime_changed={mtime_changed} age={age:.1f}")
-            
             if mtime_changed:
-                if is_audit or is_snapshot:
-                    self.state.blind_spot_additions.add(path)
-                    node.known_by_agent = False
+                self.state.blind_spot_additions.add(path)
+                node.known_by_agent = False
                 
                 if age < self.hot_file_threshold:
-                    if not getattr(node, 'known_by_agent', False) or (is_realtime and mtime_changed):
-                        node.integrity_suspect = True
-                        if path not in self.state.suspect_list:
-                            # Cap remaining_life to ensure even future-skewed files 
-                            # are checked periodically for stability (Spec §4.3)
-                            remaining_life = min(self.hot_file_threshold, self.hot_file_threshold - age)
-                            expiry = time.monotonic() + max(0.0, remaining_life)
-                            self.state.suspect_list[path] = (expiry, mtime)
-                            heapq.heappush(self.state.suspect_heap, (expiry, path))
+                    node.integrity_suspect = True
+                    if path not in self.state.suspect_list:
+                        # Cap remaining_life to ensure even future-skewed files 
+                        # are checked periodically for stability (Spec §4.3)
+                        remaining_life = min(self.hot_file_threshold, self.hot_file_threshold - age)
+                        expiry = time.monotonic() + max(0.0, remaining_life)
+                        self.state.suspect_list[path] = (expiry, mtime)
+                        heapq.heappush(self.state.suspect_heap, (expiry, path))
                 else:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)
             else:
-                # mtime unchanged, if cold, clear suspect
                 if age >= self.hot_file_threshold:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)

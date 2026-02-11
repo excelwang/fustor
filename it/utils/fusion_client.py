@@ -84,8 +84,7 @@ class FusionClient:
                     except Exception:
                         print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {resp.text}")
             raise e
-        data = resp.json()
-        return data["data"]
+        return resp.json()
 
     def search(self, pattern: str, path: str = "/") -> dict[str, Any]:
         """Search files by pattern."""

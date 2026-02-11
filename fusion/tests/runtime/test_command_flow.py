@@ -33,8 +33,9 @@ async def test_fusion_command_queue_flow():
     
     # 3. Trigger Scan
     path = "/data/logs"
-    success = await driver.trigger_realtime_scan(path, recursive=True)
+    success, job_id = await driver.trigger_realtime_scan(path, recursive=True)
     assert success is True
+    assert job_id is not None
     
     # 4. Verify Command is Queued (Internal state check)
     session = await global_sm.get_session_info(view_id, session_id)
@@ -43,9 +44,10 @@ async def test_fusion_command_queue_flow():
     cmd = session.pending_commands[0]
     assert cmd["type"] == "scan"
     assert cmd["path"] == path
+    assert cmd["job_id"] == job_id
     
     # 4.1 Verify Scan Pending Status
-    assert await global_sm.has_pending_scan(view_id, path) is True
+    assert await global_sm.has_pending_job(view_id, path) is True
     assert session.pending_scans is not None
     assert path in session.pending_scans
     
@@ -58,13 +60,13 @@ async def test_fusion_command_queue_flow():
     # 6. Verify Queue Cleared but Scan Pending remains
     session = await global_sm.get_session_info(view_id, session_id)
     assert len(session.pending_commands) == 0
-    assert await global_sm.has_pending_scan(view_id, path) is True
+    assert await global_sm.has_pending_job(view_id, path) is True
     
     # 7. Simulate Scan Completion
-    await global_sm.complete_scan(view_id, session_id, path)
+    await global_sm.complete_agent_job(view_id, session_id, path, job_id=job_id)
     
     # 8. Verify Scan Pending is Cleared
-    assert await global_sm.has_pending_scan(view_id, path) is False
+    assert await global_sm.has_pending_job(view_id, path) is False
     assert path not in session.pending_scans
     
     # 9. cleanup

@@ -86,18 +86,18 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep, chec
         if result is None:
             if job_pending:
                 return ORJSONResponse(content={
-                    "data": None,
                     "job_id": job_id,
                     "job_pending": True,
                     "message": "Path not found, but a find has been triggered and is pending."
                 }, status_code=200)
             return ORJSONResponse(content={"detail": "路径未找到或尚未同步"}, status_code=404)
         
-        return ORJSONResponse(content={
-            "data": result,
-            "job_id": job_id,
-            "job_pending": job_pending
-        })
+        # Merge job info into the result for a flat structure
+        if isinstance(result, dict):
+            result["job_id"] = job_id
+            result["job_pending"] = job_pending
+            
+        return ORJSONResponse(content=result)
 
     @router.get("/search", 
         summary="基于模式搜索文件",

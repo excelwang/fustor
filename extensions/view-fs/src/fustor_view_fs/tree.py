@@ -79,9 +79,9 @@ class TreeManager:
             parent_node = self.state.directory_path_map.get(parent_path)
             if parent_node:
                 parent_node.children[name] = node
-                self.logger.info(f"DEBUG: Attached file {name} to parent {parent_path}. Parent has {len(parent_node.children)} children.")
+                logger.info(f"ATTACHED {path} to parent {parent_path}. Parent children count: {len(parent_node.children)}")
             else:
-                self.logger.warning(f"DEBUG: Failed to attach file {name} to parent {parent_path} (Parent not found!)")
+                logger.warning(f"ORPHAN {path} - Parent {parent_path} not found!")
             
             node.last_updated_at = time.time()
 

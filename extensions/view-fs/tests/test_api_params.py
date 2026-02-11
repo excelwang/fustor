@@ -61,9 +61,9 @@ async def test_tree_default_recursive(app_client):
     driver.get_directory_tree.assert_called_with("/", recursive=True, max_depth=None, only_path=False)
     
     # Verify response structure logic (which is mostly pass-through but confirms wiring)
-    # API now wraps result in "data" field
-    assert data["data"]["path"] == "/"
-    names = [c["name"] for c in data["data"]["children"]]
+    # API response is now flat (result itself)
+    assert data["path"] == "/"
+    names = [c["name"] for c in data["children"]]
     assert "dir1" in names
 
 @pytest.mark.asyncio

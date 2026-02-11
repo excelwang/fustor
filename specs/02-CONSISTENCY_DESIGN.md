@@ -493,7 +493,7 @@ GET /api/v1/views/{view_id}/tree?path=/data/logs&force-real-time=true
 ```json
 {
   "data": { ... core_domain_object ... },
-      "find_pending": boolean,  // True if a realtime find was triggered and pending
+      "job_pending": boolean,  // True if a realtime find was triggered and pending
   
   "meta": { ... }           // Optional additional metadata
 }

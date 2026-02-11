@@ -53,9 +53,10 @@ class MockSender(Sender):
         self, 
         events: List[Any], 
         source_type: str = "message",
-        is_end: bool = False
+        is_end: bool = False,
+        metadata: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
-        self.events_sent.append((events, source_type, is_end))
+        self.events_sent.append((events, source_type, is_end, metadata))
         return {"success": True, "count": len(events)}
     
     async def heartbeat(self) -> Dict[str, Any]:
@@ -203,7 +204,7 @@ class TestSenderHandlerAdapterBatch:
         
         assert success
         assert len(mock_sender.events_sent) == 1
-        sent_events, source_type, is_end = mock_sender.events_sent[0]
+        sent_events, source_type, is_end, metadata = mock_sender.events_sent[0]
         assert sent_events == events
         assert source_type == "message"
         assert is_end is False
@@ -221,7 +222,7 @@ class TestSenderHandlerAdapterBatch:
         )
         
         assert success
-        _, source_type, is_end = mock_sender.events_sent[0]
+        _, source_type, is_end, _ = mock_sender.events_sent[0]
         assert source_type == "snapshot"
         assert is_end is True
     
@@ -238,7 +239,7 @@ class TestSenderHandlerAdapterBatch:
         )
         
         assert success
-        _, source_type, _ = mock_sender.events_sent[0]
+        _, source_type, _, _ = mock_sender.events_sent[0]
         assert source_type == "audit"
 
     @pytest.mark.asyncio
@@ -327,7 +328,7 @@ class TestSenderHandlerAdapterResume:
                 super().__init__("legacy", "http://legacy", {})
             async def connect(self): pass
             async def create_session(self, **kwargs): return {}
-            async def _send_events_impl(self, **kwargs): return {}
+            async def _send_events_impl(self, events, source_type, is_end, metadata=None): return {}
             async def heartbeat(self): return {}
             
         legacy_sender = LegacySender()

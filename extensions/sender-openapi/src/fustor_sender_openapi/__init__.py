@@ -28,7 +28,14 @@ class OpenApiDriver(Sender):
         super().__init__(sender_id, endpoint, credential, config)
         self.client = httpx.AsyncClient()
 
-    async def _send_events_impl(self, events: List[EventBase], source_type: str = "message", is_end: bool = False, **kwargs) -> Dict:
+    async def _send_events_impl(
+        self, 
+        events: List[EventBase], 
+        source_type: str = "message", 
+        is_end: bool = False, 
+        metadata: Optional[Dict[str, Any]] = None,
+        **kwargs
+    ) -> Dict:
         """
         Implementation of OpenAPI sending.
         """
