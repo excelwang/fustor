@@ -10,101 +10,195 @@ import time
 import os
 import yaml
 from pathlib import Path
-from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, INGESTION_DELAY
+import logging
+import subprocess
+from ..fixtures.constants import (
+    SHORT_TIMEOUT, MEDIUM_TIMEOUT, INGESTION_DELAY, 
+    LONG_TIMEOUT, AGENT_READY_TIMEOUT, EXTREME_TIMEOUT
+)
 
-FUSION_CONFIG_DIR = Path("it/config/fusion-config")
-AGENT_CONFIG_DIR = Path("it/config/agent-config")
+logger = logging.getLogger("fustor_test")
+
+# Container name for Fusion
+CONTAINER_FUSION = "fustor-fusion"
+
+# Paths inside containers (processed config, NOT templates)
+FUSION_PROCESSED_CONFIG_DIR = "/root/.fustor/fusion-config"
+AGENT_PROCESSED_CONFIG_DIR = "/root/.fustor/agent-config"
+
 
 @pytest.fixture
-def extra_config():
-    """Cleanup helper for extra config files."""
-    created_files = []
+def extra_fusion_config():
+    """Create extra YAML config files in Fusion's processed config directory.
     
-    def _create(path, data):
-        with open(path, "w") as f:
-            yaml.dump(data, f)
-        created_files.append(Path(path))
+    Creates files directly in /root/.fustor/fusion-config/ (the processed directory),
+    bypassing envsubst. Values must be already resolved (no ${...} vars).
+    Cleans up created files on teardown.
+    """
+    created_files = []  # list of container config paths
+    
+    def _create(filename, content):
+        """Create a YAML config file directly in Fusion container.
         
+        Args:
+            filename: Config filename (e.g., "extra_fanout.yaml")
+            content: Dict to write as YAML. All values must be resolved.
+        """
+        container_path = f"{FUSION_PROCESSED_CONFIG_DIR}/{filename}"
+        
+        # Write YAML content via docker exec
+        yaml_str = yaml.dump(content, default_flow_style=False)
+        # Escape single quotes in YAML for shell command
+        yaml_str_escaped = yaml_str.replace("'", "'\\''")
+        
+        subprocess.check_call([
+            "docker", "exec", CONTAINER_FUSION,
+            "sh", "-c", f"cat > {container_path} << 'YAML_EOF'\n{yaml_str}\nYAML_EOF"
+        ])
+        logger.info(f"Created Fusion extra config: {container_path}")
+        created_files.append(container_path)
+    
     yield _create
     
-    for p in created_files:
-        if p.exists():
-            p.unlink()
+    # Cleanup
+    for path in created_files:
+        try:
+            subprocess.call(["docker", "exec", CONTAINER_FUSION, "rm", "-f", path])
+            logger.info(f"Removed Fusion extra config: {path}")
+        except Exception as e:
+            logger.warning(f"Could not remove {path}: {e}")
+
+
+@pytest.fixture
+def extra_agent_config():
+    """Create extra YAML config files in Agent's processed config directory.
+    
+    Similar to extra_fusion_config but targets Agent containers.
+    Cleans up on teardown.
+    """
+    created_files = []  # list of (container, container_path) tuples
+    
+    def _create(container_name, filename, content):
+        """Create a YAML config file directly in Agent container.
+        
+        Args:
+            container_name: Container name
+            filename: Config filename
+            content: Dict to write as YAML
+        """
+        container_path = f"{AGENT_PROCESSED_CONFIG_DIR}/{filename}"
+        
+        yaml_str = yaml.dump(content, default_flow_style=False)
+        
+        subprocess.check_call([
+            "docker", "exec", container_name,
+            "sh", "-c", f"cat > {container_path} << 'YAML_EOF'\n{yaml_str}\nYAML_EOF"
+        ])
+        logger.info(f"Created Agent extra config in {container_name}: {container_path}")
+        created_files.append((container_name, container_path))
+    
+    yield _create
+    
+    # Cleanup
+    for container, path in created_files:
+        try:
+            subprocess.call(["docker", "exec", container, "rm", "-f", path])
+            logger.info(f"Removed Agent extra config {path} from {container}")
+        except Exception as e:
+            logger.warning(f"Could not remove {path} from {container}: {e}")
+
 
 class TestAdvancedDeployments:
 
-    def test_fan_out_deployment(self, docker_env, setup_agents, fusion_client, extra_config):
+    def test_fan_out_deployment(
+        self, docker_env, setup_agents, fusion_client, extra_fusion_config
+    ):
         """
         Test Scenario: Fan-Out (One Agent -> Multiple Views)
-        Use a separate config file to add a second view to the system.
+        
+        The default config already defines the 'archive-fanout' view.
+        This test overrides the pipe config to fan-out events to BOTH views.
         """
-        # We need the actual view ID from environment
         view_id = os.environ.get("TEST_VIEW_ID", "integration-test-ds")
         extra_view_id = "archive-fanout"
         
-        # Create extra fusion config
-        # This defines an EXTRA view and REDEFINES the pipe p1 to use both
-        # Note: REDEFINING a pipe ID in a second file overrides the first one in FusionConfigLoader
-        extra_fusion_path = FUSION_CONFIG_DIR / "extra_fanout.yaml"
-        extra_config(extra_fusion_path, {
-            "views": {
-                extra_view_id: {
-                    "driver": "fs",
-                    "driver_params": {"root_dir": "/data/fusion/archive_fanout"}
-                }
-            },
+        # The default config already has 'archive-fanout' view defined.
+        # We just need to update the pipe to fan-out to both views.
+        # Since FusionConfigLoader overwrites pipes with same ID,
+        # we create an extra config that redefines the pipe with all required fields.
+        extra_fusion_config("extra_fanout.yaml", {
             "pipes": {
-                view_id: { # Use same ID as default pipe to override
+                view_id: {
                     "receiver": "http-main",
-                    "views": [view_id, extra_view_id]
+                    "views": [view_id, extra_view_id],
+                    "audit_interval_sec": 10.0,
+                    "sentinel_interval_sec": 5.0,
+                    "session_timeout_seconds": 5,
                 }
             }
         })
-
-        # Reload
-        docker_env.exec_in_container("fustor-fusion", ["pkill", "-HUP", "-f", "fustor-fusion"])
-        time.sleep(5)
-
-        # Write data
+        
+        # Restart Fusion to pick up the extra config
+        subprocess.check_call(["docker", "restart", CONTAINER_FUSION])
+        
+        logger.info("Waiting for Fusion to reload with fan-out config...")
+        assert fusion_client.wait_for_view_ready(timeout=EXTREME_TIMEOUT), \
+            "Fusion did not become ready after restart with fan-out config"
+        
+        # Write data via leader
         containers = setup_agents["containers"]
         leader = containers["leader"]
         timestamp = int(time.time())
         filename = f"fanout_{timestamp}.txt"
         docker_env.exec_in_container(leader, ["sh", "-c", f"echo 'fanout' > /mnt/shared/{filename}"])
 
-        # Verify in both views
-        assert fusion_client.wait_for_file_in_tree(f"/{filename}", timeout=SHORT_TIMEOUT)
+        # Verify file appears in primary view
+        logger.info(f"Checking file in primary view: {view_id}")
+        assert fusion_client.wait_for_file_in_tree(f"/{filename}", timeout=EXTREME_TIMEOUT), \
+            f"File not found in primary view {view_id}"
         
+        # Verify file also appears in fan-out view
+        logger.info(f"Checking file in fan-out view: {extra_view_id}")
         original_view = fusion_client.view_id
         fusion_client.view_id = extra_view_id
         try:
-            assert fusion_client.wait_for_file_in_tree(f"/{filename}", timeout=SHORT_TIMEOUT)
+            assert fusion_client.wait_for_file_in_tree(f"/{filename}", timeout=EXTREME_TIMEOUT), \
+                f"File not found in fan-out view {extra_view_id}"
         finally:
             fusion_client.view_id = original_view
 
-    def test_aggregation_deployment(self, docker_env, setup_agents, fusion_client, extra_config):
+    def test_aggregation_deployment(
+        self, docker_env, setup_agents, fusion_client, 
+        extra_fusion_config, extra_agent_config
+    ):
         """
         Test Scenario: Aggregation (Multiple Pipes -> Single View)
-        2 Pipes (even from same agent) -> 1 View.
+        
+        Create a second pipe (pipe-agg) that feeds into the same view.
+        Agent monitors a separate directory via this second pipe.
         """
         view_id = os.environ.get("TEST_VIEW_ID", "integration-test-ds")
         agg_pipe_id = "pipe-agg"
         agg_source_id = "source-agg"
         
-        # 1. Extra Fusion Config
-        extra_fusion_path = FUSION_CONFIG_DIR / "extra_agg.yaml"
-        extra_config(extra_fusion_path, {
+        # 1. Add new pipe to Fusion
+        extra_fusion_config("extra_agg.yaml", {
             "pipes": {
                 agg_pipe_id: {
                     "receiver": "http-main",
-                    "views": [view_id]
+                    "views": [view_id],
+                    "audit_interval_sec": 10.0,
+                    "sentinel_interval_sec": 5.0,
+                    "session_timeout_seconds": 5,
                 }
             }
         })
         
-        # 2. Extra Agent Config
-        extra_agent_path = AGENT_CONFIG_DIR / "extra_agg.yaml"
-        extra_config(extra_agent_path, {
+        # 2. Add new source + pipe to Agent (leader)
+        containers = setup_agents["containers"]
+        leader = containers["leader"]
+        
+        extra_agent_config(leader, "extra_agg.yaml", {
             "sources": {
                 agg_source_id: {
                     "driver": "fs",
@@ -118,44 +212,56 @@ class TestAdvancedDeployments:
                 }
             }
         })
-
-        # Setup dir
-        containers = setup_agents["containers"]
-        leader = containers["leader"]
-        docker_env.exec_in_container(leader, ["mkdir", "-p", "/mnt/shared/aggregated"])
-
-        # Reload
-        docker_env.exec_in_container("fustor-fusion", ["pkill", "-HUP", "-f", "fustor-fusion"])
-        docker_env.exec_in_container(leader, ["pkill", "-HUP", "-f", "fustor-agent"])
-        time.sleep(5)
         
-        # Write to aggregated source
+        # 3. Create the aggregated directory
+        docker_env.exec_in_container(leader, ["mkdir", "-p", "/mnt/shared/aggregated"])
+        
+        # 4. Restart Fusion and reload Agent
+        subprocess.check_call(["docker", "restart", CONTAINER_FUSION])
+        logger.info("Waiting for Fusion to reload with aggregation config...")
+        assert fusion_client.wait_for_view_ready(timeout=EXTREME_TIMEOUT), \
+            "Fusion did not become ready after restart with aggregation config"
+        
+        # Reload agent config via SIGHUP
+        docker_env.exec_in_container(leader, ["pkill", "-HUP", "-f", "fustor-agent"])
+        logger.info("Sent SIGHUP to agent for config reload. Waiting...")
+        time.sleep(10)  # Give agent time to reload config and reconnect
+        
+        # 5. Write to aggregated source directory
         timestamp = int(time.time())
         filename = f"agg_{timestamp}.txt"
-        docker_env.exec_in_container(leader, ["sh", "-c", f"echo 'agg' > /mnt/shared/aggregated/{filename}"])
+        docker_env.exec_in_container(
+            leader, ["sh", "-c", f"echo 'aggregated data' > /mnt/shared/aggregated/{filename}"]
+        )
 
-        # Verify in shared view
-        assert fusion_client.wait_for_file_in_tree(f"/{filename}", timeout=SHORT_TIMEOUT)
+        # 6. Verify in view (the aggregated pipe feeds into the same view)
+        logger.info(f"Checking aggregated file in view: {view_id}")
+        assert fusion_client.wait_for_file_in_tree(f"/{filename}", timeout=EXTREME_TIMEOUT), \
+            f"Aggregated file not found in view {view_id}"
 
-    def test_ha_dynamic_adjustment(self, docker_env, setup_agents, fusion_client, extra_config):
+    def test_ha_dynamic_adjustment(
+        self, docker_env, setup_agents, fusion_client, extra_fusion_config
+    ):
         """
         Test Scenario: HA Cluster Configuration Reload
-        Verify global config change items like session_cleanup_interval.
+        
+        Verify that global fusion config can be changed dynamically via extra config.
+        Creates an extra config with session_cleanup_interval change,
+        restarts Fusion, verifies it comes back healthy.
         """
-        # We'll change the heartbeat behavior or similar.
-        # Let's change session_timeout_seconds in fusion global config
-        extra_fusion_path = FUSION_CONFIG_DIR / "extra_ha.yaml"
-        extra_config(extra_fusion_path, {
+        # Create extra config with modified global setting
+        extra_fusion_config("extra_ha.yaml", {
             "fusion": {
                 "session_cleanup_interval": 11.0
             }
         })
         
-        docker_env.exec_in_container("fustor-fusion", ["pkill", "-HUP", "-f", "fustor-fusion"])
-        time.sleep(3)
+        subprocess.check_call(["docker", "restart", CONTAINER_FUSION])
+        logger.info("Waiting for Fusion to reload with HA config...")
+        assert fusion_client.wait_for_view_ready(timeout=LONG_TIMEOUT), \
+            "Fusion did not become ready after HA config reload"
         
-        # Since we don't have an API to check global config easily, 
-        # let's assume if it reloaded without error, it works (basic verification).
-        # Better: check if we can see it in logs or if it affects cleanup.
-        # But for this task, successfully merging the config is the key.
-        pass
+        # Verify Fusion is operational by checking we can get stats
+        stats = fusion_client.get_stats()
+        assert stats is not None, "Could not get stats after HA config reload"
+        logger.info(f"HA config reload successful. Stats: {stats}")

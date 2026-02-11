@@ -40,7 +40,7 @@ from .constants import (
 
 
 
-def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POINT):
+def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POINT, env_overrides=None):
     """
     Ensure agent is configured and running in the container.
     
@@ -49,6 +49,7 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
         api_key: API key for authentication
         view_id: View ID for the pipe
         mount_point: Path to the NFS mount point
+        env_overrides: Dict of environment variables to export before running agent
     """
     # Ensure container is actually running
     try:
@@ -104,10 +105,16 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
     logger.info(f"Starting agent in {container_name} in DAEMON mode (-D)")
     env_prefix = "FUSTOR_USE_PIPELINE=true "
     
+    # Apply env overrides if provided
+    cmd_prefix = env_prefix
+    if env_overrides:
+        for k, v in env_overrides.items():
+            cmd_prefix = f"export {k}='{v}' && {cmd_prefix}"
+    
     # Use -D for daemon mode as requested by user
     docker_manager.exec_in_container(
         container_name, 
-        ["sh", "-c", f"{env_prefix}fustor-agent start -D -V"],
+        ["sh", "-c", f"{cmd_prefix}fustor-agent start -D -V"],
         detached=False # -D returns immediately anyway
     )
     
@@ -177,15 +184,17 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
     # causing false-suspicious flags for "Old" files if skew exists (e.g., Faketime).
     logger.info("Performing Skew Calibration Warmup...")
     warmup_file = f"{MOUNT_POINT}/skew_calibration_{int(time.time()*1000)}.txt"
+    warmup_view_path = "/" + warmup_file.split(MOUNT_POINT + "/", 1)[1]
     # Use touch to ensure mtime reflects the container's skewed time (libfaketime)
     # create_file_in_container uses echo|base64 which might have different timestamp behavior
     docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["touch", warmup_file])
     
     # Wait for Fusion to ingest it (implicitly calibrates skew)
-    if not fusion_client.wait_for_file_in_tree(warmup_file, timeout=SHORT_TIMEOUT):
+    if not fusion_client.wait_for_file_in_tree(warmup_view_path, timeout=SHORT_TIMEOUT):
         logger.warning("Skew calibration file not seen in tree. Clock might be uncalibrated.")
     else:
         logger.info("Skew calibration successful.")
+
 
     # Start Agent B as Follower
     logger.info(f"Configuring and starting agent in {CONTAINER_CLIENT_B}...")
@@ -209,6 +218,71 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
         "containers": {
             "leader": CONTAINER_CLIENT_A,
             "follower": CONTAINER_CLIENT_B,
+            "blind": CONTAINER_CLIENT_C
+        },
+        "ensure_agent_running": ensure_agent_running
+    }
+
+@pytest.fixture(scope="function")
+def setup_unskewed_agents(docker_env, fusion_client, test_api_key, test_view):
+    """
+    Setup environment with Unskewed Agent A only.
+    Disable LD_PRELOAD to remove skew from Agent A.
+    Stop Agent B.
+    """
+    view_id = test_view["id"]
+    api_key = test_api_key["key"]
+    
+    # Stop B
+    docker_manager.stop_container(CONTAINER_CLIENT_B)
+    
+    # Start Agent A unskewed
+    logger.info(f"Configuring and starting UNSKEWED agent in {CONTAINER_CLIENT_A}...")
+    ensure_agent_running(
+        CONTAINER_CLIENT_A, 
+        api_key, 
+        view_id, 
+        env_overrides={"LD_PRELOAD": ""}
+    )
+    
+    # Wait for A to be Ready
+    logger.info("Waiting for Unskewed Agent A to be ready...")
+    if not fusion_client.wait_for_agent_ready("client-a", timeout=AGENT_READY_TIMEOUT):
+         raise RuntimeError("Unskewed Agent A failed to become ready")
+         
+    # Wait for Leader
+    logger.info("Waiting for Agent A to become LEADER...")
+    timeout = 10
+    start_time = time.time()
+    leader = None
+    while time.time() - start_time < timeout:
+        sessions = fusion_client.get_sessions()
+        leader = next((s for s in sessions if "client-a" in s.get("agent_id", "")), None)
+        if leader and leader.get("role") == "leader":
+            break
+        time.sleep(0.5)
+        
+    if not leader or leader.get("role") != "leader":
+        raise RuntimeError("Agent A failed to become leader")
+        
+    logger.info("Unskewed Agent A is Leader.")
+    
+    # Wait for View Ready
+    if not fusion_client.wait_for_view_ready(timeout=VIEW_READY_TIMEOUT):
+         logger.warning("View failed to become ready.")
+
+    # Skew Calibration (Should be close to 0 now)
+    warmup_file = f"{MOUNT_POINT}/unskewed_calibration_{int(time.time()*1000)}.txt"
+    docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["touch", warmup_file])
+    fusion_client.wait_for_file_in_tree("/" + os.path.basename(warmup_file), timeout=SHORT_TIMEOUT)
+    logger.info("Unskewed calibration completed.")
+
+    return {
+        "api_key": api_key,
+        "view_id": view_id,
+        "containers": {
+            "leader": CONTAINER_CLIENT_A,
+            "follower": None,
             "blind": CONTAINER_CLIENT_C
         },
         "ensure_agent_running": ensure_agent_running

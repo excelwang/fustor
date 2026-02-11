@@ -20,9 +20,7 @@ class FusionGlobalConfig(BaseModel):
     port: int = Field(default=8101, description="管理 API 监听端口")
     session_cleanup_interval: float = Field(default=60.0, description="会话清理间隔(秒)")
 
-class AgentGlobalConfig(BaseModel):
-    # Agent typically doesn't listen on a port anymore, but we can store other globals
-    pass
+
 
 # --- Credentials and Mappings ---
 
@@ -142,7 +140,7 @@ class AppConfig(BaseModel):
 
     logging: GlobalLoggingConfig = Field(default_factory=GlobalLoggingConfig)
     fusion: FusionGlobalConfig = Field(default_factory=FusionGlobalConfig)
-    agent: AgentGlobalConfig = Field(default_factory=AgentGlobalConfig)
+
 
     sources: SourceConfigDict = Field(default_factory=SourceConfigDict)
     senders: SenderConfigDict = Field(default_factory=SenderConfigDict)

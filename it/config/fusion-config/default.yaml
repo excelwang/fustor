@@ -1,39 +1,35 @@
-# Fusion Configuration for Integration Tests
-# Uses Unified Config V2 format
-
-logging:
-  level: "${FUSTOR_LOG_LEVEL}"
-
-fusion:
-  host: "${FUSTOR_FUSION_HOST}"
-  port: ${FUSTOR_FUSION_PORT} # Should be 8102 as per docker-compose
-  session_cleanup_interval: 1  # Fast cleanup for integration tests (default 60s is too slow)
-
-receivers:
-  http-main:
-    driver: http
-    bind_host: "0.0.0.0"
-    port: 18888 # Use a separate port for data to avoid conflict with management
-    session_timeout_seconds: ${TEST_SESSION_TIMEOUT}
-    api_keys:
-      - key: "${TEST_API_KEY}"
-        pipe_id: "${TEST_VIEW_ID}"
-
-views:
-  ${TEST_VIEW_ID}:
-    driver: fs
-    disabled: false
-    api_keys:
-      - "test-query-key-456" # Dedicated query key
-    driver_params:
-      hot_file_threshold: 60.0
-      consistency:
-        tombstone_ttl_seconds: 0.5
-
+host: ${FUSTOR_FUSION_HOST}
+port: ${FUSTOR_FUSION_PORT}
+session_cleanup_interval: 1
+logging: ${FUSTOR_LOG_LEVEL}
 pipes:
   ${TEST_VIEW_ID}:
-    receiver: http-main
-    views: [${TEST_VIEW_ID}]
-    session_timeout_seconds: ${TEST_SESSION_TIMEOUT}
     audit_interval_sec: ${AUDIT_INTERVAL}
+    receiver: http-main
     sentinel_interval_sec: ${SENTINEL_INTERVAL}
+    session_timeout_seconds: ${TEST_SESSION_TIMEOUT}
+    views:
+    - ${TEST_VIEW_ID}
+receivers:
+  http-main:
+    api_keys:
+    - key: ${TEST_API_KEY}
+      pipe_id: ${TEST_VIEW_ID}
+    bind_host: 0.0.0.0
+    driver: http
+    port: 18888
+    session_timeout_seconds: ${TEST_SESSION_TIMEOUT}
+views:
+  ${TEST_VIEW_ID}:
+    api_keys:
+    - test-query-key-456
+    disabled: false
+    driver: fs
+    driver_params:
+      consistency:
+        tombstone_ttl_seconds: 0.5
+      hot_file_threshold: 60.0
+  archive-fanout:
+    driver: fs
+    driver_params:
+      root_dir: /data/fusion/archive_fanout

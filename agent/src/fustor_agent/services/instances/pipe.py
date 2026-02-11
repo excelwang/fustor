@@ -181,6 +181,22 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
             self.logger.info(f"Pipe instance '{id}' start initiated successfully.")
             return StartResult(pipe_id=id, success=True)
 
+        except (AttributeError, KeyError) as e:
+            # Provide more specific error messages for configuration issues
+            error_str = str(e)
+            friendly_msg = f"Configuration error for pipe '{id}': {error_str}"
+            if "'source'" in error_str:
+                friendly_msg = f"Pipe '{id}' is missing required field 'source' in its configuration"
+            elif "'sender'" in error_str:
+                friendly_msg = f"Pipe '{id}' is missing required field 'sender' in its configuration"
+            
+            self.logger.error(friendly_msg)
+            if self.get_instance(id):
+                self.pool.pop(id)
+            if raise_on_error:
+                raise ValueError(friendly_msg) from e
+            return StartResult(pipe_id=id, success=False, error=friendly_msg)
+            
         except Exception as e:
             self.logger.error(f"Failed to start pipe instance '{id}': {e}", exc_info=True)
             if self.get_instance(id):
@@ -208,6 +224,9 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
             if should_release_bus and bus_id:
                 # Use task_id for bus subscription release
                 await self.bus_service.release_subscriber(bus_id, instance.task_id)
+        except KeyError:
+            # Race condition: already removed
+            self.logger.warning(f"Pipe instance '{id}' was already stopped/removed during stop request.")
         except Exception as e:
             self.logger.error(f"Failed to cleanly stop {instance}: {e}", exc_info=True)
 

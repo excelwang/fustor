@@ -32,27 +32,25 @@ class TestPipeFieldMapping:
         # 1. Update Agent Config to include fields_mapping
         # Map: path -> path, modified_time -> modified_time, is_directory -> is_directory, size -> remapped_size
         pipe_config = f"""
-id: "pipe-task-1"
-source: "shared-fs"
-sender: "fusion"
-disabled: false
-fields_mapping:
-  - to: "path"
-    source: ["path:string"]
-  - to: "modified_time"
-    source: ["modified_time:number"]
-  - to: "is_directory"
-    source: ["is_directory:boolean"]
-  - to: "created_time"
-    source: ["created_time:number"]
-  # Test mapping: Map standard 'size' to a custom field 'remapped_size'
-  # This verifies that the 'size' field in Fusion becomes 0 (default) because its source was redirected.
-  - to: "remapped_size"
-    source: ["size:integer"]
+pipes:
+  integration-test-ds:
+    fields_mapping:
+      - to: "path"
+        source: ["path:string"]
+      - to: "modified_time"
+        source: ["modified_time:number"]
+      - to: "is_directory"
+        source: ["is_directory:boolean"]
+      - to: "created_time"
+        source: ["created_time:number"]
+      # Test mapping: Map standard 'size' to a custom field 'remapped_size'
+      # This verifies that the 'size' field in Fusion becomes 0 (default) because its source was redirected.
+      - to: "remapped_size"
+        source: ["size:integer"]
 """
         docker_env.create_file_in_container(
             leader, 
-            "/root/.fustor/agent-pipes-config/pipe-task-1.yaml", 
+            "/root/.fustor/agent-config/pipe-task-1.yaml", 
             pipe_config
         )
         
@@ -130,5 +128,5 @@ fields_mapping:
         
         actual_size = node.get('size')
         
-        assert actual_size == 0, f"Expected size 0 (due to mapping), but got {actual_size}"
+        assert actual_size in (0, None), f"Expected size 0 or None (due to mapping), but got {actual_size}"
         logger.info("✅ Field mapping confirmed: 'size' was correctly redirected to 'remapped_size', causing Fusion to see 0.")

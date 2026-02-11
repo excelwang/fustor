@@ -28,27 +28,7 @@ from ..fixtures.constants import (
 )
 from ..fixtures.agents import ensure_agent_running
 
-@pytest.fixture
-def setup_agent_b_only(fusion_client, test_api_key, test_view):
-    """
-    Start ONLY Agent B (Skew -1h) for Age checks. 
-    Agent A (+2h) poisons the clock making fresh files look old.
-    """
-    # Ensure A is stopped
-    docker_manager.stop_container(CONTAINER_CLIENT_A)
-    
-    # Start B
-    ensure_agent_running(CONTAINER_CLIENT_B, test_api_key, test_view)
-    
-    # Wait for Leader (B should become leader)
-    start = time.time()
-    while time.time() - start < 45: # AGENT_READY_TIMEOUT
-        leader = fusion_client.get_leader_session()
-        if leader:
-             break
-        time.sleep(POLL_INTERVAL)
-    
-    return {"api_key": test_api_key, "view_id": test_view}
+
 
 class TestSuspectClearingConditions:
     """Test all conditions under which suspect status is cleared."""
@@ -57,7 +37,7 @@ class TestSuspectClearingConditions:
         self,
         docker_env,
         fusion_client,
-        setup_agents,
+        setup_unskewed_agents,
         clean_shared_dir,
         wait_for_audit
     ):
@@ -101,7 +81,7 @@ class TestSuspectClearingConditions:
         self,
         docker_env,
         fusion_client,
-        setup_agents,
+        setup_unskewed_agents,
         clean_shared_dir,
         wait_for_audit
     ):
@@ -191,7 +171,7 @@ class TestSuspectClearingConditions:
         self,
         docker_env,
         fusion_client,
-        setup_agents,
+        setup_unskewed_agents,
         clean_shared_dir,
         # wait_for_audit removed to avoid fixture flakiness
     ):

@@ -135,15 +135,10 @@ class FusionConfigLoader:
             # 1. Global settings (Flattened or Nested)
             if "logging" in data:
                 # GlobalLoggingConfig validator handles string vs dict
-                self.logging = GlobalLoggingConfig(**data["logging"])
+                self.logging = GlobalLoggingConfig.model_validate(data["logging"])
 
             # Handle flattened Fusion globals (host, port, etc.) directly from root
-            # Prioritize root-level keys, fallback to nested 'fusion' block
-            fusion_data = data.get("fusion", {})
-            if not isinstance(fusion_data, dict):
-                 fusion_data = {}
-            
-            # Merge root-level overrides into fusion_data definition
+            fusion_data = {}
             for key in ["host", "port", "session_cleanup_interval"]:
                 if key in data:
                     fusion_data[key] = data[key]
@@ -176,12 +171,22 @@ class FusionConfigLoader:
             # Load global settings if this is default.yaml
             if file_key == "default.yaml":
                 if "logging" in data:
-                    self.logging = GlobalLoggingConfig(**data["logging"])
-                if "fusion" in data:
-                    self.fusion = FusionGlobalConfig(**data["fusion"])
+                    self.logging = GlobalLoggingConfig.model_validate(data["logging"])
+                
+                # Check for top-level fusion keys to update default global config
+                fusion_defaults = {}
+                for key in ["host", "port", "session_cleanup_interval"]:
+                    if key in data:
+                        fusion_defaults[key] = data[key]
+                if fusion_defaults:
+                    self.fusion = FusionGlobalConfig(**fusion_defaults)
             
+        except FileNotFoundError:
+            logger.error(f"Configuration file not found: {path}")
+        except yaml.YAMLError as e:
+            logger.error(f"YAML syntax error in configuration file {path}: {e}")
         except Exception as e:
-            logger.error(f"Failed to load config from {path}: {e}")
+            logger.error(f"Unexpected error loading configuration from {path}: {e}", exc_info=True)
     
     def ensure_loaded(self) -> None:
         if not self._loaded:

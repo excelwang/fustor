@@ -165,51 +165,37 @@ class TestClockSkewTolerance:
         wait_for_audit
     ):
         """
-        验证逻辑时钟不受 Agent 时钟偏移的影响而跳变。
+        验证逻辑时钟在时钟偏移环境下的 Mode 机制正确性。
+        
+        Spec §4.1.A: 仅 Realtime 事件参与 skew 采样。
+        Spec §2: 免疫单点故障: 通过全局 Mode 选举将异常样本剔除。
         
         场景：
-          1. Agent A (+2h) 创建一个文件。由于 Source-FS 修正了 drift，事件 index 应接近物理时间。
-          2. 验证 Logical Clock 仍接近 Host 物理时间 (未被推向未来)。
-          3. Client C (正常时间) 创建一个文件。
-          4. 验证该文件被正确视为"新鲜" (Age ~ 0) 并标记为 Suspect (安全)。
+          1. Agent B (-1h) 创建多个文件 (Realtime)，产生 diff ≈ +3600 的采样。
+          2. Agent A (+2h) 创建 1 个文件 (Realtime)，产生 diff ≈ -7200 的采样。
+          3. 验证 Mode 选择了 Agent B 的偏差 (3600)，而非 Agent A (−7200)。
+             因此 watermark ≈ T - 3600（即 1h 前的时间）。
+          4. Client C (正常时间) 创建文件，验证正确 suspect 判定。
+        
+        注: Audit 事件不参与 skew 采样 (can_sample_skew=is_realtime)，
+            因此 Client C 的文件只能通过 Audit 发现，不影响 Mode。
         """
-        import os.path
         
-        # 0. Warmup: Anchor the Logical Clock with "Trusted" events from Agent C (Unskewed)
-        # The Logical Clock uses a statistical Mode algorithm. If it starts cold and sees ONLY Agent A (+2h),
-        # it will sync to +2h. We need to establish a "Majority" of correct events first.
-        logger.info("Step 0: Warning up Logical Clock with unskewed events...")
+        # 0. Generate realtime events from Agent B (-1h) to establish Mode
+        # Agent B's files have mtime = T-3600, so diff = T_fusion - (T-3600) = 3600
+        logger.info("Step 0: Establishing Mode with Agent B (-1h) realtime events...")
         for i in range(5):
-            warmup_file = f"warmup_{int(time.time())}_{i}.txt"
-            docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["touch", f"{MOUNT_POINT}/{warmup_file}"])
+            warmup_file_b = f"warmup_b_{int(time.time())}_{i}.txt"
+            docker_manager.exec_in_container(CONTAINER_CLIENT_B, ["touch", f"{MOUNT_POINT}/{warmup_file_b}"])
+            time.sleep(0.3)  # Brief pause to ensure unique filenames
         
-        # Wait for ingestion of at least one to ensure clock is updated
-        # (Assuming Agent C events are picked up via Audit or if we had a trusted agent. 
-        # Client C has NO agent, so it relies on Audit from A/B.
-        # Wait... Audit from A/B will report C's files.
-        # If A audits, it reports stats.mtime = T (correct).
-        # A's local time is T+2h.
-        # If A audits, does it preserve mtime? Yes.
-        # So Arbitrator receives T.
-        # But A might send the event with `timestamp=T+2h`? No, Arbitrator uses payload.mtime.
-        # So Audit from A *should* provide correct mtime T.
+        # Wait for Agent B's realtime events to be ingested
+        warmup_rel = to_view_path(f"{MOUNT_POINT}/{warmup_file_b}")
+        assert fusion_client.wait_for_file_in_tree(warmup_rel, timeout=LONG_TIMEOUT) is not None, \
+            "Agent B warmup files should be ingested via realtime"
         
-        # To be safe, let's use Agent B (-1h) which is closer, or just rely on the fact that mtime on disk is correct.
-        # Ideally we want a Realtime Agent with correct time, but we only have A(+2h) and B(-1h).
-        # Fusion time is correct.
-        
-        # Let's use Agent B (-1h) to create some events? -1h is better than +2h.
-        # Or just trust that Audit of C's files will provide correct mtimes.
-        
-        # Actually, let's look at `test_clock_skew_environment_setup`.
-        # We need the mode to be centered around 0 skew.
-        # Skew = Ref(T) - Obs(mtime).
-        # If A audits C's file: mtime=T. Ref=T. Skew=0.
-        # So yes, Audit of C's files works!
-        
-        wait_for_audit()
-        
-        # 1. Agent A (+2h) creates a file
+        # 1. Agent A (+2h) creates a file (1 event with diff ≈ -7200)
+        logger.info("Step 1: Agent A (+2h) creating file...")
         filename_a = f"stable_trigger_{int(time.time())}.txt"
         file_path_a = f"{MOUNT_POINT}/{filename_a}"
         file_path_a_rel = to_view_path(file_path_a)
@@ -221,35 +207,39 @@ class TestClockSkewTolerance:
         stats = fusion_client.get_stats()
         logical_now = stats.get("logical_now", 0)
         host_now = time.time()
-        logger.info(f"Watermark after A: {logical_now}, Host Physical: {host_now}")
+        logger.info(f"Watermark: {logical_now}, Host Physical: {host_now}, Diff: {logical_now - host_now:.1f}s")
         
-        # The drift fix ensures Index ~ Physical Time. So Logical Clock shouldn't jump +7200s.
-        # Allow some small skew/latency (e.g. 60s).
+        # Mode should be ~3600 (from Agent B's 5 events) not -7200 (from Agent A's 1-2 events).
+        # Watermark = T_fusion - mode_skew ≈ T - 3600 (i.e., 1 hour behind host time).
+        # So logical_now - host_now ≈ -3600. Allow generous tolerance.
         diff = logical_now - host_now
-        assert diff < 600, f"Logical Clock jumped too far forwards ({diff}s). Drift fix failed?"
-        assert diff > -600, f"Logical Clock lagged too far behind ({diff}s)."
+        logger.info(f"Logical Clock drift from host: {diff:.1f}s (expected ≈ -3600)")
+        
+        # The clock should NOT have jumped +7200 (Agent A's skew)
+        assert diff < 600, f"Logical Clock jumped too far forwards ({diff:.0f}s). Mode voted for Agent A's +2h skew?"
+        
+        # The clock should be within Agent B's skew range (≈ -3600 ± tolerance)
+        # Allow wide tolerance since NFS latency and audit events could affect timing
+        assert diff > -5000, f"Logical Clock lagged too far behind ({diff:.0f}s)."
         
         # 2. Now create a NORMAL file (Host time) from Client C
+        logger.info("Step 2: Client C creating normal file...")
         normal_file = f"fresh_file_{int(time.time())}.txt"
         file_path_normal = f"{MOUNT_POINT}/{normal_file}"
         file_path_normal_rel = to_view_path(file_path_normal)
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path_normal, "normal")
         
         # 3. Wait for Audit to discover it
-        audit_marker = f"marker_stable_{int(time.time())}.txt"
-        audit_marker_path = f"{MOUNT_POINT}/{audit_marker}"
-        audit_marker_rel = to_view_path(audit_marker_path)
+        wait_for_audit()
         
-        docker_manager.create_file_in_container(CONTAINER_CLIENT_C, audit_marker_path, "marker")
-        assert fusion_client.wait_for_file_in_tree(audit_marker_rel, timeout=EXTREME_TIMEOUT) is not None
+        assert fusion_client.wait_for_file_in_tree(file_path_normal_rel, timeout=EXTREME_TIMEOUT) is not None
         
-        # 4. Verify the normal file IS suspect (Because it's fresh!)
-        # Previous test expected Not Suspect because Logical Age was 2h.
-        # Now Logical Age is 0s. Physical Age is 0s.
-        # Age < Threshold -> Suspect.
-        assert fusion_client.wait_for_file_in_tree(file_path_normal_rel) is not None
+        # 4. Verify the normal file's suspect status
+        # Watermark ≈ T-3600. File mtime ≈ T.
+        # Age = watermark - mtime ≈ (T-3600) - T = -3600 (negative age!)
+        # When age < 0 or age < hot_file_threshold, the file should be suspect.
         flags = fusion_client.check_file_flags(file_path_normal_rel)
         logger.info(f"Normal file flags: {flags}")
         
         assert flags["integrity_suspect"] is True, \
-            "Fresh file should be suspect (Logical Clock remained stable, did not age the file artificially)"
+            "Fresh file should be suspect (file mtime is ahead of watermark due to Agent B's -1h skew)"

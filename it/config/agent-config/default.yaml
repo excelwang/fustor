@@ -2,11 +2,8 @@
 # Uses Unified Config V2 format
 # Location: it/config/agent-config/default.yaml
 
-logging:
-  level: "${FUSTOR_LOG_LEVEL}"
+logging: "${FUSTOR_LOG_LEVEL}"
 
-agent:
-  # empty
 
 sources:
   shared-fs:

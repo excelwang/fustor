@@ -22,7 +22,7 @@ class TestBlindSpotVisibility:
         self,
         docker_env,
         fusion_client,
-        setup_agents,
+        setup_unskewed_agents,
         clean_shared_dir,
         wait_for_audit
     ):
@@ -93,7 +93,7 @@ class TestBlindSpotVisibility:
         self,
         docker_env,
         fusion_client,
-        setup_agents,
+        setup_unskewed_agents,
         clean_shared_dir,
         wait_for_audit
     ):

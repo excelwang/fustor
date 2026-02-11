@@ -49,7 +49,7 @@ logger.info("🚀 Integration tests running in V2 AgentPipe mode")
 
 from fixtures.docker import docker_env, clean_shared_dir
 from fixtures.fusion import test_view, test_api_key, test_query_key, fusion_client
-from fixtures.agents import setup_agents
+from fixtures.agents import setup_agents, setup_unskewed_agents
 from fixtures.leadership import wait_for_audit, reset_leadership
 
 

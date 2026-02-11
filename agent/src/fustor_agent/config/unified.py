@@ -28,7 +28,7 @@ from typing import Dict, Optional, List, Any, Set
 from pydantic import BaseModel, field_validator, Field
 
 from fustor_core.common import get_fustor_home_dir
-from fustor_core.models.config import SourceConfig, SenderConfig, GlobalLoggingConfig, AgentGlobalConfig
+from fustor_core.models.config import SourceConfig, SenderConfig, GlobalLoggingConfig
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +58,7 @@ class AgentPipeConfig(BaseModel):
 class UnifiedAgentConfig(BaseModel):
     """Unified configuration containing all components."""
     logging: GlobalLoggingConfig = Field(default_factory=GlobalLoggingConfig)
-    agent: AgentGlobalConfig = Field(default_factory=AgentGlobalConfig)
+
     sources: Dict[str, Dict[str, Any]] = {}
     senders: Dict[str, Dict[str, Any]] = {}
     pipes: Dict[str, AgentPipeConfig] = {}
@@ -80,7 +80,7 @@ class AgentConfigLoader:
         
         # Global settings
         self.logging = GlobalLoggingConfig()
-        self.agent = AgentGlobalConfig()
+
 
         # Merged namespace
         self._sources: Dict[str, SourceConfig] = {}
@@ -95,7 +95,7 @@ class AgentConfigLoader:
     def load_all(self) -> None:
         """Load and merge all YAML files from config directory."""
         self.logging = GlobalLoggingConfig()
-        self.agent = AgentGlobalConfig()
+
         self._sources.clear()
         self._senders.clear()
         self._pipes.clear()
@@ -128,10 +128,9 @@ class AgentConfigLoader:
             # 1. Global settings
             if "logging" in data:
                  # GlobalLoggingConfig validator handles string vs dict
-                self.logging = GlobalLoggingConfig(**data["logging"])
+                self.logging = GlobalLoggingConfig.model_validate(data["logging"])
             
-            if "agent" in data:
-                self.agent = self.agent.model_copy(update=data["agent"])
+
 
             # Merge sources
             for src_id, src_data in data.get("sources", {}).items():
@@ -158,12 +157,15 @@ class AgentConfigLoader:
             # Load global settings if this is default.yaml
             if file_key == "default.yaml":
                 if "logging" in data:
-                    self.logging = GlobalLoggingConfig(**data["logging"])
-                if "agent" in data:
-                    self.agent = AgentGlobalConfig(**data["agent"])
+                    self.logging = GlobalLoggingConfig.model_validate(data["logging"])
+
             
+        except FileNotFoundError:
+            logger.error(f"Configuration file not found: {path}")
+        except yaml.YAMLError as e:
+            logger.error(f"YAML syntax error in configuration file {path}: {e}")
         except Exception as e:
-            logger.error(f"Failed to load config from {path}: {e}")
+            logger.error(f"Unexpected error loading configuration from {path}: {e}", exc_info=True)
     
     def ensure_loaded(self) -> None:
         if not self._loaded:
