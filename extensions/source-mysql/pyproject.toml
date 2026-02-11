@@ -1,6 +1,6 @@
 [project]
 name = "fustor-source-mysql"
-version = "0.8.9"
+version = "0.8.10"
 description = "A MySQL source for Fustor Agent"
 requires-python = ">=3.11"
 dependencies = [ "fustor-core", "aiomysql>=0.2.0", "mysql-replication>=1.0.9"]

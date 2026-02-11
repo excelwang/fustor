@@ -1,6 +1,6 @@
 [project]
 name = "fustor-source-elasticsearch"
-version = "0.8.9"
+version = "0.8.10"
 description = "An Elasticsearch source for Fustor Agent"
 requires-python = ">=3.11"
 dependencies = [ "elasticsearch>=9.2.0", "fustor-core"]
