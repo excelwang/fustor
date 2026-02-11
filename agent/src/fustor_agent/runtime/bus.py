@@ -170,7 +170,7 @@ class MemoryEventBus:
             self._recalculate_required_fields()
             
             log_fields = "ALL_FIELDS" if required_source_fields is None else required_source_fields
-            logger.info(f"Pipe '{pipe_id}' subscribed to Bus '{self.id}' at event index {initial_position - 1}. Required fields: {log_fields}")
+            logger.debug(f"Pipe '{pipe_id}' subscribed to Bus '{self.id}' at event index {initial_position - 1}. Required fields: {log_fields}")
             self._update_low_watermark()
 
     async def unsubscribe(self, pipe_id: str):
@@ -180,7 +180,7 @@ class MemoryEventBus:
                 if pipe_id in self.subscriber_field_map:
                     del self.subscriber_field_map[pipe_id]
                 self._recalculate_required_fields()
-                logger.info(f"Pipe '{pipe_id}' unsubscribed from Bus '{self.id}'.")
+                logger.debug(f"Pipe '{pipe_id}' unsubscribed from Bus '{self.id}'.")
                 self._update_low_watermark()
                 
     def _update_low_watermark(self):

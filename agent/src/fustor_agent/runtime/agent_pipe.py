@@ -271,7 +271,7 @@ class AgentPipe(Pipe):
             # Use timeout/3 as heartbeat interval (gives 2 chances before expiry)
             # This is now the ONLY way heartbeat interval is determined.
             auto_interval = max(0.1, server_timeout / 3.0)
-            logger.info(f"Pipe {self.id}: Calculated heartbeat interval: {auto_interval}s based on session_timeout={server_timeout}s")
+            logger.debug(f"Pipe {self.id}: Calculated heartbeat interval: {auto_interval}s based on session_timeout={server_timeout}s")
             self.heartbeat_interval_sec = auto_interval
         
         # Update sync policy from server response (authoritative)
@@ -280,14 +280,14 @@ class AgentPipe(Pipe):
             old_audit = self.audit_interval_sec
             self.audit_interval_sec = float(server_audit)
             if old_audit != self.audit_interval_sec:
-                logger.info(f"Pipe {self.id}: Audit interval updated by server: {old_audit} -> {self.audit_interval_sec}")
+                logger.debug(f"Pipe {self.id}: Audit interval updated by server: {old_audit} -> {self.audit_interval_sec}")
 
         server_sentinel = kwargs.get("sentinel_interval_sec")
         if server_sentinel is not None:
              old_sentinel = self.sentinel_interval_sec
              self.sentinel_interval_sec = float(server_sentinel)
              if old_sentinel != self.sentinel_interval_sec:
-                 logger.info(f"Pipe {self.id}: Sentinel interval updated by server: {old_sentinel} -> {self.sentinel_interval_sec}")
+                 logger.debug(f"Pipe {self.id}: Sentinel interval updated by server: {old_sentinel} -> {self.sentinel_interval_sec}")
             
         # Reset state flags for new session
         self._initial_snapshot_done = False
@@ -304,7 +304,7 @@ class AgentPipe(Pipe):
         self._heartbeat_task = None
         if self._heartbeat_task is None or self._heartbeat_task.done():
             self._heartbeat_task = asyncio.create_task(self._run_heartbeat_loop())
-            logger.info(f"Pipe {self.id}: Started heartbeat loop (Session: {session_id})")
+            logger.debug(f"Pipe {self.id}: Started heartbeat loop (Session: {session_id})")
         
         msg = f"Session {session_id} created"
         if self._consecutive_errors > 0:

@@ -35,10 +35,12 @@ class FSArbitrator:
             return False
 
         message_source = self._get_message_source(event)
-        is_realtime = (message_source == MessageSource.REALTIME)
-        is_audit = (message_source == MessageSource.AUDIT)
-        is_snapshot = (message_source == MessageSource.SNAPSHOT)
-        is_on_demand = (message_source == MessageSource.ON_DEMAND_JOB)
+        source_val = message_source.value if hasattr(message_source, 'value') else str(message_source)
+        
+        is_realtime = (source_val == MessageSource.REALTIME.value)
+        is_audit = (source_val == MessageSource.AUDIT.value)
+        is_snapshot = (source_val == MessageSource.SNAPSHOT.value)
+        is_on_demand = (source_val == MessageSource.ON_DEMAND_JOB.value)
         
         # Compensation sources are those that find data already on disk (not live events)
         is_compensation = is_audit or is_snapshot or is_on_demand
@@ -55,9 +57,12 @@ class FSArbitrator:
             rows_processed += 1
             if rows_processed % 100 == 0: await asyncio.sleep(0)
 
+            # Update clock with row mtime. For deletions, mtime might be None.
             mtime = payload.get('modified_time')
+            
             self.state.logical_clock.update(mtime, can_sample_skew=is_realtime)
             
+            # Update latency (Lag) based on current watermark
             watermark = self.state.logical_clock.get_watermark()
             effective_mtime_for_lag = mtime if mtime is not None else watermark
             self.state.last_event_latency = max(0.0, (watermark - effective_mtime_for_lag) * 1000.0)
@@ -74,10 +79,10 @@ class FSArbitrator:
         return True
 
     async def _handle_delete(self, path: str, is_realtime: bool, mtime: Optional[float]):
-        self.logger.debug(f"DELETE_EVENT for {path} realtime={is_realtime}")
         if is_realtime:
             await self.tree_manager.delete_node(path)
             
+            # Watermark has been updated in the caller loop using logical_clock.update()
             logical_ts = self.state.logical_clock.get_watermark()
             physical_ts = time.time()
             self.state.tombstone_list[path] = (logical_ts, physical_ts)
@@ -104,11 +109,15 @@ class FSArbitrator:
             self.state.blind_spot_additions.discard(path)
 
     async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float, watermark: float):
+        source_val = source.value if hasattr(source, 'value') else str(source)
+        
         # 1. Tombstone Protection
         if path in self.state.tombstone_list:
-            tombstone_ts, tombstone_physical_ts = self.state.tombstone_list[path]
+            tombstone_ts, tombstone_physical_ts = self.state.tombstone_list[path] # Use logical timestamp for arbitration
             
+            # Check if this is "New activity" after deletion
             is_newer_logical = mtime > (tombstone_ts + self.TOMBSTONE_EPSILON)
+            
             is_newer_physical = False
             now = time.time()
             if not is_newer_logical and tombstone_ts > (now + 5.0):
@@ -121,19 +130,23 @@ class FSArbitrator:
 
         # 2. Smart Merge Arbitration
         existing = self.state.get_node(path)
-        is_realtime = (source == MessageSource.REALTIME)
-        is_compensation = (source in (MessageSource.AUDIT, MessageSource.SNAPSHOT, MessageSource.ON_DEMAND_JOB))
+        is_realtime = (source_val == MessageSource.REALTIME.value)
+        is_compensation = (source_val in (MessageSource.AUDIT.value, MessageSource.SNAPSHOT.value, MessageSource.ON_DEMAND_JOB.value))
         
         if is_compensation:
+            # Snapshot/Audit arbitration
             if existing:
+                # If mtime is not newer, ignore (unless audit_skipped which we use for heartbeats/protection)
                 if not payload.get('audit_skipped') and existing.modified_time >= mtime:
                     return
             
-            if source == MessageSource.AUDIT and existing is None:
+            if source_val == MessageSource.AUDIT.value and existing is None:
+                # Rule 3: Parent Mtime Check
                 parent_path = payload.get('parent_path')
                 parent_mtime_audit = payload.get('parent_mtime')
                 memory_parent = self.state.directory_path_map.get(parent_path)
                 if memory_parent and memory_parent.modified_time > (parent_mtime_audit or 0):
+                    # Memory parent is newer than what audit saw -> audit result is stale
                     return
 
         # Capture state before update for arbitration
@@ -145,32 +158,39 @@ class FSArbitrator:
         node = self.state.get_node(path)
         if not node: return
 
+        # Fix: Only Realtime events should update last_updated_at (Stale Evidence Protection)
+        # Snapshot/Audit events should NOT update this timestamp
         if not is_realtime and old_last_updated_at > 0:
             node.last_updated_at = old_last_updated_at
 
         # 3. Blind Spot and Suspect Management
         if is_realtime:
+            # Atomic Write Check:
             is_atomic = payload.get('is_atomic_write', True)
+            
             if is_atomic:
+                # Clean write (Close/Create) -> Clear suspect
                 self.state.suspect_list.pop(path, None)
-                node.old_suspect_state = False
+                node.old_suspect_state = False # Cleanup partial state
                 node.integrity_suspect = False
             else:
+                # Partial write (Modify) -> Mark/Renew suspect
                 expiry = time.monotonic() + self.hot_file_threshold
                 self.state.suspect_list[path] = (expiry, mtime)
                 heapq.heappush(self.state.suspect_heap, (expiry, path))
                 node.integrity_suspect = True
-
+            
             self.state.blind_spot_deletions.discard(path)
             self.state.blind_spot_additions.discard(path)
             node.known_by_agent = True
         else:
-            # Compensation (Audit/Snapshot/OnDemand find)
+            # Manage Suspect List (Hot Data)
             watermark = self.state.logical_clock.get_watermark()
             skew = self.state.logical_clock.get_skew()
             
             logical_age = watermark - mtime
             physical_age = (watermark + skew) - mtime
+            
             age = min(logical_age, physical_age)
             mtime_changed = (existing is None) or (abs(old_mtime - mtime) > self.FLOAT_EPSILON)
             
@@ -191,6 +211,7 @@ class FSArbitrator:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)
             else:
+                # mtime unchanged, if cold, clear suspect
                 if age >= self.hot_file_threshold:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)

@@ -51,7 +51,7 @@ class MockSenderDriver:
     async def close(self): pass
     async def create_session(self, task_id): return {"session_id": "s1", "role": "leader"}
     async def heartbeat(self): return {"role": "leader"}
-    async def send_events(self, **kwargs): return {"success": True}
+    async def send_events(self, events, source_type="message", is_end=False, metadata=None): return {"success": True}
     async def close_session(self): pass
 
 @pytest.mark.asyncio

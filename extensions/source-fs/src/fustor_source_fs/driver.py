@@ -88,7 +88,7 @@ class FSDriver(SourceDriver):
         default_workers = min(4, multiprocessing.cpu_count())
         max_workers = self.config.driver_params.get("max_scan_workers", default_workers)
         self._executor = ThreadPoolExecutor(max_workers=max_workers)
-        logger.info(f"[fs] Driver initialized with {max_workers} scan workers (default was {default_workers}).")
+        logger.debug(f"[fs] Driver initialized with {max_workers} scan workers (default was {default_workers}).")
         
         self._initialized = True
 
@@ -101,7 +101,7 @@ class FSDriver(SourceDriver):
             if self._pre_scan_completed:
                 return
 
-            logger.info(f"[fs] Performing initial parallel directory scan for: {self.uri}")
+            logger.debug(f"[fs] Performing initial parallel directory scan for: {self.uri}")
             
             dir_mtime_map: Dict[str, float] = {}
             dir_children_map: Dict[str, List[str]] = {}

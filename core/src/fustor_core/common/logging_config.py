@@ -95,7 +95,7 @@ def setup_logging(
             },
             'console': {
                 'class': 'logging.StreamHandler',
-                'level': logging.DEBUG,
+                'level': numeric_level,
                 'formatter': 'color_console',
                 'stream': sys.stdout,
                 'filters': ['uvicorn_access_filter']
@@ -141,13 +141,13 @@ def setup_logging(
             },
             'uvicorn.access': {
                 'handlers': ['file'],
-                'level': logging.INFO,
+                'level': numeric_level,
                 'propagate': False
             }
         },
         'root': {
             'handlers': ['file'],
-            'level': logging.ERROR,
+            'level': numeric_level,
             'propagate': True,
         }
     }

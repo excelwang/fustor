@@ -80,7 +80,7 @@ class EventBusInstanceRuntime:
         self.info = "生产者任务已启动，正在监听数据源。"
         self._producer_stop_event.clear()
         self.producer_task = asyncio.create_task(self._produce_loop())
-        logger.info(self.info)
+        logger.debug(self.info)
 
     async def stop_producer(self):
         if self.producer_task and not self.producer_task.done():
@@ -93,15 +93,15 @@ class EventBusInstanceRuntime:
         self.state = EventBusState.IDLE
         self.info = "因没有订阅者，生产者任务已暂停。"
         self.producer_task = None
-        logger.info(self.info)
+        logger.debug(self.info)
 
     async def _produce_loop(self):
-        logger.info(f"总线 '{self.id}' 的生产循环已启动。")
+        logger.debug(f"总线 '{self.id}' 的生产循环已启动。")
         import queue
         event_queue = queue.Queue(maxsize=100)
 
         def _threaded_producer():
-            logger.info(f"总线 '{self.id}' 的后台生产者线程已启动。")
+            logger.debug(f"总线 '{self.id}' 的后台生产者线程已启动。")
             try:
                 # Check if the requested position is available before getting the iterator
                 start_position = self.internal_bus.buffer_start_position
@@ -116,7 +116,7 @@ class EventBusInstanceRuntime:
                 
                 # Signal that the producer is ready (e.g., pre-scan is done and iterator is obtained)
                 self._loop.call_soon_threadsafe(self.ready_event.set)
-                logger.info(f"总线 '{self.id}' 的后台生产者线程已就绪，进入事件循环。")
+                logger.debug(f"总线 '{self.id}' 的后台生产者线程已就绪，进入事件循环。")
 
                 for event in iterator:
                     if self._producer_stop_event.is_set() or self.source_driver_instance._stop_driver_event.is_set(): # Check new stop event
@@ -133,7 +133,7 @@ class EventBusInstanceRuntime:
                 if not self.ready_event.is_set():
                     self._loop.call_soon_threadsafe(self.ready_event.set)
                 event_queue.put(None)
-                logger.info(f"总线 '{self.id}' 的后台生产者线程已结束。")
+                logger.debug(f"总线 '{self.id}' 的后台生产者线程已结束。")
 
         producer_thread = threading.Thread(target=_threaded_producer, daemon=True)
         producer_thread.start()

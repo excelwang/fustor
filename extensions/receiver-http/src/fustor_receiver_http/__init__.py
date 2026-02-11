@@ -88,6 +88,30 @@ HeartbeatCallback = Callable[[str, bool], Awaitable[Dict[str, Any]]]
 SessionClosedCallback = Callable[[str], Awaitable[None]]
 
 
+class HeartbeatLogFilter(logging.Filter):
+    """Filter out heartbeat access logs from uvicorn."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        # Filter out Uvicorn access logs containing '/heartbeat'
+        return "/heartbeat" not in record.getMessage()
+
+
+class EventsLogFilter(logging.Filter):
+    """Filter out high-frequency event ingestion logs from uvicorn."""
+    def __init__(self, name: str = "", skip_count: int = 100):
+        super().__init__(name)
+        self.count = 0
+        self.skip_count = skip_count
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if "/events" in record.getMessage():
+            self.count += 1
+            # Show the first 5, then every 'skip_count'
+            if self.count <= 5 or self.count % self.skip_count == 0:
+                return True
+            return False
+        return True
+
+
 class HTTPReceiver(Receiver):
     """
     HTTP-based Receiver implementation for Fustor Fusion.
@@ -123,6 +147,9 @@ class HTTPReceiver(Receiver):
         
         # Session timeout configuration
         self.session_timeout_seconds = config.get("session_timeout_seconds", 30) if config else 30
+        
+        # Log suppression for high-frequency ingestion
+        self._ingest_count = 0
         
         # Create routers
         self._session_router = self._create_session_router()
@@ -204,6 +231,11 @@ class HTTPReceiver(Receiver):
 
     async def start(self) -> None:
         """Start the receiver's own HTTP server on its configured port."""
+        # Setup heartbeat and events filtering for uvicorn access logs
+        uvicorn_access = logging.getLogger("uvicorn.access")
+        uvicorn_access.addFilter(HeartbeatLogFilter())
+        uvicorn_access.addFilter(EventsLogFilter(skip_count=500))
+
         config = uvicorn.Config(
             app=self._app,
             host=self.bind_host,
@@ -213,6 +245,7 @@ class HTTPReceiver(Receiver):
         self._server = uvicorn.Server(config)
         self._serve_task = asyncio.create_task(self._server.serve())
         self.logger.info(f"HTTP Receiver {self.id} started on {self.get_address()}")
+
     
     async def stop(self) -> None:
         """Stop the receiver's HTTP server gracefully."""

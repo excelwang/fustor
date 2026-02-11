@@ -134,7 +134,7 @@ class ViewStateManager:
             state = self._ensure_state(view_id_str)
             state.completed_snapshot_session_id = session_id
             state.updated_at = datetime.now()
-            logger.info(f"View {view_id_str} snapshot marked complete by session {session_id}")
+            logger.debug(f"View {view_id_str} snapshot marked complete by session {session_id}")
 
     async def set_state(self, view_id: str, status: str, locked_by_session_id: Optional[str] = None) -> ViewState:
         """设置指定视图的状态"""
@@ -223,12 +223,12 @@ class ViewStateManager:
             if state.leader_session_id is None:
                 state.leader_session_id = session_id
                 state.updated_at = datetime.now()
-                logger.info(f"Session {session_id} became Leader for view {view_id_str}")
+                logger.debug(f"Session {session_id} became Leader for view {view_id_str}")
                 return True
             elif state.leader_session_id == session_id:
                 return True
             else:
-                logger.info(f"Session {session_id} is Follower for view {view_id_str} (Leader: {state.leader_session_id})")
+                logger.debug(f"Session {session_id} is Follower for view {view_id_str} (Leader: {state.leader_session_id})")
                 return False
     
     async def release_leader(self, view_id: str, session_id: str) -> bool:

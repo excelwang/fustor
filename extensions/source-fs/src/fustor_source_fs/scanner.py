@@ -64,6 +64,15 @@ class RecursiveScanner:
                 except queue.Empty:
                     with self._map_lock:
                         if self._pending_dirs == 0 and self._work_queue.empty():
+                            # Final drain check: one last non-blocking attempt to see if anything was put 
+                            # into the queue just before the workers finished.
+                            try:
+                                while True:
+                                    result = self._results_queue.get_nowait()
+                                    if result is not None:
+                                        yield result
+                            except queue.Empty:
+                                pass
                             break
                     if self._stop_event.is_set():
                         break
@@ -303,6 +312,9 @@ class FSScanner:
                 if dir_metadata:
                     if is_silent:
                         dir_metadata['audit_skipped'] = True
+                        logger.debug(f"[audit] Directory {root} is SILENT (mtime {current_dir_mtime})")
+                    else:
+                        logger.debug(f"[audit] Directory {root} is NOT silent (mtime {current_dir_mtime}, cached {cached_mtime})")
                     
                     res_q.put((UpdateEvent(
                         event_schema=event_schema,
@@ -322,6 +334,7 @@ class FSScanner:
                             if entry.is_dir(follow_symlinks=False):
                                 local_subdirs.append(entry.path)
                             elif not is_silent and fnmatch.fnmatch(entry.name, self.engine.file_pattern):
+                                logger.debug(f"[audit] Found file during scan: {entry.path}")
                                 st = entry.stat()
                                 meta = get_file_metadata(entry.path, root_path=self.root, stat_info=st)
                                 if meta:

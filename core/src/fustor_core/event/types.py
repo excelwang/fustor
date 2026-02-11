@@ -24,4 +24,4 @@ class MessageSource(str, Enum):
     REALTIME = "realtime"
     SNAPSHOT = "snapshot"
     AUDIT = "audit"
-    ON_DEMAND_JOB = "on_demand_jon"
+    ON_DEMAND_JOB = "on_demand_job"

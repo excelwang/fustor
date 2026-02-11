@@ -34,13 +34,27 @@ async def send_events(pipe_id, api_key, url, total_events, batch_size=500):
         while sent < total_events:
             events = []
             for _ in range(min(batch_size, total_events - sent)):
-                filename = f"stress_{pipe_id}_{uuid.uuid4()}.txt"
-                event = {
-                    "event_type": "created",
-                    "path": f"/{filename}",
-                    "is_directory": False,
+                uid = uuid.uuid4()
+                filename = f"stress_{pipe_id}_{uid}.txt"
+                path = f"/{filename}"
+                
+                # Following fustor-schema-fs requirements
+                row = {
+                    "path": path,
+                    "file_name": filename,
                     "size": 1024,
-                    "mtime": time.time(),
+                    "modified_time": time.time(),
+                    "is_directory": False,
+                    "is_atomic_write": True
+                }
+                
+                event = {
+                    "event_type": "insert",
+                    "event_schema": "fs",
+                    "table": "files",
+                    "fields": ["path", "file_name", "size", "modified_time", "is_directory", "is_atomic_write"],
+                    "rows": [row],
+                    "message_source": "realtime"
                 }
                 events.append(event)
             
@@ -54,10 +68,10 @@ async def send_events(pipe_id, api_key, url, total_events, batch_size=500):
                 async with session.post(f"{url}/api/v1/pipe/ingest/{session_id}/events", json=payload, headers=headers) as resp:
                     if resp.status != 200:
                         text = await resp.text()
-                        print(f"[{pipe_id}] Error: {resp.status} {text}")
-                        if resp.status == 419 or resp.status == 404: # Session expired or missing
+                        if sent == 0: # Only print first error to avoid noise
+                             print(f"[{pipe_id}] Error: {resp.status} {text}")
+                        if resp.status == 419 or resp.status == 404:
                              session_id = await create_session(session, url, api_key, pipe_id)
-                             print(f"[{pipe_id}] Re-created session: {session_id}")
                     else:
                         sent += len(events)
                 
@@ -80,8 +94,6 @@ async def main():
     parser.add_argument("--batch", type=int, default=500)
     args = parser.parse_args()
 
-    # Total 200,000 events (100k per agent)
-    # Target 10,000 events/s per agent
     t1 = send_events("pipe-1", "agent-1-push-key", args.url, args.count, args.batch)
     t2 = send_events("pipe-2", "agent-2-push-key", args.url, args.count, args.batch)
 
