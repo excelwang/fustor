@@ -44,7 +44,7 @@ class CreateSessionResponse(BaseModel):
 class EventBatch(BaseModel):
     """Batch of events to ingest."""
     events: List[EventBase]
-    source_type: str = "message"  # 'message', 'snapshot', 'audit', 'find_complete', 'on_demand_find'
+    source_type: str = "message"  # 'message', 'snapshot', 'audit', 'job_complete', 'on_demand_job'
     is_end: bool = False
     metadata: Optional[Dict[str, Any]] = None  # Extra info e.g., scan_path
 
@@ -115,7 +115,7 @@ class HTTPReceiver(Receiver):
         self._on_event_received: Optional[EventReceivedCallback] = None
         self._on_heartbeat: Optional[HeartbeatCallback] = None
         self._on_session_closed: Optional[SessionClosedCallback] = None
-        self._on_scan_complete: Optional[Callable[[str, str, Optional[str]], Awaitable[None]]] = None  # session_id, path, find_id
+        self._on_scan_complete: Optional[Callable[[str, str, Optional[str]], Awaitable[None]]] = None  # session_id, path, job_id
         
         # API key to pipe mapping
         self._api_key_to_pipe: Dict[str, str] = {}
@@ -364,18 +364,18 @@ class HTTPReceiver(Receiver):
         ):
             """Ingest a batch of events."""
             
-            # Handle find_complete or on_demand_find notification
-            if batch.source_type in ("find_complete", "on_demand_find", "scan_complete") and batch.metadata:
+            # Handle job_complete or on_demand_job notification
+            if batch.source_type in ("job_complete", "on_demand_job", "find_complete", "on_demand_find", "scan_complete") and batch.metadata:
                 scan_path = batch.metadata.get("scan_path")
-                find_id = batch.metadata.get("find_id") or batch.metadata.get("scan_id")
-                receiver.logger.info(f"Received find_complete for session {session_id}, path: {scan_path}, id: {find_id}")
+                job_id = batch.metadata.get("job_id")
+                receiver.logger.info(f"Received job_complete for session {session_id}, path: {scan_path}, id: {job_id}")
                 if scan_path and receiver._on_scan_complete:
                     try:
-                        await receiver._on_scan_complete(session_id, scan_path, find_id)
-                        return {"status": "ok", "phase": "find_complete"}
+                        await receiver._on_scan_complete(session_id, scan_path, job_id)
+                        return {"status": "ok", "phase": "job_complete"}
                     except Exception as e:
                         receiver.logger.error(f"Find complete handling failed: {e}")
-                return {"status": "ok", "phase": "find_complete"}
+                return {"status": "ok", "phase": "job_complete"}
 
             if receiver._on_event_received:
                 try:

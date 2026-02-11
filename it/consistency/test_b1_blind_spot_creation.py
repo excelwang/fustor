@@ -69,6 +69,15 @@ class TestBlindSpotFileCreation:
         
         # Now check if the original blind-spot file was discovered
         found_after_audit = fusion_client.wait_for_file_in_tree(test_file_rel, timeout=SHORT_TIMEOUT)
+        
+        if not found_after_audit:
+             # Debug: dump the tree
+             try:
+                 tree_dump = fusion_client.get_tree(path="/", max_depth=2)
+                 print(f"DEBUG TREE DUMP: {tree_dump}")
+             except Exception as e:
+                 print(f"DEBUG TREE DUMP FAILED: {e}")
+
         assert found_after_audit is not None, \
             f"File {test_file_rel} should be discovered by the Audit scan"
         

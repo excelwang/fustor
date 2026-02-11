@@ -1,4 +1,4 @@
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 import asyncio
 import heapq
 import time
@@ -190,33 +190,41 @@ class FSViewDriver(FSViewBase):
 
 
 
-    async def trigger_realtime_scan(self, path: str, recursive: bool = True) -> bool:
+    async def trigger_realtime_scan(self, path: str, recursive: bool = True) -> Tuple[bool, Optional[str]]:
         """
-        Triggers a real-time scan on the agent side by queuing a command.
+        Triggers a realtime find on the agent side by broadcasting a command to ALL pipes.
+        Returns: (success, job_id)
         """
         from fustor_fusion.core.session_manager import session_manager
-        from fustor_fusion.view_state_manager import view_state_manager
         
         async with self._global_read_lock():
-            # 1. Find the authoritative session (Leader)
-            lead_session_id = await view_state_manager.get_leader_session_id(self.view_id)
-            if not lead_session_id:
-                # Fallback: check any active session if leader not explicitly set
-                active_sessions = await session_manager.get_view_sessions(self.view_id)
-                if not active_sessions:
-                    return False
-                # Pick any session (likely there's only one relevant one per view usually)
-                lead_session_id = list(active_sessions.keys())[0]
+            # 1. Get ALL active sessions for this view
+            active_sessions = await session_manager.get_view_sessions(self.view_id)
+            if not active_sessions:
+                self.logger.warning(f"No active sessions for view {self.view_id}. Cannot trigger realtime find.")
+                return False, None
             
-            # 2. Queue the command
+            session_ids = list(active_sessions.keys())
+            
+            # 2. Create a unified agent job record for tracking all sessions
+            job_id = await session_manager.create_agent_job(self.view_id, path, session_ids)
+            
+            # 3. Queue the command for EACH session (Broadcast)
             command = {
                 "type": "scan",
                 "path": path,
                 "recursive": recursive,
+                "job_id": job_id,
                 "created_at": time.time()
             }
             
-            return await session_manager.queue_command(self.view_id, lead_session_id, command)
+            success_count = 0
+            for session_id in session_ids:
+                if await session_manager.queue_command(self.view_id, session_id, command):
+                    success_count += 1
+            
+            self.logger.info(f"Broadcasted realtime find {job_id} to {success_count}/{len(session_ids)} sessions for path {path}")
+            return success_count > 0, job_id
 
     async def get_data_view(self, **kwargs) -> dict:
         """Required by the ViewDriver ABC."""

@@ -51,10 +51,13 @@ class TreeManager:
                 node = DirectoryNode(name, path, size, mtime, ctime)
                 node.audit_skipped = payload.get(FSSchemaFields.AUDIT_SKIPPED, False)
                 self.state.directory_path_map[path] = node
-                if path != '/':
-                    parent_node = self.state.directory_path_map.get(parent_path)
-                    if parent_node:
-                        parent_node.children[name] = node
+                
+            # Ensure parent-child relationship (Fix for potential orphan nodes)
+            if path != '/':
+                parent_node = self.state.directory_path_map.get(parent_path)
+                if parent_node:
+                    parent_node.children[name] = node
+                    # self.logger.debug(f"Attached directory {name} to parent {parent_path}")
             
             node.last_updated_at = time.time()
 
@@ -71,9 +74,14 @@ class TreeManager:
             else:
                 node = FileNode(name, path, size, mtime, ctime)
                 self.state.file_path_map[path] = node
-                parent_node = self.state.directory_path_map.get(parent_path)
-                if parent_node:
-                    parent_node.children[name] = node
+            
+            # Ensure parent-child relationship (Fix for potential orphan nodes)
+            parent_node = self.state.directory_path_map.get(parent_path)
+            if parent_node:
+                parent_node.children[name] = node
+                self.logger.info(f"DEBUG: Attached file {name} to parent {parent_path}. Parent has {len(parent_node.children)} children.")
+            else:
+                self.logger.warning(f"DEBUG: Failed to attach file {name} to parent {parent_path} (Parent not found!)")
             
             node.last_updated_at = time.time()
 

@@ -158,8 +158,8 @@ class SenderHandlerAdapter(SenderHandler):
             "audit": "audit",
             "sentinel": "message",
             "message": "message",
-            "on_demand_find": "on_demand_find",
-            "find_complete": "on_demand_find",
+            "on_demand_job": "on_demand_job",
+            "job_complete": "job_complete",
         }
         source_type = source_type_map.get(phase, "message")
         

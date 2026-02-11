@@ -63,44 +63,40 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep, chec
         if not driver:
             return ORJSONResponse(content={"detail": "Driver not initialized"}, status_code=503)
             
-        find_id = None
+        job_id = None
         if force_real_time:
             if hasattr(driver, "trigger_realtime_scan"):
-                # Create a job record first
-                from fustor_fusion.core.session_manager import session_manager
-                find_id = await session_manager.create_find_job(view_id, path)
-                
-                triggered = await driver.trigger_realtime_scan(path, recursive=recursive)
+                triggered, job_id = await driver.trigger_realtime_scan(path, recursive=recursive)
                 if triggered:
-                    logger.info(f"Triggered realtime find (id={find_id}) for {path} on view {view_id}")
+                    logger.info(f"Triggered realtime find (id={job_id}) for {path} on view {view_id}")
                 else:
-                    logger.warning(f"Failed to trigger realtime find (id={find_id}) for {path} on view {view_id} (No active session?)")
+                    logger.warning(f"Failed to trigger realtime find for {path} on view {view_id} (No active session?)")
             else:
                 logger.warning(f"Driver for view {view_id} does not support realtime find")
         
         effective_recursive = recursive if max_depth is None else True
         result = await driver.get_directory_tree(path, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
         
-        # Check if there's a pending find for this path
-        find_pending = False
+        # Check if there's a pending job for this path
+        job_pending = False
         if force_real_time:
             from fustor_fusion.core.session_manager import session_manager
-            find_pending = await session_manager.has_pending_find(view_id, path)
+            job_pending = await session_manager.has_pending_job(view_id, path)
 
         if result is None:
-            if find_pending:
+            if job_pending:
                 return ORJSONResponse(content={
                     "data": None,
-                    "find_id": find_id,
-                    "find_pending": True,
+                    "job_id": job_id,
+                    "job_pending": True,
                     "message": "Path not found, but a find has been triggered and is pending."
                 }, status_code=200)
             return ORJSONResponse(content={"detail": "路径未找到或尚未同步"}, status_code=404)
         
         return ORJSONResponse(content={
             "data": result,
-            "find_id": find_id,
-            "find_pending": find_pending
+            "job_id": job_id,
+            "job_pending": job_pending
         })
 
     @router.get("/search", 

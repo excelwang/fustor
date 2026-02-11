@@ -9,14 +9,15 @@ from fustor_fusion_sdk.interfaces import SessionInfo
 logger = logging.getLogger(__name__)
 
 @dataclass
-class FindJob:
-    find_id: str
+class AgentJob:
+    job_id: str
     view_id: str
     path: str
     status: str  # "PENDING", "COMPLETED", "FAILED"
     created_at: float
     completed_at: Optional[float] = None
-    session_id: Optional[str] = None
+    expected_sessions: Set[str] = field(default_factory=set)
+    completed_sessions: Set[str] = field(default_factory=set)
 
 class SessionManager:
     """
@@ -33,41 +34,51 @@ class SessionManager:
         self._cleanup_task: Optional[asyncio.Task] = None
         self._is_removing: Set[str] = set() # Set of session_ids currently being removed
         
-        # Find Job Tracking
-        self._find_jobs: Dict[str, FindJob] = {}
-        self._path_to_find_id: Dict[Tuple[str, str], str] = {} # (view_id, path) -> find_id
+        # Agent Job Tracking (Generic async command tracking)
+        self._agent_jobs: Dict[str, AgentJob] = {}
+        self._path_to_job_id: Dict[Tuple[str, str], str] = {} # (view_id, path) -> job_id
 
     def _get_view_lock(self, view_id: str) -> asyncio.Lock:
         """获取 per-view 锁（惰性创建）。"""
         return self._view_locks.setdefault(view_id, asyncio.Lock())
 
-    async def create_find_job(self, view_id: str, path: str) -> str:
-        """Create a new find job and return its unique ID."""
-        find_id = str(uuid.uuid4())[:8]
-        job = FindJob(
-            find_id=find_id,
+    async def create_agent_job(self, view_id: str, path: str, session_ids: List[str]) -> str:
+        """Create a new agent job for multiple sessions and return its unique ID."""
+        job_id = str(uuid.uuid4())[:8]
+        job = AgentJob(
+            job_id=job_id,
             view_id=view_id,
             path=path,
             status="PENDING",
-            created_at=time.time()
+            created_at=time.time(),
+            expected_sessions=set(session_ids)
         )
-        self._find_jobs[find_id] = job
-        self._path_to_find_id[(view_id, path)] = find_id
-        return find_id
+        self._agent_jobs[job_id] = job
+        self._path_to_job_id[(view_id, path)] = job_id
+        return job_id
 
-    def get_find_jobs(self) -> List[Dict[str, Any]]:
-        """List all find jobs."""
-        return [
-            {
-                "find_id": j.find_id,
+    def get_agent_jobs(self) -> List[Dict[str, Any]]:
+        """List all agent jobs with completion percentage."""
+        results = []
+        for j in self._agent_jobs.values():
+            total = len(j.expected_sessions)
+            done = len(j.completed_sessions)
+            percentage = round((done / total * 100.0), 2) if total > 0 else 100.0
+            
+            results.append({
+                "job_id": j.job_id,
                 "view_id": j.view_id,
                 "path": j.path,
                 "status": j.status,
+                "progress": {
+                    "completed_pipes": done,
+                    "total_pipes": total,
+                    "percentage": percentage
+                },
                 "created_at": j.created_at,
                 "completed_at": j.completed_at
-            }
-            for j in self._find_jobs.values()
-        ]
+            })
+        return results
 
     async def create_session_entry(self, view_id: str, session_id: str, 
                                  task_id: Optional[str] = None, 
@@ -121,57 +132,56 @@ class SessionManager:
                         session_info.pending_scans = set()
                     session_info.pending_scans.add(path)
                     
-                    # Find find_id and add to command for Agent to return
-                    find_id = self._path_to_find_id.get((view_id, path))
-                    if find_id:
-                        command["find_id"] = find_id # Pass find_id to agent
-                        if find_id in self._find_jobs:
-                            self._find_jobs[find_id].session_id = session_id
+                    # Find job_id and add to command for Agent to return
+                    job_id = command.get("job_id") or self._path_to_job_id.get((view_id, path))
+                    if job_id:
+                        command["job_id"] = job_id # Pass job_id to agent
                 
                 session_info.pending_commands.append(command)
                 logger.debug(f"Queued command for session {session_id}: {command['type']}")
                 return True
         return False
 
-    async def complete_find(self, view_id: str, session_id: str, path: str, find_id: Optional[str] = None) -> bool:
-        """Mark a find job as complete."""
+    async def complete_agent_job(self, view_id: str, session_id: str, path: str, job_id: Optional[str] = None) -> bool:
+        """Mark an agent job as complete for a specific session."""
         view_id = str(view_id)
-        logger.info(f"complete_find called: view_id={view_id}, session_id={session_id}, path={path}, find_id={find_id}")
+        logger.info(f"complete_agent_job called: view_id={view_id}, session_id={session_id}, path={path}, job_id={job_id}")
         async with self._get_view_lock(view_id):
-            # 1. Use find_id if provided (Reliable)
-            if find_id and find_id in self._find_jobs:
-                job = self._find_jobs[find_id]
-                logger.info(f"Found job for find_id={find_id}: status={job.status}")
-                job.status = "COMPLETED"
-                job.completed_at = time.time()
+            # 1. Resolve job_id
+            if not job_id:
+                job_id = self._path_to_job_id.get((view_id, path))
+            
+            if job_id and job_id in self._agent_jobs:
+                job = self._agent_jobs[job_id]
                 
-                # Also cleanup session info if matched
+                # Mark this session as completed
+                job.completed_sessions.add(session_id)
+                logger.info(f"Job {job_id}: Session {session_id} completed. Progress: {len(job.completed_sessions)}/{len(job.expected_sessions)}")
+                
+                # Check if ALL expected sessions have finished
+                # We use subset check in case some sessions disconnected during find
+                remaining = job.expected_sessions - job.completed_sessions
+                # Filter out sessions that are no longer active
+                active_view_sessions = set(self._sessions.get(view_id, {}).keys())
+                remaining_active = remaining.intersection(active_view_sessions)
+                
+                if not remaining_active:
+                    job.status = "COMPLETED"
+                    job.completed_at = time.time()
+                    logger.info(f"Job {job_id} fully COMPLETED (All active expected sessions finished)")
+                
+                # Cleanup session-specific pending state
                 if view_id in self._sessions and session_id in self._sessions[view_id]:
                     si = self._sessions[view_id][session_id]
                     if si.pending_scans:
                         si.pending_scans.discard(path)
                 return True
             else:
-                logger.warning(f"No job found for find_id={find_id}. Known jobs: {list(self._find_jobs.keys())}")
-                
-            # 2. Fallback to path matching (Legacy/Best effort)
-            if view_id in self._sessions and session_id in self._sessions[view_id]:
-                session_info = self._sessions[view_id][session_id]
-                if session_info.pending_scans and path in session_info.pending_scans:
-                    session_info.pending_scans.discard(path)
-                    
-                    # Update find job
-                    find_id_from_path = self._path_to_find_id.get((view_id, path))
-                    if find_id_from_path and find_id_from_path in self._find_jobs:
-                        job = self._find_jobs[find_id_from_path]
-                        job.status = "COMPLETED"
-                        job.completed_at = time.time()
-                        logger.info(f"Found job via path for find_id={find_id_from_path}")
-                        return True
+                logger.warning(f"No job found for job_id={job_id} or path={path}")
         return False
 
-    async def has_pending_find(self, view_id: str, path: str) -> bool:
-        """Check if any session has a pending find for the given path."""
+    async def has_pending_job(self, view_id: str, path: str) -> bool:
+        """Check if any session has a pending job for the given path."""
         view_id = str(view_id)
         async with self._get_view_lock(view_id):
             if view_id in self._sessions:
