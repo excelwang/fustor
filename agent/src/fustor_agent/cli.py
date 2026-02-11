@@ -67,6 +67,18 @@ def start(configs, daemon, verbose, no_console_log):
         fustor-agent start pipe-a pipe-b      # Start multiple pipes
         fustor-agent start custom.yaml        # Start from managed file
     """
+    # Pre-flight Validation
+    click.echo("Running pre-flight validation...")
+    from .config.validator import ConfigValidator
+    validator = ConfigValidator()
+    is_valid, errors = validator.validate()
+    
+    if not is_valid:
+        click.echo(click.style("Configuration validation failed:", fg="red"))
+        for err in errors:
+            click.echo(f"  - {err}")
+        sys.exit(1)
+    
     # Determine log level: command line flag takes precedence over config file
     if verbose:
         log_level = "DEBUG"
@@ -137,6 +149,7 @@ def start(configs, daemon, verbose, no_console_log):
     except Exception as e:
         logger.critical(f"Startup error: {e}", exc_info=True)
         click.echo(click.style(f"\nFATAL: {e}", fg="red"))
+        sys.exit(1)
     finally:
         if os.path.exists(PID_FILE):
             try:
@@ -145,6 +158,32 @@ def start(configs, daemon, verbose, no_console_log):
                         os.remove(PID_FILE)
             except Exception:
                 pass
+
+
+@cli.command()
+def validate():
+    """
+    Validate configuration integrity.
+    Checks for:
+    - YAML syntax errors
+    - Missing required fields
+    - Broken cross-references (pipes pointing to unknown sources/senders)
+    """
+    from .config.validator import ConfigValidator
+    
+    click.echo("Validating configuration...")
+    validator = ConfigValidator()
+    
+    is_valid, errors = validator.validate()
+    
+    if is_valid:
+        click.echo(click.style("Configuration is valid.", fg="green"))
+    else:
+        click.echo(click.style(f"Configuration has {len(errors)} errors:", fg="red"))
+        for err in errors:
+            click.echo(f"  - {err}")
+        sys.exit(1)
+
 
 
 @cli.command()
