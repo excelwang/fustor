@@ -59,3 +59,39 @@ async def test_auth_multiple_views_dedicated_keys():
         
         assert await get_view_id_from_api_key("key1") == "view-1"
         assert await get_view_id_from_api_key("key2") == "view-2"
+
+def test_view_config_parsing(tmp_path):
+    """验证从 YAML 文件中正确解析 View 的 api_keys。"""
+    from fustor_fusion.config.unified import FusionConfigLoader
+    
+    config_dir = tmp_path / "fusion-config"
+    config_dir.mkdir()
+    
+    yaml_content = """
+views:
+  view-1:
+    driver: fs
+    api_keys:
+      - query-key-alpha
+      - query-key-beta
+receivers:
+  rec-1:
+    driver: http
+    api_keys:
+      - {key: agent-key, pipe_id: view-1}
+"""
+    config_file = config_dir / "test.yaml"
+    config_file.write_text(yaml_content)
+    
+    loader = FusionConfigLoader(config_dir=config_dir)
+    loader.load_all()
+    
+    view = loader.get_view("view-1")
+    assert view is not None
+    assert "query-key-alpha" in view.api_keys
+    assert "query-key-beta" in view.api_keys
+    
+    receiver = loader.get_receiver("rec-1")
+    assert receiver is not None
+    assert receiver.api_keys[0].key == "agent-key"
+    assert receiver.api_keys[0].pipe_id == "view-1"
