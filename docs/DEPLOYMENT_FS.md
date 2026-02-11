@@ -35,33 +35,9 @@ uv pip install fustor-agent fustor-source-fs fustor-sender-http
 
 ---
 
-## 3. 运行服务
+## 3. 架构配置示例
 
-安装完成后，请使用 `start` 命令启动服务。默认情况下，服务在前台运行，建议在测试完成后使用 `-D` 参数转入后台。
-
-### 3.1 启动 Fusion
-```bash
-# 前台启动（查看实时日志）
-fustor-fusion start
-
-# 后台启动
-fustor-fusion start -D
-```
-
-### 3.2 启动 Agent
-```bash
-# 前台启动
-fustor-agent start
-
-# 后台启动
-fustor-agent start -D
-```
-
----
-
-## 4. 架构配置示例
-
-### 4.1 服务端 (Fusion)
+### 3.1 服务端 (Fusion)
 配置文件: `~/.fustor/fusion-config/default.yaml`
 
 ```yaml
@@ -92,7 +68,7 @@ pipes:
     views: [unified-view]
 ```
 
-### 4.2 采集端 (Agent)
+### 3.2 采集端 (Agent)
 配置文件: `~/.fustor/agent-config/default.yaml`
 
 ```yaml
@@ -107,6 +83,31 @@ senders:
     credential: { key: "agent-1-push-key" }
 pipes:
   sync-job: { source: nfs-source, sender: fusion-main }
+```
+
+---
+
+
+## 3. 运行服务
+
+安装完成后，请使用 `start` 命令启动服务。默认情况下，服务在前台运行，建议在测试完成后使用 `-D` 参数转入后台。
+
+### 3.1 启动 Fusion
+```bash
+# 前台启动（查看实时日志）
+fustor-fusion start
+
+# 后台启动
+fustor-fusion start -D
+```
+
+### 3.2 启动 Agent
+```bash
+# 前台启动
+fustor-agent start
+
+# 后台启动
+fustor-agent start -D
 ```
 
 ---

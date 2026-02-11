@@ -361,15 +361,24 @@ class FusionClient:
         try:
             initial_stats = self.get_stats()
             initial_count = initial_stats.get("audit_cycle_count", 0)
+            
+            # If an audit is currently in progress, we must wait for it to finish (count+1)
+            # AND for the next one to run (count+2) to ensure it covers events that happened
+            # just before we called this function.
+            target_increment = 1
+            if initial_stats.get("is_auditing", False):
+                target_increment = 2
+                
         except Exception:
             initial_count = -1
+            target_increment = 1
             
         start = time.time()
         while time.time() - start < timeout:
             try:
                 stats = self.get_stats()
                 current_count = stats.get("audit_cycle_count", 0)
-                if current_count > initial_count and stats.get("last_audit_finished_at", 0) > 0:
+                if current_count >= initial_count + target_increment and stats.get("last_audit_finished_at", 0) > 0:
                     return True
             except Exception:
                 pass

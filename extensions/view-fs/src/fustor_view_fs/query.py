@@ -68,5 +68,6 @@ class FSViewQuery:
              "suspect_file_count": suspect_count,
              "logical_now": logical_now,
              "last_audit_finished_at": self.state.last_audit_finished_at,
-             "audit_cycle_count": self.state.audit_cycle_count
+             "audit_cycle_count": self.state.audit_cycle_count,
+             "is_auditing": self.state.last_audit_start is not None
         }
