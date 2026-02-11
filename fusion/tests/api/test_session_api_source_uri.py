@@ -1,7 +1,8 @@
 
 import pytest
 from unittest.mock import patch, Mock
-from fustor_fusion.api.session import create_session, list_sessions, CreateSessionPayload
+from fustor_fusion.api.session import create_session, CreateSessionPayload
+from fustor_fusion.api.views import list_view_sessions
 from fustor_fusion.core.session_manager import session_manager
 from fustor_fusion.view_state_manager import view_state_manager
 
@@ -36,7 +37,7 @@ async def test_session_source_uri_exposure():
         session_id = result["session_id"]
         
         # 2. List Sessions and verify source_uri
-        list_result = await list_sessions(view_id)
+        list_result = await list_view_sessions(view_id, authorized_view_id=view_id)
         
         assert list_result["count"] == 1
         session_data = list_result["active_sessions"][0]
