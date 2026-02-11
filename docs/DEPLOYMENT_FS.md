@@ -63,9 +63,11 @@ pipes:
   pipe-1:
     receiver: http-receiver
     views: [unified-view]
+    audit_interval_sec: 43200 # 12 hours
   pipe-2:
     receiver: http-receiver
     views: [unified-view]
+    audit_interval_sec: 43200 # 12 hours
 ```
 
 ### 3.2 采集端 (Agent)
@@ -128,10 +130,10 @@ curl -H "X-API-Key: external-read-only-key" \
 通过管理 API 追踪实时查找任务的完成状态：
 ```bash
 # 列出所有任务
-curl http://localhost:8101/api/v1/management/finds
+curl http://localhost:8101/api/v1/management/jobs
 
 # 查询特定任务
-curl http://localhost:8101/api/v1/management/finds/<job_id>
+curl http://localhost:8101/api/v1/management/jobs/<job_id>
 ```
 
 ### 5.3 理解 `integrity_suspect` 标记

@@ -103,11 +103,19 @@ def make_readiness_checker(view_name: str) -> Callable:
         
         # 1. Check Global Snapshot Status (via ViewStateManager)
         from ..view_state_manager import view_state_manager
+        state = await view_state_manager.get_state(view_name)
+        if not state or not state.authoritative_session_id:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"View '{view_name}': No active leader session. Ensure at least one agent is running.",
+                headers={"Retry-After": "10"}
+            )
+            
         is_snapshot_complete = await view_state_manager.is_snapshot_complete(view_name)
         if not is_snapshot_complete:
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail=f"View '{view_name}': Initial snapshot sync phase in progress",
+                detail=f"View '{view_name}': Initial snapshot sync phase in progress (Leader is scanning storage)",
                 headers={"Retry-After": "5"}
             )
             
@@ -231,6 +239,63 @@ def setup_view_routers():
                 logger.info(f"Registered fallback view API routes: {name} at prefix /{name}")
             except Exception as e:
                 logger.error(f"Error registering fallback API routes for '{name}': {e}", exc_info=True)
+
+    # 3. Add generic jobs endpoints for all views
+    # These must be added AFTER clearing routes and registering specific view routers
+    view_router.add_api_route(
+        "/{view_id}/jobs", 
+        list_view_jobs, 
+        methods=["GET"],
+        summary="List agent jobs for a view",
+        response_model=Dict[str, Any]
+    )
+    view_router.add_api_route(
+        "/{view_id}/jobs/{job_id}", 
+        get_view_job_status, 
+        methods=["GET"],
+        summary="Get job status",
+        response_model=Dict[str, Any]
+    )
+
+
+async def list_view_jobs(view_id: str, authorized_view_id: str = Depends(get_view_id_from_api_key)):
+    """List agent jobs for a specific view."""
+    if authorized_view_id != view_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="API Key not authorized for this view"
+        )
+    from ..core.session_manager import session_manager
+    all_jobs = session_manager.get_agent_jobs()
+    # Filter by view_id
+    jobs = [j for j in all_jobs if j.get("view_id") == view_id]
+    return {"jobs": jobs}
+
+
+async def get_view_job_status(view_id: str, job_id: str, authorized_view_id: str = Depends(get_view_id_from_api_key)):
+    """Get status of a specific agent job in a view."""
+    if authorized_view_id != view_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="API Key not authorized for this view"
+        )
+    from ..core.session_manager import session_manager
+    all_jobs = session_manager.get_agent_jobs()
+    job = next((j for j in all_jobs if j["job_id"] == job_id), None)
+    
+    if not job:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Agent job '{job_id}' not found"
+        )
+        
+    if job.get("view_id") != view_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Job '{job_id}' not found in view {view_id}"
+        )
+        
+    return job
 
 # Initial call to attempt registration (will be called again in lifespan for certainty)
 setup_view_routers()

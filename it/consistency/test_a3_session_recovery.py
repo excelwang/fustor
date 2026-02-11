@@ -57,8 +57,10 @@ class TestSessionRecovery:
             sessions = fusion_client.get_sessions()
             agent_a_sessions = [s for s in sessions if "client-a" in s.get("agent_id", "")]
             if agent_a_sessions:
-                new_session_id = agent_a_sessions[0]["session_id"]
-                if new_session_id != old_session_id:
+                # The agent might briefly have the old session ID if it hasn't heartbeat yet
+                current_session = agent_a_sessions[0]
+                if current_session["session_id"] != old_session_id:
+                    new_session_id = current_session["session_id"]
                     logger.info(f"Agent A recovered with new session ID: {new_session_id}")
                     break
             time.sleep(POLL_INTERVAL)

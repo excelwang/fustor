@@ -156,24 +156,4 @@ async def list_views():
     return {"running_views": result}
 
 
-@router.get("/jobs")
-async def list_agent_jobs():
-    """List all realtime agent jobs."""
-    from ..core.session_manager import session_manager
-    return {"jobs": session_manager.get_agent_jobs()}
 
-
-@router.get("/jobs/{job_id}")
-async def get_job_status(job_id: str):
-    """Get status of a specific agent job."""
-    from ..core.session_manager import session_manager
-    jobs = session_manager.get_agent_jobs()
-    job = next((j for j in jobs if j["job_id"] == job_id), None)
-    
-    if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Agent job '{job_id}' not found"
-        )
-    
-    return job
