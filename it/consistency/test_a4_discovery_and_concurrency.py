@@ -109,3 +109,34 @@ class TestDiscoveryAndConcurrency:
         assert hb_resp.status_code == 419, f"Should return 419 Obsoleted. Got: {hb_resp.status_code} {hb_resp.text}"
         data = hb_resp.json()
         assert "not found" in data["detail"].lower() or "obsoleted" in data["detail"].lower()
+
+    def test_view_stats_access(self, fusion_client, test_view):
+        """
+        验证 Stats 接口返回正确的统计结构。
+        """
+        resp = fusion_client.api_request("GET", f"views/{test_view['id']}/stats")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "item_count" in data
+        assert "total_size" in data
+        assert "audit_cycle_count" in data
+
+    def test_view_search_access(self, fusion_client, test_view):
+        """
+        验证 Search 接口能够进行各种通配符模式搜索。
+        """
+        patterns = [
+            "*.txt",         # 基础后缀
+            "data/*/*.log",  # 深度通配符
+            "**/config.yaml",# 递归通配符 (如果驱动支持)
+            "file-?.tmp"     # 单字符通配符
+        ]
+        
+        for p in patterns:
+            resp = fusion_client.api_request(
+                "GET", 
+                f"views/{test_view['id']}/search",
+                params={"pattern": p}
+            )
+            assert resp.status_code == 200, f"Search failed for pattern: {p}"
+            assert isinstance(resp.json(), list)

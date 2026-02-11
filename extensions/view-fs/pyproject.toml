@@ -1,6 +1,6 @@
 [project]
 name = "fustor-view-fs"
-version = "0.8.13"
+version = "0.8.14"
 description = "Fustor FS Consistent View Driver"
 license = "MIT"
 dependencies = [

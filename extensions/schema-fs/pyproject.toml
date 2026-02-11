@@ -1,6 +1,6 @@
 [project]
 name = "fustor-schema-fs"
-version = "0.8.13"
+version = "0.8.14"
 description = "Fustor File System Schema - Contract between source-fs and view-fs"
 readme = "README.md"
 requires-python = ">=3.11"
