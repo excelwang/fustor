@@ -126,12 +126,15 @@ async def test_sentinel_sweep_verification_flow(parser):
         ))
     
     node = parser._get_node("/hot/file.txt")
-    assert node.integrity_suspect is True
+    is_suspect = node.integrity_suspect
+    assert is_suspect == True
     assert "/hot/file.txt" in parser._suspect_list
     
     # 2. Sentinel Sweep: Report verified (mtime same)
     # Per SPEC Accelerated Clearing: Stable files verified by Sentinel are cleared immediately.
-    await parser.update_suspect("/hot/file.txt", now)
+    with unittest.mock.patch('time.time', return_value=now), \
+         unittest.mock.patch('time.monotonic', return_value=now):
+        await parser.update_suspect("/hot/file.txt", now)
     
     # 3. Verify: Cleared immediately
     # 3. Verify: NOT cleared immediately (Wait for TTL)
