@@ -19,6 +19,12 @@ from pydantic import BaseModel
 from fustor_core.transport import Receiver
 from fustor_core.event import EventBase, EventType, MessageSource
 
+try:
+    from fustor_fusion.auth.dependencies import get_view_id_from_api_key
+except ImportError:
+    # If not in fusion context, provide dummy dependency
+    async def get_view_id_from_api_key(): return "unknown"
+
 logger = logging.getLogger(__name__)
 
 
@@ -285,6 +291,16 @@ class HTTPReceiver(Receiver):
         router = APIRouter(tags=["Session"])
         receiver = self  # Capture self for closures
         
+        @router.get("/")
+        async def get_session_info_discovery(
+            view_id: str = Depends(get_view_id_from_api_key),
+        ):
+            """Discovery endpoint to get view_id from API key."""
+            return {
+                "view_id": view_id,
+                "status": "authorized"
+            }
+
         @router.post("/", response_model=CreateSessionResponse)
         async def create_session(
             payload: CreateSessionRequest,
@@ -329,8 +345,20 @@ class HTTPReceiver(Receiver):
                         sentinel_interval_sec=session_info.sentinel_interval_sec,
                         message="Session created successfully"
                     )
+                except ValueError as e:
+                    # Specific for concurrency/lock conflicts
+                    msg = str(e)
+                    if "lock" in msg or "concurrent" in msg:
+                        raise HTTPException(
+                            status_code=status.HTTP_409_CONFLICT,
+                            detail=msg
+                        )
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=msg
+                    )
                 except Exception as e:
-                    receiver.logger.error(f"Failed to create session: {e}")
+                    receiver.logger.error(f"Failed to create session: {e}", exc_info=True)
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail=str(e)

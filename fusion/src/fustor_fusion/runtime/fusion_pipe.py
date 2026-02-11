@@ -405,6 +405,7 @@ class FusionPipe(Pipe):
         events: List[Any],
         session_id: str,
         source_type: str = "message",
+        is_end: bool = False,
         **kwargs
     ) -> Dict[str, Any]:
         """
@@ -451,8 +452,8 @@ class FusionPipe(Pipe):
         await self._event_queue.put(processed_events)
         
         # Handle snapshot completion signal
-        is_end = kwargs.get("is_end", False) or kwargs.get("is_snapshot_end", False)
-        if source_type == "snapshot" and is_end:
+        is_snapshot_end = is_end or kwargs.get("is_snapshot_end", False)
+        if source_type == "snapshot" and is_snapshot_end:
             from ..view_state_manager import view_state_manager
             # Only leader can signal snapshot end
             if await view_state_manager.is_leader(self.view_id, session_id):

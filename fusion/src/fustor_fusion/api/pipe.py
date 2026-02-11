@@ -22,12 +22,19 @@ logger = logging.getLogger(__name__)
 # Re-export existing routers with new paths
 from .session import session_router
 from .consistency import consistency_router
+from .ingest import ingest_router
 
 # Create unified pipe router
 pipe_router = APIRouter(tags=["Pipe"])
 
-# Consistency router handles its own delegation
+# Consistency router handles its own delegation (it has its own /consistency prefix)
 pipe_router.include_router(consistency_router)
+
+# Session management
+pipe_router.include_router(session_router, prefix="/session")
+
+# Event ingestion
+pipe_router.include_router(ingest_router, prefix="/ingest")
 
 # 2. Add Management endpoints for debuging/monitoring
 @pipe_router.get("/pipes", tags=["Pipe Management"])

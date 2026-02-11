@@ -16,6 +16,7 @@ from ..config.unified import fusion_config
 from ..core.session_manager import session_manager
 from ..view_state_manager import view_state_manager
 from ..view_manager.manager import reset_views, on_session_start, on_session_close
+from .. import runtime_objects
 
 
 logger = logging.getLogger(__name__)
@@ -102,50 +103,62 @@ async def create_session(
     view_id: str = Depends(get_view_id_from_api_key),
 ):
     view_id = str(view_id)
-    session_config = _get_session_config(view_id)
-    allow_concurrent_push = session_config["allow_concurrent_push"]
+    session_id = str(uuid.uuid4())
+    client_ip = request.client.host
     
     # Use client-requested timeout if provided, otherwise fallback to server config
+    session_config = _get_session_config(view_id)
     session_timeout_seconds = payload.session_timeout_seconds or session_config["session_timeout_seconds"]
-    logger.debug(f"Session timeout determined: {session_timeout_seconds}")
 
-    session_id = str(uuid.uuid4())
-    
+    if runtime_objects.pipe_manager:
+        # In the new architecture, we delegate to PipeManager to ensure correct routing
+        try:
+            client_info = payload.client_info or {}
+            client_info["client_ip"] = client_ip
+            
+            session_info = await runtime_objects.pipe_manager._on_session_created(
+                session_id=session_id,
+                task_id=payload.task_id,
+                pipe_id=view_id, # view_id as the pipe_id
+                client_info=client_info,
+                session_timeout_seconds=session_timeout_seconds
+            )
+            
+            return {
+                "session_id": session_id,
+                "role": session_info.role,
+                "is_leader": (session_info.role == "leader"),
+                "session_timeout_seconds": session_timeout_seconds,
+                "audit_interval_sec": session_info.audit_interval_sec,
+                "sentinel_interval_sec": session_info.sentinel_interval_sec,
+            }
+        except ValueError as e:
+            # Handle concurrency/locking conflicts correctly
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except Exception as e:
+            logger.error(f"PipeManager failed to create session: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+    # --- Legacy Fallback (If PipeManager not fully active) ---
+    allow_concurrent_push = session_config["allow_concurrent_push"]
     should_allow = await _should_allow_new_session(
         allow_concurrent_push, view_id, payload.task_id, session_id
     )
-    
     if not should_allow:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="New session cannot be created due to current active sessions"
         )
     
-    # Leader/Follower election (First-Come-First-Serve)
     is_leader = await view_state_manager.try_become_leader(view_id, session_id)
-    
     if is_leader:
         await view_state_manager.set_authoritative_session(view_id, session_id)
 
-    active_sessions = await session_manager.get_view_sessions(view_id)
-    if not active_sessions and allow_concurrent_push:
-        logger.info(f"View {view_id} allows concurrent push and this is the first session. Resetting views.")
-        try:
-            await reset_views(view_id)
-            logger.info(f"Successfully reset views for {view_id}.")
-        except Exception as e:
-            logger.error(f"Exception during views reset for {view_id}: {e}", exc_info=True)
-
-    client_ip = request.client.host
-    
     try:
         await on_session_start(view_id)
-        logger.info(f"Triggered on_session_start for {session_id} on view {view_id}")
     except Exception as e:
-        logger.error(f"Failed to trigger on_session_start during session creation: {e}")
+        logger.error(f"Failed to trigger on_session_start: {e}")
 
-    source_uri = payload.client_info.get("source_uri") if payload.client_info else None
-    
     await session_manager.create_session_entry(
         view_id, 
         session_id, 
@@ -153,14 +166,13 @@ async def create_session(
         client_ip=client_ip,
         allow_concurrent_push=allow_concurrent_push,
         session_timeout_seconds=session_timeout_seconds,
-        source_uri=source_uri
+        source_uri=payload.client_info.get("source_uri") if payload.client_info else None
     )
     
     if not allow_concurrent_push:
         await view_state_manager.lock_for_session(view_id, session_id)
     
     role = "leader" if is_leader else "follower"
-    
     return {
         "session_id": session_id,
         "role": role,

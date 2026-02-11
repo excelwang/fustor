@@ -34,10 +34,11 @@ class FSViewQuery:
         }
 
     def search_files(self, query: str) -> List[Dict[str, Any]]:
+        import fnmatch
         results = []
-        q = query.lower()
+        # Support both literal substring and glob patterns
         for node in self.state.file_path_map.values():
-            if q in node.name.lower():
+            if fnmatch.fnmatchcase(node.path, query) or fnmatch.fnmatchcase(node.name, query) or query.lower() in node.name.lower():
                 results.append(node.to_dict())
         return results
 
@@ -57,10 +58,13 @@ class FSViewQuery:
 
         suspect_count = sum(1 for node in self.state.file_path_map.values() if node.integrity_suspect)
 
+        total_size = sum(node.size for node in self.state.file_path_map.values() if node.size is not None)
+
         return {
              "item_count": len(self.state.file_path_map) + len(self.state.directory_path_map),
              "total_files": len(self.state.file_path_map),
              "total_directories": len(self.state.directory_path_map),
+             "total_size": total_size,
              "latency_ms": self.state.last_event_latency,
              "staleness_seconds": staleness,
              "oldest_item_path": oldest_dir["path"] if oldest_dir else None,

@@ -66,18 +66,10 @@ class ViewStateManager:
         """
         view_id_str = str(view_id)
         state = self._states.get(view_id_str)
-        if not state:
-            return False
-        
-        if not state.authoritative_session_id:
+        if not state or not state.authoritative_session_id:
             return False
             
-        is_complete = (state.completed_snapshot_session_id == state.authoritative_session_id)
-        if not is_complete and state.completed_snapshot_session_id:
-            logger.debug(f"View {view_id_str} has a completed snapshot ({state.completed_snapshot_session_id}), "
-                         f"but it is no longer authoritative (current: {state.authoritative_session_id})")
-        
-        return is_complete
+        return state.completed_snapshot_session_id == state.authoritative_session_id
 
     async def is_locked_by_session(self, view_id: str, session_id: str) -> bool:
         """检查视图是否被指定会话锁定"""
@@ -134,7 +126,7 @@ class ViewStateManager:
             state = self._ensure_state(view_id_str)
             state.completed_snapshot_session_id = session_id
             state.updated_at = datetime.now()
-            logger.debug(f"View {view_id_str} snapshot marked complete by session {session_id}")
+            logger.info(f"View {view_id_str} snapshot marked complete by session {session_id}")
 
     async def set_state(self, view_id: str, status: str, locked_by_session_id: Optional[str] = None) -> ViewState:
         """设置指定视图的状态"""
