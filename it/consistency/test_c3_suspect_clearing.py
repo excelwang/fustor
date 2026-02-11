@@ -47,9 +47,10 @@ class TestSuspectClearingConditions:
         场景:
           1. 盲区创建一个文件
           2. 等待足够长时间让文件变"老"
-          3. Audit 扫描到该文件
+          3. 期间可能被 Audit 发现并标记为 Suspect (如果 Agent 在运行)
+          4. 最终 Audit 扫描到该文件且其已变"老"
         预期:
-          - 文件被发现但 NOT suspect (因为 age >= threshold)
+          - 文件最终 NOT suspect (因为 age >= threshold)
         """
         filename = f"old_file_{int(time.time())}.txt"
         file_path = f"{MOUNT_POINT}/{filename}"
@@ -62,20 +63,36 @@ class TestSuspectClearingConditions:
         )
         
         # 2. Wait for file to become "old" (> hot_file_threshold)
-        # Plus audit interval to ensure next audit sees it
-        time.sleep(HOT_FILE_THRESHOLD)
+        # We wait for threshold + some buffer
+        time.sleep(HOT_FILE_THRESHOLD + 5)
         
-        # 3. Trigger audit by waiting
+        # 3. Trigger audit by creating a trigger file to ensure directory scan
+        # This is needed because Smart Audit might skip the directory if its mtime hasn't changed
+        trigger_file = f"{MOUNT_POINT}/trigger_{int(time.time())}.txt"
+        docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["touch", trigger_file])
+        
+        # 4. Wait for Audit to process
         wait_for_audit()
         
-        # 4. Check file - should be discovered but NOT suspect
+        # 5. Check file - should be discovered and NOT suspect
+        # If it was discovered earlier as suspect, it should now be cleared by this audit
+        # because mtime is stable and age >= threshold.
         found = fusion_client.wait_for_file_in_tree(file_rel, timeout=SHORT_TIMEOUT)
         assert found is not None, "File should be discovered"
         
-        flags = fusion_client.check_file_flags(file_rel)
-        # Old files (age > hot_file_threshold) should NOT be suspect
-        assert flags["integrity_suspect"] is False, \
-            f"Old file should NOT be marked as suspect. Age > threshold. Flags: {flags}"
+        # Poll for flag clearing as it might take a moment for stability check or next audit
+        start = time.time()
+        cleared = False
+        flags = {}
+        while time.time() - start < SHORT_TIMEOUT:
+            flags = fusion_client.check_file_flags(file_rel)
+            if flags["integrity_suspect"] is False:
+                cleared = True
+                break
+            time.sleep(POLL_INTERVAL)
+
+        assert cleared, \
+            f"Old file should NOT be marked as suspect (or should have been cleared). Flags: {flags}"
 
     def test_suspect_cleared_on_file_deletion(
         self,

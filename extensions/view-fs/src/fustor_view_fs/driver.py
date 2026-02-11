@@ -167,9 +167,14 @@ class FSViewDriver(FSViewBase):
                 
             if is_stable:
                 # Stable!
-                # Do NOT clear immediately. We must wait for TTL to expire to prove stability over time.
-                # Just log and let cleanup_expired_suspects handle it.
-                self.logger.debug(f"Sentinel check STABLE (Active via Sentinel): {path}. Keeping suspect until TTL.")
+                if not is_hot:
+                    # Stable AND Cold -> Clear immediately (Accelerate convergence)
+                    self.logger.info(f"Sentinel check STABLE & COLD: {path}. Clearing suspect flag immediately.")
+                    self.state.suspect_list.pop(path, None)
+                    node.integrity_suspect = False
+                else:
+                    # Stable but still Hot -> Keep until TTL expires to prove stability over time.
+                    self.logger.debug(f"Sentinel check STABLE (still hot): {path}. Keeping suspect until TTL.")
                 return
             else:
                 # Active: Update node and renew TTL

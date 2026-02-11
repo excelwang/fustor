@@ -1,6 +1,6 @@
 [project]
 name = "fustor-sender-echo"
-version = "0.8.10"
+version = "0.8.11"
 description = "Echo sender driver for Fustor"
 requires-python = ">= 3.10"
 dependencies = [

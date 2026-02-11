@@ -1,6 +1,6 @@
 [project]
 name = "fustor-source-fs"
-version = "0.8.10"
+version = "0.8.11"
 description = "Fustor Agent FS Source Driver"
 license = "MIT"
 dependencies = ["fustor-core", "fustor-schema-fs", "watchdog"]
