@@ -468,10 +468,12 @@
 
     <main>
         <!-- 状态提示区域 -->
-        <div id="maintenance-notice" style="display: none; background: #fff7e6; border: 1px solid #ffe58f; padding: 16px 24px; border-radius: 8px; color: #d46b08; align-items: center; gap: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); animation: slideIn 0.3s ease-out;">
+        <div id="maintenance-notice"
+            style="display: none; background: #fff7e6; border: 1px solid #ffe58f; padding: 16px 24px; border-radius: 8px; color: #d46b08; align-items: center; gap: 16px; box-shadow: 0 2px 8px rgba(0,0,0,0.05); animation: slideIn 0.3s ease-out;">
             <span style="font-size: 1.5rem;">🚧</span>
             <div>
-                <strong style="display: block; font-size: 1rem; margin-bottom: 2px;">视角处于维护状态 / View is restricted</strong>
+                <strong style="display: block; font-size: 1rem; margin-bottom: 2px;">视角处于维护状态 / View is
+                    restricted</strong>
                 <span id="maintenance-message" style="font-size: 0.9rem; opacity: 0.9;">初始化中...</span>
             </div>
         </div>
@@ -640,15 +642,20 @@
                         'x-api-key': state.apiKey
                     };
 
-                    // 1. 获取 Session 信息 (拓扑图数据)
-                    const sessionRes = await fetch('/api/v1/pipe/session/', { headers });
+                    // 1. 获取 View ID (通过授权信息发现)
+                    const authRes = await fetch('/api/v1/pipe/session/', { headers });
+                    if (!authRes.ok) throw new Error('Authorization Error');
+                    const authData = await authRes.json();
+                    const viewId = authData.view_id;
+
+                    // 2. 获取该 View 下的 Session 信息 (拓扑图数据)
+                    const sessionRes = await fetch(`/api/v1/views/${viewId}/sessions`, { headers });
                     if (!sessionRes.ok) throw new Error('Session API Error');
                     const sessionData = await sessionRes.json();
-                    const viewId = sessionData.view_id;
 
                     // 2. 获取 View 真实指标 (文件数量)
                     const viewStatsRes = await fetch(`/api/v1/views/${viewId}/stats`, { headers });
-                    
+
                     if (viewStatsRes.status === 503) {
                         const err = await viewStatsRes.json();
                         showMaintenance(err.detail || 'Service is temporarily unavailable during maintenance.');
@@ -735,7 +742,7 @@
                     id: s.task_id.split(':')[0] || s.task_id,
                     role: s.role
                 }));
-                
+
                 const sourceIds = sources.map(s => s.id).join(',');
                 if (state.lastSourceIds === sourceIds) return;
                 state.lastSourceIds = sourceIds;
@@ -753,7 +760,7 @@
                     node.id = `source-node-${idx}`;
                     node.innerHTML = `
                         <span class="source-icon">${s.role === 'leader' ? '⭐' : '📦'}</span>
-                        <span class="source-name" title="${s.id}">${s.id.substring(0,8)}</span>
+                        <span class="source-name" title="${s.id}">${s.id.substring(0, 8)}</span>
                     `;
 
                     if (idx % 2 === 0) {
@@ -821,7 +828,7 @@
                 particle.style.position = 'absolute';
                 particle.style.left = '0';
                 particle.style.top = '-2px';
-                
+
                 particle.animate([
                     { left: '0%', opacity: 0 },
                     { opacity: 1, offset: 0.1 },

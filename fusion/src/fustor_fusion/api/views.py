@@ -256,6 +256,13 @@ def setup_view_routers():
         summary="Get job status",
         response_model=Dict[str, Any]
     )
+    view_router.add_api_route(
+        "/{view_id}/sessions", 
+        list_view_sessions, 
+        methods=["GET"],
+        summary="List active sessions for a view",
+        response_model=Dict[str, Any]
+    )
 
 
 async def list_view_jobs(view_id: str, authorized_view_id: str = Depends(get_view_id_from_api_key)):
@@ -296,6 +303,50 @@ async def get_view_job_status(view_id: str, job_id: str, authorized_view_id: str
         )
         
     return job
+
+
+async def list_view_sessions(view_id: str, authorized_view_id: str = Depends(get_view_id_from_api_key)):
+    """List active sessions for a specific view."""
+    if authorized_view_id != view_id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="API Key not authorized for this view"
+        )
+    
+    from ..core.session_manager import session_manager
+    from ..view_state_manager import view_state_manager
+    
+    sessions = await session_manager.get_view_sessions(view_id)
+    
+    session_list = []
+    for session_id, session_info in sessions.items():
+        session_data = {
+            "session_id": session_id,
+            "task_id": session_info.task_id,
+            "agent_id": session_info.task_id.split(":")[0] if session_info.task_id and ":" in session_info.task_id else session_info.task_id,
+            
+            "client_ip": session_info.client_ip,
+            "source_uri": session_info.source_uri,
+            "last_activity": session_info.last_activity,
+            "created_at": session_info.created_at,
+            "allow_concurrent_push": session_info.allow_concurrent_push,
+            "session_timeout_seconds": session_info.session_timeout_seconds
+        }
+        
+        is_leader = await view_state_manager.is_leader(view_id, session_id)
+        session_data["role"] = "leader" if is_leader else "follower"
+        session_data["can_snapshot"] = is_leader
+        session_data["can_audit"] = is_leader
+        session_data["can_realtime"] = session_info.can_realtime
+        session_data["can_send"] = True
+        
+        session_list.append(session_data)
+    
+    return {
+        "view_id": view_id,
+        "active_sessions": session_list,
+        "count": len(session_list)
+    }
 
 # Initial call to attempt registration (will be called again in lifespan for certainty)
 setup_view_routers()

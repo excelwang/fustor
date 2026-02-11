@@ -149,11 +149,8 @@ class FusionClient:
     # ============ Session API ============
 
     def get_sessions(self) -> list[dict]:
-        """Get all active sessions."""
-        resp = self.session.get(f"{self.base_url}/api/v1/pipe/session/")
-        if resp.status_code == 404:
-            # Fallback for servers without slash
-            resp = self.session.get(f"{self.base_url}/api/v1/pipe/session")
+        """Get all active sessions for the current view."""
+        resp = self.session.get(f"{self.base_url}/api/v1/views/{self.view_id}/sessions")
         resp.raise_for_status()
         return resp.json().get("active_sessions", [])
 

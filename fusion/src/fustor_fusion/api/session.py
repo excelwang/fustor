@@ -243,39 +243,15 @@ async def end_session(
     }
 
 
-@session_router.get("/", tags=["Session Management"], summary="List active sessions")
-async def list_sessions(
+@session_router.get("/", tags=["Session Management"], summary="Get current view_id for API Key")
+async def get_authorized_view_info(
     view_id: str = Depends(get_view_id_from_api_key),
 ):
-    view_id = str(view_id)
-    sessions = await session_manager.get_view_sessions(view_id)
-    
-    session_list = []
-    for session_id, session_info in sessions.items():
-        session_data = {
-            "session_id": session_id,
-            "task_id": session_info.task_id,
-            "agent_id": session_info.task_id.split(":")[0] if session_info.task_id and ":" in session_info.task_id else session_info.task_id,
-            
-            "client_ip": session_info.client_ip,
-            "source_uri": session_info.source_uri,
-            "last_activity": session_info.last_activity,
-            "created_at": session_info.created_at,
-            "allow_concurrent_push": session_info.allow_concurrent_push,
-            "session_timeout_seconds": session_info.session_timeout_seconds
-        }
-        
-        is_leader = await view_state_manager.is_leader(view_id, session_id)
-        session_data["role"] = "leader" if is_leader else "follower"
-        session_data["can_snapshot"] = is_leader
-        session_data["can_audit"] = is_leader
-        session_data["can_realtime"] = session_info.can_realtime
-        session_data["can_send"] = True
-        
-        session_list.append(session_data)
-    
+    """
+    Returns the view_id associated with the provided API key.
+    This replaces the legacy session listing which has been moved to /api/v1/views/{view_id}/sessions
+    """
     return {
         "view_id": view_id,
-        "active_sessions": session_list,
-        "count": len(session_list)
+        "status": "authorized"
     }
