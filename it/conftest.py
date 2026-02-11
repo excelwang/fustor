@@ -109,7 +109,7 @@ def reset_fusion_state(fusion_client, clean_shared_dir):
     # 3. Clear logs
     for container in containers + [CONTAINER_FUSION]:
         try:
-            log_path = "/root/.fustor/agent.log" if "client" in container else "/root/.fustor/fusion.log"
+            log_path = "/root/.fustor/logs/agent.log" if "client" in container else "/root/.fustor/logs/fusion.log"
             docker_manager.exec_in_container(container, ["sh", "-c", f"> {log_path}"], timeout=5)
         except Exception:
             pass

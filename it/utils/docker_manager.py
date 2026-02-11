@@ -323,7 +323,7 @@ class DockerManager:
         state_files = [
             "/root/.fustor/agent.pid",
             "/root/.fustor/agent-state.json",
-            "/root/.fustor/agent.log",
+            "/root/.fustor/logs/agent.log",
             "/root/.fustor/agent.id"
         ]
         try:

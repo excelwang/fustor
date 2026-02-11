@@ -78,7 +78,7 @@ class TestHeartbeatTimeout:
         
         while time.time() - start_wait < MEDIUM_TIMEOUT:
             # OPTIMIZATION: Check for early failure by reading log file directly
-            logs_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/agent.log"])
+            logs_res = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/logs/agent.log"])
             logs = logs_res.stdout + logs_res.stderr
             
             # Aggressive Fast-Fail (BUT skip known non-fatal exceptions)

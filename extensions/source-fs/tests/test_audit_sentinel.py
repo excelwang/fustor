@@ -79,19 +79,19 @@ def test_perform_sentinel_check_verify_files(fsdriver, tmp_path):
     # 1. Test existing file
     batch = {
         "type": "suspect_check",
-        "paths": [str(file1)]
+        "paths": ["/verify_me.txt"]
     }
     
     result_batch = fsdriver.perform_sentinel_check(batch)
     updates = result_batch["updates"]
     
     # Find results for file1
-    res = next(u for u in updates if u["path"] == str(file1))
+    res = next(u for u in updates if u["path"] == "/verify_me.txt")
     assert res["status"] == "exists"
     assert res["mtime"] == st.st_mtime
     
     # 2. Test missing file
-    missing_file = str(tmp_path / "nonexistent.txt")
+    missing_file = "/nonexistent.txt"
     batch = {
         "type": "suspect_check",
         "paths": [missing_file]

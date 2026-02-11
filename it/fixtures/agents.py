@@ -121,7 +121,7 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
     # Wait for the log file to be created
     start_wait = time.time()
     while time.time() - start_wait < 5:
-        res = docker_manager.exec_in_container(container_name, ["test", "-f", "/root/.fustor/agent.log"])
+        res = docker_manager.exec_in_container(container_name, ["test", "-f", "/root/.fustor/logs/agent.log"])
         if res.returncode == 0:
             break
         time.sleep(0.5)
@@ -145,7 +145,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
         # Dump logs for Agent A (Errors only, last 100 lines)
         logs_res = docker_manager.exec_in_container(
             CONTAINER_CLIENT_A, 
-            ["sh", "-c", "grep -Ei 'error|fatal|exception|fail|exit' /root/.fustor/agent.log | tail -n 100"]
+            ["sh", "-c", "grep -Ei 'error|fatal|exception|fail|exit' /root/.fustor/logs/agent.log | tail -n 100"]
         )
         logs = logs_res.stdout + logs_res.stderr
         logger.error(f"FATAL: Agent A did not become ready. Relevant Logs:\n{logs}")
@@ -206,7 +206,7 @@ def setup_agents(docker_env, fusion_client, test_api_key, test_view):
         # Filter for errors before tailing as suggested by user
         logs_res = docker_manager.exec_in_container(
             CONTAINER_CLIENT_B, 
-            ["sh", "-c", "grep -Ei 'error|fatal|exception|fail|exit' /root/.fustor/agent.log | tail -n 100"]
+            ["sh", "-c", "grep -Ei 'error|fatal|exception|fail|exit' /root/.fustor/logs/agent.log | tail -n 100"]
         )
         logs = logs_res.stdout + logs_res.stderr
         logger.error(f"FATAL: Agent B did not become ready. Relevant Logs:\n{logs}")

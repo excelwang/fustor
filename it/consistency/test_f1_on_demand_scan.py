@@ -78,7 +78,7 @@ class TestOnDemandScan:
         
         # 7. 白盒验证：检查 Agent 日志中是否有 On-Demand Find 的记录
         print("[Test] Verifying agent logs for on-demand find record...")
-        agent_log = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/agent.log"]).stdout
+        agent_log = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["cat", "/root/.fustor/logs/agent.log"]).stdout
         assert "Executing realtime find" in agent_log, "Log should contain 'Executing realtime find'"
         assert "Realtime find complete" in agent_log, "Log should contain 'Realtime find complete'"
         print("[Test] Success: On-demand find identified and completed in logs.")
