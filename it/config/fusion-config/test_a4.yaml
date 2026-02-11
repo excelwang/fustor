@@ -1,0 +1,13 @@
+pipes:
+  strict-pipe:
+    allow_concurrent_push: false
+    receiver: http-strict
+    views:
+    - ${TEST_VIEW_ID}
+receivers:
+  http-strict:
+    api_keys:
+    - key: test-strict-key-789
+      pipe_id: strict-pipe
+    driver: http
+    port: 18888

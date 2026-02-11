@@ -79,7 +79,7 @@ class TreeManager:
             parent_node = self.state.directory_path_map.get(parent_path)
             if parent_node:
                 parent_node.children[name] = node
-                logger.info(f"ATTACHED {path} to parent {parent_path}. Parent children count: {len(parent_node.children)}")
+                logger.debug(f"ATTACHED {path} to parent {parent_path}. Parent children count: {len(parent_node.children)}")
             else:
                 logger.warning(f"ORPHAN {path} - Parent {parent_path} not found!")
             

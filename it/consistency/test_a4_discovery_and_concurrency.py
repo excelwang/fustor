@@ -40,11 +40,8 @@ class TestDiscoveryAndConcurrency:
         """
         验证当 allow_concurrent_push=false 时，并发推送冲突。
         """
-        # 1. 确保视图支持锁定（allow_concurrent_push 默认为 false，除非额外配置）
-        # 我们在这里通过 API 创建一个会话来模拟。
-        
         view_id = test_view["id"]
-        api_key = test_api_key["key"]
+        api_key = "test-strict-key-789"
         
         payload1 = {
             "task_id": "task-1",
