@@ -50,7 +50,7 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep, chec
         max_depth: Optional[int] = Query(None, description="最大递归深度 (1 表示仅当前目录及其直接子级)"),
         only_path: bool = Query(False, description="是否仅返回路径结构，排除元数据"),
         dry_run: bool = Query(False, description="压测模式：跳过逻辑处理以测量框架延迟"),
-        force_real_time: bool = Query(False, description="强制触发Agent端实时扫描"),
+        on_demand_scan: bool = Query(False, description="触发Agent端按需扫描（补偿型 Tier 3, 见 CONSISTENCY_DESIGN §4.5）"),
         view_id: str = Depends(get_view_id_dep)
     ) -> Optional[Dict[str, Any]]:
         """获取指定路径起始的目录结构树。"""
@@ -64,22 +64,22 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep, chec
             return ORJSONResponse(content={"detail": "Driver not initialized"}, status_code=503)
             
         job_id = None
-        if force_real_time:
-            if hasattr(driver, "trigger_realtime_scan"):
-                triggered, job_id = await driver.trigger_realtime_scan(path, recursive=recursive)
+        if on_demand_scan:
+            if hasattr(driver, "trigger_on_demand_scan"):
+                triggered, job_id = await driver.trigger_on_demand_scan(path, recursive=recursive)
                 if triggered:
-                    logger.info(f"Triggered realtime find (id={job_id}) for {path} on view {view_id}")
+                    logger.info(f"Triggered on-demand scan (id={job_id}) for {path} on view {view_id}")
                 else:
-                    logger.warning(f"Failed to trigger realtime find for {path} on view {view_id} (No active session?)")
+                    logger.warning(f"Failed to trigger on-demand scan for {path} on view {view_id} (No active session?)")
             else:
-                logger.warning(f"Driver for view {view_id} does not support realtime find")
+                logger.warning(f"Driver for view {view_id} does not support on-demand scan")
         
         effective_recursive = recursive if max_depth is None else True
         result = await driver.get_directory_tree(path, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
         
         # Check if there's a pending job for this path
         job_pending = False
-        if force_real_time:
+        if on_demand_scan:
             from fustor_fusion.core.session_manager import session_manager
             job_pending = await session_manager.has_pending_job(view_id, path)
 

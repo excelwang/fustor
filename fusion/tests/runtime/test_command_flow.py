@@ -33,7 +33,7 @@ async def test_fusion_command_queue_flow():
     
     # 3. Trigger Scan
     path = "/data/logs"
-    success, job_id = await driver.trigger_realtime_scan(path, recursive=True)
+    success, job_id = await driver.trigger_on_demand_scan(path, recursive=True)
     assert success is True
     assert job_id is not None
     

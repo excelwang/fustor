@@ -198,9 +198,10 @@ class FSViewDriver(FSViewBase):
 
 
 
-    async def trigger_realtime_scan(self, path: str, recursive: bool = True) -> Tuple[bool, Optional[str]]:
+    async def trigger_on_demand_scan(self, path: str, recursive: bool = True) -> Tuple[bool, Optional[str]]:
         """
-        Triggers a realtime find on the agent side by broadcasting a command to ALL pipes.
+        Triggers an on-demand scan on the agent side by broadcasting a command to ALL pipes.
+        Events produced are MessageSource.ON_DEMAND_JOB (Tier 3 compensatory, see §4.5).
         Returns: (success, job_id)
         """
         from fustor_fusion.core.session_manager import session_manager
@@ -209,7 +210,7 @@ class FSViewDriver(FSViewBase):
             # 1. Get ALL active sessions for this view
             active_sessions = await session_manager.get_view_sessions(self.view_id)
             if not active_sessions:
-                self.logger.warning(f"No active sessions for view {self.view_id}. Cannot trigger realtime find.")
+                self.logger.warning(f"No active sessions for view {self.view_id}. Cannot trigger on-demand scan.")
                 return False, None
             
             session_ids = list(active_sessions.keys())
@@ -231,7 +232,7 @@ class FSViewDriver(FSViewBase):
                 if await session_manager.queue_command(self.view_id, session_id, command):
                     success_count += 1
             
-            self.logger.info(f"Broadcasted realtime find {job_id} to {success_count}/{len(session_ids)} sessions for path {path}")
+            self.logger.info(f"Broadcasted on-demand scan {job_id} to {success_count}/{len(session_ids)} sessions for path {path}")
             return success_count > 0, job_id
 
     async def get_data_view(self, **kwargs) -> dict:

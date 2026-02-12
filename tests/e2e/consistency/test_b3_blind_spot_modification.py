@@ -149,7 +149,7 @@ class TestBlindSpotFileModification:
                     "source_type": "message",
                     "is_end": False
                 }
-                url = f"{fusion_client.base_url}/api/v1/pipe/ingest/{session_id}/events"
+                url = f"{fusion_client.base_url}/api/v1/pipe/{session_id}/events"
                 fusion_client.session.post(url, json=batch_payload)
                 
                 # Wait for flag to clear

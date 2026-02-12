@@ -140,9 +140,9 @@ class TestComponentCrashIsolation:
         """
         assert fusion_client.wait_for_view_ready(timeout=MEDIUM_TIMEOUT)
 
-        # Use exposed receiver port (18889) for ingestion tests
-        # because main API port (8102) does not have ingestion routes attached
-        # when receiver port != main port.
+        # Use exposed receiver port (18889) to test receiver isolation specifically.
+        # Note: main port (8102) now also has ingestion routes via pipe_router,
+        # but here we want to test the HTTPReceiver's own error handling.
         base_url = "http://localhost:18889"
 
         # --- 测试 1: 发送完全无效的 JSON ---

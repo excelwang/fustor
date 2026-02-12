@@ -56,7 +56,7 @@ class FusionClient:
         max_depth: int = -1,
         only_path: bool = False,
         dry_run: bool = False,
-        force_real_time: bool = False,
+        on_demand_scan: bool = False,
         silence_503: bool = False
     ) -> dict[str, Any]:
         """Get file tree from Fusion."""
@@ -66,8 +66,8 @@ class FusionClient:
             "only_path": only_path,
             "dry_run": dry_run
         }
-        if force_real_time:
-            params["force_real_time"] = "true"
+        if on_demand_scan:
+            params["on_demand_scan"] = "true"
 
         resp = self.session.get(
             f"{self.base_url}/api/v1/views/{self.view_id}/tree",

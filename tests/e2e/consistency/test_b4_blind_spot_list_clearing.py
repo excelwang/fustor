@@ -187,23 +187,12 @@ class TestBlindSpotListPersistence:
                  "is_end": False
              }
              
-             # URL: /api/v1/pipe/ingest/{session_id}/events
-             # Note: HTTPReceiver mounts ingestion router usually at /api/v1/pipe/ingest? 
-             # Wait, SDK says self._events_path = "/api/v1/pipe/ingest"
-             # So /api/v1/pipe/ingest/{session_id}/events
-             
-             url = f"{fusion_client.base_url}/api/v1/pipe/ingest/{session_id}/events"
+             url = f"{fusion_client.base_url}/api/v1/pipe/{session_id}/events"
              print(f"Injecting event to {url}")
              
              resp = fusion_client.session.post(url, json=batch_payload)
              if resp.status_code != 200:
                  print(f"Manual injection failed: {resp.status_code} {resp.text}")
-                 # Try legacy path if 404? No, SDK uses this.
-                 # Check if Receiver mounts it elsewhere?
-                 # If 404, maybe "ingest" prefix is wrong?
-                 # SDK Sender uses /api/v1/pipe/events/{session_id} ?? 
-                 # No, SDK Client uses /api/v1/pipe/ingest/{session_id}/events
-                 pass
              
              # Wait again
              assert fusion_client.wait_for_flag(test_file_rel, "agent_missing", False, timeout=SHORT_TIMEOUT), \

@@ -135,7 +135,7 @@ class TestDiscoveryAndConcurrency:
 
         # CRITICAL: 发送 snapshot_end 信号
         resp_ing = fusion_client.api_request(
-            "POST", f"pipe/ingest/{session_id}/events",
+            "POST", f"pipe/{session_id}/events",
             json={"events": [], "source_type": "snapshot", "is_end": True},
             headers={"X-API-Key": test_api_key["key"]}
         )
@@ -167,7 +167,7 @@ class TestDiscoveryAndConcurrency:
         
         # CRITICAL: 发送 snapshot_end 信号
         resp_ing = fusion_client.api_request(
-            "POST", f"pipe/ingest/{session_id}/events",
+            "POST", f"pipe/{session_id}/events",
             json={"events": [], "source_type": "snapshot", "is_end": True},
             headers={"X-API-Key": test_api_key["key"]}
         )
