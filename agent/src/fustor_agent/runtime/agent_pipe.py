@@ -3,8 +3,6 @@ AgentPipe orchestrates the flow: Source -> Sender
 """
 import asyncio
 import logging
-import threading
-import time
 from typing import Optional, Any, Dict, List, TYPE_CHECKING, Iterator
 
 
@@ -31,7 +29,7 @@ class AgentPipe(Pipe):
     Orchestrates the data flow from Source to Sender:
     1. Session lifecycle management with Fusion
     2. Snapshot sync phase
-    3. Realtime message sync phase
+    3. Message sync phase (EventBus)
     4. Periodic audit and sentinel checks
     5. Heartbeat and role management (Leader/Follower)
     
@@ -296,7 +294,7 @@ class AgentPipe(Pipe):
         # Recover bus if it was in a failed state from a previous error cycle
         if self._bus and getattr(self._bus, 'failed', False):
             try:
-                logger.info(f"Pipe {self.id}: Recovering EventBus from failed state for new session")
+                logger.debug(f"Pipe {self.id}: Recovering EventBus from failed state for new session")
                 self._bus.recover()
             except Exception as e:
                 logger.warning(f"Pipe {self.id}: Bus recovery failed: {e}")
@@ -329,9 +327,6 @@ class AgentPipe(Pipe):
         self._audit_task = None
         self._sentinel_task = None
         self._message_sync_task = None
-        self._message_sync_task = None
-        self._audit_task = None
-        self._sentinel_task = None
     
     async def _run_control_loop(self) -> None:
         """Main control loop for session management and error recovery."""
@@ -346,7 +341,7 @@ class AgentPipe(Pipe):
             # If we have consecutive errors, we MUST backoff here to avoid tight loops
             if self._consecutive_errors > 0:
                 backoff = self._calculate_backoff(self._consecutive_errors)
-                logger.info(f"Pipe {self.id}: Backing off for {backoff:.2f}s due to previous errors")
+                logger.debug(f"Pipe {self.id}: Backing off for {backoff:.2f}s due to previous errors")
                 await asyncio.sleep(backoff)
                 
                 # Re-check state after sleep
@@ -360,7 +355,7 @@ class AgentPipe(Pipe):
                     logger.info(f"Pipe {self.id}: No active session. Reconnecting...")
                     self._set_state(PipeState.RUNNING | PipeState.RECONNECTING, "Attempting to create session...")
                     try:
-                        logger.info(f"Pipe {self.id}: Creating session with task_id={self.task_id}, timeout={self.session_timeout_seconds}")
+                        logger.debug(f"Pipe {self.id}: Creating session with task_id={self.task_id}, timeout={self.session_timeout_seconds}")
                         # Source URI extraction (Best effort, handling both Pydantic models and dicts)
                         config = self.source_handler.config
                         if isinstance(config, dict):
@@ -386,7 +381,7 @@ class AgentPipe(Pipe):
                             # Only update if we don't have a newer local value (unlikely on fresh start, but safe)
                             if current_stats_index is None or committed_index > current_stats_index:
                                 self.statistics["last_pushed_event_id"] = committed_index
-                                logger.info(f"Pipe {self.id}: Resumed from committed index {committed_index}")
+                                logger.debug(f"Pipe {self.id}: Resumed from committed index {committed_index}")
                         except Exception as e:
                             logger.warning(f"Pipe {self.id}: Failed to fetch committed index: {e}. Defaulting to 0/Latest.")
 
@@ -427,7 +422,7 @@ class AgentPipe(Pipe):
                 if self.session_id and self.current_role:
                     # Ensure Message Sync is running (for both Leader and Follower)
                     if self._message_sync_task is None or self._message_sync_task.done():
-                        logger.info(f"Pipe {self.id}: Starting message sync phase (Role: {self.current_role})")
+                        logger.debug(f"Pipe {self.id}: Starting message sync phase (Role: {self.current_role})")
                         self._message_sync_task = asyncio.create_task(self._run_message_sync())
 
                     if self._message_sync_task and self._message_sync_task.done():
@@ -499,7 +494,7 @@ class AgentPipe(Pipe):
                 self._snapshot_task = asyncio.create_task(self._run_snapshot_sync())
                 # Note: We don't await self._snapshot_task anymore to allow role transition detection
                 # The next iteration will see it running and won't restart it.
-                logger.info(f"Pipe {self.id}: Initial snapshot sync phase started in background")
+                logger.debug(f"Pipe {self.id}: Initial snapshot sync phase started in background")
             except Exception as e:
                 self._set_state(PipeState.ERROR, f"Failed to start snapshot sync phase: {e}")
                 return
@@ -512,7 +507,7 @@ class AgentPipe(Pipe):
                 self._initial_snapshot_done = True
                 logger.info(f"Pipe {self.id}: Initial snapshot sync phase complete")
             except asyncio.CancelledError:
-                logger.info(f"Pipe {self.id}: Snapshot sync phase task was cancelled")
+                logger.debug(f"Pipe {self.id}: Snapshot sync phase task was cancelled")
             except Exception as e:
                 logger.error(f"Pipe {self.id}: Snapshot sync phase failed: {e}")
                 self._set_state(PipeState.ERROR, f"Snapshot sync phase failed: {e}")
@@ -556,7 +551,7 @@ class AgentPipe(Pipe):
                 
                 # Reset error counter on success
                 if self._consecutive_errors > 0:
-                    logger.info(f"Pipe {self.id} heartbeat recovered after {self._consecutive_errors} errors")
+                    logger.debug(f"Pipe {self.id} heartbeat recovered after {self._consecutive_errors} errors")
                     self._consecutive_errors = 0
                 
             except SessionObsoletedError as e:
@@ -586,7 +581,7 @@ class AgentPipe(Pipe):
             self._sentinel_task = None
             return
 
-        logger.info(f"Pipe {self.id}: Cancelling {len(tasks_to_cancel)} leader tasks")
+        logger.debug(f"Pipe {self.id}: Cancelling {len(tasks_to_cancel)} leader tasks")
         for task in tasks_to_cancel:
             task.cancel()
 
@@ -666,12 +661,12 @@ class AgentPipe(Pipe):
     def map_batch(self, batch: List[Any]) -> List[Any]:
         """Apply field mapping to a batch of events."""
         if self._mapper.mappings:
-            logger.info(f"Pipe {self.id}: Mapping batch of {len(batch)} events")
+            logger.debug(f"Pipe {self.id}: Mapping batch of {len(batch)} events")
         return self._mapper.map_batch(batch)
 
     async def _run_snapshot_sync(self) -> None:
         """Execute snapshot sync phase."""
-        logger.info(f"Pipe {self.id}: Snapshot sync phase starting")
+        logger.debug(f"Pipe {self.id}: Snapshot sync phase starting")
         try:
             from .pipe.phases import run_snapshot_sync
             await run_snapshot_sync(self)
@@ -692,7 +687,7 @@ class AgentPipe(Pipe):
 
     async def _run_message_sync(self) -> None:
         """Execute realtime message sync phase."""
-        logger.info(f"Pipe {self.id}: Starting message sync phase (Unified Bus Mode)")
+        logger.debug(f"Pipe {self.id}: Starting message sync phase (Unified Bus Mode)")
         self._set_state(self.state | PipeState.MESSAGE_SYNC)
         
         try:
@@ -861,14 +856,14 @@ class AgentPipe(Pipe):
         if not path:
             return
 
-        logger.info(f"Pipe {self.id}: Executing realtime find (id={job_id}) for '{path}' (recursive={recursive})")
+        logger.info(f"Pipe {self.id}: Executing On-Demand scan (id={job_id}) for '{path}' (recursive={recursive})")
         
         # Check if source handler supports scan_path
         if hasattr(self.source_handler, "scan_path"):
             # Execute scan in background to not block heartbeat/control loop
             asyncio.create_task(self._run_on_demand_job(path, recursive, job_id))
         else:
-            logger.warning(f"Pipe {self.id}: Source handler does not support 'scan_path' for realtime find")
+            logger.warning(f"Pipe {self.id}: Source handler does not support 'scan_path' for On-Demand scan")
 
     async def _run_on_demand_job(self, path: str, recursive: bool, job_id: Optional[str] = None):
         """Run the actual find task."""
@@ -877,7 +872,7 @@ class AgentPipe(Pipe):
             # This bypasses the normal message/snapshot loop but uses the same sender
             
             # Use iterator from source handler
-            iterator = self.source_handler.scan_path(path, recursive=recursive) #TODO agent dont known what is scan
+            iterator = self.source_handler.scan_path(path, recursive=recursive)
             
             # Push batch
             batch = []
@@ -895,8 +890,8 @@ class AgentPipe(Pipe):
                 await self.sender_handler.send_batch(self.session_id, mapped_batch, {"phase": "on_demand_job"})
                 count += len(batch)
             
-            # Notify Fusion that find is complete
-            metadata = {"scan_path": path}# todo agent should send job_id
+            # Notify Fusion that On-Demand scan is complete
+            metadata = {"scan_path": path}
             if job_id:
                 metadata["job_id"] = job_id
                 
@@ -905,7 +900,7 @@ class AgentPipe(Pipe):
                 "metadata": metadata
             })
                 
-            logger.info(f"Pipe {self.id}: Realtime find complete (id={job_id}) for '{path}'. Sent {count} events.")
+            logger.info(f"Pipe {self.id}: On-Demand scan completed (id={job_id}) for '{path}'. Sent {count} events.")
             
         except Exception as e:
             logger.error(f"Pipe {self.id}: On-demand scan failed: {e}")

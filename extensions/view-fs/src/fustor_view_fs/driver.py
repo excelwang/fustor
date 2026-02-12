@@ -70,7 +70,7 @@ class FSViewDriver(FSViewBase):
             self.state.blind_spot_additions.clear()
             self.state.blind_spot_deletions.clear()
             
-            self.logger.info(f"New session sequence started. Cleared audit buffer and blind-spot lists.")
+            self.logger.debug(f"New session sequence started. Cleared audit buffer and blind-spot lists.")
 
     async def on_session_close(self):
         """
@@ -88,7 +88,7 @@ class FSViewDriver(FSViewBase):
             # 1. Clear view-specific in-memory state
             self.state.reset()
             
-            self.logger.info(f"FS View state for {self.view_id} has been reset. Global sessions and ingestion state remain unaffected.")
+            self.logger.debug(f"FS View state for {self.view_id} has been reset. Global sessions and ingestion state remain unaffected.")
 
     # --- Query Delegation ---
 
@@ -143,7 +143,7 @@ class FSViewDriver(FSViewBase):
             is_mtime_stable = False
 
             if is_skew_stable and not is_raw_stable:
-                self.logger.info(f"Sentinel reported SKEWED mtime for {path} (Reported: {mtime}, Skew: {skew}, Corrected: {mtime+skew}). Treating as STABLE.")
+                self.logger.debug(f"Sentinel reported SKEWED mtime for {path} (Reported: {mtime}, Skew: {skew}, Corrected: {mtime+skew}). Treating as STABLE.")
                 # Normalize the mtime to the stable one for updates
                 mtime = old_mtime
                 is_mtime_stable = True
@@ -177,7 +177,7 @@ class FSViewDriver(FSViewBase):
                 # Stable!
                 if not is_hot:
                     # Stable AND Cold -> Clear immediately (Accelerate convergence)
-                    self.logger.info(f"Sentinel check STABLE & COLD: {path}. Clearing suspect flag immediately.")
+                    self.logger.debug(f"Sentinel check STABLE & COLD: {path}. Clearing suspect flag immediately.")
                     self.state.suspect_list.pop(path, None)
                     node.integrity_suspect = False
                 else:
@@ -194,7 +194,7 @@ class FSViewDriver(FSViewBase):
                 expiry = time.monotonic() + self.hot_file_threshold
                 self.state.suspect_list[path] = (expiry, mtime)
                 heapq.heappush(self.state.suspect_heap, (expiry, path))
-                self.logger.info(f"Suspect RENEWED (mismatch via Sentinel): {path} (Mtime: {mtime}, Size: {size})")
+                self.logger.debug(f"Suspect RENEWED (mismatch via Sentinel): {path} (Mtime: {mtime}, Size: {size})")
 
 
 

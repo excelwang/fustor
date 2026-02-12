@@ -238,7 +238,7 @@ class PipeSessionBridge:
             if is_known_leader and count % self._LEADER_VERIFY_INTERVAL == 0:
                 actual_leader = await view_state_manager.is_leader(view_id, session_id)
                 if not actual_leader:
-                    logger.info(f"Leader cache stale for {session_id} on view {view_id}, clearing")
+                    logger.debug(f"Leader cache stale for {session_id} on view {view_id}, clearing")
                     self._leader_cache.get(view_id, set()).discard(session_id)
                     is_known_leader = False
             

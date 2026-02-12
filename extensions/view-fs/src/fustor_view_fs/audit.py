@@ -21,7 +21,7 @@ class AuditManager:
         
         # If we received another start signal very recently, don't clear flags
         if self.state.last_audit_start is not None and (now - self.state.last_audit_start) < 5.0 and self.state.audit_seen_paths:
-            self.logger.info("Audit Start signal received late. Preserving observed flags.")
+            self.logger.debug("Audit Start signal received late. Preserving observed flags.")
             is_late_start = True
         
         self.state.last_audit_start = now
@@ -30,7 +30,7 @@ class AuditManager:
         
         self.logger.info(f"Audit started at local time {now}. late_start={is_late_start}")
 
-    async def handle_end(self): #todo ask only end message?
+    async def handle_end(self):
         """Finalizes audit cycle, performs Tombstone cleanup and Missing Item Detection.
         
         Per Spec §4.2 and §7: Tombstone TTL cleanup happens at Audit-End.
@@ -51,12 +51,12 @@ class AuditManager:
         }
         tombstones_cleaned = before - len(self.state.tombstone_list)
         if tombstones_cleaned > 0:
-            self.logger.info(f"Tombstone CLEANUP (Audit-End): removed {tombstones_cleaned} items (Before Audit or TTL expired).")
+            self.logger.debug(f"Tombstone CLEANUP (Audit-End): removed {tombstones_cleaned} items (Before Audit or TTL expired).")
 
         # 2. Optimized Missing File Detection
         missing_count = 0
         if self.state.audit_seen_paths:
-            self.logger.info(f"AuditManager: Processing {len(self.state.audit_seen_paths)} seen paths for missing item detection.")
+            self.logger.debug(f"AuditManager: Processing {len(self.state.audit_seen_paths)} seen paths for missing item detection.")
             paths_to_delete = []
             for path in self.state.audit_seen_paths:
                 dir_node = self.state.directory_path_map.get(path)
@@ -87,7 +87,7 @@ class AuditManager:
                                     self.logger.warning("Safety: Audit attempt to delete root directory blocked.")
                                     continue
     
-                                self.logger.info(f"Blind-spot deletion detected: {child_node.path} (Parent: {path})")
+                                self.logger.debug(f"Blind-spot deletion detected: {child_node.path} (Parent: {path})")
                                 paths_to_delete.append(child_node.path)
             
             try:

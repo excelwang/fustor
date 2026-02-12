@@ -3,7 +3,7 @@
 import logging
 from typing import Dict, Optional, List, Any
 
-# Removed legacy import
+
 from fustor_core.models.config import AppConfig, SourceConfig
 from fustor_agent.services.instances.pipe import PipeInstanceService
 from .base import BaseConfigService
@@ -38,7 +38,6 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
         """
         async with config_lock:
             self._add_config_to_app(id, config)
-            # Removed legacy persistence call
         logger.info(f"Source '{id}' configuration added.")
         return config
 
@@ -100,7 +99,6 @@ class SourceConfigService(BaseConfigService[SourceConfig], SourceConfigServiceIn
                     deleted_ids.append(an_id)
             
             if deleted_ids:
-                # Removed legacy persistence call
                 pass
         
         logger.info(f"Successfully cleaned up {len(deleted_ids)} source configurations.")

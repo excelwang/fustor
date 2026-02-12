@@ -64,7 +64,6 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
         """添加一个新的配置项并持久化到文件。"""
         async with config_lock:
             self._add_config_to_app(id, config)
-            # Removed legacy persistence call
             logger.info(f"{self.config_type_capitalized} '{id}' configuration added.")
             return config
 
@@ -84,7 +83,6 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
             for key, value in updates.items():
                 setattr(conf, key, value)
             
-            # Removed legacy persistence call
             logger.info(f"{self.config_type_capitalized} '{id}' configuration updated.")
 
             # Check if disabled status changed and notify if necessary
@@ -121,7 +119,6 @@ class BaseConfigService(Generic[T], BaseConfigService[T]): # Inherit from the in
                 await self.pipe_instance_service.stop_one(id)
             
             conf = self._delete_config_from_app(id)
-            # Removed legacy persistence call
             logger.info(f"{self.config_type_capitalized} '{id}' configuration deleted.")
         
         return conf

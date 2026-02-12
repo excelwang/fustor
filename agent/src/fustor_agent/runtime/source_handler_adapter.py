@@ -154,7 +154,7 @@ class SourceHandlerAdapter(SourceHandler):
             return self._driver.perform_sentinel_check(task_batch)
         return {}
 
-    def scan_path(self, path: str, recursive: bool = True) -> Iterator[Any]: #TODO adapter dont known what is scan_path
+    def scan_path(self, path: str, recursive: bool = True) -> Iterator[Any]:
         """
         Perform on-demand scan using the driver.
         

@@ -285,7 +285,7 @@ class FusionPipe(Pipe):
             self._handler_errors[handler_id] = 0
             if handler_id in self._disabled_handlers_timestamps:
                 del self._disabled_handlers_timestamps[handler_id]
-            logger.info(f"Handler {handler_id} re-enabled after cooldown period.")
+            logger.debug(f"Handler {handler_id} re-enabled after cooldown period.")
             return True
         return False
     
@@ -472,7 +472,7 @@ class FusionPipe(Pipe):
                     
                     if h_view_id and str(h_view_id) != str(self.view_id):
                         await view_state_manager.set_snapshot_complete(str(h_view_id), session_id)
-                        logger.info(f"Pipe {self.id}: Also marking view {h_view_id} as complete.")
+                        logger.debug(f"Pipe {self.id}: Also marking view {h_view_id} as complete.")
             else:
                 logger.warning(f"Pipe {self.id}: Received snapshot end signal from non-leader session {session_id}. Ignored.")
 

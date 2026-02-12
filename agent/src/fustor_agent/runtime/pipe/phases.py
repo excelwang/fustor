@@ -14,7 +14,7 @@ logger = logging.getLogger("fustor_agent.pipe.phases")
 
 async def run_snapshot_sync(pipe: "AgentPipe") -> None:
     """Execute snapshot sync phase for the given pipe."""
-    logger.info(f"Pipe {pipe.id}: Starting snapshot sync phase")
+    logger.debug(f"Pipe {pipe.id}: Starting snapshot sync phase")
     
     try:
         # Get snapshot iterator from source
@@ -55,7 +55,7 @@ async def run_snapshot_sync(pipe: "AgentPipe") -> None:
                 
         logger.info(f"Pipe {pipe.id}: Snapshot sync phase complete")
     except asyncio.CancelledError:
-        logger.info(f"Snapshot sync phase for {pipe.id} cancelled")
+        logger.debug(f"Snapshot sync phase for {pipe.id} cancelled")
         raise
     except Exception as e:
         logger.error(f"Pipe {pipe.id} snapshot sync phase error: {e}", exc_info=True)
@@ -69,7 +69,7 @@ async def run_bus_message_sync(pipe: "AgentPipe") -> None:
         logger.error(f"Pipe {pipe.id}: Cannot run bus message sync phase without a bus")
         return
         
-    logger.info(f"Pipe {pipe.id}: Starting bus message sync phase from bus '{pipe._bus.id}'")
+    logger.debug(f"Pipe {pipe.id}: Starting bus message sync phase from bus '{pipe._bus.id}'")
     
     try:
         while pipe.is_running() or (pipe.state & PipeState.RECONNECTING):
@@ -119,7 +119,7 @@ async def run_bus_message_sync(pipe: "AgentPipe") -> None:
 
                 
     except asyncio.CancelledError:
-        logger.info(f"Bus message sync phase for {pipe.id} cancelled")
+        logger.debug(f"Bus message sync phase for {pipe.id} cancelled")
         raise
     except Exception as e:
         logger.error(f"Pipe {pipe.id} bus phase error: {e}", exc_info=True)
@@ -127,7 +127,7 @@ async def run_bus_message_sync(pipe: "AgentPipe") -> None:
 
 async def run_audit_sync(pipe: "AgentPipe") -> None:
     """Execute a full audit synchronization."""
-    logger.info(f"Pipe {pipe.id}: Starting audit phase")
+    logger.debug(f"Pipe {pipe.id}: Starting audit phase")
     old_state = pipe.state
     pipe._set_state(old_state | PipeState.AUDIT_PHASE)
     
@@ -195,7 +195,7 @@ async def run_sentinel_check(pipe: "AgentPipe") -> None:
             logger.debug(f"Pipe {pipe.id}: No sentinel tasks available")
             return
         
-        logger.info(f"Pipe {pipe.id}: Received {len(task_batch.get('paths', []))} sentinel tasks")
+        logger.debug(f"Pipe {pipe.id}: Received {len(task_batch.get('paths', []))} sentinel tasks")
         
         # 2. Perform check via Source handler
         results = pipe.source_handler.perform_sentinel_check(task_batch)
@@ -204,7 +204,7 @@ async def run_sentinel_check(pipe: "AgentPipe") -> None:
             # 3. Submit results back to Fusion
             success = await pipe.sender_handler.submit_sentinel_results(results)
             if success:
-                logger.info(f"Pipe {pipe.id}: Submitted sentinel results for {len(results.get('updates', []))} items")
+                logger.debug(f"Pipe {pipe.id}: Submitted sentinel results for {len(results.get('updates', []))} items")
                 get_metrics().counter("fustor.agent.sentinel_checks", 1, {"pipe": pipe.id})
             else:
                 logger.warning(f"Pipe {pipe.id}: Failed to submit sentinel results")
