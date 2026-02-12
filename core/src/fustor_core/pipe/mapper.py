@@ -30,15 +30,17 @@ class EventMapper:
                 elif hasattr(item, "dict"):
                     self.config.append(item.dict())
                 elif isinstance(item, dict):
+                    # In V2, mapping items are often already dicts
                     self.config.append(item)
                 else:
                     try:
+                        # Fallback for other objects
                         self.config.append(vars(item))
                     except Exception:
                         logger.warning(f"Skipping invalid mapping config item: {item}")
 
         self._mapper_func = self._create_mapper_closure()
-        self.has_mappings = bool(self.config)
+        self.has_mappings = len(self.config) > 0
 
     @property
     def mappings(self) -> List[Dict[str, Any]]:
@@ -53,39 +55,39 @@ class EventMapper:
     def map_batch(self, batch: List[Any]) -> List[Any]:
         """
         Apply mapping to a batch of events.
-        Handles EventBase objects by modifying their 'rows' list.
+        Handles EventBase objects by modifying their 'rows' list and updating 'fields'.
         """
         if not self.has_mappings:
             return batch
             
         mapped_batch = []
         for event in batch:
-            # Map object
+            # Map object with rows
             if hasattr(event, "rows") and isinstance(event.rows, list):
                 new_rows = []
                 for row in event.rows:
-                    # Convert to dict if needed (lazy)
+                    # Robust conversion: if it's a Pydantic model, use model_dump
+                    # to ensure we have a plain dict that we can mutate/pop fields from.
                     row_data = row
-                    is_obj = False
                     if hasattr(row, "model_dump"):
-                        row_data = row.model_dump(mode="json")
-                        is_obj = True
-                    elif hasattr(row, "__dict__"):
-                        row_data = vars(row)
-                        is_obj = True
+                        row_data = row.model_dump()
+                    elif hasattr(row, "dict"):
+                        row_data = row.dict()
+                    elif not isinstance(row, dict):
+                        # Last resort for other objects
+                        row_data = vars(row).copy() if hasattr(row, "__dict__") else dict(row)
                     
                     mapped_row = self.process(row_data)
                     new_rows.append(mapped_row)
                 
-                # Careful: modifying event in place if it's mutable
-                # For safety/correctness with Pydantic, we usually shouldn't mutate 
-                # but for performance in pipe we often do.
+                # Update event with transformed rows
                 event.rows = new_rows
+                if new_rows:
+                    # Update fields list to match remapped row keys
+                    event.fields = list(new_rows[0].keys())
             
             # If the event itself is a dict (raw), map it directly
             elif isinstance(event, dict):
-                 # Support for raw dict events without rows structure
-                 # Note: This changes the event structure itself
                  mapped_batch.append(self.process(event))
                  continue
             
@@ -116,6 +118,8 @@ class EventMapper:
 
         # Prepare instructions
         instructions = []
+        # Track all source fields that should be removed from original data
+        all_source_to_remove = set()
         
         for mapping in self.config:
             target_path = mapping.get("to")
@@ -127,6 +131,7 @@ class EventMapper:
             
             # Determine source value strategy
             source_strategy = None
+            source_field_to_remove = None # Track if we should remove the source field
             
             if "hardcoded_value" in mapping:
                 val = mapping["hardcoded_value"]
@@ -143,51 +148,60 @@ class EventMapper:
                 if ':' in source_def:
                     source_field, target_type = source_def.split(':', 1)
                 
+                # If target name is different from the stripped source field name, we 'move' it
+                if source_field != target_path:
+                    source_field_to_remove = source_field
+                    all_source_to_remove.add(source_field)
+
                 converter = type_converter_map.get(target_type) if target_type else None
                 
-                def make_extractor(field, conv, path):
+                def make_extractor(field, conv):
                     def extract(event_data):
-                        val = event_data.get(field)
+                        # Handle both dict and object
+                        if hasattr(event_data, "get"):
+                            val = event_data.get(field)
+                        else:
+                            val = getattr(event_data, field, None)
+                            
                         if val is None:
                             return None
                         if conv:
                             try:
                                 return conv(val)
                             except (ValueError, TypeError):
-                                # Logger will be passed at runtime if we wanted to log here, 
-                                # but for simplicity in closure we might skip logging or raise
-                                # To keep it fast, we return None or raw val?
-                                # Original implementation logged warning.
-                                return val # Fallback to raw value on error? Or None?
-                                # Let's stick to returning raw value but ideally we should log.
-                                # But we don't have logger in this inner scope easily without overhead.
-                                # Let's handle logging in the main loop if needed.
+                                return val 
                         return val
                     return extract
                 
-                source_strategy = make_extractor(source_field, converter, target_path)
+                source_strategy = make_extractor(source_field, converter)
 
             instructions.append((target_parts, source_strategy))
 
         def mapper_logic(event_data, logger):
+            # Strict transformation: output contains ONLY mapped fields.
             processed_data = {}
-            
+
             for target_parts, get_value in instructions:
                 val = get_value(event_data)
                 if val is None:
                     continue
                 
-                # Set value in nested dict
+                # Set value in nested dict, with path conflict detection
                 current = processed_data
-                for i, part in enumerate(target_parts[:-1]):
+                conflict = False
+                for part in target_parts[:-1]:
+                    if part in current and not isinstance(current[part], dict):
+                        logger.warning(
+                            f"Mapper path conflict: '{part}' is a scalar, "
+                            f"cannot create child '{'.'.join(target_parts)}'. Skipping."
+                        )
+                        conflict = True
+                        break
                     if part not in current:
                         current[part] = {}
                     current = current[part]
-                    if not isinstance(current, dict):
-                        # Conflict: trying to use a scalar as a dict
-                        logger.warning(f"Mapping conflict for {target_parts}: {part} is not a dict")
-                        break
-                else:
+                
+                if not conflict:
                     current[target_parts[-1]] = val
             
             return processed_data
