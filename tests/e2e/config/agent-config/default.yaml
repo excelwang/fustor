@@ -1,0 +1,35 @@
+# Agent Configuration for Integration Tests
+# Uses Unified Config V2 format
+# Location: tests/e2e/config/agent-config/default.yaml
+
+logging: "${FUSTOR_LOG_LEVEL}"
+
+
+sources:
+  shared-fs:
+    driver: fs
+    uri: "${MOUNT_POINT}"
+    # credential not required for fs driver
+    disabled: false
+    # driver_params for fs-specific settings only
+    driver_params: {}
+
+senders:
+  fusion-main:
+    driver: fusion
+    uri: "${FUSION_ENDPOINT}"
+    credential:
+      key: "${API_KEY}"
+    disabled: false
+    # driver_params for http-specific settings only
+    driver_params:
+      timeout: 30.0
+
+pipes:
+  integration-test-ds:
+    source: shared-fs
+    sender: fusion-main
+    # Universal sync parameters
+    audit_interval_sec: ${AUDIT_INTERVAL}
+    sentinel_interval_sec: ${SENTINEL_INTERVAL}
+    max_consecutive_errors: 100

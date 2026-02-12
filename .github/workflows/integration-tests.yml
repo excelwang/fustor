@@ -13,7 +13,7 @@ on:
       - 'fusion/**'
       - 'benchmark/**'
       - 'packages/**'
-      - 'it/**'
+      - 'tests/e2e/**'
       - '.github/workflows/integration-tests.yml'
   pull_request:
     branches: [main, develop]
@@ -22,7 +22,7 @@ on:
       - 'fusion/**'
       - 'benchmark/**'
       - 'packages/**'
-      - 'it/**'
+      - 'tests/e2e/**'
   workflow_dispatch:
 
 env:
@@ -43,7 +43,7 @@ jobs:
 
       - name: Build integration test images
         run: |
-          cd it
+          cd tests/e2e
           docker compose build
 
       - name: Save Docker images
@@ -90,13 +90,13 @@ jobs:
 
       - name: Start Docker Compose environment
         run: |
-          cd it
+          cd tests/e2e
           docker compose up -d --wait
           docker compose ps
 
       - name: Run integration tests
         run: |
-          uv run pytest it/ -v --tb=short --junit-xml=test-results.xml
+          uv run pytest tests/e2e/ -v --tb=short --junit-xml=test-results.xml
         env:
           FUSTOR_USE_PIPELINE: 'true'
           FUSTOR_TEST_TIMEOUT: '600'
@@ -111,7 +111,7 @@ jobs:
       - name: Collect logs on failure
         if: failure()
         run: |
-          cd it
+          cd tests/e2e
           docker compose logs > docker-compose-logs.txt
           for container in fustor-fusion fustor-nfs-client-a fustor-nfs-client-b; do
             docker logs $container > ${container}-logs.txt 2>&1 || true
@@ -123,13 +123,13 @@ jobs:
         with:
           name: failure-logs
           path: |
-            it/docker-compose-logs.txt
-            it/*-logs.txt
+            tests/e2e/docker-compose-logs.txt
+            tests/e2e/*-logs.txt
 
       - name: Cleanup
         if: always()
         run: |
-          cd it
+          cd tests/e2e
           docker compose down -v || true
 
   # Summary job

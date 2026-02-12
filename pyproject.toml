@@ -63,7 +63,7 @@ testpaths = [
     "extensions/*/tests"]
 addopts = "-v --tb=short"
 asyncio_mode = "strict"
-norecursedirs = ["it"]
+norecursedirs = ["tests/e2e"]
 filterwarnings = [
     "ignore:pythonjsonlogger.jsonlogger:DeprecationWarning",
     "ignore:'crypt' is deprecated and slated for removal:DeprecationWarning:passlib.utils"]

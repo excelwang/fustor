@@ -48,7 +48,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          uv run pytest --ignore=it/ -v --tb=short --junit-xml=test-results.xml
+          uv run pytest --ignore=tests/e2e/ -v --tb=short --junit-xml=test-results.xml
 
       - name: Upload test results
         uses: actions/upload-artifact@v4
