@@ -55,9 +55,7 @@ class FSDriver(SourceDriver):
             return FSDriver._instances[signature]
     
     def __init__(self, id: str, config: SourceConfig):
-        # Prevent re-initialization of shared instances
-        if hasattr(self, '_initialized'):
-            return
+        # Option A: Always initialize. Singleton management is handled by __new__ and close().
         
         super().__init__(id, config)
         self.uri = self.config.uri
