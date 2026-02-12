@@ -231,7 +231,7 @@ class PipeSessionBridge:
                 await view_state_manager.set_authoritative_session(view_id, session_id)
                 self._leader_cache.setdefault(view_id, set()).add(session_id)
     
-    # 3. Get final status from pipe
+        # 3. Get final status from pipe
         role = await self._pipe.get_session_role(session_id)
         timeout = self._pipe.config.get("session_timeout_seconds", 30)
         

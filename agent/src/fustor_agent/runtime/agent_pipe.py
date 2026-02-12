@@ -157,6 +157,11 @@ class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
         logger.info(f"Pipe {self.id}: Role changed from {self.current_role} to {new_role}")
         self.current_role = new_role
         
+        if new_role == "leader":
+            # Gained leadership - clear audit context to ensure fresh scan
+            logger.info(f"Pipe {self.id}: Promoted to LEADER. Clearing audit cache for fresh scan.")
+            self.audit_context.clear()
+        
         if new_role != "leader":
             # If we are demoted or starting as follower, ensure leader tasks are stopped
             await self._cancel_leader_tasks()

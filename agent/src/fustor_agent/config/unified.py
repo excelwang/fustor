@@ -61,7 +61,6 @@ class UnifiedAgentConfig(BaseModel):
 
     sources: Dict[str, Dict[str, Any]] = {}
     senders: Dict[str, Dict[str, Any]] = {}
-    senders: Dict[str, Dict[str, Any]] = {}
     pipes: Dict[str, AgentPipeConfig] = {}
     
     # Tuning parameters

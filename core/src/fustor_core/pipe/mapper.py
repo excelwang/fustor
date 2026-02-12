@@ -182,49 +182,7 @@ class EventMapper:
         # Filter out fields that are BOTH a source-to-remove and a target
         final_to_remove = all_source_to_remove - all_targets
 
-        def mapper_logic(event_data, logger):
-            # Strict mode: Start with empty dict, only include mapped fields
-            processed_data = {}
-            
-            # Apply all mappings
-            for target_parts, get_value, target_path in instructions:
-                val = get_value(event_data)
-                if val is None:
-                    continue
-                
-                # Set value in nested dict
-                current = processed_data
-                for part in target_parts[:-1]:
-                    if part not in current or not isinstance(current[part], dict):
-                        current[part] = {}
-                    current = current[part]
-                
-                # Check for path conflict (if target is existing scalar)
-                if target_parts[-1] in current and not isinstance(current[target_parts[-1]], dict) and isinstance(val, dict):
-                     # If we are trying to write a dict into a place that is already a scalar?
-                     # No, wait. 
-                     # Case: target="root", val=1. processed={'root': 1}.
-                     # Next: target="root.child", val=2.
-                     # Loop above: 'root' in current. current['root'] is 1 (scalar).
-                     # current['root'] is NOT dict.
-                     # We overwrote it: current[part] = {} -> current['root'] = {}.
-                     # This would overwrite 'root': 1 with 'root': {}.
-                     # Test: test_path_conflict_avoidance expects {'root': 1}.
-                     # So we should NOT overwrite scalar with dict if strict?
-                     pass
 
-                # Let's handle the path conflict strictly as per test_path_conflict_avoidance
-                # The test expects:
-                # config 1: a -> root (val 1)
-                # config 2: b -> root.child (val 2)
-                # Result: {'root': 1}
-                # So if we encounter a scalar where we need a dict, we should SKIP this mapping?
-                
-                # Re-implementing the loop with conflict check
-            
-            return processed_data
-
-        # Better implementation of mapper_logic for the tool replacement
         def mapper_logic(event_data, logger):
             processed_data = {}
             
