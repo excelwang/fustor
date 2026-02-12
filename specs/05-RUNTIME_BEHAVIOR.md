@@ -36,6 +36,48 @@ Leader 的选举完全由 Fusion 端控制，采用非抢占式的锁机制。
 | **Audit Cache** | **Clear** | **强制清空**审计缓存，确保当选后的第一次审计是**全量扫描** (建立新基准)。 |
 | **Sentinel** | **Start** | 启动后台巡检任务。 |
 
+### 1.4 状态标志语义: 瞬态 vs 单调
+
+| 标志类型 | 示例 | 语义 | 适用场景 |
+|---------|------|------|----------|
+| **瞬态标志** (Transient) | `PipeState.MESSAGE_SYNC` | 表示某个 Task **当前正在运行**。Task 完成、异常退出或重建时，标志会短暂清除。 | 内部控制逻辑 (如是否需要重启 task) |
+| **单调标志** (Monotonic) | `is_realtime_ready` | 表示 Pipe **曾经成功连接过** EventBus 并处于就绪状态。一旦设为 `True`，除非 Pipe 重启不然不会变回 `False`。 | 外部状态判断 (如 Heartbeat `can_realtime`) |
+
+> [!CAUTION]
+> 避免在外部监控或测试中使用瞬态标志作为"服务就绪"的判据，这会导致因 Task 重启窗口期引发的 Flaky Test。
+
+### 1.5 Session Timeout Negotiation (超时协商)
+
+Session 超时时间由 **Client-Hint + Server-Default** 共同决定：
+
+1. **Client Hint**: Agent 在 `CreateSessionRequest` 中携带 `session_timeout_seconds` (通常来自本地配置)。
+2. **Server Decision**: Fusion 取 `max(client_hint, server_default)` 作为最终超时时间。
+3. **Acknowledgment**: Fusion 在响应中返回最终决定的 `session_timeout_seconds`，Agent **必须** 采纳此值作为心跳间隔的基准。
+
+### 1.6 Error Recovery Strategy (错误恢复策略)
+
+控制循环针对不同类型的异常采取差异化的恢复策略：
+
+| 异常类型 | 策略 | 原因 |
+|---------|------|------|
+| `SessionObsoletedError` | **Immediate Retry** | 会话被服务端主动终结 (如 Leader Failover)，应立即重连以竞选新 Leader。 |
+| `RuntimeError` | **Exponential Backoff** | 连接超时、配置错误等环境问题，快速重试会加重系统负担。 |
+| `CancelledError` (+ STOPPING) | **Break** | 正常的停止流程。 |
+| `CancelledError` (- STOPPING) | **Continue** | 单个 Task (如 Snapshot) 被取消，但 Pipe 仍需运行 (见 §1.7)。 |
+| Background Task Crash | **Count & Retry** | 记录连续错误计数，触发 Backoff，等待下一轮循环重启 Task。 |
+
+### 1.7 Heartbeat Never Dies Invariant (心跳永不停止原则)
+
+**核心不变量**: 只要 `AgentPipe.start()` 被调用，心跳循环 **永远不应因内部错误而停止**。
+
+即使 Snapshot 崩溃、Message Sync 异常、Audit 失败，心跳也必须持续向 Fusion 报告状态 (通过 `can_realtime` 字段隐式传递健康度)。
+
+**典型场景**: Leader → Follower 角色降级
+1. Fusion 返回 `role=follower`。
+2. Agent 取消 `snapshot`/`audit`/`sentinel` 任务 (抛出 `CancelledError`)。
+3. 心跳任务 (`_heartbeat_task`) **保持运行**。
+4. 控制循环捕获 `CancelledError`，因未设置 `STOPPING` 标志，选择 `continue` 而非退出的，确保管道存活。
+
 ---
 
 ## 2. 审计缓存 (Audit Mtime Cache)
@@ -55,6 +97,20 @@ Leader 的选举完全由 Fusion 端控制，采用非抢占式的锁机制。
 
 ### 2.3 行为影响
 - **Leader 当选后首轮审计**: **全量扫描** (IO 较高，可接受)。
+- **后续审计**: **增量扫描** (仅扫描 mtime 变化的目录，IO 极低)。
+
+### 2.4 Audit Phase Protocol: Start/End Signal Contract
+
+Audit 过程必须严格遵循 Start/End 信号契约，以确保 Fusion 端的一致性维护逻辑被触发。
+
+1. **Start Signal**: 调用 `POST /consistency/audit/start`。Fusion 记录 `last_audit_start` 时间戳。
+2. **Streaming**: 发送审计事件流。
+3. **End Signal**: **必须** 调用 `POST /consistency/audit/end` (通过发送 `is_final=True` 的空批次)。
+
+> [!IMPORTANT]
+> **Must-Send 语义**: 即使 Audit 过程中发生异常 (如 IO 错误、网络中断)，`finally` 块中也 **必须** 发送 End Signal。
+> 
+> **后果**: 若 Fusion 未收到 End Signal，将认为审计未完成，因此 **永远不会触发 Tombstone 清理和 Blind-spot 检测**，导致已删除文件的"幽灵条目"永久残留。
 - **后续审计**: **增量扫描** (仅扫描 mtime 变化的目录，IO 极低)。
 
 ---

@@ -135,7 +135,20 @@ extensions/
 ├── fustor-receiver-grpc/            # gRPC Receiver (新增)
 ```
 
-### 3.5 应用包
+### 3.5 FSDriver Singleton Lifecycle
+
+为节省系统资源（如 inotify watch 描述符），FSDriver 实现了 **Per-URI Singleton** 模式。
+
+- **唯一标识**: `signature = f"{uri}#{hash(credential)}"`
+- **行为**:
+    - 不同 Pipe 配置若指向同一 URI 且凭证相同，将共享同一个 Driver 实例。
+    - 共享实例意味着共享底层的 WatchManager 和 EventQueue。
+- **生命周期约束**:
+    - **引用计数**: Driver 内部不维护引用计数（简化设计）。
+    - **显式销毁**: 必须调用 `driver.close()` 或 `FSDriver.invalidate(uri, cred)` 才能从缓存中移除。
+    - **热重载**: 修改配置（如排除列表）但 URI 不变时，为了使新配置生效，ConfigReloader 必须显式 `invalidate` 旧实例，否则下次 `FSDriver(id, config)` 仍会返回旧实例。
+
+### 3.6 应用包
 
 ```
 agent/                               # fustor-agent

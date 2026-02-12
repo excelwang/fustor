@@ -30,6 +30,21 @@ Fustor (Agent & Fusion) 运行在 **asyncio 单线程事件循环**中。
 操作共享状态。CPU 密集操作（如 hash 计算）可以使用 `run_in_executor`，但
 **不得在 executor 中访问任何共享可变状态。**
 
+### 1.3 Thread Bridge for Sync Iterators
+
+为桥接同步 IO（如 `os.scandir`、`MinIO SDK`）与异步管道，使用 **Thread Bridge Pattern**：
+
+1. **Producer Thread**: 专用线程运行同步迭代器
+2. **Async Queue**: `asyncio.Queue` 作为反向压力缓冲区
+3. **Bridge Logic**:
+    - Producer 使用 `run_coroutine_threadsafe(queue.put(...))` 投递数据
+    - 必须使用 `threading.Event` (`stop_event`) 监听 Consumer 的退出信号
+    - **死锁预防**: Producer 在 `queue.put()` 等待时无法感知 `stop_event`，因此 Consumer 在退出前必须 **排空队列 (Drain Queue)** 以解锁 Producer。
+
+> [!WARNING]
+> 禁止简单的 `run_in_executor(None, next, iter)` 模式，这会导致大量的上下文切换。
+> Thread Bridge 模式通过批量缓冲显著降低了开销。
+
 ---
 
 ## 2. 锁粒度策略
