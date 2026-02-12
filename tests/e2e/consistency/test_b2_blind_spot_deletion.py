@@ -11,6 +11,7 @@ import os
 from ..utils import docker_manager
 from ..conftest import CONTAINER_CLIENT_A, CONTAINER_CLIENT_C, MOUNT_POINT
 from ..fixtures.constants import (
+    INGESTION_DELAY,
     SHORT_TIMEOUT,
     MEDIUM_TIMEOUT,
     EXTREME_TIMEOUT,
