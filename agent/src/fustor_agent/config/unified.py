@@ -61,7 +61,11 @@ class UnifiedAgentConfig(BaseModel):
 
     sources: Dict[str, Dict[str, Any]] = {}
     senders: Dict[str, Dict[str, Any]] = {}
+    senders: Dict[str, Dict[str, Any]] = {}
     pipes: Dict[str, AgentPipeConfig] = {}
+    
+    # Tuning parameters
+    fs_scan_workers: int = Field(default=4, description="Default concurrency for FS scans")
 
 
 class AgentConfigLoader:
@@ -80,6 +84,7 @@ class AgentConfigLoader:
         
         # Global settings
         self.logging = GlobalLoggingConfig()
+        self.fs_scan_workers: int = 4
 
 
         # Merged namespace
@@ -129,6 +134,9 @@ class AgentConfigLoader:
             if "logging" in data:
                  # GlobalLoggingConfig validator handles string vs dict
                 self.logging = GlobalLoggingConfig.model_validate(data["logging"])
+            
+            if "fs_scan_workers" in data:
+                self.fs_scan_workers = int(data["fs_scan_workers"])
             
 
 

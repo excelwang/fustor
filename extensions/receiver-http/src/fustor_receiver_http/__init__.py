@@ -147,8 +147,8 @@ class HTTPReceiver(Receiver):
         self._on_session_closed: Optional[SessionClosedCallback] = None
         self._on_scan_complete: Optional[Callable[[str, str, Optional[str]], Awaitable[None]]] = None  # session_id, path, job_id
         
-        # API key to pipe mapping
-        self._api_key_to_pipe: Dict[str, str] = {}
+        # API key to view mapping
+        self._api_key_to_view: Dict[str, str] = {}
         self._api_key_cache: Dict[str, str] = {}
         
         # Session timeout configuration
@@ -188,11 +188,11 @@ class HTTPReceiver(Receiver):
         if on_scan_complete:
             self._on_scan_complete = on_scan_complete
     
-    def register_api_key(self, api_key: str, pipe_id: str):
-        """Register an API key for a pipe."""
-        self._api_key_to_pipe[api_key] = pipe_id
+    def register_api_key(self, api_key: str, view_id: str):
+        """Register an API key for a view."""
+        self._api_key_to_view[api_key] = view_id
         self._api_key_cache.clear()  # Invalidate cache
-        self.logger.debug(f"Registered API key for pipe {pipe_id}")
+        self.logger.debug(f"Registered API key for view {view_id}")
     
     async def validate_credential(self, credential: Dict[str, Any]) -> Optional[str]:
         """
@@ -202,7 +202,7 @@ class HTTPReceiver(Receiver):
             credential: The credential to validate (expects {"api_key": "..."})
             
         Returns:
-            Associated pipe_id if valid, None if invalid
+            Associated view_id if valid, None if invalid
         """
         api_key = credential.get("api_key") or credential.get("key")
         if not api_key:
@@ -213,10 +213,10 @@ class HTTPReceiver(Receiver):
             return self._api_key_cache[api_key]
             
         # Check mapping
-        if api_key in self._api_key_to_pipe:
-            pipe_id = self._api_key_to_pipe[api_key]
-            self._api_key_cache[api_key] = pipe_id
-            return pipe_id
+        if api_key in self._api_key_to_view:
+            view_id = self._api_key_to_view[api_key]
+            self._api_key_cache[api_key] = view_id
+            return view_id
             
         return None
     
@@ -315,8 +315,8 @@ class HTTPReceiver(Receiver):
                     detail="API key required"
                 )
             
-            pipe_id = await receiver.validate_credential({"api_key": api_key})
-            if not pipe_id:
+            view_id = await receiver.validate_credential({"api_key": api_key})
+            if not view_id:
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Invalid API key"
@@ -333,7 +333,7 @@ class HTTPReceiver(Receiver):
                     session_info = await receiver._on_session_created(
                         session_id, 
                         payload.task_id, 
-                        pipe_id, 
+                        view_id, 
                         payload.client_info or {},
                         session_timeout_seconds
                     )

@@ -109,6 +109,13 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
         
         self.logger.info(f"Attempting to start pipe instance '{id}'...")
         try:
+            # D-05: Global Config Injection
+            # Inject global fs_scan_workers default if not present in driver_params
+            if source_config.driver == "fs":
+                from fustor_agent.config.unified import agent_config
+                if "max_scan_workers" not in source_config.driver_params:
+                    source_config.driver_params["max_scan_workers"] = agent_config.fs_scan_workers
+            
             # Obtain EventBus mandatory for all pipes (unifying architecture)
             task_id = f"{self.agent_id}:{id}"
             field_mappings = getattr(pipe_config, "fields_mapping", [])

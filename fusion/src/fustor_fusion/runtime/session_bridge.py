@@ -280,9 +280,7 @@ class PipeSessionBridge:
     
     async def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         """
-        Get session info from both systems.
-        
-        Priority: Pipe session info, fallback to SessionManager.
+        Get session info from Pipe.
         """
         # Try Pipe first
         info = await self._pipe.get_session_info(session_id)

@@ -15,6 +15,7 @@ class TestTreeManager:
     @pytest.fixture
     def tree_mgr(self):
         state = FSState("test-view", MagicMock()) # Mock clock
+        state.max_nodes = 1000 # Allow enough nodes for tests
         return TreeManager(state)
 
     @pytest.mark.asyncio
