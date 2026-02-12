@@ -39,9 +39,8 @@ async def aiter_sync_phase_wrapper(
             if not stop_event.is_set():
                 coro = queue.put(e)
                 try:
-                    future = asyncio.run_coroutine_threadsafe(coro, loop)
-                    future.result()
-                except (asyncio.CancelledError, RuntimeError):
+                    asyncio.run_coroutine_threadsafe(coro, loop)
+                except RuntimeError:
                     coro.close()
         finally:
             # Only send sentinel if consumer is still running.
@@ -50,9 +49,8 @@ async def aiter_sync_phase_wrapper(
             if not stop_event.is_set():
                 coro = queue.put(StopAsyncIteration)
                 try:
-                    future = asyncio.run_coroutine_threadsafe(coro, loop)
-                    future.result()
-                except (asyncio.CancelledError, RuntimeError):
+                    asyncio.run_coroutine_threadsafe(coro, loop)
+                except RuntimeError:
                     coro.close()
 
     # Start producer thread

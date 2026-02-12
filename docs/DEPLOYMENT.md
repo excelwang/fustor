@@ -44,8 +44,11 @@ Fusion 是 Fustor 的核心存储引擎，负责接收数据并提供查询视�
 ### 3.1 安装
 
 ```bash
-# 使用 uv 安装 Fusion 主程序及标准组件
+# 推荐使用 uv
 uv pip install fustor-fusion fustor-view-fs fustor-receiver-http
+
+# 或使用 pip
+pip install fustor-fusion fustor-view-fs fustor-receiver-http
 ```
 
 ### 3.2 配置
@@ -113,8 +116,11 @@ Agent 部署在数据源所在的机器上，负责监听数据源变更并推�
 ### 4.1 安装
 
 ```bash
-# 安装 Agent 主程序及相关驱动
+# 推荐使用 uv
 uv pip install fustor-agent fustor-source-fs fustor-sender-http
+
+# 或使用 pip
+pip install fustor-agent fustor-source-fs fustor-sender-http
 ```
 
 ### 4.2 配置

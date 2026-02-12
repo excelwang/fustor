@@ -21,16 +21,31 @@ mkdir -p ~/.fustor/fusion-config ~/.fustor/agent-config ~/.fustor/logs
 
 ## 2. 软件安装 (v0.8.9+)
 
+> **Python 版本要求**：Python ≥ 3.11
+
 推荐使用 `uv` 从 PyPI 安装最新版本：
+
+```bash
+# 安装 uv（推荐）
+curl -LsSf https://astral.sh/uv/install.sh | sh
+```
 
 ### 服务端 (Fusion Node)
 ```bash
+# 推荐使用 uv
 uv pip install fustor-fusion fustor-view-fs fustor-receiver-http
+
+# 或使用 pip
+pip install fustor-fusion fustor-view-fs fustor-receiver-http
 ```
 
 ### 采集端 (Source Node)
 ```bash
+# 推荐使用 uv
 uv pip install fustor-agent fustor-source-fs fustor-sender-http
+
+# 或使用 pip
+pip install fustor-agent fustor-source-fs fustor-sender-http
 ```
 
 ---

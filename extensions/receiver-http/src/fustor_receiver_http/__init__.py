@@ -102,20 +102,9 @@ class HeartbeatLogFilter(logging.Filter):
 
 
 class EventsLogFilter(logging.Filter):
-    """Filter out high-frequency event ingestion logs from uvicorn."""
-    def __init__(self, name: str = "", skip_count: int = 100):
-        super().__init__(name)
-        self.count = 0
-        self.skip_count = skip_count
-
+    """Suppress uvicorn access logs for /events — replaced by batch-level app logs."""
     def filter(self, record: logging.LogRecord) -> bool:
-        if "/events" in record.getMessage():
-            self.count += 1
-            # Show the first 5, then every 'skip_count'
-            if self.count <= 5 or self.count % self.skip_count == 0:
-                return True
-            return False
-        return True
+        return "/events" not in record.getMessage()
 
 
 class HTTPReceiver(Receiver):
@@ -240,7 +229,7 @@ class HTTPReceiver(Receiver):
         # Setup heartbeat and events filtering for uvicorn access logs
         uvicorn_access = logging.getLogger("uvicorn.access")
         uvicorn_access.addFilter(HeartbeatLogFilter())
-        uvicorn_access.addFilter(EventsLogFilter(skip_count=500))
+        uvicorn_access.addFilter(EventsLogFilter())
 
         config = uvicorn.Config(
             app=self._app,
@@ -444,6 +433,12 @@ class HTTPReceiver(Receiver):
                         session_id, batch.events, batch.source_type, batch.is_end
                     )
                     if success:
+                        receiver._ingest_count += 1
+                        logger.info(
+                            f"Batch #{receiver._ingest_count} ingested: "
+                            f"{len(batch.events)} events, phase={batch.source_type}, "
+                            f"session={session_id[:8]}{'...' if len(session_id) > 8 else ''}"
+                        )
                         return {"status": "ok", "count": len(batch.events)}
                     else:
                         raise HTTPException(
