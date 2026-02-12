@@ -16,7 +16,7 @@ class TreeManager:
         self.state = state
         self.logger = logging.getLogger(f"fustor_view.fs.tree.{state.view_id}")
 
-    async def update_node(self, payload: Dict[str, Any], path: str, last_updated_at: float = 0.0):
+    async def update_node(self, payload: Dict[str, Any], path: str, last_updated_at: float = 0.0, lineage_info: Dict[str, Any] = None):
         """Update or create a node in the tree based on event payload."""
         if not path.startswith('/'):
             path = '/' + path
@@ -81,11 +81,17 @@ class TreeManager:
             parent_node = self.state.directory_path_map.get(parent_path)
             if parent_node:
                 parent_node.children[name] = node
-                logger.debug(f"ATTACHED {path} to parent {parent_path}. Parent children count: {len(parent_node.children)}")
             else:
                 logger.warning(f"ORPHAN {path} - Parent {parent_path} not found!")
             
             node.last_updated_at = last_updated_at
+        
+        # Persist lineage info
+        if lineage_info:
+            if lineage_info.get('last_agent_id'):
+                node.last_agent_id = lineage_info.get('last_agent_id')
+            if lineage_info.get('source_uri'):
+                node.source_uri = lineage_info.get('source_uri')
 
     def _check_capacity(self) -> bool:
         """Return True if tree has capacity for new nodes."""

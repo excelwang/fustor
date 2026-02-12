@@ -161,7 +161,14 @@ class FSArbitrator:
         final_last_updated_at = time.time() if is_fresh_confirmation else old_last_updated_at
 
         # Perform the actual update (last_updated_at is set correctly by tree.py)
-        await self.tree_manager.update_node(payload, path, last_updated_at=final_last_updated_at)
+        # Extract lineage info from event metadata (injected by FusionPipe)
+        metadata = getattr(event, 'metadata', {}) or {}
+        lineage_info = {
+            'last_agent_id': metadata.get('agent_id'),
+            'source_uri': metadata.get('source_uri')
+        }
+        
+        await self.tree_manager.update_node(payload, path, last_updated_at=final_last_updated_at, lineage_info=lineage_info)
         node = self.state.get_node(path)
         if not node: return
 
