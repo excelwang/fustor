@@ -34,7 +34,7 @@ def mock_get_manager(member_drivers):
 
 @pytest.mark.asyncio
 async def test_driver_aggregation(mock_get_manager):
-    config = {"driver_params": {"members": ["v1", "v2", "missing"]}}
+    config = {"members": ["v1", "v2", "missing"]}
     
     with patch.object(MultiFSViewDriver, '_get_view_manager_func') as mock_method:
         mock_method.return_value = mock_get_manager
@@ -83,7 +83,7 @@ def test_find_best_view():
 
 @pytest.mark.asyncio
 async def test_driver_tree_best_view(mock_get_manager, member_drivers):
-    config = {"driver_params": {"members": ["v1", "v2"]}}
+    config = {"members": ["v1", "v2"]}
     
     with patch.object(MultiFSViewDriver, '_get_view_manager_func') as mock_method:
         mock_method.return_value = mock_get_manager

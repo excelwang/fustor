@@ -99,6 +99,8 @@ class AgentConfigLoader:
     def load_all(self) -> None:
         """Load and merge all YAML files from config directory."""
         self.logging = GlobalLoggingConfig()
+        self.fs_scan_workers: int = 4
+        self.agent_id: Optional[str] = None  # Global Agent ID from config
 
         self._sources.clear()
         self._senders.clear()
@@ -136,6 +138,12 @@ class AgentConfigLoader:
             
             if "fs_scan_workers" in data:
                 self.fs_scan_workers = int(data["fs_scan_workers"])
+            
+            if "agent_id" in data:
+                aid = str(data["agent_id"]).strip()
+                if self.agent_id and self.agent_id != aid:
+                    logger.warning(f"Agent ID redefined in {path}: was '{self.agent_id}', now '{aid}'")
+                self.agent_id = aid
             
 
 

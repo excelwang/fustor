@@ -198,8 +198,13 @@ def setup_view_routers():
                     async def get_driver_instance_for_instance(view_id: str, _key=view_name):
                         return await get_view_driver_instance(_key, _key)
                     
-                    checker = make_readiness_checker(view_name)
-                    limit_checker = make_metadata_limit_checker(view_name)
+                    # multi-fs views are aggregators and don't have sessions/snapshots
+                    if driver_name == "multi-fs":
+                        checker = None
+                        limit_checker = None
+                    else:
+                        checker = make_readiness_checker(view_name)
+                        limit_checker = make_metadata_limit_checker(view_name)
                     
                     router = create_func(
                         get_driver_func=get_driver_instance_for_instance,

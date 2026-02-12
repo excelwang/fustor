@@ -45,11 +45,23 @@ class App:
         self.logger = logging.getLogger("fustor_agent")
         self.logger.info("Initializing application...")
         
-        # Agent ID
-        self.agent_id = get_or_generate_agent_id(HOME_FUSTOR_DIR, self.logger)
-        
-        # Load Config
+        # Load Config first to check for agent_id
         agent_config.reload()
+        
+        # Agent ID Priority: Config > File/Auto (IP-based)
+        # Environment variable support removed per user request ("Only keep one: configuration file")
+        
+        config_id = agent_config.agent_id
+        
+        if config_id:
+             self.logger.info(f"Using Agent ID from config file: {config_id}")
+             self.agent_id = config_id
+        else:
+             # Strict requirement: Agent ID must be in config
+             raise ValueError(
+                 "Agent ID is not configured. "
+                 "Please set 'agent_id' in your agent-config (e.g., default.yaml)."
+             )
         
         # Determine which pipes to start based on config_list
         self._target_pipe_ids = self._resolve_target_pipes(config_list)
