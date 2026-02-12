@@ -14,6 +14,7 @@ class DirectoryNode:
         # Consistency flags
         self.integrity_suspect: bool = False
         self.known_by_agent: bool = False # Set to True if seen via Realtime event
+        self.audit_skipped: bool = False  # Temporary flag for missing file detection
         # Lineage info
         self.last_agent_id: Optional[str] = None
         self.source_uri: Optional[str] = None
