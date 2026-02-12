@@ -55,7 +55,11 @@ class FSDriver(SourceDriver):
             return FSDriver._instances[signature]
     
     def __init__(self, id: str, config: SourceConfig):
-        # Option A: Always initialize. Singleton management is handled by __new__ and close().
+        # Prevent re-initialization of shared singleton instances.
+        # __new__ returns cached instance, but Python always calls __init__ after __new__.
+        # Without this guard, event_queue/executor/stop_event get replaced, orphaning threads.
+        if hasattr(self, '_initialized'):
+            return
         
         super().__init__(id, config)
         self.uri = self.config.uri

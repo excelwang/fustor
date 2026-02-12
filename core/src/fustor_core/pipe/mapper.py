@@ -118,17 +118,11 @@ class EventMapper:
 
         # Prepare instructions
         instructions = []
-        # Track all source fields that should be removed from original data
-        all_source_to_remove = set()
-        # Track all target paths to avoid accidental deletion if source == target
-        all_targets = set()
         
         for mapping in self.config:
             target_path = mapping.get("to")
             if not target_path:
                 continue
-            
-            all_targets.add(target_path)
 
             # Parse target path (dot notation)
             target_parts = target_path.split('.')
@@ -151,10 +145,6 @@ class EventMapper:
                 if ':' in source_def:
                     source_field, target_type = source_def.split(':', 1)
                 
-                # If target name is different from the stripped source field name, we 'move' it
-                if source_field != target_path:
-                    all_source_to_remove.add(source_field)
-
                 converter = type_converter_map.get(target_type) if target_type else None
                 
                 def make_extractor(field, conv):
@@ -179,11 +169,10 @@ class EventMapper:
 
             instructions.append((target_parts, source_strategy, target_path))
 
-        # Filter out fields that are BOTH a source-to-remove and a target
-        final_to_remove = all_source_to_remove - all_targets
-
-
         def mapper_logic(event_data, logger):
+            # Projection Semantic (spec: 07-DATA_ROUTING_AND_CONTRACTS §3.2):
+            # Only explicitly mapped fields appear in output.
+            # When fields_mapping is empty, this closure is never called (passthrough).
             processed_data = {}
             
             for target_parts, get_value, target_path in instructions:

@@ -2,8 +2,8 @@
 """
 Bridge between FusionPipe and the existing SessionManager.
 
-This module connects the Pipe Runtime with the SessionManager.
-to the Pipe-based session management.
+This module connects the Pipe Runtime with the SessionManager
+for session lifecycle management.
 
 Architecture:
     

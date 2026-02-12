@@ -30,10 +30,12 @@ class PipeLeaderMixin:
         # Once snapshot is done, update the internal flag
         if self._snapshot_task and self._snapshot_task.done() and not self._initial_snapshot_done:
             try:
-                # Check if it failed
                 self._snapshot_task.result()
-                self._initial_snapshot_done = True
-                logger.info(f"Pipe {self.id}: Initial snapshot sync phase complete")
+                # Flag is set inside _run_snapshot_sync on success.
+                # If _handle_fatal_error swallowed the error, .result() returns None
+                # but _initial_snapshot_done remains False — which is correct.
+                if self._initial_snapshot_done:
+                    logger.info(f"Pipe {self.id}: Initial snapshot sync phase complete")
             except asyncio.CancelledError:
                 logger.debug(f"Pipe {self.id}: Snapshot sync phase task was cancelled")
             except Exception as e:
@@ -68,7 +70,6 @@ class PipeLeaderMixin:
                 )
                 
             self._initial_snapshot_done = True
-            logger.info(f"Pipe {self.id}: Initial snapshot sync phase complete")
         except Exception as e:
             # Lifecycle mixin provides this
             await self._handle_fatal_error(e)

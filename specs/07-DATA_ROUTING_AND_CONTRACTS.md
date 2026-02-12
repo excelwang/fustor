@@ -52,3 +52,44 @@ Fustor 采用 **“Pipe 层粗粒度过滤 + Manager 层细粒度路由”** 的
 *   **性能**：避免了将所有事件广播给所有 Handler 导致的无效 CPU 消耗和 Pydantic 反序列化开销。
 *   **安全性**：防止了非法或不兼容的 Schema 数据污染视图（例如：防止将 DB 事件错误地传给 FS 内存树）。
 *   **灵活性**：保留了 `view-manager` 作为聚合器的设计，允许一个 Pipe 通过插件化方式扩展多种视图。
+
+---
+
+## 3. 字段映射与投影语义 (Field Mapping & Projection)
+
+### 3.1 背景
+Agent 的 `fields_mapping` 配置允许用户在数据离开 Agent 前对事件字段进行重命名、类型转换和裁剪。这在异构数据源接入同一 Fusion View 时尤为重要。
+
+### 3.2 决策：投影语义 (Projection Semantic)
+
+`fields_mapping` 采用 **"投影"** 模式：
+
+*   **已配置 `fields_mapping`（列表非空）**：输出中 **仅包含映射规则显式声明的字段**。未在规则中出现的源字段将被静默丢弃。
+*   **未配置 `fields_mapping`（列表为空或缺省）**：Mapper 为透明直通，所有字段原样传输，不做任何变换。
+
+> **关键不变量**：  
+> `len(fields_mapping) == 0  ⟹  event_out ≡ event_in`  
+> `len(fields_mapping) > 0   ⟹  keys(event_out) ⊆ { m.to | m ∈ fields_mapping }`
+
+### 3.3 配置格式
+
+```yaml
+pipes:
+  my-pipe:
+    source: shared-fs
+    sender: fusion-main
+    fields_mapping:
+      - to: "path"                    # 目标字段名
+        source: ["path:string"]       # 源字段名[:类型转换]
+      - to: "modified_time"
+        source: ["modified_time:number"]
+      - to: "custom_size"
+        source: ["size:integer"]      # size → custom_size (重命名)
+      - to: "label"
+        hardcoded_value: "production" # 硬编码常量
+```
+
+### 3.4 设计权衡
+
+*   **数据安全**：投影语义确保只有用户明确声明的字段被传输，防止敏感字段意外泄漏。
+*   **使用注意**：配置 `fields_mapping` 时，用户**必须**列出所有需要传输的字段。遗漏任何字段（如 `size`、`is_directory`）将导致该字段不被传输，Fusion 端对应值为默认值（0 / None / False）。
