@@ -202,6 +202,8 @@ self.state.tombstone_list = {
 
 ### 4.4 盲区名单 (Blind-spot List)
 
+Blind-spot 是**信息型记录**，用于标记"仅通过补偿源（Audit/Snapshot）发现，未经 Realtime 确认"的节点。
+
 包含两个子集：
 - `blind_spot_additions`: 盲区新增的文件
 - `blind_spot_deletions`: 盲区删除的文件
@@ -212,6 +214,12 @@ self.state.tombstone_list = {
   - 收到 Realtime Delete/Update 时移除相关条目
   - Audit 再次看到文件时从 `blind_spot_deletions` 移除
   - **Session 生命周期控制**：`on_session_start` 时清空列表以重新发现盲区
+
+> **重要限制**：on_demand 扫描（由 Fusion 向 Agent 发起的目录遍历命令）**无法产生 Realtime 级别的确认**。
+> on_demand 本质上是 Agent 对指定路径执行一次目录遍历，其数据与 Audit/Snapshot 同源（补偿型），
+> 因此无法用于清除 blind-spot 标记。Blind-spot 只能通过以下途径清除：
+> 1. 自然产生的 Realtime inotify/watchdog 事件
+> 2. 下一轮完整 Audit 周期（Audit 再次扫描到该路径时移除）
 
 ---
 

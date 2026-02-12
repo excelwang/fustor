@@ -17,9 +17,11 @@ class FSViewBase(ViewDriver):
     Base class for FS View Drivers, inheriting from the core ViewDriver ABC.
     Provides shared state and concurrency primitives.
     
-    Concurrency Model:
-    - Read operations (queries, process_event) use read_lock (concurrent).
-    - Write operations (audit_start/end, reset, session_start) use write_lock (exclusive).
+    Concurrency Model (asyncio single-threaded):
+    - Concurrent operations (queries, process_event) use read_lock. 
+      process_event mutates state but is safe under asyncio's cooperative scheduling
+      since mutations complete atomically between await points.
+    - Exclusive operations (audit_start/end, reset, session_start) use write_lock.
     """
     
     def __init__(self, id: str, view_id: str, config: Optional[Dict[str, Any]] = None, hot_file_threshold: float = 30.0):

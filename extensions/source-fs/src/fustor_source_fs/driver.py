@@ -414,7 +414,8 @@ class FSDriver(SourceDriver):
 
     async def close(self):
         """
-        Close the file system watcher and stop monitoring.
+        Close the file system watcher, stop monitoring, and remove from singleton cache.
+        After close(), creating a new FSDriver with the same URI will produce a fresh instance.
         """
         logger.info(f"[fs] Closing file system watcher for {self.uri}")
         
@@ -426,4 +427,28 @@ class FSDriver(SourceDriver):
         if hasattr(self, '_stop_driver_event') and self._stop_driver_event:
             self._stop_driver_event.set()
         
+        # Shutdown thread pool
+        if hasattr(self, '_executor') and self._executor:
+            self._executor.shutdown(wait=False)
+        
+        # Remove from singleton cache so next creation gets a fresh instance
+        with FSDriver._lock:
+            signature = f"{self.config.uri}#{hash(str(self.config.credential))}"
+            FSDriver._instances.pop(signature, None)
+        
+        # Clear initialized flag
+        if hasattr(self, '_initialized'):
+            del self._initialized
+        
         logger.info(f"[fs] Closed file system watcher for {self.uri}")
+
+    @classmethod
+    def invalidate(cls, uri: str, credential: str = "") -> bool:
+        """
+        Remove a cached instance by URI+credential signature.
+        Returns True if an instance was removed.
+        """
+        signature = f"{uri}#{hash(str(credential))}"
+        with cls._lock:
+            return cls._instances.pop(signature, None) is not None
+

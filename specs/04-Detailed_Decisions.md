@@ -234,10 +234,21 @@
 ## Session 生命周期
 
 | # | 问题 | 确认答案 |
-|---|------|---------|
+|---|------|---------| 
 | 4.1 | Session 关闭后 View 状态 | **提供接口让 View 自行决定** |
 | 4.2 | 所有 Session 关闭后 | **live 类型清空，否则保留** |
 | 4.3 | Session 超时配置位置 | **Pipe 配置，通过响应告知 Agent** |
+
+### 4.2 详细说明：Live 模式 View 的全量清理
+
+**Live 模式**定义：View Driver 的数据完全依赖实时推送构建，无独立持久化层。`FSViewDriver` 属于此类型。
+
+当 live 模式 View 的**所有 Session 都失活**（超时或主动关闭）时：
+1. **内存树清理**：调用 `reset()` 清空 directory/file path map、tombstone、suspect、blind-spot 等全部状态
+2. **查询 API 返回 503**：`make_readiness_checker` 检测到无 `authoritative_session_id` 时返回 `503 Service Unavailable`
+3. **状态重建**：当新 Session 连接后，Agent 发起 Snapshot 同步，从零重建内存树
+
+**实现机制**：View Driver 声明 `requires_full_reset_on_session_close = True`，`SessionManager._check_if_view_live()` 检测该 flag，在最后一个 session 移除后自动触发 `reset_views()`。
 
 ## API Key 与路由
 

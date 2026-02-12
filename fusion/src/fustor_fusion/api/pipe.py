@@ -2,41 +2,71 @@
 """
 Unified Pipe API Router.
 
-This module provides the new /api/v1/pipe endpoint that will eventually
-replace /api/v1/ingest. For now, it reuses existing session and ingestion
-routers while providing a cleaner structure.
-
 API Structure:
 - /api/v1/pipe/session - Session management
-- /api/v1/pipe/ingest - Event ingestion
+- /api/v1/pipe/{session_id}/events - Event ingestion
 - /api/v1/pipe/consistency - Consistency checks (signals)
+- /api/v1/pipe/pipes - Pipe management
+- /api/v1/pipe/stats - Global stats
 """
 import logging
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Request
+from pydantic import BaseModel
+from typing import List, Dict, Any, Optional
 from .. import runtime_objects
 from ..config.unified import fusion_config
 from ..auth.dependencies import get_view_id_from_api_key
 
 logger = logging.getLogger(__name__)
 
-# Re-export existing routers with new paths
 from .session import session_router
 from .consistency import consistency_router
-from .ingest import ingest_router
 
 # Create unified pipe router
 pipe_router = APIRouter(tags=["Pipe"])
 
-# Consistency router handles its own delegation (it has its own /consistency prefix)
+# Consistency router handles its own delegation
 pipe_router.include_router(consistency_router)
 
 # Session management
 pipe_router.include_router(session_router, prefix="/session")
 
-# Event ingestion
-pipe_router.include_router(ingest_router, prefix="/ingest")
 
-# 2. Add Management endpoints for debuging/monitoring
+# --- Event Ingestion (inlined from legacy ingest.py) ---
+
+class IngestPayload(BaseModel):
+    events: List[Dict[str, Any]]
+    source_type: Optional[str] = "message"
+    is_end: Optional[bool] = False
+
+
+@pipe_router.post("/{session_id}/events", summary="Ingest events into a pipe session", tags=["Event Ingestion"])
+async def ingest_events(
+    session_id: str,
+    payload: IngestPayload,
+    request: Request,
+):
+    """Ingest a batch of events into an active pipe session."""
+    if runtime_objects.pipe_manager is None:
+        raise HTTPException(status_code=503, detail="Pipe Manager not initialized")
+
+    try:
+        success = await runtime_objects.pipe_manager._on_event_received(
+            session_id=session_id,
+            events=payload.events,
+            source_type=payload.source_type,
+            is_end=payload.is_end
+        )
+        return {"success": success}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Ingestion failed for session {session_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# --- Pipe Management ---
+
 @pipe_router.get("/pipes", tags=["Pipe Management"])
 async def list_pipes():
     """List all managed pipes."""
@@ -62,11 +92,11 @@ async def get_global_stats(
     """Get synchronization process metrics for the authorized pipe."""
     if runtime_objects.pipe_manager is None:
         raise HTTPException(status_code=503, detail="Pipe Manager not initialized")
-    
+
     pipe = runtime_objects.pipe_manager.get_pipe(view_id)
     if not pipe:
         return {"events_received": 0, "events_processed": 0, "active_sessions": 0}
-    
+
     return {
         "events_received": pipe.statistics.get("events_received", 0),
         "events_processed": pipe.statistics.get("events_processed", 0),
@@ -74,16 +104,8 @@ async def get_global_stats(
     }
 
 def setup_pipe_routers():
-    """
-    Legacy setup function. 
-    Now that routes are defined at module level strategies, this is a no-op 
-    or just a verification step.
-    """
+    """Verification step to ensure pipe_manager is initialized."""
     if runtime_objects.pipe_manager is None:
         logger.error("setup_pipe_routers called before pipe_manager initialized!")
         return False
     return True
-
-# NOTE: We no longer mount routers here at module level.
-# They are mounted via setup_pipe_routers() in main.py lifespan.
-

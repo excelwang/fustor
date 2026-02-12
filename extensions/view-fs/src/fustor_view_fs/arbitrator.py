@@ -153,8 +153,11 @@ class FSArbitrator:
         old_last_updated_at = existing.last_updated_at if existing else 0.0
         
         # Calculate target last_updated_at
-        # Snapshot/Audit events should NOT update this timestamp to preserve Stale Evidence Protection
-        final_last_updated_at = time.time() if is_realtime else old_last_updated_at
+        # Only Realtime (inotify/watchdog) events are fresh confirmation.
+        # Snapshot/Audit/On-demand are compensatory and should NOT update this timestamp
+        # to preserve Stale Evidence Protection (see CONSISTENCY_DESIGN.md §4.4).
+        is_fresh_confirmation = is_realtime
+        final_last_updated_at = time.time() if is_fresh_confirmation else old_last_updated_at
 
         # Perform the actual update (last_updated_at is set correctly by tree.py)
         await self.tree_manager.update_node(payload, path, last_updated_at=final_last_updated_at)
@@ -162,14 +165,14 @@ class FSArbitrator:
         if not node: return
 
         # 3. Blind Spot and Suspect Management
-        if is_realtime:
+        # Realtime and On-Demand jobs are definitive agent confirmations
+        if is_realtime or is_on_demand:
             # Atomic Write Check:
             is_atomic = payload.get('is_atomic_write', True)
             
             if is_atomic:
-                # Clean write (Close/Create) -> Clear suspect
+                # Clean write (Close/Create) or Manual Confirmation -> Clear suspect
                 self.state.suspect_list.pop(path, None)
-                node.old_suspect_state = False # Cleanup partial state
                 node.integrity_suspect = False
             else:
                 # Partial write (Modify) -> Mark/Renew suspect
@@ -182,7 +185,7 @@ class FSArbitrator:
             self.state.blind_spot_additions.discard(path)
             node.known_by_agent = True
         else:
-            # Manage Suspect List (Hot Data)
+            # Manage Suspect List (Hot Data) for Snapshot/Audit
             # Same-domain calculation: watermark and mtime are both in NFS time (Spec §5.2)
             watermark = self.state.logical_clock.get_watermark()
             age = watermark - mtime
@@ -190,8 +193,14 @@ class FSArbitrator:
             mtime_changed = (existing is None) or (abs(old_mtime - mtime) > self.FLOAT_EPSILON)
             
             if mtime_changed:
-                self.state.blind_spot_additions.add(path)
-                node.known_by_agent = False
+                if is_snapshot:
+                    # Snapshot is the Agent's initial known state, not a blind spot
+                    node.known_by_agent = True
+                    self.state.blind_spot_additions.discard(path)
+                else:
+                    # Audit discovery is a potential blind spot
+                    self.state.blind_spot_additions.add(path)
+                    node.known_by_agent = False
                 
                 if age < self.hot_file_threshold:
                     node.integrity_suspect = True
@@ -207,6 +216,10 @@ class FSArbitrator:
                     self.state.suspect_list.pop(path, None)
             else:
                 # mtime unchanged, if cold, clear suspect
+                if is_snapshot:
+                    node.known_by_agent = True
+                    self.state.blind_spot_additions.discard(path)
+                
                 if age >= self.hot_file_threshold:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)

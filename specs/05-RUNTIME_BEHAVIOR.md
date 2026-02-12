@@ -41,18 +41,20 @@ Leader 的选举完全由 Fusion 端控制，采用非抢占式的锁机制。
 ## 2. 审计缓存 (Audit Mtime Cache)
 
 ### 2.1 定义
-`Audit Context` (即 mtime cache) 是 Agent 端的内存缓存，用于实现增量审计 (Incremental Audit) 和 "True Silence" 优化。
+`Audit Context` (即 mtime cache) 是 Agent 端的**进程内存缓存**，用于实现增量审计 (Incremental Audit) 和 "True Silence" 优化。
+
+**无需持久化**：此缓存仅存在于进程内存中，不需要跨重启保存。Agent 重启后首轮 audit 执行全量扫描是可接受的行为。
 
 ### 2.2 生命周期
-- **存储位置**: `AgentPipe` 实例的内存堆 (非持久化)。
+- **存储位置**: `AgentPipe` 实例的内存堆（纯内存，不持久化）。
 - **构建时机**: 当选 Leader 后的 **第一次 Audit** 过程中动态构建。
 - **清空时机**:
     1. **Session 重建**: 显式清空。
     2. **角色切换**: 当选 Leader 时 (`_handle_role_change`) 显式清空。
-    3. **Pipe 重启**: 进程重启意味着内存丢失。
+    3. **进程重启**: 内存自然丢失，不做恢复。
 
 ### 2.3 行为影响
-- **Leader 当选后首轮审计**: **全量扫描** (IO 较高)。
+- **Leader 当选后首轮审计**: **全量扫描** (IO 较高，可接受)。
 - **后续审计**: **增量扫描** (仅扫描 mtime 变化的目录，IO 极低)。
 
 ---

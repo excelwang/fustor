@@ -15,8 +15,14 @@ class FSViewDriver(FSViewBase):
     Refactored with Composition over Inheritance.
     Coordinates various components to maintain a fused, consistent view 
     of the FS using Smart Merge arbitration logic.
+    
+    Live-mode: data is entirely built from real-time agent pushes.
+    When all sessions close, state is reset and queries return 503.
     """
     target_schema = "fs"
+    
+    # Live-mode flag: triggers full state reset when all sessions close
+    requires_full_reset_on_session_close = True
 
     def __init__(self, id: str, view_id: str, config: Optional[Dict[str, Any]] = None):
         super().__init__(id, view_id, config) 
@@ -60,17 +66,21 @@ class FSViewDriver(FSViewBase):
             self.state.audit_seen_paths.clear()
             
             # Per CONSISTENCY_DESIGN.md §4.4: Clear blind-spot lists on new session
-            # Blind spots may be rediscovered by the new session
+            # Blind spots will be rediscovered by the new session's snapshot
             self.state.blind_spot_additions.clear()
             self.state.blind_spot_deletions.clear()
             
             self.logger.info(f"New session sequence started. Cleared audit buffer and blind-spot lists.")
 
     async def on_session_close(self):
-        """Handles session closure."""
-        # Generic FS driver doesn't reset on session close usually,
-        # unless configured as 'live' only.
-        pass
+        """
+        Handle individual session close.
+        
+        Full state reset (when ALL sessions close) is handled by
+        SessionManager._check_if_view_live() which reads
+        requires_full_reset_on_session_close and calls reset_views().
+        """
+        self.logger.info(f"Session closed for view {self.view_id}")
 
     async def reset(self):
         """Full reset of the in-memory view."""

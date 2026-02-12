@@ -457,15 +457,17 @@ session_timeout_seconds: 30
 
 ## 8. API 设计
 
-### 8.1 路径变更
+### 8.1 API 路径（已完成迁移）
 
-| 原路径 | 新路径 |
+| 路径 | 用途 |
 |--------|--------|
-| `/api/v1/ingest/sessions/` | `/api/v1/pipe/sessions/` |
-| `/api/v1/ingest/events/` | `/api/v1/pipe/events/` |
-| `/api/v1/ingest/sessions/heartbeat` | `/api/v1/pipe/sessions/heartbeat` |
-| `/api/v1/ingest/consistency/*` | `/api/v1/pipe/consistency/*` (保持) |
-| `/api/v1/views/*` | `/api/v1/views/*` (保持) |
+| `/api/v1/pipe/session/` | Session 管理（创建/心跳/关闭） |
+| `/api/v1/pipe/{session_id}/events` | 事件推送 |
+| `/api/v1/pipe/consistency/*` | 一致性信号（audit_start/end, snapshot_end） |
+| `/api/v1/pipe/pipes` | Pipe 管理（列表/详情） |
+| `/api/v1/views/*` | 数据视图查询 |
+
+> 注：旧路径 `/api/v1/ingest/*` 已移除，不再支持。
 
 ### 8.2 Session 创建响应
 

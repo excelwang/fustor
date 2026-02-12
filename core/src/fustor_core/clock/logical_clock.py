@@ -26,10 +26,11 @@ class LogicalClock:
         Initialize the logical clock.
         
         Args:
-            initial_time: Initial clock value (default 0.0, will use time.time())
+            initial_time: Unused, kept for backward compatibility.
         """
-        self._value = initial_time if initial_time > 0 else time.time()
-        self._lock = threading.RLock()  # Use RLock for reentrant locking (update -> get_watermark -> now)
+        # Note: threading.RLock is used because this class serves both
+        # Agent-side (multi-threaded scanning) and Fusion-side (asyncio) contexts.
+        self._lock = threading.RLock()
 
         
         # --- Unified Global Clock State ---
@@ -140,7 +141,6 @@ class LogicalClock:
     
     def reset(self, value: float = 0.0) -> None:
         with self._lock:
-            self._value = value if value > 0 else time.time()
             self._global_buffer.clear()
             self._global_histogram.clear()
             self._cached_global_skew = None
@@ -148,4 +148,5 @@ class LogicalClock:
     
     def __repr__(self) -> str:
         skew = self._cached_global_skew if self._cached_global_skew is not None else "N/A"
-        return f"LogicalClock(val={self._value:.3f}, skew={skew}, samples={len(self._global_buffer)})"
+        watermark = self.get_watermark()
+        return f"LogicalClock(watermark={watermark:.3f}, skew={skew}, samples={len(self._global_buffer)})"
