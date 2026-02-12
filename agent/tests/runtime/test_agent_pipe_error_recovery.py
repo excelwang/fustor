@@ -57,12 +57,17 @@ class TestAgentErrorRecovery:
     @pytest.mark.asyncio
     async def test_session_loss_during_message_sync(self, mock_source, mock_sender, pipe_config):
         """Pipe should detect session loss and restart from snapshot."""
-        # Setup: Start as leader
+        # Setup: Start as leader with a bus so message sync can work
         mock_sender.role = "leader"
+        
+        mock_bus = MagicMock()
+        mock_bus.id = "mock-bus"
+        mock_bus.internal_bus = AsyncMock()
+        mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
         
         pipe = AgentPipe(
             "test-id", "agent:test-id", pipe_config,
-            mock_source, mock_sender
+            mock_source, mock_sender, event_bus=mock_bus
         )
         
         # Mock _run_message_sync to simulate error after some time
@@ -87,8 +92,8 @@ class TestAgentErrorRecovery:
         await pipe.start()
         
         # Wait for error and recovery
-        # We need enough time for error -> backoff -> retry -> success
-        await asyncio.sleep(0.3)
+        # Need time for: snapshot (~0.1s) + thread join (0.5s) + message sync entry + error + backoff + retry
+        await asyncio.sleep(1.5)
         
         try:
             assert error_triggered

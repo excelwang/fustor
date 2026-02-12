@@ -1,6 +1,6 @@
 [project]
 name = "fustor-agent"
-version = "0.8.15"
+version = "0.8.16"
 description = "realtime data sync agent for various data sources"
 readme = "README.md"
 requires-python = ">=3.11"

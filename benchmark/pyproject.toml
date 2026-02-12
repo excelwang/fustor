@@ -1,6 +1,6 @@
 [project]
 name = "fustor-benchmark"
-version = "0.8.15"
+version = "0.8.16"
 description = "Performance benchmarking tool for Fustor platform"
 readme = "README.md"
 requires-python = ">=3.11"

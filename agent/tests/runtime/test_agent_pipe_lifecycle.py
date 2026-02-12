@@ -51,20 +51,30 @@ class TestAgentPipeLifecycle:
         
         # Transition to leader
         mock_sender.role = "leader"
-        # Wait for control loop to catch the change
-        await asyncio.sleep(0.2)
         
-        # Should be running sequence
-        assert agent_pipe.current_role == "leader"
+        # Poll until leader sequence completes (snapshot done + message sync started).
+        # We check `is_realtime_ready` which is set inside bus_message_sync
+        # and is more stable than the PipeState flag.
+        reached_target = False
+        for _ in range(80):  # Up to 4 seconds
+            if (agent_pipe.current_role == "leader" 
+                and agent_pipe.is_realtime_ready
+                and mock_source.snapshot_calls > 0):
+                reached_target = True
+                break
+            await asyncio.sleep(0.05)
         
-        # Wait for snapshot to finish
-        await asyncio.sleep(0.5)
-        
-        assert mock_source.snapshot_calls > 0
-        assert len(mock_sender.batches) >= 2
-        assert PipeState.MESSAGE_SYNC in agent_pipe.state
-        
-        await agent_pipe.stop()
+        try:
+            assert agent_pipe.current_role == "leader"
+            assert mock_source.snapshot_calls > 0
+            assert len(mock_sender.batches) >= 2
+            assert reached_target, (
+                f"Pipe did not reach expected state. "
+                f"role={agent_pipe.current_role}, realtime_ready={agent_pipe.is_realtime_ready}, "
+                f"snapshot_calls={mock_source.snapshot_calls}, state={agent_pipe.state}"
+            )
+        finally:
+            await agent_pipe.stop()
 
     @pytest.mark.asyncio
     async def test_manual_triggers(self, agent_pipe, mock_sender, mock_source):
