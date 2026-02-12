@@ -48,6 +48,7 @@ class TreeManager:
                 node.created_time = ctime
                 node.audit_skipped = payload.get(FSSchemaFields.AUDIT_SKIPPED, False)
             else:
+                if not self._check_capacity(): return
                 node = DirectoryNode(name, path, size, mtime, ctime)
                 node.audit_skipped = payload.get(FSSchemaFields.AUDIT_SKIPPED, False)
                 self.state.directory_path_map[path] = node
@@ -72,6 +73,7 @@ class TreeManager:
                 node.modified_time = mtime
                 node.created_time = ctime
             else:
+                if not self._check_capacity(): return
                 node = FileNode(name, path, size, mtime, ctime)
                 self.state.file_path_map[path] = node
             
@@ -85,6 +87,18 @@ class TreeManager:
             
             node.last_updated_at = last_updated_at
 
+    def _check_capacity(self) -> bool:
+        """Return True if tree has capacity for new nodes."""
+        if self.state.max_nodes <= 0: return True
+        current = len(self.state.file_path_map) + len(self.state.directory_path_map)
+        if current >= self.state.max_nodes:
+            # Throttle logging to once per minute
+            if time.time() - self.state.last_oom_log > 60:
+                self.logger.error(f"OOM Protection: Blocked node creation. Max nodes ({self.state.max_nodes}) reached.")
+                self.state.last_oom_log = time.time()
+            return False
+        return True
+
     def _ensure_parent_chain(self, parent_path: str):
         parts = [p for p in parent_path.split('/') if p]
         current_path = ""
@@ -94,12 +108,14 @@ class TreeManager:
         for part in parts:
             current_path = os.path.normpath(current_path + "/" + part)
             if current_path not in self.state.directory_path_map:
+                if not self._check_capacity(): return
                 new_dir = DirectoryNode(part, current_path)
                 # Auto-created parents: last_updated_at remains 0.0 (no Stale Evidence Protection)
                 # until confirmed by a Realtime event
                 parent_node.children[part] = new_dir
                 self.state.directory_path_map[current_path] = new_dir
-            parent_node = self.state.directory_path_map[current_path]
+            parent_node = self.state.directory_path_map.get(current_path)
+            if not parent_node: return # Stop chain if capacity blocked creation
 
     async def delete_node(self, path: str):
         """Recursively remove a node from the tree maps and parent children."""

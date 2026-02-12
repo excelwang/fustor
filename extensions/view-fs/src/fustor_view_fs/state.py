@@ -27,6 +27,10 @@ class FSState:
         self.tombstone_list: Dict[str, Tuple[float, float]] = {}
         
         self.tombstone_ttl_seconds = float(self.config.get("consistency", {}).get("tombstone_ttl_seconds", 3600.0))
+        # OOM Protection
+        self.max_nodes = int(self.config.get("limits", {}).get("max_nodes", 0)) # 0 = unlimited
+        self.last_oom_log = 0.0
+        
         self.suspect_list: Dict[str, Tuple[float, float]] = {} # Path -> (expiry_monotonic, recorded_mtime)
         self.suspect_heap: List[Tuple[float, str]] = [] # (expiry_monotonic, path)
         
