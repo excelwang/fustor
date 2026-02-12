@@ -2,7 +2,7 @@
 Base event model for Fustor.
 Migrated from fustor_event_model.models
 """
-from typing import List, Any
+from typing import List, Any, Optional, Dict
 from pydantic import BaseModel, Field
 from .types import EventType, MessageSource
 
@@ -24,6 +24,10 @@ class EventBase(BaseModel):
     message_source: MessageSource = Field(
         default=MessageSource.REALTIME,
         description="Source of the message: realtime, snapshot, audit"
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Arbitrary metadata (e.g., lineage info)"
     )
 
 

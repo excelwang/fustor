@@ -14,7 +14,9 @@ class DirectoryNode:
         # Consistency flags
         self.integrity_suspect: bool = False
         self.known_by_agent: bool = False # Set to True if seen via Realtime event
-        self.audit_skipped: bool = False  # Temporary flag for missing file detection
+        # Lineage info
+        self.last_agent_id: Optional[str] = None
+        self.source_uri: Optional[str] = None
 
     def to_dict(self, recursive=True, max_depth=None, only_path=False):
         """Converts the directory node to a dictionary representation."""
@@ -29,7 +31,9 @@ class DirectoryNode:
                 'size': self.size,
                 'modified_time': self.modified_time,
                 'created_time': self.created_time,
-                'integrity_suspect': self.integrity_suspect
+                'integrity_suspect': self.integrity_suspect,
+                'last_agent_id': self.last_agent_id,
+                'source_uri': self.source_uri
             })
 
         # Base case for recursion depth
@@ -64,6 +68,9 @@ class FileNode:
         # Consistency flags
         self.integrity_suspect: bool = False
         self.known_by_agent: bool = False # Set to True if seen via Realtime event
+        # Lineage info
+        self.last_agent_id: Optional[str] = None
+        self.source_uri: Optional[str] = None
 
     def to_dict(self, recursive=True, max_depth=None, only_path=False):
         """Converts the file node to a dictionary representation."""
@@ -77,6 +84,8 @@ class FileNode:
                 'size': self.size,
                 'modified_time': self.modified_time,
                 'created_time': self.created_time,
-                'integrity_suspect': self.integrity_suspect
+                'integrity_suspect': self.integrity_suspect,
+                'last_agent_id': self.last_agent_id,
+                'source_uri': self.source_uri
             })
         return result

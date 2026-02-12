@@ -445,6 +445,31 @@ class FusionPipe(Pipe):
         if skipped_count > 0:
             logger.warning(f"Pipe {self.id}: Skipped {skipped_count}/{len(events)} malformed events in batch")
         
+        # Inject Lineage Info
+        # We need to know WHICH agent sent this event.
+        # This is available in the SessionInfo.
+        from ..core.session_manager import session_manager
+        session_info = await session_manager.get_session_info(self.view_id, session_id)
+        
+        lineage_meta = {}
+        if session_info:
+            if session_info.source_uri:
+                lineage_meta["source_uri"] = session_info.source_uri
+            
+            # task_id format is typically "agent_id:pipe_id"
+            if session_info.task_id and ":" in session_info.task_id:
+                parts = session_info.task_id.split(":")
+                # Assuming standard format, first part is agent_id
+                lineage_meta["agent_id"] = parts[0]
+            elif session_info.task_id:
+                 lineage_meta["agent_id"] = session_info.task_id
+        
+        if lineage_meta:
+            for ev in processed_events:
+                if ev.metadata is None:
+                    ev.metadata = {}
+                ev.metadata.update(lineage_meta)
+
         # Queue for processing
         get_metrics().counter("fustor.fusion.events_received", len(processed_events), {"pipe": self.id, "source": source_type})
         # Clear drain event since we're adding work
