@@ -39,15 +39,21 @@ async def aiter_sync_phase_wrapper(
             if not stop_event.is_set():
                 coro = queue.put(e)
                 try:
-                    asyncio.run_coroutine_threadsafe(coro, loop)
-                except RuntimeError:
+                    future = asyncio.run_coroutine_threadsafe(coro, loop)
+                    future.result()
+                except (asyncio.CancelledError, RuntimeError):
                     coro.close()
         finally:
-            coro = queue.put(StopAsyncIteration)
-            try:
-                asyncio.run_coroutine_threadsafe(coro, loop)
-            except RuntimeError:
-                coro.close()
+            # Only send sentinel if consumer is still running.
+            # If stop_event is set, consumer already exited — sending would
+            # create an unawaited coroutine that gets GC'd with a warning.
+            if not stop_event.is_set():
+                coro = queue.put(StopAsyncIteration)
+                try:
+                    future = asyncio.run_coroutine_threadsafe(coro, loop)
+                    future.result()
+                except (asyncio.CancelledError, RuntimeError):
+                    coro.close()
 
     # Start producer thread
     thread = threading.Thread(
@@ -68,9 +74,13 @@ async def aiter_sync_phase_wrapper(
             queue.task_done()
     finally:
         stop_event.set()
-        # Fix for P2-7: Ensure thread resource is given a chance to release
-        # We join with a small timeout to avoid blocking the event loop too long
-        # if the thread is truly stuck (though daemon=True helps with exit).
+        # Drain remaining items to unblock the producer and clean up pending coroutines.
+        # Without this, any in-flight queue.put() coroutine would be GC'd unawaited.
+        while not queue.empty():
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
         thread.join(timeout=0.5)
         if thread.is_alive():
             logger.warning(f"Producer thread {thread.name} did not terminate within timeout")
