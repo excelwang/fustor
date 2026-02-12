@@ -69,7 +69,10 @@ class FSArbitrator:
             
             if is_audit:
                 self.state.audit_seen_paths.add(path)
-                self.state.blind_spot_deletions.discard(path)
+                # Only discard from blind_spot_deletions when audit "sees" the file (upsert)
+                # Audit DELETE should NOT clear blind_spot_deletions (Spec §4.4)
+                if event.event_type != EventType.DELETE:
+                    self.state.blind_spot_deletions.discard(path)
 
             if event.event_type == EventType.DELETE:
                 await self._handle_delete(path, is_realtime, mtime)
@@ -111,19 +114,12 @@ class FSArbitrator:
     async def _handle_upsert(self, path: str, payload: Dict, event: Any, source: MessageSource, mtime: float, watermark: float):
         source_val = source.value if hasattr(source, 'value') else str(source)
         
-        # 1. Tombstone Protection
+        # 1. Tombstone Protection (same-domain: both mtime and tombstone_ts are in NFS time)
         if path in self.state.tombstone_list:
-            tombstone_ts, tombstone_physical_ts = self.state.tombstone_list[path] # Use logical timestamp for arbitration
+            tombstone_ts, _ = self.state.tombstone_list[path]
             
-            # Check if this is "New activity" after deletion
-            is_newer_logical = mtime > (tombstone_ts + self.TOMBSTONE_EPSILON)
-            
-            is_newer_physical = False
-            now = time.time()
-            if not is_newer_logical and tombstone_ts > (now + 5.0):
-                 is_newer_physical = mtime > (tombstone_physical_ts + self.TOMBSTONE_EPSILON)
-
-            if is_newer_logical or is_newer_physical:
+            # Single-condition reincarnation: mtime > tombstone_ts (Spec §5.2)
+            if mtime > (tombstone_ts + self.TOMBSTONE_EPSILON):
                 self.state.tombstone_list.pop(path, None)
             else:
                 return
@@ -137,7 +133,10 @@ class FSArbitrator:
             # Snapshot/Audit arbitration
             if existing:
                 # If mtime is not newer, ignore (unless audit_skipped which we use for heartbeats/protection)
-                if not payload.get('audit_skipped') and existing.modified_time >= mtime:
+                audit_skipped_in_payload = payload.get('audit_skipped')
+                # self.logger.debug(f"[DEBUG_ARB] Checking arbitration for {path}: payload_skipped={audit_skipped_in_payload}, existing_mtime={existing.modified_time}, payload_mtime={mtime}")
+                
+                if not audit_skipped_in_payload and existing.modified_time >= mtime:
                     return
             
             if source_val == MessageSource.AUDIT.value and existing is None:
@@ -153,15 +152,14 @@ class FSArbitrator:
         old_mtime = existing.modified_time if existing else 0.0
         old_last_updated_at = existing.last_updated_at if existing else 0.0
         
-        # Perform the actual update
-        await self.tree_manager.update_node(payload, path)
+        # Calculate target last_updated_at
+        # Snapshot/Audit events should NOT update this timestamp to preserve Stale Evidence Protection
+        final_last_updated_at = time.time() if is_realtime else old_last_updated_at
+
+        # Perform the actual update (last_updated_at is set correctly by tree.py)
+        await self.tree_manager.update_node(payload, path, last_updated_at=final_last_updated_at)
         node = self.state.get_node(path)
         if not node: return
-
-        # Fix: Only Realtime events should update last_updated_at (Stale Evidence Protection)
-        # Snapshot/Audit events should NOT update this timestamp
-        if not is_realtime and old_last_updated_at > 0:
-            node.last_updated_at = old_last_updated_at
 
         # 3. Blind Spot and Suspect Management
         if is_realtime:
@@ -185,13 +183,10 @@ class FSArbitrator:
             node.known_by_agent = True
         else:
             # Manage Suspect List (Hot Data)
+            # Same-domain calculation: watermark and mtime are both in NFS time (Spec §5.2)
             watermark = self.state.logical_clock.get_watermark()
-            skew = self.state.logical_clock.get_skew()
+            age = watermark - mtime
             
-            logical_age = watermark - mtime
-            physical_age = (watermark + skew) - mtime
-            
-            age = min(logical_age, physical_age)
             mtime_changed = (existing is None) or (abs(old_mtime - mtime) > self.FLOAT_EPSILON)
             
             if mtime_changed:

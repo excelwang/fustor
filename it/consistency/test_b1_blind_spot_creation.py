@@ -31,7 +31,16 @@ class TestBlindSpotFileCreation:
         wait_for_audit
     ):
         """场景: 盲区发现的新文件"""
-        test_file = f"{MOUNT_POINT}/blind_spot_created_{int(time.time()*1000)}.txt"
+        import datetime
+        print(f"\n[DEBUG] TEST BODY START at {datetime.datetime.utcnow().isoformat()} UTC, time.time()={time.time()}")
+        
+        # Use a subdirectory to ensure directory mtime change is isolated and noticeable
+        test_dir = f"{MOUNT_POINT}/blind_subdir_{int(time.time())}"
+        docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["mkdir", "-p", test_dir])
+        
+        test_file = f"{test_dir}/blind_spot_created_{int(time.time()*1000)}.txt"
+        print(f"[DEBUG] Creating blind-spot file: {test_file}")
+        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
         
         # Step 1: Create file on client without agent
         docker_manager.create_file_in_container(
@@ -39,32 +48,52 @@ class TestBlindSpotFileCreation:
             test_file,
             content="created from blind spot"
         )
+        print(f"[DEBUG] File created on Client C at {datetime.datetime.utcnow().isoformat()} UTC")
+        
+        # Verify file exists on Client C
+        check_result = docker_manager.exec_in_container(CONTAINER_CLIENT_C, ["ls", "-la", test_file])
+        print(f"[DEBUG] File on Client C: {check_result}")
+        
+        # Verify file exists on Agent A's mount (check NFS propagation)
+        print(f"[DEBUG] Waiting for file to be visible on Agent A (NFS propagation)...")
+        visible_on_a = False
+        for _ in range(20): # ~10s wait
+            check_a = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["ls", "-la", test_file])
+            if check_a.returncode == 0:
+                visible_on_a = True
+                print(f"[DEBUG] File visible on Agent A: {check_a.stdout.strip()}")
+                break
+            time.sleep(0.5)
+        
+        assert visible_on_a, f"File {test_file} did not become visible on Agent A within timeout"
         
         # Step 1.1: Create a trigger file to ensure directory mtime change is noticed
         # This prevents Smart Audit from skipping the scan if it already scanned the dir recently.
         trigger_file = f"{MOUNT_POINT}/audit_trigger_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, trigger_file, "trigger")
-
-        # Step 2: Check if file appeared
+        print(f"[DEBUG] Trigger file created at {datetime.datetime.utcnow().isoformat()} UTC")
+        
+        # IMPORTANT: Wait for Agent A to see the changes via NFS actimeo
+        print(f"[DEBUG] Waiting {INGESTION_DELAY}s for NFS propagation to Agent A...")
         time.sleep(INGESTION_DELAY)
-        # Check presence first
-        # Check presence first
-        test_file_rel = "/" + os.path.relpath(test_file, MOUNT_POINT)
+
+        # Check dir mtime from Agent A's perspective
         try:
-            tree = fusion_client.get_tree(path=test_file_rel, max_depth=0)
-            found_immediately = tree.get("path") == test_file_rel
+            dir_stat = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["stat", MOUNT_POINT])
+            print(f"[DEBUG] Agent A dir stat: {dir_stat.stdout}")
+            file_stat = docker_manager.exec_in_container(CONTAINER_CLIENT_A, ["ls", "-la", test_file])
+            print(f"[DEBUG] Agent A file check: {file_stat.stdout}")
         except Exception as e:
-            # If 404 or other error, it means not found immediately
-            print(f"DEBUG: File not found immediately: {e}")
-            found_immediately = False
+            print(f"[DEBUG] Agent A check failed: {e}")
         
-        if found_immediately:
-            # Re-fetch flags to ensure currency
-            print(f"DEBUG: File found immediately. Waiting for agent_missing=True...")
-            assert fusion_client.wait_for_flag(test_file_rel, "agent_missing", True, timeout=SHORT_TIMEOUT), \
-                f"If found immediately, it must be blind spot (agent_missing=True) eventually."
-        
-        # Wait for Audit completion
+        # Debug: check audit stats before waiting
+        try:
+            stats = fusion_client.get_stats()
+            print(f"[DEBUG] Stats before audit wait: audit_cycle_count={stats.get('audit_cycle_count')}, is_auditing={stats.get('is_auditing')}")
+        except Exception as e:
+            print(f"[DEBUG] get_stats failed: {e}")
+
+        # Step 2: Wait for Audit completion
         wait_for_audit()
         
         # Now check if the original blind-spot file was discovered

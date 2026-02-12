@@ -121,7 +121,6 @@ class FSViewDriver(FSViewBase):
             old_mtime = node.modified_time
             # Keep mtime as reported for now, but we might normalize it if skewed
             
-            watermark = self.state.logical_clock.get_watermark()
             skew = self.state.logical_clock.get_skew()
             
             # Stability Check: Allow match on Raw Mtime OR Skew-Corrected Mtime
@@ -151,11 +150,9 @@ class FSViewDriver(FSViewBase):
             
             is_stable = is_mtime_stable and is_size_stable
 
-            # Age Calculation Strategy (Align with Arbitrator)
-            # age = min(LogicalAge, PhysicalAge)
-            logical_age = watermark - mtime
-            physical_age = (watermark + skew) - mtime
-            age = min(logical_age, physical_age)
+            # Age Calculation: same-domain (watermark and mtime both in NFS time, Spec §5.2)
+            watermark = self.state.logical_clock.get_watermark()
+            age = watermark - mtime
             
             # Hot Check
             is_hot = age < self.hot_file_threshold

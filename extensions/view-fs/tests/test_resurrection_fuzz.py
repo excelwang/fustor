@@ -16,7 +16,7 @@ def state():
 def tree_manager(state):
     tm = MagicMock(spec=TreeManager)
     # Mock update_node to actually update state if needed, or just return
-    async def mock_update(payload, path):
+    async def mock_update(payload, path, **kwargs):
         # We don't need full tree logic for arbitration test
         pass
     async def mock_delete(path):

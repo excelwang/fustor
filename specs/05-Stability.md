@@ -31,6 +31,10 @@
   - **标记**: `is_atomic_write` 字段在数据源头标记事件性质。
   - **部分写处理**: `is_atomic_write=False` 的事件在 Fusion 端被标记为 `integrity_suspect=True`。
   - **完整写确认**: 收到 `is_atomic_write=True` (如 `IN_CLOSE_WRITE`) 时，立即清除 Suspect 标记。
+- **事件生命周期 (Source-FS)**:
+  - **文件创建**: `on_created` 仅处理目录创建事件。文件创建的元数据通过后续的 `on_closed` (`IN_CLOSE_WRITE`) 发送，并标记 `is_atomic_write=True`。
+  - **文件修改**: `on_modified` 发送 `is_atomic_write=False`（部分写），`on_closed` 发送 `is_atomic_write=True`（写入完成）。
+  - **已知限制**: `cp -p`、`rsync` 等不触发 `IN_CLOSE_WRITE` 的操作，文件只能在 Audit 时被发现。
 
 ### 2.2 可疑文件判定 (Suspect Logic)
 - **逻辑时钟**: 基于 `LogicalClock` 判定文件是否 "Too Young" (可能处于 NFS 缓存未刷新状态)。

@@ -175,22 +175,22 @@ def setup_view_routers():
     current_view_configs = fusion_config.get_all_views()
     
     available_factories = {name: func for name, func in _discover_view_api_factories()}
+    print(f"DEBUG: setup_view_routers started. Factories: {list(available_factories.keys())}")
     
     if not available_factories:
+        print("DEBUG: No view API factories discovered!")
         logger.warning("No view API factories discovered. Check if view driver packages are installed.")
         return
 
     registered_count = 0
+    print(f"DEBUG: current_view_configs: {list(current_view_configs.keys()) if current_view_configs else 'None'}")
     
     # 1. Registered via config
     if current_view_configs:
         for view_name, cfg in current_view_configs.items():
-            # Skip disabled views (if supported in future or via extra)
-    #         if cfg.extra.get('disabled', False):
-    #             continue
-                
             driver_name = cfg.driver
             create_func = available_factories.get(driver_name)
+            print(f"DEBUG: Processing view '{view_name}' with driver '{driver_name}'. Factory found: {create_func is not None}")
             
             if create_func:
                 try:
@@ -210,9 +210,11 @@ def setup_view_routers():
                     
                     # Register with prefix matching the view_name (e.g., test-fs)
                     view_router.include_router(router, prefix=f"/{view_name}")
+                    print(f"DEBUG: Registered router for '{view_name}' at prefix '/{view_name}'")
                     logger.info(f"Registered view API routes: {view_name} (driver: {driver_name}) at prefix /{view_name} WITH LIMIT CHECKER")
                     registered_count += 1
                 except Exception as e:
+                    print(f"DEBUG: Error registering view '{view_name}': {e}")
                     logger.error(f"Error registering view API routes '{view_name}': {e}", exc_info=True)
             else:
                 logger.warning(f"View '{view_name}' configures driver '{driver_name}', but no API factory for that driver was found.")

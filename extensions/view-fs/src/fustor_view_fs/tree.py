@@ -16,7 +16,7 @@ class TreeManager:
         self.state = state
         self.logger = logging.getLogger(f"fustor_view.fs.tree.{state.view_id}")
 
-    async def update_node(self, payload: Dict[str, Any], path: str):
+    async def update_node(self, payload: Dict[str, Any], path: str, last_updated_at: float = 0.0):
         """Update or create a node in the tree based on event payload."""
         if not path.startswith('/'):
             path = '/' + path
@@ -59,7 +59,7 @@ class TreeManager:
                     parent_node.children[name] = node
                     # self.logger.debug(f"Attached directory {name} to parent {parent_path}")
             
-            node.last_updated_at = time.time()
+            node.last_updated_at = last_updated_at
 
         else:
             # Type change protection
@@ -83,7 +83,7 @@ class TreeManager:
             else:
                 logger.warning(f"ORPHAN {path} - Parent {parent_path} not found!")
             
-            node.last_updated_at = time.time()
+            node.last_updated_at = last_updated_at
 
     def _ensure_parent_chain(self, parent_path: str):
         parts = [p for p in parent_path.split('/') if p]
@@ -95,7 +95,8 @@ class TreeManager:
             current_path = os.path.normpath(current_path + "/" + part)
             if current_path not in self.state.directory_path_map:
                 new_dir = DirectoryNode(part, current_path)
-                new_dir.last_updated_at = time.time()
+                # Auto-created parents: last_updated_at remains 0.0 (no Stale Evidence Protection)
+                # until confirmed by a Realtime event
                 parent_node.children[part] = new_dir
                 self.state.directory_path_map[current_path] = new_dir
             parent_node = self.state.directory_path_map[current_path]

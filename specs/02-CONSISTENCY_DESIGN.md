@@ -270,7 +270,7 @@ if event.message_source == MessageSource.SNAPSHOT:
         tombstone_ts, _ = tombstone_list[path]
         
         # 单条件转世判定：仅检查 mtime > tombstone_ts
-        # 移除了旧的 watermark > tombstone_ts 条件以增强保守性
+        # 两者均在 NFS 时间域内，比较有效
         if mtime > tombstone_ts:
             # 文件转世：清除墓碑，接受更新
             tombstone_list.pop(path, None)
@@ -281,18 +281,24 @@ if event.message_source == MessageSource.SNAPSHOT:
     # 添加/更新内存树
     tree_manager.update_node(payload, path)
     
-    # Suspect 判定
+    # Suspect 判定（同域计算：watermark 和 mtime 均在 NFS 时间域）
     watermark = logical_clock.get_watermark()
-    if (watermark - mtime) < hot_file_threshold:
+    age = watermark - mtime
+    
+    if age < hot_file_threshold:
         node.integrity_suspect = True
+        remaining_life = max(1.0, min(hot_file_threshold - age, hot_file_threshold))
         suspect_list[path] = (time.monotonic() + remaining_life, mtime)
 ```
 
 > [!NOTE]
-> **设计决策**：墓碑转世判定使用 `mtime > tombstone_ts` 单条件：
-> 1. **保守性原则**：只有当文件 mtime 明确新于墓碑时间时才允许复活
-> 2. **语义清晰**：移除了 `watermark > tombstone_ts` 隐式触发器，避免已删除文件"自动复活"
-> 3. **简化调试**：单条件判定更易于追踪
+> **设计决策 - 墓碑转世判定**：使用 `mtime > tombstone_ts` 单条件：
+> 1. **同域比较**：`tombstone_ts`（删除时的 watermark）和 `mtime` 均在 NFS 时间域，比较语义明确
+> 2. **保守性原则**：只有当文件 mtime 明确新于墓碑时间时才允许复活
+> 3. **禁止跨域比较**：不得将 NFS 域时间戳与 Fusion 物理时间（`time.time()`）直接比较
+>
+> **Suspect Age 计算**：`age = watermark - mtime`，两者均在 NFS 时间域内。
+> 冷启动时 skew 未校准，watermark 退化为 `time.time()`，这是已知限制（参见 [03-LOGICAL_CLOCK_DESIGN.md §5.1](./03-LOGICAL_CLOCK_DESIGN.md)）。
 
 
 ### 5.3 Audit 消息处理
@@ -328,18 +334,24 @@ if event.message_source == MessageSource.AUDIT:
         if memory_parent and memory_parent.modified_time > (parent_mtime_audit or 0):
             # 内存父目录更新：丢弃（X 是旧文件）
             return
-        
-        # 通过检查：加入 Blind-spot List（盲区新增）
-        blind_spot_additions.add(path)
-        node.known_by_agent = False
     
     # 更新内存树
     tree_manager.update_node(payload, path)
     
-    # Suspect 判定
-    if (watermark - mtime) < hot_file_threshold:
+    # Blind-spot 判定：新文件或 mtime 变化的文件加入盲区新增列表
+    mtime_changed = (existing is None) or (abs(old_mtime - mtime) > FLOAT_EPSILON)
+    if mtime_changed:
+        blind_spot_additions.add(path)
+        node.known_by_agent = False
+    
+    # Suspect 判定（同域计算）
+    watermark = logical_clock.get_watermark()
+    age = watermark - mtime
+    
+    if age < hot_file_threshold:
         node.integrity_suspect = True
-        suspect_list[path] = (expiry, mtime)
+        remaining_life = max(1.0, min(hot_file_threshold - age, hot_file_threshold))
+        suspect_list[path] = (time.monotonic() + remaining_life, mtime)
 ```
 
 #### 场景 2: Audit 报告"目录 D 缺少文件 B" (Missing Item Detection)
@@ -403,8 +415,8 @@ for path in audit_seen_paths:
 
 | 判定需求 | 时间源 | 判定逻辑 |
 | :--- | :--- | :--- |
-| **热文件判定 (Suspect Age)** | `Logical Time` | `age = watermark - file.mtime` |
-| **墓碑转世判定** | `Logical Time` | `if event.mtime > tombstone_logical_ts: reincarnate` |
+| **热文件判定 (Suspect Age)** | `Logical Time` | `age = watermark - file.mtime`（同域 NFS 时间） |
+| **墓碑转世判定** | `Logical Time` | `if event.mtime > tombstone_logical_ts: reincarnate`（同域 NFS 时间） |
 | **墓碑 TTL 清理** | `Physical Time` | `if (now - tombstone_physical_ts) > 1hr: purge` |
 | **陈旧证据保护** | `Physical Time` | `if node.last_updated_at > audit_start: skip_deletion` |
 | **Suspect TTL 过期** | `Monotonic Time` | `if time.monotonic() > expiry_monotonic: check_stability` |
@@ -531,12 +543,18 @@ GET /api/v1/views/{view_id}/tree?path=/data/logs&force-real-time=true
 **关键行为**：
 - **Realtime 事件**：更新 `last_updated_at = time.time()`
 - **Snapshot/Audit 事件**：**不更新** `last_updated_at`（保留原值）
+- **Snapshot/Audit 事件创建新节点**：`last_updated_at` 应保持为 `0`（非 Realtime 确认）
 
 ```python
 # arbitrator.py
-if not is_realtime and old_last_updated_at > 0:
-    node.last_updated_at = old_last_updated_at  # 保留旧值
+final_last_updated_at = time.time() if is_realtime else old_last_updated_at
+# old_last_updated_at 对新节点为 0，对已有节点保留原值
 ```
+
+> [!IMPORTANT]
+> `last_updated_at` 为 `0` 的节点（仅由 Snapshot/Audit 创建，未经 Realtime 确认）**不受** Stale Evidence Protection 保护。
+> 这是预期行为：Audit-End 的 Missing Detection 可以删除这类未经 Realtime 确认的节点。
+> 如果 `last_updated_at` 被错误设为 `time.time()`，将导致 Missing Detection 失效。
 
 ### 11.2 审计跳过保护 (Audit Skipped Protection)
 
@@ -569,13 +587,13 @@ while suspect_heap and suspect_heap[0][0] <= time.monotonic():
 
 ### 11.4 并发控制
 
-`FSViewDriver` 使用两级并发控制：
-- **全局信号量** (`_global_semaphore`): 限制并发事件处理数量
-- **全局独占锁** (`_global_exclusive_lock`): 用于 Audit Start/End 等需要独占访问的操作
+`FSViewDriver` 使用 `AsyncRWLock` 控制内存树的并发访问（详见 [06-CONCURRENCY_PERFORMANCE.md §2.2](./06-CONCURRENCY_PERFORMANCE.md)）：
+- **读锁 (`read_lock`)**: 事件处理 (`process_event`) 和查询 (`query`) 使用，多个操作可并发执行
+- **写锁 (`write_lock`)**: Audit Start/End、Session Start、Reset 等需要独占访问的操作
 
 ```python
 async def process_event(self, event):
-    async with self._global_semaphore:
+    async with self._global_read_lock():
         return await self.arbitrator.process_event(event)
 
 async def handle_audit_end(self):

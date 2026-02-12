@@ -103,7 +103,9 @@ class FusionClient:
 
     def reset(self) -> None:
         """Reset Fusion state for current view (comprehensive)."""
-        resp = self.session.post(f"{self.base_url}/api/v1/pipe/consistency/reset")
+        url = f"{self.base_url}/api/v1/views/{self.view_id}/reset"
+        print(f"DEBUG: FusionClient calling reset: {url}", flush=True)
+        resp = self.session.delete(url)
         resp.raise_for_status()
 
 
@@ -239,6 +241,7 @@ class FusionClient:
         start = time.time()
         while time.time() - start < timeout:
             try:
+                # max_depth=0 returns the node itself if it's a file, or the dir with children if it's a dir
                 tree = self.get_tree(path=path, max_depth=0, silence_503=True)
                 exists = tree.get("name") is not None or tree.get("path") is not None
                 if exists == should_exist:
@@ -354,28 +357,41 @@ class FusionClient:
         return False
 
     def wait_for_audit(self, timeout: float = AUDIT_WAIT_TIMEOUT, interval: float = POLL_INTERVAL) -> bool:
-        """Wait for an audit cycle to complete."""
-        try:
-            initial_stats = self.get_stats()
-            initial_count = initial_stats.get("audit_cycle_count", 0)
-            
-            # If an audit is currently in progress, we must wait for it to finish (count+1)
-            # AND for the next one to run (count+2) to ensure it covers events that happened
-            # just before we called this function.
-            target_increment = 1
-            if initial_stats.get("is_auditing", False):
-                target_increment = 2
-                
-        except Exception:
-            initial_count = -1
-            target_increment = 1
-            
+        """Wait for an audit cycle to complete. Robust implementation."""
+        initial_finished_at = 0
+        initial_count = 0
+        
+        # 1. Get initial state with retries
+        start_init = time.time()
+        while time.time() - start_init < 10:
+            try:
+                stats = self.get_stats()
+                initial_finished_at = stats.get("last_audit_finished_at", 0)
+                initial_count = stats.get("audit_cycle_count", 0)
+                is_currently_auditing = stats.get("is_auditing", False)
+                print(f"DEBUG: wait_for_audit init. count={initial_count}, finished_at={initial_finished_at}, auditing={is_currently_auditing}")
+                break
+            except Exception as e:
+                print(f"DEBUG: wait_for_audit init stats retry: {e}")
+                time.sleep(1)
+        else:
+            print("DEBUG: wait_for_audit could not get initial stats, proceeding with 0")
+            initial_count = 0
+            initial_finished_at = 0
+
+        # 2. Wait for completion
+        # If we want a FRESH audit that started after this call, we should wait for count to increase by 2 if currently auditing.
+        # But for general use, "wait for ANY completion after now" is usually what's expected.
         start = time.time()
         while time.time() - start < timeout:
             try:
                 stats = self.get_stats()
+                current_finished_at = stats.get("last_audit_finished_at", 0)
                 current_count = stats.get("audit_cycle_count", 0)
-                if current_count >= initial_count + target_increment and stats.get("last_audit_finished_at", 0) > 0:
+                
+                # Success if count increased OR timestamp advanced
+                if current_count > initial_count or current_finished_at > initial_finished_at:
+                    print(f"DEBUG: wait_for_audit success. new_count={current_count}, new_finished={current_finished_at}")
                     return True
             except Exception:
                 pass

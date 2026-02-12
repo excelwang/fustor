@@ -27,7 +27,7 @@ async def run_repro():
         mock_tree.update_node = asyncio.iscoroutinefunction(MagicMock()) # fake it
         
         # Real TreeManager.update_node is async, so we need to mock it properly
-        async def mock_update(payload, path):
+        async def mock_update(payload, path, **kwargs):
             if path not in state.file_path_map:
                 from fustor_view_fs.nodes import FileNode
                 name = os.path.basename(path)

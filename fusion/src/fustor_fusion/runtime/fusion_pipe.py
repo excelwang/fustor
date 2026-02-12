@@ -479,6 +479,10 @@ class FusionPipe(Pipe):
         # Handle audit completion signal
         if source_type == "audit" and is_end:
             logger.info(f"Pipe {self.id}: Received AUDIT end signal from session {session_id}. Triggering audit finalization.")
+            # Ensure all previous audit events are processed before finalizing
+            # This prevents race conditions where handle_audit_end reads stale dir metadata
+            await self.wait_for_drain(timeout=30.0)
+            
             for handler in self._view_handlers.values():
                 if hasattr(handler, 'handle_audit_end'):
                     try:

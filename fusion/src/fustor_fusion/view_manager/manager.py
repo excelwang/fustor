@@ -78,6 +78,7 @@ class ViewManager:
         
         # Try loading from fusion_config loader
         view_config = fusion_config.get_view(self.view_id)
+        print(f"DEBUG: ViewManager({self.view_id}) initialize_driver_instances. Config found: {view_config is not None}", flush=True)
         
         if view_config:
             # New Unified Config V2: ViewConfig is a single object, not a list
@@ -113,6 +114,7 @@ class ViewManager:
                     )
                     await driver_instance.initialize()
                     self.driver_instances[view_name] = driver_instance
+                    print(f"DEBUG: ViewManager({self.view_id}) added driver instance '{view_name}'", flush=True)
                     self.logger.info(f"Initialized ViewDriver '{view_name}' (type={driver_type})")
                 except Exception as e:
                     self.logger.error(f"Failed to initialize ViewDriver '{view_name}': {e}", exc_info=True)
