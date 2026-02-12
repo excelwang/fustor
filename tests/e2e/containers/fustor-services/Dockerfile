@@ -33,7 +33,7 @@ RUN pip install --no-cache-dir \
 RUN mkdir -p /data/fusion
 
 # Copy and set up entrypoint
-COPY it/containers/fustor-services/entrypoint.sh /entrypoint.sh
+COPY tests/e2e/containers/fustor-services/entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

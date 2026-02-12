@@ -127,6 +127,7 @@ class FSArbitrator:
         # 2. Smart Merge Arbitration
         existing = self.state.get_node(path)
         is_realtime = (source_val == MessageSource.REALTIME.value)
+        is_snapshot = (source_val == MessageSource.SNAPSHOT.value)
         is_compensation = (source_val in (MessageSource.AUDIT.value, MessageSource.SNAPSHOT.value, MessageSource.ON_DEMAND_JOB.value))
         
         if is_compensation:
@@ -165,13 +166,19 @@ class FSArbitrator:
         if not node: return
 
         # 3. Blind Spot and Suspect Management
-        # Realtime and On-Demand jobs are definitive agent confirmations
-        if is_realtime or is_on_demand:
+        # === Authority Model (see CONSISTENCY_DESIGN.md §4.5) ===
+        # Only Realtime (Tier 1) events can clear suspects and blind-spots because:
+        # - Realtime events are causal: kernel inotify/watchdog fires BECAUSE the change happened
+        # - Realtime carries is_atomic_write to distinguish partial (Modify) from complete (Close) writes
+        # On-demand/Audit/Snapshot are observational (stat()-based) and CANNOT:
+        # - Distinguish NFS-synced blind-zone files from locally-monitored files
+        # - Determine if a file is mid-write or stable
+        if is_realtime:
             # Atomic Write Check:
             is_atomic = payload.get('is_atomic_write', True)
             
             if is_atomic:
-                # Clean write (Close/Create) or Manual Confirmation -> Clear suspect
+                # Clean write (Close/Create) -> Clear suspect
                 self.state.suspect_list.pop(path, None)
                 node.integrity_suspect = False
             else:
@@ -185,7 +192,7 @@ class FSArbitrator:
             self.state.blind_spot_additions.discard(path)
             node.known_by_agent = True
         else:
-            # Manage Suspect List (Hot Data) for Snapshot/Audit
+            # Compensatory path: Snapshot/Audit/On-demand (all stat()-based, Tier 2-3)
             # Same-domain calculation: watermark and mtime are both in NFS time (Spec §5.2)
             watermark = self.state.logical_clock.get_watermark()
             age = watermark - mtime
@@ -198,7 +205,8 @@ class FSArbitrator:
                     node.known_by_agent = True
                     self.state.blind_spot_additions.discard(path)
                 else:
-                    # Audit discovery is a potential blind spot
+                    # Audit/On-demand discovery → blind spot (Spec §4.5 Tier 3)
+                    # On-demand stat() cannot prove inotify coverage, so it also creates blind-spots
                     self.state.blind_spot_additions.add(path)
                     node.known_by_agent = False
                 

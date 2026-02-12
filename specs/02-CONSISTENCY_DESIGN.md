@@ -223,6 +223,40 @@ Blind-spot 是**信息型记录**，用于标记"仅通过补偿源（Audit/Snap
 
 ---
 
+### 4.5 消息源权威性分层 (Message Source Authority Hierarchy)
+
+不同消息源的数据来源和可信度不同，**严禁混淆层级**。
+
+#### 数据来源特征
+
+| 消息源 | 层级 | 数据来源 | 触发方式 | `is_atomic_write` | 可感知写入阶段 |
+|--------|------|----------|----------|:--:|:--:|
+| `REALTIME` | Tier 1 因果性 | 内核 inotify/watchdog | 文件操作直接触发 | ✅ | ✅ |
+| `SNAPSHOT` | Tier 2 基线型 | `os.stat()` 全量遍历 | Leader 当选后一次性 | ❌ | ❌ |
+| `AUDIT` | Tier 3 补偿型 | `os.stat()` 全量遍历 | 定期调度 | ❌ | ❌ |
+| `ON_DEMAND_JOB` | Tier 3 补偿型 | `os.stat()` 目录遍历 | Fusion 请求 Agent 扫描 | ❌ | ❌ |
+
+#### 行为权限矩阵
+
+| 行为维度 | `REALTIME` | `SNAPSHOT` | `AUDIT` | `ON_DEMAND_JOB` |
+|----------|:--:|:--:|:--:|:--:|
+| 清除 Suspect | ✅ (需 `is_atomic_write=True`) | ❌ | ❌ | ❌ |
+| 创建 Suspect (hot 文件) | ✅ (`is_atomic_write=False`) | ⚠️ | ⚠️ | ⚠️ |
+| 清除 Blind-spot | ✅ | — | ❌ | ❌ |
+| 创建 Blind-spot | — | — | ✅ | ✅ |
+| 更新 `last_updated_at` | ✅ | ❌ | ❌ | ❌ |
+| 设置 `known_by_agent` | `True` | `True` | `False` | `False` |
+| 参与 Clock Skew 采样 | ✅ | ❌ | ❌ | ❌ |
+| 触发 Tombstone 重生检测 | ✅ | ✅ | ✅ | ✅ |
+
+> [!CAUTION]
+> **On-demand 不等于 Realtime**。On-demand 使用 `os.stat()` 读取文件属性，与 Audit 完全同源。
+> NFS 环境下，盲区（inotify 未覆盖的目录）中的新文件可能通过 NFS 同步出现在 Agent 本地，
+> on-demand `stat()` 会看到这些文件，但这并不意味着 Agent 的 inotify watcher 正在监控该路径。
+> 因此 on-demand 发现的文件必须标记为 blind-spot，不能清除任何已有的 blind-spot 或 suspect 标记。
+
+---
+
 ## 5. 仲裁算法
 
 核心原则：**Realtime 优先，Mtime 仲裁**
