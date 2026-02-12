@@ -4,3 +4,10 @@
 
 - [ ] 能否合并 source-fs的pre-snapshot和snapshot的逻辑
 - 分页返回大树
+
+## Centralized Agent Management (Control Plane)
+- [ ] **Architecture**: Research Control/Data Plane Separation (Ref: `under-review/2026-02-12-architecture-split.md`)
+- [ ] Implement "Configuration Signature" based Hot Reload (Prerequisite).
+- [ ] Design Fusion Management API (Config + State).
+- [ ] Implement `RemoteConfigProvider` in Agent (polling Fusion).
+- [ ] Implement `SelfUpdater` in Agent (upgrade strategy).
