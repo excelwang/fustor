@@ -1,6 +1,6 @@
 [project]
 name = "fustor-agent-sdk"
-version = "0.8.16"
+version = "0.8.17"
 description = "SDK for Fustor Agent service"
 license = "MIT"
 dependencies = [ "fustor-core"]

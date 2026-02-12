@@ -1,6 +1,6 @@
 [project]
 name = "fustor-fusion-sdk"
-version = "0.8.16"
+version = "0.8.17"
 description = "SDK for Fustor Fusion service"
 license = "MIT"
 dependencies = ["fustor-core", "httpx", "pydantic"]
