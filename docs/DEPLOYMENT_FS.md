@@ -129,6 +129,84 @@ fustor-agent start -D
 
 ---
 
+## 4. 生产环境部署 (systemd)
+
+在生产环境中，建议使用 `systemd` 管理 Fustor 进程，确保服务在意外崩溃后能够自动重启（Self-Healing）。
+
+### 4.1 Fustor Agent Service
+
+创建 `/etc/systemd/system/fustor-agent.service`：
+
+```ini
+[Unit]
+Description=Fustor Agent Service
+After=network.target
+
+[Service]
+Type=simple
+User=<USER>
+Group=<USER>
+# 确保 path 指向正确的 fustor-agent 可执行文件 (如 uv venv)
+ExecStart=/path/to/venv/bin/fustor-agent start
+WorkingDirectory=/home/<USER>
+
+# 关键: 自动重启策略
+Restart=always
+RestartSec=5s
+StartLimitInterval=0
+
+# 环境配置
+Environment=PYTHONUNBUFFERED=1
+# 如有需要，可指定配置文件路径
+# Environment=FUSTOR_CONFIG=/home/<USER>/.fustor/agent-config/default.yaml
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 4.2 Fustor Fusion Service
+
+创建 `/etc/systemd/system/fustor-fusion.service`：
+
+```ini
+[Unit]
+Description=Fustor Fusion Service
+After=network.target
+
+[Service]
+Type=simple
+User=<USER>
+Group=<USER>
+ExecStart=/path/to/venv/bin/fustor-fusion start
+WorkingDirectory=/home/<USER>
+
+# 关键: 自动重启策略
+Restart=always
+RestartSec=5s
+StartLimitInterval=0
+
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+```
+
+### 4.3 启用与管理
+
+```bash
+# 重载配置
+sudo systemctl daemon-reload
+
+# 启用开机自启并立即启动
+sudo systemctl enable --now fustor-fusion
+sudo systemctl enable --now fustor-agent
+
+# 查看状态
+sudo systemctl status fustor-agent
+```
+
+---
+
 ## 5. 管理与进阶操作
 
 ### 5.1 实时查找 (Realtime Find)
@@ -160,5 +238,5 @@ curl http://localhost:8101/api/v1/management/jobs/<job_id>
 
 ## 6. 故障排查
 *   `401 Unauthorized`: 检查 `X-API-Key` 是否与 `default.yaml` 中的配置匹配。
-*   `503 Service Unavailable`: 视图正在进行初始快照同步，或 Agent 尚未建立 Leader 角色。
+*   `503 Service Unavailable`: 视图正在进行初始快照同步，或 Agent 尚未建立 Leader 角色。若是由于 Agent 初始化耗时过长或其他异常导致服务不可用，建议使用 **On-Demand Scan** (参见 §5.1) 针对急需访问的目录提交定点扫描任务。
 *   **文件不更新**: 检查 Linux 内核 `inotify` 配额是否已提升。

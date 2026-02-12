@@ -135,12 +135,57 @@ Audit 过程必须严格遵循 Start/End 信号契约，以确保 Fusion 端的�
 
 Fusion can issue commands to the Agent via the Heartbeat response channel.
 
-### 4.1 Execution Priority
+### 4.1 Execution Priority & State Bypass
+
 - **High Priority**: Commands (like `scan`) are processed immediately after the Heartbeat response is received.
 - **Concurrency**: Commands are typically executed as asynchronous tasks, running in parallel with the main Event Loop.
+- **State Bypass**: On-Demand tasks **MUST** be executable regardless of the Pipe's current state (e.g., Initializing, Follower, Error, Degraded).
+    - Even if `is_realtime_ready=False` or the pipe is stuck in `SNAPSHOT_SYNC`, the `scan` command must be processed to support troubleshooting.
+    - The execution logic should typically bypass the shared `EventBus` and send results directly via `SenderHandler` to ensure delivery even if the local bus is broken.
 
 ### 4.2 Supported Commands
 - **`scan`**: Triggers a recursive file system scan for a specific path.
     - **Trigger**: User requests `force-real-time=true` in Fusion View API.
     - **Behavior**: Agent performs an immediate `FSScanner` walk of the target path.
     - **Events**: Generated events are pushed to Fusion, updating the View state in real-time.
+
+---
+
+## 5. Reliability & Self-Healing (Always-On)
+
+为满足 "Agent 永远在线 (Always On)" 的设计目标，系统必须具备在各类甚至由于代码缺陷导致的故障下的自愈能力。
+
+### 5.1 Fault Tolerance Model (故障隔离模型)
+
+| 故障层级 | 影响范围 | 恢复策略 |
+|---------|----------|----------|
+| **Task Level** (Snapshot/Audit) | 仅影响该阶段的数据更新 | **Task Restart**: Heartbeat 保持运行，Control Loop 经 Backoff 后重启 Task。 |
+| **Component Level** (Driver/Bus) | 影响依赖该组件的所有 Pipe | **Component Reset**: 必须支持 Invalidate/Re-init (见 §5.2)。 |
+| **Session Level** (Fusion Conn) | 影响数据传输 | **Re-Session**: 销毁旧 Session，重新从握手开始 (Backoff/Immediate)。 |
+| **Process Level** (OOM/Crash) | 影响整个 Agent | **Service Restart**: 依赖外部 Supervisor (systemd/k8s) 重启进程。 |
+
+### 5.2 Component Reset Protocol (组件重置契约)
+
+对于有状态的单例组件 (如 `FSDriver`)，若发生不可恢复的错误 (如 `inotify` 句柄耗尽、挂载点失效)，简单的 Retry 无效。
+
+**规范**:
+1. **Fatal Error Identification**: 组件必须能区分 `Transient Error` (网络抖动) 与 `Persistent Error` (资源耗尽)。
+2. **Invalidation**: 当 Control Loop 捕获到 `Persistent Error` 时，**必须** 调用组件的 `invalidate()` 或 `close()` 方法清除单例缓存。
+3. **Re-initialization**: 下次循环时 `handler.initialize()` 将创建全新的组件实例。
+
+### 5.3 Degraded Mode (降级模式)
+
+当核心能力 (Realtime) 不可用时，Agent 不应崩溃，而应进入降级模式：
+
+- **触发条件**: Local Event Bus 异常、Source Driver 无法建立 Watch (但能 LS)。
+- **行为**:
+    1. **Mark**: 设置 `is_realtime_ready = False`。
+    2. **Report**: Heartbeat 中携带 `can_realtime=False`。
+    3. **Fallback**: 依赖 `Snapshot` (启动时) 和 `Audit` (周期性) 维持数据的最终一致性。
+    4. **Retry**: 周期性尝试重新初始化 Realtime 组件。
+
+### 5.4 Zombie Prevention (僵尸任务预防)
+
+- **Liveness Probe**: Control Loop 不应仅检查 `task.done()`，还应检查 Task 是否在更新 `statistics` 或 `heartbeat` timestamp。
+- **Timeout Kill**: 对于卡死 (Stuck) 的 Task，Control Loop 应主动 `cancel()` 并重启。
+
