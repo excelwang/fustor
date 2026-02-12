@@ -49,7 +49,11 @@ class TestOnDemandScan:
         print(f"\n[Test] Creating file {test_file_name} on NFS server...")
         docker_manager.create_file_in_container(CONTAINER_NFS_SERVER, test_file_path, "On-demand scan test content")
         
-        # 3. 触发 On-Demand Scan
+        # 3. Wait for NFS attribute cache to settle (actimeo=1 + margin)
+        # Without this, Agent's scan might not see the file immediately.
+        time.sleep(2.0)
+
+        # 4. 触发 On-Demand Scan
         print(f"[Test] Triggering on-demand scan for {test_file_rel}...")
         response = fusion_client.api_request(
             "GET", 
