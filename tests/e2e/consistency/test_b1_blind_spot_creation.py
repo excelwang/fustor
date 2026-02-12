@@ -94,6 +94,11 @@ class TestBlindSpotFileCreation:
             print(f"[DEBUG] get_stats failed: {e}")
 
         # Step 2: Wait for Audit completion
+        # We wait for TWO completions to be absolutely sure that at least one 
+        # full audit cycle started AFTER the file was visible on Agent A.
+        print(f"[DEBUG] Waiting for Audit completion...")
+        wait_for_audit()
+        print(f"[DEBUG] One audit cycle finished, waiting for another just in case...")
         wait_for_audit()
         
         # Now check if the original blind-spot file was discovered

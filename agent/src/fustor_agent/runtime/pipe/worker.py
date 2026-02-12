@@ -28,22 +28,26 @@ async def aiter_sync_phase_wrapper(
                 if stop_event.is_set():
                     break
                 # Blocking put via run_coroutine_threadsafe to respect backpressure
+                coro = queue.put(item)
                 try:
-                    future = asyncio.run_coroutine_threadsafe(queue.put(item), loop)
+                    future = asyncio.run_coroutine_threadsafe(coro, loop)
                     future.result() # Wait for the queue to have space
                 except (asyncio.CancelledError, RuntimeError):
+                    coro.close()
                     break
         except Exception as e:
             if not stop_event.is_set():
+                coro = queue.put(e)
                 try:
-                    asyncio.run_coroutine_threadsafe(queue.put(e), loop)
+                    asyncio.run_coroutine_threadsafe(coro, loop)
                 except RuntimeError:
-                    pass
+                    coro.close()
         finally:
+            coro = queue.put(StopAsyncIteration)
             try:
-                asyncio.run_coroutine_threadsafe(queue.put(StopAsyncIteration), loop)
+                asyncio.run_coroutine_threadsafe(coro, loop)
             except RuntimeError:
-                pass
+                coro.close()
 
     # Start producer thread
     thread = threading.Thread(

@@ -75,11 +75,13 @@ class TestBlindSpotFileModification:
         tree = fusion_client.get_tree(path=test_file_rel, max_depth=0)
         mtime_before_audit = tree.get("modified_time")
         if mtime_before_audit != original_mtime:
-            print(f"DEBUG: Fusion mtime updated early! Original: {original_mtime}, Now: {mtime_before_audit}")
+            import logging
+            logging.getLogger(__name__).debug(f"Fusion mtime updated early! Original: {original_mtime}, Now: {mtime_before_audit}")
         
         # Step 4: Wait for Audit cycle to detect the modification
         # We wait for ACTIMEO + AUDIT_INTERVAL to ensure NFS cache is clear and audit runs
-        logger.info(f"Waiting for Audit cycle ({AUDIT_INTERVAL}s) to detect blind modification...")
+        logger.info(f"Waiting for Audit cycles to detect blind modification...")
+        wait_for_audit()
         wait_for_audit()
         
         # Step 5: After Audit, Fusion mtime should be updated
@@ -170,8 +172,9 @@ class TestBlindSpotFileModification:
         trigger_file = f"{MOUNT_POINT}/trigger_flag_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, trigger_file, "trigger")
         
-        # Wait for Audit cycle
-        logger.info(f"Waiting for Audit cycle ({AUDIT_INTERVAL}s) to detect blind modification flags...")
+        # Wait for Audit cycles
+        logger.info(f"Waiting for Audit cycles to detect blind modification flags...")
+        wait_for_audit()
         wait_for_audit()
         
         # Check agent_missing flag after modification

@@ -43,9 +43,8 @@ class TestDiscoveryAndConcurrency:
         验证 allow_concurrent_push=False 时，第二个 session 会被 409 拒绝。
         """
         # CRITICAL: 先执行一次 reset 确保状态干净，防止上一个测试点的 session 干扰
-        api_key = "test-strict-key-789"
-        reset_resp = fusion_client.api_request("POST", "pipe/consistency/reset", headers={"X-API-Key": api_key})
-        assert reset_resp.status_code == 200
+        # CRITICAL: 先执行一次 reset 确保状态干净，防止上一个测试点的 session 干扰
+        fusion_client.reset()
 
         # 1. 创建第一个 session (作为 leader)
         view_id = test_view["id"]

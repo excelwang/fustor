@@ -78,7 +78,7 @@ class ViewManager:
         
         # Try loading from fusion_config loader
         view_config = fusion_config.get_view(self.view_id)
-        print(f"DEBUG: ViewManager({self.view_id}) initialize_driver_instances. Config found: {view_config is not None}", flush=True)
+        logger.debug(f"ViewManager({self.view_id}) initialize_driver_instances. Config found: {view_config is not None}")
         
         if view_config:
             # New Unified Config V2: ViewConfig is a single object, not a list
@@ -114,7 +114,7 @@ class ViewManager:
                     )
                     await driver_instance.initialize()
                     self.driver_instances[view_name] = driver_instance
-                    print(f"DEBUG: ViewManager({self.view_id}) added driver instance '{view_name}'", flush=True)
+                    logger.debug(f"ViewManager({self.view_id}) added driver instance '{view_name}'")
                     self.logger.info(f"Initialized ViewDriver '{view_name}' (type={driver_type})")
                 except Exception as e:
                     self.logger.error(f"Failed to initialize ViewDriver '{view_name}': {e}", exc_info=True)
@@ -150,7 +150,7 @@ class ViewManager:
         for driver_id, driver_instance in self.driver_instances.items():
             # Schema Routing: 
             # 1. If driver specifies target_schema, check if it matches event_schema
-            # 2. If target_schema is empty, broadcast (legacy/generic behavior)
+            # 2. If target_schema is empty, broadcast
             target = getattr(driver_instance, "target_schema", "")
             if target and target != event.event_schema:
                 # Skip this driver for this event

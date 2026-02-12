@@ -103,7 +103,7 @@ def ensure_agent_running(container_name, api_key, view_id, mount_point=MOUNT_POI
     
     
     logger.info(f"Starting agent in {container_name} in DAEMON mode (-D)")
-    env_prefix = "FUSTOR_USE_PIPELINE=true "
+    env_prefix = ""
     
     # Apply env overrides if provided
     cmd_prefix = env_prefix

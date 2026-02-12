@@ -50,7 +50,9 @@ async def test_audit_start_endpoint(client, mock_view_manager):
     
     response = client.post("/api/v1/pipe/consistency/audit/start")
     if response.status_code != 200:
-        print(f"DEBUG: 422 error details: {response.json()}")
+        if response.status_code == 422:
+            import logging
+            logging.getLogger(__name__).debug(f"422 error details: {response.json()}")
     
     assert response.status_code == 200
     assert response.json()["status"] == "audit_started"

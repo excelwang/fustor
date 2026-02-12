@@ -32,7 +32,7 @@ pipe_router.include_router(consistency_router)
 pipe_router.include_router(session_router, prefix="/session")
 
 
-# --- Event Ingestion (inlined from legacy ingest.py) ---
+# --- Event Ingestion ---
 
 class IngestPayload(BaseModel):
     events: List[Dict[str, Any]]

@@ -58,11 +58,13 @@ class TestBlindSpotFileDeletion:
         # Step 2: Delete file from blind-spot client
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)
         
-        # Step 3: Immediately after deletion, file should STILL be in Fusion
-        # Note: In some environments (or if Audit runs coincidentally), this might fail.
-        # We relax this check to focus on eventual consistency.
+        # Step 3: Wait for NFS propagation and for Audit to detect deletion
+        # actimeo=1 + margin
+        time.sleep(INGESTION_DELAY)
         
-        # Step 4: Wait for Audit to detect deletion
+        # We wait for TWO completions to ensure at least one full cycle
+        # started AFTER the deletion happened.
+        wait_for_audit()
         wait_for_audit()
         
         assert fusion_client.wait_for_file_not_in_tree(test_file_rel, timeout=SHORT_TIMEOUT), \
@@ -92,7 +94,11 @@ class TestBlindSpotFileDeletion:
         
         docker_manager.delete_file_in_container(CONTAINER_CLIENT_C, test_file)
         
-        # Wait for Audit completion
+        # Wait for NFS propagation and for Audit to detect deletion
+        time.sleep(INGESTION_DELAY)
+        
+        # Wait for Audit completion (TWO cycles for reliability)
+        wait_for_audit()
         wait_for_audit()
         
         # Check blind-spot list for deletion record

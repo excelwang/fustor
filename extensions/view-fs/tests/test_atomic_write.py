@@ -55,29 +55,3 @@ async def test_atomic_write_integrity():
     assert node is not None
     assert node.integrity_suspect is False, "Atomic write should CLEAR suspect flag"
     assert path not in state.suspect_list
-
-@pytest.mark.asyncio
-async def test_legacy_compatibility():
-    # Setup
-    state = FSState("test_view")
-    tree = TreeManager(state)
-    arb = FSArbitrator(state, tree, hot_file_threshold=5.0)
-    path = "/legacy.txt"
-    
-    # Simulate event WITHOUT is_atomic_write field (Legacy/Default behavior)
-    event_legacy = MagicMock()
-    event_legacy.message_source = MessageSource.REALTIME
-    event_legacy.event_type = EventType.UPDATE
-    event_legacy.rows = [{
-        "path": path,
-        "file_name": "legacy.txt",
-        "size": 100,
-        "modified_time": 1000.0,
-        "is_directory": False
-        # Missing field -> should default to True
-    }]
-    
-    await arb.process_event(event_legacy)
-    
-    node = state.get_node(path)
-    assert node.integrity_suspect is False, "Missing field should default to True (Clean)"

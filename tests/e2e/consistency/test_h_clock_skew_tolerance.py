@@ -96,6 +96,12 @@ class TestClockSkewTolerance:
         # 1. Create file from Client C (No Agent)
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, file_path, "from_c")
         
+        # Ensure watermark is not too far ahead by getting samples from Agent B (-1h)
+        # This ensures host-time files (from C) are within the hot threshold.
+        logger.info("Step 1.1: Establishing Mode with Agent B (-1h) to stabilize watermark...")
+        for i in range(3):
+            docker_manager.exec_in_container(CONTAINER_CLIENT_B, ["touch", f"{MOUNT_POINT}/warmup_h_{i}.txt"])
+        
         # NOTE: Smart Audit relies on parent directory mtime change.
         trigger_path = f"{MOUNT_POINT}/trigger_h_{int(time.time()*1000)}.txt"
         docker_manager.create_file_in_container(CONTAINER_CLIENT_C, trigger_path, "trigger")

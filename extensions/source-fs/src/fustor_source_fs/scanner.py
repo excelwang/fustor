@@ -306,16 +306,16 @@ class FSScanner:
                 dir_stat = os.stat(root)
                 current_dir_mtime = dir_stat.st_mtime
                 cached_mtime = mtime_cache.get(root)
-                is_silent = (cached_mtime is not None and cached_mtime == current_dir_mtime)
+                is_silent = (cached_mtime is not None and abs(cached_mtime - current_dir_mtime) < 1e-6)
                 
                 # Report directory
                 dir_metadata = get_file_metadata(root, root_path=self.root, stat_info=dir_stat)
                 if dir_metadata:
                     if is_silent:
                         dir_metadata['audit_skipped'] = True
-                        logger.debug(f"[audit] Directory {root} is SILENT (mtime {current_dir_mtime})")
+                        logger.debug(f"[audit] Directory {root} is SILENT. mtime={current_dir_mtime}, cached={cached_mtime}")
                     else:
-                        logger.debug(f"[audit] Directory {root} is NOT silent (mtime {current_dir_mtime}, cached {cached_mtime})")
+                        logger.debug(f"[audit] Directory {root} is NOT silent. mtime={current_dir_mtime}, cached={cached_mtime}")
                     
                     res_q.put((UpdateEvent(
                         event_schema=event_schema,

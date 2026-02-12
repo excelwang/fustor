@@ -174,28 +174,4 @@ async def submit_sentinel_feedback(
         return {"status": "processed", "drivers_updated": processed_count}
     
     return {"status": "ignored", "reason": "unknown_type"}
-@consistency_router.post("/reset", summary="Reset consistency state for a view (Tests only)")
-async def reset_consistency_state(
-    view_id: str = Depends(get_view_id_from_api_key)
-):
-    """
-    Purge all runtime state for a view:
-    1. Terminate all active sessions
-    2. Clear view state manager data
-    3. Trigger full view reset
-    """
-    logger.warning(f"CRITICAL: Resetting consistency state for view {view_id}")
-    
-    # 1. Terminate sessions (handles session_manager and view_state_manager release_leader/unlock)
-    from ..core.session_manager import session_manager
-    await session_manager.clear_all_sessions(view_id)
-    
-    # 2. Clear view state manager (redundant but safe)
-    from ..view_state_manager import view_state_manager
-    await view_state_manager.clear_state(view_id)
-    
-    # 3. Trigger view reset
-    from ..view_manager.manager import reset_views
-    await reset_views(view_id)
-    
-    return {"status": "reset_complete", "view_id": view_id}
+

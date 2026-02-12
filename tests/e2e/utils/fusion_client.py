@@ -80,9 +80,11 @@ class FusionClient:
                 if not silence_503:
                     try:
                         detail = resp.json().get('detail', 'No detail provided')
-                        print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {detail}")
+                        import logging
+                        logging.getLogger(__name__).warning(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {detail}")
                     except Exception:
-                        print(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {resp.text}")
+                        import logging
+                        logging.getLogger(__name__).warning(f"\n[FUSION_CLIENT_ERROR] 503 Service Unavailable for {path}: {resp.text}")
             raise e
         return resp.json()
 
@@ -102,11 +104,34 @@ class FusionClient:
         return resp.json()
 
     def reset(self) -> None:
-        """Reset Fusion state for current view (comprehensive)."""
-        url = f"{self.base_url}/api/v1/views/{self.view_id}/reset"
-        print(f"DEBUG: FusionClient calling reset: {url}", flush=True)
-        resp = self.session.delete(url)
-        resp.raise_for_status()
+        """Reset Fusion state for current view (best effort via public API)."""
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        # url = f"{self.base_url}/api/v1/views/{self.view_id}/reset" # Removed endpoint
+        logger.info(f"FusionClient performing manual reset (terminate all sessions)")
+        
+        try:
+            sessions = self.get_sessions()
+            if not sessions:
+                logger.debug("No active sessions to terminate.")
+                return
+
+            for s in sessions:
+                sid = s.get("session_id")
+                if sid:
+                    try:
+                        self.terminate_session(sid)
+                        logger.debug(f"Terminated session {sid}")
+                    except Exception as e:
+                        logger.warning(f"Failed to terminate session {sid}: {e}")
+            
+            # Give a brief moment for cleanup
+            time.sleep(0.5)
+            
+        except Exception as e:
+            logger.error(f"Failed to perform manual reset: {e}")
+            # Don't raise, just log, as this is cleanup/setup helper
 
 
 
@@ -380,13 +405,16 @@ class FusionClient:
                 initial_finished_at = stats.get("last_audit_finished_at", 0)
                 initial_count = stats.get("audit_cycle_count", 0)
                 is_currently_auditing = stats.get("is_auditing", False)
-                print(f"DEBUG: wait_for_audit init. count={initial_count}, finished_at={initial_finished_at}, auditing={is_currently_auditing}")
+                import logging
+                logging.getLogger(__name__).debug(f"wait_for_audit init. count={initial_count}, finished_at={initial_finished_at}, auditing={is_currently_auditing}")
                 break
             except Exception as e:
-                print(f"DEBUG: wait_for_audit init stats retry: {e}")
+                import logging
+                logging.getLogger(__name__).debug(f"wait_for_audit init stats retry: {e}")
                 time.sleep(1)
         else:
-            print("DEBUG: wait_for_audit could not get initial stats, proceeding with 0")
+            import logging
+            logging.getLogger(__name__).debug("wait_for_audit could not get initial stats, proceeding with 0")
             initial_count = 0
             initial_finished_at = 0
 
@@ -402,7 +430,8 @@ class FusionClient:
                 
                 # Success if count increased OR timestamp advanced
                 if current_count > initial_count or current_finished_at > initial_finished_at:
-                    print(f"DEBUG: wait_for_audit success. new_count={current_count}, new_finished={current_finished_at}")
+                    import logging
+                    logging.getLogger(__name__).debug(f"wait_for_audit success. new_count={current_count}, new_finished={current_finished_at}")
                     return True
             except Exception:
                 pass

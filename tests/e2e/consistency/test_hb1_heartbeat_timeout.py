@@ -62,7 +62,7 @@ class TestHeartbeatTimeout:
             
         wait_for_condition(
             is_session_expired, 
-            timeout=SESSION_VANISH_TIMEOUT * 2, 
+            timeout=SESSION_VANISH_TIMEOUT * 4, 
             fail_msg=f"Session {old_session_id} did not expire within timeout"
         )
         

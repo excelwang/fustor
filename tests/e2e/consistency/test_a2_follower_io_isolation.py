@@ -48,7 +48,8 @@ class TestFollowerIOIsolation:
                 break
         
         if follower_session is None:
-            print(f"DEBUG: All sessions found: {sessions}")
+            import logging
+            logging.getLogger(__name__).debug(f"All sessions found: {sessions}")
         
         assert follower_session is not None, "Agent B session not found"
         assert follower_session.get("role") == "follower", \

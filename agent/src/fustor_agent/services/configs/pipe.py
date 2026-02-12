@@ -49,17 +49,16 @@ class PipeConfigService(BaseConfigService[PipeConfig], PipeConfigServiceInterfac
         )
 
     def get_config(self, id: str) -> Optional[PipeConfig]:
-        """Get config by ID, checking YAML first then legacy config."""
+        """Get config by ID from YAML."""
         # 1. Try YAML first
         yaml_config = agent_config.get_pipe(id)
         if yaml_config:
             return self._convert_yaml_to_model(yaml_config)
             
-        # 2. No fallback to AppConfig (Legacy)
         return None
 
     def list_configs(self) -> Dict[str, PipeConfig]:
-        """List all configs, strictly loading from YAML only."""
+        """List all configs from YAML."""
         configs: Dict[str, PipeConfig] = {}
         
         # Merge YAML configs (YAML is the ONLY source of truth now)

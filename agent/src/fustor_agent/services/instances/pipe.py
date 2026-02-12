@@ -123,7 +123,7 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
             )
             self.logger.info(f"Subscribed to EventBus {event_bus.id} for pipe '{task_id}'")
 
-            # Create Handlers (Inlined from PipeBridge to simplify)
+            # Create Handlers
             source_driver_class = self.source_driver_service._get_driver_by_type(source_config.driver)
             source_driver = source_driver_class(id=pipe_config.source, config=source_config)
             source_handler = SourceHandlerAdapter(source_driver, config=source_config)

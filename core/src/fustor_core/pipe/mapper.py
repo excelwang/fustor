@@ -120,18 +120,21 @@ class EventMapper:
         instructions = []
         # Track all source fields that should be removed from original data
         all_source_to_remove = set()
+        # Track all target paths to avoid accidental deletion if source == target
+        all_targets = set()
         
         for mapping in self.config:
             target_path = mapping.get("to")
             if not target_path:
                 continue
+            
+            all_targets.add(target_path)
 
             # Parse target path (dot notation)
             target_parts = target_path.split('.')
             
             # Determine source value strategy
             source_strategy = None
-            source_field_to_remove = None # Track if we should remove the source field
             
             if "hardcoded_value" in mapping:
                 val = mapping["hardcoded_value"]
@@ -150,7 +153,6 @@ class EventMapper:
                 
                 # If target name is different from the stripped source field name, we 'move' it
                 if source_field != target_path:
-                    source_field_to_remove = source_field
                     all_source_to_remove.add(source_field)
 
                 converter = type_converter_map.get(target_type) if target_type else None
@@ -175,35 +177,84 @@ class EventMapper:
                 
                 source_strategy = make_extractor(source_field, converter)
 
-            instructions.append((target_parts, source_strategy))
+            instructions.append((target_parts, source_strategy, target_path))
+
+        # Filter out fields that are BOTH a source-to-remove and a target
+        final_to_remove = all_source_to_remove - all_targets
 
         def mapper_logic(event_data, logger):
-            # Strict transformation: output contains ONLY mapped fields.
+            # Strict mode: Start with empty dict, only include mapped fields
             processed_data = {}
-
-            for target_parts, get_value in instructions:
+            
+            # Apply all mappings
+            for target_parts, get_value, target_path in instructions:
                 val = get_value(event_data)
                 if val is None:
                     continue
                 
-                # Set value in nested dict, with path conflict detection
+                # Set value in nested dict
                 current = processed_data
-                conflict = False
                 for part in target_parts[:-1]:
-                    if part in current and not isinstance(current[part], dict):
-                        logger.warning(
-                            f"Mapper path conflict: '{part}' is a scalar, "
-                            f"cannot create child '{'.'.join(target_parts)}'. Skipping."
-                        )
-                        conflict = True
-                        break
-                    if part not in current:
+                    if part not in current or not isinstance(current[part], dict):
                         current[part] = {}
                     current = current[part]
                 
-                if not conflict:
-                    current[target_parts[-1]] = val
+                # Check for path conflict (if target is existing scalar)
+                if target_parts[-1] in current and not isinstance(current[target_parts[-1]], dict) and isinstance(val, dict):
+                     # If we are trying to write a dict into a place that is already a scalar?
+                     # No, wait. 
+                     # Case: target="root", val=1. processed={'root': 1}.
+                     # Next: target="root.child", val=2.
+                     # Loop above: 'root' in current. current['root'] is 1 (scalar).
+                     # current['root'] is NOT dict.
+                     # We overwrote it: current[part] = {} -> current['root'] = {}.
+                     # This would overwrite 'root': 1 with 'root': {}.
+                     # Test: test_path_conflict_avoidance expects {'root': 1}.
+                     # So we should NOT overwrite scalar with dict if strict?
+                     pass
+
+                # Let's handle the path conflict strictly as per test_path_conflict_avoidance
+                # The test expects:
+                # config 1: a -> root (val 1)
+                # config 2: b -> root.child (val 2)
+                # Result: {'root': 1}
+                # So if we encounter a scalar where we need a dict, we should SKIP this mapping?
+                
+                # Re-implementing the loop with conflict check
             
+            return processed_data
+
+        # Better implementation of mapper_logic for the tool replacement
+        def mapper_logic(event_data, logger):
+            processed_data = {}
+            
+            for target_parts, get_value, target_path in instructions:
+                val = get_value(event_data)
+                if val is None:
+                    continue
+                
+                current = processed_data
+                skip_mapping = False
+                
+                # Navigate to parent
+                for part in target_parts[:-1]:
+                    if part in current:
+                        if not isinstance(current[part], dict):
+                            # Conflict: Path segment is already a scalar value
+                            logger.warning(f"Mapping conflict: cannot traverse '{part}' (value: {current[part]}) to set '{target_path}'")
+                            skip_mapping = True
+                            break
+                    else:
+                        current[part] = {}
+                    
+                    current = current[part]
+                
+                if skip_mapping:
+                    continue
+                    
+                # Set value
+                current[target_parts[-1]] = val
+                
             return processed_data
 
         return mapper_logic
