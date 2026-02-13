@@ -311,6 +311,12 @@ class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
             
         logger.info(f"Pipe {self.id}: {msg}, role={self.current_role}")
         
+        # Proactively report config to Fusion so the Management UI has it ready
+        try:
+            self._handle_command_report_config({"filename": "default.yaml"})
+        except Exception as e:
+            logger.warning(f"Pipe {self.id}: Failed to proactively report config: {e}")
+        
     
     async def on_session_closed(self, session_id: str) -> None:
         """Handle session closure."""

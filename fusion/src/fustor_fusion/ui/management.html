@@ -434,8 +434,11 @@
         <!-- Config -->
         <div class="section">
             <div class="section-header">
-                <span class="section-title">Configuration</span>
-                <button class="btn btn-sm" onclick="toggleConfig()">Show/Hide</button>
+                <span class="section-title">Fusion Configuration</span>
+                <div>
+                    <button class="btn btn-sm" onclick="editFusionConfig()">Edit</button>
+                    <button class="btn btn-sm" onclick="toggleConfig()">Show/Hide</button>
+                </div>
             </div>
             <div id="configPanel" style="display:none; padding: 16px;">
                 <pre class="mono" id="configContent"
@@ -451,12 +454,39 @@
                 <span class="section-title" id="configModalTitle">Edit Agent Config</span>
                 <button class="btn btn-sm" onclick="closeConfigModal()">✕</button>
             </div>
-            <div class="modal-body">
-                <label
-                    style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;display:block">Filename:</label>
-                <input id="configFilename" class="mono" value="default.yaml"
-                    style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px 10px;width:200px;margin-bottom:12px">
-                <textarea id="configEditor" class="config-editor" placeholder="# Agent config YAML..."></textarea>
+            <div class="modal-body" id="structuredConfigBody">
+                <!-- Header Info (Readonly) -->
+                <div id="configMetadata" style="margin-bottom:16px; padding:12px; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
+                    <div style="font-size:11px; color:var(--text-secondary); margin-bottom:4px;">AGENT ID</div>
+                    <div id="displayAgentId" class="mono" style="font-weight:bold; margin-bottom:8px;">-</div>
+                    <div style="font-size:11px; color:var(--text-secondary); margin-bottom:4px;">SOURCES</div>
+                    <div id="displaySources" class="mono" style="font-size:12px; margin-bottom:8px;">-</div>
+                </div>
+
+                <!-- Pipes List -->
+                <div style="margin-bottom:12px; display:flex; justify-content:space-between; align-items:center;">
+                    <span class="section-title" style="font-size:12px;">Active Pipes</span>
+                    <button class="btn btn-sm btn-primary" onclick="showAddPipeForm()">+ Add Pipe</button>
+                </div>
+                <div id="pipesListContainer" style="max-height:300px; overflow-y:auto; margin-bottom:16px;">
+                    <!-- Pipe items will be rendered here -->
+                </div>
+
+                <!-- Add Pipe Form (Hidden by default) -->
+                <div id="addPipeForm" style="display:none; padding:12px; border:1px solid var(--accent); border-radius:6px; background:rgba(108, 92, 231, 0.05); margin-bottom:16px;">
+                    <div style="font-size:12px; font-weight:bold; margin-bottom:10px;">New Pipe Details</div>
+                    <input id="newPipeId" placeholder="Pipe ID (e.g. pipe-custom)" class="mono" style="width:100%; background:var(--bg); color:var(--text); border:1px solid var(--border); padding:6px; border-radius:4px; margin-bottom:8px;">
+                    <select id="newPipeSource" class="mono" style="width:100%; background:var(--bg); color:var(--text); border:1px solid var(--border); padding:6px; border-radius:4px; margin-bottom:8px;"></select>
+                    <select id="newPipeSender" class="mono" style="width:100%; background:var(--bg); color:var(--text); border:1px solid var(--border); padding:6px; border-radius:4px; margin-bottom:12px;"></select>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn btn-sm btn-primary" onclick="confirmAddPipe()">Confirm Add</button>
+                        <button class="btn btn-sm" onclick="hideAddPipeForm()">Cancel</button>
+                    </div>
+                </div>
+
+                <!-- Hidden inputs for backward compat/form submission -->
+                <input type="hidden" id="configFilename" value="default.yaml">
+                <textarea id="configEditor" style="display:none;"></textarea>
             </div>
             <div class="modal-footer">
                 <button class="btn" onclick="closeConfigModal()">Cancel</button>
@@ -653,8 +683,10 @@
             if (panel.style.display === 'none') {
                 panel.style.display = 'block';
                 try {
-                    const cfg = await api('/config');
-                    document.getElementById('configContent').textContent = JSON.stringify(cfg, null, 2);
+                    const data = await api('/config');
+                    // Exclude raw_yaml from JSON display
+                    const { raw_yaml, ...meta } = data;
+                    document.getElementById('configContent').textContent = JSON.stringify(meta, null, 2);
                 } catch (e) {
                     document.getElementById('configContent').textContent = 'Error: ' + e.message;
                 }
@@ -664,23 +696,59 @@
         }
 
         let _editingAgentId = null;
+        let _isEditingFusion = false;
+        let _currentConfigDict = null;
+
+        async function editFusionConfig() {
+            _editingAgentId = null;
+            _isEditingFusion = true;
+            
+            // Switch UI modes
+            document.getElementById('configMetadata').style.display = 'none';
+            document.getElementById('pipesListContainer').style.display = 'none';
+            document.getElementById('addPipeForm').style.display = 'none';
+            document.querySelectorAll('#structuredConfigBody .section-title, #structuredConfigBody button').forEach(el => el.style.display = 'none');
+            
+            document.getElementById('configModalTitle').textContent = `Edit Fusion Config`;
+            const editor = document.getElementById('configEditor');
+            editor.style.display = 'block';
+            editor.value = 'Loading current configuration...';
+            document.getElementById('configModal').classList.add('active');
+
+            try {
+                const data = await api('/config?filename=default.yaml');
+                if (data.raw_yaml) {
+                    editor.value = data.raw_yaml;
+                } else {
+                    editor.value = '# Config file not found on server.';
+                }
+            } catch (e) {
+                editor.value = '# Error fetching Fusion config: ' + e.message;
+            }
+        }
 
         async function editConfig(agentId) {
             _editingAgentId = agentId;
-            document.getElementById('configModalTitle').textContent = `Edit Config: ${agentId}`;
-            document.getElementById('configEditor').value = 'Loading current configuration...';
-            document.getElementById('configFilename').value = 'default.yaml';
+            _isEditingFusion = false;
+            _currentConfigDict = null;
+            
+            // Switch UI modes
+            document.getElementById('configMetadata').style.display = 'block';
+            document.getElementById('pipesListContainer').style.display = 'block';
+            document.getElementById('configEditor').style.display = 'none';
+            document.querySelectorAll('#structuredConfigBody .section-title, #structuredConfigBody button').forEach(el => el.style.display = '');
+            
+            document.getElementById('configModalTitle').textContent = `Manage Agent Pipes: ${agentId}`;
+            document.getElementById('pipesListContainer').innerHTML = '<div class="loading">Fetching configuration...</div>';
             document.getElementById('configModal').classList.add('active');
+            hideAddPipeForm();
 
             try {
                 let data = await api(`/agents/${agentId}/config`);
                 
-                // If config not yet reported, trigger a report and retry once
                 if (data.status === 'pending') {
                     await api(`/agents/${agentId}/config?trigger=true`);
-                    document.getElementById('configEditor').value = 'Requesting configuration from agent... please wait.';
-                    
-                    // Poll for up to 5 seconds
+                    document.getElementById('pipesListContainer').innerHTML = '<div class="loading">Requesting config from agent...</div>';
                     for (let i = 0; i < 5; i++) {
                         await new Promise(r => setTimeout(r, 1000));
                         data = await api(`/agents/${agentId}/config`);
@@ -689,38 +757,134 @@
                 }
 
                 if (data.status === 'ok') {
-                    document.getElementById('configEditor').value = data.config_yaml;
+                    _currentConfigDict = data.config_dict;
+                    renderStructuredConfig();
                 } else {
-                    document.getElementById('configEditor').value = '# Failed to fetch config. You can still write and push a new one.\n' + (data.message || '');
+                    document.getElementById('pipesListContainer').innerHTML = `<div class="error-msg">${data.message || 'Failed to fetch config'}</div>`;
                 }
             } catch (e) {
-                document.getElementById('configEditor').value = '# Error fetching config: ' + e.message;
+                document.getElementById('pipesListContainer').innerHTML = `<div class="error-msg">${e.message}</div>`;
+            }
+        }
+
+        function renderStructuredConfig() {
+            const cfg = _currentConfigDict;
+            document.getElementById('displayAgentId').textContent = cfg.agent_id || 'unknown';
+            document.getElementById('displaySources').textContent = Object.keys(cfg.sources || {}).join(', ') || 'none';
+
+            // Populate Add Form Selects
+            const srcSelect = document.getElementById('newPipeSource');
+            srcSelect.innerHTML = '<option value="">-- Select Source --</option>';
+            Object.keys(cfg.sources || {}).forEach(s => {
+                srcSelect.innerHTML += `<option value="${s}">${s} (${cfg.sources[s].driver})</option>`;
+            });
+
+            const sndSelect = document.getElementById('newPipeSender');
+            sndSelect.innerHTML = '<option value="">-- Select Sender --</option>';
+            Object.keys(cfg.senders || {}).forEach(s => {
+                sndSelect.innerHTML += `<option value="${s}">${s} (${cfg.senders[s].driver})</option>`;
+            });
+
+            // Render Pipes
+            const container = document.getElementById('pipesListContainer');
+            const pipes = cfg.pipes || {};
+            if (Object.keys(pipes).length === 0) {
+                container.innerHTML = '<div style="text-align:center; padding:20px; color:var(--text-secondary); font-size:12px;">No pipes configured</div>';
+            } else {
+                container.innerHTML = Object.entries(pipes).map(([id, p]) => `
+                    <div style="background:var(--surface-hover); border:1px solid var(--border); border-radius:6px; padding:10px; margin-bottom:8px; display:flex; justify-content:space-between; align-items:center;">
+                        <div>
+                            <div class="mono" style="font-weight:bold; color:var(--accent);">${escapeHtml(id)}</div>
+                            <div style="font-size:11px; color:var(--text-secondary); margin-top:2px;">
+                                Source: <b>${escapeHtml(p.source)}</b> &nbsp; Sender: <b>${escapeHtml(p.sender)}</b>
+                            </div>
+                        </div>
+                        <button class="btn btn-sm btn-red" style="padding:2px 8px;" onclick="removePipe('${escapeHtml(id)}')">Delete</button>
+                    </div>
+                `).join('');
             }
         }
 
         function closeConfigModal() {
             document.getElementById('configModal').classList.remove('active');
             _editingAgentId = null;
+            _isEditingFusion = false;
+        }
+
+        function showAddPipeForm() {
+            document.getElementById('addPipeForm').style.display = 'block';
+        }
+
+        function hideAddPipeForm() {
+            document.getElementById('addPipeForm').style.display = 'none';
+            document.getElementById('newPipeId').value = '';
+        }
+
+        function removePipe(pipeId) {
+            if (!confirm(`Delete pipe "${pipeId}"?`)) return;
+            delete _currentConfigDict.pipes[pipeId];
+            renderStructuredConfig();
+        }
+
+        function confirmAddPipe() {
+            const id = document.getElementById('newPipeId').value.trim();
+            const source = document.getElementById('newPipeSource').value;
+            const sender = document.getElementById('newPipeSender').value;
+
+            if (!id || !source || !sender) {
+                alert('Please fill all fields');
+                return;
+            }
+            if (_currentConfigDict.pipes[id]) {
+                alert('Pipe ID already exists');
+                return;
+            }
+
+            // Check for redundant (source, sender) pair
+            const isRedundant = Object.values(_currentConfigDict.pipes).some(p => p.source === source && p.sender === sender);
+            if (isRedundant) {
+                alert(`Error: A pipe with Source "${source}" and Sender "${sender}" already exists. Redundant pipes are forbidden.`);
+                return;
+            }
+
+            _currentConfigDict.pipes[id] = { source, sender };
+            hideAddPipeForm();
+            renderStructuredConfig();
         }
 
         async function saveConfig() {
-            if (!_editingAgentId) return;
-            const yaml = document.getElementById('configEditor').value.trim();
-            const filename = document.getElementById('configFilename').value.trim();
-            if (!yaml || yaml.startsWith('# Error') || yaml.startsWith('# Failed')) { 
-                if (!confirm('Content looks like an error or is empty. Push anyway?')) return;
+            if (_isEditingFusion) {
+                const yaml = document.getElementById('configEditor').value.trim();
+                if (!confirm(`Save and apply Fusion configuration?`)) return;
+                try {
+                    const res = await api('/config', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ config_yaml: yaml, filename: 'default.yaml' }),
+                    });
+                    alert(res.message);
+                    closeConfigModal();
+                    refresh();
+                } catch (e) { alert('Save failed: ' + e.message); }
+                return;
             }
-            if (!confirm(`Push config to agent ${_editingAgentId}?`)) return;
+
+            if (!_editingAgentId || !_currentConfigDict) return;
+            if (!confirm(`Apply changes to agent ${_editingAgentId}?`)) return;
+            
             try {
-                const res = await api(`/agents/${_editingAgentId}/config`, {
+                const res = await api(`/agents/${_editingAgentId}/config/structured`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ config_yaml: yaml, filename }),
+                    body: JSON.stringify({ 
+                        pipes: _currentConfigDict.pipes, 
+                        filename: 'default.yaml' 
+                    }),
                 });
-                alert(`Config pushed (${res.sessions_queued} sessions queued). Agent will validate and reload.`);
+                alert(`Config updated. Agent will reload.`);
                 closeConfigModal();
             } catch (e) {
-                alert('Push failed: ' + e.message);
+                alert('Update failed: ' + e.message);
             }
         }
 

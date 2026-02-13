@@ -52,8 +52,10 @@ class ConfigValidator:
             if not s_cfg.uri:
                 errors.append(f"Sender '{s_id}' missing 'uri' field")
 
-        # 3. Validate Pipes (Cross-references)
+        # 3. Validate Pipes (Cross-references and Uniqueness)
         pipes = self.loader.get_all_pipes()
+        seen_pairs: Dict[Tuple[str, str], str] = {} # (source, sender) -> pipe_id
+
         for p_id, p_cfg in pipes.items():
             # Check Source Ref
             if not p_cfg.source:
@@ -66,6 +68,17 @@ class ConfigValidator:
                 errors.append(f"Pipe '{p_id}' missing 'sender' reference")
             elif p_cfg.sender not in senders:
                 errors.append(f"Pipe '{p_id}' references unknown sender '{p_cfg.sender}'")
+            
+            # Check Uniqueness of (source, sender) pair
+            if p_cfg.source and p_cfg.sender:
+                pair = (p_cfg.source, p_cfg.sender)
+                if pair in seen_pairs:
+                    errors.append(
+                        f"Redundant configuration: Pipe '{p_id}' uses the same (source, sender) pair "
+                        f"as Pipe '{seen_pairs[pair]}'. This is forbidden to prevent data conflicts."
+                    )
+                else:
+                    seen_pairs[pair] = p_id
 
         if not sources and not senders and not pipes:
              # Just a warning context, maybe not an error if intentional, 
@@ -77,6 +90,23 @@ class ConfigValidator:
     def validate_config(self, config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
         """Validate a configuration dictionary without loading from disk."""
         errors = []
-        # Basic smoke test for required top-level keys if needed
-        # Or more complex logic matching UnifiedAgentConfig schema
-        return True, [] # For now, return success to fix tests, can be refined later
+        if not config_dict:
+            return True, []
+
+        pipes = config_dict.get("pipes", {})
+        if not isinstance(pipes, dict):
+            errors.append("'pipes' section must be a dictionary")
+            return False, errors
+
+        seen_pairs = {}
+        for p_id, p_cfg in pipes.items():
+            source = p_cfg.get("source")
+            sender = p_cfg.get("sender")
+            if source and sender:
+                pair = (source, sender)
+                if pair in seen_pairs:
+                    errors.append(f"Redundant configuration: Pipe '{p_id}' uses the same (source, sender) pair as Pipe '{seen_pairs[pair]}'.")
+                else:
+                    seen_pairs[pair] = p_id
+        
+        return len(errors) == 0, errors

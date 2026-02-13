@@ -47,21 +47,46 @@ Fustor 将后端存储（如 NFS, S3, Local FS）抽象为 **View (视图)**。�
   - `path`: (string) 目标路径，默认 `/`。
   - `recursive`: (bool) 是否递归获取子目录，默认 `true`。
   - `max_depth`: (int) 递归深度。
-- **示例**: `curl -H "X-API-Key: ..." "http://fusion:8102/api/v1/views/my-view/tree?path=/data"`
+  - `only_path`: (bool) 若为 `true`，仅返回目录结构和文件名，不含大小/时间等元数据（轻量级）。
+  - `on_demand_scan`: (bool) 若为 `true`，且当前路径在视图中不存在，触发 Agent 端进行按需扫描（补偿机制）。
+- **示例**: `curl -H "X-API-Key: ..." "http://fusion:8102/api/v1/views/my-view/tree?path=/data&max_depth=2"`
+
+#### 响应结构示例
+```json
+{
+  "name": "data",
+  "content_type": "directory",
+  "path": "/data",
+  "modified_time": 1700001234.56,
+  "children": [
+    {
+      "name": "config.yaml",
+      "content_type": "file",
+      "size": 1024,
+      "integrity_suspect": false
+    }
+  ]
+}
+```
 
 ### 3.2 搜索文件 (`/search`)
 基于文件名的快速搜索。
 
 - **接口**: `GET /api/v1/views/{view_id}/search`
-- **参数**: `query`: (string) 搜索关键词。
-- **示例**: `GET /api/v1/views/my-view/search?query=backup`
+- **参数**: `query`: (string) 搜索模式，支持标准 Glob 通配符 (`*`, `?`, `[]`, `**`)。
+- **示例**: 
+  - 精确搜索: `GET /api/v1/views/my-view/search?query=backup.log`
+  - 通配符搜索: `GET /api/v1/views/my-view/search?query=*.log`
+  - 递归搜索: `GET /api/v1/views/my-view/search?query=**/config.yaml`
 
 ### 3.3 获取元数据 (`/metadata`)
 获取单个文件的详细属性（大小、修改时间、一致性标志）。
 
 - **接口**: `GET /api/v1/views/{view_id}/metadata`
 - **参数**: `path`: (string) 必填。
-- **亮点**: 会返回 `integrity_suspect` 字段。若为 `true`，表示该文件正处于“温吞态”（可能正在被写入或在盲区被修改），建议稍后重试。
+- **亮点**: 
+  - `integrity_suspect`: 若为 `true`，表示该文件正处于“温吞态”（可能正在被写入或在盲区被修改），建议稍后重试。
+  - `audit_skipped`: 若为 `true`，表示该目录在最近一次审计中被跳过（可能因为权限问题或文件系统错误），其内容可能不完整。
 
 ### 3.4 视图健康统计 (`/stats`)
 监控视图的同步进度、延迟和健康度。
@@ -113,6 +138,9 @@ Fustor 将后端存储（如 NFS, S3, Local FS）抽象为 **View (视图)**。�
 
 **Q: 为什么我看到的文件状态是 `integrity_suspect=true`？**
 A: 这表示 Fustor 发现该文件在非受控环境（如直接在 NFS 下修改）发生了变动，或者正在被写入。Fusion 正在等待审计扫描或 Realtime 事件来校对它的最终属性。
+
+**Q: 创建会话时返回 409 Conflict？**
+A: 这表示该视图设置了严格的并发控制 (`allow_concurrent_push: false`)，且当前已有其他 Agent (Session) 正在持有该视图的锁。请等待现有会话结束或手动终止它。
 
 **Q: 查询接口会发生阻塞吗？**
 A: 不会。所有的查询都是基于内存索引的，具有极高的响应速度。

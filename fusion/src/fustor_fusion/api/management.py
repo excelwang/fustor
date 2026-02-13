@@ -78,6 +78,12 @@ class AgentConfigUpdateRequest(BaseModel):
     filename: str = "default.yaml"  # Target config file name
 
 
+class FusionConfigUpdateRequest(BaseModel):
+    """Payload for updating Fusion's own configuration."""
+    config_yaml: str
+    filename: str = "default.yaml"
+
+
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
@@ -248,29 +254,95 @@ async def dispatch_agent_command(agent_id: str, payload: AgentCommandRequest):
 # Agent config push
 # ---------------------------------------------------------------------------
 
+class AgentConfigStructuredUpdateRequest(BaseModel):
+    """Payload for updating agent config via structured JSON."""
+    pipes: Dict[str, Any]
+    filename: str = "default.yaml"
+
+
+@router.post("/agents/{agent_id}/config/structured")
+async def update_agent_config_structured(agent_id: str, payload: AgentConfigStructuredUpdateRequest):
+    """Update agent config by merging new pipes into the existing configuration."""
+    import yaml
+    all_sessions = await session_manager.get_all_active_sessions()
+
+    current_si = None
+    for view_id, sess_map in all_sessions.items():
+        for sid, si in sess_map.items():
+            if si.task_id and si.task_id.startswith(f"{agent_id}:"):
+                if getattr(si, 'reported_config', None):
+                    current_si = si
+                    break
+    
+    if not current_si:
+        raise HTTPException(status_code=404, detail="Could not find current agent config to merge.")
+
+    try:
+        config_dict = yaml.safe_load(current_si.reported_config)
+        # Update ONLY the pipes section
+        config_dict['pipes'] = payload.pipes
+        new_yaml = yaml.dump(config_dict, sort_keys=False)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process config: {e}")
+
+    # Delegate to the existing push logic (which already has commands queued etc)
+    return await push_agent_config(agent_id, AgentConfigUpdateRequest(config_yaml=new_yaml, filename=payload.filename))
+
+
 @router.post("/agents/{agent_id}/config")
 async def push_agent_config(agent_id: str, payload: AgentConfigUpdateRequest):
     """
-    Push a new configuration to an agent.
-
-    The config YAML is delivered via heartbeat command channel.
-    The agent writes it to its local config directory and triggers a hot-reload.
+    Push a new configuration to an agent with strict validation.
+    Only allows adding or removing pipes. Editing existing sections is forbidden.
     """
+    import yaml
     all_sessions = await session_manager.get_all_active_sessions()
 
     matched = []
+    current_config_yaml = None
     for view_id, sess_map in all_sessions.items():
         for sid, si in sess_map.items():
             if si.task_id:
                 parts = si.task_id.split(":")
                 if parts[0] == agent_id:
                     matched.append((view_id, sid, si))
+                    if getattr(si, 'reported_config', None):
+                        current_config_yaml = si.reported_config
 
     if not matched:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"No active sessions found for agent '{agent_id}'",
         )
+
+    # --- Strict Validation Logic ---
+    if current_config_yaml:
+        try:
+            old_cfg = yaml.safe_load(current_config_yaml) or {}
+            new_cfg = yaml.safe_load(payload.config_yaml) or {}
+
+            # 1. Ensure non-pipe sections are identical
+            for key in set(old_cfg.keys()) | set(new_cfg.keys()):
+                if key == 'pipes':
+                    continue
+                if old_cfg.get(key) != new_cfg.get(key):
+                    raise HTTPException(
+                        status_code=400, 
+                        detail=f"Modification of section '{key}' is restricted. Only 'pipes' can be modified."
+                    )
+
+            # 2. Ensure existing pipes are not modified (only add or delete allowed)
+            old_pipes = old_cfg.get('pipes', {})
+            new_pipes = new_cfg.get('pipes', {})
+            for p_id in set(old_pipes.keys()) & set(new_pipes.keys()):
+                if old_pipes[p_id] != new_pipes[p_id]:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"Editing existing pipe '{p_id}' is restricted. To change it, please delete and re-add."
+                    )
+        except yaml.YAMLError:
+            raise HTTPException(status_code=400, detail="Invalid YAML format")
+    # --- End of Validation ---
 
     command_dict = {
         "type": "update_config",
@@ -306,12 +378,11 @@ async def get_agent_config(agent_id: str, trigger: bool = False, filename: str =
     
     for view_id, sess_map in all_sessions.items():
         for sid, si in sess_map.items():
-            if si.task_id:
-                parts = si.task_id.split(":")
-                if parts[0] == agent_id:
-                    agent_sessions.append((view_id, sid, si))
-                    if getattr(si, 'reported_config', None):
-                        cached_config = si.reported_config
+            if si.task_id and si.task_id.startswith(f"{agent_id}:"):
+                agent_sessions.append((view_id, sid, si))
+                if getattr(si, 'reported_config', None):
+                    cached_config = si.reported_config
+                    # Keep searching, maybe a newer session has a fresher config
 
     if not agent_sessions:
         raise HTTPException(
@@ -330,7 +401,16 @@ async def get_agent_config(agent_id: str, trigger: bool = False, filename: str =
         return {"status": "triggered", "message": "report_config command queued"}
 
     if cached_config:
-        return {"status": "ok", "config_yaml": cached_config}
+        import yaml
+        try:
+            config_dict = yaml.safe_load(cached_config)
+        except:
+            config_dict = {}
+        return {
+            "status": "ok", 
+            "config_yaml": cached_config, 
+            "config_dict": config_dict
+        }
     else:
         return {"status": "pending", "message": "Config not yet reported. Use ?trigger=true to request it."}
 
@@ -340,8 +420,9 @@ async def get_agent_config(agent_id: str, trigger: bool = False, filename: str =
 # ---------------------------------------------------------------------------
 
 @router.get("/config")
-async def get_config():
+async def get_config(filename: str = "default.yaml"):
     """Return the current Fusion configuration (read-only view)."""
+    # 1. Provide metadata-based view (existing)
     pipes = {}
     for pid, p in fusion_config.get_all_pipes().items():
         pipes[pid] = {
@@ -369,11 +450,57 @@ async def get_config():
             "driver_params": v.driver_params,
         }
 
+    # 2. Also provide raw YAML for editing if requested
+    raw_yaml = None
+    from fustor_core.common import get_fustor_home_dir
+    config_path = get_fustor_home_dir() / "fusion-config" / filename
+    if config_path.exists():
+        raw_yaml = config_path.read_text(encoding="utf-8")
+
     return {
         "pipes": pipes,
         "receivers": receivers,
         "views": views,
+        "raw_yaml": raw_yaml,
+        "filename": filename
     }
+
+
+@router.post("/config")
+async def update_fusion_config(payload: FusionConfigUpdateRequest):
+    """Update Fusion's own configuration file."""
+    import yaml
+    from fustor_core.common import get_fustor_home_dir
+    import shutil
+
+    # Validate YAML
+    try:
+        yaml.safe_load(payload.config_yaml)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid YAML: {e}")
+
+    # Sanitize filename
+    safe_name = os.path.basename(payload.filename)
+    if not safe_name.endswith((".yaml", ".yml")):
+        safe_name += ".yaml"
+
+    config_dir = get_fustor_home_dir() / "fusion-config"
+    target_path = config_dir / safe_name
+    backup_path = config_dir / f"{safe_name}.bak"
+
+    try:
+        if target_path.exists():
+            shutil.copy2(target_path, backup_path)
+        
+        target_path.write_text(payload.config_yaml, encoding="utf-8")
+        
+        # Auto-trigger reload if it's the default config
+        # or we can just return and let user click "Reload"
+        return {"status": "ok", "message": f"Config written to {safe_name}. Click 'Reload Fusion' to apply."}
+    except Exception as e:
+        if backup_path.exists():
+            shutil.copy2(backup_path, target_path)
+        raise HTTPException(status_code=500, detail=f"Failed to write config: {e}")
 
 
 # ---------------------------------------------------------------------------

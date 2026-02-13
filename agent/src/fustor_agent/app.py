@@ -112,11 +112,34 @@ class App:
         """Start the application and target pipes."""
         self.logger.info("Starting application...")
         
+        # Runtime validation for redundancy
+        self._validate_runtime_uniqueness(self._target_pipe_ids)
+        
         for pipe_id in self._target_pipe_ids:
             try:
                 await self._start_pipe(pipe_id)
             except Exception as e:
                 self.logger.error(f"Failed to start pipe '{pipe_id}': {e}", exc_info=True)
+
+    def _validate_runtime_uniqueness(self, pipe_ids: List[str]):
+        """Ensure no two pipes in the list share the same source and sender."""
+        seen_pairs = {} # (source, sender) -> pipe_id
+        for pid in pipe_ids:
+            resolved = agent_config.resolve_pipe_refs(pid)
+            if not resolved:
+                continue
+            p_cfg = resolved['pipe']
+            pair = (p_cfg.source, p_cfg.sender)
+            if pair in seen_pairs:
+                error_msg = (
+                    f"CRITICAL: Redundant configuration detected in runtime. "
+                    f"Pipe '{pid}' and Pipe '{seen_pairs[pair]}' both use "
+                    f"Source '{pair[0]}' and Sender '{pair[1]}'. "
+                    f"Agent will not start conflicting pipes to prevent data corruption."
+                )
+                self.logger.error(error_msg)
+                raise ValueError(error_msg)
+            seen_pairs[pair] = pid
     
     async def _start_pipe(self, pipe_id: str):
         """Start a single pipe using resolved configuration."""
@@ -243,6 +266,15 @@ class App:
             
         self.logger.info(f"Config change detected: added={added}, removed={removed}")
         
+        # 0. Runtime validation for combined set (existing minus removed plus added)
+        remaining = current_running_ids - removed
+        to_validate = list(remaining | added)
+        try:
+            self._validate_runtime_uniqueness(to_validate)
+        except ValueError as e:
+            self.logger.error(f"Reload aborted: {e}")
+            return
+
         # 1. Stop removed pipes
         for pid in removed:
             try:
