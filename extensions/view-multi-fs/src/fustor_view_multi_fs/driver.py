@@ -10,15 +10,15 @@ class MultiFSViewDriver(ViewDriver):
     schema_name = "multi-fs"
     target_schema = "multi-fs"  # Avoid processing 'fs' events
 
-    def __init__(self, handler_id: str, view_id: str, config: Dict[str, Any]):
-        super().__init__(handler_id, view_id, config)
+    def __init__(self, id: str, view_id: str, config: Dict[str, Any]):
+        super().__init__(id, view_id, config)
         # Extract members from driver_params
         # config passed to handler is typically the view config dict or object
         # In Fustor, Handler keys off config dict.
         # ViewConfig.driver_params is where parameters live.
         self.members: List[str] = config.get("members", [])
         if not self.members:
-            logger.warning(f"MultiFSViewDriver '{handler_id}' initialized with no members!")
+            logger.warning(f"MultiFSViewDriver '{id}' initialized with no members!")
 
     async def process_event(self, event: EventBase) -> bool:
         # Multi-FS view does not consume events directly.

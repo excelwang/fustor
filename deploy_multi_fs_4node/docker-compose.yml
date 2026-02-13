@@ -4,8 +4,8 @@ services:
       context: ..
       dockerfile: deploy_multi_fs_4node/Dockerfile
     ports:
-      - "8101:8101"
-      - "18888:18888"
+      - "8104:8101"
+      - "18891:18888"
     volumes:
       - ./fusion/config/default.yaml:/root/.fustor/fusion-config/default.yaml
     command: ["fustor-fusion", "start"]
