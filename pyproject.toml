@@ -65,7 +65,7 @@ testpaths = [
     "fusion/tests",
     "core/tests",
     "extensions/*/tests"]
-addopts = "-v --tb=short"
+addopts = "-v --tb=short -x --lf"
 asyncio_mode = "strict"
 norecursedirs = ["tests/e2e"]
 filterwarnings = [
