@@ -109,6 +109,12 @@ class ViewDriver(ABC):
         """Periodic cleanup hook for time-sensitive data. Optional."""
         pass
 
+    async def close(self):
+        """
+        Optional: Gracefully closes any open resources.
+        """
+        pass
+
 
 
 class SenderDriver(ABC):
