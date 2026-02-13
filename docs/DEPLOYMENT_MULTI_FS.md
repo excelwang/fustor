@@ -210,9 +210,26 @@ curl -H "X-API-Key: public-read-key" \
 ```bash
 # 获取 "最热" 的分片数据
 curl -H "X-API-Key: public-read-key" \
-     "http://localhost:8101/api/v1/views/global-view/tree?path=/data&best=latest_mtime"
+     "http://localhost:8101/api/v1/views/global-view/tree?path=%2F&best=latest_mtime"
 ```
 响应结构与 5.1 相同，但 `members` 中仅包含胜出的那个视图的数据，并附带 `best_view_selected` 字段说明选择原因。
+
+### 5.3 数据来源识别 (Data Lineage)
+在返回的目录树信息中，每个文件/目录节点都包含以下元数据字段，用于精确识别数据来源：
+*   **last_agent_id**: 最后更新该文件的 Agent ID (即配置文件中设置的 `agent_id`)。
+*   **source_uri**: 该文件在源 Agent 上的完整物理路径。
+
+**示例响应片段**:
+```json
+{
+  "name": "example.txt",
+  "path": "/example.txt",             // <--- 视图中的逻辑路径
+  "last_agent_id": "agent-shard-01",  // <--- 来源 Agent
+  "source_uri": "/mnt/data/shard-01/example.txt", // <--- 物理源路径
+  ...
+}
+```
+通过这两个字段，即便是在聚合视图中，客户端也能清晰地知道每个文件具体来自于哪个节点的哪个路径。
 
 ---
 
