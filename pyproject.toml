@@ -17,8 +17,7 @@ members = [
     "extensions/source-oss",
     "demo",
     "extensions/view-fs",
-    "extensions/view-multi-fs",
-    "management-ui"
+    "extensions/view-multi-fs"
 ]
 
 [tool.uv.sources]
@@ -39,7 +38,6 @@ fustor-source-oss = { workspace = true }
 fustor-demo = { workspace = true }
 fustor-view-fs = { workspace = true }
 fustor-view-multi-fs = { workspace = true }
-fustor-management-ui = { workspace = true }
 
 
 [tool.pytest.ini_options]

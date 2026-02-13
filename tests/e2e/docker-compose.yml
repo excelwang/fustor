@@ -50,7 +50,6 @@ services:
       - fusion-data:/data/fusion
       - ./config/fusion-config:/config/fusion-config
       - ../../fusion/src/fustor_fusion:/usr/local/lib/python3.11/site-packages/fustor_fusion
-      - ../../management-ui/src/fustor_management_ui:/usr/local/lib/python3.11/site-packages/fustor_management_ui
       - ../../core/src/fustor_core:/usr/local/lib/python3.11/site-packages/fustor_core
       - ../../fusion-sdk/src/fustor_fusion_sdk:/usr/local/lib/python3.11/site-packages/fustor_fusion_sdk
       - ../../extensions/view-fs/src/fustor_view_fs:/usr/local/lib/python3.11/site-packages/fustor_view_fs

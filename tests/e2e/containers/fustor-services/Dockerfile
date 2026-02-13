@@ -15,7 +15,6 @@ COPY fusion /app/fusion
 COPY core /app/core
 COPY fusion-sdk /app/fusion-sdk
 COPY extensions /app/extensions
-COPY management-ui /app/management-ui
 
 # Set fake version for setuptools-scm (since .git is not copied)
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
@@ -24,7 +23,6 @@ ENV SETUPTOOLS_SCM_PRETEND_VERSION=0.1.0
 RUN pip install --no-cache-dir \
     /app/core \
     /app/fusion-sdk \
-    /app/management-ui \
     /app/extensions/schema-fs \
     /app/extensions/view-fs \
     /app/extensions/receiver-http \

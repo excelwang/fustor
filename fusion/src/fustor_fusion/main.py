@@ -23,7 +23,6 @@ from fustor_core.event import EventBase
 # --- View Manager Module Imports ---
 from .view_manager.manager import process_event as process_single_event, cleanup_all_expired_suspects
 from .api.views import view_router
-import fustor_management_ui
 
 
 @asynccontextmanager
@@ -176,8 +175,6 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
-    static_dir = fustor_management_ui.get_static_dir()
-
     # 1. Load configuration
     fusion_config.ensure_loaded()
 
@@ -188,31 +185,17 @@ def create_app() -> FastAPI:
     # --- Register Routers ---
     from .api.pipe import pipe_router
     from .api.session import session_router
-    from .api.management import router as management_router
     from .api.views import view_router
 
     api_v1 = APIRouter()
     api_v1.include_router(pipe_router, prefix="/pipe")
     api_v1.include_router(view_router, prefix="/views")
-    api_v1.include_router(management_router)
     
     app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
-
-    # --- Static Files ---
-    from fastapi.staticfiles import StaticFiles
-    app.mount("/management/static", StaticFiles(directory=str(static_dir)), name="static")
 
     @app.get("/", tags=["Root"])
     async def read_web_api_root():
         return {"message": "Welcome to Fusion Storage Engine Ingest API"}
-
-    @app.get("/view", tags=["UI"])
-    async def read_view_ui(request: Request):
-        return FileResponse(str(static_dir / "view.html"))
-
-    @app.get("/management", tags=["UI"])
-    async def read_management_ui(request: Request):
-        return FileResponse(str(static_dir / "management.html"))
 
     return app
 
