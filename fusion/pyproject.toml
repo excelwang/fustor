@@ -40,4 +40,4 @@ fustor-fusion = "fustor_fusion.cli:cli"
 where = [ "src"]
 
 [tool.setuptools.package-data]
-fustor_fusion = ["ui/*.html"]
+fustor_fusion = ["ui/*.html", "ui/*.css", "ui/*.js"]

@@ -256,13 +256,15 @@ async def dispatch_agent_command(agent_id: str, payload: AgentCommandRequest):
 
 class AgentConfigStructuredUpdateRequest(BaseModel):
     """Payload for updating agent config via structured JSON."""
+    sources: Optional[Dict[str, Any]] = None
+    senders: Optional[Dict[str, Any]] = None
     pipes: Dict[str, Any]
     filename: str = "default.yaml"
 
 
 @router.post("/agents/{agent_id}/config/structured")
 async def update_agent_config_structured(agent_id: str, payload: AgentConfigStructuredUpdateRequest):
-    """Update agent config by merging new pipes into the existing configuration."""
+    """Update agent config by merging new sections into the existing configuration."""
     import yaml
     all_sessions = await session_manager.get_all_active_sessions()
 
@@ -279,13 +281,19 @@ async def update_agent_config_structured(agent_id: str, payload: AgentConfigStru
 
     try:
         config_dict = yaml.safe_load(current_si.reported_config)
-        # Update ONLY the pipes section
+        # Update specified sections
+        if payload.sources is not None:
+            config_dict['sources'] = payload.sources
+        if payload.senders is not None:
+            config_dict['senders'] = payload.senders
+        
         config_dict['pipes'] = payload.pipes
+        
         new_yaml = yaml.dump(config_dict, sort_keys=False)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process config: {e}")
 
-    # Delegate to the existing push logic (which already has commands queued etc)
+    # Delegate to the existing push logic
     return await push_agent_config(agent_id, AgentConfigUpdateRequest(config_yaml=new_yaml, filename=payload.filename))
 
 
@@ -419,48 +427,66 @@ async def get_agent_config(agent_id: str, trigger: bool = False, filename: str =
 # Configuration view
 # ---------------------------------------------------------------------------
 
+class FusionConfigStructuredUpdateRequest(BaseModel):
+    """Payload for updating Fusion config via structured JSON."""
+    receivers: Dict[str, Any]
+    views: Dict[str, Any]
+    pipes: Dict[str, Any]
+    filename: str = "default.yaml"
+
+
+@router.post("/config/structured")
+async def update_fusion_config_structured(payload: FusionConfigStructuredUpdateRequest):
+    """Update Fusion config by merging structured sections."""
+    import yaml
+    from fustor_core.common import get_fustor_home_dir
+    
+    # Validation: Check for duplicate pipes (logical redundancy)
+    seen_configs = set()
+    for pid, pcfg in payload.pipes.items():
+        # A pipe is defined by its receiver and its set of views
+        config_sig = (pcfg.get('receiver'), tuple(sorted(pcfg.get('views', []))))
+        if config_sig in seen_configs:
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Redundant Pipe detected: Multiple pipes are configured with the same Receiver and Views. This is forbidden."
+            )
+        seen_configs.add(config_sig)
+
+    config_path = get_fustor_home_dir() / "fusion-config" / payload.filename
+    try:
+        # We start with a clean slate for these three main sections to allow full sync with UI
+        config_dict = {
+            "receivers": payload.receivers,
+            "views": payload.views,
+            "pipes": payload.pipes
+        }
+        new_yaml = yaml.dump(config_dict, sort_keys=False)
+        return await update_fusion_config(FusionConfigUpdateRequest(config_yaml=new_yaml, filename=payload.filename))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process Fusion config: {e}")
+
+
 @router.get("/config")
 async def get_config(filename: str = "default.yaml"):
-    """Return the current Fusion configuration (read-only view)."""
-    # 1. Provide metadata-based view (existing)
-    pipes = {}
-    for pid, p in fusion_config.get_all_pipes().items():
-        pipes[pid] = {
-            "receiver": p.receiver,
-            "views": p.views,
-            "disabled": getattr(p, 'disabled', False),
-            "session_timeout_seconds": p.session_timeout_seconds,
-            "audit_interval_sec": p.audit_interval_sec,
-            "sentinel_interval_sec": p.sentinel_interval_sec,
-        }
-
-    receivers = {}
-    for rid, r in fusion_config.get_all_receivers().items():
-        receivers[rid] = {
-            "driver": r.driver,
-            "port": r.port,
-            "disabled": getattr(r, 'disabled', False),
-        }
-
-    views = {}
-    for vid, v in fusion_config.get_all_views().items():
-        views[vid] = {
-            "driver": v.driver,
-            "disabled": getattr(v, 'disabled', False),
-            "driver_params": v.driver_params,
-        }
-
-    # 2. Also provide raw YAML for editing if requested
-    raw_yaml = None
+    """Return the current Fusion configuration."""
     from fustor_core.common import get_fustor_home_dir
+    import yaml
+    
     config_path = get_fustor_home_dir() / "fusion-config" / filename
+    raw_yaml = None
+    config_dict = {}
+    
     if config_path.exists():
         raw_yaml = config_path.read_text(encoding="utf-8")
+        try:
+            config_dict = yaml.safe_load(raw_yaml) or {}
+        except:
+            pass
 
     return {
-        "pipes": pipes,
-        "receivers": receivers,
-        "views": views,
+        "status": "ok",
+        "config_dict": config_dict,
         "raw_yaml": raw_yaml,
         "filename": filename
     }

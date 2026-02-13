@@ -186,6 +186,11 @@ def create_app() -> FastAPI:
     
     app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
 
+    # --- Static Files ---
+    from fastapi.staticfiles import StaticFiles
+    static_dir = os.path.join(ui_dir, "ui")
+    app.mount("/management/static", StaticFiles(directory=static_dir), name="static")
+
     @app.get("/", tags=["Root"])
     async def read_web_api_root():
         return {"message": "Welcome to Fusion Storage Engine Ingest API"}

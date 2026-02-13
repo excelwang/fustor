@@ -5,6 +5,7 @@ import shutil
 from unittest.mock import MagicMock, AsyncMock, patch
 from fustor_agent.app import App
 from fustor_agent.config.unified import agent_config
+import socket
 
 @pytest.fixture
 def mock_config_dir(tmp_path):
@@ -45,8 +46,26 @@ async def test_app_initialization_no_agent_id(tmp_path):
     
     with patch("fustor_agent.app.get_fustor_home_dir", return_value=tmp_path):
         with patch.object(agent_config, "dir", config_dir):
-            with pytest.raises(ValueError, match="Agent ID is not configured"):
-                App()
+            with patch("socket.gethostname", return_value="mock-hostname"):
+                # Ensure no agent_id is set in the mocked config initially
+                mock_agent_config_loader = MagicMock(spec=agent_config.__class__)
+                mock_agent_config_loader.get_all_sources.return_value = {}
+                mock_agent_config_loader.get_all_senders.return_value = {}
+                mock_agent_config_loader.get_all_pipes.return_value = {}
+                mock_agent_config_loader.agent_id = None # Explicitly set to None
+                mock_agent_config_loader.reload.return_value = None
+                mock_agent_config_loader.fs_scan_workers = 4 # Default value needed by pipe_instance_service init
+
+                with patch("fustor_agent.app.agent_config", new=mock_agent_config_loader):
+                    # App should initialize without error and default agent_id
+                    app = App()
+                    # The app defaults to "unknown-agent" if hostname fails or is empty,
+                    # and no agent_id is specified in config.
+                    assert app.agent_id == "unknown-agent" 
+                    assert agent_config.agent_id == "unknown-agent"
+                    
+                    # Ensure app's internal config is also using the defaulted ID
+                    assert app.config_loader.agent_id == "unknown-agent"
 
 @pytest.mark.asyncio
 async def test_app_resolve_target_pipes(mock_config_dir, tmp_path):
@@ -80,6 +99,12 @@ async def test_app_startup_shutdown(mock_config_dir, tmp_path):
             app.event_bus_service.get_or_create_bus_for_subscriber.return_value = (mock_bus, 0)
             
             mock_pipe = AsyncMock()
+            mock_pipe.id = "pipe1" # Mock attribute access
+            mock_pipe.state = MagicMock() # Mock state
+            mock_pipe.info = "" # Mock info
+            mock_pipe.task_id = "test-agent:pipe1" # Mock task_id
+            mock_pipe.bus = MagicMock(id="mock-bus-id") # Mock bus attribute
+
             with patch("fustor_agent.app.SourceHandlerAdapter"), patch("fustor_agent.app.SenderHandlerAdapter"):
                 with patch("fustor_agent.runtime.agent_pipe.AgentPipe", return_value=mock_pipe):
                     await app.startup()
@@ -104,7 +129,18 @@ async def test_app_reload_config(mock_config_dir, tmp_path):
             app.event_bus_service.get_or_create_bus_for_subscriber.return_value = (mock_bus, 0)
             
             mock_pipe1 = AsyncMock()
+            mock_pipe1.id = "pipe1"
+            mock_pipe1.state = MagicMock()
+            mock_pipe1.info = ""
+            mock_pipe1.task_id = "test-agent:pipe1"
+            mock_pipe1.bus = MagicMock(id="mock-bus-id-1")
+
             mock_pipe2 = AsyncMock()
+            mock_pipe2.id = "pipe2"
+            mock_pipe2.state = MagicMock()
+            mock_pipe2.info = ""
+            mock_pipe2.task_id = "test-agent:pipe2"
+            mock_pipe2.bus = MagicMock(id="mock-bus-id-2")
             
             def pipe_side_effect(pipe_id, **kwargs):
                 if pipe_id == "pipe1": return mock_pipe1

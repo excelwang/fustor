@@ -23,6 +23,7 @@ Example:
 """
 import yaml
 import logging
+import socket
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Set
 from pydantic import BaseModel, field_validator, Field
@@ -117,6 +118,10 @@ class AgentConfigLoader:
         for yaml_file in sorted(self.dir.glob("*.yaml")):
             self._load_file(yaml_file)
         
+        if self.agent_id is None:
+             self.agent_id = socket.gethostname()
+             logger.info(f"Agent ID not configured. Defaulting to hostname: {self.agent_id}")
+
         self._loaded = True
         logger.info(
             f"Loaded config: {len(self._sources)} sources, "
@@ -144,6 +149,11 @@ class AgentConfigLoader:
                 if self.agent_id and self.agent_id != aid:
                     logger.warning(f"Agent ID redefined in {path}: was '{self.agent_id}', now '{aid}'")
                 self.agent_id = aid
+            
+            # Default to hostname if not set after loading all (logic moved to load_all end, 
+            # but to ensure validator sees it, we can set it if still None? 
+            # No, load_all calls _load_file multiple times. 
+            # Better to set default in load_all AFTER loop.)
             
 
 

@@ -54,14 +54,12 @@ class App:
         config_id = agent_config.agent_id
         
         if config_id:
-             self.logger.info(f"Using Agent ID from config file: {config_id}")
+             self.logger.info(f"Using Agent ID: {config_id}")
              self.agent_id = config_id
         else:
-             # Strict requirement: Agent ID must be in config
-             raise ValueError(
-                 "Agent ID is not configured. "
-                 "Please set 'agent_id' in your agent-config (e.g., default.yaml)."
-             )
+             # Should not happen as unified.py sets default
+             self.agent_id = "unknown-agent"
+             self.logger.warning("Agent ID is unknown (not in config or hostname failed).")
         
         # Determine which pipes to start based on config_list
         self._target_pipe_ids = self._resolve_target_pipes(config_list)
