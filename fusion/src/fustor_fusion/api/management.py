@@ -10,6 +10,7 @@ Provides:
 """
 import os
 import signal
+import hmac
 import time
 import logging
 from typing import Dict, Any, Optional
@@ -44,7 +45,7 @@ async def require_management_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="X-Management-Key header is required",
         )
-    if x_management_key != configured_key:
+    if not hmac.compare_digest(x_management_key, configured_key):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid management key",
@@ -117,7 +118,11 @@ async def dashboard():
         view_sessions = []
         for sid, si in sess_map.items():
             agent_id = None
-            if si.task_id and ":" in si.task_id:
+            agent_status = getattr(si, "agent_status", None)
+            
+            if agent_status and agent_status.get("agent_id"):
+                agent_id = agent_status["agent_id"]
+            elif si.task_id and ":" in si.task_id:
                 agent_id = si.task_id.split(":")[0]
             elif si.task_id:
                 agent_id = si.task_id

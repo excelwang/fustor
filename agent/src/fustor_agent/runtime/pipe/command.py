@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import signal
+import shutil
 from typing import Dict, List, Any, Optional, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -131,9 +132,6 @@ class PipeCommandMixin:
         Writes the received YAML content to the agent's config directory,
         creates a backup of the existing file, then triggers SIGHUP reload.
         """
-        import yaml
-        from fustor_core.common import get_fustor_home_dir
-
         config_yaml = cmd.get("config_yaml")
         filename = cmd.get("filename", "default.yaml")
 
@@ -141,11 +139,25 @@ class PipeCommandMixin:
             logger.warning(f"Pipe {self.id}: update_config command missing 'config_yaml'")
             return
 
+        import fustor_agent.config.validator as validator
+        from fustor_core.common import get_fustor_home_dir
+        import yaml
+
         # Validate YAML syntax before writing
         try:
-            yaml.safe_load(config_yaml)
+            config_dict = yaml.safe_load(config_yaml)
+            
+            # Semantic validation
+            success, errors = validator.ConfigValidator().validate_config(config_dict)
+            if not success:
+                logger.error(f"Pipe {self.id}: Received semantically invalid config: {errors}")
+                return
+                
         except yaml.YAMLError as e:
-            logger.error(f"Pipe {self.id}: Received invalid YAML: {e}")
+            logger.error(f"Pipe {self.id}: Received invalid YAML syntax: {e}")
+            return
+        except Exception as e:
+            logger.error(f"Pipe {self.id}: Unexpected error during config validation: {e}")
             return
 
         # Sanitize filename to prevent path traversal
@@ -160,7 +172,6 @@ class PipeCommandMixin:
         try:
             # Backup existing file
             if target_path.exists():
-                import shutil
                 shutil.copy2(target_path, backup_path)
                 logger.info(f"Pipe {self.id}: Backed up {target_path} -> {backup_path}")
 
@@ -177,7 +188,6 @@ class PipeCommandMixin:
             # Restore backup on failure
             if backup_path.exists():
                 try:
-                    import shutil
                     shutil.copy2(backup_path, target_path)
                     logger.info(f"Pipe {self.id}: Restored backup after write failure")
                 except Exception as restore_err:

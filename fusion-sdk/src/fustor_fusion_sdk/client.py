@@ -142,13 +142,15 @@ class FusionClient:
             logger.error(f"An error occurred during event push: {e}")
             return False
 
-    async def send_heartbeat(self, session_id: str, can_realtime: bool = False) -> Optional[Dict[str, Any]]:
+    async def send_heartbeat(self, session_id: str, can_realtime: bool = False, agent_status: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
         """
         Sends a heartbeat to the Fusion service to keep the session alive.
         Returns the response dict if successful, None otherwise.
         """
         try:
             params = {"can_realtime": can_realtime}
+            if agent_status:
+                params["agent_status"] = agent_status
             response = await self.client.post(f"{self._session_path}/{session_id}/heartbeat", json=params)
             response.raise_for_status()
             return response.json()
