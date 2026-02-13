@@ -36,6 +36,8 @@ from pydantic import ValidationError
 if TYPE_CHECKING:
     from fustor_core.pipe.context import PipeContext
 
+from ..core.session_manager import session_manager
+
 logger = logging.getLogger("fustor_fusion.pipe")
 
 
@@ -330,7 +332,6 @@ class FusionPipe(Pipe):
         self.statistics["sessions_created"] += 1
         
         # Build lineage cache for this session
-        from ..core.session_manager import session_manager
         session_info = await session_manager.get_session_info(self.view_id, session_id)
         if session_info:
             lineage = {}
@@ -364,7 +365,6 @@ class FusionPipe(Pipe):
         # Clean lineage cache
         self._session_lineage_cache.pop(session_id, None)
         
-        from ..core.session_manager import session_manager
         from ..view_state_manager import view_state_manager
 
         if self._cached_leader_session == session_id:
@@ -470,8 +470,10 @@ class FusionPipe(Pipe):
         if lineage_meta:
             for ev in processed_events:
                 if ev.metadata is None:
-                    ev.metadata = {}
-                ev.metadata.update(lineage_meta)
+                    # Efficiently inject cached lineage info
+                    ev.metadata = lineage_meta.copy()
+                else:
+                    ev.metadata.update(lineage_meta)
 
         # Queue for processing
         get_metrics().counter("fustor.fusion.events_received", len(processed_events), {"pipe": self.id, "source": source_type})
@@ -548,7 +550,6 @@ class FusionPipe(Pipe):
     
     async def get_dto(self) -> Dict[str, Any]:
         """Get pipestatus as a dictionary."""
-        from ..core.session_manager import session_manager
         from ..view_state_manager import view_state_manager
         
         sessions = await session_manager.get_view_sessions(self.view_id)
@@ -591,7 +592,6 @@ class FusionPipe(Pipe):
     
     async def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get information about a specific session."""
-        from ..core.session_manager import session_manager
         si = await session_manager.get_session_info(self.view_id, session_id)
         if si:
             # Convert to dict for DTO
@@ -607,7 +607,6 @@ class FusionPipe(Pipe):
     
     async def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
         """Get all active sessions."""
-        from ..core.session_manager import session_manager
         si_map = await session_manager.get_view_sessions(self.view_id)
         return {k: {"task_id": v.task_id} for k, v in si_map.items()}
         

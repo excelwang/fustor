@@ -33,6 +33,7 @@ class DirectoryNode:
                 'modified_time': self.modified_time,
                 'created_time': self.created_time,
                 'integrity_suspect': self.integrity_suspect,
+                'audit_skipped': self.audit_skipped,
                 'last_agent_id': self.last_agent_id,
                 'source_uri': self.source_uri
             })
