@@ -169,6 +169,7 @@ class TreeManager:
             if hasattr(self.state, 'blind_spot_additions'):
                 self.state.blind_spot_additions.discard(path)
 
+            parent = self.state.directory_path_map.get(parent_path)
             if parent:
                 parent.children.pop(name, None)
 

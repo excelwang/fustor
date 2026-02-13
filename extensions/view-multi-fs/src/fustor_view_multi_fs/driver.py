@@ -1,4 +1,4 @@
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import asyncio
 import logging
 from fustor_core.drivers import ViewDriver
@@ -140,3 +140,56 @@ class MultiFSViewDriver(ViewDriver):
         # kwargs might contain path, recursive, etc.
         path = kwargs.get("path", "/")
         return await self.get_directory_tree(path, **{k:v for k,v in kwargs.items() if k != "path"})
+
+    async def trigger_on_demand_scan(self, path: str, recursive: bool = True) -> Tuple[bool, Optional[str]]:
+        """
+        Broadcast on-demand scan command to ALL member views.
+        Each member FSViewDriver will further broadcast to its active sessions/agents.
+        
+        Returns:
+            (overall_success, composite_result_summary)
+        """
+        if not self.members:
+            logger.warning(f"MultiFSViewDriver '{self.id}' has no members. Cannot broadcast on-demand scan.")
+            return False, None
+
+        results = {}
+
+        async def broadcast_to_member(vid: str):
+            try:
+                driver = await self._get_member_driver(vid)
+                if not driver:
+                    return vid, False, None, "View not found or driver not ready"
+                
+                if not hasattr(driver, 'trigger_on_demand_scan'):
+                    return vid, False, None, "Driver does not support on-demand scan"
+                
+                success, job_id = await driver.trigger_on_demand_scan(path, recursive=recursive)
+                return vid, success, job_id, None
+            except Exception as e:
+                logger.error(f"Error broadcasting on-demand scan to member '{vid}': {e}")
+                return vid, False, None, str(e)
+
+        tasks = [broadcast_to_member(vid) for vid in self.members]
+        task_results = await asyncio.gather(*tasks)
+
+        any_success = False
+        member_jobs = {}
+        for vid, success, job_id, error in task_results:
+            member_jobs[vid] = {
+                "success": success,
+                "job_id": job_id,
+                "error": error
+            }
+            if success:
+                any_success = True
+
+        logger.info(
+            f"On-demand scan broadcast complete for path '{path}': "
+            f"{sum(1 for r in task_results if r[1])}/{len(self.members)} members accepted"
+        )
+
+        # Return a summary job_id that encodes all member jobs
+        import json
+        composite_id = json.dumps(member_jobs, default=str) if any_success else None
+        return any_success, composite_id

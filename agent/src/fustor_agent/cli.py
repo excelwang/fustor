@@ -287,8 +287,7 @@ def reload():
     try:
         with open(PID_FILE, 'r') as f:
             pid = int(f.read().strip())
-        import os
-        import signal
+        
         os.kill(pid, signal.SIGHUP)
         click.echo(click.style("✓ Reload signal sent (SIGHUP)", fg="green"))
     except ProcessLookupError:

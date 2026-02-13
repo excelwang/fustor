@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir \
     /app/extensions/schema-fs \
     /app/extensions/view-fs \
     /app/extensions/receiver-http \
+    /app/extensions/view-multi-fs \
     /app/fusion
 
 

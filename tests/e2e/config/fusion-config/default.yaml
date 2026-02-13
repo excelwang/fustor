@@ -33,3 +33,8 @@ views:
     driver: fs
     driver_params:
       root_dir: /data/fusion/archive_fanout
+  global-multi-fs:
+    driver: multi-fs
+    api_keys:
+    - test-query-key-456
+    driver_params: {}

@@ -4,6 +4,8 @@
 
 logging: "${FUSTOR_LOG_LEVEL}"
 
+agent_id: "${AGENT_ID}"
+
 
 sources:
   shared-fs:

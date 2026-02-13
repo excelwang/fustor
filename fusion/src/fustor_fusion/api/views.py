@@ -2,6 +2,7 @@
 """
 Data Views API Router Generator.
 """
+
 import logging
 import time
 from typing import Callable, Any, Optional, Dict
@@ -272,6 +273,7 @@ def setup_view_routers():
     )
 
 
+
 async def list_view_jobs(view_id: str, authorized_view_id: str = Depends(get_view_id_from_api_key)):
     """List agent jobs for a specific view."""
     if authorized_view_id != view_id:
@@ -354,6 +356,7 @@ async def list_view_sessions(view_id: str, authorized_view_id: str = Depends(get
         "active_sessions": session_list,
         "count": len(session_list)
     }
+
 
 # Initial call to attempt registration (will be called again in lifespan for certainty)
 setup_view_routers()

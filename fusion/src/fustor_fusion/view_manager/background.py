@@ -6,7 +6,6 @@ import asyncio
 import logging
 from typing import Dict, Any, Optional
 from .manager import get_cached_view_manager
-from ..in_memory_queue import memory_event_queue
 from datetime import datetime
 
 

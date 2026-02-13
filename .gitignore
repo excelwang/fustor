@@ -35,3 +35,4 @@ deploy_fs_3node_v2
 deploy_multi_fs_4node/
 .gemini/
 gha-creds-*.json
+fustor-remote/

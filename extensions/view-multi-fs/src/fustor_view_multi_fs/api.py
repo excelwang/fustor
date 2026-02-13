@@ -2,6 +2,7 @@ from fastapi import APIRouter, Query, Depends, HTTPException, status
 from fastapi.responses import ORJSONResponse
 from typing import Dict, Any, Optional, List
 import logging
+import json
 
 from .driver import MultiFSViewDriver
 
@@ -64,9 +65,16 @@ def _find_best_view(stats_agg: Dict[str, Any], strategy: str) -> Optional[Dict[s
 async def _logic_get_stats(
     path: str,
     best: Optional[str],
+    on_demand_scan: bool,
     view_id: str,
     driver: MultiFSViewDriver
 ):
+    job_id = None
+    if on_demand_scan:
+        triggered, job_id = await driver.trigger_on_demand_scan(path, recursive=True)
+        if triggered:
+            logger.info(f"Triggered on-demand scan (id={job_id}) via stats for {path} on view {view_id}")
+
     stats_agg = await driver.get_subtree_stats_agg(path)
     
     result = stats_agg.copy()
@@ -74,6 +82,16 @@ async def _logic_get_stats(
         best_view = _find_best_view(stats_agg, best)
         if best_view:
             result["best"] = best_view
+            
+    if job_id:
+        # Parse composite_id (JSON string with per-member details)
+        member_jobs = {}
+        try:
+            member_jobs = json.loads(job_id)
+        except (json.JSONDecodeError, TypeError):
+            # If it's not a JSON string, treat it as a simple job_id
+            member_jobs = {"_overall": job_id}
+        result["job_id"] = member_jobs
             
     return ORJSONResponse(content=result)
 
@@ -83,9 +101,16 @@ async def _logic_get_tree(
     max_depth: Optional[int],
     only_path: bool,
     best: Optional[str],
+    on_demand_scan: bool,
     view_id: str,
     driver: MultiFSViewDriver
 ):
+    job_id = None
+    if on_demand_scan:
+        triggered, job_id = await driver.trigger_on_demand_scan(path, recursive=recursive)
+        if triggered:
+            logger.info(f"Triggered on-demand scan (id={job_id}) via tree for {path} on view {view_id}")
+
     target_view_id = None
     best_info = None
 
@@ -115,6 +140,12 @@ async def _logic_get_tree(
     if best_info:
         result["best_view_selected"] = best_info
 
+    if job_id:
+        try:
+            result["job_id"] = json.loads(job_id)
+        except (json.JSONDecodeError, TypeError):
+            result["job_id"] = job_id
+
     return ORJSONResponse(content=result)
 
 def create_multi_fs_router(
@@ -134,10 +165,11 @@ def create_multi_fs_router(
     async def get_stats_wrapper(
         path: str = Query("/", description="查询路径"),
         best: Optional[str] = Query(None, description="自动推荐策略: file_count / total_size / latest_mtime"),
+        on_demand_scan: bool = Query(False, description="触发Agent端按需扫描（广播至所有成员）"),
         view_id: str = Depends(get_view_id_dep),
         driver = Depends(get_driver_dependency)
     ):
-        return await _logic_get_stats(path, best, view_id, driver)
+        return await _logic_get_stats(path, best, on_demand_scan, view_id, driver)
 
     @router.get("/tree", summary="获取聚合目录树")
     async def get_tree_wrapper(
@@ -146,9 +178,11 @@ def create_multi_fs_router(
         max_depth: Optional[int] = Query(None, description="最大深度"),
         only_path: bool = Query(False, description="仅返回路径结构"),
         best: Optional[str] = Query(None, description="指定策略仅返回最优成员树"),
+        on_demand_scan: bool = Query(False, description="触发Agent端按需扫描（广播至所有成员）"),
         view_id: str = Depends(get_view_id_dep),
         driver = Depends(get_driver_dependency)
     ):
-        return await _logic_get_tree(path, recursive, max_depth, only_path, best, view_id, driver)
+        return await _logic_get_tree(path, recursive, max_depth, only_path, best, on_demand_scan, view_id, driver)
         
     return router
+
