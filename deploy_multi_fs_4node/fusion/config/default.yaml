@@ -1,0 +1,37 @@
+receivers:
+  http-receiver:
+    driver: http
+    port: 18888
+    api_keys:
+      - key: "key-agent-1"
+        pipe_id: "pipe-a"
+      - key: "key-agent-2"
+        pipe_id: "pipe-a"
+      - key: "key-agent-3"
+        pipe_id: "pipe-b"
+
+views:
+  view-a:
+    driver: fs
+    api_keys: ["admin-key"]
+  
+  view-b:
+    driver: fs
+    api_keys: ["admin-key"]
+
+  multi-view:
+    driver: multi-fs
+    api_keys: ["public-key"]
+    driver_params:
+      members:
+        - view-a
+        - view-b
+
+pipes:
+  pipe-a:
+    receiver: http-receiver
+    views: [view-a]
+  
+  pipe-b:
+    receiver: http-receiver
+    views: [view-b]
