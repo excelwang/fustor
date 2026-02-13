@@ -233,7 +233,95 @@ curl -H "X-API-Key: public-read-key" \
 
 ---
 
-## 6. 常见问题
+## 6. 动态扩容 (Dynamic Scaling)
+
+本节介绍如何在 **不停止服务** 的情况下，向现有 Agent 添加新的 NFS 挂载源，并使其出现在 Multi-FS 聚合视图中。
+
+由于 Fusion 的 `API Key` 与 `Pipe` 是 1:1 绑定的，新增 Source 需要同时更新 Fusion 和 Agent 的配置。
+
+### 步骤 1: 修改 Fusion 配置 (fusion.yaml)
+
+在 Fusion 侧做好接收准备：
+1.  **定义新 View**: 承载新 NFS 的数据。
+2.  **更新 Multi-FS**: 将新 View 加入聚合列表。
+3.  **定义新 Pipe**: 路由数据到新 View。
+4.  **分配新 Key**: 在 Receiver 中为新 Pipe 分配专用 Key。
+
+```yaml
+views:
+  # ... 原有 views ...
+  view-new-nfs:           # [新增] 1. 定义新 View
+    driver: fs
+  
+  global-view:
+    driver: multi-fs
+    driver_params:
+      members: [..., view-new-nfs] # [修改] 2. 加入聚合列表
+
+pipes:
+  # ... 原有 pipes ...
+  pipe-new-nfs:           # [新增] 3. 定义新 Pipe
+    receiver: http-main
+    views: [view-new-nfs]
+
+receivers:
+  http-main:
+    driver: http
+    api_keys:
+      # ... 原有 keys ...
+      - key: "new-nfs-key"      # [新增] 4. 分配新 Key
+        pipe_id: "pipe-new-nfs" #       映射到新 Pipe
+```
+
+### 步骤 2: 热重载 Fusion
+
+使用 CLI 命令让 Fusion 加载新配置 (View 和 Pipe 支持热添加)：
+
+```bash
+# 安全重载配置 (不会停止服务)
+fustor-fusion reload
+```
+
+### 步骤 3: 修改 Agent 配置 (agent.yaml)
+
+在 Agent 侧添加采集任务。注意我们需要定义一个 **新 Sender** 来使用上面分配的新 Key。
+
+```yaml
+sources:
+  # ... 原有 sources ...
+  source-new-nfs:         # [新增] 1. 定义新 Source
+    driver: fs
+    uri: "/mnt/new-nfs-path"
+
+senders:
+  # ... 原有 sender ...
+  sender-for-new-nfs:     # [新增] 2. 定义新 Sender (为了用新 Key)
+    driver: fusion
+    uri: "http://fusion-ip:18101"
+    credential:
+      key: "new-nfs-key"  # <--- 对应 Fusion 侧的新 Key
+
+pipes:
+  # ... 原有 pipes ...
+  pipe-new-nfs:           # [新增] 3. 定义新 Pipe
+    source: source-new-nfs
+    sender: sender-for-new-nfs
+```
+
+### 步骤 4: 热重载 Agent
+
+让 Agent 启动新的采集管道：
+
+```bash
+# 安全重载配置 (不会停止服务)
+fustor-agent reload
+```
+
+完成上述步骤后，新挂载点的数据将自动同步，并可通过 Multi-FS View API 查询到。
+
+---
+
+## 7. 常见问题
 
 **Q: Agent 启动报错 "Agent ID is not configured"?**
 A: 请检查 Agent 的 YAML 配置文件中是否包含 `agent_id: "..."` 字段。这是 v0.9.0 引入的强制要求。

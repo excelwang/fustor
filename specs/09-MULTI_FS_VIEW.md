@@ -24,6 +24,14 @@
 | 每个 NFS 写入速率 | ~1000 events/s |
 | 总内存占用（所有 View） | ~50GB |
 
+### 1.3 关键约束: 来源识别
+
+在多 Agent 汇聚到同一 View (N:1) 的场景下，Fusion 必须能够区分每个文件/事件的具体来源 Agent。
+
+- **强制要求**: 每个 Agent **必须**在配置文件中显式设置唯一的 `agent_id`。
+- **机制**: Fusion 会话建立时会传输 `agent_id`，并将其作为元数据 (`last_agent_id`) 附加到文件节点上。
+- **目的**: 即使多个 Agent 向同一个 View 推送数据（共享 View ID），系统也能通过 `agent_id` 精确区分数据来源，防止数据混淆并支持血缘追踪。
+
 ---
 
 ## 2. 架构决策
@@ -115,10 +123,12 @@ pipes:
 
 ### 3.2 Agent 配置 (每台 NFS 服务器)
 
-每个 Agent 的配置结构不变，仅 `uri` 和 `credential.key` 不同：
+每个 Agent 的配置结构不变，但即便是不同服务器，也**必须配置唯一的 `agent_id`**：
 
 ```yaml
 # Agent-A (部署在 NFS-A 服务器上)
+agent_id: "agent-nfs-a"  # <--- 必须配置且唯一
+
 sources:
   nfs-a-src:
     driver: fs
