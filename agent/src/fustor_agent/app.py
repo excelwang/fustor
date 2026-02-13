@@ -10,7 +10,7 @@ import shutil
 from typing import Dict, Any, Optional, List
 
 from fustor_core.common import get_fustor_home_dir
-from fustor_agent_sdk.utils import get_or_generate_agent_id
+# ID generation is removed per config-only requirement
 
 from .config.unified import agent_config, AgentPipeConfig
 
