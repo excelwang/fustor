@@ -124,6 +124,7 @@ class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
         self._last_heartbeat_at = 0.0  # Time of last successful role update (monotonic)
         self.is_realtime_ready = False  # Track if realtime is officially active (post-prescan)
         self._initial_snapshot_done = False # Track if initial snapshot complete
+        self.start_time = asyncio.get_event_loop().time()
 
     def map_batch(self, events: List[Any]) -> List[Any]:
         """Map events using the configured field mapper."""
@@ -131,17 +132,22 @@ class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
 
     def _build_agent_status(self) -> Dict[str, Any]:
         """Build agent status dict for heartbeat reporting to management plane."""
+        from fustor_agent import __version__
         agent_id = None
         if self.task_id and ":" in self.task_id:
             agent_id = self.task_id.split(":")[0]
 
+        uptime = round(asyncio.get_event_loop().time() - self.start_time, 1)
+
         return {
             "agent_id": agent_id,
+            "version": __version__,
             "pipe_id": self.id,
             "state": str(self.state),
             "role": self.current_role,
             "events_pushed": self.statistics.get("events_pushed", 0),
             "is_realtime_ready": self.is_realtime_ready,
+            "uptime_seconds": uptime,
         }
 
     def _set_state(self, new_state: PipeState, info: Optional[str] = None):

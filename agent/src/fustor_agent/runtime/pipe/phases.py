@@ -42,6 +42,8 @@ async def run_snapshot_sync(pipe: "AgentPipe") -> None:
                     batch = []
                 else:
                     raise Exception("Snapshot batch send failed")
+            
+            await asyncio.sleep(0.01) # Yield to other tasks
                 
         # Send remaining events and signal completion
         if pipe.has_active_session():
@@ -117,6 +119,8 @@ async def run_bus_message_sync(pipe: "AgentPipe") -> None:
                 logger.warning(f"Pipe {pipe.id}: Failed to send bus events")
                 await asyncio.sleep(1.0) # Wait before retry
 
+            await asyncio.sleep(0.1) # Yield to other tasks
+
                 
     except asyncio.CancelledError:
         logger.debug(f"Bus message sync phase for {pipe.id} cancelled")
@@ -165,6 +169,8 @@ async def run_audit_sync(pipe: "AgentPipe") -> None:
                 )
                 get_metrics().counter("fustor.agent.events_pushed", len(batch), {"pipe": pipe.id, "phase": "audit"})
                 batch = []
+            
+            await asyncio.sleep(0.01) # Yield to other tasks
         
         if batch:
             batch = pipe.map_batch(batch)

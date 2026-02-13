@@ -159,7 +159,7 @@ class HTTPSender(Sender):
             self.logger.error(f"[{source_type}] Failed to send {len(events)} events: {e}")
             return {"success": False, "error": "Push failed"}
     
-    async def heartbeat(self, can_realtime: bool = False) -> Dict[str, Any]:
+    async def heartbeat(self, can_realtime: bool = False, **kwargs) -> Dict[str, Any]:
         """
         Send a heartbeat to maintain session.
         
@@ -171,7 +171,7 @@ class HTTPSender(Sender):
             return {"status": "error", "message": "Session ID not set"}
         
         try:
-            result = await self.client.send_heartbeat(self.session_id, can_realtime=can_realtime)
+            result = await self.client.send_heartbeat(self.session_id, can_realtime=can_realtime, **kwargs)
             
             if result and result.get("status") == "ok":
                 self.logger.debug("Heartbeat sent successfully.")

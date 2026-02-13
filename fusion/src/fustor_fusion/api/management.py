@@ -64,16 +64,21 @@ router = APIRouter(
 
 class AgentCommandRequest(BaseModel):
     """Payload for dispatching a command to an agent."""
-    type: str  # "reload_config", "stop_pipe", "scan", "report_status"
+    type: str  # "reload_config", "stop_pipe", "report_status"
     pipe_id: Optional[str] = None
-    path: Optional[str] = None
-    recursive: Optional[bool] = True
 
 
 class AgentConfigUpdateRequest(BaseModel):
     """Payload for pushing configuration to an agent."""
     config_yaml: str  # Raw YAML content to write to agent's config file
     filename: str = "default.yaml"  # Target config file name
+
+
+class AgentUpgradeRequest(BaseModel):
+    """Payload for triggering an agent self-upgrade."""
+    version: str
+    index_url: Optional[str] = None
+    upgrade_timeout_sec: int = 60
 
 
 # ---------------------------------------------------------------------------
@@ -216,9 +221,6 @@ async def dispatch_agent_command(agent_id: str, payload: AgentCommandRequest):
     command_dict: Dict[str, Any] = {"type": payload.type}
     if payload.pipe_id:
         command_dict["pipe_id"] = payload.pipe_id
-    if payload.path:
-        command_dict["path"] = payload.path
-        command_dict["recursive"] = payload.recursive
 
     queued_count = 0
     for view_id, session_id, _ in matched:
@@ -280,6 +282,51 @@ async def push_agent_config(agent_id: str, payload: AgentConfigUpdateRequest):
         "status": "ok",
         "agent_id": agent_id,
         "filename": payload.filename,
+        "sessions_queued": queued_count,
+    }
+
+
+@router.post("/agents/{agent_id}/upgrade")
+async def upgrade_agent(agent_id: str, payload: AgentUpgradeRequest):
+    """
+    Trigger a self-upgrade on a specific agent.
+
+    The command is delivered via heartbeat. The agent will run pip install
+    and then restart itself using os.execv.
+    """
+    all_sessions = await session_manager.get_all_active_sessions()
+
+    matched = []
+    for view_id, sess_map in all_sessions.items():
+        for sid, si in sess_map.items():
+            if si.task_id:
+                parts = si.task_id.split(":")
+                if parts[0] == agent_id:
+                    matched.append((view_id, sid, si))
+
+    if not matched:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active sessions found for agent '{agent_id}'",
+        )
+
+    command_dict = {
+        "type": "upgrade_agent",
+        "version": payload.version,
+        "index_url": payload.index_url,
+        "upgrade_timeout_sec": payload.upgrade_timeout_sec,
+    }
+
+    queued_count = 0
+    for view_id, session_id, _ in matched:
+        success = await session_manager.queue_command(view_id, session_id, command_dict)
+        if success:
+            queued_count += 1
+
+    return {
+        "status": "ok",
+        "agent_id": agent_id,
+        "target_version": payload.version,
         "sessions_queued": queued_count,
     }
 

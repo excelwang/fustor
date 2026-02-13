@@ -30,6 +30,8 @@ class PipeCommandMixin:
                     await self._handle_command_stop_pipe(cmd)
                 elif cmd_type == "update_config":
                     self._handle_command_update_config(cmd)
+                elif cmd_type == "upgrade_agent":
+                    self._handle_command_upgrade(cmd)
                 else:
                     logger.warning(f"Pipe {self.id}: Unknown command type '{cmd_type}'")
             except Exception as e:
@@ -182,3 +184,70 @@ class PipeCommandMixin:
                     logger.info(f"Pipe {self.id}: Restored backup after write failure")
                 except Exception as restore_err:
                     logger.error(f"Pipe {self.id}: Failed to restore backup: {restore_err}")
+
+    def _handle_command_upgrade(self: "AgentPipe", cmd: Dict[str, Any]) -> None:
+        """
+        Handle 'upgrade_agent' command.
+        
+        Performs self-upgrade using pip install and os.execv restart.
+        """
+        import sys
+        import subprocess
+        from fustor_agent import __version__
+
+        target_version = cmd.get("version")
+        if not target_version:
+            logger.warning(f"Pipe {self.id}: upgrade_agent command missing 'version'")
+            return
+
+        if target_version == __version__:
+            logger.info(f"Pipe {self.id}: Already at version {__version__}, skipping upgrade")
+            return
+
+        logger.info(f"Pipe {self.id}: Initiating upgrade from {__version__} to {target_version}")
+
+        # Step 1: Install new version
+        # We use [sys.executable, "-m", "pip"] to ensure we are in the same venv
+        pip_cmd = [sys.executable, "-m", "pip", "install", f"fustor-agent=={target_version}"]
+        
+        index_url = cmd.get("index_url")
+        if index_url:
+            pip_cmd += ["--index-url", index_url]
+
+        try:
+            result = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=120)
+            if result.returncode != 0:
+                logger.error(f"Pipe {self.id}: Upgrade failed (pip install error): {result.stderr}")
+                return
+        except Exception as e:
+            logger.error(f"Pipe {self.id}: Upgrade failed during pip install: {e}")
+            return
+
+        # Step 2: Verify installation (using a subprocess to avoid cached modules)
+        try:
+            verify_cmd = [
+                sys.executable, "-c", 
+                "import fustor_agent; print(fustor_agent.__version__)"
+            ]
+            verify_res = subprocess.run(verify_cmd, capture_output=True, text=True, timeout=15)
+            if verify_res.returncode != 0:
+                logger.error(f"Pipe {self.id}: Upgrade verification failed (import error)")
+                return
+            
+            new_ver = verify_res.stdout.strip()
+            if new_ver != target_version:
+                logger.error(f"Pipe {self.id}: Upgrade verification failed (version mismatch: expected {target_version}, got {new_ver})")
+                return
+        except Exception as e:
+            logger.error(f"Pipe {self.id}: Upgrade verification failed: {e}")
+            return
+
+        # Step 3: Restart process
+        logger.info(f"Pipe {self.id}: Upgrade successful. Restarting process...")
+        try:
+            # os.execv replaces the current process
+            # sys.argv[0] is usually the script path or 'fustor-agent'
+            # We want to maintain the same arguments
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except Exception as e:
+            logger.error(f"Pipe {self.id}: Failed to restart after upgrade: {e}")

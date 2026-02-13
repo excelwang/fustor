@@ -28,6 +28,8 @@ from fustor_core.exceptions import ConfigError as ConfigurationError
 
 _app_config_instance: Optional[AppConfig] = None 
 
+__version__ = "0.8.17"
+
 logger = logging.getLogger("fustor_agent")
 logger.setLevel(logging.DEBUG)
 

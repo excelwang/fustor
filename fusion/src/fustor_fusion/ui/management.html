@@ -369,6 +369,7 @@
                     <thead>
                         <tr>
                             <th>Agent ID</th>
+                            <th>Version</th>
                             <th>IP</th>
                             <th>Sessions</th>
                             <th>Actions</th>
@@ -534,15 +535,17 @@
 
             // Agents table
             const agentsHtml = Object.entries(agents).map(([id, a]) => {
-                const status = a.status;
-                const evts = status ? (status.events_pushed || 0) : '-';
+                const status = a.status || {};
+                const ver = status.version || 'unknown';
                 return `<tr>
                 <td class="mono">${id}</td>
+                <td class="mono">${ver}</td>
                 <td class="mono">${a.client_ip || '-'}</td>
                 <td>${a.sessions ? a.sessions.length : 0}</td>
                 <td>
-                    <button class="btn btn-sm" onclick="editConfig('${id}')">Edit Config</button>
+                    <button class="btn btn-sm" onclick="editConfig('${id}')">Config</button>
                     <button class="btn btn-sm" onclick="sendCmd('${id}','reload_config')">Reload</button>
+                    <button class="btn btn-sm" onclick="upgradeAgent('${id}')">Upgrade</button>
                 </td>
             </tr>`;
             }).join('');
@@ -617,6 +620,23 @@
                 setTimeout(refresh, 1000);
             } catch (e) {
                 alert('Reload failed: ' + e.message);
+            }
+        }
+
+        async function upgradeAgent(agentId) {
+            const version = prompt(`Enter target version for agent ${agentId}:`);
+            if (!version) return;
+            if (!confirm(`Trigger upgrade to ${version} for agent ${agentId}?`)) return;
+            try {
+                const res = await api(`/agents/${agentId}/upgrade`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ version }),
+                });
+                alert(`Upgrade triggered: ${res.sessions_queued} sessions queued. Target version: ${res.target_version}`);
+                refresh();
+            } catch (e) {
+                alert('Upgrade failed: ' + e.message);
             }
         }
 
