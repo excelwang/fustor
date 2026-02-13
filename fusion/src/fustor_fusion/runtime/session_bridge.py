@@ -180,7 +180,8 @@ class PipeSessionBridge:
         self,
         session_id: str,
         client_ip: Optional[str] = None,
-        can_realtime: bool = False
+        can_realtime: bool = False,
+        agent_status: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Keep session alive (heartbeat).
@@ -189,6 +190,7 @@ class PipeSessionBridge:
             session_id: The session to keep alive
             client_ip: Client IP for tracking
             can_realtime: Whether the agent is ready for realtime events
+            agent_status: Status report from the agent
             
         Returns:
             Heartbeat response with role, tasks, etc.
@@ -201,7 +203,8 @@ class PipeSessionBridge:
             view_id=view_id,
             session_id=session_id,
             client_ip=client_ip,
-            can_realtime=can_realtime
+            can_realtime=can_realtime,
+            agent_status=agent_status
         )
         if not alive:
             return {
@@ -210,7 +213,14 @@ class PipeSessionBridge:
                 "session_id": session_id
             }
         
-        # 2. Try to become leader (Follower promotion) if not known leader
+        # 2. Update Pipe
+        await self._pipe.keep_session_alive(
+            session_id, 
+            can_realtime=can_realtime, 
+            agent_status=agent_status
+        )
+        
+        # 3. Try to become leader (Follower promotion) if not known leader
         from fustor_fusion.view_state_manager import view_state_manager
         
         is_known_leader = session_id in self._leader_cache.get(view_id, set())

@@ -65,10 +65,11 @@ router = APIRouter(
 
 class AgentCommandRequest(BaseModel):
     """Payload for dispatching a command to an agent."""
-    type: str  # "reload_config", "stop_pipe", "scan", "report_status"
+    type: str  # "reload_config", "stop_pipe", "scan", "report_status", "upgrade"
     pipe_id: Optional[str] = None
     path: Optional[str] = None
     recursive: Optional[bool] = True
+    version: Optional[str] = None  # For upgrade command
 
 
 class AgentConfigUpdateRequest(BaseModel):
@@ -225,6 +226,8 @@ async def dispatch_agent_command(agent_id: str, payload: AgentCommandRequest):
     if payload.path:
         command_dict["path"] = payload.path
         command_dict["recursive"] = payload.recursive
+    if payload.version:
+        command_dict["version"] = payload.version
 
     queued_count = 0
     for view_id, session_id, _ in matched:
@@ -344,7 +347,7 @@ async def get_config():
         pipes[pid] = {
             "receiver": p.receiver,
             "views": p.views,
-            "disabled": p.disabled,
+            "disabled": getattr(p, 'disabled', False),
             "session_timeout_seconds": p.session_timeout_seconds,
             "audit_interval_sec": p.audit_interval_sec,
             "sentinel_interval_sec": p.sentinel_interval_sec,
@@ -355,14 +358,14 @@ async def get_config():
         receivers[rid] = {
             "driver": r.driver,
             "port": r.port,
-            "disabled": r.disabled,
+            "disabled": getattr(r, 'disabled', False),
         }
 
     views = {}
     for vid, v in fusion_config.get_all_views().items():
         views[vid] = {
             "driver": v.driver,
-            "disabled": v.disabled,
+            "disabled": getattr(v, 'disabled', False),
             "driver_params": v.driver_params,
         }
 

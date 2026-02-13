@@ -393,10 +393,15 @@ class FusionPipe(Pipe):
         
         logger.info(f"Session {session_id} closed for view {self.view_id}")
     
-    async def keep_session_alive(self, session_id: str) -> bool:
+    async def keep_session_alive(self, session_id: str, can_realtime: bool = False, agent_status: Optional[Dict[str, Any]] = None) -> bool:
         """Update last activity for a session."""
         from ..core.session_manager import session_manager
-        si = await session_manager.keep_session_alive(self.view_id, session_id)
+        si = await session_manager.keep_session_alive(
+            self.view_id, 
+            session_id, 
+            can_realtime=can_realtime, 
+            agent_status=agent_status
+        )
         return si is not None
 
     async def get_session_role(self, session_id: str) -> str:

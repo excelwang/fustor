@@ -341,11 +341,11 @@ class PipeManager:
         # Session not found or pipe gone
         raise ValueError(f"Session {session_id} not found or expired")
 
-    async def _on_heartbeat(self, session_id, can_realtime=False):
+    async def _on_heartbeat(self, session_id, can_realtime=False, agent_status=None):
         pipe_id = self._session_to_pipe.get(session_id)
         if pipe_id:
             bridge = self._bridges.get(pipe_id)
-            if bridge: return await bridge.keep_alive(session_id, can_realtime=can_realtime)
+            if bridge: return await bridge.keep_alive(session_id, can_realtime=can_realtime, agent_status=agent_status)
         return {"status": "error"}
 
     async def _on_session_closed(self, session_id):

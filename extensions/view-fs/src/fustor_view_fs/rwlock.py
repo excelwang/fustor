@@ -10,6 +10,7 @@ operations (audit_start/end, reset) must be exclusive.
 """
 import asyncio
 from contextlib import asynccontextmanager
+from collections import defaultdict
 
 
 class AsyncRWLock:
@@ -30,28 +31,54 @@ class AsyncRWLock:
         self._writer_done = asyncio.Event()   # Signaled when writer releases
         self._readers_done.set()
         self._writer_done.set()
+        
+        # Track recursive read locks per task
+        self._reader_tasks = defaultdict(int)
 
     @asynccontextmanager
     async def read_lock(self):
         """Acquire read access (concurrent with other readers)."""
-        # Wait if a writer is active or waiting
-        while True:
-            async with self._lock:
-                if not self._writer_active and not self._writer_waiting:
-                    self._readers += 1
-                    if self._readers == 1:
-                        self._readers_done.clear()
-                    break
-            # Writer is active/waiting — wait for it to finish
-            await self._writer_done.wait()
+        task = asyncio.current_task()
+        
+        # Check if this task already holds the lock (Recursive Read)
+        # If so, we can proceed immediately without checking writer status
+        # to avoid self-deadlock when a writer is waiting.
+        is_recursive = False
+        async with self._lock:
+            if self._reader_tasks[task] > 0:
+                is_recursive = True
+                self._reader_tasks[task] += 1
+                # Readers count already incremented for this task's first lock
+        
+        if not is_recursive:
+            # Normal acquisition for fresh reader
+            # Wait if a writer is active or waiting
+            while True:
+                async with self._lock:
+                    if not self._writer_active and not self._writer_waiting:
+                        self._readers += 1
+                        self._reader_tasks[task] = 1
+                        if self._readers == 1:
+                            self._readers_done.clear()
+                        break
+                # Writer is active/waiting — wait for it to finish
+                await self._writer_done.wait()
 
         try:
             yield
         finally:
-            async with self._lock:
-                self._readers -= 1
-                if self._readers == 0:
-                    self._readers_done.set()
+            if is_recursive:
+                async with self._lock:
+                    self._reader_tasks[task] -= 1
+            else:
+                async with self._lock:
+                    self._readers -= 1
+                    self._reader_tasks[task] -= 1
+                    if self._reader_tasks[task] == 0:
+                        del self._reader_tasks[task]
+                    
+                    if self._readers == 0:
+                        self._readers_done.set()
 
     @asynccontextmanager
     async def write_lock(self):

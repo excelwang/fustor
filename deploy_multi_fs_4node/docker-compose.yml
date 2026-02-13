@@ -4,8 +4,8 @@ services:
       context: ..
       dockerfile: deploy_multi_fs_4node/Dockerfile
     ports:
-      - "8104:8101"
-      - "18891:18888"
+      - "8101"
+      - "18888"
     volumes:
       - ./fusion/config/default.yaml:/root/.fustor/fusion-config/default.yaml
     command: ["fustor-fusion", "start"]
@@ -45,6 +45,19 @@ services:
     volumes:
       - ./agent3/config/default.yaml:/root/.fustor/agent-config/default.yaml
       - ./agent3/data:/data
+    command: ["fustor-agent", "start"]
+    depends_on:
+      - fusion
+    networks:
+      - fustor-net
+
+  agent4:
+    build:
+      context: ..
+      dockerfile: deploy_multi_fs_4node/Dockerfile
+    volumes:
+      - ./agent4/config/default.yaml:/root/.fustor/agent-config/default.yaml
+      - ./agent4/data:/data
     command: ["fustor-agent", "start"]
     depends_on:
       - fusion

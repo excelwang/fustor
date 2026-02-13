@@ -90,7 +90,7 @@ class SessionInfo:
 # Type aliases for callbacks
 SessionCreatedCallback = Callable[[str, str, str, Dict[str, Any], int], Awaitable[SessionInfo]]
 EventReceivedCallback = Callable[[str, List[EventBase], str, bool, Optional[Dict[str, Any]]], Awaitable[bool]]
-HeartbeatCallback = Callable[[str, bool], Awaitable[Dict[str, Any]]]
+HeartbeatCallback = Callable[[str, bool, Optional[Dict[str, Any]]], Awaitable[Dict[str, Any]]]
 SessionClosedCallback = Callable[[str], Awaitable[None]]
 
 
@@ -361,18 +361,20 @@ class HTTPReceiver(Receiver):
         @router.post("/{session_id}/heartbeat", response_model=HeartbeatResponse)
         async def heartbeat(session_id: str, request: Request):
             """Send a heartbeat to maintain session."""
-            # Extract can_realtime from payload (if any)
+            # Extract can_realtime and agent_status from payload (if any)
             try:
                 payload = await request.json()
                 can_realtime = payload.get("can_realtime", False)
+                agent_status = payload.get("agent_status")
             except Exception:
                 can_realtime = False
+                agent_status = None
 
             logger.debug(f"Received heartbeat for session {session_id}, can_realtime={can_realtime}")
 
             if receiver._on_heartbeat:
                 try:
-                    result = await receiver._on_heartbeat(session_id, can_realtime)
+                    result = await receiver._on_heartbeat(session_id, can_realtime, agent_status)
                     if result and result.get("status") == "error":
                         raise HTTPException(
                             status_code=419,

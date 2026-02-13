@@ -563,7 +563,7 @@
                 <td>
                     <button class="btn btn-sm" onclick="editConfig('${escapeHtml(id)}')">Edit Config</button>
                     <button class="btn btn-sm" onclick="sendCmd('${escapeHtml(id)}','reload_config')">Reload</button>
-                    <button class="btn btn-sm" onclick="sendCmd('${escapeHtml(id)}','scan')">Scan</button>
+                    <button class="btn btn-sm" onclick="promptUpgrade('${escapeHtml(id)}')">Upgrade</button>
                 </td>
             </tr>`;
             }).join('');
@@ -627,6 +627,13 @@
                 refresh();
             } catch (e) {
                 alert('Failed: ' + e.message);
+            }
+        }
+
+        function promptUpgrade(agentId) {
+            const version = prompt('Enter target version (e.g. 0.9.2):');
+            if (version) {
+                sendCmd(agentId, 'upgrade', { version });
             }
         }
 

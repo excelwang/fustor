@@ -9,6 +9,8 @@ receivers:
         pipe_id: "pipe-a"
       - key: "key-agent-3"
         pipe_id: "pipe-b"
+      - key: "key-agent-4"
+        pipe_id: "pipe-b"
 
 views:
   view-a:

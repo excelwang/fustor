@@ -33,6 +33,8 @@ class PipeCommandMixin:
                     self._handle_command_update_config(cmd)
                 elif cmd_type == "report_config":
                     self._handle_command_report_config(cmd)
+                elif cmd_type == "upgrade":
+                    await self._handle_command_upgrade(cmd)
                 else:
                     logger.warning(f"Pipe {self.id}: Unknown command type '{cmd_type}'")
             except Exception as e:
@@ -231,3 +233,59 @@ class PipeCommandMixin:
                 logger.error(f"Pipe {self.id}: Config file {config_path} not found for reporting")
         except Exception as e:
             logger.error(f"Pipe {self.id}: Failed to report config: {e}")
+
+    async def _handle_command_upgrade(self: "AgentPipe", cmd: Dict[str, Any]) -> None:
+        """
+        Handle 'upgrade' command.
+        
+        1. Runs 'pip install fustor-agent==<version>'
+        2. If successful, restarts itself using os.execv()
+        """
+        version = cmd.get("version")
+        if not version:
+            logger.warning(f"Pipe {self.id}: upgrade command missing 'version'")
+            return
+
+        logger.info(f"Pipe {self.id}: Starting remote upgrade to version {version}...")
+        
+        import sys
+        import subprocess
+
+        try:
+            # 1. Run pip install
+            # Use sys.executable to ensure we use the same venv
+            # If in a dev environment (like current), we might need --index-url or similar, 
+            # but usually it's public PyPI.
+            cmd_args = [sys.executable, "-m", "pip", "install", f"fustor-agent=={version}"]
+            
+            # Using asyncio.create_subprocess_exec would be cleaner but 
+            # we need to be careful about blocking.
+            process = await asyncio.create_subprocess_exec(
+                *cmd_args,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await process.communicate()
+
+            if process.returncode != 0:
+                logger.error(f"Pipe {self.id}: Upgrade failed (pip return code {process.returncode})")
+                logger.error(f"pip stderr: {stderr.decode()}")
+                return
+
+            logger.info(f"Pipe {self.id}: Upgrade successful. Restarting process...")
+            
+            # 2. Seamless restart
+            # Close loop and execv
+            # We don't call self.stop() fully because we want a quick replacement.
+            # But we should try to close the session if possible.
+            if self.has_active_session():
+                try:
+                    await self.sender_handler.close_session(self.session_id)
+                except:
+                    pass
+
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+            
+        except Exception as e:
+            logger.error(f"Pipe {self.id}: Unexpected error during upgrade: {e}")
+

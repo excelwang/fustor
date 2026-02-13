@@ -192,7 +192,8 @@ class SessionManager:
 
     async def keep_session_alive(self, view_id: str, session_id: str, 
                                client_ip: Optional[str] = None,
-                               can_realtime: bool = False) -> Tuple[bool, List[Dict[str, Any]]]:
+                               can_realtime: bool = False,
+                               agent_status: Optional[Dict[str, Any]] = None) -> Tuple[bool, List[Dict[str, Any]]]:
         """
         Updates session activity and returns any pending commands.
         Returns: (success, list_of_commands)
@@ -204,6 +205,8 @@ class SessionManager:
                 session_info = self._sessions[view_id][session_id]
                 session_info.last_activity = time.monotonic()
                 session_info.can_realtime = can_realtime
+                if agent_status:
+                    session_info.agent_status = agent_status
                 if client_ip:
                     session_info.client_ip = client_ip
                 
