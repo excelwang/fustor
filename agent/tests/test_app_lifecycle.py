@@ -151,7 +151,9 @@ async def test_app_reload_config(mock_config_dir, tmp_path):
                     assert "pipe1" in app.pipe_runtime
                     
                     with patch.object(agent_config, "get_diff", return_value={"added": {"pipe2"}, "removed": {"pipe1"}}):
-                        await app.reload_config()
+                        # Force signature change to trigger reload
+                        with patch.object(agent_config, "get_config_signature", return_value="new_signature"):
+                            await app.reload_config()
                         
                         assert "pipe1" not in app.pipe_runtime
                         assert "pipe2" in app.pipe_runtime
