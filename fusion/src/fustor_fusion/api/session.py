@@ -57,43 +57,20 @@ def _get_session_config(pipe_id: str) -> Dict[str, Any]:
     }
 
 
-async def _should_allow_new_session(
-    allow_concurrent_push: bool, 
+async def _check_duplicate_task(
     view_id: str, 
-    task_id: str, 
-    session_id: str
+    task_id: str
 ) -> bool:
     """
-    Determine if a new session should be allowed based on configuration and current active sessions.
+    Check if task_id is already active in this view.
+    Returns True if duplicate exists.
     """
-    view_id = str(view_id)
     sessions = await session_manager.get_view_sessions(view_id)
-    active_session_ids = set(sessions.keys())
-    
-    # NEW: Even if concurrent push is allowed, we don't allow duplicate task_id
-    # for different sessions. This prevents confusion in state management.
     for si in sessions.values():
         if si.task_id == task_id:
             logger.warning(f"Task {task_id} already has an active session {si.session_id} on view {view_id}")
-            return False
-
-    if allow_concurrent_push:
-        return True
-    else:
-        locked_session_id = await view_state_manager.get_locked_session_id(view_id)
-        logger.debug(f"View {view_id} is locked by session: {locked_session_id}")
-
-        if not locked_session_id:
-            logger.debug(f"View {view_id} is not locked. Allowing new session.")
             return True
-
-        if locked_session_id not in active_session_ids:
-            logger.warning(f"View {view_id} is locked by a stale session {locked_session_id} that is no longer active. Unlocking automatically.")
-            await view_state_manager.unlock_for_session(view_id, locked_session_id)
-            return True
-        else:
-            logger.warning(f"View {view_id} is locked by an active session {locked_session_id}. Denying new session {session_id}.")
-            return False
+    return False
 
 
 @session_router.post("/", summary="Create new pipesession")
@@ -141,36 +118,57 @@ async def create_session(
 
     # --- Legacy Fallback (If PipeManager not fully active) ---
     allow_concurrent_push = session_config["allow_concurrent_push"]
-    should_allow = await _should_allow_new_session(
-        allow_concurrent_push, view_id, payload.task_id, session_id
-    )
-    if not should_allow:
+    
+    # 1. Check for duplicate task ID (Logic moved from _should_allow_new_session)
+    if await _check_duplicate_task(view_id, payload.task_id):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="New session cannot be created due to current active sessions"
+            detail=f"Task {payload.task_id} already active on view {view_id}"
         )
-    
-    is_leader = await view_state_manager.try_become_leader(view_id, session_id)
-    if is_leader:
-        await view_state_manager.set_authoritative_session(view_id, session_id)
 
-    try:
-        await on_session_start(view_id)
-    except Exception as e:
-        logger.error(f"Failed to trigger on_session_start: {e}")
-
-    await session_manager.create_session_entry(
-        view_id, 
-        session_id, 
-        task_id=payload.task_id,
-        client_ip=client_ip,
-        allow_concurrent_push=allow_concurrent_push,
-        session_timeout_seconds=session_timeout_seconds,
-        source_uri=payload.client_info.get("source_uri") if payload.client_info else None
-    )
-    
+    # 2. Atomic Locking Check (Race Condition Fix)
     if not allow_concurrent_push:
-        await view_state_manager.lock_for_session(view_id, session_id)
+        # Check for stale lock first
+        locked_session_id = await view_state_manager.get_locked_session_id(view_id)
+        if locked_session_id:
+            sessions = await session_manager.get_view_sessions(view_id)
+            if locked_session_id not in sessions:
+                logger.warning(f"View {view_id} locked by stale session {locked_session_id}. Auto-unlocking.")
+                await view_state_manager.unlock_for_session(view_id, locked_session_id)
+        
+        # Atomic acquire
+        acquired = await view_state_manager.acquire_lock_if_free_or_owned(view_id, session_id)
+        if not acquired:
+             raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"View {view_id} is currently locked by another session"
+            )
+    
+    # 3. Create Session Entry
+    try:
+        is_leader = await view_state_manager.try_become_leader(view_id, session_id)
+        if is_leader:
+            await view_state_manager.set_authoritative_session(view_id, session_id)
+
+        try:
+            await on_session_start(view_id)
+        except Exception as e:
+            logger.error(f"Failed to trigger on_session_start: {e}")
+
+        await session_manager.create_session_entry(
+            view_id, 
+            session_id, 
+            task_id=payload.task_id,
+            client_ip=client_ip,
+            allow_concurrent_push=allow_concurrent_push,
+            session_timeout_seconds=session_timeout_seconds,
+            source_uri=payload.client_info.get("source_uri") if payload.client_info else None
+        )
+    except Exception as e:
+        # Rollback lock if creation fails
+        if not allow_concurrent_push:
+            await view_state_manager.unlock_for_session(view_id, session_id)
+        raise e
     
     role = "leader" if is_leader else "follower"
     return {

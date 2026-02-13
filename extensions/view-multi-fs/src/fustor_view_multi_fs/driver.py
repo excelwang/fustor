@@ -48,7 +48,7 @@ class MultiFSViewDriver(ViewDriver):
             logger.debug(f"Failed to get driver for view '{view_id}': {e}")
             return None
 
-    async def get_subtree_stats_agg(self, path: str) -> Dict[str, Any]:
+    async def get_subtree_stats_agg(self, path: str, timeout: Optional[float] = None) -> Dict[str, Any]:
         """
         Aggregate subtree stats from all members.
         Returns:
@@ -66,7 +66,8 @@ class MultiFSViewDriver(ViewDriver):
             try:
                 # Use wait_for for the entire operation including driver lookup
                 # (driver lookup is usually fast but might be slow if locks are held)
-                return await asyncio.wait_for(self._fetch_stats_internal(vid, path), timeout=self.query_timeout)
+                effective_timeout = timeout if timeout is not None else self.query_timeout
+                return await asyncio.wait_for(self._fetch_stats_internal(vid, path), timeout=effective_timeout)
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout fetching stats for member '{vid}' (path='{path}')")
                 return {"view_id": vid, "status": "error", "error": "Timeout"}
@@ -96,7 +97,7 @@ class MultiFSViewDriver(ViewDriver):
         stats = await driver.get_subtree_stats(path)
         return {"view_id": vid, "status": "ok", **stats}
 
-    async def get_directory_tree(self, path: str, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False, best_view: Optional[str] = None) -> Dict[str, Any]:
+    async def get_directory_tree(self, path: str, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False, best_view: Optional[str] = None, timeout: Optional[float] = None) -> Dict[str, Any]:
         """
         Get directory tree from members.
         If best_view is specified, only query that view.
@@ -108,7 +109,8 @@ class MultiFSViewDriver(ViewDriver):
 
         async def fetch_tree(vid):
             try:
-                return await asyncio.wait_for(self._fetch_tree_internal(vid, path, recursive, max_depth, only_path), timeout=self.query_timeout)
+                effective_timeout = timeout if timeout is not None else self.query_timeout
+                return await asyncio.wait_for(self._fetch_tree_internal(vid, path, recursive, max_depth, only_path), timeout=effective_timeout)
             except asyncio.TimeoutError:
                 logger.warning(f"Timeout fetching tree for member '{vid}' (path='{path}')")
                 return vid, {"status": "error", "error": "Timeout"}

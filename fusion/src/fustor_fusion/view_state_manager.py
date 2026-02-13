@@ -159,6 +159,23 @@ class ViewStateManager:
                 return True
             else:
                 return False
+
+    async def acquire_lock_if_free_or_owned(self, view_id: str, session_id: str) -> bool:
+        """
+        Atomic operation: check if lock is free OR owned by this session.
+        If so, take/renew it and return True.
+        If owned by another session, return False.
+        """
+        view_id_str = str(view_id)
+        async with self._get_view_lock(view_id_str):
+            state = self._ensure_state(view_id_str)
+            if not state.locked_by_session_id or state.locked_by_session_id == session_id:
+                state.locked_by_session_id = session_id
+                state.status = 'ACTIVE'
+                state.updated_at = datetime.now()
+                return True
+            else:
+                return False
     
     async def unlock_for_session(self, view_id: str, session_id: str) -> bool:
         """为会话解锁视图"""
