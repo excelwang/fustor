@@ -28,6 +28,8 @@ class PipeCommandMixin:
                     self._handle_command_reload()
                 elif cmd_type == "stop_pipe":
                     await self._handle_command_stop_pipe(cmd)
+                elif cmd_type == "update_config":
+                    self._handle_command_update_config(cmd)
                 else:
                     logger.warning(f"Pipe {self.id}: Unknown command type '{cmd_type}'")
             except Exception as e:
@@ -121,3 +123,62 @@ class PipeCommandMixin:
             asyncio.create_task(self.stop())
         else:
             logger.debug(f"Pipe {self.id}: stop_pipe command for '{target_pipe_id}' (not me, ignoring)")
+
+    def _handle_command_update_config(self: "AgentPipe", cmd: Dict[str, Any]) -> None:
+        """
+        Handle 'update_config' command.
+
+        Writes the received YAML content to the agent's config directory,
+        creates a backup of the existing file, then triggers SIGHUP reload.
+        """
+        import yaml
+        from fustor_core.common import get_fustor_home_dir
+
+        config_yaml = cmd.get("config_yaml")
+        filename = cmd.get("filename", "default.yaml")
+
+        if not config_yaml:
+            logger.warning(f"Pipe {self.id}: update_config command missing 'config_yaml'")
+            return
+
+        # Validate YAML syntax before writing
+        try:
+            yaml.safe_load(config_yaml)
+        except yaml.YAMLError as e:
+            logger.error(f"Pipe {self.id}: Received invalid YAML: {e}")
+            return
+
+        # Sanitize filename to prevent path traversal
+        safe_name = os.path.basename(filename)
+        if not safe_name.endswith((".yaml", ".yml")):
+            safe_name += ".yaml"
+
+        config_dir = get_fustor_home_dir() / "agent-config"
+        target_path = config_dir / safe_name
+        backup_path = config_dir / f"{safe_name}.bak"
+
+        try:
+            # Backup existing file
+            if target_path.exists():
+                import shutil
+                shutil.copy2(target_path, backup_path)
+                logger.info(f"Pipe {self.id}: Backed up {target_path} -> {backup_path}")
+
+            # Write new config
+            target_path.write_text(config_yaml, encoding="utf-8")
+            logger.info(f"Pipe {self.id}: Config written to {target_path} ({len(config_yaml)} bytes)")
+
+            # Trigger reload
+            os.kill(os.getpid(), signal.SIGHUP)
+            logger.info(f"Pipe {self.id}: Config updated and reload triggered")
+
+        except Exception as e:
+            logger.error(f"Pipe {self.id}: Failed to write config: {e}")
+            # Restore backup on failure
+            if backup_path.exists():
+                try:
+                    import shutil
+                    shutil.copy2(backup_path, target_path)
+                    logger.info(f"Pipe {self.id}: Restored backup after write failure")
+                except Exception as restore_err:
+                    logger.error(f"Pipe {self.id}: Failed to restore backup: {restore_err}")

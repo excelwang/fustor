@@ -1,5 +1,6 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -21,7 +22,12 @@
             --radius: 10px;
         }
 
-        * { margin: 0; padding: 0; box-sizing: border-box; }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
         body {
             font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
             background: var(--bg);
@@ -38,6 +44,7 @@
             align-items: center;
             justify-content: space-between;
         }
+
         .header h1 {
             font-size: 20px;
             font-weight: 600;
@@ -45,18 +52,24 @@
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
         }
+
         .header-actions {
             display: flex;
             gap: 12px;
             align-items: center;
         }
+
         .refresh-info {
             font-size: 12px;
             color: var(--text-secondary);
         }
 
         /* Content */
-        .content { padding: 24px 32px; max-width: 1400px; margin: 0 auto; }
+        .content {
+            padding: 24px 32px;
+            max-width: 1400px;
+            margin: 0 auto;
+        }
 
         /* Stats bar */
         .stats-bar {
@@ -65,6 +78,7 @@
             gap: 16px;
             margin-bottom: 24px;
         }
+
         .stat-card {
             background: var(--surface);
             border: 1px solid var(--border);
@@ -72,7 +86,11 @@
             padding: 16px 20px;
             transition: border-color 0.2s;
         }
-        .stat-card:hover { border-color: var(--accent); }
+
+        .stat-card:hover {
+            border-color: var(--accent);
+        }
+
         .stat-label {
             font-size: 12px;
             color: var(--text-secondary);
@@ -80,6 +98,7 @@
             letter-spacing: 0.5px;
             margin-bottom: 6px;
         }
+
         .stat-value {
             font-size: 28px;
             font-weight: 700;
@@ -93,6 +112,7 @@
             margin-bottom: 20px;
             overflow: hidden;
         }
+
         .section-header {
             padding: 14px 20px;
             border-bottom: 1px solid var(--border);
@@ -100,6 +120,7 @@
             justify-content: space-between;
             align-items: center;
         }
+
         .section-title {
             font-size: 14px;
             font-weight: 600;
@@ -108,7 +129,11 @@
         }
 
         /* Table */
-        table { width: 100%; border-collapse: collapse; }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+
         th {
             padding: 10px 16px;
             text-align: left;
@@ -119,13 +144,20 @@
             letter-spacing: 0.5px;
             border-bottom: 1px solid var(--border);
         }
+
         td {
             padding: 12px 16px;
             font-size: 13px;
             border-bottom: 1px solid var(--border);
         }
-        tr:last-child td { border-bottom: none; }
-        tr:hover td { background: var(--surface-hover); }
+
+        tr:last-child td {
+            border-bottom: none;
+        }
+
+        tr:hover td {
+            background: var(--surface-hover);
+        }
 
         /* Badges */
         .badge {
@@ -135,11 +167,31 @@
             font-size: 11px;
             font-weight: 600;
         }
-        .badge-green { background: rgba(0, 214, 143, 0.15); color: var(--green); }
-        .badge-red { background: rgba(255, 107, 107, 0.15); color: var(--red); }
-        .badge-yellow { background: rgba(255, 217, 61, 0.15); color: var(--yellow); }
-        .badge-blue { background: rgba(78, 205, 196, 0.15); color: var(--blue); }
-        .badge-purple { background: var(--accent-glow); color: var(--accent); }
+
+        .badge-green {
+            background: rgba(0, 214, 143, 0.15);
+            color: var(--green);
+        }
+
+        .badge-red {
+            background: rgba(255, 107, 107, 0.15);
+            color: var(--red);
+        }
+
+        .badge-yellow {
+            background: rgba(255, 217, 61, 0.15);
+            color: var(--yellow);
+        }
+
+        .badge-blue {
+            background: rgba(78, 205, 196, 0.15);
+            color: var(--blue);
+        }
+
+        .badge-purple {
+            background: var(--accent-glow);
+            color: var(--accent);
+        }
 
         /* Buttons */
         .btn {
@@ -152,18 +204,25 @@
             cursor: pointer;
             transition: all 0.2s;
         }
+
         .btn:hover {
             background: var(--surface-hover);
             border-color: var(--accent);
         }
+
         .btn-primary {
             background: var(--accent);
             border-color: var(--accent);
         }
+
         .btn-primary:hover {
             background: #7c6df0;
         }
-        .btn-sm { padding: 4px 10px; font-size: 11px; }
+
+        .btn-sm {
+            padding: 4px 10px;
+            font-size: 11px;
+        }
 
         /* Loading / Error */
         .loading {
@@ -171,6 +230,7 @@
             padding: 40px;
             color: var(--text-secondary);
         }
+
         .error-msg {
             background: rgba(255, 107, 107, 0.1);
             border: 1px solid var(--red);
@@ -181,13 +241,89 @@
         }
 
         /* Mono text */
-        .mono { font-family: 'JetBrains Mono', 'Fira Code', monospace; font-size: 12px; }
+        .mono {
+            font-family: 'JetBrains Mono', 'Fira Code', monospace;
+            font-size: 12px;
+        }
 
         /* Grid layout */
-        .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        @media (max-width: 900px) { .grid-2 { grid-template-columns: 1fr; } }
+        .grid-2 {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+
+        @media (max-width: 900px) {
+            .grid-2 {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        /* Modal */
+        .modal-overlay {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.7);
+            z-index: 100;
+            justify-content: center;
+            align-items: center;
+        }
+
+        .modal-overlay.active {
+            display: flex;
+        }
+
+        .modal {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            width: 600px;
+            max-height: 80vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .modal-header {
+            padding: 16px 20px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .modal-body {
+            padding: 16px 20px;
+            flex: 1;
+            overflow: auto;
+        }
+
+        .modal-footer {
+            padding: 12px 20px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            justify-content: flex-end;
+            gap: 8px;
+        }
+
+        .config-editor {
+            width: 100%;
+            min-height: 300px;
+            background: var(--bg);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 6px;
+            padding: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            resize: vertical;
+        }
     </style>
 </head>
+
 <body>
     <div class="header">
         <h1>⚡ Fustor Management Console</h1>
@@ -203,10 +339,22 @@
 
         <!-- Stats Bar -->
         <div class="stats-bar" id="statsBar">
-            <div class="stat-card"><div class="stat-label">Agents</div><div class="stat-value" id="statAgents">-</div></div>
-            <div class="stat-card"><div class="stat-label">Pipes</div><div class="stat-value" id="statPipes">-</div></div>
-            <div class="stat-card"><div class="stat-label">Views</div><div class="stat-value" id="statViews">-</div></div>
-            <div class="stat-card"><div class="stat-label">Sessions</div><div class="stat-value" id="statSessions">-</div></div>
+            <div class="stat-card">
+                <div class="stat-label">Agents</div>
+                <div class="stat-value" id="statAgents">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Pipes</div>
+                <div class="stat-value" id="statPipes">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Views</div>
+                <div class="stat-value" id="statViews">-</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">Sessions</div>
+                <div class="stat-value" id="statSessions">-</div>
+            </div>
         </div>
 
         <!-- Agents & Pipes -->
@@ -217,8 +365,19 @@
                     <span class="section-title">Connected Agents</span>
                 </div>
                 <table>
-                    <thead><tr><th>Agent ID</th><th>IP</th><th>Sessions</th><th>Actions</th></tr></thead>
-                    <tbody id="agentsBody"><tr><td colspan="4" class="loading">Loading...</td></tr></tbody>
+                    <thead>
+                        <tr>
+                            <th>Agent ID</th>
+                            <th>IP</th>
+                            <th>Sessions</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="agentsBody">
+                        <tr>
+                            <td colspan="4" class="loading">Loading...</td>
+                        </tr>
+                    </tbody>
                 </table>
             </div>
 
@@ -228,8 +387,19 @@
                     <span class="section-title">Fusion Pipes</span>
                 </div>
                 <table>
-                    <thead><tr><th>Pipe ID</th><th>View</th><th>Sessions</th><th>Status</th></tr></thead>
-                    <tbody id="pipesBody"><tr><td colspan="4" class="loading">Loading...</td></tr></tbody>
+                    <thead>
+                        <tr>
+                            <th>Pipe ID</th>
+                            <th>View</th>
+                            <th>Sessions</th>
+                            <th>Status</th>
+                        </tr>
+                    </thead>
+                    <tbody id="pipesBody">
+                        <tr>
+                            <td colspan="4" class="loading">Loading...</td>
+                        </tr>
+                    </tbody>
                 </table>
             </div>
         </div>
@@ -240,11 +410,23 @@
                 <span class="section-title">Active Sessions</span>
             </div>
             <table>
-                <thead><tr>
-                    <th>Session ID</th><th>View</th><th>Agent</th><th>Role</th>
-                    <th>Realtime</th><th>Age</th><th>Idle</th><th>Events</th>
-                </tr></thead>
-                <tbody id="sessionsBody"><tr><td colspan="8" class="loading">Loading...</td></tr></tbody>
+                <thead>
+                    <tr>
+                        <th>Session ID</th>
+                        <th>View</th>
+                        <th>Agent</th>
+                        <th>Role</th>
+                        <th>Realtime</th>
+                        <th>Age</th>
+                        <th>Idle</th>
+                        <th>Events</th>
+                    </tr>
+                </thead>
+                <tbody id="sessionsBody">
+                    <tr>
+                        <td colspan="8" class="loading">Loading...</td>
+                    </tr>
+                </tbody>
             </table>
         </div>
 
@@ -255,109 +437,132 @@
                 <button class="btn btn-sm" onclick="toggleConfig()">Show/Hide</button>
             </div>
             <div id="configPanel" style="display:none; padding: 16px;">
-                <pre class="mono" id="configContent" style="white-space: pre-wrap; color: var(--text-secondary);">Loading...</pre>
+                <pre class="mono" id="configContent"
+                    style="white-space: pre-wrap; color: var(--text-secondary);">Loading...</pre>
+            </div>
+        </div>
+    </div>
+
+    <!-- Config Editor Modal -->
+    <div class="modal-overlay" id="configModal">
+        <div class="modal">
+            <div class="modal-header">
+                <span class="section-title" id="configModalTitle">Edit Agent Config</span>
+                <button class="btn btn-sm" onclick="closeConfigModal()">✕</button>
+            </div>
+            <div class="modal-body">
+                <label
+                    style="font-size:12px;color:var(--text-secondary);margin-bottom:6px;display:block">Filename:</label>
+                <input id="configFilename" class="mono" value="default.yaml"
+                    style="background:var(--bg);color:var(--text);border:1px solid var(--border);border-radius:4px;padding:6px 10px;width:200px;margin-bottom:12px">
+                <textarea id="configEditor" class="config-editor" placeholder="# Agent config YAML..."></textarea>
+            </div>
+            <div class="modal-footer">
+                <button class="btn" onclick="closeConfigModal()">Cancel</button>
+                <button class="btn btn-primary" onclick="saveConfig()">Push Config</button>
             </div>
         </div>
     </div>
 
     <script>
-    const API = '/api/v1/management';
-    let autoRefreshTimer = null;
+        const API = '/api/v1/management';
+        let autoRefreshTimer = null;
 
-    async function api(path, opts = {}) {
-        const res = await fetch(API + path, opts);
-        if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-        return res.json();
-    }
-
-    function showError(msg) {
-        const el = document.getElementById('error');
-        el.innerHTML = msg ? `<div class="error-msg">${msg}</div>` : '';
-    }
-
-    function badge(text, type) {
-        return `<span class="badge badge-${type}">${text}</span>`;
-    }
-
-    function formatAge(seconds) {
-        if (seconds == null) return '-';
-        if (seconds < 60) return Math.round(seconds) + 's';
-        if (seconds < 3600) return Math.round(seconds / 60) + 'm';
-        return Math.round(seconds / 3600) + 'h';
-    }
-
-    async function refresh() {
-        try {
-            showError('');
-            const data = await api('/dashboard');
-            renderDashboard(data);
-            document.getElementById('lastRefresh').textContent =
-                'Updated: ' + new Date().toLocaleTimeString();
-        } catch (e) {
-            showError('Failed to load dashboard: ' + e.message);
+        async function api(path, opts = {}) {
+            const res = await fetch(API + path, opts);
+            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+            return res.json();
         }
-    }
 
-    function renderDashboard(data) {
-        const agents = data.agents || {};
-        const pipes = data.pipes || {};
-        const sessions = data.sessions || {};
+        function showError(msg) {
+            const el = document.getElementById('error');
+            el.innerHTML = msg ? `<div class="error-msg">${msg}</div>` : '';
+        }
 
-        // Stats
-        let totalSessions = 0;
-        Object.values(sessions).forEach(arr => totalSessions += arr.length);
+        function badge(text, type) {
+            return `<span class="badge badge-${type}">${text}</span>`;
+        }
 
-        document.getElementById('statAgents').textContent = Object.keys(agents).length;
-        document.getElementById('statPipes').textContent = Object.keys(pipes).length;
-        document.getElementById('statViews').textContent = Object.keys(data.views || {}).length;
-        document.getElementById('statSessions').textContent = totalSessions;
+        function formatAge(seconds) {
+            if (seconds == null) return '-';
+            if (seconds < 60) return Math.round(seconds) + 's';
+            if (seconds < 3600) return Math.round(seconds / 60) + 'm';
+            return Math.round(seconds / 3600) + 'h';
+        }
 
-        // Agents table
-        const agentsHtml = Object.entries(agents).map(([id, a]) => {
-            const status = a.status;
-            const evts = status ? (status.events_pushed || 0) : '-';
-            return `<tr>
+        async function refresh() {
+            try {
+                showError('');
+                const data = await api('/dashboard');
+                renderDashboard(data);
+                document.getElementById('lastRefresh').textContent =
+                    'Updated: ' + new Date().toLocaleTimeString();
+            } catch (e) {
+                showError('Failed to load dashboard: ' + e.message);
+            }
+        }
+
+        function renderDashboard(data) {
+            const agents = data.agents || {};
+            const pipes = data.pipes || {};
+            const sessions = data.sessions || {};
+
+            // Stats
+            let totalSessions = 0;
+            Object.values(sessions).forEach(arr => totalSessions += arr.length);
+
+            document.getElementById('statAgents').textContent = Object.keys(agents).length;
+            document.getElementById('statPipes').textContent = Object.keys(pipes).length;
+            document.getElementById('statViews').textContent = Object.keys(data.views || {}).length;
+            document.getElementById('statSessions').textContent = totalSessions;
+
+            // Agents table
+            const agentsHtml = Object.entries(agents).map(([id, a]) => {
+                const status = a.status;
+                const evts = status ? (status.events_pushed || 0) : '-';
+                return `<tr>
                 <td class="mono">${id}</td>
                 <td class="mono">${a.client_ip || '-'}</td>
                 <td>${a.sessions ? a.sessions.length : 0}</td>
                 <td>
+                    <button class="btn btn-sm" onclick="editConfig('${id}')">Edit Config</button>
                     <button class="btn btn-sm" onclick="sendCmd('${id}','reload_config')">Reload</button>
                 </td>
             </tr>`;
-        }).join('');
-        document.getElementById('agentsBody').innerHTML =
-            agentsHtml || '<tr><td colspan="4" style="text-align:center;color:var(--text-secondary)">No agents connected</td></tr>';
+            }).join('');
+            document.getElementById('agentsBody').innerHTML =
+                agentsHtml || '<tr><td colspan="4" style="text-align:center;color:var(--text-secondary)">No agents connected</td></tr>';
 
-        // Pipes table
-        const pipesHtml = Object.entries(pipes).map(([id, p]) => {
-            const sessCnt = p.active_sessions ? Object.keys(p.active_sessions).length : 0;
-            const state = p.state || 'unknown';
-            let stateBadge = badge(state, 'yellow');
-            if (state.includes('RUNNING')) stateBadge = badge('RUNNING', 'green');
-            if (state.includes('ERROR')) stateBadge = badge('ERROR', 'red');
-            if (state.includes('STOPPED')) stateBadge = badge('STOPPED', 'red');
+            // Pipes table
+            const pipesHtml = Object.entries(pipes).map(([id, p]) => {
+                const sessCnt = p.active_sessions ? Object.keys(p.active_sessions).length : 0;
+                const state = p.state || 'unknown';
+                let stateBadge = badge(state, 'yellow');
+                if (state.includes('RUNNING')) stateBadge = badge('RUNNING', 'green');
+                if (state.includes('ERROR')) stateBadge = badge('ERROR', 'red');
+                if (state.includes('STOPPED')) stateBadge = badge('STOPPED', 'red');
 
-            return `<tr>
+                return `<tr>
                 <td class="mono">${id}</td>
                 <td class="mono">${p.view_id || id}</td>
                 <td>${sessCnt}</td>
                 <td>${stateBadge}</td>
             </tr>`;
-        }).join('');
-        document.getElementById('pipesBody').innerHTML =
-            pipesHtml || '<tr><td colspan="4" style="text-align:center;color:var(--text-secondary)">No pipes</td></tr>';
+            }).join('');
+            document.getElementById('pipesBody').innerHTML =
+                pipesHtml || '<tr><td colspan="4" style="text-align:center;color:var(--text-secondary)">No pipes</td></tr>';
 
-        // Sessions table
-        let sessionsHtml = '';
-        for (const [viewId, sessArr] of Object.entries(sessions)) {
-            for (const s of sessArr) {
-                const agentStatus = s.agent_status || {};
-                const role = agentStatus.role || '-';
-                const roleBadge = role === 'leader' ? badge('LEADER', 'purple') : badge(role, 'blue');
-                const rt = s.can_realtime ? badge('YES', 'green') : badge('NO', 'yellow');
-                const evts = agentStatus.events_pushed != null ? agentStatus.events_pushed : '-';
+            // Sessions table
+            let sessionsHtml = '';
+            for (const [viewId, sessArr] of Object.entries(sessions)) {
+                for (const s of sessArr) {
+                    const agentStatus = s.agent_status || {};
+                    const role = agentStatus.role || '-';
+                    const roleBadge = role === 'leader' ? badge('LEADER', 'purple') : badge(role, 'blue');
+                    const rt = s.can_realtime ? badge('YES', 'green') : badge('NO', 'yellow');
+                    const evts = agentStatus.events_pushed != null ? agentStatus.events_pushed : '-';
 
-                sessionsHtml += `<tr>
+                    sessionsHtml += `<tr>
                     <td class="mono" title="${s.session_id}">${s.session_id.substring(0, 8)}…</td>
                     <td class="mono">${viewId}</td>
                     <td class="mono">${s.agent_id || '-'}</td>
@@ -367,56 +572,91 @@
                     <td>${formatAge(s.idle_seconds)}</td>
                     <td>${evts}</td>
                 </tr>`;
+                }
             }
+            document.getElementById('sessionsBody').innerHTML =
+                sessionsHtml || '<tr><td colspan="8" style="text-align:center;color:var(--text-secondary)">No active sessions</td></tr>';
         }
-        document.getElementById('sessionsBody').innerHTML =
-            sessionsHtml || '<tr><td colspan="8" style="text-align:center;color:var(--text-secondary)">No active sessions</td></tr>';
-    }
 
-    async function sendCmd(agentId, type, extra = {}) {
-        try {
-            const body = { type, ...extra };
-            const res = await api(`/agents/${agentId}/command`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(body),
-            });
-            alert(`Command sent: ${res.sessions_queued} sessions queued`);
-            refresh();
-        } catch (e) {
-            alert('Failed: ' + e.message);
-        }
-    }
-
-    async function reloadFusion() {
-        if (!confirm('Reload Fusion configuration?')) return;
-        try {
-            await api('/reload', { method: 'POST' });
-            alert('Reload triggered');
-            setTimeout(refresh, 1000);
-        } catch (e) {
-            alert('Reload failed: ' + e.message);
-        }
-    }
-
-    async function toggleConfig() {
-        const panel = document.getElementById('configPanel');
-        if (panel.style.display === 'none') {
-            panel.style.display = 'block';
+        async function sendCmd(agentId, type, extra = {}) {
             try {
-                const cfg = await api('/config');
-                document.getElementById('configContent').textContent = JSON.stringify(cfg, null, 2);
+                const body = { type, ...extra };
+                const res = await api(`/agents/${agentId}/command`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(body),
+                });
+                alert(`Command sent: ${res.sessions_queued} sessions queued`);
+                refresh();
             } catch (e) {
-                document.getElementById('configContent').textContent = 'Error: ' + e.message;
+                alert('Failed: ' + e.message);
             }
-        } else {
-            panel.style.display = 'none';
         }
-    }
 
-    // Auto-refresh every 5 seconds
-    refresh();
-    autoRefreshTimer = setInterval(refresh, 5000);
+        async function reloadFusion() {
+            if (!confirm('Reload Fusion configuration?')) return;
+            try {
+                await api('/reload', { method: 'POST' });
+                alert('Reload triggered');
+                setTimeout(refresh, 1000);
+            } catch (e) {
+                alert('Reload failed: ' + e.message);
+            }
+        }
+
+        async function toggleConfig() {
+            const panel = document.getElementById('configPanel');
+            if (panel.style.display === 'none') {
+                panel.style.display = 'block';
+                try {
+                    const cfg = await api('/config');
+                    document.getElementById('configContent').textContent = JSON.stringify(cfg, null, 2);
+                } catch (e) {
+                    document.getElementById('configContent').textContent = 'Error: ' + e.message;
+                }
+            } else {
+                panel.style.display = 'none';
+            }
+        }
+
+        let _editingAgentId = null;
+
+        function editConfig(agentId) {
+            _editingAgentId = agentId;
+            document.getElementById('configModalTitle').textContent = `Edit Config: ${agentId}`;
+            document.getElementById('configEditor').value = '';
+            document.getElementById('configFilename').value = 'default.yaml';
+            document.getElementById('configModal').classList.add('active');
+        }
+
+        function closeConfigModal() {
+            document.getElementById('configModal').classList.remove('active');
+            _editingAgentId = null;
+        }
+
+        async function saveConfig() {
+            if (!_editingAgentId) return;
+            const yaml = document.getElementById('configEditor').value.trim();
+            const filename = document.getElementById('configFilename').value.trim();
+            if (!yaml) { alert('Config content is empty'); return; }
+            if (!confirm(`Push config to agent ${_editingAgentId}?`)) return;
+            try {
+                const res = await api(`/agents/${_editingAgentId}/config`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ config_yaml: yaml, filename }),
+                });
+                alert(`Config pushed (${res.sessions_queued} sessions queued). Agent will reload on next heartbeat.`);
+                closeConfigModal();
+            } catch (e) {
+                alert('Push failed: ' + e.message);
+            }
+        }
+
+        // Auto-refresh every 5 seconds
+        refresh();
+        autoRefreshTimer = setInterval(refresh, 5000);
     </script>
 </body>
+
 </html>

@@ -36,6 +36,12 @@ class AgentCommandRequest(BaseModel):
     recursive: Optional[bool] = True
 
 
+class AgentConfigUpdateRequest(BaseModel):
+    """Payload for pushing configuration to an agent."""
+    config_yaml: str  # Raw YAML content to write to agent's config file
+    filename: str = "default.yaml"  # Target config file name
+
+
 # ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
@@ -192,6 +198,55 @@ async def dispatch_agent_command(agent_id: str, payload: AgentCommandRequest):
         "command": payload.type,
         "sessions_queued": queued_count,
         "total_sessions": len(matched),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Agent config push
+# ---------------------------------------------------------------------------
+
+@router.post("/agents/{agent_id}/config")
+async def push_agent_config(agent_id: str, payload: AgentConfigUpdateRequest):
+    """
+    Push a new configuration to an agent.
+
+    The config YAML is delivered via heartbeat command channel.
+    The agent writes it to its local config directory and triggers a hot-reload.
+    """
+    all_sessions = await session_manager.get_all_active_sessions()
+
+    matched = []
+    for view_id, sess_map in all_sessions.items():
+        for sid, si in sess_map.items():
+            if si.task_id:
+                parts = si.task_id.split(":")
+                if parts[0] == agent_id:
+                    matched.append((view_id, sid, si))
+
+    if not matched:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active sessions found for agent '{agent_id}'",
+        )
+
+    command_dict = {
+        "type": "update_config",
+        "config_yaml": payload.config_yaml,
+        "filename": payload.filename,
+    }
+
+    queued_count = 0
+    for view_id, session_id, _ in matched:
+        success = await session_manager.queue_command(view_id, session_id, command_dict)
+        if success:
+            queued_count += 1
+            break  # Only need to deliver to one session per agent
+
+    return {
+        "status": "ok",
+        "agent_id": agent_id,
+        "filename": payload.filename,
+        "sessions_queued": queued_count,
     }
 
 
