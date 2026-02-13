@@ -667,12 +667,20 @@
 
         let _editingAgentId = null;
 
-        function editConfig(agentId) {
+        async function editConfig(agentId) {
             _editingAgentId = agentId;
-            document.getElementById('configModalTitle').textContent = `Edit Config: ${agentId}`;
-            document.getElementById('configEditor').value = '';
+            document.getElementById('configModalTitle').textContent = `Edit Config: ${escapeHtml(agentId)}`;
+            document.getElementById('configEditor').value = 'Loading current config...';
             document.getElementById('configFilename').value = 'default.yaml';
             document.getElementById('configModal').classList.add('active');
+
+            try {
+                const data = await api(`/agents/${agentId}/config`);
+                document.getElementById('configEditor').value = data.config_yaml || '';
+                document.getElementById('configFilename').value = data.filename || 'default.yaml';
+            } catch (e) {
+                document.getElementById('configEditor').value = '# Error loading template: ' + e.message;
+            }
         }
 
         function closeConfigModal() {

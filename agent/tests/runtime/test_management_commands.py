@@ -81,6 +81,26 @@ async def test_handle_update_config_command(pipe, tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_handle_update_config_invalid_yaml(pipe, tmp_path):
+    """Test update_config with invalid YAML does nothing."""
+    with patch("fustor_core.common.get_fustor_home_dir", return_value=tmp_path), \
+         patch("os.kill") as mock_kill:
+        
+        config_dir = tmp_path / "agent-config"
+        config_dir.mkdir()
+        
+        invalid_yaml = "invalid: yaml: : oops"
+        await pipe._handle_commands([{
+            "type": "update_config",
+            "config_yaml": invalid_yaml,
+            "filename": "default.yaml"
+        }])
+        
+        assert not (config_dir / "default.yaml").exists()
+        mock_kill.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_handle_upgrade_command(pipe):
     """Test upgrade_agent command flow."""
     with patch("subprocess.run") as mock_run, \

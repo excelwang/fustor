@@ -154,17 +154,20 @@ async def dashboard():
                         "agent_id": agent_id,
                         "client_ip": si.client_ip,
                         "sessions": [],
-                        "status": si.agent_status,
+                        "pipe_statuses": {}, # Issue 5 fix: Store status per pipe
                     }
                 agents_info[agent_id]["sessions"].append({
                     "session_id": sid,
                     "view_id": view_id,
                     "task_id": si.task_id,
                 })
-                # Keep latest status
-                latest_status = si.agent_status
-                if latest_status:
-                    agents_info[agent_id]["status"] = latest_status
+                
+                # Update pipe status if available
+                if si.agent_status:
+                    p_id = si.agent_status.get("pipe_id") or view_id
+                    agents_info[agent_id]["pipe_statuses"][p_id] = si.agent_status
+                    # Compatibility: keep a top-level status for version info (use latest)
+                    agents_info[agent_id]["status"] = si.agent_status
 
         sessions_info[view_id] = view_sessions
 
@@ -288,6 +291,23 @@ async def push_agent_config(agent_id: str, payload: AgentConfigUpdateRequest):
         "agent_id": agent_id,
         "filename": payload.filename,
         "sessions_queued": queued_count,
+    }
+
+
+@router.get("/agents/{agent_id}/config")
+async def get_agent_config(agent_id: str):
+    """
+    Get the configuration for a specific agent.
+    
+    Since agent configs are local to agents, this returns a heuristic 
+    template based on current session information or an empty template.
+    """
+    # For now, return a template. 
+    # Real implementation would require a fetch_config command.
+    return {
+        "agent_id": agent_id,
+        "config_yaml": f"# Configuration for agent: {agent_id}\nagent_id: {agent_id}\n\nsources:\n  # Add sources here\n\nsenders:\n  # Add senders here\n\npipes:\n  # Add pipes here\n",
+        "filename": "default.yaml"
     }
 
 
