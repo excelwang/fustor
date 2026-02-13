@@ -510,9 +510,13 @@ class FusionPipe(Pipe):
                 from ..view_state_manager import view_state_manager
                 # Only leader can signal snapshot end
                 if await view_state_manager.is_leader(self.view_id, session_id):
+                    logger.info(f"Pipe {self.id}: Received SNAPSHOT end signal from leader session {session_id}. Draining before marking complete.")
+                    # Ensure all snapshot events are processed before marking as complete
+                    await self.wait_for_drain(timeout=30.0, target_active_pushes=1)
+                    
                     # Mark primary view complete
                     await view_state_manager.set_snapshot_complete(self.view_id, session_id)
-                    logger.info(f"Pipe {self.id}: Received snapshot end signal from leader session {session_id}. Marking primary view {self.view_id} as complete.")
+                    logger.info(f"Pipe {self.id}: Marked view {self.view_id} as snapshot complete.")
                     
                     # Also mark all other handlers' views as complete if they are different
                     for h_id, handler in self._view_handlers.items():
@@ -658,23 +662,37 @@ class FusionPipe(Pipe):
         """
         start_time = time.time()
         
-        # Fast path
-        async with self._lock:
-            if self._active_pushes <= target_active_pushes and self._event_queue.empty():
-                return True
-        
+        # 1. Wait for queue to be fully processed (including batches currently being handled)
+        try:
+            if timeout:
+                await asyncio.wait_for(self._event_queue.join(), timeout=timeout)
+            else:
+                await self._event_queue.join()
+        except asyncio.TimeoutError:
+            return False
+            
+        # 2. Wait for active pushes to reach target
         if target_active_pushes == 0:
-            # Use event for 0 case
+            # For 0 case, we can also use the event for better responsiveness
+            # though join() already ensured current queue is empty.
+            async with self._lock:
+                if self._active_pushes == 0:
+                    return True
             try:
-                await asyncio.wait_for(self._queue_drained.wait(), timeout=timeout)
+                if timeout:
+                    remaining = timeout - (time.time() - start_time)
+                    if remaining <= 0: return False
+                    await asyncio.wait_for(self._queue_drained.wait(), timeout=remaining)
+                else:
+                    await self._queue_drained.wait()
                 return True
             except asyncio.TimeoutError:
                 return False
         else:
-            # Polling for non-zero target (since event only fires at 0)
+            # Polling for non-zero target
             while True:
                 async with self._lock:
-                    if self._active_pushes <= target_active_pushes and self._event_queue.empty():
+                    if self._active_pushes <= target_active_pushes:
                         return True
                 
                 if timeout and (time.time() - start_time > timeout):
