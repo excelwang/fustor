@@ -105,8 +105,25 @@ async def lifespan(app: FastAPI):
     # Setup SIGHUP for reload
     def handle_reload():
         logger.info("Received SIGHUP - initiating hot reload")
+        # Reload Pipes
         asyncio.create_task(pm.reload())
-    
+        
+        # Reload View Routes (Dynamically update API for new Views)
+        # Note: This relies on APIRouter internals being mutable or using a mounting strategy 
+        # capable of updates. Ideally, check FastAPI docs, but attempting refresh here.
+        try:
+             from .api.views import setup_view_routers
+             setup_view_routers()
+             
+             # Clear ViewManager cache to force re-init of drivers (e.g. multi-fs members)
+             if hasattr(runtime_objects, 'view_managers'):
+                 runtime_objects.view_managers.clear()
+                 logger.info("Cleared ViewManager cache")
+                 
+             logger.info("Refreshed View API routers")
+        except Exception as e:
+             logger.error(f"Failed to refresh view routers: {e}")
+
     try:
         loop = asyncio.get_running_loop()
         import signal
