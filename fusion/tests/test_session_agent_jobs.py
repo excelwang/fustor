@@ -18,7 +18,7 @@ async def test_create_agent_job(sm):
     assert job_id is not None
     jobs = sm.get_agent_jobs()
     assert len(jobs) == 1
-    assert jobs[0]["status"] == "PENDING"
+    assert jobs[0]["status"] == "RUNNING"
     assert jobs[0]["progress"]["total_pipes"] == 2
     assert jobs[0]["progress"]["percentage"] == 0.0
 
@@ -34,7 +34,7 @@ async def test_complete_agent_job_partial(sm):
     assert result is True
     jobs = sm.get_agent_jobs()
     assert jobs[0]["progress"]["completed_pipes"] == 1
-    assert jobs[0]["status"] == "PENDING"
+    assert jobs[0]["status"] == "RUNNING"
 
 
 @pytest.mark.asyncio

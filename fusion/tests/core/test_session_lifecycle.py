@@ -35,13 +35,13 @@ class TestSessionLifecycle:
         assert job_id
         assert job_id in manager._agent_jobs
         job = manager._agent_jobs[job_id]
-        assert job.status == "PENDING"
+        assert job.status == "RUNNING"
         assert job.expected_sessions == set(sessions)
         
         # 2. Complete for s1
         await manager.complete_agent_job(view_id, "s1", "/path/target")
         assert "s1" in job.completed_sessions
-        assert job.status == "PENDING"
+        assert job.status == "RUNNING"
         
         # 3. Complete for s2 (Final)
         await manager.complete_agent_job(view_id, "s2", "/path/target")

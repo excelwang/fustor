@@ -7,7 +7,7 @@ name: Integration Tests
 
 on:
   push:
-    branches: [main, develop, 'refactor/*', 'feature/*']
+    branches: [master, develop, 'refactor/*', 'feature/*']
     paths:
       - 'agent/**'
       - 'fusion/**'
@@ -16,7 +16,7 @@ on:
       - 'tests/e2e/**'
       - '.github/workflows/integration-tests.yml'
   pull_request:
-    branches: [main, develop]
+    branches: [master, develop]
     paths:
       - 'agent/**'
       - 'fusion/**'

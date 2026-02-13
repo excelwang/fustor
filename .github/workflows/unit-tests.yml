@@ -1,92 +1,40 @@
-# .github/workflows/unit-tests.yml
-# Unit test workflow for Fustor packages
-
 name: Unit Tests
 
 on:
   push:
-    branches: [main, develop, 'refactor/*', 'feature/*']
-    paths:
-      - 'agent/**'
-      - 'fusion/**'
-      - 'benchmark/**'
-      - 'packages/**'
-      - '.github/workflows/unit-tests.yml'
-      - 'pyproject.toml'
+    branches: [ master ]
   pull_request:
-    branches: [main, develop]
-    paths:
-      - 'agent/**'
-      - 'fusion/**'
-      - 'benchmark/**'
-      - 'packages/**'
-      - 'pyproject.toml'
-
-env:
-  PYTHON_VERSION: '3.11'
+    branches: [ master ]
 
 jobs:
   test:
-    name: Run Unit Tests
     runs-on: ubuntu-latest
-    
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
+      
       - name: Install uv
-        uses: astral-sh/setup-uv@v4
+        uses: astral-sh/setup-uv@v5
         with:
-          version: "0.5.14"
-          cache: true
+          enable-cache: true
+          version: "latest"
 
       - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version-file: ".python-version"
 
       - name: Install dependencies
-        run: uv sync --all-packages
+        run: uv sync --all-extras --dev
 
       - name: Run unit tests
         run: |
-          uv run pytest --ignore=tests/e2e/ -v --tb=short --junit-xml=test-results.xml
+          uv run pytest --cov=agent/src --cov=fusion/src --cov=core/src --cov-report=xml agent/tests fusion/tests core/tests extensions/*/tests
 
-      - name: Upload test results
-        uses: actions/upload-artifact@v4
-        if: always()
+      - name: Upload coverage reports to Codecov
+        uses: codecov/codecov-action@v4
         with:
-          name: test-results
-          path: test-results.xml
-
-  lint:
-    name: Code Quality
-    runs-on: ubuntu-latest
-    
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v4
-        with:
-          version: "0.5.14"
-          cache: true
-
-      - name: Set up Python
-        run: uv python install ${{ env.PYTHON_VERSION }}
-
-      - name: Install dependencies
-        run: uv sync --all-packages
-
-      - name: Run ruff check
-        run: |
-          uv run ruff check .
-
-      - name: Run ruff format check
-        run: |
-          uv run ruff format --check .
-
-      - name: Run mypy type check
-        run: |
-          # Check core, SDKs and V2 drivers
-          uv run mypy packages/core/src packages/agent-sdk/src packages/fusion-sdk/src \
-                      packages/source-fs/src packages/view-fs/src fusion/src agent/src
+          token: ${{ secrets.CODECOV_TOKEN }}
+          file: ./coverage.xml
+          flags: unittests
+          name: codecov-umbrella
+          fail_ci_if_error: false

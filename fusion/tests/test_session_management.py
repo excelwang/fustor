@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from fustor_fusion.api.session import create_session, _should_allow_new_session
+from fustor_fusion.api.session import create_session
 from fustor_fusion.core.session_manager import session_manager
 from fustor_fusion.view_state_manager import view_state_manager
 
