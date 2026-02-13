@@ -124,6 +124,9 @@ class FusionPipe(Pipe):
         self.HANDLER_TIMEOUT = config.get("handler_timeout", 30.0)  # Seconds
         self.MAX_HANDLER_ERRORS = config.get("max_handler_errors", 50)  # Before disabling
         self.HANDLER_RECOVERY_INTERVAL = config.get("handler_recovery_interval", 60.0) # Seconds cooldown
+        
+        # Lineage cache: session_id -> {agent_id, source_uri}
+        self._session_lineage_cache: Dict[str, Dict[str, str]] = {}
     
     def register_view_handler(self, handler: ViewHandler) -> None:
         """
@@ -326,6 +329,20 @@ class FusionPipe(Pipe):
         
         self.statistics["sessions_created"] += 1
         
+        # Build lineage cache for this session
+        from ..core.session_manager import session_manager
+        session_info = await session_manager.get_session_info(self.view_id, session_id)
+        if session_info:
+            lineage = {}
+            if session_info.source_uri:
+                lineage["source_uri"] = session_info.source_uri
+            if session_info.task_id and ":" in session_info.task_id:
+                lineage["agent_id"] = session_info.task_id.split(":")[0]
+            elif session_info.task_id:
+                lineage["agent_id"] = session_info.task_id
+            if lineage:
+                self._session_lineage_cache[session_id] = lineage
+        
         # Notify view handlers of session start
         for handler in self._view_handlers.values():
             if hasattr(handler, 'on_session_start'):
@@ -343,6 +360,9 @@ class FusionPipe(Pipe):
         # Note: Session removal from backing store is handled by PipeSessionBridge
         
         self.statistics["sessions_closed"] += 1
+        
+        # Clean lineage cache
+        self._session_lineage_cache.pop(session_id, None)
         
         from ..core.session_manager import session_manager
         from ..view_state_manager import view_state_manager
@@ -445,25 +465,8 @@ class FusionPipe(Pipe):
         if skipped_count > 0:
             logger.warning(f"Pipe {self.id}: Skipped {skipped_count}/{len(events)} malformed events in batch")
         
-        # Inject Lineage Info
-        # We need to know WHICH agent sent this event.
-        # This is available in the SessionInfo.
-        from ..core.session_manager import session_manager
-        session_info = await session_manager.get_session_info(self.view_id, session_id)
-        
-        lineage_meta = {}
-        if session_info:
-            if session_info.source_uri:
-                lineage_meta["source_uri"] = session_info.source_uri
-            
-            # task_id format is typically "agent_id:pipe_id"
-            if session_info.task_id and ":" in session_info.task_id:
-                parts = session_info.task_id.split(":")
-                # Assuming standard format, first part is agent_id
-                lineage_meta["agent_id"] = parts[0]
-            elif session_info.task_id:
-                 lineage_meta["agent_id"] = session_info.task_id
-        
+        # Inject Lineage Info from cache (built at session creation)
+        lineage_meta = self._session_lineage_cache.get(session_id, {})
         if lineage_meta:
             for ev in processed_events:
                 if ev.metadata is None:

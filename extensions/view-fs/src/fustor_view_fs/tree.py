@@ -169,6 +169,50 @@ class TreeManager:
             if hasattr(self.state, 'blind_spot_additions'):
                 self.state.blind_spot_additions.discard(path)
 
-            parent = self.state.directory_path_map.get(parent_path)
             if parent:
                 parent.children.pop(name, None)
+
+    def get_subtree_stats(self, path: str) -> Dict[str, Any]:
+        """Calculates stats for a subtree (file_count, dir_count, total_size, latest_mtime)."""
+        path = os.path.normpath(path).rstrip('/') if path != '/' else '/'
+        
+        root_node = self.state.directory_path_map.get(path)
+        if not root_node:
+            # Check if it's a file
+            file_node = self.state.file_path_map.get(path)
+            if file_node:
+                return {
+                    "file_count": 1,
+                    "dir_count": 0,
+                    "total_size": file_node.size or 0,
+                    "latest_mtime": file_node.modified_time
+                }
+            return {} # Not found
+
+        file_count = 0
+        dir_count = 1 # Count self
+        total_size = 0
+        latest_mtime = root_node.modified_time
+
+        stack = [root_node]
+
+        while stack:
+            curr = stack.pop()
+            
+            for child in curr.children.values():
+                if isinstance(child, DirectoryNode):
+                    dir_count += 1
+                    latest_mtime = max(latest_mtime, child.modified_time)
+                    stack.append(child)
+                else:
+                    # FileNode
+                    file_count += 1
+                    total_size += child.size or 0
+                    latest_mtime = max(latest_mtime, child.modified_time)
+
+        return {
+            "file_count": file_count,
+            "dir_count": dir_count,
+            "total_size": total_size,
+            "latest_mtime": latest_mtime
+        }

@@ -1,0 +1,56 @@
+services:
+  fusion:
+    build:
+      context: ..
+      dockerfile: deploy_multi_fs_4node/Dockerfile
+    ports:
+      - "8104:8101"
+      - "18891:18888"
+    volumes:
+      - ./fusion/config/default.yaml:/root/.fustor/fusion-config/default.yaml
+    command: ["fustor-fusion", "start"]
+    networks:
+      - fustor-net
+
+  agent1:
+    build:
+      context: ..
+      dockerfile: deploy_multi_fs_4node/Dockerfile
+    volumes:
+      - ./agent1/config/default.yaml:/root/.fustor/agent-config/default.yaml
+      - ./agent1/data:/data
+    command: ["fustor-agent", "start"]
+    depends_on:
+      - fusion
+    networks:
+      - fustor-net
+
+  agent2:
+    build:
+      context: ..
+      dockerfile: deploy_multi_fs_4node/Dockerfile
+    volumes:
+      - ./agent2/config/default.yaml:/root/.fustor/agent-config/default.yaml
+      - ./agent2/data:/data
+    command: ["fustor-agent", "start"]
+    depends_on:
+      - fusion
+    networks:
+      - fustor-net
+
+  agent3:
+    build:
+      context: ..
+      dockerfile: deploy_multi_fs_4node/Dockerfile
+    volumes:
+      - ./agent3/config/default.yaml:/root/.fustor/agent-config/default.yaml
+      - ./agent3/data:/data
+    command: ["fustor-agent", "start"]
+    depends_on:
+      - fusion
+    networks:
+      - fustor-net
+
+networks:
+  fustor-net:
+    driver: bridge

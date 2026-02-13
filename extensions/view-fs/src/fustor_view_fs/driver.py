@@ -113,6 +113,11 @@ class FSViewDriver(FSViewBase):
         async with self._global_read_lock():
             return self.query.get_stats()
 
+    async def get_subtree_stats(self, path: str) -> Dict[str, Any]:
+        """Calculates stats for a subtree (file_count, dir_count, total_size, latest_mtime) without serialization."""
+        async with self._global_read_lock():
+            return self.tree_manager.get_subtree_stats(path)
+
     async def update_suspect(self, path: str, mtime: float, size: Optional[int] = None):
         """Update suspect status from sentinel feedback.
         

@@ -32,3 +32,4 @@ fustor_home_agent2
 deploy
 docker_deploy/
 deploy_fs_3node_v2
+deploy_multi_fs_4node/
