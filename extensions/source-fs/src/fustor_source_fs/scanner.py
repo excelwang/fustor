@@ -7,7 +7,7 @@ import threading
 from typing import Dict, List, Optional, Callable, Any, Iterator, Tuple, Union
 
 from fustor_core.event import EventBase, UpdateEvent, MessageSource
-from .event_handler import get_file_metadata
+from .event_handler import get_file_metadata, _get_relative_path
 
 logger = logging.getLogger("fustor_agent.driver.fs.scanner")
 
@@ -220,7 +220,7 @@ class FSScanner:
                                 self.engine.increment_pending()
                                 work_q.put(entry.path)
                             elif fnmatch.fnmatch(entry.name, self.engine.file_pattern):
-                                st = entry.stat()
+                                st = os.stat(entry.path)
                                 meta = get_file_metadata(entry.path, root_path=self.root, stat_info=st)
                                 latest_mtime_in_subtree = max(latest_mtime_in_subtree, meta['modified_time'])
                                 local_batch.append(meta)
@@ -335,11 +335,13 @@ class FSScanner:
                             if entry.is_dir(follow_symlinks=False):
                                 local_subdirs.append(entry.path)
                             elif not is_silent and fnmatch.fnmatch(entry.name, self.engine.file_pattern):
-                                logger.debug(f"[audit] Found file during scan: {entry.path}")
-                                st = entry.stat()
+                                # Use os.stat instead of entry.stat() to force attribute refresh on some systems (NFS)
+                                st = os.stat(entry.path)
+                                logger.debug(f"[audit] Found file during scan: {entry.path}, mtime={st.st_mtime}")
                                 meta = get_file_metadata(entry.path, root_path=self.root, stat_info=st)
                                 if meta:
-                                    meta['parent_path'] = root
+                                    # Use relative path for parent_path to match Fusion's tree
+                                    meta['parent_path'] = _get_relative_path(root, self.root)
                                     meta['parent_mtime'] = current_dir_mtime
                                     local_batch.append(meta)
                                     if len(local_batch) >= batch_size:

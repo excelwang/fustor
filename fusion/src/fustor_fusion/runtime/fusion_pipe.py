@@ -108,6 +108,7 @@ class FusionPipe(Pipe):
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
         self._queue_drained = asyncio.Event()  # Signaled when queue becomes empty
         self._queue_drained.set()  # Initially empty
+        self._active_pushes = 0 # Track concurrent push requests
         
         # Statistics
         self.statistics = {
@@ -234,9 +235,11 @@ class FusionPipe(Pipe):
                 
                 self._event_queue.task_done()
                 
-                # Signal queue drain if empty
+                # Signal queue drain if empty and no pushes active
                 if self._event_queue.empty():
-                    self._queue_drained.set()
+                    async with self._lock:
+                        if self._active_pushes == 0:
+                            self._queue_drained.set()
                 
             except asyncio.CancelledError:
                 logger.debug(f"Processing loop cancelled for pipe {self.id}")
@@ -448,100 +451,109 @@ class FusionPipe(Pipe):
         if not self.is_running():
             return {"success": False, "error": "Pipe not running"}
         
-        self.statistics["events_received"] += len(events)
-        logger.debug(f"Pipe {self.id}: Received {len(events)} events from {session_id} (source={source_type})")
-        
-        # Convert dict events to EventBase if needed
-        processed_events = []
-        skipped_count = 0
-        
-        for event in events:
-            if isinstance(event, dict):
-                try:
-                    ev = EventBase.model_validate(event)
-                    processed_events.append(ev)
-                except Exception as e:
-                    logger.warning(f"Pipe {self.id}: Skipping malformed event in batch: {e}")
-                    self.statistics["errors"] += 1
-                    skipped_count += 1
-            else:
-                processed_events.append(event)
-        
-        if skipped_count > 0:
-            logger.warning(f"Pipe {self.id}: Skipped {skipped_count}/{len(events)} malformed events in batch")
-        
-        # Inject Lineage Info from cache (built at session creation)
-        lineage_meta = self._session_lineage_cache.get(session_id, {})
-        if lineage_meta:
-            for ev in processed_events:
-                if ev.metadata is None:
-                    # Efficiently inject cached lineage info
-                    ev.metadata = lineage_meta.copy()
-                else:
-                    ev.metadata.update(lineage_meta)
+        async with self._lock:
+            self._active_pushes += 1
+            self._queue_drained.clear()
 
-        # Handle special phases (config_report, etc.)
-        if source_type == "config_report":
-            metadata = kwargs.get("metadata", {})
-            config_yaml = metadata.get("config_yaml")
-            if config_yaml:
-                session_info = await session_manager.get_session_info(self.view_id, session_id)
-                if session_info:
-                    session_info.reported_config = config_yaml
-                    logger.info(f"Pipe {self.id}: Cached reported config for session {session_id}")
-            return {"success": True, "message": "Config cached"}
-
-        # Queue for processing
-        get_metrics().counter("fustor.fusion.events_received", len(processed_events), {"pipe": self.id, "source": source_type})
-        # Clear drain event since we're adding work
-        self._queue_drained.clear()
-        await self._event_queue.put(processed_events)
-        
-        # Handle snapshot completion signal
-        is_snapshot_end = is_end or kwargs.get("is_snapshot_end", False)
-        if source_type == "snapshot" and is_snapshot_end:
-            from ..view_state_manager import view_state_manager
-            # Only leader can signal snapshot end
-            if await view_state_manager.is_leader(self.view_id, session_id):
-                # Mark primary view complete
-                await view_state_manager.set_snapshot_complete(self.view_id, session_id)
-                logger.info(f"Pipe {self.id}: Received snapshot end signal from leader session {session_id}. Marking primary view {self.view_id} as complete.")
-                
-                # Also mark all other handlers' views as complete if they are different
-                for h_id, handler in self._view_handlers.items():
-                    # Check common adapter patterns
-                    h_view_id = getattr(handler, 'view_id', None)
-                    if not h_view_id and hasattr(handler, 'manager'):
-                        h_view_id = getattr(handler.manager, 'view_id', None)
-                    if not h_view_id and hasattr(handler, '_vm'):
-                        h_view_id = getattr(handler._vm, 'view_id', None)
-                    
-                    if h_view_id and str(h_view_id) != str(self.view_id):
-                        await view_state_manager.set_snapshot_complete(str(h_view_id), session_id)
-                        logger.debug(f"Pipe {self.id}: Also marking view {h_view_id} as complete.")
-            else:
-                logger.warning(f"Pipe {self.id}: Received snapshot end signal from non-leader session {session_id}. Ignored.")
-
-        # Handle audit completion signal
-        if source_type == "audit" and is_end:
-            logger.info(f"Pipe {self.id}: Received AUDIT end signal from session {session_id}. Triggering audit finalization.")
-            # Ensure all previous audit events are processed before finalizing
-            # This prevents race conditions where handle_audit_end reads stale dir metadata
-            await self.wait_for_drain(timeout=30.0)
+        try:
+            self.statistics["events_received"] += len(events)
+            logger.debug(f"Pipe {self.id}: Received {len(events)} events from {session_id} (source={source_type})")
             
-            for handler in self._view_handlers.values():
-                if hasattr(handler, 'handle_audit_end'):
+            # Convert dict events to EventBase if needed
+            processed_events = []
+            skipped_count = 0
+            
+            for event in events:
+                if isinstance(event, dict):
                     try:
-                        await handler.handle_audit_end()
+                        ev = EventBase.model_validate(event)
+                        processed_events.append(ev)
                     except Exception as e:
-                        logger.error(f"Pipe {self.id}: Error in handle_audit_end for {handler}: {e}")
+                        logger.warning(f"Pipe {self.id}: Skipping malformed event in batch: {e}")
+                        self.statistics["errors"] += 1
+                        skipped_count += 1
+                else:
+                    processed_events.append(event)
+            
+            if skipped_count > 0:
+                logger.warning(f"Pipe {self.id}: Skipped {skipped_count}/{len(events)} malformed events in batch")
+            
+            # Inject Lineage Info from cache (built at session creation)
+            lineage_meta = self._session_lineage_cache.get(session_id, {})
+            if lineage_meta:
+                for ev in processed_events:
+                    if ev.metadata is None:
+                        # Efficiently inject cached lineage info
+                        ev.metadata = lineage_meta.copy()
+                    else:
+                        ev.metadata.update(lineage_meta)
 
-        return {
-            "success": True,
-            "count": len(processed_events),
-            "skipped": skipped_count,
-            "source_type": source_type,
-        }
+            # Handle special phases (config_report, etc.)
+            if source_type == "config_report":
+                metadata = kwargs.get("metadata", {})
+                config_yaml = metadata.get("config_yaml")
+                if config_yaml:
+                    session_info = await session_manager.get_session_info(self.view_id, session_id)
+                    if session_info:
+                        session_info.reported_config = config_yaml
+                        logger.info(f"Pipe {self.id}: Cached reported config for session {session_id}")
+                return {"success": True, "message": "Config cached"}
+
+            # Queue for processing
+            if processed_events:
+                get_metrics().counter("fustor.fusion.events_received", len(processed_events), {"pipe": self.id, "source": source_type})
+                await self._event_queue.put(processed_events)
+            
+            # Handle snapshot completion signal
+            is_snapshot_end = is_end or kwargs.get("is_snapshot_end", False)
+            if source_type == "snapshot" and is_snapshot_end:
+                from ..view_state_manager import view_state_manager
+                # Only leader can signal snapshot end
+                if await view_state_manager.is_leader(self.view_id, session_id):
+                    # Mark primary view complete
+                    await view_state_manager.set_snapshot_complete(self.view_id, session_id)
+                    logger.info(f"Pipe {self.id}: Received snapshot end signal from leader session {session_id}. Marking primary view {self.view_id} as complete.")
+                    
+                    # Also mark all other handlers' views as complete if they are different
+                    for h_id, handler in self._view_handlers.items():
+                        # Check common adapter patterns
+                        h_view_id = getattr(handler, 'view_id', None)
+                        if not h_view_id and hasattr(handler, 'manager'):
+                            h_view_id = getattr(handler.manager, 'view_id', None)
+                        if not h_view_id and hasattr(handler, '_vm'):
+                            h_view_id = getattr(handler._vm, 'view_id', None)
+                        
+                        if h_view_id and str(h_view_id) != str(self.view_id):
+                            await view_state_manager.set_snapshot_complete(str(h_view_id), session_id)
+                            logger.debug(f"Pipe {self.id}: Also marking view {h_view_id} as complete.")
+                else:
+                    logger.warning(f"Pipe {self.id}: Received snapshot end signal from non-leader session {session_id}. Ignored.")
+
+            # Handle audit completion signal
+            if source_type == "audit" and is_end:
+                logger.info(f"Pipe {self.id}: Received AUDIT end signal from session {session_id}. Triggering audit finalization.")
+                # Ensure all previous audit events are processed before finalizing
+                # This prevents race conditions where handle_audit_end reads stale dir metadata
+                await self.wait_for_drain(timeout=30.0)
+                
+                for handler in self._view_handlers.values():
+                    if hasattr(handler, 'handle_audit_end'):
+                        try:
+                            await handler.handle_audit_end()
+                        except Exception as e:
+                            logger.error(f"Pipe {self.id}: Error in handle_audit_end for {handler}: {e}")
+
+            return {
+                "success": True,
+                "count": len(processed_events),
+                "skipped": skipped_count,
+                "source_type": source_type,
+            }
+        finally:
+            async with self._lock:
+                self._active_pushes -= 1
+                if self._active_pushes == 0 and self._event_queue.empty():
+                    self._queue_drained.set()
 
     
     # --- View Access ---
@@ -635,9 +647,10 @@ class FusionPipe(Pipe):
         return self._cached_leader_session
     
     async def wait_for_drain(self, timeout: float = None) -> bool:
-        """Wait until the event queue is empty."""
-        if self._event_queue.empty():
-            return True
+        """Wait until the event queue is empty and no pushes are active."""
+        async with self._lock:
+            if self._active_pushes == 0 and self._event_queue.empty():
+                return True
         try:
             await asyncio.wait_for(self._queue_drained.wait(), timeout=timeout)
             return True

@@ -17,8 +17,8 @@ COPY . .
 RUN uv pip install --system \
     ./core \
     ./agent-sdk \
-    ./fusion-sdk \
-    ./fusion \
+    ./management-ui ./fusion-sdk \
+    ./management-ui ./fusion \
     ./agent \
     ./benchmark \
     ./extensions/view-fs \
