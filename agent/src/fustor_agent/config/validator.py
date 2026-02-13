@@ -32,6 +32,10 @@ class ConfigValidator:
             errors.append(f"Failed to load configuration files: {e}")
             return False, errors
 
+        # 0. Validate Global Settings
+        if not getattr(self.loader, "agent_id", None):
+            errors.append("Global 'agent_id' is missing in configuration. It is required for Multi-FS identification.")
+
         # 1. Validate Sources
         sources = self.loader.get_all_sources()
         for s_id, s_cfg in sources.items():
