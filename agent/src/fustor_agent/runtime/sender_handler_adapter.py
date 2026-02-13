@@ -160,6 +160,7 @@ class SenderHandlerAdapter(SenderHandler):
             "message": "message",
             "on_demand_job": "on_demand_job",
             "job_complete": "job_complete",
+            "config_report": "config_report",
         }
         source_type = source_type_map.get(phase, "message")
         

@@ -23,6 +23,7 @@ class SessionInfo:
             self.pending_scans = set()
     can_realtime: bool = False
     agent_status: Optional[Dict[str, Any]] = None  # Cached agent status from heartbeat
+    reported_config: Optional[str] = None  # Cached YAML config from Agent
     cleanup_task: Optional[asyncio.Task] = None
 
 

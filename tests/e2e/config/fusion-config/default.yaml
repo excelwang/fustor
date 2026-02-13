@@ -1,6 +1,4 @@
 host: ${FUSTOR_FUSION_HOST}
-port: ${FUSTOR_FUSION_PORT}
-session_cleanup_interval: 1
 logging: ${FUSTOR_LOG_LEVEL}
 pipes:
   ${TEST_VIEW_ID}:
@@ -10,15 +8,23 @@ pipes:
     session_timeout_seconds: ${TEST_SESSION_TIMEOUT}
     views:
     - ${TEST_VIEW_ID}
+  pipe-extra:
+    receiver: http-main
+    views:
+    - view-extra
+port: ${FUSTOR_FUSION_PORT}
 receivers:
   http-main:
     api_keys:
     - key: ${TEST_API_KEY}
       pipe_id: ${TEST_VIEW_ID}
+    - key: extra-api-key
+      pipe_id: pipe-extra
     bind_host: 0.0.0.0
     driver: http
     port: 18888
     session_timeout_seconds: ${TEST_SESSION_TIMEOUT}
+session_cleanup_interval: 1
 views:
   ${TEST_VIEW_ID}:
     api_keys:
@@ -34,7 +40,14 @@ views:
     driver_params:
       root_dir: /data/fusion/archive_fanout
   global-multi-fs:
-    driver: multi-fs
     api_keys:
     - test-query-key-456
-    driver_params: {}
+    driver: multi-fs
+    driver_params:
+      members:
+      - integration-test-ds
+      - view-extra
+  view-extra:
+    driver: fs
+    driver_params:
+      hot_file_threshold: 60.0

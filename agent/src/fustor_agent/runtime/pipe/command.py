@@ -31,6 +31,8 @@ class PipeCommandMixin:
                     await self._handle_command_stop_pipe(cmd)
                 elif cmd_type == "update_config":
                     self._handle_command_update_config(cmd)
+                elif cmd_type == "report_config":
+                    self._handle_command_report_config(cmd)
                 else:
                     logger.warning(f"Pipe {self.id}: Unknown command type '{cmd_type}'")
             except Exception as e:
@@ -192,3 +194,40 @@ class PipeCommandMixin:
                     logger.info(f"Pipe {self.id}: Restored backup after write failure")
                 except Exception as restore_err:
                     logger.error(f"Pipe {self.id}: Failed to restore backup: {restore_err}")
+
+    def _handle_command_report_config(self: "AgentPipe", cmd: Dict[str, Any]) -> None:
+        """
+        Handle 'report_config' command.
+        Reads the local config file and sends it back to Fusion.
+        """
+        filename = cmd.get("filename", "default.yaml")
+        from fustor_core.common import get_fustor_home_dir
+        
+        # Sanitize filename
+        safe_name = os.path.basename(filename)
+        if not safe_name.endswith((".yaml", ".yml")):
+            safe_name += ".yaml"
+            
+        config_path = get_fustor_home_dir() / "agent-config" / safe_name
+        
+        try:
+            if config_path.exists():
+                config_yaml = config_path.read_text(encoding="utf-8")
+                
+                # Send back as a metadata-only batch
+                asyncio.create_task(self.sender_handler.send_batch(
+                    self.session_id, 
+                    [], 
+                    {
+                        "phase": "config_report",
+                        "metadata": {
+                            "filename": safe_name,
+                            "config_yaml": config_yaml
+                        }
+                    }
+                ))
+                logger.info(f"Pipe {self.id}: Reported config from {config_path}")
+            else:
+                logger.error(f"Pipe {self.id}: Config file {config_path} not found for reporting")
+        except Exception as e:
+            logger.error(f"Pipe {self.id}: Failed to report config: {e}")

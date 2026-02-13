@@ -289,6 +289,48 @@ async def push_agent_config(agent_id: str, payload: AgentConfigUpdateRequest):
     }
 
 
+@router.get("/agents/{agent_id}/config")
+async def get_agent_config(agent_id: str, trigger: bool = False, filename: str = "default.yaml"):
+    """
+    Get the cached configuration of an agent.
+    If 'trigger' is True, queues a 'report_config' command to refresh the cache.
+    """
+    all_sessions = await session_manager.get_all_active_sessions()
+    
+    agent_sessions = []
+    cached_config = None
+    
+    for view_id, sess_map in all_sessions.items():
+        for sid, si in sess_map.items():
+            if si.task_id:
+                parts = si.task_id.split(":")
+                if parts[0] == agent_id:
+                    agent_sessions.append((view_id, sid, si))
+                    if getattr(si, 'reported_config', None):
+                        cached_config = si.reported_config
+
+    if not agent_sessions:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No active sessions found for agent '{agent_id}'",
+        )
+
+    if trigger:
+        command_dict = {
+            "type": "report_config",
+            "filename": filename
+        }
+        # Trigger on all sessions to ensure at least one picks it up quickly
+        for v_id, s_id, _ in agent_sessions:
+            await session_manager.queue_command(v_id, s_id, command_dict)
+        return {"status": "triggered", "message": "report_config command queued"}
+
+    if cached_config:
+        return {"status": "ok", "config_yaml": cached_config}
+    else:
+        return {"status": "pending", "message": "Config not yet reported. Use ?trigger=true to request it."}
+
+
 # ---------------------------------------------------------------------------
 # Configuration view
 # ---------------------------------------------------------------------------

@@ -475,6 +475,17 @@ class FusionPipe(Pipe):
                 else:
                     ev.metadata.update(lineage_meta)
 
+        # Handle special phases (config_report, etc.)
+        if source_type == "config_report":
+            metadata = kwargs.get("metadata", {})
+            config_yaml = metadata.get("config_yaml")
+            if config_yaml:
+                session_info = await session_manager.get_session_info(self.view_id, session_id)
+                if session_info:
+                    session_info.reported_config = config_yaml
+                    logger.info(f"Pipe {self.id}: Cached reported config for session {session_id}")
+            return {"success": True, "message": "Config cached"}
+
         # Queue for processing
         get_metrics().counter("fustor.fusion.events_received", len(processed_events), {"pipe": self.id, "source": source_type})
         # Clear drain event since we're adding work

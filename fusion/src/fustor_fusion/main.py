@@ -103,39 +103,36 @@ async def lifespan(app: FastAPI):
     suspect_cleanup_task = asyncio.create_task(periodic_suspect_cleanup())
     
     # Setup SIGHUP for reload
-    def handle_reload():
-        logger.info("Received SIGHUP - initiating hot reload")
-        # Reload Pipes
-        asyncio.create_task(pm.reload())
-        
-        # Reload View Routes (Dynamically update API for new Views)
-        # Note: This relies on APIRouter internals being mutable or using a mounting strategy 
-        # capable of updates. Ideally, check FastAPI docs, but attempting refresh here.
+    async def _async_reload():
         try:
-            from .api.views import setup_view_routers
-            setup_view_routers()
-            
-            # Clear ViewManager cache to force re-init of drivers (e.g. multi-fs members)
+            # 1. Clear ViewManager cache first to force re-init of drivers
             if hasattr(runtime_objects, 'view_managers'):
-                # Issue 3: Cleanup resources before clearing cache
-                for name, mgr in runtime_objects.view_managers.items():
+                for name, mgr in list(runtime_objects.view_managers.items()):
                     try:
                         if hasattr(mgr, 'close'):
-                            # Note: handle_reload is sync, assuming close() is sync or we need to schedule it
-                            # If close() is async, we should use create_task
                             if asyncio.iscoroutinefunction(mgr.close):
-                                asyncio.create_task(mgr.close())
+                                await mgr.close()
                             else:
                                 mgr.close()
                     except Exception as e:
                         logger.warning(f"Error closing view manager {name}: {e}")
-
                 runtime_objects.view_managers.clear()
                 logger.info("Cleared ViewManager cache")
-                
+
+            # 2. Reload Pipes (re-reading config and restarting pipes)
+            await pm.reload()
+            
+            # 3. Refresh View API routers
+            from .api.views import setup_view_routers
+            setup_view_routers()
             logger.info("Refreshed View API routers")
+            logger.info("Hot reload complete")
         except Exception as e:
-            logger.error(f"Failed to refresh view routers: {e}")
+            logger.error(f"Hot reload failed: {e}", exc_info=True)
+
+    def handle_reload():
+        logger.info("Received SIGHUP - initiating hot reload")
+        asyncio.create_task(_async_reload())
 
     try:
         loop = asyncio.get_running_loop()

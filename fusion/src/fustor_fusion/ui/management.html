@@ -469,11 +469,19 @@
         const API = '/api/v1/management';
         let autoRefreshTimer = null;
 
+        /** Simple XSS protection */
+        function escapeHtml(text) {
+            if (text == null) return '';
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
         // --- Auth key management ---
         function getKey() { return localStorage.getItem('mgmt_key') || ''; }
         function setKey(k) { localStorage.setItem('mgmt_key', k); }
         function promptKey() {
-            const k = prompt('Enter management API key:', getKey());
+            const k = prompt('Enter management API key (Configured in fusion.management_api_key):', getKey());
             if (k !== null) { setKey(k); refresh(); }
         }
 
@@ -486,17 +494,26 @@
                 promptKey();
                 throw new Error('Authentication required');
             }
-            if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+            if (!res.ok) {
+                let err = res.statusText;
+                try { 
+                    const data = await res.json();
+                    if (data.detail) err = data.detail;
+                } catch(e) {}
+                const error = new Error(`${res.status} ${err}`);
+                error.status = res.status;
+                throw error;
+            }
             return res.json();
         }
 
         function showError(msg) {
             const el = document.getElementById('error');
-            el.innerHTML = msg ? `<div class="error-msg">${msg}</div>` : '';
+            el.innerHTML = msg ? `<div class="error-msg">${escapeHtml(msg)}</div>` : '';
         }
 
         function badge(text, type) {
-            return `<span class="badge badge-${type}">${text}</span>`;
+            return `<span class="badge badge-${type}">${escapeHtml(text)}</span>`;
         }
 
         function formatAge(seconds) {
@@ -515,6 +532,11 @@
                     'Updated: ' + new Date().toLocaleTimeString();
             } catch (e) {
                 showError('Failed to load dashboard: ' + e.message);
+                // Clear UI on auth error
+                if (e.status === 401 || e.status === 403) {
+                    document.getElementById('agentsBody').innerHTML = '';
+                    document.getElementById('pipesBody').innerHTML = '';
+                }
             }
         }
 
@@ -534,15 +556,14 @@
 
             // Agents table
             const agentsHtml = Object.entries(agents).map(([id, a]) => {
-                const status = a.status;
-                const evts = status ? (status.events_pushed || 0) : '-';
                 return `<tr>
-                <td class="mono">${id}</td>
-                <td class="mono">${a.client_ip || '-'}</td>
+                <td class="mono">${escapeHtml(id)}</td>
+                <td class="mono">${escapeHtml(a.client_ip || '-')}</td>
                 <td>${a.sessions ? a.sessions.length : 0}</td>
                 <td>
-                    <button class="btn btn-sm" onclick="editConfig('${id}')">Edit Config</button>
-                    <button class="btn btn-sm" onclick="sendCmd('${id}','reload_config')">Reload</button>
+                    <button class="btn btn-sm" onclick="editConfig('${escapeHtml(id)}')">Edit Config</button>
+                    <button class="btn btn-sm" onclick="sendCmd('${escapeHtml(id)}','reload_config')">Reload</button>
+                    <button class="btn btn-sm" onclick="sendCmd('${escapeHtml(id)}','scan')">Scan</button>
                 </td>
             </tr>`;
             }).join('');
@@ -559,8 +580,8 @@
                 if (state.includes('STOPPED')) stateBadge = badge('STOPPED', 'red');
 
                 return `<tr>
-                <td class="mono">${id}</td>
-                <td class="mono">${p.view_id || id}</td>
+                <td class="mono">${escapeHtml(id)}</td>
+                <td class="mono">${escapeHtml(p.view_id || id)}</td>
                 <td>${sessCnt}</td>
                 <td>${stateBadge}</td>
             </tr>`;
@@ -579,9 +600,9 @@
                     const evts = agentStatus.events_pushed != null ? agentStatus.events_pushed : '-';
 
                     sessionsHtml += `<tr>
-                    <td class="mono" title="${s.session_id}">${s.session_id.substring(0, 8)}…</td>
-                    <td class="mono">${viewId}</td>
-                    <td class="mono">${s.agent_id || '-'}</td>
+                    <td class="mono" title="${escapeHtml(s.session_id)}">${escapeHtml(s.session_id.substring(0, 8))}…</td>
+                    <td class="mono">${escapeHtml(viewId)}</td>
+                    <td class="mono">${escapeHtml(s.agent_id || '-')}</td>
                     <td>${roleBadge}</td>
                     <td>${rt}</td>
                     <td>${formatAge(s.age_seconds)}</td>
@@ -637,12 +658,37 @@
 
         let _editingAgentId = null;
 
-        function editConfig(agentId) {
+        async function editConfig(agentId) {
             _editingAgentId = agentId;
             document.getElementById('configModalTitle').textContent = `Edit Config: ${agentId}`;
-            document.getElementById('configEditor').value = '';
+            document.getElementById('configEditor').value = 'Loading current configuration...';
             document.getElementById('configFilename').value = 'default.yaml';
             document.getElementById('configModal').classList.add('active');
+
+            try {
+                let data = await api(`/agents/${agentId}/config`);
+                
+                // If config not yet reported, trigger a report and retry once
+                if (data.status === 'pending') {
+                    await api(`/agents/${agentId}/config?trigger=true`);
+                    document.getElementById('configEditor').value = 'Requesting configuration from agent... please wait.';
+                    
+                    // Poll for up to 5 seconds
+                    for (let i = 0; i < 5; i++) {
+                        await new Promise(r => setTimeout(r, 1000));
+                        data = await api(`/agents/${agentId}/config`);
+                        if (data.status === 'ok') break;
+                    }
+                }
+
+                if (data.status === 'ok') {
+                    document.getElementById('configEditor').value = data.config_yaml;
+                } else {
+                    document.getElementById('configEditor').value = '# Failed to fetch config. You can still write and push a new one.\n' + (data.message || '');
+                }
+            } catch (e) {
+                document.getElementById('configEditor').value = '# Error fetching config: ' + e.message;
+            }
         }
 
         function closeConfigModal() {
@@ -654,7 +700,9 @@
             if (!_editingAgentId) return;
             const yaml = document.getElementById('configEditor').value.trim();
             const filename = document.getElementById('configFilename').value.trim();
-            if (!yaml) { alert('Config content is empty'); return; }
+            if (!yaml || yaml.startsWith('# Error') || yaml.startsWith('# Failed')) { 
+                if (!confirm('Content looks like an error or is empty. Push anyway?')) return;
+            }
             if (!confirm(`Push config to agent ${_editingAgentId}?`)) return;
             try {
                 const res = await api(`/agents/${_editingAgentId}/config`, {
@@ -662,7 +710,7 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ config_yaml: yaml, filename }),
                 });
-                alert(`Config pushed (${res.sessions_queued} sessions queued). Agent will reload on next heartbeat.`);
+                alert(`Config pushed (${res.sessions_queued} sessions queued). Agent will validate and reload.`);
                 closeConfigModal();
             } catch (e) {
                 alert('Push failed: ' + e.message);

@@ -89,7 +89,7 @@ class SessionInfo:
 
 # Type aliases for callbacks
 SessionCreatedCallback = Callable[[str, str, str, Dict[str, Any], int], Awaitable[SessionInfo]]
-EventReceivedCallback = Callable[[str, List[EventBase], str, bool], Awaitable[bool]]
+EventReceivedCallback = Callable[[str, List[EventBase], str, bool, Optional[Dict[str, Any]]], Awaitable[bool]]
 HeartbeatCallback = Callable[[str, bool], Awaitable[Dict[str, Any]]]
 SessionClosedCallback = Callable[[str], Awaitable[None]]
 
@@ -430,7 +430,7 @@ class HTTPReceiver(Receiver):
             if receiver._on_event_received:
                 try:
                     success = await receiver._on_event_received(
-                        session_id, batch.events, batch.source_type, batch.is_end
+                        session_id, batch.events, batch.source_type, batch.is_end, batch.metadata
                     )
                     if success:
                         receiver._ingest_count += 1

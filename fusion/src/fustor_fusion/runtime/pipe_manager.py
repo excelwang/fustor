@@ -200,30 +200,53 @@ class PipeManager:
         
         async with self._init_lock:
             current_pipe_ids = set(self._pipes.keys())
-            diff = fusion_config.get_diff(current_pipe_ids)
             
+            # Detect changed pipes by comparing their resolved config (simplified)
+            # A more robust way is to hash the resolved config, but for now we can 
+            # just treat all existing pipes as potentially modified and restart them
+            # to be safe, or compare their resolved config dicts.
+            modified = set()
+            for p_id in current_pipe_ids:
+                old_pipe = self._pipes[p_id]
+                new_resolved = fusion_config.resolve_pipe_refs(p_id)
+                if not new_resolved:
+                    continue # Will be handled by removed
+                
+                # Compare critical parts: receiver ID and view IDs
+                # Note: This is an optimization. In a real system we'd compare the whole config.
+                p_cfg = new_resolved['pipe']
+                r_cfg = new_resolved['receiver']
+                v_ids = sorted(list(new_resolved['views'].keys()))
+                
+                # Check if p_cfg or r_cfg or views changed
+                # For simplicity, we can just restart any pipe that is still in config
+                # because we don't track the 'old_resolved' currently.
+                # However, to avoid excessive restarts, let's at least check if it's still enabled.
+                modified.add(p_id)
+
+            diff = fusion_config.get_diff(current_pipe_ids)
             added = diff["added"]
             removed = diff["removed"]
             
-            if not added and not removed:
+            if not added and not removed and not modified:
                 logger.info("No configuration changes affecting pipes.")
                 return
                 
-            logger.info(f"Config change detected: added={added}, removed={removed}")
+            logger.info(f"Config change detected: added={added}, removed={removed}, modified={len(modified)}")
             
-            # 1. Stop removed pipes
-            for p_id in removed:
+            # 1. Stop removed AND modified pipes
+            for p_id in (removed | modified):
                 pipe = self._pipes.pop(p_id, None)
                 if pipe:
                     await pipe.stop()
                     self._bridges.pop(p_id, None)
-                    logger.info(f"Pipe '{p_id}' stopped during reload")
+                    logger.info(f"Pipe '{p_id}' stopped for reload/update")
             
-            # 2. Re-initialize and start added pipes
-            if added:
-                # We reuse initialize_pipes but only for the added set
-                await self.initialize_pipes(list(added))
-                for p_id in added:
+            # 2. Re-initialize and start added AND modified pipes
+            to_start = added | modified
+            if to_start:
+                await self.initialize_pipes(list(to_start))
+                for p_id in to_start:
                     if p_id in self._pipes:
                         await self._pipes[p_id].start()
             
@@ -307,12 +330,13 @@ class PipeManager:
             info.sentinel_interval_sec = sentinel_interval
             return info
 
-    async def _on_event_received(self, session_id, events, source_type, is_end):
+    async def _on_event_received(self, session_id, events, source_type, is_end, metadata=None):
         pipe_id = self._session_to_pipe.get(session_id)
         if pipe_id:
             pipe = self._pipes.get(pipe_id)
             if pipe:
-                res = await pipe.process_events(events, session_id, source_type, is_end=is_end)
+                # metadata is passed as part of kwargs
+                res = await pipe.process_events(events, session_id, source_type, is_end=is_end, metadata=metadata)
                 return res.get("success", False)
         # Session not found or pipe gone
         raise ValueError(f"Session {session_id} not found or expired")
