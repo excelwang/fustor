@@ -20,6 +20,7 @@ class FusionGlobalConfig(BaseModel):
     host: str = Field(default="0.0.0.0", description="管理 API 监听地址")
     port: int = Field(default=8101, description="管理 API 监听端口")
     session_cleanup_interval: float = Field(default=5.0, description="会话清理间隔(秒)")
+    management_api_key: Optional[str] = Field(default=None, description="管理 API 密钥，为空则不鉴权")
 
 
 

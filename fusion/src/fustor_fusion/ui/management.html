@@ -329,6 +329,7 @@
         <h1>⚡ Fustor Management Console</h1>
         <div class="header-actions">
             <span class="refresh-info" id="lastRefresh">-</span>
+            <button class="btn" onclick="promptKey()" title="Set management key">🔑</button>
             <button class="btn" onclick="refresh()">↻ Refresh</button>
             <button class="btn btn-primary" onclick="reloadFusion()">⟳ Reload Fusion</button>
         </div>
@@ -468,8 +469,23 @@
         const API = '/api/v1/management';
         let autoRefreshTimer = null;
 
+        // --- Auth key management ---
+        function getKey() { return localStorage.getItem('mgmt_key') || ''; }
+        function setKey(k) { localStorage.setItem('mgmt_key', k); }
+        function promptKey() {
+            const k = prompt('Enter management API key:', getKey());
+            if (k !== null) { setKey(k); refresh(); }
+        }
+
         async function api(path, opts = {}) {
+            opts.headers = opts.headers || {};
+            const key = getKey();
+            if (key) opts.headers['X-Management-Key'] = key;
             const res = await fetch(API + path, opts);
+            if (res.status === 401 || res.status === 403) {
+                promptKey();
+                throw new Error('Authentication required');
+            }
             if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
             return res.json();
         }

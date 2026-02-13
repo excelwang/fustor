@@ -164,33 +164,185 @@ app.mount("/ui", StaticFiles(directory="ui", html=True))
 
 ---
 
-## 4. 对架构的影响
+### Phase 4: 远程 Agent 升级 (~200 行)
 
-### 4.1 不变的部分
+通过 heartbeat 命令通道触发 Agent 自升级，采用 `pip install + os.execv()` 方案。
+
+#### 4.1 升级流程
+
+```
+Fusion Management UI             Fusion API               Agent
+       │                            │                       │
+       │── POST /agents/{id}/       │                       │
+       │   upgrade {version}        │                       │
+       │                            │── queue command ──────>│ (heartbeat response)
+       │                            │   {type: "upgrade",   │
+       │                            │    version: "1.2.0"}  │
+       │                            │                       │
+       │                            │                       ├─ 1. 检测环境 (venv/system)
+       │                            │                       ├─ 2. pip install fustor-agent==1.2.0
+       │                            │                       ├─ 3. 子进程验证新版本可导入
+       │                            │                       ├─ 4. os.execv() 重启自身
+       │                            │                       │
+       │                            │   (进程重启, ~5-10s)   │
+       │                            │                       │
+       │                            │<── heartbeat ─────────│ agent_status.version = "1.2.0"
+       │                            │                       │
+       │<── dashboard 显示新版本 ───│                       │
+```
+
+#### 4.2 Venv 环境检测
+
+Agent 必须正确识别自身运行环境，使用对应的 pip 路径：
+
+```python
+import sys
+
+def _get_pip_executable() -> str:
+    """获取当前环境的 pip 路径。"""
+    # 检测 venv/virtualenv
+    if hasattr(sys, 'real_prefix') or (
+        hasattr(sys, 'base_prefix') and sys.base_prefix != sys.prefix
+    ):
+        # 在 venv 中，使用 venv 内的 python -m pip
+        return sys.executable  # 后续用 [sys.executable, "-m", "pip", ...]
+    else:
+        # 系统环境，同样用当前解释器
+        return sys.executable
+```
+
+> **关键**: 始终使用 `sys.executable -m pip` 而非裸 `pip` 命令，确保在正确的 Python 环境中安装。
+
+#### 4.3 命令处理器设计
+
+新增 `upgrade_agent` 命令类型：
+
+```python
+def _handle_command_upgrade(self, cmd):
+    target_version = cmd.get("version")
+    current_version = _get_current_version()
+    
+    if target_version == current_version:
+        logger.info(f"Already at version {current_version}, skip")
+        return
+    
+    pip_cmd = [sys.executable, "-m", "pip", "install",
+               f"fustor-agent=={target_version}"]
+    
+    # 可选: 私有源
+    index_url = cmd.get("index_url")
+    if index_url:
+        pip_cmd += ["--index-url", index_url]
+    
+    # Step 1: 安装
+    result = subprocess.run(pip_cmd, capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        logger.error(f"pip install failed: {result.stderr}")
+        return
+    
+    # Step 2: 验证（用子进程，不受当前进程已加载模块影响）
+    verify = subprocess.run(
+        [sys.executable, "-c",
+         "import fustor_agent; print(fustor_agent.__version__)"],
+        capture_output=True, text=True, timeout=10
+    )
+    if verify.returncode != 0 or verify.stdout.strip() != target_version:
+        logger.error(f"Verification failed, rolling back")
+        subprocess.run([sys.executable, "-m", "pip", "install",
+                       f"fustor-agent=={current_version}"],
+                      capture_output=True, timeout=120)
+        return
+    
+    # Step 3: 重启
+    logger.info(f"Upgrade verified. Restarting: {sys.argv}")
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+```
+
+#### 4.4 安全机制
+
+| 机制 | 实现 |
+|:---|:---|
+| **YAML 版本号校验** | Fusion API 端校验 version 格式 (PEP 440) |
+| **安装后验证** | 子进程 `import` + `__version__` 比对 |
+| **自动回滚** | 验证失败时 `pip install` 回退到旧版本 |
+| **Fusion 侧超时** | 命令带 `upgrade_timeout_sec`，超时未见新版本 heartbeat 标记失败 |
+| **灰度升级** | 指定单个 `agent_id` 升级，逐台推进 |
+| **venv 隔离** | 检测 `sys.prefix != sys.base_prefix`，始终用 `sys.executable -m pip` |
+
+#### 4.5 版本上报扩展
+
+`agent_status` 在 heartbeat 中增加 `version` 字段：
+
+```python
+def _build_agent_status(self) -> Dict[str, Any]:
+    return {
+        "agent_id": ...,
+        "version": _get_current_version(),  # NEW
+        "pipe_id": self.id,
+        "state": str(self.state),
+        ...
+    }
+```
+
+#### 4.6 Session 连续性
+
+- 升级期间 heartbeat 中断约 5-10 秒
+- `session_timeout_seconds` 默认 30 秒，不会触发清理
+- Agent 重启后创建新 session，旧 session 自然过期
+
+#### 4.7 Management API
+
+```python
+POST /management/agents/{agent_id}/upgrade
+Body: {
+    "version": "1.2.0",
+    "index_url": null,              # 可选，私有 PyPI 源
+    "upgrade_timeout_sec": 60       # 可选，超时秒数
+}
+Response: {
+    "status": "ok",
+    "agent_id": "agent-1",
+    "target_version": "1.2.0",
+    "sessions_queued": 1
+}
+```
+
+#### 4.8 UI 扩展
+
+Agent 列表新增:
+- 版本号显示列
+- "Upgrade" 按钮 → 弹出版本输入框 → 调用 upgrade API
+
+---
+
+## 5. 对架构的影响
+
+### 5.1 不变的部分
 
 - 3 层对称模型 (Source/Pipe/Sender ↔ Receiver/Pipe/View)
 - 6 层分层架构
 - 一致性模型 (Tombstone/Suspect/Blind-spot)
 - Agent ↔ Fusion 数据通道协议
 
-### 4.2 扩展的部分
+### 5.2 扩展的部分
 
 - Heartbeat payload 增加 `agent_status` 字段（向后兼容，可选字段）
 - Heartbeat response `commands` 增加新命令类型（Agent 忽略未知命令）
 - `management.py` 从 28 行扩展为 ~300 行
 - 新增 `ui/` 静态资源目录
 
-### 4.3 向后兼容性
+### 5.3 向后兼容性
 
 所有扩展均为**可选字段追加**，不修改已有协议。旧版 Agent 连接新版 Fusion 不受影响（忽略新命令），新版 Agent 连接旧版 Fusion 也不受影响（`agent_status` 被忽略）。
 
 ---
 
-## 5. 工作量估算
+## 6. 工作量估算
 
 | Phase | 工作量 | 新增代码 | 涉及文件 |
 |:---|:---|:---|:---|
 | 1. 管理 API | 2-3 天 | ~300 行 | `management.py`, `command.py`, `session_manager.py` |
 | 2. 状态上报 | 1 天 | ~100 行 | `agent_pipe.py`, `session.py`, `session_manager.py` |
-| 3. Web UI | 2-3 天 | ~500 行 | `ui/index.html` (新建) |
-| **总计** | **~6 天** | **~900 行** | |
+| 3. Web UI | 2-3 天 | ~500 行 | `ui/management.html` (新建) |
+| 4. 远程升级 | 1-2 天 | ~200 行 | `command.py`, `management.py`, `agent_pipe.py`, `management.html` |
+| **总计** | **~8 天** | **~1100 行** | |

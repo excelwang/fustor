@@ -13,7 +13,7 @@ import signal
 import time
 import logging
 from typing import Dict, Any, Optional
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Header, Depends
 from pydantic import BaseModel
 
 from ..config.unified import fusion_config
@@ -21,7 +21,41 @@ from ..core.session_manager import session_manager
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/management", tags=["Management"])
+
+# ---------------------------------------------------------------------------
+# Management auth dependency
+# ---------------------------------------------------------------------------
+
+async def require_management_key(
+    x_management_key: Optional[str] = Header(None, alias="X-Management-Key"),
+) -> None:
+    """
+    Validate management API key.
+    
+    If fusion.management_api_key is configured, all management endpoints
+    require a matching X-Management-Key header.
+    If not configured, management API is open (backward compatible).
+    """
+    configured_key = fusion_config.fusion.management_api_key
+    if not configured_key:
+        return  # No key configured → open access
+    if not x_management_key:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="X-Management-Key header is required",
+        )
+    if x_management_key != configured_key:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Invalid management key",
+        )
+
+
+router = APIRouter(
+    prefix="/management",
+    tags=["Management"],
+    dependencies=[Depends(require_management_key)],
+)
 
 
 # ---------------------------------------------------------------------------
