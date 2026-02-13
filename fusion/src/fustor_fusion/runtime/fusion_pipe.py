@@ -534,7 +534,8 @@ class FusionPipe(Pipe):
                 logger.info(f"Pipe {self.id}: Received AUDIT end signal from session {session_id}. Triggering audit finalization.")
                 # Ensure all previous audit events are processed before finalizing
                 # This prevents race conditions where handle_audit_end reads stale dir metadata
-                await self.wait_for_drain(timeout=30.0)
+                # We target 1 because this current push is still active
+                await self.wait_for_drain(timeout=30.0, target_active_pushes=1)
                 
                 for handler in self._view_handlers.values():
                     if hasattr(handler, 'handle_audit_end'):
@@ -646,16 +647,40 @@ class FusionPipe(Pipe):
         """
         return self._cached_leader_session
     
-    async def wait_for_drain(self, timeout: float = None) -> bool:
-        """Wait until the event queue is empty and no pushes are active."""
+    async def wait_for_drain(self, timeout: float = None, target_active_pushes: int = 0) -> bool:
+        """
+        Wait until the event queue is empty and active pushes reach target.
+        
+        Args:
+            timeout: Max time to wait
+            target_active_pushes: The number of active pushes to wait for (default 0).
+                                  Set to 1 if calling from within a push handler.
+        """
+        start_time = time.time()
+        
+        # Fast path
         async with self._lock:
-            if self._active_pushes == 0 and self._event_queue.empty():
+            if self._active_pushes <= target_active_pushes and self._event_queue.empty():
                 return True
-        try:
-            await asyncio.wait_for(self._queue_drained.wait(), timeout=timeout)
-            return True
-        except asyncio.TimeoutError:
-            return False
+        
+        if target_active_pushes == 0:
+            # Use event for 0 case
+            try:
+                await asyncio.wait_for(self._queue_drained.wait(), timeout=timeout)
+                return True
+            except asyncio.TimeoutError:
+                return False
+        else:
+            # Polling for non-zero target (since event only fires at 0)
+            while True:
+                async with self._lock:
+                    if self._active_pushes <= target_active_pushes and self._event_queue.empty():
+                        return True
+                
+                if timeout and (time.time() - start_time > timeout):
+                    return False
+                
+                await asyncio.sleep(0.1)
 
     def __str__(self) -> str:
         return f"FusionPipe({self.id}, state={self.state.name})"

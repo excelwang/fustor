@@ -494,9 +494,8 @@ Agent 通过 API 发送生命周期信号，触发 Fusion 的一致性处理：
 ---
 
 ## 8. 哨兵巡检 (Sentinel Sweep)
-
-- **触发者**：Leader Agent
-- **频率**：2 分钟/次 (可配置 `sentinel_interval_sec`)
+- **Sentinels (Every 5 minutes)**: Short cycle integrity check.
+- **Audit (Every 12 hours)**: Long cycle complete consistency check.
 - **目的**：验证 Suspect List 中文件的 mtime 稳定性
 - **实现**：Agent 调用 `FSDriver.perform_sentinel_check()` 获取文件最新状态
 

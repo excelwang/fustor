@@ -42,8 +42,8 @@ class AgentPipeConfig(BaseModel):
     sender: str  # Reference to sender ID
     
     # Sync intervals
-    audit_interval_sec: float = 600.0
-    sentinel_interval_sec: float = 120.0
+    audit_interval_sec: float = 43200.0  # 12 hours
+    sentinel_interval_sec: float = 300.0   # 5 minutes
     session_timeout_seconds: Optional[float] = None  # Session timeout hint for the server
     
     # Reliability configuration

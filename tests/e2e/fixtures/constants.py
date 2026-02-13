@@ -35,7 +35,7 @@ def scaled_duration(seconds: float, min_val: float = 0.1) -> float:
     return max(seconds * TIME_SCALE, min_val)
 
 # --- Core Intervals ---
-AUDIT_INTERVAL = scaled_duration(200.0, min_val=0.5)       # ~10s
+AUDIT_INTERVAL = scaled_duration(300.0, min_val=0.5)       # ~15s
 SENTINEL_INTERVAL = scaled_duration(100.0, min_val=0.1)     # ~5s
 HEARTBEAT_INTERVAL = scaled_duration(10.0, min_val=0.1)     # ~0.5s
 SESSION_TIMEOUT = scaled_duration(30.0, min_val=2.0)        # ~2s

@@ -126,6 +126,8 @@ Audit 过程必须严格遵循 Start/End 信号契约，以确保 Fusion 端的�
 - **漂移计算**: 计算 NFS Server 与 Agent 本地时间的 `drift`，并在设置 Watch 时修正时间戳。
 
 ### 3.2 架构分离
+- **Audit Interval**: 12 hours (Long cycle)
+- **Sentinel Interval**: 5 minutes (Short cycle)
 - **FSScanner**: 负责 IO 和遍历 (无状态)。
 - **FSDriver**: 负责策略 (Policy)、排序 (Sorting) 和 调度 (Scheduling)。
 

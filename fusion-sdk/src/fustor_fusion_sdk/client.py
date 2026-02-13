@@ -3,7 +3,7 @@ import httpx
 import logging
 from typing import Optional, List, Dict, Any
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("fustor_agent.sdk")
 
 def contains_surrogate_characters(text: str) -> bool:
     """Check if text contains surrogate characters."""
