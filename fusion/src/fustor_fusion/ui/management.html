@@ -500,6 +500,16 @@
             return `<span class="badge badge-${type}">${text}</span>`;
         }
 
+        function escapeHtml(text) {
+            if (!text) return text;
+            return text
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
         function formatAge(seconds) {
             if (seconds == null) return '-';
             if (seconds < 60) return Math.round(seconds) + 's';
@@ -538,14 +548,14 @@
                 const status = a.status || {};
                 const ver = status.version || 'unknown';
                 return `<tr>
-                <td class="mono">${id}</td>
-                <td class="mono">${ver}</td>
-                <td class="mono">${a.client_ip || '-'}</td>
+                <td class="mono">${escapeHtml(id)}</td>
+                <td class="mono">${escapeHtml(ver)}</td>
+                <td class="mono">${escapeHtml(a.client_ip || '-')}</td>
                 <td>${a.sessions ? a.sessions.length : 0}</td>
                 <td>
-                    <button class="btn btn-sm" onclick="editConfig('${id}')">Config</button>
-                    <button class="btn btn-sm" onclick="sendCmd('${id}','reload_config')">Reload</button>
-                    <button class="btn btn-sm" onclick="upgradeAgent('${id}')">Upgrade</button>
+                    <button class="btn btn-sm" onclick="editConfig('${escapeHtml(id)}')">Config</button>
+                    <button class="btn btn-sm" onclick="sendCmd('${escapeHtml(id)}','reload_config')">Reload</button>
+                    <button class="btn btn-sm" onclick="upgradeAgent('${escapeHtml(id)}')">Upgrade</button>
                 </td>
             </tr>`;
             }).join('');
@@ -556,14 +566,14 @@
             const pipesHtml = Object.entries(pipes).map(([id, p]) => {
                 const sessCnt = p.active_sessions ? Object.keys(p.active_sessions).length : 0;
                 const state = p.state || 'unknown';
-                let stateBadge = badge(state, 'yellow');
+                let stateBadge = badge(escapeHtml(state), 'yellow');
                 if (state.includes('RUNNING')) stateBadge = badge('RUNNING', 'green');
                 if (state.includes('ERROR')) stateBadge = badge('ERROR', 'red');
                 if (state.includes('STOPPED')) stateBadge = badge('STOPPED', 'red');
 
                 return `<tr>
-                <td class="mono">${id}</td>
-                <td class="mono">${p.view_id || id}</td>
+                <td class="mono">${escapeHtml(id)}</td>
+                <td class="mono">${escapeHtml(p.view_id || id)}</td>
                 <td>${sessCnt}</td>
                 <td>${stateBadge}</td>
             </tr>`;
@@ -577,19 +587,19 @@
                 for (const s of sessArr) {
                     const agentStatus = s.agent_status || {};
                     const role = agentStatus.role || '-';
-                    const roleBadge = role === 'leader' ? badge('LEADER', 'purple') : badge(role, 'blue');
+                    const roleBadge = role === 'leader' ? badge('LEADER', 'purple') : badge(escapeHtml(role), 'blue');
                     const rt = s.can_realtime ? badge('YES', 'green') : badge('NO', 'yellow');
                     const evts = agentStatus.events_pushed != null ? agentStatus.events_pushed : '-';
 
                     sessionsHtml += `<tr>
-                    <td class="mono" title="${s.session_id}">${s.session_id.substring(0, 8)}…</td>
-                    <td class="mono">${viewId}</td>
-                    <td class="mono">${s.agent_id || '-'}</td>
+                    <td class="mono" title="${escapeHtml(s.session_id)}">${escapeHtml(s.session_id.substring(0, 8))}…</td>
+                    <td class="mono">${escapeHtml(viewId)}</td>
+                    <td class="mono">${escapeHtml(s.agent_id || '-')}</td>
                     <td>${roleBadge}</td>
                     <td>${rt}</td>
                     <td>${formatAge(s.age_seconds)}</td>
                     <td>${formatAge(s.idle_seconds)}</td>
-                    <td>${evts}</td>
+                    <td>${escapeHtml(String(evts))}</td>
                 </tr>`;
                 }
             }

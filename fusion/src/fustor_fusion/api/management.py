@@ -44,7 +44,9 @@ async def require_management_key(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="X-Management-Key header is required",
         )
-    if x_management_key != configured_key:
+    
+    import hmac
+    if not hmac.compare_digest(x_management_key, configured_key):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid management key",
@@ -122,7 +124,10 @@ async def dashboard():
         view_sessions = []
         for sid, si in sess_map.items():
             agent_id = None
-            if si.task_id and ":" in si.task_id:
+            # Issue 4 fix: Prioritize agent_status
+            if getattr(si, "agent_status", None) and si.agent_status.get("agent_id"):
+                agent_id = si.agent_status["agent_id"]
+            elif si.task_id and ":" in si.task_id:
                 agent_id = si.task_id.split(":")[0]
             elif si.task_id:
                 agent_id = si.task_id
@@ -138,7 +143,7 @@ async def dashboard():
                 "last_activity": si.last_activity,
                 "age_seconds": round(time.monotonic() - si.created_at, 1),
                 "idle_seconds": round(time.monotonic() - si.last_activity, 1),
-                "agent_status": getattr(si, "agent_status", None),
+                "agent_status": si.agent_status,
             }
             view_sessions.append(sess_dto)
 
@@ -149,7 +154,7 @@ async def dashboard():
                         "agent_id": agent_id,
                         "client_ip": si.client_ip,
                         "sessions": [],
-                        "status": getattr(si, "agent_status", None),
+                        "status": si.agent_status,
                     }
                 agents_info[agent_id]["sessions"].append({
                     "session_id": sid,
@@ -157,7 +162,7 @@ async def dashboard():
                     "task_id": si.task_id,
                 })
                 # Keep latest status
-                latest_status = getattr(si, "agent_status", None)
+                latest_status = si.agent_status
                 if latest_status:
                     agents_info[agent_id]["status"] = latest_status
 

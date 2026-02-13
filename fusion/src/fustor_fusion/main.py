@@ -105,7 +105,24 @@ async def lifespan(app: FastAPI):
     # Setup SIGHUP for reload
     def handle_reload():
         logger.info("Received SIGHUP - initiating hot reload")
+        # 1. Reload Pipes
         asyncio.create_task(pm.reload())
+        
+        # 2. Reload Views
+        try:
+            from .api.views import setup_view_routers
+            from .view_manager.manager import reset_all_view_managers
+            
+            logger.info("Reloading View configuration...")
+            # Re-read view configs and update router paths
+            setup_view_routers()
+            
+            # Reset view managers to pick up new config/drivers
+            # Note: This is an async operation, so we schedule it
+            asyncio.create_task(reset_all_view_managers())
+            logger.info("View reload task scheduled.")
+        except Exception as e:
+            logger.error(f"Failed to reload views: {e}", exc_info=True)
     
     try:
         loop = asyncio.get_running_loop()
