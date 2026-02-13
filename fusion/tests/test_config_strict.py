@@ -21,7 +21,7 @@ class StrictLoader(SafeLoader):
         return mapping
 
 def get_all_yaml_files():
-    root_dir = Path(__file__).parent.parent.parent.parent # Project root
+    root_dir = Path(__file__).parent.parent.parent # Project root
     yaml_files = list(root_dir.glob("**/*.yaml"))
     yaml_files.extend(list(root_dir.glob("**/*.yml")))
     # Exclude venv and hidden dirs
