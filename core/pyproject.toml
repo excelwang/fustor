@@ -1,6 +1,6 @@
 [project]
 name = "fustor-core"
-version = "0.8.17"
+version = "0.9.1"
 description = "Core foundation for Fustor - event models, pipe/transport abstractions, and common utilities"
 requires-python = ">=3.11"
 dependencies = [

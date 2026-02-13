@@ -1,6 +1,6 @@
 [project]
 name = "fustor-sender-openapi"
-version = "0.8.17"
+version = "0.9.1"
 description = "An OpenAPI sender for Fustor Agent"
 requires-python = ">=3.11"
 dependencies = [ "fustor-core"]
