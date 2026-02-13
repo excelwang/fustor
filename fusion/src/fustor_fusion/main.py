@@ -167,6 +167,10 @@ def create_app() -> FastAPI:
     async def read_view_ui(request: Request):
         return FileResponse(f"{ui_dir}/view.html")
 
+    @app.get("/management", tags=["UI"])
+    async def read_management_ui(request: Request):
+        return FileResponse(f"{ui_dir}/ui/management.html")
+
     return app
 
 app = create_app()

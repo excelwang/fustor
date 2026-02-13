@@ -129,6 +129,21 @@ class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
         """Map events using the configured field mapper."""
         return self._mapper.map_batch(events)
 
+    def _build_agent_status(self) -> Dict[str, Any]:
+        """Build agent status dict for heartbeat reporting to management plane."""
+        agent_id = None
+        if self.task_id and ":" in self.task_id:
+            agent_id = self.task_id.split(":")[0]
+
+        return {
+            "agent_id": agent_id,
+            "pipe_id": self.id,
+            "state": str(self.state),
+            "role": self.current_role,
+            "events_pushed": self.statistics.get("events_pushed", 0),
+            "is_realtime_ready": self.is_realtime_ready,
+        }
+
     def _set_state(self, new_state: PipeState, info: Optional[str] = None):
         """Update pipestate only if it actually changed."""
         if self.state == new_state and self.info == info:
@@ -330,7 +345,11 @@ class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
                 can_realtime = self.is_realtime_ready
                 logger.debug(f"Pipe {self.id}: Sending heartbeat. can_realtime={can_realtime} (is_realtime_ready={self.is_realtime_ready})")
 
-                response = await self.sender_handler.send_heartbeat(self.session_id, can_realtime=can_realtime)
+                response = await self.sender_handler.send_heartbeat(
+                    self.session_id,
+                    can_realtime=can_realtime,
+                    agent_status=self._build_agent_status(),
+                )
                 await self._update_role_from_response(response)
                 
                 # Check for commands in response

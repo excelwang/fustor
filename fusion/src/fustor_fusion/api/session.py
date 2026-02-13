@@ -205,6 +205,11 @@ async def heartbeat(
     payload = await request.json()
     can_realtime = payload.get("can_realtime", False)
     
+    # Cache agent status if provided (Management Plane Phase 2)
+    agent_status = payload.get("agent_status")
+    if agent_status:
+        si.agent_status = agent_status
+    
     success, commands = await session_manager.keep_session_alive(view_id, session_id, client_ip=request.client.host, can_realtime=can_realtime)
     if not success:  # Should match session existence check above, but for safety
         logger.warning(f"Session {session_id} not found during heartbeat update (race condition?)")
