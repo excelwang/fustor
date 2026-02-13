@@ -24,6 +24,8 @@ Example:
 import yaml
 import logging
 import socket
+import hashlib
+import json
 from pathlib import Path
 from typing import Dict, Optional, List, Any, Set
 from pydantic import BaseModel, field_validator, Field
@@ -287,6 +289,27 @@ class AgentConfigLoader:
         added = current_enabled - old_pipe_ids
         removed = old_pipe_ids - current_enabled
         return {"added": added, "removed": removed}
+
+    def get_config_signature(self) -> str:
+        """
+        Calculate a SHA256 signature of the current configuration state.
+        This allows for efficient change detection (hot reload).
+        """
+        self.ensure_loaded()
+        
+        # Collect all config components into a stable structure
+        state = {
+            "logging": self.logging.model_dump(),
+            "fs_scan_workers": self.fs_scan_workers,
+            "agent_id": self.agent_id,
+            "sources": {k: v.model_dump() for k, v in sorted(self._sources.items())},
+            "senders": {k: v.model_dump() for k, v in sorted(self._senders.items())},
+            "pipes": {k: v.model_dump() for k, v in sorted(self._pipes.items())},
+        }
+        
+        # Serialize to JSON with sorted keys for stability
+        serialized = json.dumps(state, sort_keys=True)
+        return hashlib.sha256(serialized.encode('utf-8')).hexdigest()
 
     def reload(self) -> None:
         """Force reload all configurations."""

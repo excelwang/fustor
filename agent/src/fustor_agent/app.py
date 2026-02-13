@@ -48,6 +48,7 @@ class App:
         # Load Config first to check for agent_id
         agent_config.reload()
         self.config_loader = agent_config
+        self.config_signature = agent_config.get_config_signature()
         
         # Agent ID Priority: Config > File/Auto (IP-based)
         # Environment variable support removed per user request ("Only keep one: configuration file")
@@ -253,6 +254,14 @@ class App:
         self.logger.info("Reloading configuration...")
         agent_config.reload()
         
+        new_signature = agent_config.get_config_signature()
+        if new_signature == self.config_signature:
+             self.logger.info("Configuration signature unchanged. Skipping reload logic.")
+             return
+             
+        self.logger.info(f"Configuration changed (sig={new_signature[:8]}). Calculating diff...")
+        self.config_signature = new_signature
+
         # Get diff between currently running pipes and new enabled pipes
         # Note: We only auto-reload pipes that were either in the original startup list 
         # or are in default.yaml if no list was provided.
