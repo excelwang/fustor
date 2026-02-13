@@ -22,6 +22,7 @@ class SessionInfo:
         if self.pending_scans is None:
             self.pending_scans = set()
     can_realtime: bool = False
+    agent_status: Optional[Dict[str, Any]] = None  # Cached agent status from heartbeat
     cleanup_task: Optional[asyncio.Task] = None
 
 
