@@ -73,7 +73,7 @@ async def _logic_get_stats(
     if on_demand_scan:
         triggered, job_id = await driver.trigger_on_demand_scan(path, recursive=True)
         if triggered:
-             logger.info(f"Triggered on-demand scan (id={job_id}) via stats for {path} on view {view_id}")
+            logger.info(f"Triggered on-demand scan (id={job_id}) via stats for {path} on view {view_id}")
 
     stats_agg = await driver.get_subtree_stats_agg(path)
     
@@ -109,7 +109,7 @@ async def _logic_get_tree(
     if on_demand_scan:
         triggered, job_id = await driver.trigger_on_demand_scan(path, recursive=recursive)
         if triggered:
-             logger.info(f"Triggered on-demand scan (id={job_id}) via tree for {path} on view {view_id}")
+            logger.info(f"Triggered on-demand scan (id={job_id}) via tree for {path} on view {view_id}")
 
     target_view_id = None
     best_info = None
@@ -143,7 +143,7 @@ async def _logic_get_tree(
     if job_id:
         try:
             result["job_id"] = json.loads(job_id)
-        except:
+        except (json.JSONDecodeError, TypeError):
             result["job_id"] = job_id
 
     return ORJSONResponse(content=result)

@@ -6,8 +6,6 @@ license = "MIT"
 dependencies = [
     "fustor-core",
     "fustor-schema-fs",
-    "fustor-view-fs",
-    "fustor-fusion",
     "fastapi",
     "pydantic"
 ]
