@@ -49,7 +49,7 @@ class SessionManager:
             job_id=job_id,
             view_id=view_id,
             path=path,
-            status="PENDING",
+            status="RUNNING",  # Initialized as RUNNING since it's immediately queued
             created_at=time.time(),
             expected_sessions=set(session_ids)
         )
@@ -337,8 +337,28 @@ class SessionManager:
             while True:
                 await asyncio.sleep(interval)
                 await self.cleanup_expired_sessions()
+                await self.cleanup_old_jobs()
         except asyncio.CancelledError:
             logger.info("Session cleanup loop stopped")
+
+    async def cleanup_old_jobs(self, ttl_seconds: int = 3600):
+        """Remove completed or very old jobs from history."""
+        now = time.time()
+        to_remove = []
+        for jid, job in self._agent_jobs.items():
+            # Remove completed jobs after TTL
+            if job.status in ("COMPLETED", "FAILED") and job.completed_at:
+                if now - job.completed_at > ttl_seconds:
+                    to_remove.append(jid)
+            # Failsafe for stuck jobs (e.g. 24h)
+            elif now - job.created_at > 86400:
+                to_remove.append(jid)
+        
+        for jid in to_remove:
+            job = self._agent_jobs.pop(jid, None)
+            if job:
+                self._path_to_job_id.pop((job.view_id, job.path), None)
+                logger.debug(f"Cleaned up old job {jid}")
 
     async def cleanup_expired_sessions(self):
         now = time.monotonic()

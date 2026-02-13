@@ -169,6 +169,7 @@ async def dashboard():
         "pipes": pipes_info,
         "sessions": sessions_info,
         "agents": agents_info,
+        "jobs": session_manager.get_agent_jobs(),
     }
 
 

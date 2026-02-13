@@ -51,3 +51,27 @@ async def test_multi_fs_driver_tree(mock_member_vm):
         tree2 = await multi_driver.get_directory_tree("/", best_view="v1")
         assert len(tree2["members"]) == 1
         assert "v1" in tree2["members"]
+
+@pytest.mark.asyncio
+async def test_multi_fs_driver_timeout(mock_member_vm):
+    vm, driver = mock_member_vm
+    config = {"members": ["v1", "v2"], "query_timeout": 0.1}
+    
+    # Mock v1 as fast, v2 as slow
+    async def slow_fetch(*args, **kwargs):
+        await asyncio.sleep(0.5)
+        return {"name": "slow"}
+        
+    driver.get_directory_tree.side_effect = slow_fetch
+    
+    with patch.object(MultiFSViewDriver, '_get_view_manager_func') as mock_func:
+        mock_func.return_value = AsyncMock(return_value=vm)
+        
+        multi_driver = MultiFSViewDriver("m1", "g1", config)
+        
+        # Test tree aggregation with one slow member
+        tree = await multi_driver.get_directory_tree("/")
+        assert "v1" in tree["members"]
+        assert "v2" in tree["members"]
+        assert tree["members"]["v2"]["status"] == "error"
+        assert tree["members"]["v2"]["error"] == "Timeout"

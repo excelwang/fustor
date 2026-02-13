@@ -135,3 +135,13 @@ def test_agent_config_get_trigger():
             assert response.json()["status"] == "triggered"
             mock_queue.assert_called_once()
             assert mock_queue.call_args[0][2]["type"] == "report_config"
+
+def test_dashboard_includes_jobs():
+    """Test that dashboard includes agent jobs from session_manager."""
+    with patch.object(session_manager, "get_agent_jobs", return_value=[{"job_id": "job-1", "status": "RUNNING"}]):
+        response = client.get("/api/v1/management/dashboard")
+        assert response.status_code == 200
+        data = response.json()
+        assert "jobs" in data
+        assert len(data["jobs"]) == 1
+        assert data["jobs"][0]["job_id"] == "job-1"

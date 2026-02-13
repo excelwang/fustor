@@ -10,6 +10,8 @@ class MultiFSViewDriver(ViewDriver):
     schema_name = "multi-fs"
     target_schema = "multi-fs"  # Avoid processing 'fs' events
 
+    QUERY_TIMEOUT = 5.0  # Seconds to wait for member responses
+
     def __init__(self, id: str, view_id: str, config: Dict[str, Any]):
         super().__init__(id, view_id, config)
         # Extract members from driver_params
@@ -17,6 +19,7 @@ class MultiFSViewDriver(ViewDriver):
         # In Fustor, Handler keys off config dict.
         # ViewConfig.driver_params is where parameters live.
         self.members: List[str] = config.get("members", [])
+        self.query_timeout = float(config.get("query_timeout", self.QUERY_TIMEOUT))
         if not self.members:
             logger.warning(f"MultiFSViewDriver '{id}' initialized with no members!")
 
@@ -61,43 +64,37 @@ class MultiFSViewDriver(ViewDriver):
         
         async def fetch_stats(vid):
             try:
-                driver = await self._get_member_driver(vid)
-                if not driver:
-                     return {"view_id": vid, "status": "error", "error": "View not found or driver not ready"}
-                
-                # Call get_subtree_stats on member driver
-                # NOTE: FSViewDriver must implement get_subtree_stats
-                if not hasattr(driver, "get_subtree_stats"):
-                     return {"view_id": vid, "status": "error", "error": "Driver does not support subtree stats"}
-
-                stats = await driver.get_subtree_stats(path)
-                return {"view_id": vid, "status": "ok", **stats}
+                # Use wait_for for the entire operation including driver lookup
+                # (driver lookup is usually fast but might be slow if locks are held)
+                return await asyncio.wait_for(self._fetch_stats_internal(vid, path), timeout=self.query_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout fetching stats for member '{vid}' (path='{path}')")
+                return {"view_id": vid, "status": "error", "error": "Timeout"}
             except Exception as e:
                 return {"view_id": vid, "status": "error", "error": str(e)}
 
         # Perform concurrent queries
-        # If no members, return empty list
-        if not self.members:
-            # Fallback: if no members explicitly configured, maybe try to query all views?
-            # Spec says "members" param is used. If empty, maybe specific logic?
-            # Spec 4.1 says: `views` param in API defaults to all. 
-            # But here we are in the driver which is configured with specific members (e.g. "shared-storage").
-            # If members is empty in config, it returns empty results.
-            # The API level might handle "all views" by not strictly relying on this driver 
-            # if we wanted a generic "query all" endpoint. 
-            # But the spec says `view-multi-fs` *is* the driver for aggregation.
-            # So `members` should be configured.
-            pass
-
-        # We query all configured members
-        tasks = [fetch_stats(vid) for vid in self.members]
-        if tasks:
+        if self.members:
+            tasks = [fetch_stats(vid) for vid in self.members]
             results = await asyncio.gather(*tasks)
         
         return {
             "path": path,
             "members": list(results)
         }
+
+    async def _fetch_stats_internal(self, vid: str, path: str) -> Dict[str, Any]:
+        driver = await self._get_member_driver(vid)
+        if not driver:
+             return {"view_id": vid, "status": "error", "error": "View not found or driver not ready"}
+        
+        # Call get_subtree_stats on member driver
+        # NOTE: FSViewDriver must implement get_subtree_stats
+        if not hasattr(driver, "get_subtree_stats"):
+             return {"view_id": vid, "status": "error", "error": "Driver does not support subtree stats"}
+
+        stats = await driver.get_subtree_stats(path)
+        return {"view_id": vid, "status": "ok", **stats}
 
     async def get_directory_tree(self, path: str, recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False, best_view: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -111,21 +108,15 @@ class MultiFSViewDriver(ViewDriver):
 
         async def fetch_tree(vid):
             try:
-                driver = await self._get_member_driver(vid)
-                if not driver:
-                     return vid, {"status": "error", "error": "View not found or driver not ready"}
-                
-                # Call get_directory_tree on member driver
-                data = await driver.get_directory_tree(path, recursive=recursive, max_depth=max_depth, only_path=only_path)
-                if data is None:
-                    return vid, {"status": "error", "error": "Path not found"}
-                
-                return vid, {"status": "ok", "data": data}
+                return await asyncio.wait_for(self._fetch_tree_internal(vid, path, recursive, max_depth, only_path), timeout=self.query_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout fetching tree for member '{vid}' (path='{path}')")
+                return vid, {"status": "error", "error": "Timeout"}
             except Exception as e:
                 return vid, {"status": "error", "error": str(e)}
 
-        tasks = [fetch_tree(vid) for vid in target_views]
-        if tasks:
+        if target_views:
+            tasks = [fetch_tree(vid) for vid in target_views]
             results_list = await asyncio.gather(*tasks)
             results = dict(results_list)
             
@@ -133,6 +124,18 @@ class MultiFSViewDriver(ViewDriver):
             "path": path,
             "members": results
         }
+
+    async def _fetch_tree_internal(self, vid: str, path: str, recursive: bool, max_depth: Optional[int], only_path: bool) -> Tuple[str, Dict[str, Any]]:
+        driver = await self._get_member_driver(vid)
+        if not driver:
+             return vid, {"status": "error", "error": "View not found or driver not ready"}
+        
+        # Call get_directory_tree on member driver
+        data = await driver.get_directory_tree(path, recursive=recursive, max_depth=max_depth, only_path=only_path)
+        if data is None:
+            return vid, {"status": "error", "error": "Path not found"}
+        
+        return vid, {"status": "ok", "data": data}
 
     async def get_data_view(self, **kwargs) -> Any:
         """Required by the ViewDriver ABC."""
@@ -153,19 +156,13 @@ class MultiFSViewDriver(ViewDriver):
             logger.warning(f"MultiFSViewDriver '{self.id}' has no members. Cannot broadcast on-demand scan.")
             return False, None
 
-        results = {}
-
         async def broadcast_to_member(vid: str):
             try:
-                driver = await self._get_member_driver(vid)
-                if not driver:
-                    return vid, False, None, "View not found or driver not ready"
-                
-                if not hasattr(driver, 'trigger_on_demand_scan'):
-                    return vid, False, None, "Driver does not support on-demand scan"
-                
-                success, job_id = await driver.trigger_on_demand_scan(path, recursive=recursive)
-                return vid, success, job_id, None
+                # Command dispatch is usually very fast unless SessionManager is locked
+                return await asyncio.wait_for(self._broadcast_internal(vid, path, recursive), timeout=self.query_timeout)
+            except asyncio.TimeoutError:
+                logger.warning(f"Timeout broadcasting scan command to member '{vid}'")
+                return vid, False, None, "Timeout"
             except Exception as e:
                 logger.error(f"Error broadcasting on-demand scan to member '{vid}': {e}")
                 return vid, False, None, str(e)
@@ -193,3 +190,14 @@ class MultiFSViewDriver(ViewDriver):
         import json
         composite_id = json.dumps(member_jobs, default=str) if any_success else None
         return any_success, composite_id
+
+    async def _broadcast_internal(self, vid: str, path: str, recursive: bool) -> Tuple[str, bool, Optional[str], Optional[str]]:
+        driver = await self._get_member_driver(vid)
+        if not driver:
+            return vid, False, None, "View not found or driver not ready"
+        
+        if not hasattr(driver, 'trigger_on_demand_scan'):
+            return vid, False, None, "Driver does not support on-demand scan"
+        
+        success, job_id = await driver.trigger_on_demand_scan(path, recursive=recursive)
+        return vid, success, job_id, None
