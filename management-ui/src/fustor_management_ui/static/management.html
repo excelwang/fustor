@@ -44,7 +44,7 @@
 
         <div class="section">
             <div class="section-header"><span class="section-title">Fusion Configuration</span><button class="btn btn-sm" onclick="editFusionConfig()">Edit</button></div>
-            <div style="padding: 16px;"><pre class="mono" id="configOverview" style="white-space: pre-wrap; color: var(--text-secondary);">Loading metadata...</pre></div>
+            <div style="padding: 16px;"><pre class="mono" id="configOverview" style="white-space: pre-wrap; color: var(--text-secondary);">Loading...</pre></div>
         </div>
     </div>
 
@@ -53,79 +53,102 @@
         <div class="modal">
             <div class="modal-header"><span class="section-title" id="modalTitle">Editor</span><button class="btn btn-sm" onclick="closeConfigModal()">✕</button></div>
             <div class="modal-body">
-                <div id="agentMetaArea" style="display:none; margin-bottom:12px; padding:10px; background:var(--bg); border-radius:6px;">
+                <!-- Agent Meta -->
+                <div id="agentMetaArea" style="display:none; margin-bottom:12px; padding:10px; background:var(--bg); border-radius:6px; border:1px solid var(--border);">
                     <div style="font-size:10px; color:var(--text-secondary);">AGENT ID</div><div id="displayAgentId" class="mono" style="font-weight:bold;">-</div>
                 </div>
 
                 <div id="structuredArea">
+                    <!-- Receivers (Fusion Only) -->
                     <div id="fusionReceiversArea" style="display:none; margin-bottom:16px;">
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                             <span class="section-title" style="font-size:12px; color:var(--blue);">Receivers</span>
-                            <button class="btn btn-sm" onclick="toggleElement('addFusionReceiverForm')">+ Add</button>
+                            <button class="btn btn-sm" onclick="toggleElement('addReceiverForm')">+ Add Receiver</button>
                         </div>
-                        <div id="addFusionReceiverForm" class="form-box" style="display:none; border:1px solid var(--blue); background:rgba(78,205,196,0.05);">
-                            <input id="f_rcv_id" placeholder="Receiver ID" class="mono">
-                            <input id="f_rcv_port" placeholder="Port" class="mono" type="number">
-                            <input id="f_rcv_key" placeholder="Initial API Key" class="mono">
-                            <input id="f_rcv_pipe" placeholder="Associate Pipe ID" class="mono">
-                            <button class="btn btn-sm btn-primary" onclick="addFusionReceiver()">Confirm</button>
+                        <div id="addReceiverForm" class="form-box" style="display:none; border:1px solid var(--blue); background:rgba(78,205,196,0.05);">
+                            <input id="f_rcv_id" placeholder="Receiver ID (e.g. http-main)" class="mono">
+                            <select id="f_rcv_driver" class="mono"><option value="http">HTTP Receiver</option></select>
+                            <input id="f_rcv_port" placeholder="Port (e.g. 18888)" class="mono" type="number">
+                            <button class="btn btn-sm btn-primary" onclick="addReceiver()">Confirm</button>
                         </div>
                         <div id="fusionReceiversList" class="mono"></div>
                     </div>
 
+                    <!-- Items (Sources for Agent / Views for Fusion) -->
                     <div id="itemsArea" style="margin-bottom:16px;">
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                             <span class="section-title" id="itemsTitle" style="font-size:12px; color:var(--green);">Items</span>
-                            <button class="btn btn-sm" onclick="toggleElement('addItemForm')">+ Add</button>
+                            <button class="btn btn-sm" onclick="toggleElement('addItemForm')">+ Add New</button>
                         </div>
                         <div id="addItemForm" class="form-box" style="display:none; border:1px solid var(--green); background:rgba(0,214,143,0.05);">
-                            <input id="item_id" placeholder="ID" class="mono">
-                            <input id="item_driver" placeholder="Driver" class="mono">
+                            <div class="autocomplete-container">
+                                <input id="item_id" placeholder="ID (e.g. research-data)" class="mono">
+                                <div id="item_id_results" class="autocomplete-results"></div>
+                            </div>
+                            <select id="item_driver" class="mono"></select>
                             <input id="item_uri" placeholder="URI / Root Path" class="mono">
                             <button class="btn btn-sm btn-primary" onclick="addItem()">Confirm</button>
                         </div>
                         <div id="itemsList" class="mono"></div>
                     </div>
 
+                    <!-- Senders (Agent Only) -->
                     <div id="agentSendersArea" style="display:none; margin-bottom:16px;">
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
                             <span class="section-title" style="font-size:12px; color:var(--yellow);">Senders</span>
-                            <button class="btn btn-sm" onclick="toggleElement('addSenderForm')">+ Add</button>
+                            <button class="btn btn-sm" onclick="toggleElement('addSenderForm')">+ Add Sender</button>
                         </div>
                         <div id="addSenderForm" class="form-box" style="display:none; border:1px solid var(--yellow); background:rgba(255,217,61,0.05);">
                             <input id="snd_id" placeholder="Sender ID" class="mono">
-                            <input id="snd_uri" placeholder="Fusion URL" class="mono">
+                            <select id="snd_driver" class="mono"><option value="fusion">Fusion Sender</option><option value="echo">Echo (Debug)</option></select>
+                            <input id="snd_uri" placeholder="Target URL" class="mono">
                             <input id="snd_key" placeholder="API Key" class="mono">
                             <button class="btn btn-sm btn-primary" onclick="addSender()">Confirm</button>
                         </div>
                         <div id="sendersList" class="mono"></div>
                     </div>
 
+                    <!-- Pipes (Shared UI, different selection logic) -->
                     <div style="border-top:1px solid var(--border); padding-top:12px;">
                         <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
                             <span class="section-title" style="font-size:12px; color:var(--accent);">Active Pipes</span>
                             <button class="btn btn-sm btn-primary" onclick="toggleElement('addPipeForm')">+ Add Pipe</button>
                         </div>
-                        <div id="pipesList" style="max-height:250px; overflow-y:auto;"></div>
+                        <div id="pipesList"></div>
                         <div id="addPipeForm" class="form-box" style="display:none; border:1px solid var(--accent); background:rgba(108, 92, 231, 0.05);">
-                            <input id="p_id" placeholder="Pipe ID" class="mono">
-                            <select id="p_target" class="mono"></select>
-                            <div id="p_views_area" style="display:none;">
-                                <input id="p_views" placeholder="view-1, view-2" class="mono">
+                            <div class="autocomplete-container">
+                                <input id="p_id" placeholder="New Pipe ID" class="mono">
+                                <div id="p_id_results" class="autocomplete-results"></div>
                             </div>
-                            <button class="btn btn-sm btn-primary" onclick="confirmAddPipe()">Confirm Add</button>
+                            
+                            <div id="agentPipeSelection" style="display:none;">
+                                <div style="font-size:10px; color:var(--text-secondary); margin-bottom:4px;">SELECT SOURCE</div>
+                                <select id="p_source" class="mono"></select>
+                                <div style="font-size:10px; color:var(--text-secondary); margin-bottom:4px; margin-top:8px;">SELECT SENDER</div>
+                                <select id="p_sender" class="mono"></select>
+                            </div>
+
+                            <div id="fusionPipeSelection" style="display:none;">
+                                <div style="font-size:10px; color:var(--text-secondary); margin-bottom:4px;">SELECT RECEIVER</div>
+                                <select id="p_receiver" class="mono"></select>
+                                <div style="font-size:10px; color:var(--text-secondary); margin-bottom:4px; margin-top:8px;">MAP TO VIEWS (SELECT MULTIPLE)</div>
+                                <div id="p_views_checkboxes" style="background:var(--bg); border:1px solid var(--border); padding:8px; border-radius:4px; max-height:120px; overflow-y:auto;"></div>
+                            </div>
+
+                            <button class="btn btn-sm btn-primary" style="margin-top:12px;" onclick="confirmAddPipe()">Confirm Add Pipe</button>
                         </div>
                     </div>
                 </div>
             </div>
             <div class="modal-footer">
                 <button class="btn" onclick="closeConfigModal()">Cancel</button>
-                <button class="btn btn-primary" onclick="saveConfig()">Save All Changes</button>
+                <button class="btn btn-primary" onclick="saveConfig()">Apply and Save</button>
             </div>
         </div>
     </div>
 
     <script src="/management/static/utils.js"></script>
+    <script src="/management/static/fusion_client.js"></script>
     <script src="/management/static/app.js"></script>
 </body>
 </html>

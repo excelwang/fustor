@@ -15,7 +15,8 @@ dependencies = [
     "fustor-core",
     "fustor-receiver-http",
     "fustor-fusion-sdk",
-    "fustor-view-fs"]
+    "fustor-view-fs",
+    "fustor-management-ui"]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
@@ -38,6 +39,3 @@ fustor-fusion = "fustor_fusion.cli:cli"
 
 [tool.setuptools.packages.find]
 where = [ "src"]
-
-[tool.setuptools.package-data]
-fustor_fusion = ["ui/*.html", "ui/*.css", "ui/*.js"]

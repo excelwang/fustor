@@ -46,7 +46,7 @@ async def test_app_initialization_no_agent_id(tmp_path):
     
     with patch("fustor_agent.app.get_fustor_home_dir", return_value=tmp_path):
         with patch.object(agent_config, "dir", config_dir):
-            with patch("socket.gethostname", return_value="mock-hostname"):
+            with patch("socket.gethostname", return_value="win"): # Mock hostname to "win"
                 # Ensure no agent_id is set in the mocked config initially
                 mock_agent_config_loader = MagicMock(spec=agent_config.__class__)
                 mock_agent_config_loader.get_all_sources.return_value = {}
@@ -59,13 +59,11 @@ async def test_app_initialization_no_agent_id(tmp_path):
                 with patch("fustor_agent.app.agent_config", new=mock_agent_config_loader):
                     # App should initialize without error and default agent_id
                     app = App()
-                    # The app defaults to "unknown-agent" if hostname fails or is empty,
-                    # and no agent_id is specified in config.
-                    assert app.agent_id == "unknown-agent" 
-                    assert agent_config.agent_id == "unknown-agent"
-                    
-                    # Ensure app's internal config is also using the defaulted ID
-                    assert app.config_loader.agent_id == "unknown-agent"
+                    # Assert that agent_id falls back to the mocked hostname
+                    assert app.agent_id == "win"
+                    assert app.config_loader.agent_id == "win"
+                    # Also verify it was synced back to the loader
+                    assert mock_agent_config_loader.agent_id == "win"
 
 @pytest.mark.asyncio
 async def test_app_resolve_target_pipes(mock_config_dir, tmp_path):

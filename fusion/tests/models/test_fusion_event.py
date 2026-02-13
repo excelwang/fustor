@@ -13,8 +13,6 @@ def test_event_create_model():
     event_data = {
         "event_id": "test-123",
         "timestamp": 1678886400,
-        "data": {"key": "value"},
-        # --- Required EventBase fields ---
         "event_type": EventType.INSERT, 
         "fields": ["key"],
         "rows": [["value"]],
@@ -43,9 +41,7 @@ def test_event_response_model():
     event_data = {
         "event_id": "response-456",
         "timestamp": 1678886500,
-        "data": {"status": "success"},
         "id": "response-id-1", # EventResponse adds 'id' field
-        # --- Required EventBase fields ---
         "event_type": EventType.UPDATE,
         "fields": ["status"],
         "rows": [["success"]],
@@ -74,8 +70,6 @@ def test_event_response_missing_id():
     event_data = {
         "event_id": "response-456",
         "timestamp": 1678886500,
-        "data": {"status": "success"},
-        # --- Required EventBase fields ---
         "event_type": EventType.UPDATE,
         "fields": ["status"],
         "rows": [["success"]],

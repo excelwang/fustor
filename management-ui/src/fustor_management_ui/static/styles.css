@@ -66,6 +66,25 @@ tr:hover td { background: var(--surface-hover); }
 .modal-body { padding: 16px 20px; flex: 1; overflow-y: auto; }
 .modal-footer { padding: 12px 20px; border-top: 1px solid var(--border); display: flex; justify-content: flex-end; gap: 8px; }
 
-input, select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; width: 100%; margin-bottom: 8px; }
+input, select { background: var(--bg); color: var(--text); border: 1px solid var(--border); border-radius: 4px; padding: 6px 10px; width: 100%; margin-bottom: 8px; transition: border-color 0.2s; }
+input:focus, select:focus { border-color: var(--accent); outline: none; box-shadow: 0 0 0 2px var(--accent-glow); }
+input.invalid { border-color: var(--red); }
 .list-item { background: var(--surface-hover); border: 1px solid var(--border); border-radius: 6px; padding: 10px; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }
 .form-box { padding: 12px; border-radius: 6px; margin-bottom: 12px; }
+
+/* Searchable Autocomplete Styles */
+.autocomplete-container { position: relative; width: 100%; }
+.autocomplete-results { 
+    position: absolute; top: 100%; left: 0; right: 0; 
+    background: var(--surface); border: 1px solid var(--border); 
+    border-radius: 4px; z-index: 1000; max-height: 200px; 
+    overflow-y: auto; display: none; margin-top: -8px;
+    box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+}
+.autocomplete-results.active { display: block; }
+.autocomplete-item { 
+    padding: 8px 12px; cursor: pointer; font-size: 12px; 
+    border-bottom: 1px solid var(--border);
+}
+.autocomplete-item:hover { background: var(--surface-hover); color: var(--accent); }
+.autocomplete-item:last-child { border-bottom: none; }

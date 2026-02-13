@@ -85,6 +85,33 @@ class FusionConfigUpdateRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Drivers discovery
+# ---------------------------------------------------------------------------
+
+@router.get("/drivers")
+async def list_drivers():
+    """List all available driver types for sources, senders, receivers, and views."""
+    from fustor_core.transport.receiver import ReceiverRegistry
+    from fustor_agent.services.drivers.source_driver import SourceDriverService
+    from fustor_agent.services.drivers.sender_driver import SenderDriverService
+    from ..view_manager.manager import _load_view_drivers
+
+    # We instantiate services to get the registered drivers
+    # Note: This assumes Agent packages are installed in the same environment
+    source_service = SourceDriverService()
+    sender_service = SenderDriverService()
+    
+    view_drivers = _load_view_drivers()
+
+    return {
+        "sources": source_service.list_available_drivers(),
+        "senders": sender_service.list_available_drivers(),
+        "receivers": ReceiverRegistry.available_drivers(),
+        "views": list(view_drivers.keys())
+    }
+
+
+# ---------------------------------------------------------------------------
 # Dashboard
 # ---------------------------------------------------------------------------
 
@@ -264,7 +291,7 @@ class AgentConfigStructuredUpdateRequest(BaseModel):
 
 @router.post("/agents/{agent_id}/config/structured")
 async def update_agent_config_structured(agent_id: str, payload: AgentConfigStructuredUpdateRequest):
-    """Update agent config by merging new sections into the existing configuration."""
+    """Update agent config with strict reference integrity validation."""
     import yaml
     all_sessions = await session_manager.get_all_active_sessions()
 
@@ -281,19 +308,40 @@ async def update_agent_config_structured(agent_id: str, payload: AgentConfigStru
 
     try:
         config_dict = yaml.safe_load(current_si.reported_config)
-        # Update specified sections
-        if payload.sources is not None:
-            config_dict['sources'] = payload.sources
-        if payload.senders is not None:
-            config_dict['senders'] = payload.senders
         
-        config_dict['pipes'] = payload.pipes
+        # New Sections from payload
+        new_sources = payload.sources if payload.sources is not None else config_dict.get('sources', {})
+        new_senders = payload.senders if payload.senders is not None else config_dict.get('senders', {})
+        new_pipes = payload.pipes
+
+        # --- Strict Reference Validation ---
+        seen_pairs = {}
+        for pid, pcfg in new_pipes.items():
+            src_id = pcfg.get('source')
+            snd_id = pcfg.get('sender')
+            
+            if src_id not in new_sources:
+                raise HTTPException(status_code=400, detail=f"Agent Pipe '{pid}' references unknown Source '{src_id}'")
+            if snd_id not in new_senders:
+                raise HTTPException(status_code=400, detail=f"Agent Pipe '{pid}' references unknown Sender '{snd_id}'")
+            
+            # Uniqueness check
+            pair = (src_id, snd_id)
+            if pair in seen_pairs:
+                raise HTTPException(status_code=400, detail=f"Redundant Agent Pipe: {pid} and {seen_pairs[pair]} share same Source/Sender.")
+            seen_pairs[pair] = pid
+
+        # Apply changes
+        config_dict['sources'] = new_sources
+        config_dict['senders'] = new_senders
+        config_dict['pipes'] = new_pipes
         
         new_yaml = yaml.dump(config_dict, sort_keys=False)
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to process config: {e}")
 
-    # Delegate to the existing push logic
     return await push_agent_config(agent_id, AgentConfigUpdateRequest(config_yaml=new_yaml, filename=payload.filename))
 
 
@@ -437,29 +485,50 @@ class FusionConfigStructuredUpdateRequest(BaseModel):
 
 @router.post("/config/structured")
 async def update_fusion_config_structured(payload: FusionConfigStructuredUpdateRequest):
-    """Update Fusion config by merging structured sections."""
+    """Update Fusion config with strict reference integrity validation."""
     import yaml
     from fustor_core.common import get_fustor_home_dir
     
-    # Validation: Check for duplicate pipes (logical redundancy)
+    receivers = payload.receivers
+    views = payload.views
+    pipes = payload.pipes
+
+    # 1. Validate Pipes
     seen_configs = set()
-    for pid, pcfg in payload.pipes.items():
-        # A pipe is defined by its receiver and its set of views
-        config_sig = (pcfg.get('receiver'), tuple(sorted(pcfg.get('views', []))))
+    for pid, pcfg in pipes.items():
+        # Check Receiver reference
+        rcv_id = pcfg.get('receiver')
+        if rcv_id not in receivers:
+            raise HTTPException(status_code=400, detail=f"Pipe '{pid}' references unknown Receiver '{rcv_id}'")
+        
+        # Check Views references
+        p_views = pcfg.get('views', [])
+        if not p_views:
+            raise HTTPException(status_code=400, detail=f"Pipe '{pid}' must have at least one View")
+        for vid in p_views:
+            if vid not in views:
+                raise HTTPException(status_code=400, detail=f"Pipe '{pid}' references unknown View '{vid}'")
+
+        # Uniqueness check (Receiver + sorted Views)
+        config_sig = (rcv_id, tuple(sorted(p_views)))
         if config_sig in seen_configs:
-            raise HTTPException(
-                status_code=400, 
-                detail=f"Redundant Pipe detected: Multiple pipes are configured with the same Receiver and Views. This is forbidden."
-            )
+            raise HTTPException(status_code=400, detail=f"Redundant Pipe config: Another pipe already exists with same Receiver and Views.")
         seen_configs.add(config_sig)
 
+    # 2. Validate Receivers (API Keys consistency)
+    for rid, rcfg in receivers.items():
+        for ak in rcfg.get('api_keys', []):
+            target_pipe = ak.get('pipe_id')
+            if target_pipe and target_pipe not in pipes:
+                raise HTTPException(status_code=400, detail=f"Receiver '{rid}' API key references unknown Pipe '{target_pipe}'")
+
+    # 3. Write to file
     config_path = get_fustor_home_dir() / "fusion-config" / payload.filename
     try:
-        # We start with a clean slate for these three main sections to allow full sync with UI
         config_dict = {
-            "receivers": payload.receivers,
-            "views": payload.views,
-            "pipes": payload.pipes
+            "receivers": receivers,
+            "views": views,
+            "pipes": pipes
         }
         new_yaml = yaml.dump(config_dict, sort_keys=False)
         return await update_fusion_config(FusionConfigUpdateRequest(config_yaml=new_yaml, filename=payload.filename))

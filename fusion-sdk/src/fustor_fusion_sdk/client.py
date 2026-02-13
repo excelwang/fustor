@@ -61,6 +61,60 @@ class FusionClient:
         self._session_path = "/api/v1/pipe/session"
         self._events_path = "/api/v1/pipe/ingest"
         self._consistency_path = "/api/v1/pipe/consistency"
+        self._management_path = "/api/v1/management"
+
+    # --- Management API ---
+
+    async def get_dashboard(self) -> Dict[str, Any]:
+        """Return a full overview of all views, pipes, sessions, and connected agents."""
+        response = await self.client.get(f"{self._management_path}/dashboard")
+        response.raise_for_status()
+        return response.json()
+
+    async def get_drivers(self) -> Dict[str, Any]:
+        """List all available driver types."""
+        response = await self.client.get(f"{self._management_path}/drivers")
+        response.raise_for_status()
+        return response.json()
+
+    async def get_fusion_config(self, filename: str = "default.yaml") -> Dict[str, Any]:
+        """Return the current Fusion configuration."""
+        response = await self.client.get(f"{self._management_path}/config", params={"filename": filename})
+        response.raise_for_status()
+        return response.json()
+
+    async def update_fusion_config_structured(self, config: Dict[str, Any], filename: str = "default.yaml") -> Dict[str, Any]:
+        """Update Fusion config via structured JSON."""
+        payload = {**config, "filename": filename}
+        response = await self.client.post(f"{self._management_path}/config/structured", json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    async def get_agent_config(self, agent_id: str, trigger: bool = False, filename: str = "default.yaml") -> Dict[str, Any]:
+        """Get the cached configuration of an agent."""
+        params = {"trigger": str(trigger).lower(), "filename": filename}
+        response = await self.client.get(f"{self._management_path}/agents/{agent_id}/config", params=params)
+        response.raise_for_status()
+        return response.json()
+
+    async def update_agent_config_structured(self, agent_id: str, config: Dict[str, Any], filename: str = "default.yaml") -> Dict[str, Any]:
+        """Update agent config via structured JSON."""
+        payload = {**config, "filename": filename}
+        response = await self.client.post(f"{self._management_path}/agents/{agent_id}/config/structured", json=payload)
+        response.raise_for_status()
+        return response.json()
+
+    async def send_agent_command(self, agent_id: str, command: Dict[str, Any]) -> Dict[str, Any]:
+        """Queue a command for a specific agent."""
+        response = await self.client.post(f"{self._management_path}/agents/{agent_id}/command", json=command)
+        response.raise_for_status()
+        return response.json()
+
+    async def reload_fusion(self) -> Dict[str, Any]:
+        """Trigger a hot-reload of Fusion configuration."""
+        response = await self.client.post(f"{self._management_path}/reload")
+        response.raise_for_status()
+        return response.json()
 
     async def create_session(
         self, 

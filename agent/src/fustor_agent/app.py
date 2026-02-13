@@ -47,19 +47,26 @@ class App:
         
         # Load Config first to check for agent_id
         agent_config.reload()
+        self.config_loader = agent_config
         
         # Agent ID Priority: Config > File/Auto (IP-based)
         # Environment variable support removed per user request ("Only keep one: configuration file")
         
         config_id = agent_config.agent_id
         
-        if config_id:
+        if config_id and config_id != "unknown-agent":
              self.logger.info(f"Using Agent ID: {config_id}")
              self.agent_id = config_id
         else:
-             # Should not happen as unified.py sets default
-             self.agent_id = "unknown-agent"
-             self.logger.warning("Agent ID is unknown (not in config or hostname failed).")
+             import socket
+             try:
+                 self.agent_id = socket.gethostname()
+             except:
+                 self.agent_id = "unknown-agent"
+             
+             # Sync back to config for other components
+             agent_config.agent_id = self.agent_id
+             self.logger.info(f"Using Agent ID (auto): {self.agent_id}")
         
         # Determine which pipes to start based on config_list
         self._target_pipe_ids = self._resolve_target_pipes(config_list)

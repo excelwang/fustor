@@ -139,25 +139,24 @@ async def run_audit_sync(pipe: "AgentPipe") -> None:
         if not hasattr(audit_iter, "__aiter__"):
             audit_iter = pipe._aiter_sync_phase(audit_iter)
             
+        last_item = None
         async for item in audit_iter:
             if not pipe.is_running():
                 break
             
-            # FSDriver.get_audit_iterator returns Tuple[Optional[EventBase], Dict[str, float]]
-            # Unpack the tuple: event can be None (for silent dirs), mtime_cache_update is a dict
-            if isinstance(item, tuple) and len(item) == 2:
-                event, mtime_cache_update = item
-                # Update cache immediately (D-05/U-02)
+            if last_item is not None:
+                event, mtime_cache_update = last_item
                 if mtime_cache_update:
                     pipe.audit_context.update(mtime_cache_update)
-                    
-                if event is None:
-                    continue  # Skip None events (silent dirs)
-            else:
-                # Handle case where iterator yields plain events (for other drivers)
-                event = item
+                if event is not None:
+                    batch.append(event)
             
-            batch.append(event)
+            # FSDriver.get_audit_iterator returns Tuple[Optional[EventBase], Dict[str, float]]
+            if isinstance(item, tuple) and len(item) == 2:
+                last_item = item
+            else:
+                last_item = (item, {})
+
             if len(batch) >= pipe.batch_size:
                 batch = pipe.map_batch(batch)
                 await pipe.sender_handler.send_batch(
@@ -166,15 +165,30 @@ async def run_audit_sync(pipe: "AgentPipe") -> None:
                 get_metrics().counter("fustor.agent.events_pushed", len(batch), {"pipe": pipe.id, "phase": "audit"})
                 batch = []
         
-        if batch:
+        # Send remaining events and signal completion
+        if pipe.has_active_session():
+            final_event = None
+            if last_item is not None:
+                event, mtime_cache_update = last_item
+                if mtime_cache_update:
+                    pipe.audit_context.update(mtime_cache_update)
+                final_event = event
+            
+            if final_event is not None:
+                batch.append(final_event)
+            
             batch = pipe.map_batch(batch)
             await pipe.sender_handler.send_batch(
-                pipe.session_id, batch, {"phase": "audit"}
+                pipe.session_id, batch, {"phase": "audit", "is_final": True}
             )
     finally:
-        # Always send audit end signal to ensure Fusion calls handle_audit_end()
+        # We don't need to send an empty final batch here anymore if we sent it above,
+        # but for safety against errors during the loop, we ensure the signal is sent.
+        # However, we should check if we already successfully sent is_final.
+        # Actually, let's just make it robust: Fusion handle_audit_end is idempotent.
         if pipe.has_active_session():
             try:
+                # If we get here via 'break' or exception, we still need to end the audit
                 await pipe.sender_handler.send_batch(
                     pipe.session_id, [], {"phase": "audit", "is_final": True}
                 )

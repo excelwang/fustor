@@ -1,6 +1,7 @@
 import asyncio
 import pytest
 import signal
+import os
 from unittest.mock import MagicMock, AsyncMock, patch
 
 from fustor_agent.runner import run_agent
@@ -20,7 +21,7 @@ async def test_run_agent_signal_handling(mock_app_instance):
     Test that run_agent properly handles SIGINT/SIGTERM for shutdown
     and SIGHUP for reload.
     """
-    with patch("fustor_agent.runner.App", return_value=mock_app_instance) as MockAppClass:
+    with patch("fustor_agent.app.App", return_value=mock_app_instance) as MockAppClass: # Corrected patch target
         # Create a task to run the agent
         agent_task = asyncio.create_task(run_agent())
         
@@ -45,7 +46,7 @@ async def test_run_agent_sighup_handling(mock_app_instance):
     if not hasattr(signal, 'SIGHUP'):
         pytest.skip("SIGHUP is not available on this platform (e.g., Windows)")
 
-    with patch("fustor_agent.runner.App", return_value=mock_app_instance) as MockAppClass:
+    with patch("fustor_agent.app.App", return_value=mock_app_instance) as MockAppClass: # Corrected patch target
         # Create a task to run the agent
         agent_task = asyncio.create_task(run_agent())
         

@@ -35,7 +35,8 @@ class DirectoryNode:
                 'integrity_suspect': self.integrity_suspect,
                 'audit_skipped': self.audit_skipped,
                 'last_agent_id': self.last_agent_id,
-                'source_uri': self.source_uri
+                'source_uri': self.source_uri,
+                'agent_missing': not self.known_by_agent
             })
 
         # Base case for recursion depth
@@ -88,6 +89,7 @@ class FileNode:
                 'created_time': self.created_time,
                 'integrity_suspect': self.integrity_suspect,
                 'last_agent_id': self.last_agent_id,
-                'source_uri': self.source_uri
+                'source_uri': self.source_uri,
+                'agent_missing': not self.known_by_agent
             })
         return result

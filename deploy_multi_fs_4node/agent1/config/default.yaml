@@ -1,18 +1,14 @@
-agent_id: agent-1
+agent_id: "agent-1"
 sources:
   fs-source:
     driver: fs
-    uri: /data
+    uri: "/data"
 senders:
   fusion:
     driver: fusion
-    uri: http://fusion:18888
-    credential:
-      key: key-agent-1
+    uri: "http://fusion:18888"
+    credential: { key: "key-agent-1" }
 pipes:
   sync-pipe:
-    source: fs-source
-    sender: fusion
-  dfd:
     source: fs-source
     sender: fusion

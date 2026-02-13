@@ -23,6 +23,7 @@ from fustor_core.event import EventBase
 # --- View Manager Module Imports ---
 from .view_manager.manager import process_event as process_single_event, cleanup_all_expired_suspects
 from .api.views import view_router
+import fustor_management_ui
 
 
 @asynccontextmanager
@@ -164,7 +165,18 @@ async def lifespan(app: FastAPI):
 
 def create_app() -> FastAPI:
     app = FastAPI(lifespan=lifespan, title="Fusion Storage Engine API", version="1.0.0")
-    ui_dir = os.path.dirname(__file__)
+    
+    # --- CORS Middleware ---
+    from fastapi.middleware.cors import CORSMiddleware
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],  # For management UI, we allow all for now
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    static_dir = fustor_management_ui.get_static_dir()
 
     # 1. Load configuration
     fusion_config.ensure_loaded()
@@ -188,8 +200,7 @@ def create_app() -> FastAPI:
 
     # --- Static Files ---
     from fastapi.staticfiles import StaticFiles
-    static_dir = os.path.join(ui_dir, "ui")
-    app.mount("/management/static", StaticFiles(directory=static_dir), name="static")
+    app.mount("/management/static", StaticFiles(directory=str(static_dir)), name="static")
 
     @app.get("/", tags=["Root"])
     async def read_web_api_root():
@@ -197,11 +208,11 @@ def create_app() -> FastAPI:
 
     @app.get("/view", tags=["UI"])
     async def read_view_ui(request: Request):
-        return FileResponse(f"{ui_dir}/view.html")
+        return FileResponse(str(static_dir / "view.html"))
 
     @app.get("/management", tags=["UI"])
     async def read_management_ui(request: Request):
-        return FileResponse(f"{ui_dir}/ui/management.html")
+        return FileResponse(str(static_dir / "management.html"))
 
     return app
 
