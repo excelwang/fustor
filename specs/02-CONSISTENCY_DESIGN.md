@@ -154,7 +154,7 @@ Fusion 通过 `FSState` 类维护以下状态：
 | `size` | `int` | 文件大小（字节） |
 | `last_updated_at` | `float` | Fusion 本地物理时间戳，记录最后确认时刻 |
 | `integrity_suspect` | `bool` | 是否为可疑热文件 (由原子写标记或时效判定) |
-| `known_by_agent` | `bool` | 是否被 Realtime 事件确认 |
+| `known_by_agent` | `bool` | 监控质量证明（Monitoring Quality Attestation）。仅由 Realtime 事件确认为 True，表示该节点当前状态已知由 Agent 实时监控。 |
 | `audit_skipped` | `bool` | (仅目录) 是否在审计中因静默被跳过 |
 
 ### 4.2 墓碑表 (Tombstone List)
@@ -245,8 +245,15 @@ Blind-spot 是**信息型记录**，用于标记"仅通过补偿源（Audit/Snap
 | 清除 Blind-spot | ✅ | — | ❌ | ❌ |
 | 创建 Blind-spot | — | — | ✅ | ✅ |
 | 更新 `last_updated_at` | ✅ | ❌ | ❌ | ❌ |
-| 设置 `known_by_agent` | `True` | `True` | `False` | `False` |
 | 参与 Clock Skew 采样 | ✅ | ❌ | ❌ | ❌ |
+| 设置 `known_by_agent` | `True` | `False` (保留原值) | `False` (遗漏时设为False) | `False` (遗漏时设为False) |
+
+> [!IMPORTANT]
+> **监控质量证明 (Monitoring Quality Attestation) 哲学**：
+> `known_by_agent`（API 中体现为 `agent_missing`）是一个**非对称证据系统**：
+> 1. **反证能力**：若为 `False`，可确凿证明该文件发生过“带外修改”或 Agent 监控遗漏。
+> 2. **非预见性**：若为 `True`，仅代表最近一次变更被捕获，不保证未来盲区服务器的写入能被感知。
+> 因此，Snapshot, Audit, On-Demand 等轮询源**严禁**将此标志设为 `True`，因为它们无法证明 inotify Wather 的实时覆盖。
 | 触发 Tombstone 重生检测 | ✅ | ✅ | ✅ | ✅ |
 
 > [!CAUTION]
@@ -384,7 +391,7 @@ if event.message_source == MessageSource.AUDIT:
     mtime_changed = (existing is None) or (abs(old_mtime - mtime) > FLOAT_EPSILON)
     if mtime_changed:
         blind_spot_additions.add(path)
-        node.known_by_agent = False
+        node.known_by_agent = False # 发现变更但缺失 Realtime 事件，判定为监控遗漏
     
     # Suspect 判定（同域计算）
     watermark = logical_clock.get_watermark()
