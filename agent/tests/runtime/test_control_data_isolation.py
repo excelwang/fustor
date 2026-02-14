@@ -34,6 +34,7 @@ class TestControlDataIsolation:
         # Fast control loop for testing
         pipe.control_loop_interval = 0.1
         pipe.heartbeat_interval_sec = 0.5
+        pipe.data_supervisor_interval = 0.1
         return pipe
 
     @pytest.mark.asyncio

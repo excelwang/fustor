@@ -143,24 +143,17 @@ class PipeLeaderMixin:
         if self._sentinel_task and not self._sentinel_task.done():
             tasks_to_cancel.append(self._sentinel_task)
             
+        # Clear handles immediately to prevent race conditions
+        self._snapshot_task = None
+        self._audit_task = None
+        self._sentinel_task = None
+
         if not tasks_to_cancel:
-            # Ensure handles are cleared if they were finished
-            self._snapshot_task = None
-            self._audit_task = None
-            self._sentinel_task = None
             return
 
         logger.debug(f"Pipe {self.id}: Cancelling {len(tasks_to_cancel)} leader tasks")
         for task in tasks_to_cancel:
             task.cancel()
-
-        try:
-            # Wait briefly for tasks to acknowledge cancellation
-            await asyncio.wait(tasks_to_cancel, timeout=0.1)
-        except Exception as e:
-            logger.debug(f"Pipe {self.id}: Ignore error while cancelling leader tasks: {e}")
             
-        # Clear handles
-        self._snapshot_task = None
-        self._audit_task = None
-        self._sentinel_task = None
+        # We generally don't need to wait for them to finish here, 
+        # as they are supervised by the data loop which handles their lifecycle/errors.

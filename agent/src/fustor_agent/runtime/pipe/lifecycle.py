@@ -141,7 +141,6 @@ class PipeLifecycleMixin:
                         raise RuntimeError(f"Session creation failed: {e}")
 
                 # GAP-1: Control Loop only supervises, does not do data work directly
-                self._supervise_data_tasks()
                 
                 # Sleep is now the primary pacer for the control loop
                 await asyncio.sleep(self.control_loop_interval)
@@ -196,77 +195,4 @@ class PipeLifecycleMixin:
 
                 await asyncio.sleep(backoff)
 
-    def _supervise_data_tasks(self: "AgentPipe") -> None:
-        """
-        Monitor and manage data plane tasks based on current role.
-        This is a synchronous supervisor that ensures tasks are running but does not block.
-        GAP-1 decoupled logic.
-        """
-        if not self.has_active_session() or not self.is_running():
-            return
 
-        # 1. Message Sync (Realtime) - Always needs to be running or ready
-        if self._message_sync_task is None or self._message_sync_task.done():
-             # If it finished with exception, it should have been handled by _handle_fatal_error
-             # We just restart it here.
-             if self._message_sync_task and self._message_sync_task.done() and not self._message_sync_task.cancelled():
-                 # Log if it crashed silently (though _handle_fatal_error should catch it)
-                 exc = self._message_sync_task.exception()
-                 if exc:
-                     logger.warning(f"Pipe {self.id}: Restarting crashed message sync: {exc}")
-             
-             logger.debug(f"Pipe {self.id}: Starting message sync phase (Role: {self.current_role})")
-             self._message_sync_task = asyncio.create_task(self._run_message_sync())
-        
-        # DEBUG LOGGING for snapshot startup
-        if self.current_role == "leader" and not self._initial_snapshot_done:
-             if self.is_realtime_ready:
-                 if self._snapshot_task is None or self._snapshot_task.done():
-                    logger.debug(f"Pipe {self.id}: SUPERVISOR starting snapshot task. State: {self.state}")
-                 else:
-                     pass # Task running
-             else:
-                 logger.debug(f"Pipe {self.id}: SUPERVISOR waiting for realtime ready before snapshot")
-        elif self.current_role == "leader" and self._initial_snapshot_done:
-             pass # Snapshot done
-        else:
-             pass # Not leader
-
-        if self.current_role == "leader":
-            # Leader Sequence: Prescan -> Message Sync -> Snapshot -> Audit/Sentinel
-            
-            # Check for initial snapshot need
-            if not self._initial_snapshot_done:
-                # Only start snapshot if message sync (which handles prescan) is running
-                # and ideally 'ready' (prescan done).
-                # Note: is_realtime_ready is set by message sync phase.
-                if self.is_realtime_ready:
-                    if self._snapshot_task is None or self._snapshot_task.done():
-                        # Restart if failed or not started
-                         self._snapshot_task = asyncio.create_task(self._run_snapshot_sync())
-                         logger.debug(f"Pipe {self.id}: Initial snapshot sync phase started in background")
-            
-            # Check snapshot completion
-            if self._snapshot_task and self._snapshot_task.done():
-                # We don't await result here to avoid raising. 
-                # Exceptions are handled in _run_snapshot_sync via _handle_fatal_error
-                # We just check if it finished successfully (logic inside sets flag)
-                # But we can clear the task handle
-                self._snapshot_task = None
-
-            # Maintenance tasks - only after snapshot
-            if self._initial_snapshot_done:
-                if self.audit_interval_sec > 0 and (self._audit_task is None or self._audit_task.done()):
-                    self._audit_task = asyncio.create_task(self._run_audit_loop())
-                
-                if self.sentinel_interval_sec > 0 and (self._sentinel_task is None or self._sentinel_task.done()):
-                    self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
-        else:
-             # Follower: Ensure leader tasks are NOT running
-             # Fire and forget cancellation
-             asyncio.create_task(self._cancel_leader_tasks())
-             
-             if self.current_role == "follower":
-                 # Update state info for visibility (since we don't have the blocking wait logic anymore)
-                 if self.state & PipeState.RUNNING and not (self.state & PipeState.PAUSED):
-                      self._set_state((self.state | PipeState.PAUSED) & ~PipeState.SNAPSHOT_SYNC, "Follower mode - standby")
