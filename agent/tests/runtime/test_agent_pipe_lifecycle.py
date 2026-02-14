@@ -17,7 +17,7 @@ class TestAgentPipeLifecycle:
     def agent_pipe(self, mock_source, mock_sender, pipe_config):
         mock_bus = MagicMock()
         mock_bus.id = "mock-bus"
-        mock_bus.internal_bus = AsyncMock()
+        mock_bus.internal_bus = MagicMock()
         # Prevent busy loop in message sync task
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
         
