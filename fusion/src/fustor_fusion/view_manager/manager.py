@@ -201,6 +201,12 @@ class ViewManager:
         for driver_id, driver_instance in self.driver_instances.items():
             if hasattr(driver_instance, 'on_session_close'):
                 await driver_instance.on_session_close(**kwargs)
+    
+    async def on_snapshot_complete(self, session_id: str, **kwargs):
+        """Handle snapshot complete signal."""
+        for driver_id, driver_instance in self.driver_instances.items():
+            if hasattr(driver_instance, 'on_snapshot_complete'):
+                await driver_instance.on_snapshot_complete(session_id=session_id, **kwargs)
 
     async def get_aggregated_stats(self) -> Dict[str, Any]:
         """

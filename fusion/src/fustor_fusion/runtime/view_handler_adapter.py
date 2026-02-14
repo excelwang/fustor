@@ -133,6 +133,11 @@ class ViewDriverAdapter(ViewHandler):
         """Handle audit end."""
         if hasattr(self._driver, 'handle_audit_end'):
             await self._driver.handle_audit_end()
+
+    async def on_snapshot_complete(self, session_id: str, **kwargs) -> None:
+        """Handle snapshot complete."""
+        if hasattr(self._driver, 'on_snapshot_complete'):
+            await self._driver.on_snapshot_complete(session_id=session_id, **kwargs)
     
     async def reset(self) -> None:
         """Reset the driver state."""
@@ -232,14 +237,26 @@ class ViewManagerAdapter(ViewHandler):
     async def on_session_close(self, **kwargs) -> None:
         """Handle session close for all driver instances."""
         await self._manager.on_session_close(**kwargs)
+
+    async def on_snapshot_complete(self, session_id: str, **kwargs) -> None:
+        """Handle snapshot complete for all driver instances."""
+        await self._manager.on_snapshot_complete(session_id=session_id, **kwargs)
     
     async def resolve_session_role(self, session_id: str, **kwargs) -> Dict[str, Any]:
         """
         Determine session role.
-        Standard ViewManager delegates to global election.
-        Scoped election logic is now exclusively in ForestFSViewDriver.
+        
+        1. Try delegated election (for scoped drivers like ForestFSViewDriver).
+        2. Fallback to global election (for standard drivers).
         """
-        # Fallback: Perform global election for standard drivers
+        # 1. Try delegated election first
+        for driver_instance in self._manager.driver_instances.values():
+            if hasattr(driver_instance, 'resolve_session_role'):
+                res = await driver_instance.resolve_session_role(session_id, **kwargs)
+                if res.get("role") == "leader":
+                    return res
+
+        # 2. Fallback: Perform global election
         from ..view_state_manager import view_state_manager
         # Try to acquire global leadership for this view
         is_leader = await view_state_manager.try_become_leader(self._manager.view_id, session_id)
