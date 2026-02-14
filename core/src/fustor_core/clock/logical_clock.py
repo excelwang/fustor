@@ -82,9 +82,15 @@ class LogicalClock:
                     self._global_buffer.append(diff)
                     self._global_histogram[diff] += 1
                     self._dirty = True
-            except Exception:
-                # Silent fail to proceed with event processing
+            except Exception as e:
+                # Log error but proceed to ensure event processing continues.
+                # Use a specific logger for clock issues
+                if not hasattr(self, '_logger'):
+                    import logging
+                    self._logger = logging.getLogger("fustor_core.clock")
+                self._logger.warning(f"LogicalClock skew sampling failed: {e}")
                 pass
+
 
             return self.get_watermark()
 

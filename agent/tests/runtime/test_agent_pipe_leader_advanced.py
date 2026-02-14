@@ -34,7 +34,9 @@ async def test_snapshot_sync_fatal_error_propagation(mock_pipe):
     """测试 Snapshot 内部发生致命错误"""
     mock_pipe._handle_fatal_error = AsyncMock()
     
-    with patch("fustor_agent.runtime.pipe.phases.run_snapshot_sync", side_effect=ValueError("fatal")):
+    # 模拟 phases.run_snapshot_sync 抛出异常
+    with patch("fustor_agent.runtime.pipe.phases.run_snapshot_sync", new_callable=AsyncMock) as mock_run:
+        mock_run.side_effect = ValueError("fatal")
         await mock_pipe._run_snapshot_sync()
         mock_pipe._handle_fatal_error.assert_called_once()
         assert mock_pipe._initial_snapshot_done is False

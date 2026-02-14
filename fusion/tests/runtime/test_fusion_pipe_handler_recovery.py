@@ -45,12 +45,13 @@ class TestHandlerDegradation:
     @pytest.mark.asyncio
     async def test_handler_is_disabled_after_max_errors(self):
         """验证当前行为: Handler 达到 MAX_HANDLER_ERRORS 后被永久禁用。"""
-        handler = FlakeyViewHandler(fail_count=100)  # 永远失败
+        handler = FlakeyViewHandler(fail_count=100)  # 永遠失败
         pipe = FusionPipe(
             pipe_id="test",
             config={"view_id": "1", "allow_concurrent_push": True},
             view_handlers=[handler]
         )
+        pipe.pipe_id = pipe.id
         await pipe.start()
 
         # 发送足够多的事件触发 MAX_HANDLER_ERRORS
@@ -58,7 +59,8 @@ class TestHandlerDegradation:
             event = EventBase(
                 event_type=EventType.INSERT,
                 event_schema="flakey", table="t",
-                rows=[{"id": i}], fields=["id"], index=i
+                rows=[{"id": i}], fields=["id"], index=i,
+                metadata={}
             )
             await pipe._dispatch_to_handlers(event)
 
@@ -83,6 +85,7 @@ class TestHandlerDegradation:
             },
             view_handlers=[handler]
         )
+        pipe.pipe_id = pipe.id
         pipe.MAX_HANDLER_ERRORS = 3  # 降低阈值方便测试
         await pipe.start()
 
@@ -91,7 +94,8 @@ class TestHandlerDegradation:
             event = EventBase(
                 event_type=EventType.INSERT,
                 event_schema="flakey", table="t",
-                rows=[{"id": i}], fields=["id"], index=i
+                rows=[{"id": i}], fields=["id"], index=i,
+                metadata={}
             )
             await pipe._dispatch_to_handlers(event)
 
@@ -106,7 +110,8 @@ class TestHandlerDegradation:
             event = EventBase(
                 event_type=EventType.INSERT,
                 event_schema="flakey", table="t",
-                rows=[{"id": i}], fields=["id"], index=i
+                rows=[{"id": i}], fields=["id"], index=i,
+                metadata={}
             )
             await pipe._dispatch_to_handlers(event)
 

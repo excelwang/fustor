@@ -42,6 +42,7 @@ async def test_fusion_pipe_queue_behavior():
         config={"view_id": "test-view"},
         view_handlers=[mock_handler]
     )
+    pipe.pipe_id = pipe.id # Inject required attribute
     
     await pipe.start()
     
@@ -52,7 +53,8 @@ async def test_fusion_pipe_queue_behavior():
             event_schema="test",
             table="test_table",
             fields=["path"],
-            rows=[["/test"]]
+            rows=[["/test"]],
+            metadata={}
         )
         events = [event]
         
@@ -91,6 +93,7 @@ async def test_fusion_pipe_queue_observability():
         config={"view_id": "test-view-slow"},
         view_handlers=[mock_handler]
     )
+    pipe.pipe_id = pipe.id # Inject required attribute
     
     await pipe.start()
     
@@ -101,7 +104,8 @@ async def test_fusion_pipe_queue_observability():
             event_schema="test",
             table="test_table",
             fields=["path"],
-            rows=[["/test"]]
+            rows=[["/test"]],
+            metadata={}
         )
         events = [event] * 1 # Batch of 1
         

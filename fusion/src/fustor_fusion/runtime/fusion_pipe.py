@@ -270,7 +270,6 @@ class FusionPipe(Pipe):
                 if hasattr(handler, 'process_event'):
                     # Apply timeout protection
                     try:
-                        # Inject pipe_id for ForestView routing
                         event.metadata.setdefault("pipe_id", self.pipe_id)
                         success = await asyncio.wait_for(
                             handler.process_event(event),

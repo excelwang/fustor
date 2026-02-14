@@ -127,7 +127,6 @@ def test_validate_config_dict_happy_path():
 def test_validate_config_dict_redundant_pair():
     """Test validate_config with a redundant (source, sender) pair."""
     config_dict = {
-        "agent_id": "test-agent",
         "sources": {"s1": {"driver": "fs", "uri": "/tmp"}},
         "senders": {"se1": {"driver": "echo", "uri": "http://localhost"}},
         "pipes": {
@@ -143,7 +142,6 @@ def test_validate_config_dict_redundant_pair():
 def test_validate_config_dict_empty_pipes():
     """Test validate_config with an empty pipes dictionary."""
     config_dict = {
-        "agent_id": "test-agent",
         "pipes": {}
     }
     validator = ConfigValidator()
@@ -165,6 +163,8 @@ def test_validate_config_dict_pipes_not_dict():
         "pipes": []
     }
     validator = ConfigValidator()
+    
+    # Since we added explicit check, it now returns proper error instead of crashing
     is_valid, errors = validator.validate_config(config_dict)
     assert is_valid is False
     assert "'pipes' section must be a dictionary" in errors[0]
@@ -180,11 +180,27 @@ def test_validate_config_dict_pipe_missing_source_sender():
     validator = ConfigValidator()
     is_valid, errors = validator.validate_config(config_dict)
     
-    # New behavior: strict validation catches missing required fields
+    # Current behavior: strict validation catches missing required fields
     assert is_valid is False
     assert len(errors) > 0
     # Error messages come from Pydantic, e.g. "Field required"
     assert "source" in str(errors) or "sender" in str(errors)
+
+def test_validate_config_dict_optional_fields_defaults():
+    """Test validate_config allows omitting optional fields (they get defaults)."""
+    # Pipe config implies audit_interval_sec=600.0 (default)
+    config_dict = {
+        "sources": {"s1": {"driver": "fs", "uri": "/tmp"}},
+        "senders": {"se1": {"driver": "echo", "uri": "http://localhost"}},
+        "pipes": {
+            "p1": {"source": "s1", "sender": "se1"} # Missing audit_interval_sec is OK
+        }
+    }
+    validator = ConfigValidator()
+    is_valid, errors = validator.validate_config(config_dict)
+    
+    assert is_valid is True
+    assert errors == []
 
 def test_validate_loader_reload_failure(mock_loader):
     """Test that validation correctly handles exceptions during loader reload."""

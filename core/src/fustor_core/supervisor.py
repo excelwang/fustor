@@ -59,6 +59,7 @@ class ComponentWrapper:
     restart_policy: RestartPolicy = RestartPolicy.ON_FAILURE
     max_restarts: int = 3
     restart_count: int = 0
+    lifetime_restarts: int = 0
     
     async def start(self) -> bool:
         """Start the wrapped component with error handling."""
@@ -304,11 +305,13 @@ class ComponentSupervisor:
                         logger.info(f"Attempting to restart {cid}")
                         await wrapper.stop()
                         wrapper.restart_count += 1
+                        wrapper.lifetime_restarts += 1
                         await wrapper.start()
                 
                 elif wrapper.state == ComponentState.FAILED and wrapper.can_restart():
                     logger.info(f"Attempting to restart failed component {cid}")
                     wrapper.restart_count += 1
+                    wrapper.lifetime_restarts += 1
                     await wrapper.start()
                     
             except Exception as e:
@@ -323,6 +326,7 @@ class ComponentSupervisor:
                 "healthy": wrapper.is_healthy(),
                 "error_count": wrapper.error_count,
                 "restart_count": wrapper.restart_count,
+                "lifetime_restarts": wrapper.lifetime_restarts,
             }
             for cid, wrapper in self._components.items()
         }

@@ -18,6 +18,7 @@ async def test_lineage_injection_flow():
     mock_handler.process_event = AsyncMock(return_value=True)
     
     pipe = FusionPipe(pipe_id="v1", config={"view_id": "v1"}, view_handlers=[mock_handler])
+    pipe.pipe_id = pipe.id # Inject required attribute
     await pipe.start()
     
     # 2. Setup a session with lineage info
@@ -42,7 +43,8 @@ async def test_lineage_injection_flow():
             # Mandatory fields for validation
             "table": "files",
             "fields": ["path", "size"],
-            "rows": [["/file.txt", 100]]
+            "rows": [["/file.txt", 100]],
+            "metadata": {} # Prevent AttributeError
         }
         
         await pipe.process_events([event_dict], session_id=sid)

@@ -4,6 +4,7 @@ Configuration Validation Utility
 import logging
 from typing import List, Dict, Any, Tuple
 from fustor_agent.config.unified import AgentConfigLoader, agent_config
+from fustor_core.models.config import SourceConfig, SenderConfig, GlobalLoggingConfig
 
 
 logger = logging.getLogger("fustor_agent.validator")
@@ -16,9 +17,13 @@ class ConfigValidator:
     def __init__(self, loader: AgentConfigLoader = agent_config):
         self.loader = loader
 
-    def validate(self) -> Tuple[bool, List[str]]:
+    def validate(self, auto_reload: bool = True) -> Tuple[bool, List[str]]:
         """
         Run all validation checks.
+        
+        Args:
+            auto_reload: Whether to reload config from disk before validation.
+                       Set to False when validating in-memory config dicts.
         
         Returns:
             (is_valid, list_of_errors)
@@ -26,8 +31,9 @@ class ConfigValidator:
         errors = []
         
         try:
-            # Force reload to ensure freshness
-            self.loader.reload()
+            if auto_reload:
+                # Force reload to ensure freshness
+                self.loader.reload()
         except Exception as e:
             errors.append(f"Failed to load configuration files: {e}")
             return False, errors
@@ -81,32 +87,66 @@ class ConfigValidator:
                     seen_pairs[pair] = p_id
 
         if not sources and not senders and not pipes:
-             # Just a warning context, maybe not an error if intentional, 
-             # but usually means empty config dir
              pass
 
         return len(errors) == 0, errors
 
     def validate_config(self, config_dict: Dict[str, Any]) -> Tuple[bool, List[str]]:
-        """Validate a configuration dictionary without loading from disk."""
+        """
+        Validate a configuration dictionary using the same strict rules as disk loading.
+        
+        This method simulates loading the config into a temporary loader instance
+        to leverage Pydantic model validation and cross-reference checks.
+        """
         errors = []
         if not config_dict:
             return True, []
 
-        pipes = config_dict.get("pipes", {})
-        if not isinstance(pipes, dict):
-            errors.append("'pipes' section must be a dictionary")
-            return False, errors
-
-        seen_pairs = {}
-        for p_id, p_cfg in pipes.items():
-            source = p_cfg.get("source")
-            sender = p_cfg.get("sender")
-            if source and sender:
-                pair = (source, sender)
-                if pair in seen_pairs:
-                    errors.append(f"Redundant configuration: Pipe '{p_id}' uses the same (source, sender) pair as Pipe '{seen_pairs[pair]}'.")
-                else:
-                    seen_pairs[pair] = p_id
+        try:
+            # 1. Structural Validation via Pydantic (Generic Adapter)
+            temp_loader = AgentConfigLoader(config_dir=None)
+            data = config_dict
+            
+            if "logging" in data:
+                 GlobalLoggingConfig.model_validate(data["logging"])
+            
+            if "fs_scan_workers" in data:
+                temp_loader.fs_scan_workers = int(data["fs_scan_workers"])
+            
+            # Use provided agent_id or a dummy for validation context
+            if "agent_id" in data:
+                temp_loader.agent_id = str(data["agent_id"]).strip()
+            else:
+                temp_loader.agent_id = "validation-dummy-id"
+            
+            # Sources
+            for src_id, src_data in data.get("sources", {}).items():
+                temp_loader._sources[src_id] = SourceConfig(**src_data)
+            
+            # Senders
+            for sender_id, sender_data in data.get("senders", {}).items():
+                temp_loader._senders[sender_id] = SenderConfig(**sender_data)
+            
+            # Pipes
+            from fustor_agent.config.unified import AgentPipeConfig
+            pipes_data = data.get("pipes", {})
+            if not isinstance(pipes_data, dict):
+                errors.append("'pipes' section must be a dictionary")
+                return False, errors
+                
+            for pipe_id, pipe_data in pipes_data.items():
+                temp_loader._pipes[pipe_id] = AgentPipeConfig(**pipe_data)
+            
+            temp_loader._loaded = True
+            
+            # 2. Semantic Validation (Cross-references, Uniqueness)
+            temp_validator = ConfigValidator(loader=temp_loader)
+            is_valid, semantic_errors = temp_validator.validate(auto_reload=False)
+            
+            if not is_valid:
+                errors.extend(semantic_errors)
+                
+        except Exception as e:
+            errors.append(f"Validation failed: {e}")
         
         return len(errors) == 0, errors

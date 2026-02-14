@@ -23,7 +23,8 @@ async def test_get_view_status_error():
         assert status["status"] == "error"
         assert "Failed" in status["error"]
 
-def test_background_task_status():
+@pytest.mark.asyncio
+async def test_background_task_status():
     # task_status is a global instance
     task_status.update_status("v1", "task1", "running", {"detail": 1})
     s = task_status.get_status("v1", "task1")

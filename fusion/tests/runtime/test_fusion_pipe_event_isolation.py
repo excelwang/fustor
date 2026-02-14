@@ -42,6 +42,7 @@ def fusion_pipe_with_handler():
         config={"view_id": "1", "allow_concurrent_push": True},
         view_handlers=[handler]
     )
+    pipe.pipe_id = pipe.id # Inject required attribute
     return pipe, handler
 
 
@@ -61,11 +62,13 @@ class TestProcessEventIsolation:
         good_events = [
             {
                 "event_type": "insert", "event_schema": "test", "table": "files",
-                "rows": [{"path": "/a.txt"}], "fields": ["path"], "index": 1
+                "rows": [{"path": "/a.txt"}], "fields": ["path"], "index": 1,
+                "metadata": {}
             },
             {
                 "event_type": "insert", "event_schema": "test", "table": "files",
-                "rows": [{"path": "/b.txt"}], "fields": ["path"], "index": 2
+                "rows": [{"path": "/b.txt"}], "fields": ["path"], "index": 2,
+                "metadata": {}
             }
         ]
         bad_event = {"garbage_field": True, "not_a_valid_event": 123}
@@ -101,7 +104,8 @@ class TestProcessEventIsolation:
         events = [
             {
                 "event_type": "insert", "event_schema": "test", "table": "files",
-                "rows": [{"path": f"/{i}.txt"}], "fields": ["path"], "index": i
+                "rows": [{"path": f"/{i}.txt"}], "fields": ["path"], "index": i,
+                "metadata": {}
             }
             for i in range(5)
         ]

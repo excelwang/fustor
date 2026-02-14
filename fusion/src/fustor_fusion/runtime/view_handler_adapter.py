@@ -233,6 +233,18 @@ class ViewManagerAdapter(ViewHandler):
         """Handle session close for all driver instances."""
         await self._manager.on_session_close()
     
+    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Determine session role by asking driver instances.
+        Returns 'leader' if any driver instance accepts leadership.
+        """
+        for driver_instance in self._manager.driver_instances.values():
+            if hasattr(driver_instance, 'resolve_session_role'):
+                res = await driver_instance.resolve_session_role(session_id, pipe_id)
+                if res.get("role") == "leader":
+                    return res
+        return {"role": "leader"} # Default fallback
+    
     async def handle_audit_start(self) -> None:
         """Handle audit start for all driver instances."""
         for driver_instance in self._manager.driver_instances.values():

@@ -67,7 +67,7 @@ class FusionPipeConfig(BaseModel):
     session_timeout_seconds: int = 30
     
     # Sync Policy (Pushed to Agent)
-    audit_interval_sec: float = 600.0
+    audit_interval_sec: float = 43200.0
     sentinel_interval_sec: float = 120.0
 
 
