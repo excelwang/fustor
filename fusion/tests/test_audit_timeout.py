@@ -45,36 +45,22 @@ async def test_audit_timeout_detected(mock_runtime_objects):
     """Test that audit is cancelled if time exceeds limit."""
     mock_pm, mock_pipe, mock_handler = mock_runtime_objects
     
-    # Start time is old (3s ago > 2s limit)
+    # Start time is old (3s ago > 2s limit with default 2x multiplier)
     mock_handler.audit_start_time = time.time() - 3.0
-    
-    # Need to simulate ViewDriverAdapter structure for clearing timestamp
-    mock_driver = MagicMock()
-    mock_handler.driver = mock_driver
     
     await check_audit_timeout()
     
     mock_handler.handle_audit_end.assert_called_once()
-    assert mock_driver._audit_start_time is None
+    mock_handler.reset_audit_tracking.assert_called_once()
     
 @pytest.mark.asyncio
 async def test_audit_timeout_manager_adapter(mock_runtime_objects):
     """Test timeout for ViewManagerAdapter structure."""
     mock_pm, mock_pipe, mock_handler = mock_runtime_objects
     
-    # Remove driver attr, add manager attr
-    del mock_handler.driver
-    
-    mock_manager = MagicMock()
-    mock_d1 = MagicMock()
-    mock_d2 = MagicMock()
-    mock_manager.driver_instances = {"d1": mock_d1, "d2": mock_d2}
-    mock_handler.manager = mock_manager
-    
     mock_handler.audit_start_time = time.time() - 3.0
     
     await check_audit_timeout()
     
     mock_handler.handle_audit_end.assert_called_once()
-    assert mock_d1._audit_start_time is None
-    assert mock_d2._audit_start_time is None
+    mock_handler.reset_audit_tracking.assert_called_once()

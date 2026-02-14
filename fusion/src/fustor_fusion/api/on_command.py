@@ -78,12 +78,15 @@ async def on_command_fallback(view_id: str, params: Dict[str, Any]) -> Dict[str,
     }
 
     # 4. Send and Wait
+    from ..config.unified import fusion_config
+    fallback_timeout = fusion_config.fusion.on_command_fallback_timeout
+    
     try:
         result = await bridge.send_command_and_wait(
             session_id=target_session_id,
             command="scan",
             params={**cmd_params, "job_id": start_time}, # start_time as pseudo job_id or rely on bridge cmd_id
-            timeout=10.0 # Longer timeout for disk I/O
+            timeout=fallback_timeout
         )
         
         # 5. Format Response to match View APIv1
@@ -103,7 +106,19 @@ async def on_command_fallback(view_id: str, params: Dict[str, Any]) -> Dict[str,
                 "timestamp": time.time()
             }
         }
-        
+    except asyncio.TimeoutError:
+        logger.error(f"View {view_id}: Fallback TIMEOUT after {fallback_timeout}s via session {target_session_id}")
+        raise HTTPException(
+            status_code=504,
+            detail=f"Fallback command timeout: Agent {target_session_id} did not respond within {fallback_timeout}s"
+        )
     except Exception as e:
-        logger.error(f"View {view_id}: Fallback failed: {e}")
-        raise
+        logger.error(f"View {view_id}: Fallback FAILED via session {target_session_id}: {e}")
+        raise HTTPException(
+            status_code=502,
+            detail=f"Fallback command failed on Agent {target_session_id}: {str(e)}"
+        )
+
+
+from fastapi import HTTPException
+import asyncio

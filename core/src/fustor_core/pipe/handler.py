@@ -193,6 +193,10 @@ class ViewHandler(Handler):
         """Called at the end of an audit cycle."""
         pass
     
+    async def reset_audit_tracking(self) -> None:
+        """Force reset any internal audit tracking state (e.g. start time)."""
+        pass
+    
     async def on_snapshot_complete(self, session_id: str, **kwargs) -> None:
         """
         Called when a snapshot phase is complete.

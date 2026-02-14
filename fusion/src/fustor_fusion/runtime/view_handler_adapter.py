@@ -134,6 +134,11 @@ class ViewDriverAdapter(ViewHandler):
         if hasattr(self._driver, 'handle_audit_end'):
             await self._driver.handle_audit_end()
 
+    async def reset_audit_tracking(self) -> None:
+        """Force reset any internal audit tracking state."""
+        if hasattr(self._driver, '_audit_start_time'):
+            self._driver._audit_start_time = None
+
     async def on_snapshot_complete(self, session_id: str, **kwargs) -> None:
         """Handle snapshot complete."""
         if hasattr(self._driver, 'on_snapshot_complete'):
@@ -283,6 +288,12 @@ class ViewManagerAdapter(ViewHandler):
         for driver_instance in self._manager.driver_instances.values():
             if hasattr(driver_instance, 'handle_audit_end'):
                 await driver_instance.handle_audit_end()
+
+    async def reset_audit_tracking(self) -> None:
+        """Force reset any internal audit tracking state for all drivers."""
+        for driver_instance in self._manager.driver_instances.values():
+            if hasattr(driver_instance, '_audit_start_time'):
+                driver_instance._audit_start_time = None
     
     async def reset(self) -> None:
         """Reset all driver instances."""

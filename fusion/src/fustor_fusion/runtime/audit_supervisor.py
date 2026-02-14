@@ -11,10 +11,12 @@ async def check_audit_timeout():
     
     now = time.time()
     for pipe in pm.get_pipes().values():
-        # Default to 600s if not configured, timeout is 2x interval
+        # Default to 600s if not configured, timeout is configured multiplier x interval
         interval = getattr(pipe, 'audit_interval_sec', None) or \
                    pipe.config.get("audit_interval_sec", 600)
-        timeout_threshold = interval * 2
+        from ..config.unified import fusion_config
+        multiplier = fusion_config.fusion.audit_timeout_multiplier
+        timeout_threshold = interval * multiplier
         
         # Check all handlers in this pipe
         # We access protected _view_handlers as we are in the runtime/main loop
@@ -33,13 +35,8 @@ async def check_audit_timeout():
                     if hasattr(handler, 'handle_audit_end'):
                         await handler.handle_audit_end()
                     
-                    # Manually clear timestamp since the driver doesn't know about it
-                    # Handle Adapter cases
-                    if hasattr(handler, 'driver'): # ViewDriverAdapter
-                        handler.driver._audit_start_time = None
-                    elif hasattr(handler, 'manager'): # ViewManagerAdapter
-                         for d in handler.manager.driver_instances.values():
-                             d._audit_start_time = None
+                    if hasattr(handler, 'reset_audit_tracking'):
+                        await handler.reset_audit_tracking()
                              
                 except Exception as e:
                     logger.error(f"Error forcing audit end for {handler.id}: {e}")
