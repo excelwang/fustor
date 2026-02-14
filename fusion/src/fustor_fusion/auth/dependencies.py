@@ -45,8 +45,8 @@ async def get_pipe_id_from_auth(x_api_key: str = Depends(_get_api_key)) -> str:
                 return ak.pipe_id
     
     raise HTTPException(
-        status_code=403, 
-        detail="API Key is not authorized for Pipe ingestion (Sessions)."
+        status_code=401, 
+        detail="Invalid or inactive X-API-Key"
     )
 
 # Alias for compatibility while migrating
