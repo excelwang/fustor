@@ -88,8 +88,11 @@ class FusionPipe(FustorPipe):
         """
         super().__init__(pipe_id, config, context)
         
-        # FusionPipe now handles M:N view mappings.
-        self.view_ids = config.get("view_ids", [pipe_id])
+        # FusionPipe handles M:N view mappings.
+        # view_ids must be explicitly provided in config (from fusion-pipes-config.yaml)
+        self.view_ids = config.get("view_ids")
+        if not self.view_ids:
+            raise ValueError(f"FusionPipe '{pipe_id}': 'view_ids' is required in config. A pipe must serve at least one view.")
 
         self.allow_concurrent_push = config.get("allow_concurrent_push", True)
         self.queue_batch_size = config.get("queue_batch_size", 100)

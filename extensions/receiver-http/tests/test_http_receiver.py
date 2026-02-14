@@ -4,7 +4,7 @@ from fustor_receiver_http import HTTPReceiver
 
 class TestHTTPReceiver:
     def test_credential_validation_with_view_id(self):
-        """Test that register_api_key and validate_credential work with view_id."""
+        """Test that register_api_key and validate_credential work with pipe_id."""
         receiver = HTTPReceiver(
             receiver_id="test-recv",
             port=8888,
@@ -12,7 +12,7 @@ class TestHTTPReceiver:
         )
         
         # Register using new parameter name
-        receiver.register_api_key("secret-key", view_id="my-view-123")
+        receiver.register_api_key("secret-key", pipe_id="my-view-123")
         
         # Validate
         loop = asyncio.new_event_loop()

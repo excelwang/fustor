@@ -1,6 +1,6 @@
 
 import pytest
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, AsyncMock
 from fustor_fusion.api.session import create_session, CreateSessionPayload
 from fustor_fusion.api.views import list_view_sessions
 from fustor_fusion.core.session_manager import session_manager
@@ -17,6 +17,7 @@ async def test_session_source_uri_exposure():
     await session_manager.cleanup_expired_sessions()
     view_state_manager._states.clear()
     view_id = "test_view_uri"
+    pipe_id = "test_pipe_uri"
     
     # Mock config
     config = {
@@ -24,27 +25,46 @@ async def test_session_source_uri_exposure():
         "session_timeout_seconds": 30,
     }
     
+    # Mock pipe and pipe_manager
+    mock_pipe = Mock()
+    mock_pipe.pipe_id = pipe_id
+    mock_pipe.view_ids = [view_id]
+    
+    mock_pipe_manager = Mock()
+    mock_pipe_manager.get_pipe = Mock(return_value=mock_pipe)
+    mock_pipe_manager._on_session_created = AsyncMock(return_value=Mock(
+        session_id="test-session-id",
+        role="leader",
+        audit_interval_sec=30,
+        sentinel_interval_sec=10
+    ))
+    
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
-        # 1. Create Session with source_uri
-        payload = CreateSessionPayload(
-            task_id="task_with_uri",
-            client_info={"source_uri": "file:///tmp/test.txt"},
-            session_timeout_seconds=30
-        )
-        request = MockRequest()
-        
-        result = await create_session(payload, request, view_id)
-        session_id = result["session_id"]
-        
-        # 2. List Sessions and verify source_uri
-        list_result = await list_view_sessions(view_id, authorized_view_id=view_id)
-        
-        assert list_result["count"] == 1
-        session_data = list_result["active_sessions"][0]
-        
-        assert session_data["session_id"] == session_id
-        assert session_data["source_uri"] == "file:///tmp/test.txt"
-        assert session_data["client_ip"] == "127.0.0.1"
+        with patch('fustor_fusion.api.session.runtime_objects') as mock_runtime:
+            mock_runtime.pipe_manager = mock_pipe_manager
+            
+            # 1. Create Session with source_uri
+            payload = CreateSessionPayload(
+                task_id="task_with_uri",
+                client_info={"source_uri": "file:///tmp/test.txt"},
+                session_timeout_seconds=30
+            )
+            request = MockRequest()
+            
+            # Mock get_pipe_id_from_auth dependency
+            with patch('fustor_fusion.api.session.get_pipe_id_from_auth', return_value=pipe_id):
+                result = await create_session(payload, request, pipe_id=pipe_id)
+                session_id = result["session_id"]
+                
+                # 2. List Sessions and verify source_uri
+                list_result = await list_view_sessions(view_id, authorized_view_id=view_id)
+                
+                assert list_result["count"] == 1
+                session_data = list_result["active_sessions"][0]
+                
+                assert session_data["session_id"] == session_id
+                assert session_data["source_uri"] == "file:///tmp/test.txt"
+                assert session_data["client_ip"] == "127.0.0.1"
 
     # Cleanup
     await session_manager.terminate_session(view_id, session_id)

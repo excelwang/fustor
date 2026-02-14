@@ -12,7 +12,7 @@ class TestFusionEventFlow:
 
     @pytest_asyncio.fixture
     async def pipe(self):
-        config = {"view_id": "view-main"}
+        config = {"view_ids": ["view-main"]}
         pipe = FusionPipe("pipe-test", config)
         pipe._set_state = MagicMock() # Mock state transitions
         pipe._handlers_ready.set()    # Avoid initialization timeout

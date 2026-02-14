@@ -39,7 +39,7 @@ def fusion_pipe_with_handler():
     handler = MockViewHandler()
     pipe = FusionPipe(
         pipe_id="test",
-        config={"view_id": "1", "allow_concurrent_push": True},
+        config={"view_ids": ["1"], "allow_concurrent_push": True},
         view_handlers=[handler]
     )
     # pipe.pipe_id = pipe.id # Inject required attribute - REMOVED: V2 uses .id correctly

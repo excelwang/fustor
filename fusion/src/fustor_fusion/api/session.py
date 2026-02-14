@@ -133,69 +133,11 @@ async def create_session(
             logger.error(f"PipeManager failed to create session: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))
 
-    # --- Legacy Fallback (If PipeManager not fully active) ---
-    allow_concurrent_push = session_config["allow_concurrent_push"]
-    
-    # 1. Check for duplicate task ID (Logic moved from _should_allow_new_session)
-    if await _check_duplicate_task(view_id, payload.task_id):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Task {payload.task_id} already active on view {view_id}"
-        )
-
-    # 2. Atomic Locking Check (Race Condition Fix)
-    if not allow_concurrent_push:
-        # Check for stale lock first
-        locked_session_id = await view_state_manager.get_locked_session_id(view_id)
-        if locked_session_id:
-            sessions = await session_manager.get_view_sessions(view_id)
-            if locked_session_id not in sessions:
-                logger.warning(f"View {view_id} locked by stale session {locked_session_id}. Auto-unlocking.")
-                await view_state_manager.unlock_for_session(view_id, locked_session_id)
-        
-        # Atomic acquire
-        acquired = await view_state_manager.acquire_lock_if_free_or_owned(view_id, session_id)
-        if not acquired:
-             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"View {view_id} is currently locked by another session"
-            )
-    
-    # 3. Create Session Entry
-    try:
-        is_leader = await view_state_manager.try_become_leader(view_id, session_id)
-        if is_leader:
-            await view_state_manager.set_authoritative_session(view_id, session_id)
-
-        try:
-            await on_session_start(view_id)
-        except Exception as e:
-            logger.error(f"Failed to trigger on_session_start: {e}")
-
-        await session_manager.create_session_entry(
-            view_id, 
-            session_id, 
-            task_id=payload.task_id,
-            client_ip=client_ip,
-            allow_concurrent_push=allow_concurrent_push,
-            session_timeout_seconds=session_timeout_seconds,
-            source_uri=payload.client_info.get("source_uri") if payload.client_info else None
-        )
-    except Exception as e:
-        # Rollback lock if creation fails
-        if not allow_concurrent_push:
-            await view_state_manager.unlock_for_session(view_id, session_id)
-        raise e
-    
-    role = "leader" if is_leader else "follower"
-    return {
-        "session_id": session_id,
-        "role": role,
-        "is_leader": is_leader,
-        "session_timeout_seconds": session_timeout_seconds,
-        "audit_interval_sec": session_config.get("audit_interval_sec"),
-        "sentinel_interval_sec": session_config.get("sentinel_interval_sec"),
-    }
+    # PipeManager is required for session creation
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail="PipeManager not initialized. Service is not ready."
+    )
 
 
 @session_router.post("/{session_id}/heartbeat", tags=["Session Management"], summary="Session heartbeat keepalive")

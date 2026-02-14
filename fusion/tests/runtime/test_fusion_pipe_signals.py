@@ -64,7 +64,7 @@ def handler():
 async def pipe(handler):
     p = FusionPipe(
         pipe_id="test-pipe",
-        config={"view_id": "test-view", "allow_concurrent_push": True},
+        config={"view_ids": ["test-view"], "allow_concurrent_push": True},
         view_handlers=[handler]
     )
     await p.start()
@@ -129,7 +129,7 @@ async def test_process_events_not_running():
     h = StubViewHandler()
     p = FusionPipe(
         pipe_id="test-pipe",
-        config={"view_id": "test-view"},
+        config={"view_ids": ["test-view"]},
         view_handlers=[h]
     )
     result = await p.process_events(

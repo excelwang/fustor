@@ -42,7 +42,7 @@ async def pipe_with_bridge():
     handler = MinimalHandler(hid="bv1")
     pipe = FusionPipe(
         pipe_id="bridge-test",
-        config={"view_id": "bv1", "allow_concurrent_push": True},
+        config={"view_ids": ["bv1"], "allow_concurrent_push": True},
         view_handlers=[handler]
     )
     # pipe.pipe_id = pipe.id # Inject required attribute - REMOVED: V2 uses .id correctly

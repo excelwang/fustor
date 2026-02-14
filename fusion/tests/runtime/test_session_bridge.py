@@ -18,6 +18,7 @@ def mock_pipe():
     """Create a mock FusionPipe."""
     pipe = MagicMock(spec=FusionPipe)
     pipe.view_id = "1"
+    pipe.view_ids = ["1"]
     pipe._active_sessions = {}
     pipe._leader_session = None
     pipe.config = {"session_timeout_seconds": 30}

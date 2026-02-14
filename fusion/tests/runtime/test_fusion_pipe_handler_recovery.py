@@ -48,7 +48,7 @@ class TestHandlerDegradation:
         handler = FlakeyViewHandler(fail_count=100)  # 永遠失败
         pipe = FusionPipe(
             pipe_id="test",
-            config={"view_id": "1", "allow_concurrent_push": True},
+            config={"view_ids": ["1"], "allow_concurrent_push": True},
             view_handlers=[handler]
         )
         # pipe.pipe_id = pipe.id # REMOVED
@@ -79,7 +79,7 @@ class TestHandlerDegradation:
         pipe = FusionPipe(
             pipe_id="test",
             config={
-                "view_id": "1", 
+                "view_ids": ["1"], 
                 "allow_concurrent_push": True,
                 "handler_recovery_interval": 0.5  # 短冷却时间方便测试
             },

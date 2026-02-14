@@ -24,19 +24,16 @@ async def get_view_id_from_auth(x_api_key: str = Depends(_get_api_key)) -> str:
             return str(v_id)
 
     # 2. Check Receiver Keys (Receiver keys can query any view served by their pipe)
-    # Note: This returns the first view associated with the pipe for now, or we might
-    # need a more complex return. But for queries, the view_id is usually in the URL.
-    # The 'authorized_view_id' returned here is used for ownership verification.
+    # The view_id is typically in the URL path. The pipe_id returned here
+    # is used to verify that the pipe serves the requested view.
     receivers = fusion_config.get_all_receivers()
     for r_id, r_config in receivers.items():
         for ak in r_config.api_keys:
             if ak.key == x_api_key:
-                # For a pipe key, the 'authorized identity' is the pipe_id.
-                # However, many APIs use this as a view_id for backward compatibility.
-                # We return the pipe_id but it must be matched against the view's pipe set.
+                # Return the pipe_id - the API layer will verify that this pipe serves the requested view
                 return ak.pipe_id
     
-    raise HTTPException(status_code=401, detail="Invalid API Key")
+    raise HTTPException(status_code=401, detail="Invalid or inactive X-API-Key")
 
 async def get_pipe_id_from_auth(x_api_key: str = Depends(_get_api_key)) -> str:
     """Returns the Pipe ID authorized by this key. Sessions must use this."""

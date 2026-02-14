@@ -137,8 +137,9 @@ def make_metadata_limit_checker(view_name: str) -> Callable:
 
 def make_readiness_checker(view_name: str) -> Callable:
     """Creates a dependency that ensures a view is ready before allowing API access."""
-    async def check_ready(view_id: str = Depends(get_view_id_from_api_key)):
-        # Note: view_id from auth is actually pipe_id. Use view_name (from closure) for lookups.
+    async def check_ready(authorized_identity: str = Depends(get_view_id_from_api_key)):
+        # authorized_identity is the pipe_id (from API key) or view_id (if dedicated view key).
+        # For view readiness checks, we use view_name (from closure) which is the actual view ID from URL path.
         manager = await get_cached_view_manager(view_name)
         driver_instance = manager.driver_instances.get(view_name)
         

@@ -39,7 +39,7 @@ async def test_fusion_pipe_queue_behavior():
     mock_handler = MockViewHandler("mock-1")
     pipe = FusionPipe(
         pipe_id="test-pipe",
-        config={"view_id": "test-view"},
+        config={"view_ids": ["test-view"]},
         view_handlers=[mock_handler]
     )
     # pipe.pipe_id = pipe.id # REMOVED
@@ -90,7 +90,7 @@ async def test_fusion_pipe_queue_observability():
     
     pipe = FusionPipe(
         pipe_id="test-pipe-slow",
-        config={"view_id": "test-view-slow"},
+        config={"view_ids": ["test-view-slow"]},
         view_handlers=[mock_handler]
     )
     # pipe.pipe_id = pipe.id # REMOVED

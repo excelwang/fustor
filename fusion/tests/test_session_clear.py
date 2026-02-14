@@ -27,7 +27,7 @@ async def setup_dummy_pipe(view_id: str, allow_concurrent_push: bool = False):
     
     pipe = FusionPipe(
         pipe_id=view_id,
-        config={"view_id": view_id, "allow_concurrent_push": allow_concurrent_push},
+        config={"view_ids": [view_id], "allow_concurrent_push": allow_concurrent_push},
         view_handlers=[]
     )
     pipe._handlers_ready.set()

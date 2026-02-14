@@ -17,7 +17,7 @@ async def test_lineage_injection_flow():
     mock_handler.close = AsyncMock()
     mock_handler.process_event = AsyncMock(return_value=True)
     
-    pipe = FusionPipe(pipe_id="v1", config={"view_id": "v1"}, view_handlers=[mock_handler])
+    pipe = FusionPipe(pipe_id="v1", config={"view_ids": ["v1"]}, view_handlers=[mock_handler])
     await pipe.start()
     
     from fustor_fusion.runtime.session_bridge import create_session_bridge
