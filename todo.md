@@ -13,4 +13,7 @@
 - [ ] Implement `RemoteConfigProvider` in Agent (polling Fusion).
 - [ ] Implement `SelfUpdater` in Agent (upgrade strategy).
 - [ ] **Architecture**: Generalize `on_session_created` pattern to Sender side for full negotiation decoupling.
-- [ ] **Testing**: Add integration tests covering dynamic `source_uri` changes in ForestView.
+- [ ] **Testing**: Add integration tests covering dynamic `source_uri` changes in ForestView.】
+
+## source-fs
+考虑到一个agent可能需要监听十几个fs source。如果每个source都能监控1000万个文件的inotify，cpu、内存开销会有多大？是否要改进。

@@ -43,7 +43,7 @@ class MockViewHandler(ViewHandler):
     
     async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
         from fustor_fusion.view_state_manager import view_state_manager
-        view_id = "1"
+        view_id = self.id
         if self.next_role == "leader":
             is_leader = await view_state_manager.try_become_leader(view_id, session_id)
             return {"role": "leader" if is_leader else "follower"}
@@ -58,13 +58,13 @@ class MockViewHandler(ViewHandler):
 
 @pytest.fixture
 def mock_view_handler():
-    return MockViewHandler(handler_id="1")
+    return MockViewHandler(handler_id="mock-view")
 
 
 @pytest.fixture
 def pipe_config():
     return {
-        "view_id": "1",
+        "view_id": "mock-view",
         "allow_concurrent_push": True,
         "queue_batch_size": 100,
     }
@@ -77,8 +77,8 @@ async def fusion_pipe(mock_view_handler, pipe_config):
     from fustor_fusion.core.session_manager import session_manager
     
     # 清理旧状态
-    await view_state_manager.clear_state("1")
-    await session_manager.clear_all_sessions("1")
+    await view_state_manager.clear_state("mock-view")
+    await session_manager.clear_all_sessions("mock-view")
     
     p = FusionPipe(
         pipe_id="test-pipe",
@@ -106,7 +106,7 @@ class TestFusionPipeInit:
     
     @pytest.mark.asyncio
     async def test_config_parsing(self, fusion_pipe):
-        assert fusion_pipe.view_id == "1"
+        assert fusion_pipe.view_id == "mock-view"
         assert fusion_pipe.allow_concurrent_push is True
         assert fusion_pipe.queue_batch_size == 100
     
@@ -115,7 +115,7 @@ class TestFusionPipeInit:
         dto = await fusion_pipe.get_dto() # get_dto is async
         assert dto["id"] == "test-pipe"
         assert dto["state"] == "STOPPED"
-        assert dto["view_id"] == "1"
+        assert dto["view_id"] == "mock-view"
 
 
 class TestFusionPipeLifecycle:
@@ -223,7 +223,7 @@ class TestFusionPipeViewHandler:
     @pytest.mark.asyncio
     async def test_get_view(self, fusion_pipe, mock_view_handler):
         # get_view is synchronous
-        view = fusion_pipe.get_view("mock")
+        view = fusion_pipe.get_view("mock-view")
         assert view["events_count"] == 0
     
     @pytest.mark.asyncio

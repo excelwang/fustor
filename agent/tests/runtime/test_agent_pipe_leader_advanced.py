@@ -22,14 +22,17 @@ def mock_pipe():
     return pipe
 
 @pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited")
 async def test_run_leader_sequence_snapshot_failure(mock_pipe):
     """测试 Snapshot 启动失败路径"""
+    mock_pipe._run_snapshot_sync = AsyncMock()  # Mock to avoid unawaited coroutine warning
     with patch("asyncio.create_task", side_effect=RuntimeError("spawn fail")):
         await mock_pipe._run_leader_sequence()
         assert mock_pipe.state == PipeState.ERROR
         assert "Failed to start snapshot sync phase" in mock_pipe.info
 
 @pytest.mark.asyncio
+@pytest.mark.filterwarnings("ignore:coroutine 'AsyncMockMixin._execute_mock_call' was never awaited")
 async def test_snapshot_sync_fatal_error_propagation(mock_pipe):
     """测试 Snapshot 内部发生致命错误"""
     mock_pipe._handle_fatal_error = AsyncMock()
