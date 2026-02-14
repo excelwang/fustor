@@ -646,6 +646,17 @@ class FusionPipe(FustorPipe):
                         except Exception as e:
                             logger.error(f"Pipe {self.id}: Error in handle_audit_end for {handler}: {e}")
 
+            # Handle command results (GAP-P0-3)
+            if source_type == "command_result":
+                if self.session_bridge:
+                    for ev in processed_events:
+                        cmd_id = ev.get("id") or ev.metadata.get("command_id")
+                        if cmd_id:
+                            self.session_bridge.resolve_command(cmd_id, ev)
+                        else:
+                            logger.warning(f"Pipe {self.id}: Computed result without ID: {ev}")
+
+
             return {
                 "success": True,
                 "count": len(processed_events),

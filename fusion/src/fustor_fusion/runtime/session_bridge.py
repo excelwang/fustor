@@ -130,6 +130,10 @@ class PipeSessionBridge:
         # Event queue for asynchronous handler notifications in FusionPipe
         self.event_queue = asyncio.Queue()
         
+        # Command/Response Correlation (GAP-P0-3)
+        # {command_id: Future}
+        self._pending_commands: Dict[str, asyncio.Future] = {} 
+        
         self._LEADER_VERIFY_INTERVAL = 5  # Verify every N heartbeats
     
     async def create_session(
@@ -412,6 +416,76 @@ class PipeSessionBridge:
     def leader_session(self) -> Optional[str]:
         """Get the current leader session ID."""
         return self._pipe.leader_session
+
+    async def send_command_and_wait(
+        self, 
+        session_id: str, 
+        command: str, 
+        params: Dict[str, Any], 
+        timeout: float = 5.0
+    ) -> Dict[str, Any]:
+        """
+        Send a command to the agent and wait for a response.
+        
+        This enables synchronous-like API behavior over the async pipe.
+        
+        Args:
+            session_id: Target session ID
+            command: Command name (e.g., 'scan_path')
+            params: Command parameters
+            timeout: Max wait time in seconds
+            
+        Returns:
+            The command result dictionary
+            
+        Raises:
+            asyncio.TimeoutError: If no response received in time
+            Exception: If command fails or session invalid
+        """
+        import uuid
+        
+        # 1. Generate unique command ID for correlation
+        cmd_id = str(uuid.uuid4())
+        
+        # 2. Register future
+        future = asyncio.get_running_loop().create_future()
+        self._pending_commands[cmd_id] = future
+        
+        try:
+            # 3. Queue command for next heartbeat (legacy mechanism)
+            # OR send directly if we had a push channel (future optimization)
+            # Currently we piggy-back on heartbeat response via session_manager
+            await self._session_manager.queue_command(
+                self._pipe.view_id, 
+                session_id, 
+                {"id": cmd_id, "cmd": command, "params": params}
+            )
+            
+            # 4. Wait for result
+            logger.debug(f"Queued command {command} ({cmd_id}) for session {session_id}, waiting {timeout}s...")
+            return await asyncio.wait_for(future, timeout=timeout)
+            
+        except Exception:
+            # Cleanup on error
+            if cmd_id in self._pending_commands:
+                del self._pending_commands[cmd_id]
+            raise
+            
+    def resolve_command(self, command_id: str, result: Dict[str, Any]):
+        """
+        Resolve a pending command with a result.
+        Called by FusionPipe when it receives a command_result event.
+        """
+        if command_id in self._pending_commands:
+            future = self._pending_commands.pop(command_id)
+            if not future.done():
+                if result.get("success", True):
+                    future.set_result(result)
+                else:
+                    future.set_exception(Exception(result.get("error", "Command failed")))
+        else:
+            logger.warning(f"Received result for unknown/expired command {command_id}")
+
 
 
 def create_session_bridge(

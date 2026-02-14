@@ -12,6 +12,8 @@ from importlib.metadata import entry_points
 from ..auth.dependencies import get_view_id_from_api_key
 from ..view_manager.manager import get_cached_view_manager
 from ..config.unified import fusion_config
+from .. import runtime_objects
+from .on_command import on_command_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -49,7 +51,34 @@ async def get_view_driver_instance(view_id: str, lookup_key: str):
                 detail=f"View '{lookup_key}' not found or not active"
             )
             
-    return driver_instance
+    return FallbackDriverWrapper(driver_instance, view_id)
+
+class FallbackDriverWrapper:
+    """
+    Wraps a View Driver to provide On-Command Fallback on failure.
+    Acts as a proxy, intercepting get_data_view calls.
+    """
+    def __init__(self, driver, view_id):
+        self._driver = driver
+        self._view_id = view_id
+        
+    def __getattr__(self, name):
+        return getattr(self._driver, name)
+        
+    async def get_data_view(self, **kwargs):
+        try:
+            return await self._driver.get_data_view(**kwargs)
+        except Exception as e:
+            # Only fallback on specific availability errors or if configured?
+            # For P0 implementation, we try fallback on any failure + warning
+            logger.warning(f"View {self._view_id} primary query failed ({e}), triggering On-Command Fallback...")
+            try:
+                return await on_command_fallback(self._view_id, kwargs)
+            except Exception as fallback_e:
+                logger.error(f"Fallback failed for {self._view_id}: {fallback_e}")
+                # Re-raise original error to not mask the root cause if fallback also fails
+                raise e
+
 
 def make_metadata_limit_checker(view_name: str) -> Callable:
     """Creates a dependency that ensures a request doesn't exceed metadata limits."""
@@ -199,7 +228,8 @@ def setup_view_routers():
                     async def get_driver_instance_for_instance(view_id: str, _key=view_name):
                         return await get_view_driver_instance(_key, _key)
                     
-                    # multi-fs views are aggregators and don't have sessions/snapshots
+                    # Register with prefix matching the view_name (e.g., test-fs)
+
                     if driver_name == "multi-fs":
                         checker = None
                         limit_checker = None
