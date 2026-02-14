@@ -38,7 +38,8 @@ async def test_create_session_delegation(mock_pipe, mock_session_manager):
     }
     
     with patch("fustor_fusion.view_state_manager.view_state_manager") as mock_vsm:
-        mock_vsm.lock_for_session = AsyncMock()
+        mock_vsm.lock_for_session = AsyncMock(return_value=True)
+        mock_vsm.get_locked_session_id = AsyncMock(return_value=None)
         
         # 1. Create session
         await bridge.create_session(
@@ -65,6 +66,7 @@ async def test_create_session_follower(mock_pipe, mock_session_manager):
     
     with patch("fustor_fusion.view_state_manager.view_state_manager") as mock_vsm:
         mock_vsm.lock_for_session = AsyncMock()
+        mock_vsm.get_locked_session_id = AsyncMock(return_value=None)
         
         await bridge.create_session(task_id="task-1", session_id="sess-1")
         

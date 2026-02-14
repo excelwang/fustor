@@ -26,6 +26,9 @@ async def run_snapshot_sync(pipe: "AgentPipe") -> None:
             snapshot_iter = pipe._aiter_sync_phase(snapshot_iter)
 
         async for event in snapshot_iter:
+            # P1-2: Heartbeat for zombie detection
+            pipe._task_last_active["snapshot"] = asyncio.get_event_loop().time()
+            
             if not pipe.is_running() and not (pipe.state & PipeState.RECONNECTING):
                 break
                 
@@ -74,6 +77,9 @@ async def run_bus_message_sync(pipe: "AgentPipe") -> None:
     try:
         while pipe.is_running() or (pipe.state & PipeState.RECONNECTING):
             # 1. Fetch from bus
+            # P1-2: Heartbeat for zombie detection
+            pipe._task_last_active["message_sync"] = asyncio.get_event_loop().time()
+            
             # Use pipe.task_id for bus operations to match subscription ID
             events = await pipe._bus.internal_bus.get_events_for(
                 pipe.task_id, 
@@ -139,8 +145,12 @@ async def run_audit_sync(pipe: "AgentPipe") -> None:
         if not hasattr(audit_iter, "__aiter__"):
             audit_iter = pipe._aiter_sync_phase(audit_iter)
             
+            
         last_item = None
         async for item in audit_iter:
+            # P1-2: Heartbeat for zombie detection
+            pipe._task_last_active["audit"] = asyncio.get_event_loop().time()
+            
             if not pipe.is_running():
                 break
             

@@ -8,12 +8,34 @@ import pytest
 from fustor_fusion.api.session import create_session
 from fustor_fusion.core.session_manager import session_manager
 from fustor_fusion.view_state_manager import view_state_manager
+from fustor_fusion.runtime.fusion_pipe import FusionPipe
+from fustor_fusion.runtime.session_bridge import create_session_bridge
+from fustor_fusion import runtime_objects
 
 
 class MockRequest:
     def __init__(self, client_host="127.0.0.1"):
         self.client = Mock()
         self.client.host = client_host
+
+
+async def setup_dummy_pipe(view_id: str, allow_concurrent_push: bool = False):
+    """Register a dummy pipe in the global manager for API tests."""
+    if not runtime_objects.pipe_manager:
+        from fustor_fusion.runtime.pipe_manager import FusionPipeManager
+        runtime_objects.pipe_manager = FusionPipeManager()
+    
+    pipe = FusionPipe(
+        pipe_id=view_id,
+        config={"view_id": view_id, "allow_concurrent_push": allow_concurrent_push},
+        view_handlers=[]
+    )
+    pipe._handlers_ready.set()
+    runtime_objects.pipe_manager._pipes[view_id] = pipe
+    
+    bridge = create_session_bridge(pipe)
+    runtime_objects.pipe_manager._bridges[view_id] = bridge
+    return pipe
 
 
 def make_session_config(allow_concurrent_push=False, session_timeout_seconds=30):
@@ -33,6 +55,8 @@ async def test_clear_all_sessions():
     view_state_manager._states.clear()
     
     view_id = "7"
+    await setup_dummy_pipe(view_id, allow_concurrent_push=False)
+    
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):

@@ -111,6 +111,10 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
         self.backoff_multiplier = config.get("backoff_multiplier", 2.0)        # Exponential backoff factor
         self.max_backoff_seconds = config.get("max_backoff_seconds", 60.0)     # Max backoff delay cap
         self.data_supervisor_interval = config.get("data_supervisor_interval", 1.0)
+        
+        # P1-2: Zombie Prevention
+        self._task_last_active: Dict[str, float] = {}
+        self.task_zombie_timeout = config.get("task_zombie_timeout", 300)  # 5 minutes default
 
         
 
@@ -136,6 +140,11 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
         if self.task_id and ":" in self.task_id:
             agent_id = self.task_id.split(":")[0]
 
+        # Safe check for source health
+        source_is_healthy = True
+        if hasattr(self.source_handler, 'is_healthy'):
+             source_is_healthy = self.source_handler.is_healthy()
+
         return {
             "agent_id": agent_id,
             "pipe_id": self.id,
@@ -143,6 +152,20 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
             "role": self.current_role,
             "events_pushed": self.statistics.get("events_pushed", 0),
             "is_realtime_ready": self.is_realtime_ready,
+            "component_health": {
+                "source": {
+                    "status": "ok" if source_is_healthy else "error",
+                    "restart_count": getattr(self.source_handler, '_restart_count', 0),
+                },
+                "sender": {
+                    "status": "ok" if self._control_errors == 0 else "degraded",
+                    "consecutive_errors": self._control_errors,
+                },
+                "data_plane": {
+                    "status": "ok" if self._data_errors == 0 else "degraded",
+                    "consecutive_errors": self._data_errors,
+                }
+            }
         }
 
     def _set_state(self, new_state: PipeState, info: Optional[str] = None):
@@ -246,26 +269,56 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
                 self._data_errors += 1
                 await asyncio.sleep(5.0) # Fixed backoff for supervisor error, distinct from task errors
 
+    async def _check_task_liveness(self, task: asyncio.Task, task_name: str) -> bool:
+        """Check if task appears stuck (no activity for zombie timeout)."""
+        if task is None or task.done():
+            return True
+        
+        now = asyncio.get_event_loop().time()
+        # If task never reported activity, assume it started 'now' (give it grace period)
+        last_active = self._task_last_active.get(task_name, now)
+        
+        if now - last_active > self.task_zombie_timeout:
+            logger.warning(
+                f"Pipe {self.id}: Task {task_name} appears stuck "
+                f"(no activity for {now - last_active:.0f}s > {self.task_zombie_timeout}s). Cancelling."
+            )
+            try:
+                task.cancel()
+            except Exception as e:
+                logger.error(f"Pipe {self.id}: Error cancelling zombie task {task_name}: {e}")
+            return False
+        return True
+
     async def _supervise_data_tasks(self) -> None:
         """
         Manage Data Tasks based on Role and state.
         Extracted from supervisor loop for testability.
         """
+        # Check liveness of critical tasks
+        await self._check_task_liveness(self._message_sync_task, "message_sync")
+        if self.current_role == "leader":
+            await self._check_task_liveness(self._snapshot_task, "snapshot")
+            await self._check_task_liveness(self._audit_task, "audit")
+            
         # Message Sync (Realtime) - Always needs to be running or ready if we have a session
         if self._message_sync_task is None or self._message_sync_task.done():
-                # If it finished with exception, it should have been handled by internal error handler
-                # We just restart it here if it's not cancelled
-                if self._message_sync_task and self._message_sync_task.done() and not self._message_sync_task.cancelled():
-                    try:
-                        exc = self._message_sync_task.exception()
-                        if exc:
-                            logger.warning(f"Pipe {self.id}: Restarting crashed message sync: {exc}")
-                            self._data_errors += 1
-                    except (asyncio.CancelledError, asyncio.InvalidStateError):
-                        pass
-                
-                logger.debug(f"Pipe {self.id}: DataSupervisor starting message sync phase")
-                self._message_sync_task = asyncio.create_task(self._run_message_sync())
+            # If it finished with exception, it should have been handled by internal error handler
+            # We just restart it here if it's not cancelled
+            if self._message_sync_task and self._message_sync_task.done() and not self._message_sync_task.cancelled():
+                try:
+                    exc = self._message_sync_task.exception()
+                    if exc:
+                        logger.warning(f"Pipe {self.id}: Restarting crashed message sync: {exc}")
+                        self._data_errors += 1
+                        # Backoff to prevent tight loop on persistent failures
+                        # We use the generic error retry interval for this specific task failure
+                        await asyncio.sleep(self.error_retry_interval)
+                except (asyncio.CancelledError, asyncio.InvalidStateError):
+                    pass
+            
+            logger.debug(f"Pipe {self.id}: DataSupervisor starting message sync phase")
+            self._message_sync_task = asyncio.create_task(self._run_message_sync())
 
         if self.current_role == "leader":
             # Leader Sequence: Prescan -> Message Sync -> Snapshot -> Audit/Sentinel
@@ -299,11 +352,11 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
                     self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
         
         elif self.current_role == "follower":
-                # Follower: Ensure leader tasks are NOT running
-                await self._cancel_leader_tasks()
-                
-                if self.state & PipeState.RUNNING and not (self.state & PipeState.PAUSED):
-                    self._set_state((self.state | PipeState.PAUSED) & ~PipeState.SNAPSHOT_SYNC, "Follower mode - standby")
+            # Follower: Ensure leader tasks are NOT running
+            await self._cancel_leader_tasks()
+            
+            if self.state & PipeState.RUNNING and not (self.state & PipeState.PAUSED):
+                self._set_state((self.state | PipeState.PAUSED) & ~PipeState.SNAPSHOT_SYNC, "Follower mode - standby")
         
         else:
             # Role is None or other state: ensure leader tasks are stopped for safety
@@ -405,8 +458,10 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
             except Exception as e:
                 logger.warning(f"Pipe {self.id}: Bus recovery failed: {e}")
         
-        self._heartbeat_task = None
-        if self._heartbeat_task is None or self._heartbeat_task.done():
+        if self._heartbeat_task and self._heartbeat_task.done():
+            self._heartbeat_task = None
+            
+        if self._heartbeat_task is None:
             self._heartbeat_task = asyncio.create_task(self._run_heartbeat_loop())
             logger.debug(f"Pipe {self.id}: Started heartbeat loop (Session: {session_id})")
         

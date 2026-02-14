@@ -155,6 +155,11 @@ class ViewDriverAdapter(ViewHandler):
         """Check if driver requires full reset."""
         return getattr(self._driver, 'requires_full_reset_on_session_close', False)
 
+    @property
+    def audit_start_time(self) -> Optional[float]:
+        """Get the audit start time from the underlying driver."""
+        return getattr(self._driver, '_audit_start_time', None)
+
 
 class ViewManagerAdapter(ViewHandler):
     """
@@ -296,6 +301,16 @@ class ViewManagerAdapter(ViewHandler):
     def get_driver_instance(self, name: str) -> Optional[ViewDriver]:
         """Get a specific driver instance by name."""
         return self._manager.get_driver_instance(name)
+
+    @property
+    def audit_start_time(self) -> Optional[float]:
+        """Get the earliest audit start time from any underlying driver."""
+        times = [
+            getattr(d, '_audit_start_time', None) 
+            for d in self._manager.driver_instances.values()
+        ]
+        active_times = [t for t in times if t is not None]
+        return min(active_times) if active_times else None
 
 
 def create_view_handler_from_driver(

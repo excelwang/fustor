@@ -2,6 +2,7 @@ from fastapi import FastAPI, APIRouter, Request, HTTPException, status
 from fastapi.responses import FileResponse
 import os
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
@@ -23,6 +24,7 @@ from fustor_core.event import EventBase
 # --- View Manager Module Imports ---
 from .view_manager.manager import process_event as process_single_event, cleanup_all_expired_suspects
 from .api.views import view_router
+from .runtime.audit_supervisor import check_audit_timeout
 
 
 @asynccontextmanager
@@ -87,13 +89,14 @@ async def lifespan(app: FastAPI):
     # Start all pipes and receivers
     await pm.start()
 
-    # Start periodic suspect cleanup
+    # Start periodic suspect cleanup & monitoring
     async def periodic_suspect_cleanup():
-        logger.info("Starting periodic suspect cleanup task")
+        logger.info("Starting periodic suspect cleanup & monitoring task")
         while True:
             try:
                 await asyncio.sleep(0.5)
                 await cleanup_all_expired_suspects()
+                await check_audit_timeout()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -185,11 +188,15 @@ def create_app() -> FastAPI:
     # --- Register Routers ---
     from .api.pipe import pipe_router
     from .api.session import session_router
+    from .api.pipe import pipe_router
+    from .api.session import session_router
     from .api.views import view_router
+    from .api.health import health_router
 
     api_v1 = APIRouter()
     api_v1.include_router(pipe_router, prefix="/pipe")
     api_v1.include_router(view_router, prefix="/views")
+    api_v1.include_router(health_router)
     
     app.include_router(api_v1, prefix="/api/v1", tags=["v1"])
 

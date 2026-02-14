@@ -20,7 +20,9 @@ import subprocess
 import time
 
 from fustor_core.common import setup_logging, get_fustor_home_dir
+from fustor_core.common import setup_logging, get_fustor_home_dir
 from .config.unified import fusion_config
+from .runner import run_fusion
 
 # Define standard directories and file names for fusion
 HOME_FUSTOR_DIR = get_fustor_home_dir()
@@ -137,14 +139,14 @@ def start(configs, reload, port, host, daemon, verbose, no_console_log):
         
         click.echo(f"Fusion starting on http://{host}:{port}")
         
-        uvicorn.run(
-            fastapi_app if not reload else "fustor_fusion.main:app",
+        # Use supervisor runner
+        asyncio.run(run_fusion(
             host=host,
             port=port,
-            log_config=None,
-            access_log=True,
             reload=reload,
-        )
+            access_log=True,
+            app_import_str="fustor_fusion.main:app"
+        ))
 
     except KeyboardInterrupt:
         click.echo("\nFusion shutting down...")

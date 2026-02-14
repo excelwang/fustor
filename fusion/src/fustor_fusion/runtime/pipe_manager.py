@@ -311,6 +311,12 @@ class FusionPipeManager:
         # Lock-free lookup (pipes dict is stable after init)
         fusion_pipe = self._pipes.get(p_id)
         if not fusion_pipe: raise ValueError(f"FusionPipe {p_id} not found")
+        
+        # Check for duplicate task ID in this view
+        from ..api.session import _check_duplicate_task
+        if await _check_duplicate_task(fusion_pipe.view_id, task_id):
+             raise ValueError(f"Task {task_id} already active on view {fusion_pipe.view_id}")
+
         bridge = self._bridges.get(p_id)
         
         # Per-pipe lock for session creation

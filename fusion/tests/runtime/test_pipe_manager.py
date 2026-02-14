@@ -123,6 +123,8 @@ class TestPipeManager:
     async def test_callbacks(self, pipe_manager):
         # Manually inject a mock pipe and bridge
         mock_pipe = AsyncMock(spec=FusionPipe)
+        mock_pipe.id = "pipe-1"
+        mock_pipe.view_id = "view-1"
         mock_pipe.get_session_role.return_value = "leader"
         mock_pipe.get_session_info.return_value = {"id": "sess-1"}
         mock_pipe.process_events.return_value = {"success": True}

@@ -93,10 +93,14 @@ async def create_session(
             client_info = payload.client_info or {}
             client_info["client_ip"] = client_ip
             
+            # TODO: Conceptually, pipe_id and view_id are distinct. Currently view_id is used as 
+            # the p_id because the authentication model (API Key) is tied to the view_id.
+            # A future refactoring should implement a proper mapping between view_id and pipe_id
+            # or allow explicit pipe identification in the payload.
             session_info = await runtime_objects.pipe_manager._on_session_created(
                 session_id=session_id,
                 task_id=payload.task_id,
-                pipe_id=view_id, # view_id as the pipe_id
+                p_id=view_id, # view_id as the p_id
                 client_info=client_info,
                 session_timeout_seconds=session_timeout_seconds
             )
@@ -110,7 +114,10 @@ async def create_session(
                 "sentinel_interval_sec": session_info.sentinel_interval_sec,
             }
         except ValueError as e:
-            # Handle concurrency/locking conflicts correctly
+            # Handle concurrency/locking conflicts correctly (e.g. duplicate task ID)
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
+        except RuntimeError as e:
+            # Task already active etc
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
         except Exception as e:
             logger.error(f"PipeManager failed to create session: {e}", exc_info=True)

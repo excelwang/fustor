@@ -490,6 +490,8 @@ class FusionPipe(FustorPipe):
             can_realtime=can_realtime, 
             agent_status=agent_status
         )
+        if agent_status:
+            self._last_agent_status = agent_status
         return si is not None
 
     async def get_session_role(self, session_id: str) -> str:

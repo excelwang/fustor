@@ -35,6 +35,8 @@ async def signal_audit_start(
         if hasattr(driver_instance, 'handle_audit_start'):
             try:
                 await driver_instance.handle_audit_start()
+                # Record start time for timeout protection
+                driver_instance._audit_start_time = time.time()
                 handled_count += 1
             except Exception as e:
                 logger.error(f"Failed to handle audit start for driver {driver_id}: {e}")
@@ -93,6 +95,8 @@ async def signal_audit_end(
         if hasattr(driver_instance, 'handle_audit_end'):
             try:
                 await driver_instance.handle_audit_end()
+                # Clear start time
+                driver_instance._audit_start_time = None
                 handled_count += 1
             except Exception as e:
                 logger.error(f"Failed to handle audit end for driver {driver_id}: {e}")

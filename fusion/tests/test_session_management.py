@@ -13,6 +13,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from fustor_fusion.api.session import create_session
 from fustor_fusion.core.session_manager import session_manager
 from fustor_fusion.view_state_manager import view_state_manager
+from fustor_fusion.runtime.fusion_pipe import FusionPipe
+from fustor_fusion.runtime.session_bridge import create_session_bridge
+from fustor_fusion import runtime_objects
 
 
 class MockRequest:
@@ -29,6 +32,26 @@ def make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     }
 
 
+async def setup_dummy_pipe(view_id: str, allow_concurrent_push: bool = False):
+    """Register a dummy pipe in the global manager for API tests."""
+    if not runtime_objects.pipe_manager:
+        from fustor_fusion.runtime.pipe_manager import FusionPipeManager
+        runtime_objects.pipe_manager = FusionPipeManager()
+    
+    pipe = FusionPipe(
+        pipe_id=view_id,
+        config={"view_id": view_id, "allow_concurrent_push": allow_concurrent_push},
+        view_handlers=[]
+    )
+    # Set ready so it doesn't timeout
+    pipe._handlers_ready.set()
+    runtime_objects.pipe_manager._pipes[view_id] = pipe
+    
+    bridge = create_session_bridge(pipe)
+    runtime_objects.pipe_manager._bridges[view_id] = bridge
+    return pipe
+
+
 @pytest.mark.asyncio
 async def test_session_creation_multiple_servers():
     """
@@ -38,6 +61,8 @@ async def test_session_creation_multiple_servers():
     view_state_manager._states.clear()
     
     view_id = "1"
+    await setup_dummy_pipe(view_id, allow_concurrent_push=False)
+    
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=1)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -82,6 +107,8 @@ async def test_session_creation_same_task_id():
     view_state_manager._states.clear()
     
     view_id = "2"
+    await setup_dummy_pipe(view_id, allow_concurrent_push=False)
+    
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -120,6 +147,8 @@ async def test_session_creation_different_task_id():
     view_state_manager._states.clear()
     
     view_id = "3"
+    await setup_dummy_pipe(view_id, allow_concurrent_push=False)
+    
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -142,6 +171,8 @@ async def test_session_creation_different_task_id():
         
         request2 = MockRequest(client_host="192.168.1.15")
         
+        # In V2 architecture, different task_id still competes for the view-level lock 
+        # if allow_concurrent_push is False.
         with pytest.raises(Exception) as exc_info:
             await create_session(payload2, request2, view_id)
         
@@ -158,6 +189,8 @@ async def test_concurrent_push_allowed():
     view_state_manager._states.clear()
     
     view_id = "4"
+    await setup_dummy_pipe(view_id, allow_concurrent_push=True)
+    
     config = make_session_config(allow_concurrent_push=True, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -196,6 +229,8 @@ async def test_same_task_id_with_concurrent_push():
     view_state_manager._states.clear()
     
     view_id = "5"
+    await setup_dummy_pipe(view_id, allow_concurrent_push=True)
+    
     config = make_session_config(allow_concurrent_push=True, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
@@ -234,11 +269,14 @@ async def test_stale_lock_handling():
     view_state_manager._states.clear()
     
     view_id = "6"
+    await setup_dummy_pipe(view_id, allow_concurrent_push=False)
+    
     config = make_session_config(allow_concurrent_push=False, session_timeout_seconds=30)
     
     with patch('fustor_fusion.api.session._get_session_config', return_value=config):
         stale_session_id = str(uuid.uuid4())
-        await view_state_manager.lock_for_session(view_id, stale_session_id)
+        # Set stale lock in VSM
+        await view_state_manager.set_state(view_id, "ACTIVE", locked_by_session_id=stale_session_id)
         
         assert await view_state_manager.is_locked_by_session(view_id, stale_session_id)
         

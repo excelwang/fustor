@@ -192,8 +192,24 @@ class PipeSessionBridge:
         if is_leader:
              self.store.record_leader(session_id, election_key)
              if not allow_concurrent_push:
+                 # Check for stale lock first (GAP-1 stabilization)
+                 locked_sid = await view_state_manager.get_locked_session_id(election_key)
+                 if locked_sid:
+                      # If the session holding the lock is not in ANY view's active list
+                      # (Checking legacy global session manager for now as it holds all state)
+                      # We check globally across all views because election_key might be scoped
+                      from fustor_fusion.core.session_manager import session_manager
+                      all_active = await session_manager.get_all_active_sessions()
+                      is_active = any(locked_sid in view_sess for view_sess in all_active.values())
+                      
+                      if not is_active:
+                           logger.warning(f"View {election_key} locked by stale session {locked_sid}. Auto-unlocking.")
+                           await view_state_manager.unlock_for_session(election_key, locked_sid)
+
                  # We lock on the election key provided by the view (could be scoped or global)
-                 await view_state_manager.lock_for_session(election_key, session_id)
+                 locked = await view_state_manager.lock_for_session(election_key, session_id)
+                 if not locked:
+                      raise ValueError(f"View {election_key} is currently locked by another session")
         
         # Create in legacy SessionManager
         session_entry = await self._session_manager.create_session_entry(
