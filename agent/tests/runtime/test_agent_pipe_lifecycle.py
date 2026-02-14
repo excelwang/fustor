@@ -48,7 +48,7 @@ class TestAgentPipeLifecycle:
         # Start as follower
         await agent_pipe.start()
         
-        # Transition to leader
+        # Transisition to leader - update mock state for next heartbeat
         mock_sender.role = "leader"
         
         # Poll until leader sequence completes (snapshot done + message sync started).
@@ -136,8 +136,15 @@ class TestAgentPipeLifecycle:
             mock_sender.role = "leader"
             await agent_pipe.start()
             
-            await asyncio.sleep(0.2)
-            assert PipeState.SNAPSHOT_SYNC in agent_pipe.state
+            # Wait for snapshot task to start (poll)
+            found_snapshot = False
+            for _ in range(20):
+                if agent_pipe.state & PipeState.SNAPSHOT_SYNC:
+                    found_snapshot = True
+                    break
+                await asyncio.sleep(0.1)
+                
+            assert found_snapshot, "Pipe did not enter SNAPSHOT_SYNC state"
             
             await agent_pipe.stop()
             assert agent_pipe.state == PipeState.STOPPED

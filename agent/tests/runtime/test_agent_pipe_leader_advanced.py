@@ -22,13 +22,48 @@ def mock_pipe():
     return pipe
 
 @pytest.mark.asyncio
-async def test_run_leader_sequence_snapshot_failure(mock_pipe):
-    """测试 Snapshot 启动失败路径"""
-    mock_pipe._run_snapshot_sync = MagicMock()  # Use MagicMock to avoid unawaited coroutine warning when create_task fails
-    with patch("asyncio.create_task", side_effect=RuntimeError("spawn fail")):
-        await mock_pipe._run_leader_sequence()
-        assert mock_pipe.state == PipeState.ERROR
-        assert "Failed to start snapshot sync phase" in mock_pipe.info
+async def test_supervise_starts_snapshot(mock_pipe):
+    """Test that supervise_data_tasks starts snapshot if needed."""
+    # mock_pipe._supervise_data_tasks is already the real method
+    
+    # Test object capability
+    mock_pipe._snapshot_task = "test_val"
+    assert mock_pipe._snapshot_task == "test_val"
+    mock_pipe._snapshot_task = None
+    
+    # Setup conditions
+    mock_pipe.is_realtime_ready = True
+    mock_pipe._initial_snapshot_done = False
+    mock_pipe._snapshot_task = None
+    
+    # We need to mock _run_snapshot_sync to avoid actually running it
+    mock_pipe._run_snapshot_sync = MagicMock()
+    
+    # Call supervise (it's synchronous now)
+    # We need to ensure has_active_session returns true
+    mock_pipe.has_active_session = MagicMock(return_value=True)
+    
+    # We also need _message_sync_task to be handled or mocked
+    mock_pipe._message_sync_task = MagicMock()
+    mock_pipe._message_sync_task.done.return_value = False
+    
+    with patch("asyncio.create_task") as mock_create:
+        # Important: The supervisor checks task.done(). MagicMock.done() returns a mock which is Truthy.
+        # This causes the loop to think the task finished immediately and clear the handle.
+        # We must explicitly set done() to False.
+        mock_task = MagicMock()
+        mock_task.done.return_value = False
+        mock_create.return_value = mock_task
+        
+        mock_pipe._supervise_data_tasks()
+        
+        # Verify create_task was called
+        assert mock_create.called
+        
+        # Verify it was assigned
+        assert mock_pipe._snapshot_task is not None
+        assert mock_pipe._snapshot_task == mock_task
+
 
 @pytest.mark.asyncio
 async def test_snapshot_sync_fatal_error_propagation(mock_pipe):

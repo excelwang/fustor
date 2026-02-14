@@ -14,51 +14,14 @@ class PipeLeaderMixin:
     Mixin for AgentPipe leader task orchestration.
     """
 
-    async def _run_leader_sequence(self: "AgentPipe") -> None:
-        """Run the leader-specific sequence: Snapshot and background Audit/Sentinel."""
-        # Sync Phase 1: Initial Snapshot sync phase
-        if not self._initial_snapshot_done and (self._snapshot_task is None or self._snapshot_task.done()):
-            self._set_state(PipeState.RUNNING | PipeState.SNAPSHOT_SYNC, "Starting initial snapshot sync phase...")
-            try:
-                # Start Snapshot in a background task. 
-                self._snapshot_task = asyncio.create_task(self._run_snapshot_sync())
-                logger.debug(f"Pipe {self.id}: Initial snapshot sync phase started in background")
-            except Exception as e:
-                self._set_state(PipeState.ERROR, f"Failed to start snapshot sync phase: {e}")
-                return
-        
-        # Once snapshot is done, update the internal flag
-        if self._snapshot_task and self._snapshot_task.done() and not self._initial_snapshot_done:
-            try:
-                self._snapshot_task.result()
-                # Flag is set inside _run_snapshot_sync on success.
-                # If _handle_fatal_error swallowed the error, .result() returns None
-                # but _initial_snapshot_done remains False — which is correct.
-                if not self._initial_snapshot_done:
-                    logger.info(f"Pipe {self.id}: Initial snapshot sync phase complete")
-                    self._initial_snapshot_done = True
-            except asyncio.CancelledError:
-                logger.debug(f"Pipe {self.id}: Snapshot sync phase task was cancelled")
-            except Exception as e:
-                logger.error(f"Pipe {self.id}: Snapshot sync phase failed: {e}")
-                self._set_state(PipeState.ERROR, f"Snapshot sync phase failed: {e}")
-            finally:
-                self._snapshot_task = None
-        
-        # Double check session and running state before starting more background tasks
-        if not self.has_active_session() or not self.is_running():
-            return
+    # _run_leader_sequence removed (Blocking logic deprecated)
 
-        # Background Leader Tasks: Audit and Sentinel
-        if self.audit_interval_sec > 0 and (self._audit_task is None or self._audit_task.done()):
-            self._audit_task = asyncio.create_task(self._run_audit_loop())
-            
-        if self.sentinel_interval_sec > 0 and (self._sentinel_task is None or self._sentinel_task.done()):
-            self._sentinel_task = asyncio.create_task(self._run_sentinel_loop())
 
     async def _run_snapshot_sync(self: "AgentPipe") -> None:
         """Execute snapshot sync phase."""
         logger.debug(f"Pipe {self.id}: Snapshot sync phase starting")
+        # Set state bit
+        self._set_state(self.state | PipeState.SNAPSHOT_SYNC, "Starting initial snapshot sync phase...")
         try:
             from .phases import run_snapshot_sync
             await run_snapshot_sync(self)
@@ -70,8 +33,13 @@ class PipeLeaderMixin:
                     self.session_id, [], {"phase": "snapshot", "is_final": True}
                 )
                 
-            # Initial snapshot flag is now set by the monitor loop in _run_leader_sequence
-            # to ensure the "complete" log is correctly triggered once.
+                await self.sender_handler.send_batch(
+                    self.session_id, [], {"phase": "snapshot", "is_final": True}
+                )
+                
+            logger.info(f"Pipe {self.id}: Initial snapshot sync phase complete")
+            self._initial_snapshot_done = True
+            
         except Exception as e:
             # Lifecycle mixin provides this
             await self._handle_fatal_error(e)
@@ -108,7 +76,7 @@ class PipeLeaderMixin:
                 await self._handle_fatal_error(e)
                 break
             except Exception as e:
-                backoff = self._handle_loop_error(e, "audit")
+                backoff = self._handle_data_error(e, "audit")
                 await asyncio.sleep(backoff)
 
     async def _run_audit_sync(self: "AgentPipe") -> None:
@@ -143,7 +111,7 @@ class PipeLeaderMixin:
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                backoff = self._handle_loop_error(e, "sentinel")
+                backoff = self._handle_data_error(e, "sentinel")
                 await asyncio.sleep(backoff)
 
     async def _run_sentinel_check(self: "AgentPipe") -> None:

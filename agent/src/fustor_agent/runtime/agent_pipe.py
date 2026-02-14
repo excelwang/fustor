@@ -118,7 +118,8 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
             "last_pushed_event_id": None
         }
         self.audit_context: Dict[str, Any] = {} # D-05: Incremental audit state (mtime cache)
-        self._consecutive_errors = 0
+        self._control_errors = 0
+        self._data_errors = 0
         self._last_heartbeat_at = 0.0  # Time of last successful role update (monotonic)
         self.is_realtime_ready = False  # Track if realtime is officially active (post-prescan)
         self._initial_snapshot_done = False # Track if initial snapshot complete
@@ -303,9 +304,9 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
             logger.debug(f"Pipe {self.id}: Started heartbeat loop (Session: {session_id})")
         
         msg = f"Session {session_id} created"
-        if self._consecutive_errors > 0:
-            msg = f"Session {session_id} RECOVERED after {self._consecutive_errors} errors"
-            self._consecutive_errors = 0
+        if self._control_errors > 0:
+            msg = f"Session {session_id} RECOVERED after {self._control_errors} control errors"
+            self._control_errors = 0
             
         logger.info(f"Pipe {self.id}: {msg}, role={self.current_role}")
         
@@ -361,15 +362,15 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
                     await self._handle_commands(response["commands"])
                 
                 # Reset error counter on success
-                if self._consecutive_errors > 0:
-                    logger.debug(f"Pipe {self.id} heartbeat recovered after {self._consecutive_errors} errors")
-                    self._consecutive_errors = 0
+                if self._control_errors > 0:
+                    logger.debug(f"Pipe {self.id} heartbeat recovered after {self._control_errors} errors")
+                    self._control_errors = 0
                 
             except SessionObsoletedError as e:
                 await self._handle_fatal_error(e)
                 break
             except Exception as e:
-                backoff = self._handle_loop_error(e, "heartbeat")
+                backoff = self._handle_control_error(e, "heartbeat")
                 # Don't kill the loop for transient heartbeat errors
                 # But use backoff instead of just fixed interval if failing
                 await asyncio.sleep(max(self.heartbeat_interval_sec, backoff))
@@ -408,8 +409,8 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
             
         if not isinstance(error, SessionObsoletedError):
             logger.error(f"Pipe {self.id} fatal background error: {error}", exc_info=True)
-            # Increment error counter so control loop will backoff in next iteration
-            self._consecutive_errors += 1
+            # Increment data error counter (background task failure)
+            self._data_errors += 1
             # Keep RUNNING bit so control loop doesn't exit
             self._set_state(PipeState.RUNNING | PipeState.ERROR, str(error))
 

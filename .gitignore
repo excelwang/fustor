@@ -39,3 +39,4 @@ fustor-remote/
 gha-creds-*.json
 .coverage
 .env_state
+fustor-master/
