@@ -46,6 +46,9 @@ class ForestFSViewDriver(ViewDriver):
         """
         Determine session role with SCOPED leader election (per-tree).
         """
+        if not pipe_id:
+            return {"role": "follower", "error": "pipe_id required for ForestView session"}
+
         from fustor_fusion.view_state_manager import view_state_manager
         election_id = f"{self.view_id}:{pipe_id}"
             

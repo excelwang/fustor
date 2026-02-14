@@ -109,6 +109,12 @@ class ViewDriver(ABC):
         """Periodic cleanup hook for time-sensitive data. Optional."""
         pass
 
+    async def close(self):
+        """
+        Optional: Gracefully closes any open resources.
+        """
+        pass
+
 
     async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
         """
