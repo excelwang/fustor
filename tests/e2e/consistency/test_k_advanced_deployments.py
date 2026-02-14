@@ -14,13 +14,11 @@ import logging
 import subprocess
 from ..fixtures.constants import (
     SHORT_TIMEOUT, MEDIUM_TIMEOUT, INGESTION_DELAY, 
-    LONG_TIMEOUT, AGENT_READY_TIMEOUT, EXTREME_TIMEOUT
+    LONG_TIMEOUT, AGENT_READY_TIMEOUT, EXTREME_TIMEOUT,
+    CONTAINER_FUSION
 )
 
 logger = logging.getLogger("fustor_test")
-
-# Container name for Fusion
-CONTAINER_FUSION = "fustor-fusion"
 
 # Paths inside containers (processed config, NOT templates)
 FUSION_PROCESSED_CONFIG_DIR = "/root/.fustor/fusion-config"

@@ -11,12 +11,9 @@ Run with:
 import time
 import pytest
 import logging
-from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, INGESTION_DELAY
+from ..fixtures.constants import SHORT_TIMEOUT, MEDIUM_TIMEOUT, INGESTION_DELAY, MOUNT_POINT
 
 logger = logging.getLogger("fustor_test")
-
-
-MOUNT_POINT = "/mnt/shared"
 
 
 class TestPipeBasicOperations:
