@@ -74,8 +74,9 @@ async def test_on_command_fallback_logic():
         mock_bridge.send_command_and_wait.assert_called_once()
         call_args = mock_bridge.send_command_and_wait.call_args
         assert call_args.kwargs["session_id"] == session_id
-        assert call_args.kwargs["command"] == "remote_scan"
+        assert call_args.kwargs["command"] == "scan"
         assert call_args.kwargs["params"]["path"] == "/foo"
+        assert "job_id" in call_args.kwargs["params"]
 
 @pytest.mark.asyncio
 async def test_on_command_fallback_no_session():

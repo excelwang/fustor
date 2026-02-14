@@ -455,10 +455,17 @@ class PipeSessionBridge:
             # 3. Queue command for next heartbeat (legacy mechanism)
             # OR send directly if we had a push channel (future optimization)
             # Currently we piggy-back on heartbeat response via session_manager
+            # Flatten params into the command dict for Agent compatibility
+            command_payload = {
+                "id": cmd_id,
+                "type": command,
+                **params
+            }
+            
             await self._session_manager.queue_command(
                 self._pipe.view_id, 
                 session_id, 
-                {"id": cmd_id, "cmd": command, "params": params}
+                command_payload
             )
             
             # 4. Wait for result
