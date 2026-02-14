@@ -140,6 +140,8 @@ class SessionManager:
                 session_info.pending_commands.append(command)
                 logger.debug(f"Queued command for session {session_id}: {command['type']}")
                 return True
+            else:
+                logger.warning(f"queue_command failed: Session {session_id} not found in view {view_id} (Sessions: {list(self._sessions.get(view_id, {}).keys())})")
         return False
 
     async def complete_agent_job(self, view_id: str, session_id: str, path: str, job_id: Optional[str] = None) -> bool:

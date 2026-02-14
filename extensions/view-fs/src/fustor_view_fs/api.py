@@ -79,8 +79,9 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep, chec
             path, 
             recursive=effective_recursive, 
             max_depth=max_depth, 
-            only_path=only_path,
-            on_demand_scan=on_demand_scan  # This triggers Fallback if driver doesn't explicitly handle it
+            only_path=only_path
+            # Note: on_demand_scan is NOT passed to driver - it's handled via trigger_on_demand_scan above
+            # If the driver doesn't support the path, it returns None and fallback is triggered via FallbackDriverWrapper
         )
         
         # Check if there's a pending job for this path

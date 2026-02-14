@@ -477,6 +477,7 @@ class PipeSessionBridge:
             
             # Queue to all views (redundant but ensures visibility)
             for vid in self._pipe.view_ids:
+                logger.debug(f"Queuing command {cmd_id} for session {session_id} on view {vid}")
                 await self._session_manager.queue_command(
                     vid, 
                     session_id, 

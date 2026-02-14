@@ -58,7 +58,7 @@ async def test_tree_default_recursive(app_client):
     data = response.json()
     
     # Verify calls passed to driver correctly
-    driver.get_directory_tree.assert_called_with("/", recursive=True, max_depth=None, only_path=False, on_demand_scan=False)
+    driver.get_directory_tree.assert_called_with("/", recursive=True, max_depth=None, only_path=False)
     
     # Verify response structure logic (which is mostly pass-through but confirms wiring)
     # API response is now flat (result itself)
@@ -75,7 +75,7 @@ async def test_tree_non_recursive(app_client):
     assert response.status_code == 200
     
     # Verify recursive=False passed
-    driver.get_directory_tree.assert_called_with("/", recursive=False, max_depth=None, only_path=False, on_demand_scan=False)
+    driver.get_directory_tree.assert_called_with("/", recursive=False, max_depth=None, only_path=False)
 
 @pytest.mark.asyncio
 async def test_tree_max_depth(app_client):
@@ -85,7 +85,7 @@ async def test_tree_max_depth(app_client):
     response = client.get("/tree", params={"path": "/", "max_depth": 2, "view_id": "1"})
     assert response.status_code == 200
     
-    driver.get_directory_tree.assert_called_with("/", recursive=True, max_depth=2, only_path=False, on_demand_scan=False)
+    driver.get_directory_tree.assert_called_with("/", recursive=True, max_depth=2, only_path=False)
 
 @pytest.mark.asyncio
 async def test_tree_only_path(app_client):
@@ -95,4 +95,4 @@ async def test_tree_only_path(app_client):
     response = client.get("/tree", params={"path": "/", "only_path": "true", "view_id": "1"})
     assert response.status_code == 200
     
-    driver.get_directory_tree.assert_called_with("/", recursive=True, max_depth=None, only_path=True, on_demand_scan=False)
+    driver.get_directory_tree.assert_called_with("/", recursive=True, max_depth=None, only_path=True)
