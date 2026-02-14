@@ -63,13 +63,14 @@ async def lifespan(app: FastAPI):
             
     logger.info(f"Port configuration: {current_port} (Source: {'Env' if current_port_env else 'YAML'})")
     
-    from fustor_receiver_http import HTTPReceiver
+    # Remove hardcoded receiver import - relies on dynamic initialization in pm.initialize_pipes
     
     logger.info(f"Current receivers in PM: {list(pm._receivers.keys())}")
     
     for sig, receiver in pm._receivers.items():
         logger.info(f"Checking receiver {receiver.id}: type={type(receiver)}, port={receiver.port}")
-        if isinstance(receiver, HTTPReceiver) and receiver.port == current_port:
+        # Use duck typing or check if it's a receiver that supports attaching
+        if hasattr(receiver, 'get_session_router') and receiver.port == current_port:
             logger.info(f"Receiver {receiver.id} matches main port {current_port} - attaching routers to main app")
             
             # Attach routers to main app to serve on the same port
@@ -178,6 +179,9 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # Load management extensions (L3)
+    _load_management_extensions(app)
+
     # 1. Load configuration
     fusion_config.ensure_loaded()
 
@@ -205,5 +209,21 @@ def create_app() -> FastAPI:
         return {"message": "Welcome to Fusion Storage Engine Ingest API"}
 
     return app
+
+def _load_management_extensions(app):
+    """Discover and mount management routers via entry points."""
+    from importlib.metadata import entry_points
+    # In Python 3.10+, entry_points() returns an EntryPoints object that can be queried by group
+    try:
+        eps = entry_points(group="fustor_fusion.management_routers")
+        for ep in eps:
+            try:
+                router = ep.load()
+                app.include_router(router, prefix="/api/v1/mgmt")
+                logger.info(f"Loaded management extension: {ep.name}")
+            except Exception as e:
+                logger.error(f"Failed to load management extension {ep.name}: {e}")
+    except Exception as e:
+        logger.debug(f"No management extensions found or error in discovery: {e}")
 
 app = create_app()

@@ -31,7 +31,7 @@ async def on_command_fallback(view_id: str, params: Dict[str, Any]) -> Dict[str,
             raise RuntimeError(f"No active pipes found to service view {view_id}")
 
         # 2. Prepare Parallel Execution
-        from ..config.unified import fusion_config
+        from fustor_fusion.config.unified import fusion_config
         fallback_timeout = fusion_config.fusion.on_command_fallback_timeout
 
         async def execute_on_pipe(p_id: str) -> Optional[Dict[str, Any]]:

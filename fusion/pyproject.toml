@@ -32,15 +32,16 @@ license = "MIT"
 [project.optional-dependencies]
 fs = ["fustor-view-fs", "fustor-schema-fs"]
 forest = ["fustor-view-fs-forest", "fustor-view-fs", "fustor-schema-fs"]
-http = ["fustor-receiver-http"]
+mgmt = ["fustor-fusion-mgmt"]
 # Recommended installation for FS use cases
-default = ["fustor-view-fs", "fustor-receiver-http", "fustor-schema-fs"]
+default = ["fustor-view-fs", "fustor-receiver-http", "fustor-schema-fs", "fustor-fusion-mgmt"]
 # Full install
 all = [
     "fustor-view-fs",
     "fustor-view-fs-forest",
     "fustor-receiver-http",
-    "fustor-schema-fs"
+    "fustor-schema-fs",
+    "fustor-fusion-mgmt"
 ]
 dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0"]
 

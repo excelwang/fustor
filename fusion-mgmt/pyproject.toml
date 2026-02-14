@@ -1,0 +1,25 @@
+[project]
+name = "fustor-fusion-mgmt"
+version = "0.9.1"
+description = "Management (L3) extension for Fustor Fusion - Remote commands, monitoring, and UI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "fustor-core",
+    "fustor-fusion-sdk",
+    "fastapi",
+    "pydantic>=2.0.0"
+]
+
+[project.entry-points."fustor_fusion.management_routers"]
+mgmt = "fustor_fusion_mgmt:router"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fustor_fusion_mgmt"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

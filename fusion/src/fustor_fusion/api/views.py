@@ -14,7 +14,6 @@ from ..auth.dependencies import get_view_id_from_api_key
 from ..view_manager.manager import get_cached_view_manager
 from ..config.unified import fusion_config
 from .. import runtime_objects
-from .on_command import on_command_fallback
 
 logger = logging.getLogger(__name__)
 
@@ -72,12 +71,14 @@ class FallbackDriverWrapper:
                     return await attr(*args, **kwargs)
                 except Exception as e:
                     # In Gap P0-3, we fallback to on-demand agent scan on failure
-                    logger.warning(f"[DEBUG_FALLBACK] View {self._view_id} method '{name}' failed ({e}), triggering On-Command Fallback...")
-                    try:
-                        return await on_command_fallback(self._view_id, kwargs)
-                    except Exception as fallback_e:
-                        logger.error(f"Fallback failed for {self._view_id}: {fallback_e}")
-                        # Re-raise original error to not mask root cause
+                    if runtime_objects.on_command_fallback:
+                        try:
+                            return await runtime_objects.on_command_fallback(self._view_id, kwargs)
+                        except Exception as fallback_e:
+                            logger.error(f"Fallback failed for {self._view_id}: {fallback_e}")
+                            # Re-raise original error to not mask root cause
+                            raise e
+                    else:
                         raise e
             return wrapped
         return attr
@@ -87,8 +88,10 @@ class FallbackDriverWrapper:
         try:
             return await self._driver.get_data_view(**kwargs)
         except Exception as e:
-            logger.warning(f"View {self._view_id} primary query failed ({e}), triggering On-Command Fallback...")
-            return await on_command_fallback(self._view_id, kwargs)
+            if runtime_objects.on_command_fallback:
+                logger.warning(f"View {self._view_id} primary query failed ({e}), triggering On-Command Fallback...")
+                return await runtime_objects.on_command_fallback(self._view_id, kwargs)
+            raise e
 
 
 def make_metadata_limit_checker(view_name: str) -> Callable:

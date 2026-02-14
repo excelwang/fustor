@@ -18,7 +18,8 @@ members = [
     "demo",
     "extensions/view-fs",
     "extensions/view-fs-forest",
-    "agent-mgmt"
+    "agent-mgmt",
+    "fusion-mgmt"
 ]
 
 [tool.uv.sources]
@@ -40,6 +41,7 @@ fustor-demo = { workspace = true }
 fustor-view-fs = { workspace = true }
 fustor-view-fs-forest = { workspace = true }
 fustor-agent-mgmt = { workspace = true }
+fustor-fusion-mgmt = { workspace = true }
 
 
 [tool.pytest.ini_options]
@@ -59,7 +61,8 @@ pythonpath = [
     "demo/src",
     "extensions/view-fs/src",
     "extensions/view-fs-forest/src",
-    "agent-mgmt/src"
+    "agent-mgmt/src",
+    "fusion-mgmt/src"
 ]
 markers = [
     "timeout: mark test to timeout after X seconds"]
