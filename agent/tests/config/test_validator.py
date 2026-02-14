@@ -112,6 +112,9 @@ def test_validate_pipe_redundant_pair(mock_loader):
 def test_validate_config_dict_happy_path():
     """Test validate_config with a valid dictionary config."""
     config_dict = {
+        "agent_id": "test-agent",
+        "sources": {"s1": {"driver": "fs", "uri": "/tmp"}},
+        "senders": {"se1": {"driver": "echo", "uri": "http://localhost"}},
         "pipes": {
             "p1": {"source": "s1", "sender": "se1"}
         }
@@ -124,6 +127,9 @@ def test_validate_config_dict_happy_path():
 def test_validate_config_dict_redundant_pair():
     """Test validate_config with a redundant (source, sender) pair."""
     config_dict = {
+        "agent_id": "test-agent",
+        "sources": {"s1": {"driver": "fs", "uri": "/tmp"}},
+        "senders": {"se1": {"driver": "echo", "uri": "http://localhost"}},
         "pipes": {
             "p1": {"source": "s1", "sender": "se1"},
             "p2": {"source": "s1", "sender": "se1"}
@@ -137,6 +143,7 @@ def test_validate_config_dict_redundant_pair():
 def test_validate_config_dict_empty_pipes():
     """Test validate_config with an empty pipes dictionary."""
     config_dict = {
+        "agent_id": "test-agent",
         "pipes": {}
     }
     validator = ConfigValidator()
@@ -172,9 +179,12 @@ def test_validate_config_dict_pipe_missing_source_sender():
     }
     validator = ConfigValidator()
     is_valid, errors = validator.validate_config(config_dict)
-    # The validate_config_dict only checks for redundancy if both source and sender are present
-    assert is_valid is True 
-    assert errors == []
+    
+    # New behavior: strict validation catches missing required fields
+    assert is_valid is False
+    assert len(errors) > 0
+    # Error messages come from Pydantic, e.g. "Field required"
+    assert "source" in str(errors) or "sender" in str(errors)
 
 def test_validate_loader_reload_failure(mock_loader):
     """Test that validation correctly handles exceptions during loader reload."""
