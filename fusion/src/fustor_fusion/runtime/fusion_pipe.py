@@ -164,8 +164,14 @@ class FusionPipe(FustorPipe):
             if h_manager and getattr(h_manager, 'view_id', None) == view_id:
                 return handler
             
-            # Check ViewDriverAdapter/Standard Handler pattern
-            if getattr(handler, 'view_id', None) == view_id:
+            # Check ViewDriverAdapter pattern (has view_id property)
+            h_view_id = getattr(handler, 'view_id', None)
+            if h_view_id == view_id:
+                return handler
+            
+            # Check driver pattern (FSViewDriver has view_id attribute)
+            h_driver = getattr(handler, '_driver', None)
+            if h_driver and getattr(h_driver, 'view_id', None) == view_id:
                 return handler
             
             # Check config (ViewHandler base)

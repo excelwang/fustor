@@ -7,7 +7,7 @@ from typing import Dict, List, Optional, Any, Tuple
 from fastapi import APIRouter
 
 from fustor_core.transport.receiver import Receiver, ReceiverRegistry
-from fustor_receiver_http import SessionInfo # Kept for registration of 'http' driver and type info
+from fustor_core.models.states import SessionInfo
 from .fusion_pipe import FusionPipe
 from ..config.unified import fusion_config
 from ..view_manager.manager import get_cached_view_manager
@@ -351,7 +351,14 @@ class FusionPipeManager:
             audit_interval = p_cfg.audit_interval_sec if p_cfg else None
             sentinel_interval = p_cfg.sentinel_interval_sec if p_cfg else None
             
-            info = SessionInfo(session_id, task_id, p_id, result["role"], time.time(), time.time())
+            info = SessionInfo(
+                session_id=session_id, 
+                task_id=task_id, 
+                view_id=p_id, 
+                role=result["role"], 
+                created_at=time.time(), 
+                last_heartbeat=time.time()
+            )
             info.source_uri = source_uri
             info.audit_interval_sec = audit_interval
             info.sentinel_interval_sec = sentinel_interval

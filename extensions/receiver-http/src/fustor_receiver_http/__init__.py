@@ -65,26 +65,7 @@ class HeartbeatResponse(BaseModel):
 
 # --- Session Handler Protocol ---
 
-@dataclass
-class SessionInfo:
-    """Information about an active session."""
-    session_id: str
-    task_id: str
-    view_id: str
-    role: str  # 'leader' or 'follower'
-    created_at: float
-    last_heartbeat: float
-    can_realtime: bool = False
-    source_uri: Optional[str] = None
-    audit_interval_sec: Optional[float] = None
-    sentinel_interval_sec: Optional[float] = None
-
-    @property
-    def pipe_id(self) -> str:
-        """Deprecated alias for view_id."""
-        import warnings
-        warnings.warn("pipe_id is deprecated, use view_id instead", DeprecationWarning, stacklevel=2)
-        return self.view_id
+from fustor_core.models.states import SessionInfo
 
 
 # Type aliases for callbacks

@@ -4,7 +4,7 @@ Test cases for session management with multiple servers to prevent the 409 confl
 import asyncio
 import uuid
 from datetime import datetime
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, patch, MagicMock
 from dataclasses import dataclass
 
 import pytest
@@ -38,10 +38,15 @@ async def setup_dummy_pipe(view_id: str, allow_concurrent_push: bool = False):
         from fustor_fusion.runtime.pipe_manager import FusionPipeManager
         runtime_objects.pipe_manager = FusionPipeManager()
     
+    mock_handler = MagicMock()
+    mock_handler.id = "dummy-handler"
+    mock_handler.view_id = view_id
+    mock_handler.resolve_session_role = AsyncMock(return_value={"role": "leader"})
+    
     pipe = FusionPipe(
         pipe_id=view_id,
         config={"view_ids": [view_id], "allow_concurrent_push": allow_concurrent_push},
-        view_handlers=[]
+        view_handlers=[mock_handler]
     )
     # Set ready so it doesn't timeout
     pipe._handlers_ready.set()

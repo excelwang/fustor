@@ -4,7 +4,7 @@ version = "0.9.1"
 description = "realtime data sync agent for various data sources"
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = ["click>=8.1.7", "pydantic>=2.11.7", "python-dotenv", "fustor-core", "fustor-source-fs", "fustor-sender-echo", "fustor-agent-sdk", "fustor-sender-http"]
+dependencies = ["click>=8.1.7", "pydantic>=2.11.7", "python-dotenv", "fustor-core", "fustor-agent-sdk"]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
@@ -20,6 +20,28 @@ Homepage = "https://github.com/excelwang/fustor/agent"
 license = "MIT"
 
 [project.optional-dependencies]
+fs = ["fustor-source-fs", "fustor-schema-fs"]
+mysql = ["fustor-source-mysql"]
+oss = ["fustor-source-oss"]
+elasticsearch = ["fustor-source-elasticsearch"]
+http = ["fustor-sender-http"]
+echo = ["fustor-sender-echo"]
+openapi = ["fustor-sender-openapi"]
+mgmt = ["fustor-agent-mgmt"]
+# Default recommended installation
+default = ["fustor-source-fs", "fustor-sender-http", "fustor-schema-fs", "fustor-agent-mgmt"]
+# Full install
+all = [
+    "fustor-source-fs",
+    "fustor-source-mysql",
+    "fustor-source-oss",
+    "fustor-source-elasticsearch",
+    "fustor-sender-http",
+    "fustor-sender-echo",
+    "fustor-sender-openapi",
+    "fustor-schema-fs",
+    "fustor-agent-mgmt"
+]
 dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0", "pytest-mock>=3.0.0"]
 
 [project.scripts]

@@ -13,9 +13,8 @@ dependencies = [
     "httpx",
     "orjson",
     "fustor-core",
-    "fustor-receiver-http",
-    "fustor-fusion-sdk",
-    "fustor-view-fs"]
+    "fustor-fusion-sdk"
+]
 [[project.authors]]
 name = "Huajin Wang"
 email = "wanghuajin999@163.com"
@@ -31,6 +30,18 @@ Homepage = "https://github.com/excelwang/fustor/fusion"
 license = "MIT"
 
 [project.optional-dependencies]
+fs = ["fustor-view-fs", "fustor-schema-fs"]
+forest = ["fustor-view-fs-forest", "fustor-view-fs", "fustor-schema-fs"]
+http = ["fustor-receiver-http"]
+# Recommended installation for FS use cases
+default = ["fustor-view-fs", "fustor-receiver-http", "fustor-schema-fs"]
+# Full install
+all = [
+    "fustor-view-fs",
+    "fustor-view-fs-forest",
+    "fustor-receiver-http",
+    "fustor-schema-fs"
+]
 dev = [ "pytest>=8.0.0", "ruff>=0.1.0", "mypy>=1.0.0", "pytest-asyncio>=0.23.0"]
 
 [project.scripts]

@@ -1,0 +1,22 @@
+[project]
+name = "fustor-agent-mgmt"
+version = "0.9.1"
+description = "Management (L3) extension for Fustor Agent - Remote commands and upgrades"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = [
+    "fustor-core",
+    "fustor-agent-sdk",
+    "pyyaml>=6.0"
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project.entry-points."fustor_agent.command_processors"]
+default = "fustor_agent_mgmt:CommandProcessor"
+
+[tool.setuptools.packages.find]
+where = ["src"]

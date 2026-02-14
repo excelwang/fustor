@@ -65,6 +65,11 @@ class ViewDriverAdapter(ViewHandler):
         self._initialized = False
     
     @property
+    def view_id(self) -> str:
+        """Expose the underlying driver's view_id for handler lookup."""
+        return self._driver.view_id
+    
+    @property
     def driver(self) -> ViewDriver:
         """Access the underlying driver."""
         return self._driver
@@ -185,6 +190,11 @@ class ViewManagerAdapter(ViewHandler):
         self.schema_name = "view-manager"
     
     @property
+    def view_id(self) -> str:
+        """Expose the underlying manager's view_id for handler lookup."""
+        return self._manager.view_id
+    
+    @property
     def manager(self) -> "ViewManager":
         """Access the underlying ViewManager."""
         return self._manager
@@ -261,21 +271,25 @@ class ViewManagerAdapter(ViewHandler):
         """
         await self._manager.wait_until_ready()
         
-        # 1. Try delegated election first
+        # 1. Try delegated election first (driver-specific)
+        # Return the result from the first driver that has election logic
+        # (typically only one driver instance per ViewManager)
         for driver_instance in self._manager.driver_instances.values():
             if hasattr(driver_instance, 'resolve_session_role'):
                 res = await driver_instance.resolve_session_role(session_id, **kwargs)
-                if res.get("role") == "leader":
+                # Return immediately with whatever result the driver returns
+                # (leader OR follower - both are valid outcomes)
+                if res:
                     return res
 
-        # 2. Fallback: Perform global election
+        # 2. Fallback: Perform global election (no drivers with election logic found)
         from ..view_state_manager import view_state_manager
-        # Try to acquire global leadership for this view
-        is_leader = await view_state_manager.try_become_leader(self._manager.view_id, session_id)
+        election_key = self._manager.view_id
+        is_leader = await view_state_manager.try_become_leader(election_key, session_id)
         if is_leader:
-            await view_state_manager.set_authoritative_session(self._manager.view_id, session_id)
+            await view_state_manager.set_authoritative_session(election_key, session_id)
             
-        return {"role": "leader" if is_leader else "follower"}
+        return {"role": "leader" if is_leader else "follower", "election_key": election_key}
     
     async def handle_audit_start(self) -> None:
         """Handle audit start for all driver instances."""

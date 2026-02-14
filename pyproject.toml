@@ -17,7 +17,8 @@ members = [
     "extensions/source-oss",
     "demo",
     "extensions/view-fs",
-    "extensions/view-fs-forest"
+    "extensions/view-fs-forest",
+    "agent-mgmt"
 ]
 
 [tool.uv.sources]
@@ -38,6 +39,7 @@ fustor-source-oss = { workspace = true }
 fustor-demo = { workspace = true }
 fustor-view-fs = { workspace = true }
 fustor-view-fs-forest = { workspace = true }
+fustor-agent-mgmt = { workspace = true }
 
 
 [tool.pytest.ini_options]
@@ -56,7 +58,8 @@ pythonpath = [
     "extensions/source-oss/src",
     "demo/src",
     "extensions/view-fs/src",
-    "extensions/view-fs-forest/src"
+    "extensions/view-fs-forest/src",
+    "agent-mgmt/src"
 ]
 markers = [
     "timeout: mark test to timeout after X seconds"]

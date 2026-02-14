@@ -181,3 +181,16 @@ class PipeInstanceServiceInterface(BaseInstanceServiceInterface):
 
     async def stop_all(self):
         ...
+
+
+class CommandProcessorInterface(Protocol):
+    """
+    Interface for processing commands from Fusion (L3 Management).
+    """
+    async def process_commands(self, pipe: Any, commands: List[Dict[str, Any]]) -> None:
+        """Process a list of management commands for a specific pipe."""
+        ...
+
+    async def initialize(self, pipe: Any) -> None:
+        """Initialize the command processor for a specific pipe."""
+        ...

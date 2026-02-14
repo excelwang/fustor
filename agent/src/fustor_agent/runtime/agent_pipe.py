@@ -24,9 +24,8 @@ logger = logging.getLogger("fustor_agent")
 
 from .pipe.lifecycle import PipeLifecycleMixin
 from .pipe.leader import PipeLeaderMixin
-from .pipe.command import PipeCommandMixin
 
-class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
+class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin):
     """
     Agent-side Pipe implementation.
     
@@ -130,9 +129,40 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
         self.is_realtime_ready = False  # Track if realtime is officially active (post-prescan)
         self._initial_snapshot_done = False # Track if initial snapshot complete
 
+        # L3 Management Plane (Optional)
+        self._mgmt = self._load_mgmt_processor()
+
     def map_batch(self, events: List[Any]) -> List[Any]:
         """Map events using the configured field mapper."""
         return self._mapper.map_batch(events)
+
+    async def _handle_commands(self, commands: List[Dict[str, Any]]) -> None:
+        """Process commands via management extension if available."""
+        if not commands:
+            return
+            
+        if self._mgmt:
+            await self._mgmt.process_commands(self, commands)
+        else:
+            logger.debug(f"Pipe {self.id}: Received {len(commands)} commands but management extension is not installed.")
+
+    def _load_mgmt_processor(self) -> Optional[Any]:
+        """Dynamically load the L3 management processor if available."""
+        from importlib.metadata import entry_points
+        try:
+            # Use fustor_agent.command_processors entry point group
+            eps = entry_points(group="fustor_agent.command_processors")
+            for ep in eps:
+                try:
+                    processor_class = ep.load()
+                    processor = processor_class()
+                    logger.debug(f"Pipe {self.id}: Loaded management extension '{ep.name}'")
+                    return processor
+                except Exception as e:
+                    logger.warning(f"Pipe {self.id}: Failed to load management extension '{ep.name}': {e}")
+        except Exception:
+            pass
+        return None
 
     def _build_agent_status(self) -> Dict[str, Any]:
         """Build agent status dict for heartbeat reporting to management plane."""

@@ -2,7 +2,7 @@
 Test cases for session clear functionality.
 """
 import asyncio
-from unittest.mock import patch, Mock
+from unittest.mock import patch, Mock, MagicMock, AsyncMock
 import pytest
 
 from fustor_fusion.api.session import create_session
@@ -25,10 +25,15 @@ async def setup_dummy_pipe(view_id: str, allow_concurrent_push: bool = False):
         from fustor_fusion.runtime.pipe_manager import FusionPipeManager
         runtime_objects.pipe_manager = FusionPipeManager()
     
+    mock_handler = Mock()
+    mock_handler.id = "dummy-handler"
+    mock_handler.view_id = view_id
+    mock_handler.resolve_session_role = AsyncMock(return_value={"role": "leader"})
+    
     pipe = FusionPipe(
         pipe_id=view_id,
         config={"view_ids": [view_id], "allow_concurrent_push": allow_concurrent_push},
-        view_handlers=[]
+        view_handlers=[mock_handler]
     )
     pipe._handlers_ready.set()
     runtime_objects.pipe_manager._pipes[view_id] = pipe
