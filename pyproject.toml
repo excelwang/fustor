@@ -17,7 +17,7 @@ members = [
     "extensions/source-oss",
     "demo",
     "extensions/view-fs",
-    "extensions/view-multi-fs"
+    "extensions/view-fs-forest"
 ]
 
 [tool.uv.sources]
@@ -37,7 +37,7 @@ fustor-source-mysql = { workspace = true }
 fustor-source-oss = { workspace = true }
 fustor-demo = { workspace = true }
 fustor-view-fs = { workspace = true }
-fustor-view-multi-fs = { workspace = true }
+fustor-view-fs-forest = { workspace = true }
 
 
 [tool.pytest.ini_options]
@@ -56,7 +56,7 @@ pythonpath = [
     "extensions/source-oss/src",
     "demo/src",
     "extensions/view-fs/src",
-    "extensions/view-multi-fs/src"
+    "extensions/view-fs-forest/src"
 ]
 markers = [
     "timeout: mark test to timeout after X seconds"]

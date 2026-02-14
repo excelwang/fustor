@@ -209,3 +209,93 @@ class TestComponentSupervisor:
         
         assert supervisor.get_healthy_count() == 2
         assert supervisor.get_failed_count() == 1
+
+    @pytest.mark.asyncio
+    async def test_unregister_component(self):
+        supervisor = ComponentSupervisor()
+        c1 = MockComponent()
+        await supervisor.register("c1", c1)
+        await supervisor.start_one("c1")
+        assert c1.started is True
+        
+        success = await supervisor.unregister("c1")
+        assert success is True
+        assert c1.stopped is True
+        assert "c1" not in supervisor._components
+        
+        assert await supervisor.unregister("missing") is False
+
+    @pytest.mark.asyncio
+    async def test_health_check_and_restart(self):
+        supervisor = ComponentSupervisor(health_check_interval=0.1)
+        c1 = MockComponent()
+        await supervisor.register("c1", c1)
+        await supervisor.start_all()
+        
+        # Manually make it unhealthy
+        c1.should_fail_health = True
+        
+        # Trigger health check
+        await supervisor._check_all_health()
+        
+        status = supervisor.get_status()
+        # Note: restart_count is reset to 0 in wrapper.start() if successful.
+        # But we can check that it WAS attempted or just check that it's running again.
+        assert status["c1"]["state"] == "RUNNING"
+        assert c1.started is True
+
+    @pytest.mark.asyncio
+    async def test_health_check_failed_restart(self):
+        supervisor = ComponentSupervisor()
+        c1 = MockComponent()
+        await supervisor.register("c1", c1)
+        await supervisor.start_all()
+        
+        # Make it fail start when restarting
+        c1.should_fail_health = True
+        c1.should_fail_start = True
+        
+        await supervisor._check_all_health()
+        
+        status = supervisor.get_status()
+        assert status["c1"]["state"] == "FAILED"
+        assert status["c1"]["restart_count"] == 1 # Incremented before start(), and start() failed so not reset
+
+    @pytest.mark.asyncio
+    async def test_health_check_loop(self):
+        supervisor = ComponentSupervisor(health_check_interval=0.01)
+        c1 = MockComponent()
+        await supervisor.register("c1", c1)
+        await supervisor.start_all()
+        
+        await supervisor.start_health_monitoring()
+        assert supervisor._health_check_task is not None
+        
+        c1.should_fail_health = True
+        # Wait for loop to run and restart to happen
+        await asyncio.sleep(0.1)
+        
+        status = supervisor.get_status()
+        # It should be RUNNING if it successfully restarted (even if it's about to be marked unhealthy again)
+        assert status["c1"]["state"] in ("RUNNING", "DEGRADED", "STARTING", "STOPPING")
+        
+        await supervisor.stop_all()
+        assert supervisor._health_check_task is None
+
+    @pytest.mark.asyncio
+    async def test_start_one_not_found(self):
+        supervisor = ComponentSupervisor()
+        res = await supervisor.start_one("none")
+        assert res.success is False
+        assert "not found" in res.error
+
+    @pytest.mark.asyncio
+    async def test_wrapper_stop_failure(self):
+        class BadComponent:
+            async def stop(self): raise RuntimeError("fail stop")
+        
+        wrapper = ComponentWrapper(component=BadComponent())
+        wrapper.state = ComponentState.RUNNING
+        success = await wrapper.stop()
+        assert success is False
+        assert wrapper.state == ComponentState.FAILED

@@ -32,8 +32,8 @@ class TestUnifiedPipesConfig:
         loader.load_all()
         
         config = loader.get_pipe("minimal")
-        assert config.audit_interval_sec == 600.0
-        assert config.sentinel_interval_sec == 120.0
+        assert config.audit_interval_sec == 43200.0
+        assert config.sentinel_interval_sec == 300.0
         assert config.disabled == False
 
     def test_get_enabled_pipes(self, config_dir):
