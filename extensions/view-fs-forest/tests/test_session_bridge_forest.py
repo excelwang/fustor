@@ -47,7 +47,7 @@ async def test_create_session_delegation(mock_pipe, mock_session_manager):
         )
         
         # 2. Verify delegation
-        mock_handler.resolve_session_role.assert_called_with("sess-1", "pipe-1")
+        mock_handler.resolve_session_role.assert_called_with("sess-1", pipe_id="pipe-1")
         
         # 3. Verify locking on returned election key
         mock_vsm.lock_for_session.assert_called_with("view:pipe-1", "sess-1")

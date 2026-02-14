@@ -165,7 +165,7 @@ class ViewHandler(Handler):
         """
         raise NotImplementedError
     
-    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+    async def resolve_session_role(self, session_id: str, **kwargs) -> Dict[str, Any]:
         """
         Determine the role (leader/follower) for a newly created session.
         
@@ -177,11 +177,11 @@ class ViewHandler(Handler):
         """
         return {"role": "leader"}
     
-    async def on_session_start(self, session_id: Optional[str] = None) -> None:
+    async def on_session_start(self, **kwargs) -> None:
         """Called when a new Agent session starts."""
         pass
     
-    async def on_session_close(self, session_id: Optional[str] = None) -> None:
+    async def on_session_close(self, **kwargs) -> None:
         """Called when an Agent session terminates."""
         pass
     
@@ -191,6 +191,15 @@ class ViewHandler(Handler):
     
     async def handle_audit_end(self) -> None:
         """Called at the end of an audit cycle."""
+        pass
+    
+    async def on_snapshot_complete(self, session_id: str, **kwargs) -> None:
+        """
+        Called when a snapshot phase is complete.
+        
+        Handlers can use this hook to perform finalization or mark scoped keys 
+        (e.g., ForestView marking a specific subtree as complete).
+        """
         pass
     
     async def reset(self) -> None:

@@ -28,8 +28,8 @@ class MockViewHandler:
         self.events.append(event)
         return True
 
-    async def on_session_start(self): pass
-    async def on_session_close(self): pass
+    async def on_session_start(self, **kwargs): pass
+    async def on_session_close(self, **kwargs): pass
     def get_data_view(self, **kwargs): return {}
     def get_stats(self): return {}
 

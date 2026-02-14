@@ -118,13 +118,13 @@ class PipeSessionBridge:
         
         # Fallback for ViewManagerAdapter which might have a prefixed handler_id
         if not view_handler:
-            view_handler = self._pipe.get_view_handler(f"view-manager-{view_id}")
+            view_handler = self._pipe.find_handler_for_view(view_id)
             
         session_result = {"role": "leader"} # Default fallback
         
         if view_handler:
              try:
-                 session_result = await view_handler.resolve_session_role(session_id, getattr(self._pipe, 'pipe_id', None))
+                 session_result = await view_handler.resolve_session_role(session_id, pipe_id=getattr(self._pipe, 'pipe_id', None))
              except Exception as e:
                  logger.error(f"View handler failed to process new session {session_id}: {e}")
                  # Should we fail the session? For now, log and proceed as follower for safety
@@ -231,7 +231,7 @@ class PipeSessionBridge:
         if count % self._LEADER_VERIFY_INTERVAL == 0:
             view_handler = self._pipe.get_view_handler(view_id)
             if not view_handler:
-                view_handler = self._pipe.get_view_handler(f"view-manager-{view_id}")
+                view_handler = self._pipe.find_handler_for_view(view_id)
             if view_handler:
                  try:
                      # Re-run election logic via handler

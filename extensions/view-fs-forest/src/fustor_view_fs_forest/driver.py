@@ -45,11 +45,13 @@ class ForestFSViewDriver(ViewDriver):
         # Nothing specific to init for the forest container yet.
         pass
 
-    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+    async def resolve_session_role(self, session_id: str, **kwargs) -> Dict[str, Any]:
         """
         Determine session role with SCOPED leader election (per-tree).
         """
+        pipe_id = kwargs.get("pipe_id")
         if not pipe_id:
+            # Try to infer or fallback
             return {"role": "follower", "error": "pipe_id required for ForestView session"}
 
         from fustor_fusion.view_state_manager import view_state_manager
@@ -282,28 +284,41 @@ class ForestFSViewDriver(ViewDriver):
 
     # --- Lifecycle and Audit Delegation ---
     
-    async def on_session_start(self, session_id: Optional[str] = None):
+    async def on_session_start(self, **kwargs):
         """Delegate session start to the specific tree for this session."""
+        session_id = kwargs.get("session_id")
         if not session_id:
              # Broadcast if no session_id (unlikely in new architecture)
              for tree in self._trees.values():
-                 await tree.on_session_start()
+                 await tree.on_session_start(**kwargs)
              return
 
-        pipe_id = self._session_to_pipe.get(session_id)
-        if pipe_id and pipe_id in self._trees:
-            await self._trees[pipe_id].on_session_start()
+        pipe_id = self._session_to_pipe.get(session_id) or kwargs.get("pipe_id")
+        if pipe_id:
+             self._session_to_pipe[session_id] = pipe_id
+             tree = await self._get_or_create_tree(pipe_id)
+             await tree.on_session_start(**kwargs)
 
-    async def on_session_close(self, session_id: Optional[str] = None):
+    async def on_session_close(self, **kwargs):
         """Delegate session close and cleanup mapping."""
+        session_id = kwargs.get("session_id")
         if not session_id:
              for tree in self._trees.values():
-                 await tree.on_session_close()
+                 await tree.on_session_close(**kwargs)
              return
 
         pipe_id = self._session_to_pipe.pop(session_id, None)
         if pipe_id and pipe_id in self._trees:
-            await self._trees[pipe_id].on_session_close()
+            await self._trees[pipe_id].on_session_close(**kwargs)
+    
+    async def on_snapshot_complete(self, session_id: str, **kwargs) -> None:
+        """Mark scoped view key for this session's sub-tree."""
+        pipe_id = self._session_to_pipe.get(session_id) or kwargs.get("metadata", {}).get("pipe_id")
+        if pipe_id:
+            from fustor_fusion.view_state_manager import view_state_manager
+            scoped_key = f"{self.view_id}:{pipe_id}"
+            await view_state_manager.set_snapshot_complete(scoped_key, session_id)
+            self.logger.debug(f"ForestView {self.view_id}: Marked scoped tree {scoped_key} snapshot complete")
 
     async def handle_audit_start(self):
         """Broadcast audit start to all trees."""

@@ -35,13 +35,13 @@ class MockViewHandler(ViewHandler):
     async def process_event(self, event: Any) -> None:
         self.events_processed.append(event)
     
-    async def on_session_start(self) -> None:
+    async def on_session_start(self, **kwargs) -> None:
         self.session_starts += 1
     
-    async def on_session_close(self) -> None:
+    async def on_session_close(self, **kwargs) -> None:
         self.session_closes += 1
     
-    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+    async def resolve_session_role(self, session_id: str, **kwargs) -> Dict[str, Any]:
         from fustor_fusion.view_state_manager import view_state_manager
         view_id = self.id
         if self.next_role == "leader":

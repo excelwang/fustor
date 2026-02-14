@@ -143,8 +143,28 @@ class FusionPipe(Pipe):
         logger.debug(f"Registered view handler: {handler_id}")
     
     def get_view_handler(self, handler_id: str) -> Optional[ViewHandler]:
-        """Get a registered view handler by ID."""
+        """Get a view handler by ID."""
         return self._view_handlers.get(handler_id)
+
+    def find_handler_for_view(self, view_id: str) -> Optional[ViewHandler]:
+        """
+        Find handler associated with a view_id, regardless of handler_id naming.
+        """
+        for handler in self._view_handlers.values():
+            # Check ViewManagerAdapter pattern
+            h_manager = getattr(handler, '_manager', None)
+            if h_manager and getattr(h_manager, 'view_id', None) == view_id:
+                return handler
+            
+            # Check ViewDriverAdapter/Standard Handler pattern
+            if getattr(handler, 'view_id', None) == view_id:
+                return handler
+            
+            # Check config (ViewHandler base)
+            if handler.config and handler.config.get('view_id') == view_id:
+                return handler
+                
+        return None
     
     def get_available_views(self) -> List[str]:
         """Get list of available view handler IDs."""
@@ -270,7 +290,7 @@ class FusionPipe(Pipe):
                 if hasattr(handler, 'process_event'):
                     # Apply timeout protection
                     try:
-                        event.metadata.setdefault("pipe_id", self.pipe_id)
+                        # event.metadata.setdefault("pipe_id", self.pipe_id) # DECOUPLED: pipe_id is already in metadata from agent or not needed
                         success = await asyncio.wait_for(
                             handler.process_event(event),
                             timeout=self.HANDLER_TIMEOUT
@@ -351,7 +371,7 @@ class FusionPipe(Pipe):
         # Notify view handlers of session start
         for handler in self._view_handlers.values():
             if hasattr(handler, 'on_session_start'):
-                await handler.on_session_start(session_id=session_id)
+                await handler.on_session_start(session_id=session_id, pipe_id=self.pipe_id)
         
         if is_leader:
             self._cached_leader_session = session_id
@@ -393,7 +413,7 @@ class FusionPipe(Pipe):
         # Notify view handlers of session close
         for handler in self._view_handlers.values():
             if hasattr(handler, 'on_session_close'):
-                await handler.on_session_close(session_id=session_id)
+                await handler.on_session_close(session_id=session_id, pipe_id=self.pipe_id)
         
         logger.info(f"Session {session_id} closed for view {self.view_id}")
     
@@ -519,13 +539,10 @@ class FusionPipe(Pipe):
                     await view_state_manager.set_snapshot_complete(self.view_id, session_id)
                     logger.info(f"Pipe {self.id}: Marked view {self.view_id} as snapshot complete.")
                     
-                    # Also mark scoped view key (for ForestView)
-                    lineage = self._session_lineage_cache.get(session_id, {})
-                    pipe_id_for_key = kwargs.get("metadata", {}).get("pipe_id") or lineage.get("pipe_id") or self.pipe_id
-                    if pipe_id_for_key:
-                         scoped_key = f"{self.view_id}:{pipe_id_for_key}"
-                         await view_state_manager.set_snapshot_complete(scoped_key, session_id)
-                         logger.debug(f"Pipe {self.id}: Also marked scoped view {scoped_key} as complete.")
+                    # Notify handlers so they can mark scoped keys if needed (DECOUPLED)
+                    for handler in self._view_handlers.values():
+                        if hasattr(handler, 'on_snapshot_complete'):
+                            await handler.on_snapshot_complete(session_id=session_id, metadata=kwargs.get("metadata"))
                     
                     # Also mark all other handlers' views as complete if they are different
                     for h_id, handler in self._view_handlers.items():

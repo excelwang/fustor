@@ -190,17 +190,17 @@ class ViewManager:
                     self.logger.error(f"Error cleaning up suspects for driver {driver_id}: {e}")
 
 
-    async def on_session_start(self, session_id: Optional[str] = None):
-        """Dispatch session start event to all driver instances."""
+    async def on_session_start(self, **kwargs):
+        """Handle session start."""
         for driver_id, driver_instance in self.driver_instances.items():
             if hasattr(driver_instance, 'on_session_start'):
-                 await driver_instance.on_session_start(session_id=session_id)
+                await driver_instance.on_session_start(**kwargs)
 
-    async def on_session_close(self, session_id: Optional[str] = None):
-        """Dispatch session close event to all driver instances for cleanup."""
+    async def on_session_close(self, **kwargs):
+        """Handle session close."""
         for driver_id, driver_instance in self.driver_instances.items():
             if hasattr(driver_instance, 'on_session_close'):
-                 await driver_instance.on_session_close(session_id=session_id)
+                await driver_instance.on_session_close(**kwargs)
 
     async def get_aggregated_stats(self) -> Dict[str, Any]:
         """

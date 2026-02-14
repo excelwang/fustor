@@ -17,9 +17,9 @@ class MinimalHandler(ViewHandler):
     async def initialize(self): pass
     async def close(self): pass
     async def process_event(self, event): pass
-    async def on_session_start(self): pass
-    async def on_session_close(self): pass
-    async def resolve_session_role(self, session_id, pipe_id=None):
+    async def on_session_start(self, **kwargs): pass
+    async def on_session_close(self, **kwargs): pass
+    async def resolve_session_role(self, session_id, **kwargs):
         from fustor_fusion.view_state_manager import view_state_manager
         view_id = "bv1" # Matches the view_id in fixture
         if self.next_role == "leader":
