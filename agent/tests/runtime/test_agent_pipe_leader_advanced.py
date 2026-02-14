@@ -55,7 +55,7 @@ async def test_supervise_starts_snapshot(mock_pipe):
         mock_task.done.return_value = False
         mock_create.return_value = mock_task
         
-        mock_pipe._supervise_data_tasks()
+        await mock_pipe._supervise_data_tasks()
         
         # Verify create_task was called
         assert mock_create.called
@@ -122,7 +122,7 @@ async def test_cancel_leader_tasks(mock_pipe):
         try:
             await asyncio.sleep(10)
         except asyncio.CancelledError:
-            pass
+            raise # Re-raise to mark task as cancelled
 
     s_task = asyncio.create_task(slow_task())
     a_task = asyncio.create_task(slow_task())
@@ -133,6 +133,7 @@ async def test_cancel_leader_tasks(mock_pipe):
     mock_pipe._sentinel_task = sn_task
     
     await mock_pipe._cancel_leader_tasks()
+    await asyncio.sleep(0.01) # Give tasks a chance to finish cancellation
     
     assert s_task.cancelled()
     assert a_task.cancelled()

@@ -49,7 +49,7 @@ class TestPipeErrorThreshold:
         pipe.max_consecutive_errors = 3
         
         for i in range(pipe.max_consecutive_errors):
-            pipe._handle_loop_error(Exception(f"Error {i+1}"), "test")
+            pipe._handle_control_error(Exception(f"Error {i+1}"), "test")
             
         # ERROR 位应已设置
         assert pipe.state & PipeState.ERROR, \
@@ -85,7 +85,7 @@ class TestPipeErrorThreshold:
             "Pipe 应在达到 max_consecutive_errors 后仍保持运行 (自愈)"
 
         # 错误计数确实已超过阈值
-        assert pipe._consecutive_errors >= pipe.max_consecutive_errors, \
+        assert pipe._control_errors >= pipe.max_consecutive_errors, \
             "错误计数应已达到阈值"
 
         # ERROR 位应已设置
@@ -107,7 +107,7 @@ class TestPipeErrorThreshold:
         
         # 触发恰好达到阈值
         for i in range(pipe.max_consecutive_errors):
-            backoff = pipe._handle_loop_error(Exception(f"Error {i+1}"), "test")
+            backoff = pipe._handle_control_error(Exception(f"Error {i+1}"), "test")
         
         # 最后一次 backoff 应为 max_backoff_seconds
         assert backoff == pipe.max_backoff_seconds, \
@@ -135,7 +135,7 @@ class TestPipeErrorThreshold:
         await pipe.start()
         await asyncio.sleep(0.5)
 
-        assert pipe._consecutive_errors == 0, \
+        assert pipe._control_errors == 0, \
             "成功恢复后错误计数应重置为 0"
         assert pipe.session_id == "recovered-session"
 

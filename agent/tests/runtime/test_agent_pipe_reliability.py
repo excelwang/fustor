@@ -53,16 +53,16 @@ def test_backoff_calculation():
 def test_handle_loop_error_counter(mock_source, mock_sender, reliability_config):
     pipe = AgentPipe("test", reliability_config, mock_source, mock_sender)
     
-    backoff = pipe._handle_loop_error(Exception("Test 1"), "test-loop")
-    assert pipe._consecutive_errors == 1
+    backoff = pipe._handle_control_error(Exception("Test 1"), "test-loop")
+    assert pipe._control_errors == 1
     assert backoff == 0.01
     
-    backoff = pipe._handle_loop_error(Exception("Test 2"), "test-loop")
-    assert pipe._consecutive_errors == 2
+    backoff = pipe._handle_control_error(Exception("Test 2"), "test-loop")
+    assert pipe._control_errors == 2
     assert backoff == 0.02
     
-    backoff = pipe._handle_loop_error(Exception("Test 3"), "test-loop")
-    assert pipe._consecutive_errors == 3
+    backoff = pipe._handle_control_error(Exception("Test 3"), "test-loop")
+    assert pipe._control_errors == 3
     # At threshold (3), backoff is capped to max_backoff_seconds
     assert backoff == reliability_config["max_backoff_seconds"]
 
@@ -74,7 +74,7 @@ async def test_heartbeat_loop_uses_backoff(mock_source, mock_sender, reliability
     
     # Mock sleep to capture backoff value
     mock_sleep = mocker.patch("asyncio.sleep", AsyncMock())
-    spy_handle = mocker.spy(pipe, "_handle_loop_error")
+    spy_handle = mocker.spy(pipe, "_handle_control_error")
     
     # We want to run exactly one iteration
     # To do this safely, we can make the second iteration exit
@@ -86,7 +86,7 @@ async def test_heartbeat_loop_uses_backoff(mock_source, mock_sender, reliability
     await pipe._run_heartbeat_loop()
     
     assert spy_handle.called
-    assert pipe._consecutive_errors >= 1
+    assert pipe._control_errors >= 1
     # Check that sleep was called with at least 0.01 (the backoff for 1st error)
     # The actual sleep is max(interval, backoff)
     assert mock_sleep.call_args[0][0] >= 0.01
@@ -108,7 +108,7 @@ async def test_audit_loop_uses_backoff(mock_source, mock_sender, reliability_con
     # Let's make the FIRST sleep (initial delay) fail
     mock_sleep.side_effect = [Exception("Sleep Err"), None]
     
-    spy_handle = mocker.spy(pipe, "_handle_loop_error")
+    spy_handle = mocker.spy(pipe, "_handle_data_error")
     
     # Use a function side effect to handle repeated calls
     loop_count = 0
@@ -127,25 +127,25 @@ async def test_audit_loop_uses_backoff(mock_source, mock_sender, reliability_con
     await pipe._run_audit_loop()
     
     assert spy_handle.called
-    assert pipe._consecutive_errors >= 1
+    assert pipe._data_errors >= 1
 
 def test_alert_threshold(mock_source, mock_sender, reliability_config, caplog):
     pipe = AgentPipe("test", reliability_config, mock_source, mock_sender)
     
     # 1. Error 1 & 2 -> no warning
-    pipe._handle_loop_error(Exception("E1"), "test")
-    pipe._handle_loop_error(Exception("E2"), "test")
+    pipe._handle_control_error(Exception("E1"), "test")
+    pipe._handle_control_error(Exception("E2"), "test")
     assert "reached threshold" not in caplog.text
     
     # 3. Error 3 -> warning logged
-    pipe._handle_loop_error(Exception("E3"), "test")
+    pipe._handle_control_error(Exception("E3"), "test")
     assert "reached threshold" in caplog.text
 
 @pytest.mark.asyncio
 async def test_heartbeat_recovery_resets_counter(mock_source, mock_sender, reliability_config, mocker):
     pipe = AgentPipe("test", reliability_config, mock_source, mock_sender)
     await pipe.on_session_created("sess-1", role="leader", session_timeout_seconds=0.3)
-    pipe._consecutive_errors = 5
+    pipe._control_errors = 5
     
     # Mock sleep to exit after one successful HB
     mock_sleep = mocker.patch("asyncio.sleep", AsyncMock())
@@ -156,4 +156,4 @@ async def test_heartbeat_recovery_resets_counter(mock_source, mock_sender, relia
     
     await pipe._run_heartbeat_loop()
     
-    assert pipe._consecutive_errors == 0
+    assert pipe._control_errors == 0

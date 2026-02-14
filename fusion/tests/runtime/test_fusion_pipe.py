@@ -124,6 +124,7 @@ class TestFusionPipeLifecycle:
     @pytest.mark.asyncio
     async def test_start(self, fusion_pipe, mock_view_handler):
         await fusion_pipe.start()
+        await fusion_pipe.wait_until_ready()
         assert fusion_pipe.state == PipeState.RUNNING
         assert mock_view_handler.initialized is True
         await fusion_pipe.stop()
@@ -131,6 +132,7 @@ class TestFusionPipeLifecycle:
     @pytest.mark.asyncio
     async def test_stop(self, fusion_pipe, mock_view_handler):
         await fusion_pipe.start()
+        await fusion_pipe.wait_until_ready()
         await fusion_pipe.stop()
         assert fusion_pipe.state == PipeState.STOPPED
         assert mock_view_handler._closed is True
@@ -149,6 +151,9 @@ class TestFusionPipeSession:
         
         # Use bridge to create session (handles election and backing store)
         await bridge.create_session(task_id="agent:pipe", session_id="sess-1")
+        
+        # Give background event loop time to notify handlers
+        await asyncio.sleep(0.05)
         
         assert await fusion_pipe.get_session_role("sess-1") == "leader"
         assert mock_view_handler.session_starts == 1
@@ -169,6 +174,9 @@ class TestFusionPipeSession:
         mock_view_handler.next_role = "follower"
         await bridge.create_session(task_id="agent2:pipe", session_id="sess-2")
         
+        # Give background event loop time
+        await asyncio.sleep(0.05)
+        
         assert await fusion_pipe.get_session_role("sess-1") == "leader"
         assert await fusion_pipe.get_session_role("sess-2") == "follower"
         
@@ -187,6 +195,12 @@ class TestFusionPipeSession:
         
         # Close via bridge (which calls pipe.on_session_closed)
         await bridge.close_session("sess-1")
+        
+        # In V2, promotion happens during heartbeat/keep_alive
+        mock_view_handler.next_role = "leader"
+        # We must trigger enough heartbeats or set _LEADER_VERIFY_INTERVAL to 1 for test
+        bridge._LEADER_VERIFY_INTERVAL = 1
+        await bridge.keep_alive("sess-2")
         
         # sess-2 should now be leader
         assert await fusion_pipe.get_session_role("sess-2") == "leader"

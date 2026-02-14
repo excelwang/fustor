@@ -16,7 +16,14 @@ As long as the **Control Plane** (Heartbeat, Task Assignment, Status Reporting) 
 2.  **Hot Upgrades**: The Agent can receive new software versions or bytecode for the Data Plane and apply them without losing connection.
 3.  **Config Hot-Reload**: Business logic configurations (which directories to scan, which regex to use) can be updated dynamically to fix issues that caused the Data Plane to crash in the first place.
 
-## 本项目处于关键的核心业务链条上，因此提供的api服务（fs/tree）不可以返回503状态。必须时时刻刻都能提供查询服务。
+### 1.3 API 永不 503 保障
+
+本项目处于关键的核心业务链条上，API 服务 `/fs/tree` **不可以返回 503 状态**，必须时刻可用。
+
+**实现策略 — On-Command Find**:
+- 当 Fusion 收到查询请求时，若内存视图因数据面故障不可用或数据不完整，可通过**下发命令**到 Agent 执行实时 `scan`（对应 `command.py` 中的 On-Demand Scan）。
+- 只要 **Agent 进程在线 + Fusion 进程在线**，此查询机制即生效（"进程上线即服务可用"原则）。
+- 这确保了即使 Pipe 处于 Error/Reconnecting 状态，查询 API 仍可通过 On-Command 路径返回结果。
 
 ## 2. Architecture of Separation
 

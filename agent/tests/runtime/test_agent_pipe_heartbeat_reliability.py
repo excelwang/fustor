@@ -45,7 +45,7 @@ async def test_heartbeat_failure_backoff(mock_source, mock_sender, pipe_config):
         # Verify it skipped/failed but continued
         assert mock_sender.send_heartbeat.call_count >= 3
         # Should have incremented error counter
-        assert pipe._consecutive_errors >= 2
+        assert pipe._control_errors >= 2
     finally:
         hb_task.cancel()
         await pipe.stop()

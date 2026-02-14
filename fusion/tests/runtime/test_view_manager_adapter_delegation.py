@@ -16,6 +16,7 @@ async def test_view_manager_adapter_delegation_regression():
     
     # Inject driver into manager
     manager.driver_instances["d1"] = mock_driver
+    manager._init_done.set() # Avoid hang in wait_until_ready()
     
     # 2. Creating Adapter
     adapter = ViewManagerAdapter(manager)

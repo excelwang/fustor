@@ -111,7 +111,10 @@ Audit 过程必须严格遵循 Start/End 信号契约，以确保 Fusion 端的�
 > **Must-Send 语义**: 即使 Audit 过程中发生异常 (如 IO 错误、网络中断)，`finally` 块中也 **必须** 发送 End Signal。
 > 
 > **后果**: 若 Fusion 未收到 End Signal，将认为审计未完成，因此 **永远不会触发 Tombstone 清理和 Blind-spot 检测**，导致已删除文件的"幽灵条目"永久残留。
-- **后续审计**: **增量扫描** (仅扫描 mtime 变化的目录，IO 极低)。
+
+#### Audit 超时保护
+
+当 Fusion 收到 `audit_start` 但超过一定时间（建议为 `2 * audit_interval_sec`）未收到对应的 `audit_end` 时，应自动关闭该审计窗口并记录警告日志。这可以防止 Agent 崩溃在 Audit 中间时，Fusion 的审计窗口永远开启。
 
 ---
 
@@ -170,21 +173,48 @@ Fusion can issue commands to the Agent via the Heartbeat response channel.
 
 对于有状态的单例组件 (如 `FSDriver`)，若发生不可恢复的错误 (如 `inotify` 句柄耗尽、挂载点失效)，简单的 Retry 无效。
 
-**规范**:
-1. **Fatal Error Identification**: 组件必须能区分 `Transient Error` (网络抖动) 与 `Persistent Error` (资源耗尽)。
-2. **Invalidation**: 当 Control Loop 捕获到 `Persistent Error` 时，**必须** 调用组件的 `invalidate()` 或 `close()` 方法清除单例缓存。
-3. **Re-initialization**: 下次循环时 `handler.initialize()` 将创建全新的组件实例。
+**当前策略**：
+基于我们的业务场景（NFS 文件监控），采用**简化的重置流程**：
+
+1. **区分璯性错误与暂态错误**: 组件通过连续错误计数超阈值来识别（已实现）
+2. **日志告警 + 最大退避重试**: 达到阈值后 CRITICAL 日志 + 最大退避间隔持续重试（已实现）
+3. **外部进程 Supervisor**: 对于真正不可恢复的故障（如 OOM），依赖外部 Supervisor (`runner.py` / systemd) 重启进程
+
+> [!NOTE]
+> 完整的 Component Reset Protocol（清理缓存 → 重新初始化 → 验证健康）在当前 NFS 监控场景下不是必需的，
+> 因为 FSDriver 的状态可以通过重启进程完全重建。未来若引入有状态的持久化组件（如本地数据库缓存），再考虑实现完整协议。
 
 ### 5.3 Degraded Mode (降级模式)
 
-当核心能力 (Realtime) 不可用时，Agent 不应崩溃，而应进入降级模式：
+组件健康管理采用 **分层级联故障** 模型：
 
-- **触发条件**: Local Event Bus 异常、Source Driver 无法建立 Watch (但能 LS)。
-- **行为**:
-    1. **Mark**: 设置 `is_realtime_ready = False`。
-    2. **Report**: Heartbeat 中携带 `can_realtime=False`。
-    3. **Fallback**: 依赖 `Snapshot` (启动时) 和 `Audit` (周期性) 维持数据的最终一致性。
-    4. **Retry**: 周期性尝试重新初始化 Realtime 组件。
+#### 最小粒度组件 (Health Unit)
+
+以下组件是健康维护的最小粒度单元：
+
+| 组件 | 层面 | 说明 |
+|------|------|------|
+| **Source** | Agent | 数据源驱动（如 FSDriver） |
+| **AgentPipe** | Agent | 代理管道 |
+| **Sender** | Agent | 上行发送通道 |
+| **Receiver** | Fusion | 下行接收通道 |
+| **FusionPipe** | Fusion | 融合管道 |
+| **View** | Fusion | 视图驱动（如 FSViewDriver） |
+
+#### 级联故障规则 (Cascading Failure Rules)
+
+- **Pipe 失败不影响其他 Pipe**: 每个 Pipe 独立运行，某个 Pipe 崩溃不影响同进程内的其他 Pipe
+- **Source/Sender 失败 → 关联 AgentPipe 全部失败**: Source 或 Sender 是共享组件，其故障影响所有依赖它的 AgentPipe
+- **Receiver 失败 → 关联 FusionPipe 全部失败**: Receiver 是共享组件，其故障影响所有依赖它的 FusionPipe
+- **FusionPipe 失败 → 中止下游视图**: FusionPipe 故障应中止其下游关联的 View 的数据写入，View 的查询 API 的可用性要根据view的类型进行判断。live类型的视图一旦任一FusionPipe失败则不可用（保留应急on-demand查询服务），其他类型的默认继续可用。
+- 失败后，组件应尝试通过自行重启恢复运行，并记录错误日志。健康状态中记录失败重启次数。
+
+#### 可观测性要求
+
+所有组件的健康状态必须提供观测手段：
+- Heartbeat 响应中携带组件健康摘要
+- API 接口提供组件级别的健康检查 (`/health/components`)
+- 日志中明确标记组件状态转换事件
 
 ### 5.4 Zombie Prevention (僵尸任务预防)
 

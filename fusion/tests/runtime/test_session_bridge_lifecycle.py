@@ -92,6 +92,10 @@ async def test_bridge_leader_promotion_on_close(pipe_with_bridge):
     handler.next_role = "leader"
     await bridge.close_session("s1")
     
+    # In V2, promotion is pull-based. We need to trigger it via keep_alive
+    bridge._LEADER_VERIFY_INTERVAL = 1
+    await bridge.keep_alive("s2")
+    
     # s2 should be promoted
     assert await pipe.get_session_role("s2") == "leader"
 

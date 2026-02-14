@@ -30,18 +30,19 @@ Agent 负责监控 NFS 变化。NFS 服务器的时钟跳变（例如被 `ntpdat
 
 ### 3.1 影子参考系 (Shadow Reference Frame)
 
-Agent 内部计算一个虚拟的物理参考系。
+Agent 在 Pre-scan 阶段计算 NFS 时钟与本地时钟的漂移量，此后的所有事件生成和 LRU 调度都使用补偿后的时间。
 
-**实现** (`source-fs/__init__.py`)：
+**实现** (`source-fs/driver.py`):
 
 ```python
-# 1. P99 漂移采样
+# 1. P99 漂移采样——过滤前 1% 异常值
 mtimes = sorted(dir_mtime_map.values())
-p99_idx = max(0, len(mtimes) - 1 - (len(mtimes) // 1000))  # 99.9th percentile
+p99_idx = max(0, int(len(mtimes) * 0.99) - 1)
 latest_mtime_stable = mtimes[p99_idx]
 
 # 2. 计算漂移
 self.drift_from_nfs = latest_mtime_stable - time.time()
+self.watch_manager.drift_from_nfs = self.drift_from_nfs
 
 # 3. 归一化调度 (LRU 使用归一化时间)
 lru_timestamp = server_mtime - drift_from_nfs
@@ -51,24 +52,25 @@ self.watch_manager.schedule(path, lru_timestamp)
 **效果**：即使 NFS 上某个孤岛文件跳变到 2050 年，该文件在 Agent 内部也只会自保（计算出的归一化年龄依然是正常的），而不会导致全树的归一化年龄被拉大而导致其他文件被提前踢出缓存。
 
 ### 3.2 统一时间参考要求 (Unified Time Reference Requirement)
-**CRITICAL**:
 
-Agent 内部的所有事件生成组件（Scanner, Watcher, Poller）**必须统一使用**经过漂移补偿的影子参考时间（Shadow Reference Time），即 `Time + Drift`。
+**CRITICAL**: Agent 内部的 **所有** 事件生成组件必须统一使用漂移补偿后的 `Time + Drift` 作为事件 `index`。
+
+**当前实现状态** (全部已统一 ✅)：
+
+| 组件 | 代码位置 | index 生成方式 |
+|------|----------|----------------|
+| **EventHandler** (Realtime) | `event_handler.py:_get_index()` | `int((time.time() + drift) * 1000)` |
+| **Scanner** (Snapshot) | `scanner.py:scan_snapshot()` | `int((time.time() + self.drift_from_nfs) * 1000)` |
+| **Scanner** (Audit) | `scanner.py:scan_audit()` | `int((time.time() + self.drift_from_nfs) * 1000)` |
+| **Driver** (On-Demand Scan) | `driver.py:scan_path()` | `int((time.time() + self.drift_from_nfs) * 1000)` |
 
 **禁止行为 (Split-Brain Timer)**:
-- 禁止 Snapshot Scanner 和 Realtime Watcher 使用 不同类型的时间戳（如Realtime模型使用Raw Time，而Snapshot模型使用Drift补偿后的Time）。
-- **后果**: 如果 Agent 时钟滞后于 NFS (`Drift > 0`)，切换到 Realtime 模式时，事件时间戳会从"未来"跳变回"现在"。
-- **故障现象**: Agent 内部的总线（EventBus）会检测到索引回退（Index Regression），并根据单调递增原则**丢弃**这些合法的实时事件，导致数据丢失。
-
-**正确实现**:
-所有事件的 `index` 字段生成逻辑必须一致：
-```python
-event_index = int((time.time() + self.drift_from_nfs) * 1000)
-```
+- 禁止任何组件使用未补偿的 `time.time()` 生成 `index`
+- **违反的后果**: 如果 Agent 时钟滞后于 NFS (`Drift > 0`)，未补偿的时间戳会导致 EventBus 检测到 Index Regression，根据单调递增原则**丢弃**合法的实时事件
 
 ### 3.3 职责限制
 
-Agent 侧的时钟逻辑主要用于本地资源管理 (LRU) 和 **维持内部事件单调性**，但也通过 `index` 字段将校准后的时间传递给 Fusion。
+Agent 侧的时钟逻辑主要用于本地资源管理 (LRU) 和 **维持内部事件单调性**，但也通过 `index` 字段将校准后的时间传递给 Fusion。时间异常的最终裁决仍由 Fusion 侧的 LogicalClock 负责。
 
 Agent 发送的消息携带：
 - 原始 `mtime` (NFS 及其逻辑时间)
@@ -192,10 +194,10 @@ def get_watermark(self) -> float:
 
 | 场景 | Agent (Source FS) 行为 | Fusion (View FS) 行为 |
 | :--- | :--- | :--- |
-| **正常流逝** | 顺延 P99 校准，LRU 保持稳定 | Watermark 随 BaseLine 稳健推进 |
-| **mtime 跳向未来** | 计算出的 Drift 增大，归一化时间保持稳定 | **拒绝推进水位线**（超出 Trust Window）；标记该文件为 `integrity_suspect` |
+| **正常流逝** | 顺延 P99 校准，LRU 保持稳定 | Watermark 随流逝时间稳健推进 |
+| **mtime 跳向未来** | 归一化时间保持稳定 | **拒绝推进水位线**；标记该文件为 `integrity_suspect` |
 | **mtime 退回过去** | 归一化 Age 变大，作为旧文件处理 | 视为旧数据注入，不影响当前水位线；通过墓碑策略裁决 |
-| **长期无写入** | 停止采样，Drift 维持现状 | BaseLine 随物理时间流逝，Watermark 自动推进，促使 Suspect 过期 |
+| **长期无写入** | 停止采样，Drift 维持现状 | Watermark 自动推进，促使 Suspect 过期 |
 | **冷启动** | 正常发送物理时间戳 | Skew 采样不足时回退到物理时间，可能导致 Suspect 判定偏宽松 |
 
 ---
@@ -209,7 +211,7 @@ def get_watermark(self) -> float:
 | **墓碑 TTL 清理** | Physical Time | `time.time() - tombstone[1]` (物理时间戳) | 清理超过 1 小时的墓碑 |
 | **陈旧证据保护** | Physical Time | `node.last_updated_at` vs `audit_start` | 保护审计后有实时更新的节点 |
 | **Suspect TTL 过期** | Monotonic Time | `time.monotonic()` vs `suspect_heap[0][0]` | 稳定的过期判定，不受系统时钟调整影响 |
-| **事件索引 (Index)** | Physical Time | `int(time.time() * 1000)` | Agent 捕获事件的物理时刻 |
+| **事件索引 (Index)** | Shadow Reference Time | `int((time.time() + drift_from_nfs) * 1000)` | Agent 漂移补偿后的毫秒级时间戳 |
 
 ---
 

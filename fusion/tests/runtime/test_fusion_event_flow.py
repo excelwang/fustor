@@ -15,6 +15,7 @@ class TestFusionEventFlow:
         config = {"view_id": "view-main"}
         pipe = FusionPipe("pipe-test", config)
         pipe._set_state = MagicMock() # Mock state transitions
+        pipe._handlers_ready.set()    # Avoid initialization timeout
         
         # Setup handlers
         self.handler1 = AsyncMock(spec=ViewHandler)

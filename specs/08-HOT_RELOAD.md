@@ -11,7 +11,8 @@
 Fustor 的 Agent 和 Fusion 均支持 **基于 SIGHUP 信号的配置热重载**，允许在不停止服务的情况下动态增减管道（Pipe）。
 
 > [!IMPORTANT]
-> 热重载仅支持 Pipe 的**增加和删除**。已运行 Pipe 的配置变更（如修改 `fields_mapping`、`source.uri`）不会被检测到——需要先删除再重新添加。
+> **设计硬约束**：热重载**禁止修改**任何已运行组件（不局限于 Pipe）的配置。只能**增加或删除**组件。
+> 若需变更已运行组件的配置（如修改 `fields_mapping`、`source.uri`），必须先删除该组件再重新添加（通过改 Pipe ID 实现，见 §5）。
 
 ---
 

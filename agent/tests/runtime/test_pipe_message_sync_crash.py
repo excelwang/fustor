@@ -55,14 +55,14 @@ class TestMessageSyncCrashDetection:
         pipe._message_sync_task = crashed_task
 
         # 初始错误计数为 0
-        initial_errors = pipe._consecutive_errors
+        initial_errors = pipe._data_errors
 
-        # 模拟 control loop 的检测逻辑 (L383-391)
+        # 模拟 supervisor loop 的检测逻辑
         if pipe._message_sync_task and pipe._message_sync_task.done():
-            pipe._consecutive_errors += 1
+            pipe._data_errors += 1
 
-        assert pipe._consecutive_errors == initial_errors + 1, \
-            "Control loop 应检测到崩溃的 message_sync 任务并增加错误计数"
+        assert pipe._data_errors == initial_errors + 1, \
+            "Supervisor loop 应检测到崩溃的 message_sync 任务并增加错误计数"
 
     @pytest.mark.asyncio
     async def test_crashed_task_exception_is_retrievable(

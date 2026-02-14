@@ -77,8 +77,9 @@ class TestAgentErrorRecovery:
         async def mock_msg_sync_phase():
             nonlocal error_triggered
             pipe._set_state(pipe.state | PipeState.MESSAGE_SYNC)
+            pipe.is_realtime_ready = True # Signal that realtime is ready so snapshot can start
             if not error_triggered:
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.2)
                 error_triggered = True
                 await pipe._handle_fatal_error(RuntimeError("Session lost"))
                 return
@@ -242,7 +243,7 @@ class TestAgentErrorRecovery:
             # 1st error: backoff should be ERROR_RETRY_INTERVAL (0.01)
             # 2nd error: backoff should be 0.02
             # 3rd error: backoff should be 0.04
-            assert pipe._consecutive_errors >= 2
+            assert pipe._control_errors >= 2
             # The state info should reflect backoff
             assert "backoff" in pipe.info
         finally:
