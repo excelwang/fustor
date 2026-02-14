@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "fustor-view-fs-forest"
+version = "0.1.0"
+description = "Fustor Forest View Driver (Multi-Pipe Aggregation)"
+requires-python = ">=3.11"
+dependencies = [
+    "fustor-core",
+    "fustor-view-fs",
+]
+
+[project.entry-points."fustor.view_drivers"]
+forest-fs = "fustor_view_fs_forest:ForestFSViewDriver"
+
+[project.entry-points."fustor.view_api"]
+forest-fs = "fustor_view_fs_forest.api:create_view_router"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/fustor_view_fs_forest"]

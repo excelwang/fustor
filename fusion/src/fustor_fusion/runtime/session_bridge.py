@@ -106,6 +106,31 @@ class PipeSessionBridge:
         session_id = session_id or str(uuid.uuid4())
         view_id = str(self._pipe.view_id)
         
+        # ForestView support: Per-tree leader election
+        # Only apply scoping if the driver strictly requires it (e.g. ForestFSViewDriver)
+        # Otherwise standard views (FSViewDriver) must use the raw view_id for consistency.
+        pipe_id = getattr(self._pipe, 'pipe_id', None)
+        election_view_id = view_id
+        
+        if pipe_id:
+            # Check if driver opts-in for scoped election
+            # Path: Pipe -> Handler -> Manager -> Driver
+            should_scope = False
+            handler = self._pipe.get_view_handler(view_id)
+            if handler:
+                # Try to find the driver in common adapter structures
+                driver = getattr(handler, 'driver', None)
+                if not driver and hasattr(handler, 'manager'):
+                    driver = getattr(handler.manager, 'driver', None)
+                
+                # Check flag
+                if driver:
+                    should_scope = getattr(driver, 'use_scoped_session_leader', False)
+            
+            if should_scope:
+                 election_view_id = f"{view_id}:{pipe_id}"
+        
+        
         # Use pipe config if not explicitly overridden
         if allow_concurrent_push is None:
             allow_concurrent_push = getattr(self._pipe, 'allow_concurrent_push', True)
@@ -124,15 +149,30 @@ class PipeSessionBridge:
 
         is_leader = False
         # Try to become leader for the primary view first
-        is_leader = await view_state_manager.try_become_leader(view_id, session_id)
+        is_leader = await view_state_manager.try_become_leader(election_view_id, session_id)
         
         # For all views, we need to ensure we have a role and respect concurrent push
         for v_id in all_view_ids:
+            # Apply the same scoping logic for other views if they are forest views?
+            # For simplicity, we assume secondary views follow standard logic or
+            # user must use primary view for Forest features.
             v_is_leader = await view_state_manager.try_become_leader(v_id, session_id)
             
             if v_id == view_id:
-                is_leader = v_is_leader
+                # If v_id matches primary, we already did it with election_view_id?
+                # current implementation of all_view_ids includes primary view_id.
+                # But we used election_view_id for primary.
+                # So we should skip v_id == view_id in this loop if we want to rely on the scoped one.
+                pass 
             
+            # Actually, the loop logic is a bit flawed for ForestView.
+            # ForestView has 1 view_id but N trees. 
+            # We only care about OUR tree (election_view_id).
+            # The all_view_ids loop is for "Composite" view handlers (legacy).
+            # Let's keep it but skip the primary view_id from loop to avoid double-locking wrong key.
+            if v_id == view_id:
+                 continue
+
             if not v_is_leader and not allow_concurrent_push:
                 leader_sid = await view_state_manager.get_leader(v_id)
                 if leader_sid:
@@ -144,6 +184,13 @@ class PipeSessionBridge:
                 self._leader_cache.setdefault(v_id, set()).add(session_id)
                 if not allow_concurrent_push:
                     await view_state_manager.lock_for_session(v_id, session_id)
+
+        # Handle the Primary Election ID (Scoped)
+        if is_leader:
+            await view_state_manager.set_authoritative_session(election_view_id, session_id)
+            self._leader_cache.setdefault(election_view_id, set()).add(session_id)
+            if not allow_concurrent_push:
+                await view_state_manager.lock_for_session(election_view_id, session_id)
         
         # Create in legacy SessionManager
         await self._session_manager.create_session_entry(
@@ -196,6 +243,22 @@ class PipeSessionBridge:
             Heartbeat response with role, tasks, etc.
         """
         view_id = str(self._pipe.view_id)
+        pipe_id = getattr(self._pipe, 'pipe_id', None)
+        
+        election_view_id = view_id
+        if pipe_id:
+            should_scope = False
+            handler = self._pipe.get_view_handler(view_id)
+            if handler:
+                driver = getattr(handler, 'driver', None)
+                if not driver and hasattr(handler, 'manager'):
+                    driver = getattr(handler.manager, 'driver', None)
+                if driver:
+                    should_scope = getattr(driver, 'use_scoped_session_leader', False)
+            
+            if should_scope:
+                election_view_id = f"{view_id}:{pipe_id}"
+        
         commands = []
         
         # 1. Update legacy SessionManager
@@ -223,23 +286,25 @@ class PipeSessionBridge:
         # 3. Try to become leader (Follower promotion) if not known leader
         from fustor_fusion.view_state_manager import view_state_manager
         
-        is_known_leader = session_id in self._leader_cache.get(view_id, set())
+        # Check against the election_view_id
+        is_known_leader = session_id in self._leader_cache.get(election_view_id, set())
         
         # Periodic validation: every N heartbeats, verify cache against actual state
         count = self._heartbeat_count.get(session_id, 0) + 1
         self._heartbeat_count[session_id] = count
         if is_known_leader and count % self._LEADER_VERIFY_INTERVAL == 0:
-            actual_leader = await view_state_manager.is_leader(view_id, session_id)
+            actual_leader = await view_state_manager.is_leader(election_view_id, session_id)
             if not actual_leader:
-                logger.debug(f"Leader cache stale for {session_id} on view {view_id}, clearing")
-                self._leader_cache.get(view_id, set()).discard(session_id)
+                logger.debug(f"Leader cache stale for {session_id} on view {election_view_id}, clearing")
+                self._leader_cache.get(election_view_id, set()).discard(session_id)
                 is_known_leader = False
         
         if not is_known_leader:
-            is_leader = await view_state_manager.try_become_leader(view_id, session_id)
+            # Try to become leader on the scoped view ID
+            is_leader = await view_state_manager.try_become_leader(election_view_id, session_id)
             if is_leader:
-                await view_state_manager.set_authoritative_session(view_id, session_id)
-                self._leader_cache.setdefault(view_id, set()).add(session_id)
+                await view_state_manager.set_authoritative_session(election_view_id, session_id)
+                self._leader_cache.setdefault(election_view_id, set()).add(session_id)
     
         # 3. Get final status from pipe
         role = await self._pipe.get_session_role(session_id)
@@ -264,6 +329,21 @@ class PipeSessionBridge:
             True if successfully closed
         """
         view_id = str(self._pipe.view_id)
+        pipe_id = getattr(self._pipe, 'pipe_id', None)
+        
+        election_view_id = view_id
+        if pipe_id:
+            should_scope = False
+            handler = self._pipe.get_view_handler(view_id)
+            if handler:
+                driver = getattr(handler, 'driver', None)
+                if not driver and hasattr(handler, 'manager'):
+                    driver = getattr(handler.manager, 'driver', None)
+                if driver:
+                    should_scope = getattr(driver, 'use_scoped_session_leader', False)
+            
+            if should_scope:
+                election_view_id = f"{view_id}:{pipe_id}"
         
         # Remove from legacy SessionManager and release locks/leader
         await self._session_manager.terminate_session(
@@ -273,12 +353,14 @@ class PipeSessionBridge:
         
         # Explicitly release leader/lock just in case terminate_session didn't cover everything
         from fustor_fusion.view_state_manager import view_state_manager
-        await view_state_manager.unlock_for_session(view_id, session_id)
-        await view_state_manager.release_leader(view_id, session_id)
+        
+        # Unlock SCOPED view
+        await view_state_manager.unlock_for_session(election_view_id, session_id)
+        await view_state_manager.release_leader(election_view_id, session_id)
         
         # Remove from leader cache
-        if view_id in self._leader_cache and session_id in self._leader_cache[view_id]:
-            self._leader_cache[view_id].discard(session_id)
+        if election_view_id in self._leader_cache and session_id in self._leader_cache[election_view_id]:
+            self._leader_cache[election_view_id].discard(session_id)
         
         # Remove heartbeat counter
         self._heartbeat_count.pop(session_id, None)

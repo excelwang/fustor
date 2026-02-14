@@ -1,6 +1,6 @@
-# Fustor 多视图聚合部署指南 (Multi-FS View)
+# Fustor 多视图聚合部署指南 (Forest View)
 
-本文档指导如何部署 Fustor 并启用 **Multi-FS View** 特性。该特性允许 Fusion 将分布在不同 Agent 上的多个文件系统视图聚合成一个统一的逻辑视图，对外提供单一访问入口。
+本文档指导如何部署 Fustor 并启用 **Forest View** 特性。该特性允许 Fusion 将多个 Pipe 的数据流聚合到一个统一的逻辑视图 (Forest) 中，内部自动维护多棵文件系统树。
 
 ## 场景描述
 
@@ -21,12 +21,12 @@
 
 ## 2. 软件安装
 
-除了基础组件外，Fusion 端需要安装 `fustor-view-multi-fs` 扩展。
+除了基础组件外，Fusion 端需要安装 `fustor-view-fs-forest` 扩展。
 
 ### 2.1 服务端 (Fusion Node)
 ```bash
 # 安装核心组件及扩展
-uv pip install fustor-fusion fustor-view-fs fustor-view-multi-fs fustor-receiver-http
+uv pip install fustor-fusion fustor-view-fs fustor-view-fs-forest fustor-receiver-http
 ```
 
 ### 2.2 采集端 (Source Agents)
@@ -91,7 +91,9 @@ pipes:
 
 ### 3.2 服务端配置 (Fusion)
 
-在 Fusion 端，您需要先定义与每个 Agent 对应的普通视图 (`fs` driver)，然后定义一个聚合视图 (`multi-fs` driver)。
+在 Fusion 端，您只需要定义**一个**聚合视图 (`forest-fs` driver)，并将所有 Pipes 指向该视图。
+
+**注意**: Forest View 会根据 `pipe_id` 自动在内部创建和管理子树。
 
 `~/.fustor/fusion-config/default.yaml`:
 ```yaml
@@ -101,38 +103,28 @@ receivers:
     port: 18888
     api_keys:
       - key: "key-shard-01"
-        pipe_id: "pipe-shard-01"
+        pipe_id: "pipe-shard-01"  # <--- Pipe ID 将作为子树的唯一标识
       - key: "key-shard-02"
         pipe_id: "pipe-shard-02"
 
 views:
-  # 1. 基础视图 (对应各自的 Agent)
-  view-shard-01:
-    driver: fs
-    api_keys: ["admin-key"]
-  
-  view-shard-02:
-    driver: fs
-    api_keys: ["admin-key"]
-
-  # 2. 聚合视图 (Multi-FS)
+  # 统一的森林视图
   global-view:
-    driver: multi-fs  # <--- 使用聚合驱动
+    driver: forest-fs   # <--- 使用森林驱动
     api_keys: ["public-read-key"]
     driver_params:
-      members:        # <--- 指定成员视图 ID
-        - view-shard-01
-        - view-shard-02
+      hot_file_threshold: 60.0
+      max_tree_items: 10000000
 
 pipes:
-  # 绑定 Pipe 到对应的基础视图
+  # 所有 Pipe 指向同一个森林 View
   pipe-shard-01:
     receiver: http-receiver
-    views: [view-shard-01]
+    views: [global-view]  # <--- 指向森林
   
   pipe-shard-02:
     receiver: http-receiver
-    views: [view-shard-02]
+    views: [global-view]  # <--- 指向森林
 ```
 
 ---
@@ -186,11 +178,11 @@ curl -H "X-API-Key: public-read-key" \
 {
   "path": "/",
   "members": {
-    "view-shard-01": {
+    "pipe-shard-01": {  // <--- 以 Pipe ID 为键
       "status": "ok",
       "data": { ... }
     },
-    "view-shard-02": {
+    "pipe-shard-02": {
       "status": "ok",
       "data": { ... }
     }
@@ -235,41 +227,33 @@ curl -H "X-API-Key: public-read-key" \
 
 ## 6. 动态扩容 (Dynamic Scaling)
 
-本节介绍如何在 **不停止服务** 的情况下，向现有 Agent 添加新的 NFS 挂载源，并使其出现在 Multi-FS 聚合视图中。
+本节介绍如何在 **不停止服务** 的情况下，向现有 Agent 添加新的 NFS 挂载源，并使其出现在 Forest View 聚合视图中。
 
 由于 Fusion 的 `API Key` 与 `Pipe` 是 1:1 绑定的，新增 Source 需要同时更新 Fusion 和 Agent 的配置。
 
 ### 步骤 1: 修改 Fusion 配置 (fusion.yaml)
 
 在 Fusion 侧做好接收准备：
-1.  **定义新 View**: 承载新 NFS 的数据。
-2.  **更新 Multi-FS**: 将新 View 加入聚合列表。
-3.  **定义新 Pipe**: 路由数据到新 View。
-4.  **分配新 Key**: 在 Receiver 中为新 Pipe 分配专用 Key。
+1.  **定义新 Pipe**: 路由数据到现有的 Forest View。
+2.  **分配新 Key**: 在 Receiver 中为新 Pipe 分配专用 Key。
 
 ```yaml
 views:
   # ... 原有 views ...
-  view-new-nfs:           # [新增] 1. 定义新 View
-    driver: fs
-  
-  global-view:
-    driver: multi-fs
-    driver_params:
-      members: [..., view-new-nfs] # [修改] 2. 加入聚合列表
+  # 无需修改 Views 配置! Forest View 会自动接纳新 Pipe 的数据。
 
 pipes:
   # ... 原有 pipes ...
-  pipe-new-nfs:           # [新增] 3. 定义新 Pipe
+  pipe-new-nfs:           # [新增] 1. 定义新 Pipe
     receiver: http-main
-    views: [view-new-nfs]
+    views: [global-view]  # <--- 指向现有的森林 View
 
 receivers:
   http-main:
     driver: http
     api_keys:
       # ... 原有 keys ...
-      - key: "new-nfs-key"      # [新增] 4. 分配新 Key
+      - key: "new-nfs-key"      # [新增] 2. 分配新 Key
         pipe_id: "pipe-new-nfs" #       映射到新 Pipe
 ```
 
@@ -317,7 +301,7 @@ pipes:
 fustor-agent reload
 ```
 
-完成上述步骤后，新挂载点的数据将自动同步，并可通过 Multi-FS View API 查询到。
+完成上述步骤后，新挂载点的数据将自动同步，并可通过 Forest View API 查询到（作为新的 tree key）。
 
 ---
 
@@ -326,5 +310,5 @@ fustor-agent reload
 **Q: Agent 启动报错 "Agent ID is not configured"?**
 A: 请检查 Agent 的 YAML 配置文件中是否包含 `agent_id: "..."` 字段。这是 v0.9.0 引入的强制要求。
 
-**Q: 聚合视图中某个成员显示 "status": "error"?**
-A: 这表示 Fusion 无法连接到对应的基础视图（可能是对应的 Agent 未连接，或视图未就绪）。聚合视图具有容错性，单个成员失败不会导致整个请求失败。
+**Q: 聚合视图中成员 key 是什么?**
+A: Forest View 使用 `pipe_id` 作为内部子树的 key。在查询 API 返回的 `members` 字典中，key 即为对应的 `pipe_id`。

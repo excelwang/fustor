@@ -1,4 +1,4 @@
-# Multi-FS View 设计
+# Forest View 设计 (Multi-Source Aggregation)
 
 > 版本: 1.0.0  
 > 日期: 2026-02-13  
@@ -36,32 +36,28 @@
 
 ## 2. 架构决策
 
-### 2.1 核心原则: View Driver 组合
+### 2.1 核心原则: Forest Pattern (单一视图，内部多树)
 
-Multi-FS 聚合功能作为一个**新的 View Driver** (`view-multi-fs`) 实现，不引入新的架构层级。
+采用 **Forest View** 架构 (`view-fs-forest`)，对外表现为单一 View，对内管理多棵 FS Tree。
 
-这一决策基于对称性分析：
-
-```
-Agent:   Source(data) → Pipe(orchestration) → Sender(transport)
-Fusion:  Receiver(transport) → Pipe(orchestration) → View(data)
-```
-
-Agent 侧有不同的 Source Driver (`source-fs`, `source-oss` ...)，Fusion 侧对称地有不同的 View Driver (`view-fs`, `view-multi-fs` ...)。`view-multi-fs` 是一个**组合型 View Driver**——它不自己消费事件，而是聚合其他 `view-fs` 实例的查询结果。
+- **Symmetry**: 保持 Source → Pipe → View 的 1:1:1 数据流对称性。
+- **Routing**: Forest View 接收所有 Pipe 的数据，根据 `pipe_id` 将事件路由到内部对应的子树。
+- **Reuse**: 内部子树直接复用 `FSViewDriver` 的逻辑（Arbitration, Audit, Consistency）。
 
 ```
-                         ┌── view-fs (nfs-a) ◄── Pipe-A ◄── Receiver
-view-multi-fs ──读取──►  │
-  (聚合查询)              └── view-fs (nfs-b) ◄── Pipe-B ◄── Receiver
+Pipe-A ─(pipe_id=A)─┐                    ┌─ Tree A (FSViewDriver)
+                    │                    │
+Pipe-B ─(pipe_id=B)─┼─► ForestView ────► ├─ Tree B (FSViewDriver)
+                    │   (Router)         │
+Pipe-C ─(pipe_id=C)─┘                    └─ Tree C (FSViewDriver)
 ```
 
 ### 2.2 为什么不用其他方案
 
 | 方案 | 否决原因 |
 |:---|:---|
-| 多 View + 独立聚合 API (`multi_views` 配置段) | 引入新的架构概念，破坏现有 `views` 配置模型 |
-| 单 View 内多源仲裁 | 需重构一致性模型（Tombstone、Suspect 等多源化），风险极高 |
-| Pipeline/Materializer 中间层 | 打破 Agent-Fusion 3 层对称性，过度工程化 |
+| 多 View + 独立聚合 API | 配置繁琐（N+1个View），破坏 pipe-view 对称性 |
+| 独立 View Driver 组合 | 旧方案 (`view-multi-fs`)，导致无法直接 ingest 数据，不仅破坏对称性还导致架构耦合 |
 
 ---
 
@@ -84,41 +80,25 @@ receivers:
         pipe_id: "pipe-nfs-c"
 
 views:
-  # 基础 View: 每个 NFS 一个
-  nfs-a:
-    driver: fs
-    driver_params:
-      hot_file_threshold: 60.0
-      max_tree_items: 10000000
-  nfs-b:
-    driver: fs
-    driver_params:
-      hot_file_threshold: 60.0
-      max_tree_items: 10000000
-  nfs-c:
-    driver: fs
-    driver_params:
-      hot_file_threshold: 60.0
-      max_tree_items: 10000000
-
-  # 聚合 View: 组合多个基础 View
+views:
+  # 唯一的森林视图
   shared-storage:
-    driver: multi-fs
+    driver: forest-fs
     api_keys: ["query-key-shared"]
     driver_params:
-      members: [nfs-a, nfs-b, nfs-c]
+      hot_file_threshold: 60.0    # 应用于所有子树
+      max_tree_items: 10000000
 
 pipes:
   pipe-nfs-a:
     receiver: http-shared
-    views: [nfs-a]
+    views: [shared-storage]  # 指向森林
   pipe-nfs-b:
     receiver: http-shared
-    views: [nfs-b]
+    views: [shared-storage]  # 指向森林
   pipe-nfs-c:
     receiver: http-shared
-    views: [nfs-c]
-  # 注意: shared-storage 不绑定任何 Pipe (不直接消费事件)
+    views: [shared-storage]  # 指向森林
 ```
 
 ### 3.2 Agent 配置 (每台 NFS 服务器)
@@ -151,7 +131,9 @@ pipes:
 
 ## 4. API 设计
 
-`view-multi-fs` 通过 `fustor.view_api` entry point 注册以下端点（前缀由 view 名称决定，如 `/shared-storage/`）：
+`view-fs-forest` 通过 `fustor.view_api` entry point 注册以下端点（前缀由 view 名称决定，如 `/shared-storage/`）。
+
+**主要变化**: 原 `members` 列表中的 `view_id` 变为 `pipe_id`。
 
 ### 4.1 `GET /{view_name}/stats`
 
@@ -169,7 +151,7 @@ pipes:
   "path": "/data/experiment-42",
   "members": [
     {
-      "view_id": "nfs-a",
+      "view_id": "pipe-nfs-a",  // <--- Pipe ID
       "status": "ok",
       "file_count": 5234,
       "dir_count": 120,
@@ -177,7 +159,7 @@ pipes:
       "latest_mtime": 1706000500
     },
     {
-      "view_id": "nfs-b",
+      "view_id": "pipe-nfs-b",  // <--- Pipe ID
       "status": "ok",
       "file_count": 5100,
       "dir_count": 118,
@@ -186,7 +168,7 @@ pipes:
     }
   ],
   "best": {
-    "view_id": "nfs-a",
+    "view_id": "pipe-nfs-a",
     "reason": "file_count",
     "value": 5234
   }
@@ -213,11 +195,11 @@ pipes:
 {
   "path": "/data/logs",
   "members": {
-    "nfs-a": {
+    "pipe-nfs-a": {
       "status": "ok",
       "data": { "name": "logs", "content_type": "directory", "children": [...] }
     },
-    "nfs-b": {
+    "pipe-nfs-b": {
       "status": "error",
       "error": "Path not found"
     }
@@ -229,10 +211,11 @@ pipes:
 
 ## 5. 实现要点
 
-### 5.1 `view-multi-fs` Driver 行为
+### 5.1 `view-fs-forest` Driver 行为
 
-- **不消费事件**: `process_event()` 直接返回 `True`（无操作）
-- **查询代理**: 所有查询方法代理给成员 View Driver
+- **Event Routing**: `process_event(event)` 读取 `event.metadata["pipe_id"]`，将事件路由给对应的内部 `FSViewDriver`。
+- **Dynamic Tree**: 遇到未知的 `pipe_id` 自动创建新子树。
+- **Query Aggregation**: 所有查询方法（stats, tree）遍历所有内部子树并聚合结果。
 - **并发查询**: 使用 `asyncio.gather()` 并发查询所有成员
 - **容错**: 单个成员查询失败不影响其他成员的结果
 
@@ -259,11 +242,11 @@ async def get_subtree_stats(self, path: str) -> Dict[str, Any]:
 
 ```
 extensions/
-├── view-multi-fs/                   # 新增
-│   └── src/fustor_view_multi_fs/
+├── view-fs-forest/                  # 新增 (替代 view-multi-fs)
+│   └── src/fustor_view_fs_forest/
 │       ├── __init__.py
-│       ├── driver.py                # MultiFS ViewDriver
-│       └── api.py                   # /stats, /tree 端点
+│       ├── driver.py                # ForestFSViewDriver
+│       └── api.py                   # /stats, /tree 聚合端点
 ```
 
 ---
@@ -279,9 +262,9 @@ extensions/
 
 ### 6.2 扩展的部分
 
-- `views` 配置段支持 `driver: multi-fs` 类型
-- 包结构新增 `fustor-view-multi-fs`
-- View Driver 的组合模式（一个 View Driver 可引用其他 View Driver）
+- `views` 配置段支持 `driver: forest-fs` 类型
+- 包结构新增 `fustor-view-fs-forest`，删除 `fustor-view-multi-fs`
+- 引入 Forest Pattern (1 View Driver : N Internal Trees)
 
 ### 6.3 术语更新
 
@@ -289,4 +272,4 @@ extensions/
 |:---|:---|:---|
 | Source (fs) | View (fs) | 单 NFS 视图 |
 | Source (oss) | View (oss) | 对象存储视图 |
-| — | View (multi-fs) | 多 NFS 聚合视图 |
+| — | View (forest-fs) | 多 NFS 聚合视图 |
