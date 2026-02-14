@@ -216,8 +216,13 @@ pipes:
 - **Event Routing**: `process_event(event)` 读取 `event.metadata["pipe_id"]`，将事件路由给对应的内部 `FSViewDriver`。
 - **Dynamic Tree**: 遇到未知的 `pipe_id` 自动创建新子树。
 - **Query Aggregation**: 所有查询方法（stats, tree）遍历所有内部子树并聚合结果。
-- **并发查询**: 使用 `asyncio.gather()` 并发查询所有成员
-- **容错**: 单个成员查询失败不影响其他成员的结果
+### 5.2 Session Lifecycle & Leader Election
+
+Forest View 实际上是一个 View 容器，因此 Session 管理权必须下放：
+
+- **Delegation**: `FusionPipe` -> `PipeSessionBridge` -> `ViewHandler.on_session_created()` -> `ViewDriver.on_session_created()`
+- **Scoped Election**: `ForestFSViewDriver` 实现 `on_session_created`，根据传入的 `pipe_id` 构建 scoped election key (`{view_id}:{pipe_id}`)，确保每棵子树有独立的 Leader。
+- **Cleanup**: `PipeSessionBridge` 负责根据 cache 清理所有相关的 election keys，无需感知具体策略。
 
 ### 5.2 `get_subtree_stats(path)` 方法
 

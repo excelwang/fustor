@@ -12,3 +12,5 @@
 - [ ] Design Fusion Management API (Config + State).
 - [ ] Implement `RemoteConfigProvider` in Agent (polling Fusion).
 - [ ] Implement `SelfUpdater` in Agent (upgrade strategy).
+- [ ] **Architecture**: Generalize `on_session_created` pattern to Sender side for full negotiation decoupling.
+- [ ] **Testing**: Add integration tests covering dynamic `source_uri` changes in ForestView.

@@ -189,19 +189,8 @@ class PipeSessionBridge:
         view_id = str(self._pipe.view_id)
         pipe_id = getattr(self._pipe, 'pipe_id', None)
         
-        election_view_id = view_id
-        if pipe_id:
-            should_scope = False
-            handler = self._pipe.get_view_handler(view_id)
-            if handler:
-                driver = getattr(handler, 'driver', None)
-                if not driver and hasattr(handler, 'manager'):
-                    driver = getattr(handler.manager, 'driver', None)
-                if driver:
-                    should_scope = getattr(driver, 'use_scoped_session_leader', False)
-            
-            if should_scope:
-                election_view_id = f"{view_id}:{pipe_id}"
+        # No legacy flag check needed here. 
+        # Election status is maintained via _leader_cache and verified/retried below.
         
         commands = []
         
@@ -228,37 +217,30 @@ class PipeSessionBridge:
         )
         
         # 3. Try to become leader (Follower promotion) if not known leader
-        # 3. Try to become leader if not known leader (Follower promotion)
         # We delegate this to on_session_created again (idempotent "try become leader" check)
-        # Optimization: only check periodically or if we think we might be able to promote
         
-        # Check based on pipe_id (Forest) or view_id (Standard) - logic is inside handler now!
-        # But bridge needs to know WHICH key to check cache against.
-        # We can ask the handler for the current election key? Or just rely on return value.
-        
-        # Simplification: Invoke on_session_created periodically to retry election
+        # Periodic validation/retry: every N heartbeats
         count = self._heartbeat_count.get(session_id, 0) + 1
         self._heartbeat_count[session_id] = count
         
-        # Retrieve handler again
-        view_handler = self._pipe.get_view_handler(view_id)
-        
-        if view_handler and count % self._LEADER_VERIFY_INTERVAL == 0:
-             # Retry election / verify status
-             try:
-                 res = await view_handler.on_session_created(session_id, getattr(self._pipe, 'pipe_id', None))
-                 is_leader = (res.get("role") == "leader")
-                 election_key = res.get("election_key", view_id)
-                 
-                 if is_leader:
-                     self._leader_cache.setdefault(election_key, set()).add(session_id)
-                 else:
-                     # Demoted or failed to promote
-                     if election_key in self._leader_cache:
-                         self._leader_cache[election_key].discard(session_id)
-                         
-             except Exception as e:
-                 logger.debug(f"Leader promotion check failed: {e}")
+        if count % self._LEADER_VERIFY_INTERVAL == 0:
+            view_handler = self._pipe.get_view_handler(view_id)
+            if view_handler:
+                 try:
+                     # Re-run election logic via handler
+                     res = await view_handler.on_session_created(session_id, getattr(self._pipe, 'pipe_id', None))
+                     is_leader = (res.get("role") == "leader")
+                     election_key = res.get("election_key", view_id)
+                     
+                     if is_leader:
+                         self._leader_cache.setdefault(election_key, set()).add(session_id)
+                     else:
+                         # Demoted or failed to promote - ensure we don't have stale cache
+                         if election_key in self._leader_cache:
+                             self._leader_cache[election_key].discard(session_id)
+                             
+                 except Exception as e:
+                     logger.debug(f"Leader promotion check failed during keep_alive: {e}")
     
         # 3. Get final status from pipe
         role = await self._pipe.get_session_role(session_id)
@@ -295,6 +277,12 @@ class PipeSessionBridge:
             if session_id in sessions:
                 keys_to_clean.append(key)
                 
+        # Remove from legacy SessionManager
+        await self._session_manager.terminate_session(
+            view_id=view_id,
+            session_id=session_id
+        )
+
         for key in keys_to_clean:
             await view_state_manager.unlock_for_session(key, session_id)
             await view_state_manager.release_leader(key, session_id)
