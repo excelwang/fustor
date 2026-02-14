@@ -3,6 +3,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock, patch
 from fustor_fusion_mgmt.on_command import on_command_fallback
 from fustor_fusion.runtime.session_bridge import PipeSessionBridge
+from fustor_fusion import runtime_objects
 from fastapi import HTTPException
 
 @pytest.mark.asyncio
@@ -22,12 +23,14 @@ async def test_on_command_fallback_logic():
         "agent_id": "agent-1"
     }
     
-    # Mock pipe manager
-    with patch("fustor_fusion.runtime_objects.pipe_manager") as mock_pm:
-        mock_pm.resolve_pipes_for_view.return_value = ["pipe-1"]
-        mock_pm.get_pipe.side_effect = lambda pid: mock_pipe if pid == "pipe-1" else None
-        mock_pm.get_bridge.side_effect = lambda pid: mock_bridge if pid == "pipe-1" else None
-        
+    # Explicitly create a MagicMock for PipeManager
+    mock_pm = MagicMock()
+    mock_pm.resolve_pipes_for_view.return_value = ["pipe-1"]
+    mock_pm.get_pipe.return_value = mock_pipe
+    mock_pm.get_bridge.return_value = mock_bridge
+    
+    # Use patch.object on the module to be absolutely sure
+    with patch.object(runtime_objects, "pipe_manager", mock_pm):
         # Execute
         result = await on_command_fallback(view_id, {"path": "/foo"})
         
@@ -45,11 +48,11 @@ async def test_on_command_fallback_no_session():
     """Test error when no session available."""
     view_id = "view-1"
     
-    # Mock pipe manager
-    with patch("fustor_fusion.runtime_objects.pipe_manager") as mock_pm:
-        mock_pm.resolve_pipes_for_view.return_value = ["pipe-1"]
-        mock_pm.get_pipe.return_value = MagicMock(leader_session=None)
-        mock_pm.get_bridge.return_value = AsyncMock(get_all_sessions=AsyncMock(return_value={}))
-        
+    mock_pm = MagicMock()
+    mock_pm.resolve_pipes_for_view.return_value = ["pipe-1"]
+    mock_pm.get_pipe.return_value = MagicMock(leader_session=None)
+    mock_pm.get_bridge.return_value = AsyncMock(get_all_sessions=AsyncMock(return_value={}))
+    
+    with patch.object(runtime_objects, "pipe_manager", mock_pm):
         with pytest.raises(HTTPException, match="Fallback command failed"):
             await on_command_fallback(view_id, {})

@@ -1,4 +1,4 @@
-# fusion/src/fustor_fusion/api/on_command.py
+# fusion-mgmt/src/fustor_fusion_mgmt/on_command.py
 """
 On-Command Find Fallback Mechanism.
 
@@ -7,12 +7,14 @@ when the memory view is incomplete or unavailable.
 """
 import logging
 import time
+import asyncio
 from typing import Any, Dict, List, Optional
+from fastapi import HTTPException
 
 from fustor_fusion.core.session_manager import session_manager
 from fustor_fusion import runtime_objects
 
-logger = logging.getLogger("fustor_fusion.api.on_command")
+logger = logging.getLogger("fustor_fusion_mgmt.on_command")
 
 async def on_command_fallback(view_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -115,7 +117,3 @@ async def on_command_fallback(view_id: str, params: Dict[str, Any]) -> Dict[str,
             status_code=502,
             detail=f"Fallback command failed on view {view_id}: {str(e)}"
         )
-
-
-from fastapi import HTTPException
-import asyncio
