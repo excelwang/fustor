@@ -60,6 +60,9 @@ class App:
         
         self.pipe_runtime: Dict[str, Any] = {}
         
+        # Track config signature for reload detection
+        self.config_signature = agent_config.get_config_signature()
+        
         self.logger.info(f"Target pipes: {self._target_pipe_ids}")
     
     def _resolve_target_pipes(self, config_list: Optional[List[str]]) -> List[str]:

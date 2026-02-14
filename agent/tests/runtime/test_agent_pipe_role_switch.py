@@ -23,7 +23,7 @@ class TestAgentRoleSwitch:
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
 
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config,
+            "test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
         
@@ -79,7 +79,7 @@ class TestAgentRoleSwitch:
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
 
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config,
+            "test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
         

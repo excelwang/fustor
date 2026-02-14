@@ -141,6 +141,7 @@ class TestSenderHandlerAdapterSession:
     async def test_create_session(self, adapter, mock_sender):
         """create_session should delegate to sender."""
         session_id, metadata = await adapter.create_session(
+            task_id="test-task",
             source_type="fs",
             session_timeout_seconds=60
         )
