@@ -41,12 +41,12 @@ async def test_handle_command_scan():
 async def test_handle_command_stop_pipe():
     pipe = MockPipe()
     
-    # Wrong pipe_id -> Ignore
-    await pipe._handle_commands([{"type": "stop_pipe", "pipe_id": "other"}])
+    # Wrong agent_pipe_id -> Ignore
+    await pipe._handle_commands([{"type": "stop_pipe", "agent_pipe_id": "other"}])
     pipe.stop.assert_not_called()
     
-    # Correct pipe_id -> Stop
-    await pipe._handle_commands([{"type": "stop_pipe", "pipe_id": "test-pipe"}])
+    # Correct agent_pipe_id -> Stop
+    await pipe._handle_commands([{"type": "stop_pipe", "agent_pipe_id": "test-pipe"}])
     await asyncio.sleep(0.1) # Background task
     pipe.stop.assert_called_once()
 

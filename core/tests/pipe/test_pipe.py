@@ -1,7 +1,7 @@
 import pytest
-from fustor_core.pipe.pipe import Pipe, PipeState
+from fustor_core.pipe.pipe import FustorPipe, PipeState
 
-class ConcretePipe(Pipe):
+class ConcretePipe(FustorPipe):
     async def start(self):
         self._set_state(PipeState.RUNNING)
     async def stop(self):
@@ -17,7 +17,7 @@ async def test_pipe_basics():
     assert p.id == "p1"
     assert p.session_timeout_seconds == 10
     assert p.state == PipeState.STOPPED
-    assert str(p) == "Pipe(p1, state=STOPPED)"
+    assert str(p) == "FustorPipe(p1, state=STOPPED)"
     
     await p.start()
     assert p.state == PipeState.RUNNING

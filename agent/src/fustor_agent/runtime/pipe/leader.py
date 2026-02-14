@@ -187,8 +187,8 @@ class PipeLeaderMixin:
         try:
             # Wait briefly for tasks to acknowledge cancellation
             await asyncio.wait(tasks_to_cancel, timeout=0.1)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"Pipe {self.id}: Ignore error while cancelling leader tasks: {e}")
             
         # Clear handles
         self._snapshot_task = None

@@ -45,7 +45,7 @@ async def pipe_with_bridge():
         config={"view_id": "bv1", "allow_concurrent_push": True},
         view_handlers=[handler]
     )
-    pipe.pipe_id = pipe.id # Inject required attribute
+    # pipe.pipe_id = pipe.id # Inject required attribute - REMOVED: V2 uses .id correctly
     await pipe.start()
     bridge = create_session_bridge(pipe)
     yield pipe, bridge

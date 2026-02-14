@@ -36,7 +36,7 @@ async def get_view_id_from_api_key(x_api_key: Optional[str] = Header(None, alias
         for r_id, r_config in receivers.items():
             for api_key_config in r_config.api_keys:
                 if api_key_config.key == x_api_key:
-                    # Found matching agent key
+                    # In Receiver/API Key config, pipe_id acts as the scoping identifier (mapped to view_id)
                     view_id = api_key_config.pipe_id
                     logger.debug(f"Authorized via receiver key for: {view_id}")
                     return str(view_id)

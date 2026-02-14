@@ -325,8 +325,8 @@ class SessionManager:
                 for driver_instance in manager.driver_instances.values():
                     if getattr(driver_instance, "requires_full_reset_on_session_close", False):
                         return True
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Failed to check if view {view_id} is live: {e}")
         return False
 
     async def start_periodic_cleanup(self, interval_seconds: int = 1):

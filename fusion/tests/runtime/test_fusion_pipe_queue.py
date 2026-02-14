@@ -42,7 +42,7 @@ async def test_fusion_pipe_queue_behavior():
         config={"view_id": "test-view"},
         view_handlers=[mock_handler]
     )
-    pipe.pipe_id = pipe.id # Inject required attribute
+    # pipe.pipe_id = pipe.id # REMOVED
     
     await pipe.start()
     
@@ -93,7 +93,7 @@ async def test_fusion_pipe_queue_observability():
         config={"view_id": "test-view-slow"},
         view_handlers=[mock_handler]
     )
-    pipe.pipe_id = pipe.id # Inject required attribute
+    # pipe.pipe_id = pipe.id # REMOVED
     
     await pipe.start()
     

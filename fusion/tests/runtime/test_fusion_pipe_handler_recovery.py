@@ -51,7 +51,7 @@ class TestHandlerDegradation:
             config={"view_id": "1", "allow_concurrent_push": True},
             view_handlers=[handler]
         )
-        pipe.pipe_id = pipe.id
+        # pipe.pipe_id = pipe.id # REMOVED
         await pipe.start()
 
         # 发送足够多的事件触发 MAX_HANDLER_ERRORS
@@ -85,7 +85,7 @@ class TestHandlerDegradation:
             },
             view_handlers=[handler]
         )
-        pipe.pipe_id = pipe.id
+        # pipe.pipe_id = pipe.id # REMOVED
         pipe.MAX_HANDLER_ERRORS = 3  # 降低阈值方便测试
         await pipe.start()
 

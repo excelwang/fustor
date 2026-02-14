@@ -15,7 +15,7 @@ from fustor_agent_sdk.interfaces import PipeInstanceServiceInterface # Import th
 @dataclass
 class StartResult:
     """Result of a pipe start operation for fault isolation."""
-    pipe_id: str
+    agent_pipe_id: str
     success: bool
     error: Optional[str] = None
     skipped: bool = False

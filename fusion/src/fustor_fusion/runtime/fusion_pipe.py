@@ -27,7 +27,7 @@ import logging
 import time
 from typing import Any, Dict, List, Optional, TYPE_CHECKING
 
-from fustor_core.pipe import Pipe, PipeState
+from fustor_core.pipe import FustorPipe, PipeState
 from fustor_core.pipe.handler import ViewHandler
 from fustor_core.event import EventBase
 from fustor_core.common.metrics import get_metrics
@@ -41,7 +41,7 @@ from ..core.session_manager import session_manager
 logger = logging.getLogger("fustor_fusion.pipe")
 
 
-class FusionPipe(Pipe):
+class FusionPipe(FustorPipe):
     """
     Fusion-side Pipe for receiving and processing events.
     
@@ -80,7 +80,7 @@ class FusionPipe(Pipe):
         Initialize the FusionPipe.
         
         Args:
-            pipe_id: Unique identifier (typically view_id)
+            pipe_id: Unique identifier for this connection pipeline (mapped to self.id)
             config: Configuration dict containing:
                 - view_id: str
             view_handlers: List of ViewHandler instances to dispatch events to
@@ -88,7 +88,7 @@ class FusionPipe(Pipe):
         """
         super().__init__(pipe_id, config, context)
         
-        # Terminology: view_id is the primary identifier
+        # view_id represents the logical storage container/group this pipe belongs to
         self.view_id = str(config.get("view_id", pipe_id))
 
         
@@ -290,7 +290,12 @@ class FusionPipe(Pipe):
                 if hasattr(handler, 'process_event'):
                     # Apply timeout protection
                     try:
-                        # event.metadata.setdefault("pipe_id", self.pipe_id) # DECOUPLED: pipe_id is already in metadata from agent or not needed
+                        # Inject pipe_id for ForestView routing if not already present.
+                        # Base class 'Pipe' defines 'self.id' as the unique pipeline identifier.
+                        if event.metadata is None:
+                            event.metadata = {}
+                        event.metadata.setdefault("pipe_id", self.id)
+                        
                         success = await asyncio.wait_for(
                             handler.process_event(event),
                             timeout=self.HANDLER_TIMEOUT
@@ -371,7 +376,14 @@ class FusionPipe(Pipe):
         # Notify view handlers of session start
         for handler in self._view_handlers.values():
             if hasattr(handler, 'on_session_start'):
-                await handler.on_session_start(session_id=session_id, pipe_id=self.pipe_id)
+                # Pass all available metadata to handlers. 
+                # Scoped drivers (like ForestView) retrieve pipe_id from internal session map.
+                await handler.on_session_start(
+                    session_id=session_id,
+                    task_id=task_id,
+                    is_leader=is_leader,
+                    **kwargs
+                )
         
         if is_leader:
             self._cached_leader_session = session_id
@@ -413,7 +425,7 @@ class FusionPipe(Pipe):
         # Notify view handlers of session close
         for handler in self._view_handlers.values():
             if hasattr(handler, 'on_session_close'):
-                await handler.on_session_close(session_id=session_id, pipe_id=self.pipe_id)
+                await handler.on_session_close(session_id=session_id)
         
         logger.info(f"Session {session_id} closed for view {self.view_id}")
     

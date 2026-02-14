@@ -66,11 +66,12 @@ def get_env_hash():
 
 
 @pytest.fixture(scope="session")
-def docker_env():
+def docker_env(request):
     """
     Session-scoped fixture that manages the Docker Compose environment.
     Initializes Fusion with static configuration.
     """
+    fast_mode = request.config.getoption("--fast")
     state_file = _it_dir / ".env_state"
     current_hash = get_env_hash()
     
@@ -86,6 +87,10 @@ def docker_env():
         is_up = False
         
     needs_rebuild = not is_up or (stored_hash != current_hash)
+    
+    if fast_mode and is_up:
+        logger.info("⚡ Fast mode: Skipping hash check and forced rebuild. Assuming environment is good.")
+        needs_rebuild = False
     
     if needs_rebuild:
         logger.info(f"Environment needs rebuild (Hash mismatch or not up). Hash: {current_hash}")
@@ -119,7 +124,7 @@ def docker_env():
         for container in [CONTAINER_FUSION, CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]:
             docker_manager.restart_container(container)
             docker_manager.wait_for_health(container)
-    else:
+    elif not fast_mode:
         # If we are reusing, we still might want to restart Fusion once per session 
         # to ensure it picked up the (potentially) updated static configs.
         logger.info("Restarting Fusion to apply static configs...")

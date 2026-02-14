@@ -42,7 +42,7 @@ def fusion_pipe_with_handler():
         config={"view_id": "1", "allow_concurrent_push": True},
         view_handlers=[handler]
     )
-    pipe.pipe_id = pipe.id # Inject required attribute
+    # pipe.pipe_id = pipe.id # Inject required attribute - REMOVED: V2 uses .id correctly
     return pipe, handler
 
 

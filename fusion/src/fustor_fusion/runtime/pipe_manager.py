@@ -4,16 +4,18 @@ import logging
 import time
 import os
 from typing import Dict, List, Optional, Any, Tuple
+from fastapi import APIRouter
 
 from fustor_core.transport.receiver import Receiver, ReceiverRegistry
 from fustor_receiver_http import SessionInfo # Kept for registration of 'http' driver and type info
 from .fusion_pipe import FusionPipe
-from ..config.unified import fusion_config, FusionPipeConfig
+from ..config.unified import fusion_config
 from ..view_manager.manager import get_cached_view_manager
+from ..api.consistency import consistency_router
 
 logger = logging.getLogger(__name__)
 
-class PipeManager:
+class FusionPipeManager:
     """
     Manages the lifecycle of FusionPipes and their associated Receivers.
     
@@ -35,9 +37,17 @@ class PipeManager:
     
     async def initialize_pipes(self, config_list: Optional[List[str]] = None):
         """
-        Initialize pipes and receivers based on configuration.
+        Public API: Initialize pipes and receivers based on configuration.
+        Acquires _init_lock before proceeding.
         """
-        logger.info(f"PipeManager.initialize_pipes called with config_list={config_list}")
+        async with self._init_lock:
+            return await self._initialize_pipes_internal(config_list)
+
+    async def _initialize_pipes_internal(self, config_list: Optional[List[str]] = None):
+        """
+        Internal initialization logic (no locking).
+        """
+        logger.info(f"FusionPipeManager._initialize_pipes_internal called with config_list={config_list}")
         
         # 1. Load configs
         fusion_config.reload()
@@ -46,114 +56,109 @@ class PipeManager:
         self._target_pipe_ids = self._resolve_target_pipes(config_list)
         
         initialized_count = 0
-        async with self._init_lock:
-            for p_id in self._target_pipe_ids:
-                try:
-                    resolved = fusion_config.resolve_pipe_refs(p_id)
-                    if not resolved:
-                        logger.error(f"Could not resolve configuration for pipe '{p_id}'")
-                        continue
+        # No lock here, expected to be called with _init_lock held
+        for p_id in self._target_pipe_ids:
+            try:
+                resolved = fusion_config.resolve_pipe_refs(p_id)
+                if not resolved:
+                    logger.error(f"Could not resolve configuration for pipe '{p_id}'")
+                    continue
 
-                    p_cfg = resolved['pipe']
-                    r_cfg = resolved['receiver']
+                p_cfg = resolved['pipe']
+                r_cfg = resolved['receiver']
+                
+                if r_cfg.disabled:
+                    logger.warning(f"FusionPipe '{p_id}' skipped because receiver '{p_cfg.receiver}' is disabled")
+                    continue
+
+                # 1. Initialize/Get Receiver (Shared by driver + port)
+                r_sig = (r_cfg.driver, r_cfg.port)
+                
+                if r_sig not in self._receivers:
+                    r_id = f"recv_{r_cfg.driver}_{r_cfg.port}"
                     
-                    if r_cfg.disabled:
-                        logger.warning(f"Pipe '{p_id}' skipped because receiver '{p_cfg.receiver}' is disabled")
-                        continue
-
-                    # 1. Initialize/Get Receiver (Shared by driver + port)
-                    r_sig = (r_cfg.driver, r_cfg.port)
-                    
-                    if r_sig not in self._receivers:
-                        r_id = f"recv_{r_cfg.driver}_{r_cfg.port}"
-                        
-                        # Use Registry to create the concrete receiver instance (driver-agnostic)
-                        receiver = ReceiverRegistry.create(
-                            r_cfg.driver,
-                            receiver_id=r_id,
-                            bind_host=r_cfg.bind_host,
-                            port=r_cfg.port,
-                            config={
-                                "session_timeout_seconds": p_cfg.session_timeout_seconds,
-                            }
-                        )
-                        
-                        receiver.register_callbacks(
-                            on_session_created=self._on_session_created,
-                            on_event_received=self._on_event_received,
-                            on_heartbeat=self._on_heartbeat,
-                            on_session_closed=self._on_session_closed,
-                            on_scan_complete=self._on_scan_complete
-                        )
-                        self._receivers[r_sig] = receiver
-                        logger.info(f"Initialized shared {r_cfg.driver.upper()} Receiver on port {r_cfg.port}")
-                    
-                    receiver = self._receivers[r_sig]
-                    
-                    # 2. Register API keys for this specific pipe on the shared receiver
-                    for ak in r_cfg.api_keys:
-                        # Only register keys relevant to this pipe
-                        if ak.pipe_id == p_id:
-                            receiver.register_api_key(ak.key, ak.pipe_id)
-
-                    # 2. Initialize Views
-                    view_handlers = []
-                    # resolved['views'] is a dict {view_id: ViewConfig}
-                    for v_id, v_cfg in resolved['views'].items():
-                        if v_cfg.disabled:
-                            logger.warning(f"View '{v_id}' for pipe '{p_id}' is disabled, skipping")
-                            continue
-                        try:
-                            # The view manager handles the actual FS/View logic based on group_id (view_id)
-                            # We might need to pass v_cfg details to view manager if it's dynamic
-                            # For now, assuming view manager loads its own config or we use existing pattern
-                            vm = await get_cached_view_manager(v_id)
-                            from .view_handler_adapter import create_view_handler_from_manager
-                            handler = create_view_handler_from_manager(vm)
-                            view_handlers.append(handler)
-                        except Exception as e:
-                            logger.error(f"Failed to load view group {v_id} for pipe {p_id}: {e}")
-
-                    if not view_handlers:
-                        logger.warning(f"Pipe {p_id} has no valid views, skipping")
-                        continue
-
-                    # 3. Create Pipe
-                    # Determine primary view ID for session leadership
-                    primary_view_id = p_id 
-                    if p_cfg.views:
-                         primary_view_id = p_cfg.views[0]
-
-                    pipe = FusionPipe(
-                        pipe_id=p_id,
+                    # Use Registry to create the concrete receiver instance (driver-agnostic)
+                    receiver = ReceiverRegistry.create(
+                        r_cfg.driver,
+                        receiver_id=r_id,
+                        bind_host=r_cfg.bind_host,
+                        port=r_cfg.port,
                         config={
-                            "view_id": primary_view_id,
-                            "allow_concurrent_push": p_cfg.allow_concurrent_push,
-                            "session_timeout_seconds": p_cfg.session_timeout_seconds
-                        },
-                        view_handlers=view_handlers
+                            "session_timeout_seconds": p_cfg.session_timeout_seconds,
+                        }
                     )
                     
-                    self._pipes[p_id] = pipe
-                    from .session_bridge import create_session_bridge
-                    self._bridges[p_id] = create_session_bridge(pipe)
+                    receiver.register_callbacks(
+                        on_session_created=self._on_session_created,
+                        on_event_received=self._on_event_received,
+                        on_heartbeat=self._on_heartbeat,
+                        on_session_closed=self._on_session_closed,
+                        on_scan_complete=self._on_scan_complete
+                    )
                     
-                    logger.info(f"Initialized Fusion Pipe: {p_id} with {len(view_handlers)} views")
-                    initialized_count += 1
+                    # Fix: Mount consistency router here immediately upon receiver creation
+                    consistency_api = APIRouter(prefix="/api/v1/pipe")
+                    consistency_api.include_router(consistency_router)
+                    receiver.mount_router(consistency_api)
                     
-                except Exception as e:
-                    logger.error(f"Failed to initialize pipe {p_id}: {e}", exc_info=True)
-            
-            # Mount consistency router onto each receiver
-            # so Agent can reach sentinel/audit endpoints via the same port
-            from ..api.consistency import consistency_router
-            from fastapi import APIRouter
-            for r_sig, receiver in self._receivers.items():
-                consistency_api = APIRouter(prefix="/api/v1/pipe")
-                consistency_api.include_router(consistency_router)
-                # Use generic mount_router interface
-                receiver.mount_router(consistency_api)
-                logger.info(f"Mounted consistency router on receiver {receiver.id}")
+                    self._receivers[r_sig] = receiver
+                    logger.info(f"Initialized shared {r_cfg.driver.upper()} Receiver on port {r_cfg.port} with consistency routes")
+                
+                receiver = self._receivers[r_sig]
+                
+                # 2. Register API keys for this specific pipe on the shared receiver
+                for ak in r_cfg.api_keys:
+                    # Only register keys relevant to this pipe
+                    if ak.pipe_id == p_id:
+                        receiver.register_api_key(ak.key, ak.pipe_id)
+
+                # 2. Initialize Views
+                view_handlers = []
+                # resolved['views'] is a dict {view_id: ViewConfig}
+                for v_id, v_cfg in resolved['views'].items():
+                    if v_cfg.disabled:
+                        logger.warning(f"View '{v_id}' for pipe '{p_id}' is disabled, skipping")
+                        continue
+                    try:
+                        # The view manager handles the actual FS/View logic based on group_id (view_id)
+                        # We might need to pass v_cfg details to view manager if it's dynamic
+                        # For now, assuming view manager loads its own config or we use existing pattern
+                        vm = await get_cached_view_manager(v_id)
+                        from .view_handler_adapter import create_view_handler_from_manager
+                        handler = create_view_handler_from_manager(vm)
+                        view_handlers.append(handler)
+                    except Exception as e:
+                        logger.error(f"Failed to load view group {v_id} for pipe {p_id}: {e}")
+
+                if not view_handlers:
+                    logger.warning(f"FusionPipe {p_id} has no valid views, skipping")
+                    continue
+
+                # 3. Create FusionPipe
+                # Determine primary view ID for session leadership
+                primary_view_id = p_id 
+                if p_cfg.views:
+                     primary_view_id = p_cfg.views[0]
+
+                fusion_pipe = FusionPipe(
+                    pipe_id=p_id,
+                    config={
+                        "view_id": primary_view_id,
+                        "allow_concurrent_push": p_cfg.allow_concurrent_push,
+                        "session_timeout_seconds": p_cfg.session_timeout_seconds
+                    },
+                    view_handlers=view_handlers
+                )
+                
+                self._pipes[p_id] = fusion_pipe
+                from .session_bridge import create_session_bridge
+                self._bridges[p_id] = create_session_bridge(fusion_pipe)
+                
+                logger.info(f"Initialized FusionPipe: {p_id} with {len(view_handlers)} views")
+                initialized_count += 1
+                
+            except Exception as e:
+                logger.error(f"Failed to initialize pipe {p_id}: {e}", exc_info=True)
             
         return {"initialized": initialized_count}
 
@@ -171,13 +176,13 @@ class PipeManager:
                 if fusion_config.get_pipe(item):
                     targets.append(item)
                 else:
-                    logger.error(f"Pipe ID '{item}' not found in any loaded config")
+                    logger.error(f"FusionPipe ID '{item}' not found in any loaded config")
         return targets
 
     async def start(self):
         async with self._init_lock:
-            for p_id, pipe in self._pipes.items():
-                await pipe.start()
+            for p_id, fusion_pipe in self._pipes.items():
+                await fusion_pipe.start()
             for r_sig, receiver in self._receivers.items():
                 await receiver.start()
             logger.info("Fusion components started")
@@ -186,8 +191,8 @@ class PipeManager:
         async with self._init_lock:
             for r_sig, receiver in self._receivers.items():
                 await receiver.stop()
-            for p_id, pipe in self._pipes.items():
-                await pipe.stop()
+            for p_id, fusion_pipe in self._pipes.items():
+                await fusion_pipe.stop()
             logger.info("Fusion components stopped")
 
     async def reload(self):
@@ -207,7 +212,6 @@ class PipeManager:
             # to be safe, or compare their resolved config dicts.
             modified = set()
             for p_id in current_pipe_ids:
-                old_pipe = self._pipes[p_id]
                 new_resolved = fusion_config.resolve_pipe_refs(p_id)
                 if not new_resolved:
                     continue # Will be handled by removed
@@ -216,7 +220,6 @@ class PipeManager:
                 # Note: This is an optimization. In a real system we'd compare the whole config.
                 p_cfg = new_resolved['pipe']
                 r_cfg = new_resolved['receiver']
-                v_ids = sorted(list(new_resolved['views'].keys()))
                 
                 # Check if p_cfg or r_cfg or views changed
                 # For simplicity, we can just restart any pipe that is still in config
@@ -236,16 +239,16 @@ class PipeManager:
             
             # 1. Stop removed AND modified pipes
             for p_id in (removed | modified):
-                pipe = self._pipes.pop(p_id, None)
-                if pipe:
-                    await pipe.stop()
+                fusion_pipe = self._pipes.pop(p_id, None)
+                if fusion_pipe:
+                    await fusion_pipe.stop()
                     self._bridges.pop(p_id, None)
-                    logger.info(f"Pipe '{p_id}' stopped for reload/update")
+                    logger.info(f"FusionPipe '{p_id}' stopped for reload/update")
             
             # 2. Re-initialize and start added AND modified pipes
             to_start = added | modified
             if to_start:
-                await self.initialize_pipes(list(to_start))
+                await self._initialize_pipes_internal(list(to_start))
                 for p_id in to_start:
                     if p_id in self._pipes:
                         await self._pipes[p_id].start()
@@ -295,20 +298,20 @@ class PipeManager:
         
         # 2. Check if it's an internal ID (e.g. recv_http_8102)
         for r in self._receivers.values():
-            if r.receiver_id == receiver_id:
+            if r.id == receiver_id:
                 return r
         
         return None
 
     # --- Receiver Callbacks (UNCHANGED) ---
-    async def _on_session_created(self, session_id, task_id, pipe_id, client_info, session_timeout_seconds):
+    async def _on_session_created(self, session_id, task_id, p_id, client_info, session_timeout_seconds):
         # Lock-free lookup (pipes dict is stable after init)
-        pipe = self._pipes.get(pipe_id)
-        if not pipe: raise ValueError(f"Pipe {pipe_id} not found")
-        bridge = self._bridges.get(pipe_id)
+        fusion_pipe = self._pipes.get(p_id)
+        if not fusion_pipe: raise ValueError(f"FusionPipe {p_id} not found")
+        bridge = self._bridges.get(p_id)
         
         # Per-pipe lock for session creation
-        async with self._get_pipe_lock(pipe_id):
+        async with self._get_pipe_lock(p_id):
             source_uri = client_info.get("source_uri") if client_info else None
             result = await bridge.create_session(
                 task_id=task_id, 
@@ -317,31 +320,31 @@ class PipeManager:
                 session_timeout_seconds=session_timeout_seconds,
                 source_uri=source_uri
             )
-            self._session_to_pipe[session_id] = pipe_id
+            self._session_to_pipe[session_id] = p_id
             
             # Fetch sync policy from config
-            p_cfg = fusion_config.get_pipe(pipe_id)
+            p_cfg = fusion_config.get_pipe(p_id)
             audit_interval = p_cfg.audit_interval_sec if p_cfg else None
             sentinel_interval = p_cfg.sentinel_interval_sec if p_cfg else None
             
-            info = SessionInfo(session_id, task_id, pipe_id, result["role"], time.time(), time.time())
+            info = SessionInfo(session_id, task_id, p_id, result["role"], time.time(), time.time())
             info.source_uri = source_uri
             info.audit_interval_sec = audit_interval
             info.sentinel_interval_sec = sentinel_interval
             return info
 
     async def _on_event_received(self, session_id, events, source_type, is_end, metadata=None):
-        pipe_id = self._session_to_pipe.get(session_id)
-        if pipe_id:
-            pipe = self._pipes.get(pipe_id)
-            if pipe:
+        p_id = self._session_to_pipe.get(session_id)
+        if p_id:
+            fusion_pipe = self._pipes.get(p_id)
+            if fusion_pipe:
                 # metadata is passed as part of kwargs
-                res = await pipe.process_events(events, session_id, source_type, is_end=is_end, metadata=metadata)
+                res = await fusion_pipe.process_events(events, session_id, source_type, is_end=is_end, metadata=metadata)
                 return res.get("success", False)
         # Session not found or pipe gone
         raise ValueError(f"Session {session_id} not found or expired")
 
-    async def _on_heartbeat(self, session_id, can_realtime=False, agent_status=None):
+    async def _on_heartbeat(self, session_id, can_realtime=bool, agent_status=None):
         pipe_id = self._session_to_pipe.get(session_id)
         if pipe_id:
             bridge = self._bridges.get(pipe_id)
@@ -360,11 +363,16 @@ class PipeManager:
         from ..core.session_manager import session_manager
         pipe_id = self._session_to_pipe.get(session_id)
         if pipe_id:
-            pipe = self._pipes.get(pipe_id)
-            if pipe:
-                view_id = pipe.view_id
+            fusion_pipe = self._pipes.get(pipe_id)
+            if fusion_pipe:
+                view_id = fusion_pipe.view_id
                 await session_manager.complete_agent_job(view_id, session_id, scan_path, job_id)
                 logger.debug(f"Scan complete (job_id={job_id}) for path {scan_path} on session {session_id}")
 
+# Alias for compatibility
+PipeManager = FusionPipeManager
+
 # Global singleton
-pipe_manager = PipeManager()
+pipe_manager = FusionPipeManager()
+fusion_pipe_manager = pipe_manager
+

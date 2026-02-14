@@ -36,18 +36,18 @@ class PipeState(IntFlag):
     STOPPING = auto()        # Gracefully stopping
 
 
-class Pipe(ABC):
+class FustorPipe(ABC):
     """
-    Abstract base class for all Pipes.
+    Abstract base class for all Fustor Pipes (Agent or Fusion).
     
-    A Pipe orchestrates:
+    A FustorPipe orchestrates:
     - Session lifecycle management
     - Handler invocation (Source/Sender or Receiver/View)
     - Heartbeat and timeout handling
     - Error recovery
     
-    Agent Pipe: Source -> Sender
-    Fusion Pipe: Receiver -> View(s)
+    Agent FustorPipe: Source -> Sender
+    Fusion FustorPipe: Receiver -> View(s)
     """
     
     def __init__(
@@ -60,7 +60,7 @@ class Pipe(ABC):
         Initialize the pipe.
         
         Args:
-            pipe_id: Unique identifier for this pipe
+            pipe_id: Unique identifier for this pipe (accessible as self.id)
             config: Pipe configuration dictionary
             context: Optional shared context for cross-pipe coordination
         """
@@ -76,7 +76,7 @@ class Pipe(ABC):
         self.session_timeout_seconds: int = config.get("session_timeout_seconds", 30)
         
     def __str__(self) -> str:
-        return f"Pipe({self.id}, state={self.state.name})"
+        return f"FustorPipe({self.id}, state={self.state.name})"
     
     def _set_state(self, new_state: PipeState, info: Optional[str] = None):
         """Update pipestate with optional info message."""
@@ -116,7 +116,7 @@ class Pipe(ABC):
         raise NotImplementedError
     
     async def restart(self) -> None:
-        """Restart the pipe (stop then start)."""
+        """Restart the pipe (stop then start).."""
         await self.stop()
         await self.start()
     
@@ -153,7 +153,7 @@ class Pipe(ABC):
     def has_active_session(self) -> bool:
         """Check if pipe has an active session with the remote peer."""
         return self.session_id is not None
-
+    
     def is_outdated(self) -> bool:
         """Check if pipe configuration is outdated."""
         return bool(self.state & PipeState.CONF_OUTDATED)

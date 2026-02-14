@@ -85,8 +85,8 @@ async def fusion_pipe(mock_view_handler, pipe_config):
         config=pipe_config,
         view_handlers=[mock_view_handler]
     )
-    # Manual injection to adapt to business logic bug
-    p.pipe_id = p.id
+    # Manual injection to adapt to business logic bug - REMOVED: V2 uses .id correctly
+    # p.pipe_id = p.id
     return p
 
 

@@ -41,7 +41,7 @@ Leader 的选举完全由 Fusion 端控制，采用非抢占式的锁机制。
 | 标志类型 | 示例 | 语义 | 适用场景 |
 |---------|------|------|----------|
 | **瞬态标志** (Transient) | `PipeState.MESSAGE_SYNC` | 表示某个 Task **当前正在运行**。Task 完成、异常退出或重建时，标志会短暂清除。 | 内部控制逻辑 (如是否需要重启 task) |
-| **单调标志** (Monotonic) | `is_realtime_ready` | 表示 Pipe **曾经成功连接过** EventBus 并处于就绪状态。一旦设为 `True`，除非 Pipe 重启不然不会变回 `False`。 | 外部状态判断 (如 Heartbeat `can_realtime`) |
+| **单调标志** (Monotonic) | `is_realtime_ready` | 表示记录 AgentPipe **曾经成功连接过** EventBus 并处于就绪状态。一旦设为 `True`，除非 AgentPipe 重启不然不会变回 `False`。 | 外部状态判断 (如 Heartbeat `can_realtime`) |
 
 > [!CAUTION]
 > 避免在外部监控或测试中使用瞬态标志作为"服务就绪"的判据，这会导致因 Task 重启窗口期引发的 Flaky Test。
@@ -63,7 +63,7 @@ Session 超时时间由 **Client-Hint + Server-Default** 共同决定：
 | `SessionObsoletedError` | **Immediate Retry** | 会话被服务端主动终结 (如 Leader Failover)，应立即重连以竞选新 Leader。 |
 | `RuntimeError` | **Exponential Backoff** | 连接超时、配置错误等环境问题，快速重试会加重系统负担。 |
 | `CancelledError` (+ STOPPING) | **Break** | 正常的停止流程。 |
-| `CancelledError` (- STOPPING) | **Continue** | 单个 Task (如 Snapshot) 被取消，但 Pipe 仍需运行 (见 §1.7)。 |
+| `CancelledError` (- STOPPING) | **Continue** | 单个 Task (如 Snapshot) 被取消，但 AgentPipe 仍需运行 (见 §1.7)。 |
 | Background Task Crash | **Count & Retry** | 记录连续错误计数，触发 Backoff，等待下一轮循环重启 Task。 |
 
 ### 1.7 Heartbeat Never Dies Invariant (心跳永不停止原则)
@@ -76,7 +76,7 @@ Session 超时时间由 **Client-Hint + Server-Default** 共同决定：
 1. Fusion 返回 `role=follower`。
 2. Agent 取消 `snapshot`/`audit`/`sentinel` 任务 (抛出 `CancelledError`)。
 3. 心跳任务 (`_heartbeat_task`) **保持运行**。
-4. 控制循环捕获 `CancelledError`，因未设置 `STOPPING` 标志，选择 `continue` 而非退出的，确保管道存活。
+4. 控制循环捕获 `CancelledError`，因未设置 `STOPPING` 标志，选择 `continue` 而非退出的，确保 AgentPipe 实例存活。
 
 ---
 
@@ -141,8 +141,8 @@ Fusion can issue commands to the Agent via the Heartbeat response channel.
 
 - **High Priority**: Commands (like `scan`) are processed immediately after the Heartbeat response is received.
 - **Concurrency**: Commands are typically executed as asynchronous tasks, running in parallel with the main Event Loop.
-- **State Bypass**: On-Demand tasks **MUST** be executable regardless of the Pipe's current state (e.g., Initializing, Follower, Error, Degraded).
-    - Even if `is_realtime_ready=False` or the pipe is stuck in `SNAPSHOT_SYNC`, the `scan` command must be processed to support troubleshooting.
+- **State Bypass**: On-Demand tasks **MUST** be executable regardless of the AgentPipe's current state (e.g., Initializing, Follower, Error, Degraded).
+    - Even if `is_realtime_ready=False` or the agent_pipe is stuck in `SNAPSHOT_SYNC`, the `scan` command must be processed to support troubleshooting.
     - The execution logic should typically bypass the shared `EventBus` and send results directly via `SenderHandler` to ensure delivery even if the local bus is broken.
 
 ### 4.2 Supported Commands
@@ -162,7 +162,7 @@ Fusion can issue commands to the Agent via the Heartbeat response channel.
 | 故障层级 | 影响范围 | 恢复策略 |
 |---------|----------|----------|
 | **Task Level** (Snapshot/Audit) | 仅影响该阶段的数据更新 | **Task Restart**: Heartbeat 保持运行，Control Loop 经 Backoff 后重启 Task。 |
-| **Component Level** (Driver/Bus) | 影响依赖该组件的所有 Pipe | **Component Reset**: 必须支持 Invalidate/Re-init (见 §5.2)。 |
+| **Component Level** (Driver/Bus) | 影响依赖该组件的所有 AgentPipe | **Component Reset**: 必须支持 Invalidate/Re-init (见 §5.2)。 |
 | **Session Level** (Fusion Conn) | 影响数据传输 | **Re-Session**: 销毁旧 Session，重新从握手开始 (Backoff/Immediate)。 |
 | **Process Level** (OOM/Crash) | 影响整个 Agent | **Service Restart**: 依赖外部 Supervisor (systemd/k8s) 重启进程。 |
 

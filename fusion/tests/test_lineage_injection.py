@@ -18,7 +18,7 @@ async def test_lineage_injection_flow():
     mock_handler.process_event = AsyncMock(return_value=True)
     
     pipe = FusionPipe(pipe_id="v1", config={"view_id": "v1"}, view_handlers=[mock_handler])
-    pipe.pipe_id = pipe.id # Inject required attribute
+    # pipe.pipe_id = pipe.id # Inject required attribute - REMOVED: V2 uses .id correctly
     await pipe.start()
     
     # 2. Setup a session with lineage info

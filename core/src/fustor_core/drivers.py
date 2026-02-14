@@ -182,6 +182,13 @@ class SenderDriver(ABC):
         """
         raise NotImplementedError
 
+    async def close_session(self) -> bool:
+        """
+        Optional: Closes the active session with the destination.
+        Returns True if successful.
+        """
+        return True
+
 
 
     async def signal_audit_start(self, source_id: Any) -> bool:

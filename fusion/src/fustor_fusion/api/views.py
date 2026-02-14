@@ -327,7 +327,7 @@ async def list_view_sessions(view_id: str, authorized_view_id: str = Depends(get
     from .. import runtime_objects
     
     sessions = await session_manager.get_view_sessions(view_id)
-    pipe = runtime_objects.pipe_manager.get_pipe(view_id)
+    pipe = runtime_objects.pipe_manager.get_pipe(view_id) if runtime_objects.pipe_manager else None
     
     session_list = []
     for session_id, session_info in sessions.items():

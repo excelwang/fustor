@@ -6,7 +6,7 @@ import logging
 from typing import Optional, Any, Dict, List, TYPE_CHECKING, Iterator
 
 
-from fustor_core.pipe import Pipe, PipeState
+from fustor_core.pipe import FustorPipe, PipeState
 from fustor_core.pipe.handler import SourceHandler
 from fustor_core.pipe.sender import SenderHandler
 from fustor_core.models.states import PipeInstanceDTO
@@ -26,7 +26,7 @@ from .pipe.lifecycle import PipeLifecycleMixin
 from .pipe.leader import PipeLeaderMixin
 from .pipe.command import PipeCommandMixin
 
-class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
+class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
     """
     Agent-side Pipe implementation.
     

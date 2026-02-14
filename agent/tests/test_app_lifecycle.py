@@ -42,6 +42,7 @@ pipes:
 async def test_app_resolve_target_pipes(mock_config_dir, tmp_path):
     with patch("fustor_agent.app.get_fustor_home_dir", return_value=tmp_path):
         with patch.object(agent_config, "dir", mock_config_dir):
+            agent_config.reload()
             # Default: only from default.yaml
             app = App()
             assert app._target_pipe_ids == ["pipe1"]
@@ -58,6 +59,7 @@ async def test_app_resolve_target_pipes(mock_config_dir, tmp_path):
 async def test_app_startup_shutdown(mock_config_dir, tmp_path):
     with patch("fustor_agent.app.get_fustor_home_dir", return_value=tmp_path):
         with patch.object(agent_config, "dir", mock_config_dir):
+            agent_config.reload()
             app = App()
             
             # Mock drivers and instances to avoid actual IO
@@ -90,6 +92,7 @@ async def test_app_startup_shutdown(mock_config_dir, tmp_path):
 async def test_app_reload_config(mock_config_dir, tmp_path):
     with patch("fustor_agent.app.get_fustor_home_dir", return_value=tmp_path):
         with patch.object(agent_config, "dir", mock_config_dir):
+            agent_config.reload()
             app = App()
             app.source_driver_service = MagicMock()
             app.sender_driver_service = MagicMock()

@@ -23,7 +23,7 @@ from . import models
 # Re-export commonly used classes at package level
 from .event import EventBase, EventType, MessageSource
 from .clock import LogicalClock
-from .pipe import Pipe, PipeState, PipeContext, Handler
+from .pipe import FustorPipe, PipeState, PipeContext, Handler
 from .transport import Sender, Receiver
 from .exceptions import (
     FustorException,
@@ -52,7 +52,7 @@ __all__ = [
     # Clock
     "LogicalClock",
     # Pipe
-    "Pipe",
+    "FustorPipe",
     "PipeState",
     "PipeContext",
     "Handler",

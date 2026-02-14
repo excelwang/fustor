@@ -135,7 +135,7 @@ class SenderHandlerAdapter(SenderHandler):
         response = await self._sender.heartbeat(**kwargs)
         
         return {
-            "role": response.get("role", response.get("current_role")),
+            "role": response.get("role", response.get("current_role", "follower")),
             "session_id": session_id,
             "status": response.get("status", "ok"),
             **{k: v for k, v in response.items() if k not in ("role", "current_role")}

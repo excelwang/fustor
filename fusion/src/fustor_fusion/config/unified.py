@@ -39,7 +39,7 @@ logger = logging.getLogger(__name__)
 class APIKeyConfig(BaseModel):
     """API Key configuration."""
     key: str
-    pipe_id: str
+    pipe_id: str  # The Scope/Instance ID this key is authorized for (maps to view_id in runtime)
 
 
 class ReceiverConfig(BaseModel):

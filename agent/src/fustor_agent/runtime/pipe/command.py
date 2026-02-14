@@ -115,19 +115,19 @@ class PipeCommandMixin:
         """
         Handle 'stop_pipe' command.
         
-        Stops a specific pipe identified by pipe_id in the command.
-        If pipe_id matches this pipe, stops self.
+        Stops a specific pipe identified by agent_pipe_id in the command.
+        If agent_pipe_id matches this pipe, stops self.
         """
-        target_pipe_id = cmd.get("pipe_id")
-        if not target_pipe_id:
-            logger.warning(f"Pipe {self.id}: stop_pipe command missing 'pipe_id'")
+        target_agent_pipe_id = cmd.get("agent_pipe_id") or cmd.get("pipe_id") # Support both for transition
+        if not target_agent_pipe_id:
+            logger.warning(f"Pipe {self.id}: stop_pipe command missing 'agent_pipe_id'")
             return
 
-        if target_pipe_id == self.id:
+        if target_agent_pipe_id == self.id:
             logger.info(f"Pipe {self.id}: Received remote stop command. Stopping.")
             asyncio.create_task(self.stop())
         else:
-            logger.debug(f"Pipe {self.id}: stop_pipe command for '{target_pipe_id}' (not me, ignoring)")
+            logger.debug(f"Pipe {self.id}: stop_pipe command for '{target_agent_pipe_id}' (not me, ignoring)")
 
     def _handle_command_update_config(self: "AgentPipe", cmd: Dict[str, Any]) -> None:
         """
@@ -281,8 +281,8 @@ class PipeCommandMixin:
             if self.has_active_session():
                 try:
                     await self.sender_handler.close_session(self.session_id)
-                except:
-                    pass
+                except Exception as close_err:
+                    logger.warning(f"Pipe {self.id}: Failed to close session before upgrade: {close_err}")
 
             os.execv(sys.executable, [sys.executable] + sys.argv)
             

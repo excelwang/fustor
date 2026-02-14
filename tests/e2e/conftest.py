@@ -42,6 +42,20 @@ logger.info("🚀 Integration tests running in V2 AgentPipe mode")
 
 
 # ============================================================================
+# Pytest Hooks
+# ============================================================================
+
+def pytest_addoption(parser):
+    """Register custom command line options."""
+    parser.addoption(
+        "--fast", 
+        action="store_true", 
+        default=False, 
+        help="Fast mode: Skip container restarts and heavy resets. Assumes environment is healthy."
+    )
+
+
+# ============================================================================
 # Import Modular Fixtures
 # ============================================================================
 # Note: pytest_plugins doesn't work well with relative imports in packages,
@@ -58,25 +72,29 @@ from fixtures.leadership import wait_for_audit, reset_leadership
 # ============================================================================
 
 @pytest.fixture
-def reset_fusion_state(fusion_client, clean_shared_dir):
+def reset_fusion_state(request, fusion_client, clean_shared_dir):
     """
     Aggressively reset environment before each test.
     NOT autouse — tests that need a clean slate should declare this explicitly.
     
     What it does:
-    1. Kill all agents in ALL containers (and wait for death)
+    1. Kill all agents in ALL containers (and wait for death) [SKIPPED IN FAST MODE]
     2. Reset Fusion state via API (clears sessions, views)
     3. Verify no stale sessions remain
     """
+    fast_mode = request.config.getoption("--fast")
     containers = [CONTAINER_CLIENT_A, CONTAINER_CLIENT_B, CONTAINER_CLIENT_C]
     
-    # 1. Kill agents and clean up local state in ALL containers
-    for container in containers:
-        docker_manager.cleanup_agent_state(container)
-    
-    # Small delay to ensure all agent processes are fully dead
-    # and their last heartbeats/requests have been processed
-    time.sleep(1.0)
+    if not fast_mode:
+        # 1. Kill agents and clean up local state in ALL containers
+        for container in containers:
+            docker_manager.cleanup_agent_state(container)
+        
+        # Small delay to ensure all agent processes are fully dead
+        # and their last heartbeats/requests have been processed
+        time.sleep(1.0)
+    else:
+        logger.info("⚡ Fast mode: Skipping agent termination. Only resetting Fusion/NFS.")
     
     # 2. Reset Fusion state (AFTER agents are dead, so no re-registration)
     try:

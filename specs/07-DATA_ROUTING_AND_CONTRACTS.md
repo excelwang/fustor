@@ -30,10 +30,10 @@
 ## 2. 两级路由分发机制 (Two-Tier Event Routing)
 
 ### 2.1 背景
-为了支持一个管道（Pipe）同时更新多个视图（View），且保证不同类型的数据（如 FS 和 DB）在同一管道中不发生误分发，需要建立严格的路由过滤机制。
+为了支持一个 AgentPipe 同时更新多个视图（View），且保证不同类型的数据（如 FS 和 DB）在同一 FusionPipe 链路中不发生误分发，需要建立严格的路由过滤机制。
 
 ### 2.2 决策
-Fustor 采用 **“Pipe 层粗粒度过滤 + Manager 层细粒度路由”** 的两级分发架构。
+Fustor 采用 **“FusionPipe 层粗粒度过滤 + Manager 层细粒度路由”** 的两级分发架构。
 
 #### 第一级：FusionPipe 路由 (Coarse-grained)
 *   **职责**：负责基于 `ViewHandler` 的能力声明进行路由。
@@ -51,7 +51,7 @@ Fustor 采用 **“Pipe 层粗粒度过滤 + Manager 层细粒度路由”** 的
 ### 2.3 架构权衡 (Trade-offs)
 *   **性能**：避免了将所有事件广播给所有 Handler 导致的无效 CPU 消耗和 Pydantic 反序列化开销。
 *   **安全性**：防止了非法或不兼容的 Schema 数据污染视图（例如：防止将 DB 事件错误地传给 FS 内存树）。
-*   **灵活性**：保留了 `view-manager` 作为聚合器的设计，允许一个 Pipe 通过插件化方式扩展多种视图。
+*   **灵活性**：保留了 `view-manager` 作为聚合器的设计，允许一个 FusionPipe 通过插件化方式扩展多种视图。
 
 ---
 
@@ -74,8 +74,9 @@ Agent 的 `fields_mapping` 配置允许用户在数据离开 Agent 前对事件�
 ### 3.3 配置格式
 
 ```yaml
+# Agent 端配置示例
 pipes:
-  my-pipe:
+  my-agent-pipe:
     source: shared-fs
     sender: fusion-main
     fields_mapping:

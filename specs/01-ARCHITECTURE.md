@@ -19,7 +19,7 @@
 |-----------|------|------------|------|
 | **Source** | 数据读取实现 | **View** | 数据处理实现 |
 | **Sender** | 传输通道（协议+凭证） | **Receiver** | 传输通道（协议+凭证） |
-| **Pipe** | 运行时绑定 (Source→Sender) | **Pipe** | 运行时绑定 (Receiver→View) |
+| **AgentPipe** | 运行时绑定 (Source→Sender) | **FusionPipe** | 运行时绑定 (Receiver→View) |
 
 ---
 
@@ -37,8 +37,8 @@
 │                  │                                      │                            │
 │   Layer 4: Pipe Engine (管道引擎层)                                               │
 │   ┌──────────────▼──────────────┐       ┌──────────────▼──────────────┐             │
-│   │     Pipe Manager        │       │     Pipe Manager        │             │
-│   │     (调度 Source→Sender)    │       │     (调度 Receiver→View)    │             │
+│   │     PipeInstanceService     │       │     FusionPipeManager       │             │
+│   │     (管理 Source→Sender)    │       │     (管理 Receiver→View)    │             │
 │   └──────────────┬──────────────┘       └──────────────┬──────────────┘             │
 │                  │                                      │                            │
 │   Layer 3: Handler (处理器层) - fustor-source-*, fustor-view-*                        │
@@ -54,7 +54,7 @@
 │                                                                                      │
 │   Layer 1: Core (核心层) - fustor-core                                                │
 │   ┌─────────────────────────────────────────────────────────────────────────────┐   │
-│   │  Pipe 抽象 │ Event 模型 │ Transport 抽象 │ LogicalClock │ Common Utils  │   │
+│   │ FustorPipe 抽象 │ Event 模型 │ Transport 抽象 │ LogicalClock │ Common Utils │   │
 │   └─────────────────────────────────────────────────────────────────────────────┘   │
 │                                                                                      │
 │   Layer 0: Schema (契约层) - fustor-schema-*                                          │
@@ -84,7 +84,7 @@ extensions/
 │       │   ├── base.py              # EventBase
 │       │   └── types.py             # EventType, MessageSource
 │       ├── pipe/                # Pipe 抽象
-│       │   ├── pipe.py          # Pipe ABC
+│       │   ├── pipe.py          # FustorPipe ABC
 │       │   ├── context.py           # PipeContext
 │       │   └── handler.py           # Handler ABC
 │       ├── transport/               # 传输抽象
@@ -141,7 +141,7 @@ extensions/
 
 - **唯一标识**: `signature = f"{uri}#{hash(credential)}"`
 - **行为**:
-    - 不同 Pipe 配置若指向同一 URI 且凭证相同，将共享同一个 Driver 实例。
+    - 不同 AgentPipe 配置若指向同一 URI 且凭证相同，将共享同一个 Driver 实例。
     - 共享实例意味着共享底层的 WatchManager 和 EventQueue。
 - **生命周期约束**:
     - **引用计数**: Driver 内部不维护引用计数（简化设计）。
@@ -167,17 +167,17 @@ fusion/                              # fustor-fusion
 │   Agent 侧                                                                           │
 │   ─────────                                                                          │
 │                                                                                      │
-│   Source ──┬── Pipe ──┬── Sender                                                 │
-│   Source ──┘              └── Sender                                                 │
+│   Source ──┬── AgentPipe ──┬── Sender                                          │
+│   Source ──┘               └── Sender                                          │
 │                                                                                      │
-│   约束: <source, sender> 组合唯一 (同一组合只能启动一个 Pipe)                      │
+│   约束: <source, sender> 组合唯一 (同一组合只能启动一个 AgentPipe)                 │
 │                                                                                      │
 │   ─────────────────────────────────────────────────────────────────────────────────  │
 │                                                                                      │
 │   Fusion 侧                                                                          │
 │   ──────────                                                                         │
 │                                                                                      │
-│   Receiver (1) ──── Pipe (N) ──── View (N)                                       │
+│   Receiver (1) ─── FusionPipe (N) ─── View (N)                                   │
 │       │                  │                │                                          │
 │       │                  └────────────────┘                                          │
 │       │                         │                                                    │
@@ -191,29 +191,29 @@ fusion/                              # fustor-fusion
 ```
 ┌─────────────────────────────────────────────────────────────────────────────────────┐
 │                                                                                      │
-│   Receiver : Pipe = 1 : N                                                        │
-│   (一个 Receiver 可服务多个 Pipe)                                                 │
+│   Receiver : FusionPipe = 1 : N                                                  │
+│   (一个 Receiver 可服务多个 FusionPipe)                                          │
 │                                                                                      │
 │   ┌──────────────────┐                                                              │
-│   │ Receiver (HTTP)  │───┬──▶ Pipe-A ──▶ View-X                                 │
+│   │ Receiver (HTTP)  │───┬──▶ FusionPipe-A ──▶ View-X                           │
 │   │ Port: 8102       │   │                                                          │
-│   │ API Key: fk_xxx  │   └──▶ Pipe-B ──┬──▶ View-X                              │
-│   └──────────────────┘                     └──▶ View-Y                              │
+│   │ API Key: fk_xxx  │   └──▶ FusionPipe-B ──┬──▶ View-X                       │
+│   └──────────────────┘                       └──▶ View-Y                       │
 │                                                                                      │
 │   ─────────────────────────────────────────────────────────────────────────────────  │
 │                                                                                      │
-│   Pipe : View = 1 : N                                                            │
-│   (一个 Pipe 可分发到多个 View)                                                   │
+│   FusionPipe : View = 1 : N                                                      │
+│   (一个 FusionPipe 可分发到多个 View)                                             │
 │                                                                                      │
-│   View : Pipe = N : 1                                                            │
-│   (一个 View 可接收多个 Pipe 的事件)                                               │
+│   View : FusionPipe = N : 1                                                      │
+│   (一个 View 可接收多个 FusionPipe 的事件)                                         │
 │                                                                                      │
 └─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### 4.3 Agent 侧消息同步机制
 
-Agent Pipe 使用 EventBus 实现高吞吐低延迟的消息同步。
+AgentPipe 使用 EventBus 实现高吞吐低延迟的消息同步。
 
 #### 4.3.1 架构图
 
@@ -223,7 +223,7 @@ Agent Pipe 使用 EventBus 实现高吞吐低延迟的消息同步。
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                      │
 │   ┌──────────────┐         ┌─────────────────┐         ┌──────────────┐             │
-│   │  FS Watch    │────────▶│    EventBus     │────────▶│  Pipe    │──▶ Fusion   │
+│   │  FS Watch    │────────▶│    EventBus     │────────▶│  AgentPipe   │──▶ Fusion   │
 │   │   Thread     │  put()  │   (MemoryBus)   │get()    │  Consumer    │             │
 │   └──────────────┘         └─────────────────┘         └──────────────┘             │
 │         │                         │                                                  │
@@ -236,7 +236,7 @@ Agent Pipe 使用 EventBus 实现高吞吐低延迟的消息同步。
 │   1. 生产者-消费者完全解耦 (Source 产生事件不被推送阻塞)                                │
 │   2. 200ms 轮询超时 (低负载时延迟 ~0ms, 最坏 200ms)                                   │
 │   3. 批量获取已有事件 (有多少取多少, 不等待凑满 batch)                                  │
-│   4. 同源 Pipe 共享 Bus (节省资源, 减少重复读取)                                   │
+│   4. 同源 AgentPipe 共享 Bus (节省资源, 减少重复读取)                                  │
 │   5. 反向命令通道: Fusion 通过 Heartbeat 响应下发指令 (如 Real-Time Scan)                │
 │                                                                                      │
 └─────────────────────────────────────────────────────────────────────────────────────┘
@@ -244,7 +244,7 @@ Agent Pipe 使用 EventBus 实现高吞吐低延迟的消息同步。
 
 #### 4.3.2 EventBus 共享机制
 
-同源的多个 Pipe 可共享同一个 EventBus：
+同源的多个 AgentPipe 可共享同一个 EventBus：
 
 ```
 Source Signature = (driver, uri, credential)
@@ -308,7 +308,7 @@ async def _run_message_sync(self):
 
 ### 5.1 Session 定义
 
-Session 是 **Agent Pipe** 和 **Fusion Pipe** 之间的业务会话。
+Session 是 **AgentPipe** 和 **FusionPipe** 之间的业务会话。
 
 ### 5.2 Session 数据结构
 
@@ -316,8 +316,8 @@ Session 是 **Agent Pipe** 和 **Fusion Pipe** 之间的业务会话。
 @dataclass
 class Session:
     session_id: str                    # 唯一会话 ID
-    agent_task_id: str                 # Agent Pipe 的 task_id
-    fusion_pipe_id: str            # Fusion Pipe ID
+    agent_task_id: str                 # AgentPipe 的 task_id
+    fusion_pipe_id: str                # FusionPipe ID
     
     # 生命周期
     created_at: datetime
@@ -335,12 +335,12 @@ class Session:
 ### 5.3 Session 生命周期
 
 ```
-Agent Pipe 启动
+AgentPipe 启动
     │
     ├── Sender.connect() ────────────────────▶ Receiver 验证 API Key
     │   POST /api/v1/pipe/sessions/              │
     │   {task_id: "..."}                         ▼
-    │                                       Fusion Pipe 创建 Session
+    │                                       FusionPipe 创建 Session
     │                                            │
     │◀── 200 {session_id, timeout_seconds} ─────┤
     │                                            │
@@ -386,7 +386,7 @@ Pipe 停止 或 网络断开                     Session 超时检测
 $FUSTOR_AGENT_HOME/
 ├── sources-config.yaml              # Source 定义
 ├── senders-config.yaml              # Sender 定义 (原 pushers-config.yaml)
-└── agent-pipes-config/              # Pipe 定义 (原 agent-pipes-config/)
+└── agent-pipes-config/              # AgentPipe 定义 (原 agent-pipes-config/)
     └── pipe-*.yaml
 ```
 
@@ -428,7 +428,7 @@ $FUSTOR_FUSION_HOME/
 ├── receivers-config.yaml            # Receiver 定义 (新增)
 ├── views-config/                    # View 定义
 │   └── view-*.yaml
-└── fusion-pipes-config/             # Pipe 定义 (新增)
+└── fusion-pipes-config/             # FusionPipe 定义 (新增)
     └── pipe-*.yaml
 ```
 
@@ -477,7 +477,7 @@ session_timeout_seconds: 30
 | `/api/v1/pipe/session/` | Session 管理（创建/心跳/关闭） |
 | `/api/v1/pipe/{session_id}/events` | 事件推送 |
 | `/api/v1/pipe/consistency/*` | 一致性信号（audit_start/end, snapshot_end） |
-| `/api/v1/pipe/pipes` | Pipe 管理（列表/详情） |
+| `/api/v1/pipe/pipes` | FusionPipe 管理（列表/详情） |
 | `/api/v1/views/*` | 数据视图查询 |
 
 > 注：旧路径 `/api/v1/ingest/*` 已移除，不再支持。

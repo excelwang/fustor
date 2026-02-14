@@ -109,7 +109,7 @@ class AgentConfigLoader:
         # Global settings
         self.logging = GlobalLoggingConfig()
         self.fs_scan_workers: int = 4
-
+        self.agent_id: Optional[str] = None
 
         # Merged namespace
         self._sources: Dict[str, SourceConfig] = {}
@@ -125,6 +125,7 @@ class AgentConfigLoader:
         """Load and merge all YAML files from config directory."""
         self.logging = GlobalLoggingConfig()
         self.fs_scan_workers: int = 4
+        self.agent_id = None
 
         self._sources.clear()
         self._senders.clear()

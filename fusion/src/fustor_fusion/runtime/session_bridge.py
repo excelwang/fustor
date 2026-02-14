@@ -124,7 +124,7 @@ class PipeSessionBridge:
         
         if view_handler:
              try:
-                 session_result = await view_handler.resolve_session_role(session_id, pipe_id=getattr(self._pipe, 'pipe_id', None))
+                 session_result = await view_handler.resolve_session_role(session_id, fusion_pipe_id=self._pipe.id)
              except Exception as e:
                  logger.error(f"View handler failed to process new session {session_id}: {e}")
                  # Should we fail the session? For now, log and proceed as follower for safety
@@ -192,7 +192,7 @@ class PipeSessionBridge:
             Heartbeat response with role, tasks, etc.
         """
         view_id = str(self._pipe.view_id)
-        pipe_id = getattr(self._pipe, 'pipe_id', None)
+        pipe_id = self._pipe.id
         
         # No legacy flag check needed here. 
         # Election status is maintained via _leader_cache and verified/retried below.
@@ -235,7 +235,7 @@ class PipeSessionBridge:
             if view_handler:
                  try:
                      # Re-run election logic via handler
-                     res = await view_handler.resolve_session_role(session_id, pipe_id=getattr(self._pipe, 'pipe_id', None))
+                     res = await view_handler.resolve_session_role(session_id, pipe_id=self._pipe.id)
                      is_leader = (res.get("role") == "leader")
                      election_key = res.get("election_key", view_id)
                      

@@ -6,7 +6,7 @@ from fustor_fusion.runtime.session_bridge import PipeSessionBridge
 def mock_pipe():
     pipe = MagicMock()
     pipe.view_id = "global-view"
-    pipe.pipe_id = "pipe-1"  # Forest mode
+    pipe.id = "pipe-1"  # Forest mode
     pipe.on_session_created = AsyncMock()
     pipe.get_session_role = AsyncMock(return_value="leader")
     # Mock get_view_handler to return a handler

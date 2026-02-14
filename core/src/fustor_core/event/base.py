@@ -28,8 +28,8 @@ class EventBase(BaseModel):
         default=MessageSource.REALTIME,
         description="Source of the message: realtime, snapshot, audit"
     )
-    metadata: Optional[Dict[str, Any]] = Field(
-        default=None,
+    metadata: Dict[str, Any] = Field(
+        default_factory=dict,
         description="Arbitrary metadata (e.g., lineage info)"
     )
 
