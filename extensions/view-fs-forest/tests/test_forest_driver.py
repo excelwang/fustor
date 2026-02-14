@@ -81,3 +81,36 @@ async def test_aggregation_tree(forest_driver):
     assert "pipe-A" in result["members"]
     assert result["members"]["pipe-A"]["data"]["name"] == "root-A"
     assert "pipe-B" in result["members"]
+
+@pytest.mark.asyncio
+async def test_get_directory_stats_strategies(forest_driver):
+    """Test get_directory_stats with 'best' and 'aggregate' strategies."""
+    # Setup mock trees
+    tree_a = AsyncMock()
+    tree_a.get_directory_stats.return_value = {
+        "item_count": 100, "total_size": 1000, "latency_ms": 10.0,
+        "staleness_seconds": 1.0, "suspect_file_count": 1
+    }
+    
+    tree_b = AsyncMock()
+    tree_b.get_directory_stats.return_value = {
+        "item_count": 200, "total_size": 2000, "latency_ms": 20.0,
+        "staleness_seconds": 2.0, "suspect_file_count": 2
+    }
+    
+    forest_driver._trees = {"pipe-A": tree_a, "pipe-B": tree_b}
+    
+    # 1. Test "best" strategy (default)
+    best_stats = await forest_driver.get_directory_stats(strategy="best")
+    assert best_stats["item_count"] == 200  # Picked tree_b because it has more items
+    assert best_stats["tree_count"] == 2
+    assert best_stats["latency_ms"] == 20.0
+    
+    # 2. Test "aggregate" strategy
+    agg_stats = await forest_driver.get_directory_stats(strategy="aggregate")
+    assert agg_stats["item_count"] == 300  # 100 + 200
+    assert agg_stats["total_size"] == 3000 # 1000 + 2000
+    assert agg_stats["latency_ms"] == 20.0 # max(10, 20)
+    assert agg_stats["staleness_seconds"] == 2.0 # max(1, 2)
+    assert agg_stats["suspect_file_count"] == 3 # 1 + 2
+    assert agg_stats["tree_count"] == 2

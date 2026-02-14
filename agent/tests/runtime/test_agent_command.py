@@ -24,7 +24,7 @@ async def test_agent_command_execution():
     config = {
         "control_loop_interval": 0.1
     }
-    pipe = AgentPipe("pipe-1", "task-1", config, mock_source, mock_sender)
+    pipe = AgentPipe("pipe-1", config, mock_source, mock_sender)
     pipe.session_id = "sess-1"
     pipe.current_role = "leader"
     

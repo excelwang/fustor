@@ -35,7 +35,7 @@ class TestAgentErrorRecovery:
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
         
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config,
+            "test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
         
@@ -66,7 +66,7 @@ class TestAgentErrorRecovery:
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
         
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config,
+            "test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
         
@@ -108,7 +108,7 @@ class TestAgentErrorRecovery:
     async def test_audit_sync_with_session_loss(self, mock_source, mock_sender, pipe_config):
         """Audit phase should handle session being cleared during execution."""
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config,
+            "test-id", pipe_config,
             mock_source, mock_sender
         )
         pipe.session_id = "test-session"
@@ -142,7 +142,7 @@ class TestAgentErrorRecovery:
         mock_source.initialize = AsyncMock(side_effect=RuntimeError("Init failed"))
         
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config,
+            "test-id", pipe_config,
             mock_source, mock_sender
         )
         
@@ -170,7 +170,7 @@ class TestAgentErrorRecovery:
         mock_bus.internal_bus.get_events_for = AsyncMock(return_value=[])
         
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config_no_bg,
+            "test-id", pipe_config_no_bg,
             mock_source, mock_sender, event_bus=mock_bus
         )
         
@@ -226,7 +226,7 @@ class TestAgentErrorRecovery:
 
         """Test that consecutive errors increase backoff."""
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config,
+            "test-id", pipe_config,
             mock_source, mock_sender
         )
         

@@ -46,7 +46,6 @@ class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
     def __init__(
         self,
         pipe_id: str,
-        task_id: str,
         config: Dict[str, Any],
         source_handler: SourceHandler,
         sender_handler: SenderHandler,
@@ -59,7 +58,6 @@ class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
         
         Args:
             pipe_id: Unique identifier for this pipe
-            task_id: Full task identifier (agent_id:pipe_id)
             config: Pipe configuration
             source_handler: Handler for reading source data
             sender_handler: Handler for sending data to Fusion
@@ -69,7 +67,7 @@ class AgentPipe(Pipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixin):
         """
         super().__init__(pipe_id, config, context)
         
-        self.task_id = task_id
+        self.task_id: Optional[str] = None  # Resolved at session creation (agent_id:pipe_id)
         self.source_handler = source_handler
         self.sender_handler = sender_handler
         self._bus = event_bus  # Private attribute for bus

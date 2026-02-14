@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 from fustor_agent.config.validator import ConfigValidator
 from fustor_agent.config.unified import AgentConfigLoader, SourceConfig, SenderConfig, AgentPipeConfig # Assuming these models are used internally
 
@@ -10,7 +10,6 @@ def mock_loader():
     loader.reload.return_value = None # Assume reload always works for now
     
     # Default valid state
-    loader.agent_id = "test-agent-id"
     loader.get_all_sources.return_value = {
         "s1": SourceConfig(driver="fs", uri="/data")
     }
@@ -28,14 +27,6 @@ def test_validate_happy_path(mock_loader):
     is_valid, errors = validator.validate()
     assert is_valid is True
     assert errors == []
-
-def test_validate_missing_agent_id(mock_loader):
-    """Test validation fails if agent_id is missing."""
-    mock_loader.agent_id = None
-    validator = ConfigValidator(loader=mock_loader)
-    is_valid, errors = validator.validate()
-    assert is_valid is False
-    assert "Global 'agent_id' is missing" in errors[0]
 
 def test_validate_source_missing_driver(mock_loader):
     """Test validation fails if a source is missing its driver."""
@@ -112,7 +103,6 @@ def test_validate_pipe_redundant_pair(mock_loader):
 def test_validate_config_dict_happy_path():
     """Test validate_config with a valid dictionary config."""
     config_dict = {
-        "agent_id": "test-agent",
         "sources": {"s1": {"driver": "fs", "uri": "/tmp"}},
         "senders": {"se1": {"driver": "echo", "uri": "http://localhost"}},
         "pipes": {
@@ -164,10 +154,28 @@ def test_validate_config_dict_pipes_not_dict():
     }
     validator = ConfigValidator()
     
-    # Since we added explicit check, it now returns proper error instead of crashing
+    # Pydantic returns a structured error message
     is_valid, errors = validator.validate_config(config_dict)
     assert is_valid is False
-    assert "'pipes' section must be a dictionary" in errors[0]
+    assert "pipes" in errors[0]
+    assert "dict_type" in errors[0] or "dictionary" in errors[0].lower()
+
+def test_validate_config_dict_agent_id_removed_from_config():
+    """Test that agent_id is no longer expected in the config dictionary."""
+    config_dict = {
+        "sources": {"s1": {"driver": "fs", "uri": "/tmp"}},
+        "senders": {"se1": {"driver": "fusion", "uri": "http://1.2.3.4:8102"}},
+        "pipes": {
+            "p1": {"source": "s1", "sender": "se1"}
+        }
+    }
+    validator = ConfigValidator()
+    is_valid, errors = validator.validate_config(config_dict)
+    assert is_valid is True
+    
+    from fustor_agent.config.unified import UnifiedAgentConfig
+    cfg = UnifiedAgentConfig.model_validate(config_dict)
+    assert not hasattr(cfg, "agent_id")
 
 def test_validate_config_dict_pipe_missing_source_sender():
     """Test validate_config handles pipes missing source or sender."""
@@ -215,7 +223,6 @@ def test_validate_empty_config_dir(mock_loader):
     mock_loader.get_all_sources.return_value = {}
     mock_loader.get_all_senders.return_value = {}
     mock_loader.get_all_pipes.return_value = {}
-    mock_loader.agent_id = "test-agent-id" # Still needs agent_id, otherwise that error takes precedence
     
     validator = ConfigValidator(loader=mock_loader)
     is_valid, errors = validator.validate()

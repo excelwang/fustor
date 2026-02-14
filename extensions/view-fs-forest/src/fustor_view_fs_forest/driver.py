@@ -118,19 +118,42 @@ class ForestFSViewDriver(ViewDriver):
         """
         return await self.get_directory_tree(**kwargs)
 
-    async def get_directory_stats(self) -> Dict[str, Any]:
+    async def get_directory_stats(self, strategy: str = "best") -> Dict[str, Any]:
         """
-        Aggregate stats from all internal trees.
-        Required by metadata limit checker in API.
+        Get directory statistics.
+        
+        Args:
+            strategy: "best" (default) returns tree with max items,
+                     "aggregate" returns sum of all trees.
         """
+        current_trees = list(self._trees.values())
+        if not current_trees:
+            return {
+                "item_count": 0, "total_size": 0, "latency_ms": 0.0,
+                "staleness_seconds": 0.0, "suspect_file_count": 0, "tree_count": 0
+            }
+
+        if strategy == "best":
+            # For "best", we pick the tree that seems most complete/largest
+            best_stats = None
+            for tree in current_trees:
+                try:
+                    stats = await tree.get_directory_stats()
+                    if best_stats is None or stats.get("item_count", 0) > best_stats.get("item_count", 0):
+                        best_stats = stats
+                except Exception as e:
+                    self.logger.warning(f"Failed to get stats from sub-tree: {e}")
+            
+            if best_stats:
+                best_stats["tree_count"] = len(current_trees)
+                return best_stats
+        
+        # Default/Aggregate logic
         total_items = 0
         total_size = 0
         max_latency = 0.0
         max_staleness = 0.0
         suspect_count = 0
-        
-        # Snapshot current trees safely
-        current_trees = list(self._trees.values())
         
         for tree in current_trees:
             try:

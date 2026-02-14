@@ -13,7 +13,6 @@ from fustor_agent.runtime.agent_pipe import AgentPipe
 def agent_pipe(mock_source, mock_sender, pipe_config):
     return AgentPipe(
         pipe_id="test-pipe",
-        task_id="agent1:test-pipe",
         config=pipe_config,
         source_handler=mock_source,
         sender_handler=mock_sender
@@ -36,7 +35,7 @@ class TestAgentPipeInit:
         """get_dto should return pipe info."""
         dto = agent_pipe.get_dto()
         assert dto.id == "test-pipe"
-        assert dto.task_id == "agent1:test-pipe"
+        assert dto.task_id is None # Not yet resolved
         assert "STOPPED" in str(dto.state)
 
         assert dto.statistics is not None

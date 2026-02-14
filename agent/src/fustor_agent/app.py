@@ -45,30 +45,6 @@ class App:
         self.logger = logging.getLogger("fustor_agent")
         self.logger.info("Initializing application...")
         
-        # Load Config first to check for agent_id
-        agent_config.reload()
-        self.config_loader = agent_config
-        self.config_signature = agent_config.get_config_signature()
-        
-        # Agent ID Priority: Config > File/Auto (IP-based)
-        # Environment variable support removed per user request ("Only keep one: configuration file")
-        
-        config_id = agent_config.agent_id
-        
-        if config_id and config_id != "unknown-agent":
-             self.logger.info(f"Using Agent ID: {config_id}")
-             self.agent_id = config_id
-        else:
-             import socket
-             try:
-                 self.agent_id = socket.gethostname()
-             except:
-                 self.agent_id = "unknown-agent"
-             
-             # Sync back to config for other components
-             agent_config.agent_id = self.agent_id
-             self.logger.info(f"Using Agent ID (auto): {self.agent_id}")
-        
         # Determine which pipes to start based on config_list
         self._target_pipe_ids = self._resolve_target_pipes(config_list)
         
@@ -160,9 +136,12 @@ class App:
         sender_cfg = resolved['sender']
         
         # 1. Get or create event bus for source
-        # Use source ID from config for sharing
+        # Identity (agent_id) will be resolved dynamically by the pipe itself.
+        # For bus subscription, we use pipe_id for now. 
+        # Note: In ForestView, task_id (agent_id:pipe_id) is used for routing.
+        # So we actually need the identity before subscribing to the bus?
+        # If identity is dynamic per sender, then task_id for bus is also dynamic.
         source_id = pipe_cfg.source
-        task_id = f"{self.agent_id}:{pipe_id}"
         
         # Convert fields_mapping to FieldMapping objects for EventBus
         from fustor_core.models.config import FieldMapping
@@ -174,7 +153,7 @@ class App:
         bus_runtime, _ = await self.event_bus_service.get_or_create_bus_for_subscriber(
             source_id=source_id,
             source_config=source_cfg,
-            pipe_id=task_id,
+            pipe_id=pipe_id, # Use pipe_id as subscriber_id for now
             required_position=0,
             fields_mapping=field_mappings
         )
@@ -204,7 +183,6 @@ class App:
 
         pipe = AgentPipe(
             pipe_id=pipe_id,
-            task_id=f"{self.agent_id}:{pipe_id}",
             config=pipe_config_dict,
             source_handler=source_handler,
             sender_handler=sender_handler,

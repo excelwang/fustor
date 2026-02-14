@@ -519,11 +519,11 @@ class FusionPipe(Pipe):
                     await view_state_manager.set_snapshot_complete(self.view_id, session_id)
                     logger.info(f"Pipe {self.id}: Marked view {self.view_id} as snapshot complete.")
                     
-                    # Also mark scoped view key (for ForestView) using source_uri
+                    # Also mark scoped view key (for ForestView)
                     lineage = self._session_lineage_cache.get(session_id, {})
-                    source_uri = lineage.get("source_uri")
-                    if source_uri:
-                         scoped_key = f"{self.view_id}:{source_uri}"
+                    pipe_id_for_key = kwargs.get("metadata", {}).get("pipe_id") or lineage.get("pipe_id") or self.pipe_id
+                    if pipe_id_for_key:
+                         scoped_key = f"{self.view_id}:{pipe_id_for_key}"
                          await view_state_manager.set_snapshot_complete(scoped_key, session_id)
                          logger.debug(f"Pipe {self.id}: Also marked scoped view {scoped_key} as complete.")
                     

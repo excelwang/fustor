@@ -38,10 +38,6 @@ class ConfigValidator:
             errors.append(f"Failed to load configuration files: {e}")
             return False, errors
 
-        # 0. Validate Global Settings
-        if not getattr(self.loader, "agent_id", None):
-            errors.append("Global 'agent_id' is missing in configuration. It is required for Multi-FS identification.")
-
         # 1. Validate Sources
         sources = self.loader.get_all_sources()
         for s_id, s_cfg in sources.items():
@@ -95,51 +91,35 @@ class ConfigValidator:
         """
         Validate a configuration dictionary using the same strict rules as disk loading.
         
-        This method simulates loading the config into a temporary loader instance
-        to leverage Pydantic model validation and cross-reference checks.
+        Leverages UnifiedAgentConfig for Pydantic structural validation and 
+        ConfigValidator.validate for semantic checks.
         """
         errors = []
         if not config_dict:
             return True, []
 
         try:
-            # 1. Structural Validation via Pydantic (Generic Adapter)
+            # 1. Structural Validation via Pydantic
+            from fustor_agent.config.unified import UnifiedAgentConfig
+            
+            # Pydantic handles structural validation. defaults (like agent_id being Optional) are handled here.
+            unified_cfg = UnifiedAgentConfig.model_validate(config_dict)
+            
+            # 2. Build temp loader for semantic check
             temp_loader = AgentConfigLoader(config_dir=None)
-            data = config_dict
+            temp_loader.logging = unified_cfg.logging
+            temp_loader.fs_scan_workers = unified_cfg.fs_scan_workers
             
-            if "logging" in data:
-                 GlobalLoggingConfig.model_validate(data["logging"])
-            
-            if "fs_scan_workers" in data:
-                temp_loader.fs_scan_workers = int(data["fs_scan_workers"])
-            
-            # Use provided agent_id or a dummy for validation context
-            if "agent_id" in data:
-                temp_loader.agent_id = str(data["agent_id"]).strip()
-            else:
-                temp_loader.agent_id = "validation-dummy-id"
-            
-            # Sources
-            for src_id, src_data in data.get("sources", {}).items():
+            # Convert Dict[str, dict] to expected Dict[str, ConfigModel]
+            for src_id, src_data in unified_cfg.sources.items():
                 temp_loader._sources[src_id] = SourceConfig(**src_data)
-            
-            # Senders
-            for sender_id, sender_data in data.get("senders", {}).items():
+            for sender_id, sender_data in unified_cfg.senders.items():
                 temp_loader._senders[sender_id] = SenderConfig(**sender_data)
-            
-            # Pipes
-            from fustor_agent.config.unified import AgentPipeConfig
-            pipes_data = data.get("pipes", {})
-            if not isinstance(pipes_data, dict):
-                errors.append("'pipes' section must be a dictionary")
-                return False, errors
-                
-            for pipe_id, pipe_data in pipes_data.items():
-                temp_loader._pipes[pipe_id] = AgentPipeConfig(**pipe_data)
-            
+
+            temp_loader._pipes = unified_cfg.pipes
             temp_loader._loaded = True
             
-            # 2. Semantic Validation (Cross-references, Uniqueness)
+            # 3. Semantic Validation (Cross-references, Uniqueness)
             temp_validator = ConfigValidator(loader=temp_loader)
             is_valid, semantic_errors = temp_validator.validate(auto_reload=False)
             

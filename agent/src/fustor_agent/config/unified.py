@@ -36,6 +36,28 @@ from fustor_core.models.config import SourceConfig, SenderConfig, GlobalLoggingC
 logger = logging.getLogger(__name__)
 
 
+def get_outbound_ip(target_host: str = "8.8.8.8", target_port: int = 80) -> str:
+    """
+    Detect the local IP address used to reach a target host.
+    Does not actually establish a connection.
+    """
+    try:
+        # We use UDP to avoid actual handshake, just gets the routing decision
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        # Handle cases where target_host might be a URL
+        if "://" in target_host:
+            from urllib.parse import urlparse
+            target_host = urlparse(target_host).hostname or target_host
+        
+        s.connect((target_host, target_port))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        # Fallback to hostname if IP detection fails
+        return socket.gethostname()
+
+
 class AgentPipeConfig(BaseModel):
     """Configuration for a single Agent pipe."""
     source: str  # Reference to source ID
@@ -103,7 +125,6 @@ class AgentConfigLoader:
         """Load and merge all YAML files from config directory."""
         self.logging = GlobalLoggingConfig()
         self.fs_scan_workers: int = 4
-        self.agent_id: Optional[str] = None  # Global Agent ID from config
 
         self._sources.clear()
         self._senders.clear()
@@ -120,10 +141,6 @@ class AgentConfigLoader:
         for yaml_file in sorted(self.dir.glob("*.yaml")):
             self._load_file(yaml_file)
         
-        if self.agent_id is None:
-             self.agent_id = socket.gethostname()
-             logger.info(f"Agent ID not configured. Defaulting to hostname: {self.agent_id}")
-
         self._loaded = True
         logger.info(
             f"Loaded config: {len(self._sources)} sources, "

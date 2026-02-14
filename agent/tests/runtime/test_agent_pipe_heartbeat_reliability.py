@@ -29,7 +29,7 @@ async def test_heartbeat_failure_backoff(mock_source, mock_sender, pipe_config):
     ])
     
     pipe = AgentPipe(
-        "hb-test", "agent:test", pipe_config,
+        "hb-test", pipe_config,
         mock_source, mock_sender
     )
     
@@ -62,7 +62,7 @@ async def test_heartbeat_session_obsolete_recovery(mock_source, mock_sender, pip
     mock_sender.send_heartbeat = mock_hb
     
     pipe = AgentPipe(
-        "hb-fatal", "agent:test", pipe_config,
+        "hb-fatal", pipe_config,
         mock_source, mock_sender
     )
     

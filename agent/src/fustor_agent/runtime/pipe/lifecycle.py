@@ -3,6 +3,7 @@ import logging
 from typing import Optional, TYPE_CHECKING
 from fustor_core.pipe import PipeState
 from fustor_core.exceptions import SessionObsoletedError, FusionConnectionError
+from fustor_agent.config.unified import get_outbound_ip
 
 if TYPE_CHECKING:
     from ..agent_pipe import AgentPipe
@@ -74,7 +75,19 @@ class PipeLifecycleMixin:
                     logger.info(f"Pipe {self.id}: No active session. Reconnecting...")
                     self._set_state(PipeState.RUNNING | PipeState.RECONNECTING, "Attempting to create session...")
                     try:
-                        logger.debug(f"Pipe {self.id}: Creating session with task_id={self.task_id}, timeout={self.session_timeout_seconds}")
+                        # Resolve dynamic Agent ID (IP) based on Sender endpoint
+                        fusion_uri = getattr(self.sender_handler, "endpoint", "8.8.8.8")
+                        # Some adapters might wrap the driver differently. 
+                        # SenderHandlerAdapter usually has a .driver with .endpoint or similar.
+                        if not isinstance(fusion_uri, str):
+                            # Fallback if URI extraction fails
+                            fusion_uri = "8.8.8.8"
+                        
+                        agent_id = get_outbound_ip(fusion_uri)
+                        self.task_id = f"{agent_id}:{self.id}"
+                        
+                        logger.debug(f"Pipe {self.id}: Resolved dynamic identity task_id={self.task_id} via {fusion_uri}")
+                        
                         # Source URI extraction (Best effort, handling both Pydantic models and dicts)
                         config = self.source_handler.config
                         if isinstance(config, dict):

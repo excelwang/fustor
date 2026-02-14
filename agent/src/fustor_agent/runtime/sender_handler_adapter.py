@@ -69,6 +69,11 @@ class SenderHandlerAdapter(SenderHandler):
         """Access the underlying sender."""
         return self._sender
     
+    @property
+    def endpoint(self) -> str:
+        """Access the underlying sender's endpoint."""
+        return self._sender.endpoint
+    
     async def initialize(self) -> None:
         """Initialize the handler (connect the underlying sender)."""
         if not self._connected:

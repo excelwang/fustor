@@ -85,11 +85,11 @@ class ViewDriver(ABC):
         """
         raise NotImplementedError
 
-    async def on_session_start(self):
+    async def on_session_start(self, session_id: Optional[str] = None):
         """Called when a new Agent session starts. Optional hook for state reset."""
         pass
 
-    async def on_session_close(self):
+    async def on_session_close(self, session_id: Optional[str] = None):
         """Called when an Agent session terminates. Optional hook for cleanup."""
         pass
 

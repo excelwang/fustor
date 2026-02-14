@@ -194,19 +194,13 @@ class ViewManager:
         """Dispatch session start event to all driver instances."""
         for driver_id, driver_instance in self.driver_instances.items():
             if hasattr(driver_instance, 'on_session_start'):
-                try:
-                    await driver_instance.on_session_start(session_id=session_id)
-                except TypeError:
-                    await driver_instance.on_session_start()
+                 await driver_instance.on_session_start(session_id=session_id)
 
     async def on_session_close(self, session_id: Optional[str] = None):
         """Dispatch session close event to all driver instances for cleanup."""
         for driver_id, driver_instance in self.driver_instances.items():
             if hasattr(driver_instance, 'on_session_close'):
-                try:
-                    await driver_instance.on_session_close(session_id=session_id)
-                except TypeError:
-                    await driver_instance.on_session_close()
+                 await driver_instance.on_session_close(session_id=session_id)
 
     async def get_aggregated_stats(self) -> Dict[str, Any]:
         """

@@ -24,7 +24,7 @@ def pipe_with_session():
         "max_consecutive_errors": 10,  # 高阈值避免终态
         "batch_size": 10,
     }
-    pipe = AgentPipe("test-pipe", "agent:pipe", config, src, snd)
+    pipe = AgentPipe("test-pipe", config, src, snd)
     return pipe
 
 

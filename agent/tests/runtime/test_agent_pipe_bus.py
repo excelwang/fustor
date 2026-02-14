@@ -31,9 +31,10 @@ class TestAgentPipeBus:
         mock_sender.send_batch = AsyncMock(return_value=(True, {"count": 1}))
         
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config,
+            "test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
+        pipe.task_id = "agent:test-id"
         pipe.session_id = "test-session"
         pipe.state = PipeState.RUNNING
         
@@ -76,9 +77,10 @@ class TestAgentPipeBus:
         ])
         
         pipe = AgentPipe(
-            "test-id", "agent:test-id", pipe_config,
+            "test-id", pipe_config,
             mock_source, mock_sender, event_bus=mock_bus
         )
+        pipe.task_id = "agent:test-id"
         pipe.session_id = "test-session"
         pipe.state = PipeState.RUNNING
         

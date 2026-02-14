@@ -24,7 +24,6 @@ class TestAgentPipeAudit:
     def agent_pipe(self, mock_source_audit, mock_sender, pipe_config):
         pipe = AgentPipe(
             pipe_id="test-audit-pipe",
-            task_id="agent:test-audit",
             config=pipe_config,
             source_handler=mock_source_audit,
             sender_handler=mock_sender

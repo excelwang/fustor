@@ -38,15 +38,19 @@ def mock_services():
     bus_svc = EventBusService(source_configs={"s1": source_cfg}, source_driver_service=source_dr_svc)
     bus_svc.get_or_create_bus_for_subscriber = AsyncMock(return_value=(mock_bus_instance_runtime, False))
     
-    service = PipeInstanceService(
-        pipe_config_service=pipe_cfg_svc,
-        source_config_service=source_cfg_svc,
-        sender_config_service=sender_cfg_svc,
-        bus_service=bus_svc,
-        sender_driver_service=sender_dr_svc,
-        source_driver_service=source_dr_svc,
-        agent_id="test-agent"
-    )
+    # Patch discovery before creating services
+    with patch.object(SourceDriverService, "_discover_installed_drivers", return_value={}), \
+         patch.object(SenderDriverService, "_discover_installed_drivers", return_value={}):
+        service = PipeInstanceService(
+            pipe_config_service=pipe_cfg_svc,
+            source_config_service=source_cfg_svc,
+            sender_config_service=sender_cfg_svc,
+            bus_service=bus_svc,
+            sender_driver_service=sender_dr_svc,
+            source_driver_service=source_dr_svc,
+        )
+        service.source_driver_service._get_driver_by_type = MagicMock(return_value=MagicMock())
+        service.sender_driver_service._get_driver_by_type = MagicMock(return_value=MagicMock())
     return service, pipe_cfg_svc
 
 @pytest.mark.asyncio
@@ -104,7 +108,6 @@ async def test_pipe_service_stop_all_cleans_up(mock_services):
     
     mock_pipe_instance = AsyncMock() # Single mock instance
     mock_pipe_instance.id = "p1"
-    mock_pipe_instance.task_id = "test-agent:p1"
     mock_pipe_instance.bus = MagicMock(id="mock-bus-id-1") # Ensure bus attribute exists
 
     with patch("fustor_agent.services.configs.pipe.agent_config") as mock_agent_config, \

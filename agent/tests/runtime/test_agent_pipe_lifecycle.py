@@ -23,7 +23,6 @@ class TestAgentPipeLifecycle:
         
         return AgentPipe(
             pipe_id="test-pipe",
-            task_id="agent:test-pipe",
             config=pipe_config,
             source_handler=mock_source,
             sender_handler=mock_sender,

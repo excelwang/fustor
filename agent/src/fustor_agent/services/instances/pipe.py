@@ -46,7 +46,6 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
         bus_service: "EventBusService",
         sender_driver_service: "SenderDriverService",
         source_driver_service: "SourceDriverService",
-        agent_id: str  # Added agent_id
     ):
         super().__init__()
         self.pipe_config_service = pipe_config_service
@@ -55,7 +54,6 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
         self.bus_service = bus_service
         self.sender_driver_service = sender_driver_service
         self.source_driver_service = source_driver_service
-        self.agent_id = agent_id  # Store agent_id
         self.logger = logging.getLogger("fustor_agent") 
 
     async def start_one(self, id: str, raise_on_error: bool = False) -> StartResult:
@@ -117,18 +115,17 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
                     source_config.driver_params["max_scan_workers"] = agent_config.fs_scan_workers
             
             # Obtain EventBus mandatory for all pipes (unifying architecture)
-            task_id = f"{self.agent_id}:{id}"
             field_mappings = getattr(pipe_config, "fields_mapping", [])
             
             # We assume start from position 0 for new pipes
             event_bus, needed_position_lost = await self.bus_service.get_or_create_bus_for_subscriber(
                 source_id=pipe_config.source,
                 source_config=source_config,
-                pipe_id=task_id,
+                pipe_id=id, # Use pipe_id as subscriber_id
                 required_position=0, 
                 fields_mapping=field_mappings
             )
-            self.logger.info(f"Subscribed to EventBus {event_bus.id} for pipe '{task_id}'")
+            self.logger.info(f"Subscribed to EventBus {event_bus.id} for pipe '{id}'")
 
             # Create Handlers
             source_driver_class = self.source_driver_service._get_driver_by_type(source_config.driver)
@@ -174,7 +171,6 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
 
             pipe = AgentPipe(
                 pipe_id=id,
-                task_id=task_id,
                 config=runtime_config,
                 source_handler=source_handler,
                 sender_handler=sender_handler,

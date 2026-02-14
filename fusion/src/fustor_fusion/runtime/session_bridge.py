@@ -114,8 +114,9 @@ class PipeSessionBridge:
         
         # Delegate election and role determination to the View Handler
         # This decouples the bridge from specific consistency models (forest vs standard)
-        # Try direct ID first, then ViewManager prefix
         view_handler = self._pipe.get_view_handler(view_id)
+        
+        # Fallback for ViewManagerAdapter which might have a prefixed handler_id
         if not view_handler:
             view_handler = self._pipe.get_view_handler(f"view-manager-{view_id}")
             

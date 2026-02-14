@@ -117,20 +117,12 @@ class ViewDriverAdapter(ViewHandler):
     async def on_session_start(self, session_id: Optional[str] = None) -> None:
         """Handle session start - delegates state reset to driver."""
         if hasattr(self._driver, 'on_session_start'):
-            # FSViewDriver might not support session_id yet, but we'll adapt it later if needed
-            # For now, ViewDriverAdapter just passes it along
-            try:
-                await self._driver.on_session_start(session_id=session_id)
-            except TypeError:
-                await self._driver.on_session_start()
+             await self._driver.on_session_start(session_id=session_id)
     
     async def on_session_close(self, session_id: Optional[str] = None) -> None:
         """Handle session close."""
         if hasattr(self._driver, 'on_session_close'):
-            try:
-                await self._driver.on_session_close(session_id=session_id)
-            except TypeError:
-                await self._driver.on_session_close()
+             await self._driver.on_session_close(session_id=session_id)
     
     async def handle_audit_start(self) -> None:
         """Handle audit start."""

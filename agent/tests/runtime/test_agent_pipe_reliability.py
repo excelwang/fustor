@@ -38,7 +38,7 @@ def reliability_config():
     }
 
 def test_backoff_calculation():
-    pipe = AgentPipe("test", "t1", {
+    pipe = AgentPipe("test", {
         "error_retry_interval": 1.0, 
         "backoff_multiplier": 2.0, 
         "max_backoff_seconds": 10.0
@@ -51,7 +51,7 @@ def test_backoff_calculation():
     assert pipe._calculate_backoff(10) == 10.0 # Maxed out
 
 def test_handle_loop_error_counter(mock_source, mock_sender, reliability_config):
-    pipe = AgentPipe("test", "t1", reliability_config, mock_source, mock_sender)
+    pipe = AgentPipe("test", reliability_config, mock_source, mock_sender)
     
     backoff = pipe._handle_loop_error(Exception("Test 1"), "test-loop")
     assert pipe._consecutive_errors == 1
@@ -69,7 +69,7 @@ def test_handle_loop_error_counter(mock_source, mock_sender, reliability_config)
 @pytest.mark.asyncio
 async def test_heartbeat_loop_uses_backoff(mock_source, mock_sender, reliability_config, mocker):
     mock_sender.send_heartbeat.side_effect = Exception("HB error")
-    pipe = AgentPipe("test", "t1", reliability_config, mock_source, mock_sender)
+    pipe = AgentPipe("test", reliability_config, mock_source, mock_sender)
     await pipe.on_session_created("sess-1", role="leader", session_timeout_seconds=0.3)
     
     # Mock sleep to capture backoff value
@@ -94,7 +94,7 @@ async def test_heartbeat_loop_uses_backoff(mock_source, mock_sender, reliability
 @pytest.mark.asyncio
 async def test_audit_loop_uses_backoff(mock_source, mock_sender, reliability_config, mocker):
     # Simulating leader role so it enters the try block
-    pipe = AgentPipe("test", "t1", reliability_config, mock_source, mock_sender)
+    pipe = AgentPipe("test", reliability_config, mock_source, mock_sender)
     pipe.current_role = "leader"
     pipe._set_state(PipeState.RUNNING)
     
@@ -130,7 +130,7 @@ async def test_audit_loop_uses_backoff(mock_source, mock_sender, reliability_con
     assert pipe._consecutive_errors >= 1
 
 def test_alert_threshold(mock_source, mock_sender, reliability_config, caplog):
-    pipe = AgentPipe("test", "t1", reliability_config, mock_source, mock_sender)
+    pipe = AgentPipe("test", reliability_config, mock_source, mock_sender)
     
     # 1. Error 1 & 2 -> no warning
     pipe._handle_loop_error(Exception("E1"), "test")
@@ -143,7 +143,7 @@ def test_alert_threshold(mock_source, mock_sender, reliability_config, caplog):
 
 @pytest.mark.asyncio
 async def test_heartbeat_recovery_resets_counter(mock_source, mock_sender, reliability_config, mocker):
-    pipe = AgentPipe("test", "t1", reliability_config, mock_source, mock_sender)
+    pipe = AgentPipe("test", reliability_config, mock_source, mock_sender)
     await pipe.on_session_created("sess-1", role="leader", session_timeout_seconds=0.3)
     pipe._consecutive_errors = 5
     

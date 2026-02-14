@@ -17,7 +17,6 @@ class TestAgentPipeResume:
     def agent_pipe(self, mock_source, mock_sender_with_index, pipe_config):
         return AgentPipe(
             pipe_id="test-resume-pipe",
-            task_id="agent:test-resume",
             config=pipe_config,
             source_handler=mock_source,
             sender_handler=mock_sender_with_index

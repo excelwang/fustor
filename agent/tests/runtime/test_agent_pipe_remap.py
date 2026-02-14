@@ -30,7 +30,6 @@ def new_mock_bus():
 def agent_pipe(mock_source, mock_sender, pipe_config, mock_bus):
     return AgentPipe(
         pipe_id="test-pipe",
-        task_id="agent1:test-pipe",
         config=pipe_config,
         source_handler=mock_source,
         sender_handler=mock_sender,
@@ -105,7 +104,6 @@ class TestRemapToNewBus:
         # Create pipe without bus
         pipe = AgentPipe(
             pipe_id="test-pipe-no-bus",
-            task_id="agent1:test-pipe-no-bus",
             config=pipe_config,
             source_handler=mock_source,
             sender_handler=mock_sender,

@@ -24,7 +24,7 @@ def mock_pipe():
     }
     source_h = MagicMock()
     sender_h = AsyncMock()
-    pipe = AgentPipe("test-pipe", "agent:test-pipe", config, source_h, sender_h)
+    pipe = AgentPipe("test-pipe", config, source_h, sender_h)
     pipe.session_id = "s123"
     pipe.state = PipeState.RUNNING
     return pipe

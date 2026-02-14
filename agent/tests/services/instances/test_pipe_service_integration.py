@@ -3,6 +3,7 @@ import pytest
 from pathlib import Path
 import time
 import logging
+from unittest.mock import MagicMock, Mock, patch, AsyncMock
 
 from fustor_agent.runtime import AgentPipe
 from fustor_agent.services.drivers.source_driver import SourceDriverService
@@ -45,12 +46,14 @@ def integration_configs(tmp_path: Path):
 class MockSenderDriver:
     """Mock for EchoDriver to avoid real network if any, though Echo is usually local."""
     def __init__(self, **kwargs):
-        self.id = "mock"
+        self.id = kwargs.get("sender_id", "mock")
+        self.endpoint = kwargs.get("endpoint", "http://localhost:8080")
         self.config = {}
     async def connect(self): pass
     async def close(self): pass
-    async def create_session(self, task_id): return {"session_id": "s1", "role": "leader"}
-    async def heartbeat(self): return {"role": "leader"}
+    async def create_session(self, task_id, **kwargs): 
+        return {"session_id": "s1", "role": "leader"}
+    async def heartbeat(self, **kwargs): return {"role": "leader"}
     async def send_events(self, events, source_type="message", is_end=False, metadata=None): return {"success": True}
     async def close_session(self): pass
 
@@ -86,9 +89,34 @@ async def test_pipe_instance_service_integration(integration_configs, tmp_path: 
         sender_cfg_svc = SenderConfigService(app_config)
         pipe_cfg_svc = PipeConfigService(app_config, source_cfg_svc, sender_cfg_svc)
         
-        source_dr_svc = SourceDriverService()
-        sender_dr_svc = SenderDriverService()
-        bus_svc = EventBusService(source_configs={"test_source": source_config}, source_driver_service=source_dr_svc)
+        # Patch discovery before creating services
+        with patch.object(SourceDriverService, "_discover_installed_drivers", return_value={}), \
+             patch.object(SenderDriverService, "_discover_installed_drivers", return_value={"echo": MockSenderDriver}):
+            
+            source_dr_svc = SourceDriverService()
+            sender_dr_svc = SenderDriverService()
+            
+            # Define a mock source driver class
+            class MockSourceDriver:
+                def __init__(self, id, config):
+                    self.id = id
+                    self.config = config
+                    self.schema_name = "fs"
+                    self.is_transient = True
+                    self.logger = logging.getLogger("mock_source")
+                async def connect(self): pass
+                async def close(self): pass
+                async def get_events(self, **kwargs): return []
+                async def get_snapshot(self, **kwargs): return []
+                def is_position_available(self, position): return True
+                def get_message_iterator(self, **kwargs): return iter([])
+                def get_snapshot_iterator(self, **kwargs): return iter([])
+
+            # Mock driver discovery to return our mock classes
+            source_dr_svc._get_driver_by_type = MagicMock(return_value=MockSourceDriver)
+            sender_dr_svc._get_driver_by_type = MagicMock(return_value=MockSenderDriver)
+
+            bus_svc = EventBusService(source_configs={"test_source": source_config}, source_driver_service=source_dr_svc)
         
         service = PipeInstanceService(
             pipe_config_service=pipe_cfg_svc,
@@ -97,7 +125,6 @@ async def test_pipe_instance_service_integration(integration_configs, tmp_path: 
             bus_service=bus_svc,
             sender_driver_service=sender_dr_svc,
             source_driver_service=source_dr_svc,
-            agent_id="test-agent"
         )
 
         # Prepare some data

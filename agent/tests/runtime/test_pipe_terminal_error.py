@@ -30,7 +30,7 @@ def pipe_with_low_max_errors():
         "max_consecutive_errors": 3,
         "batch_size": 10,
     }
-    pipe = AgentPipe("test-pipe", "agent:pipe", config, src, snd)
+    pipe = AgentPipe("test-pipe", config, src, snd)
     return pipe, src, snd
 
 
