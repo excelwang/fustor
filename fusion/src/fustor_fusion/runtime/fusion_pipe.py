@@ -111,6 +111,9 @@ class FusionPipe(FustorPipe):
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
         self._queue_drained = asyncio.Event()  # Signaled when queue becomes empty
         self._queue_drained.set()  # Initially empty
+        self._lock = asyncio.Lock()
+        self._active_pushes = 0
+        self._cached_leader_session = None
         
         # Statistics
         self.statistics = {
@@ -241,8 +244,8 @@ class FusionPipe(FustorPipe):
         # 2. Stop all handlers
         for h_id, handler in self._view_handlers.items():
             try:
-                if hasattr(handler, 'stop'):
-                    await handler.stop()
+                if hasattr(handler, 'close'):
+                    await handler.close()
             except Exception as e:
                 logger.error(f"Error stopping handler {h_id}: {e}")
                 

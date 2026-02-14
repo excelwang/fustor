@@ -30,5 +30,6 @@ def pipe_config():
         "role_check_interval": 0.1,
         "follower_standby_interval": 0.1,
         "error_retry_interval": 0.1,
+        "data_supervisor_interval": 0.1,
         "session_timeout_seconds": 0.3,
     }

@@ -121,6 +121,9 @@ class PipeSessionBridge:
         self._pipe = pipe
         self._session_manager = session_manager
         
+        # Link bridge back to pipe for role lookups
+        pipe.session_bridge = self
+        
         # New State Management (GAP-4)
         self.store = PipeSessionStore(str(pipe.view_id))
         
