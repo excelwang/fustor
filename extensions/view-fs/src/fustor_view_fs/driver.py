@@ -58,7 +58,7 @@ class FSViewDriver(FSViewBase):
         async with self._global_read_lock():
             return self.arbitrator.cleanup_expired_suspects()
 
-    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+    async def resolve_session_role(self, session_id: str, **kwargs) -> Dict[str, Any]:
         """
         Determine session role with standard (global) leader election.
         """
@@ -77,7 +77,7 @@ class FSViewDriver(FSViewBase):
             "election_key": self.view_id
         }
 
-    async def on_session_start(self, session_id: Optional[str] = None):
+    async def on_session_start(self, **kwargs):
         """Handles new session lifecycle."""
         async with self._global_exclusive_lock():
             # If we were in an audit, it's now invalid
@@ -91,7 +91,7 @@ class FSViewDriver(FSViewBase):
             
             self.logger.debug(f"New session sequence started. Cleared audit buffer and blind-spot lists.")
 
-    async def on_session_close(self, session_id: Optional[str] = None):
+    async def on_session_close(self, **kwargs):
         """
         Handle individual session close.
         

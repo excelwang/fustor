@@ -298,6 +298,8 @@ class ForestFSViewDriver(ViewDriver):
              self._session_to_pipe[session_id] = pipe_id
              tree = await self._get_or_create_tree(pipe_id)
              await tree.on_session_start(**kwargs)
+        else:
+             self.logger.warning(f"ForestView {self.view_id}: session {session_id} has no pipe_id mapping, cannot route to tree.")
 
     async def on_session_close(self, **kwargs):
         """Delegate session close and cleanup mapping."""
@@ -313,7 +315,7 @@ class ForestFSViewDriver(ViewDriver):
     
     async def on_snapshot_complete(self, session_id: str, **kwargs) -> None:
         """Mark scoped view key for this session's sub-tree."""
-        pipe_id = kwargs.get("metadata", {}).get("pipe_id") or self._session_to_pipe.get(session_id)
+        pipe_id = (kwargs.get("metadata") or {}).get("pipe_id") or self._session_to_pipe.get(session_id)
         if pipe_id:
             from fustor_fusion.view_state_manager import view_state_manager
             scoped_key = f"{self.view_id}:{pipe_id}"

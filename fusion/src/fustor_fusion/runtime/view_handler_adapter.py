@@ -108,10 +108,10 @@ class ViewDriverAdapter(ViewHandler):
         """
         return await self._driver.get_data_view(**kwargs)
 
-    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+    async def resolve_session_role(self, session_id: str, **kwargs) -> Dict[str, Any]:
         """Delegate session role resolution to driver."""
         if hasattr(self._driver, 'resolve_session_role'):
-            return await self._driver.resolve_session_role(session_id, pipe_id)
+            return await self._driver.resolve_session_role(session_id, **kwargs)
         return {"role": "leader"}
     
     async def on_session_start(self, **kwargs) -> None:

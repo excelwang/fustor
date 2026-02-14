@@ -235,7 +235,7 @@ class PipeSessionBridge:
             if view_handler:
                  try:
                      # Re-run election logic via handler
-                     res = await view_handler.resolve_session_role(session_id, getattr(self._pipe, 'pipe_id', None))
+                     res = await view_handler.resolve_session_role(session_id, pipe_id=getattr(self._pipe, 'pipe_id', None))
                      is_leader = (res.get("role") == "leader")
                      election_key = res.get("election_key", view_id)
                      

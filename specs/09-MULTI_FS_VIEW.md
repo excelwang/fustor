@@ -24,13 +24,13 @@
 | 每个 NFS 写入速率 | ~1000 events/s |
 | 总内存占用（所有 View） | ~50GB |
 
-### 1.3 关键约束: 来源识别
+### 1.3 来源识别
 
 在多 Agent 汇聚到同一 View (N:1) 的场景下，Fusion 必须能够区分每个文件/事件的具体来源 Agent。
 
-- **强制要求**: 每个 Agent **必须**在配置文件中显式设置唯一的 `agent_id`。
-- **机制**: Fusion 会话建立时会传输 `agent_id`，并将其作为元数据 (`last_agent_id`) 附加到文件节点上。
-- **目的**: 即使多个 Agent 向同一个 View 推送数据（共享 View ID），系统也能通过 `agent_id` 精确区分数据来源，防止数据混淆并支持血缘追踪。
+- **标识机制**: 每个 Agent 必须拥有全局唯一的 `agent_id`。
+- **自动检测**: Agent 默认会根据出站流量自动检测本地 IP 作为 `agent_id`。
+- **目的**: 即使多个 Agent 向同一个 View 推送数据（共享 View ID），系统也能通过 `agent_id` 精确区分数据来源，支持血缘追踪。
 
 ---
 
@@ -220,11 +220,67 @@ pipes:
 
 Forest View 实际上是一个 View 容器，因此 Session 管理权必须下放：
 
-- **Delegation**: `FusionPipe` -> `PipeSessionBridge` -> `ViewHandler.on_session_created()` -> `ViewDriver.on_session_created()`
-- **Scoped Election**: `ForestFSViewDriver` 实现 `on_session_created`，根据传入的 `pipe_id` 构建 scoped election key (`{view_id}:{pipe_id}`)，确保每棵子树有独立的 Leader。
+- **Delegation**: `FusionPipe` -> `PipeSessionBridge` -> `ViewHandler.resolve_session_role()` -> `ViewDriver.resolve_session_role()`
+- **Scoped Election**: `ForestFSViewDriver` 实现 `resolve_session_role`，从 `**kwargs` 中提取 `pipe_id`，构建 scoped election key (`{view_id}:{pipe_id}`)，确保每棵子树有独立的 Leader。
+- **Lifecycle 通知**: `on_session_start(**kwargs)` / `on_session_close(**kwargs)` 由 `FusionPipe` 广播，ForestView 从 kwargs 中提取 `session_id` 和 `pipe_id` 进行内部路由，标准 View 忽略这些额外参数。
+- **Snapshot 完成**: `on_snapshot_complete(session_id, **kwargs)` 由 `FusionPipe` 在 snapshot 结束时通知所有 handler。ForestView 在此回调中标记 scoped key（`{view_id}:{pipe_id}`），标准 View 无需实现此方法。
 - **Cleanup**: `PipeSessionBridge` 负责根据 cache 清理所有相关的 election keys，无需感知具体策略。
 
-### 5.2 `get_subtree_stats(path)` 方法
+### 5.3 标准层解耦契约 (`**kwargs` 穿透模式)
+
+Forest View 的路由需求（`session_id`, `pipe_id`）不得侵入标准层。标准层只传递上下文，不解读它。
+
+#### 5.3.1 核心接口签名
+
+`core/drivers.py` 中的 `ViewDriver` 基类定义宽松的 `**kwargs` 接口：
+
+```python
+# 标准层只传递上下文，不解读它
+class ViewDriver:
+    async def on_session_start(self, **kwargs): pass
+    async def on_session_close(self, **kwargs): pass
+    async def resolve_session_role(self, session_id: str, **kwargs) -> Dict[str, Any]: ...
+    async def on_snapshot_complete(self, session_id: str, **kwargs) -> None: pass
+```
+
+- **标准 View** (`FSViewDriver`): 签名匹配 `**kwargs`，但函数体不使用这些参数。
+- **Forest View** (`ForestFSViewDriver`): 从 `kwargs` 中提取 `session_id`, `pipe_id` 进行内部路由。
+
+#### 5.3.2 Adapter 层穿透规则
+
+`ViewDriverAdapter` 和 `ViewManagerAdapter` 必须透传 `**kwargs`，**不得将 kwargs 拆解为 positional 参数**再传递：
+
+```python
+# ✅ 正确: 透传 **kwargs
+async def resolve_session_role(self, session_id: str, **kwargs):
+    return await self._driver.resolve_session_role(session_id, **kwargs)
+
+# ❌ 错误: 拆解为 positional 参数，会导致接收端 kwargs.get("pipe_id") 取不到值
+async def resolve_session_role(self, session_id: str, pipe_id=None):
+    return await self._driver.resolve_session_role(session_id, pipe_id)
+```
+
+#### 5.3.3 Handler 查找规则
+
+`FusionPipe` 提供 `find_handler_for_view(view_id)` 方法，按 view_id 语义查找 handler，**不依赖 handler_id 命名规则**（如 `view-manager-{view_id}` 前缀）：
+
+```python
+# ✅ 正确: 按语义查找
+handler = self._pipe.find_handler_for_view(view_id)
+
+# ❌ 错误: 硬编码命名前缀
+handler = self._pipe.get_view_handler(f"view-manager-{view_id}")
+```
+
+#### 5.3.4 禁止事项 (Anti-patterns)
+
+| 禁止 | 原因 | 正确做法 |
+|:---|:---|:---|
+| 在 `FusionPipe` 中写 scoped snapshot key | 将 Forest 细节泄漏到标准层 | 通知 `handler.on_snapshot_complete()`，由 Forest 自行处理 |
+| 在 `FusionPipe._dispatch_to_handlers` 中注入 `pipe_id` 到 event metadata | Agent 端已在 metadata 中设置 pipe_id | 不需要 Fusion 端重复注入 |
+| 在 `SessionBridge` 中猜测 handler_id 前缀 | 将 Adapter 内部命名规则泄漏到 Bridge | 使用 `find_handler_for_view()` |
+
+### 5.4 `get_subtree_stats(path)` 方法
 
 需要在 `FSViewDriver` 上新增一个**只读查询方法**（不影响现有逻辑）：
 
@@ -235,7 +291,7 @@ async def get_subtree_stats(self, path: str) -> Dict[str, Any]:
     # → file_count, dir_count, total_size, latest_mtime
 ```
 
-### 5.3 性能保证
+### 5.5 性能保证
 
 | 操作 | 复杂度 | 预期延迟 |
 |:---|:---|:---|
@@ -243,7 +299,7 @@ async def get_subtree_stats(self, path: str) -> Dict[str, Any]:
 | `/tree` (depth=1) | O(直接子节点数) × 1 (并发) | <10ms |
 | `/tree` (全量) | O(子树节点数) × 1 (并发序列化) | 取决于子树大小 |
 
-### 5.4 包结构
+### 5.6 包结构
 
 ```
 extensions/

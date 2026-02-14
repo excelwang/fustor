@@ -161,7 +161,7 @@ class FusionPipe(Pipe):
                 return handler
             
             # Check config (ViewHandler base)
-            if handler.config and handler.config.get('view_id') == view_id:
+            if isinstance(handler.config, dict) and handler.config.get('view_id') == view_id:
                 return handler
                 
         return None
