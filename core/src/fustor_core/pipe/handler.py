@@ -165,6 +165,15 @@ class ViewHandler(Handler):
         """
         raise NotImplementedError
     
+    async def on_session_created(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Handle session creation and determine role.
+        
+        Returns:
+            Dict with 'role', etc.
+        """
+        return {"role": "leader"}
+    
     async def on_session_start(self) -> None:
         """Called when a new Agent session starts."""
         pass

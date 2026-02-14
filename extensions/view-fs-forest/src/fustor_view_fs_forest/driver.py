@@ -23,7 +23,7 @@ class ForestFSViewDriver(ViewDriver):
       (Consistency, Audit, Tombstones) but scoped to that pipe's data stream.
     """
     target_schema = "fs"
-    use_scoped_session_leader = True  # Opt-in for SessionBridge per-pipe election
+    # Removed use_scoped_session_leader flag as logic is now internal
 
     def __init__(self, id: str, view_id: str, config: Optional[Dict[str, Any]] = None):
         super().__init__(id, view_id, config)
@@ -41,6 +41,28 @@ class ForestFSViewDriver(ViewDriver):
         """Initialize the forest driver itself."""
         # Nothing specific to init for the forest container yet.
         pass
+
+    async def on_session_created(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Handle session creation with SCOPED leader election (per-tree).
+        """
+        from fustor_fusion.view_state_manager import view_state_manager
+        election_id = f"{self.view_id}:{pipe_id}"
+            
+        # Register session mapping internally
+        if pipe_id:
+             # Ensure tree exists so it's ready for events
+             await self._get_or_create_tree(pipe_id)
+
+        is_leader = await view_state_manager.try_become_leader(election_id, session_id)
+        
+        if is_leader:
+            await view_state_manager.set_authoritative_session(election_id, session_id)
+            
+        return {
+            "role": "leader" if is_leader else "follower",
+            "election_key": election_id
+        }
 
     async def process_event(self, event: Any) -> bool:
         """

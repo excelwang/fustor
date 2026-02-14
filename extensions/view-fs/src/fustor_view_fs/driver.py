@@ -58,6 +58,25 @@ class FSViewDriver(FSViewBase):
         async with self._global_read_lock():
             return self.arbitrator.cleanup_expired_suspects()
 
+    async def on_session_created(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Handle session creation with standard leader election.
+        """
+        from fustor_fusion.view_state_manager import view_state_manager
+        
+        # Standard View behavior: Use the global view_id for election
+        is_leader = await view_state_manager.try_become_leader(self.view_id, session_id)
+        
+        if is_leader:
+            await view_state_manager.set_authoritative_session(self.view_id, session_id)
+            # Lock for concurrent push if needed (typically handled by bridge based on pipe config, 
+            # but we can enforce it here if strictly required by driver)
+            
+        return {
+            "role": "leader" if is_leader else "follower",
+            "election_key": self.view_id
+        }
+
     async def on_session_start(self):
         """Handles new session lifecycle."""
         async with self._global_exclusive_lock():

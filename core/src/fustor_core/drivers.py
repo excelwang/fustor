@@ -109,11 +109,21 @@ class ViewDriver(ABC):
         """Periodic cleanup hook for time-sensitive data. Optional."""
         pass
 
-    async def close(self):
+
+    async def on_session_created(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Optional: Gracefully closes any open resources.
+        Calculates session role and metadata.
+        
+        Args:
+            session_id: The ID of the session being created
+            pipe_id: Optional pipe ID for scoped logic (e.g. Forest View)
+            
+        Returns:
+            Dict containing 'role' (leader/follower) and other metadata.
+            Default implementation returns leader role (no election).
         """
-        pass
+        return {"role": "leader"}
+
 
 
 

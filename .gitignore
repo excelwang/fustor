@@ -8,7 +8,8 @@ wheels/
 .pytest_cache
 fustor-benchmark-run
 # Virtual environments
-.venv
+.venv/
+venv/
 
 config.yaml
 .env
