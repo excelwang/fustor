@@ -135,15 +135,12 @@ class FusionPipeManager:
                     continue
 
                 # 3. Create FusionPipe
-                # Determine primary view ID for session leadership
-                primary_view_id = p_id 
-                if p_cfg.views:
-                     primary_view_id = p_cfg.views[0]
-
+                view_ids = list(resolved['views'].keys())
+                
                 fusion_pipe = FusionPipe(
                     pipe_id=p_id,
                     config={
-                        "view_id": primary_view_id,
+                        "view_ids": view_ids,
                         "allow_concurrent_push": p_cfg.allow_concurrent_push,
                         "session_timeout_seconds": p_cfg.session_timeout_seconds
                     },
@@ -279,6 +276,19 @@ class FusionPipeManager:
 
         logger.info("Fusion configuration reload complete.")
 
+    def resolve_pipes_for_view(self, view_id: str) -> List[str]:
+        """
+        Maps a View ID to a list of Pipe IDs that service it.
+        This uses a linear search through active pipes to find all pipes
+        that list the view_id in their handlers.
+        """
+        pipe_ids = []
+        for p_id, pipe in self._pipes.items():
+            if pipe.find_handler_for_view(view_id):
+                pipe_ids.append(p_id)
+        
+        return pipe_ids
+
     def get_pipes(self) -> Dict[str, FusionPipe]:
         return self._pipes.copy()
 
@@ -312,10 +322,11 @@ class FusionPipeManager:
         fusion_pipe = self._pipes.get(p_id)
         if not fusion_pipe: raise ValueError(f"FusionPipe {p_id} not found")
         
-        # Check for duplicate task ID in this view
+        # Check for duplicate task ID across all views served by this pipe
         from ..api.session import _check_duplicate_task
-        if await _check_duplicate_task(fusion_pipe.view_id, task_id):
-             raise ValueError(f"Task {task_id} already active on view {fusion_pipe.view_id}")
+        for vid in fusion_pipe.view_ids:
+            if await _check_duplicate_task(vid, task_id):
+                 raise ValueError(f"Task {task_id} already active on view {vid}")
 
         bridge = self._bridges.get(p_id)
         

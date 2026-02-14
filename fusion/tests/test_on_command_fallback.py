@@ -57,8 +57,9 @@ async def test_on_command_fallback_logic():
     
     # Mock pipe manager
     with patch("fustor_fusion.runtime_objects.pipe_manager") as mock_pm:
-        mock_pm.get_pipe.return_value = mock_pipe
-        mock_pm.get_bridge.return_value = mock_bridge
+        mock_pm.resolve_pipes_for_view.return_value = ["pipe-1"]
+        mock_pm.get_pipe.side_effect = lambda pid: mock_pipe if pid == "pipe-1" else None
+        mock_pm.get_bridge.side_effect = lambda pid: mock_bridge if pid == "pipe-1" else None
         
         # Execute
         result = await on_command_fallback(view_id, {"path": "/foo"})
@@ -68,7 +69,8 @@ async def test_on_command_fallback_logic():
         assert len(result["entries"]) == 1
         assert result["entries"][0]["name"] == "foo.txt"
         assert result["metadata"]["source"] == "remote_fallback"
-        assert result["metadata"]["agent_id"] == "agent-1"
+        assert result["metadata"]["pipes_queried"] == 1
+        assert result["metadata"]["successful_pipes"] == 1
         
         # Verify bridge call
         mock_bridge.send_command_and_wait.assert_called_once()
@@ -90,8 +92,10 @@ async def test_on_command_fallback_no_session():
     mock_bridge.get_all_sessions.return_value = {} # No active sessions
     
     with patch("fustor_fusion.runtime_objects.pipe_manager") as mock_pm:
+        mock_pm.resolve_pipes_for_view.return_value = ["pipe-1"]
         mock_pm.get_pipe.return_value = mock_pipe
         mock_pm.get_bridge.return_value = mock_bridge
         
-        with pytest.raises(RuntimeError, match="No active sessions"):
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException, match="Fallback command failed"):
             await on_command_fallback(view_id, {})

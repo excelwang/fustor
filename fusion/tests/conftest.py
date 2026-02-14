@@ -5,7 +5,7 @@ from unittest.mock import patch, MagicMock
 import asyncio
 
 from fustor_fusion.main import app
-from fustor_fusion.api.session import get_view_id_from_api_key  # Using view_id internally
+from fustor_fusion.auth.dependencies import get_view_id_from_api_key  # Using view_id internally
 
 @pytest.fixture(scope="session", autouse=True)
 def prevent_logging_reconfiguration():

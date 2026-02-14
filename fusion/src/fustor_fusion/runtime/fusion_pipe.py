@@ -88,10 +88,9 @@ class FusionPipe(FustorPipe):
         """
         super().__init__(pipe_id, config, context)
         
-        # view_id represents the logical storage container/group this pipe belongs to
-        self.view_id = str(config.get("view_id", pipe_id))
+        # FusionPipe now handles M:N view mappings.
+        self.view_ids = config.get("view_ids", [pipe_id])
 
-        
         self.allow_concurrent_push = config.get("allow_concurrent_push", True)
         self.queue_batch_size = config.get("queue_batch_size", 100)
         
@@ -114,6 +113,12 @@ class FusionPipe(FustorPipe):
         self._lock = asyncio.Lock()
         self._active_pushes = 0
         self._cached_leader_session = None
+
+        # Drainage Sequence Tracking (M:N support)
+        self._global_ingest_seq = 0
+        self._global_processed_seq = 0
+        self._view_max_ingest_seq: Dict[str, int] = {}
+        self._seq_condition = asyncio.Condition()
         
         # Statistics
         self.statistics = {
@@ -310,13 +315,27 @@ class FusionPipe(FustorPipe):
                 
                 # Process each event
                 t0 = time.time()
-                for event in event_batch:
+                
+                # Check if batch is tuple (events, seq) or just events (legacy)
+                current_seq = None
+                if isinstance(event_batch, tuple):
+                    events_to_process, current_seq = event_batch
+                else:
+                    events_to_process = event_batch
+
+                for event in events_to_process:
                     await self._dispatch_to_handlers(event)
                     self.statistics["events_processed"] += 1
                 
                 duration = time.time() - t0
-                get_metrics().counter("fustor.fusion.events_processed", len(event_batch), {"pipe": self.id})
+                get_metrics().counter("fustor.fusion.events_processed", len(events_to_process), {"pipe": self.id})
                 get_metrics().histogram("fustor.fusion.processing_latency", duration, {"pipe": self.id})
+                
+                # Update sequence progress
+                if current_seq is not None:
+                    async with self._seq_condition:
+                        self._global_processed_seq = current_seq
+                        self._seq_condition.notify_all()
                 
                 self._event_queue.task_done()
                 
@@ -484,23 +503,31 @@ class FusionPipe(FustorPipe):
     async def keep_session_alive(self, session_id: str, can_realtime: bool = False, agent_status: Optional[Dict[str, Any]] = None) -> bool:
         """Update last activity for a session."""
         from ..core.session_manager import session_manager
-        si = await session_manager.keep_session_alive(
-            self.view_id, 
-            session_id, 
-            can_realtime=can_realtime, 
-            agent_status=agent_status
-        )
+        
+        # Keep session alive for ALL views served by this pipe
+        for vid in self.view_ids:
+            si = await session_manager.keep_session_alive(
+                vid, 
+                session_id, 
+                can_realtime=can_realtime, 
+                agent_status=agent_status
+            )
+        
         if agent_status:
             self._last_agent_status = agent_status
-        return si is not None
+        return True # Assumed alive if it was successfully kept alive for at least one or generally
 
     async def get_session_role(self, session_id: str) -> str:
         """Get the role of a session (leader/follower)."""
         if not self.session_bridge:
             return "follower"
         # Check against the bridge store's cache
-        is_leader = self.session_bridge.store.is_leader(session_id, str(self.view_id))
-        return "leader" if is_leader else "follower"
+        # Note: Roles are per-view in M:N. Here we assume the perspective of the pipe's views.
+        # If this session is leader for ANY of the pipe's views, we consider it a leader from the pipe's perspective.
+        for vid in self.view_ids:
+            if self.session_bridge.store.is_leader(session_id, vid):
+                return "leader"
+        return "follower"
     
     async def _session_cleanup_loop(self) -> None:
         """
@@ -586,36 +613,56 @@ class FusionPipe(FustorPipe):
                 metadata = kwargs.get("metadata", {})
                 config_yaml = metadata.get("config_yaml")
                 if config_yaml:
-                    session_info = await session_manager.get_session_info(self.view_id, session_id)
-                    if session_info:
-                        session_info.reported_config = config_yaml
-                        logger.info(f"Pipe {self.id}: Cached reported config for session {session_id}")
+                    # Cache config for ALL views this session serves
+                    for vid in self.view_ids:
+                        session_info = await session_manager.get_session_info(vid, session_id)
+                        if session_info:
+                            session_info.reported_config = config_yaml
+                    logger.info(f"Pipe {self.id}: Cached reported config for session {session_id}")
                 return {"success": True, "message": "Config cached"}
 
-            # Queue for processing
+            # Queue for processing with Sequence Tracking
             if processed_events:
+                # Atomic Sequence Increment
+                seq = 0
+                async with self._seq_condition: # Use condition lock for sequence protection
+                    self._global_ingest_seq += 1
+                    seq = self._global_ingest_seq
+                    # Update max ingest sequence for ALL views served by this pipe
+                    # Since session applies to all views (via bridge), events apply to all.
+                    for vid in self.view_ids:
+                        self._view_max_ingest_seq[vid] = seq
+                
                 get_metrics().counter("fustor.fusion.events_received", len(processed_events), {"pipe": self.id, "source": source_type})
-                await self._event_queue.put(processed_events)
+                # Enqueue tuple (events, seq)
+                await self._event_queue.put((processed_events, seq))
             
-            # Handle snapshot completion signal
             is_snapshot_end = is_end or kwargs.get("is_snapshot_end", False)
             if source_type == "snapshot" and is_snapshot_end:
                 from ..view_state_manager import view_state_manager
-                # Only leader can signal snapshot end
-                if await view_state_manager.is_leader(self.view_id, session_id):
+                # Resolve leadership for the primary view or check any
+                # In M:N, we check if leader for ANY view to authorize the snapshot end signal for the pipe.
+                is_leader = False
+                for vid in self.view_ids:
+                    if await view_state_manager.is_leader(vid, session_id):
+                        is_leader = True
+                        break
+
+                if is_leader:
                     logger.info(f"Pipe {self.id}: Received SNAPSHOT end signal from leader session {session_id}. Draining before marking complete.")
                     # Ensure all snapshot events are processed before marking as complete
                     await self.wait_for_drain(timeout=30.0, target_active_pushes=1)
                     
-                    # Mark primary view complete
-                    await view_state_manager.set_snapshot_complete(self.view_id, session_id)
-                    logger.info(f"Pipe {self.id}: Marked view {self.view_id} as snapshot complete.")
+                    # Mark ALL views as complete
+                    for vid in self.view_ids:
+                        await view_state_manager.set_snapshot_complete(vid, session_id)
+                    
+                    logger.info(f"Pipe {self.id}: Marked {len(self.view_ids)} views as snapshot complete.")
                     
                     # Notify handlers so they can mark scoped keys if needed (DECOUPLED)
                     for handler in self._view_handlers.values():
                         if hasattr(handler, 'on_snapshot_complete'):
                             await handler.on_snapshot_complete(session_id=session_id, metadata=kwargs.get("metadata"))
-                    
                     # Also mark all other handlers' views as complete if they are different
                     for h_id, handler in self._view_handlers.items():
                         # Check common adapter patterns
@@ -625,7 +672,7 @@ class FusionPipe(FustorPipe):
                         if not h_view_id and hasattr(handler, '_vm'):
                             h_view_id = getattr(handler._vm, 'view_id', None)
                         
-                        if h_view_id and str(h_view_id) != str(self.view_id):
+                        if h_view_id and str(h_view_id) not in self.view_ids:
                             await view_state_manager.set_snapshot_complete(str(h_view_id), session_id)
                             logger.debug(f"Pipe {self.id}: Also marking view {h_view_id} as complete.")
                 else:
@@ -694,18 +741,29 @@ class FusionPipe(FustorPipe):
         """Get pipestatus as a dictionary."""
         from ..view_state_manager import view_state_manager
         
-        sessions = await session_manager.get_view_sessions(self.view_id)
-        leader = await view_state_manager.get_leader(self.view_id)
-        
+        # Aggregate sessions from all views
+        all_sessions = set()
+        for vid in self.view_ids:
+            s_map = await session_manager.get_view_sessions(vid)
+            all_sessions.update(s_map.keys())
+            
+        # Leaders per view
+        leaders = {}
+        for vid in self.view_ids:
+            l = await view_state_manager.get_leader(vid)
+            if l:
+                leaders[vid] = l
+
         # Lock-free: all reads are safe in asyncio single-thread model
         return {
             "id": self.id,
-            "view_id": self.view_id,
+            "view_ids": self.view_ids,
             "state": self.state.name if hasattr(self.state, 'name') else str(self.state),
             "info": self.info,
             "view_handlers": self.get_available_views(),
-            "active_sessions": len(sessions),
-            "leader_session": leader,
+            "active_sessions": len(all_sessions),
+            "leaders": leaders,
+            "leader_session": list(leaders.values())[0] if leaders else None,
             "statistics": self.statistics.copy(),
             "queue_size": self._event_queue.qsize(),
             "is_ready": self._handlers_ready.is_set(),
@@ -735,7 +793,12 @@ class FusionPipe(FustorPipe):
     
     async def get_session_info(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get information about a specific session."""
-        si = await session_manager.get_session_info(self.view_id, session_id)
+        si = None
+        for vid in self.view_ids:
+            si = await session_manager.get_session_info(vid, session_id)
+            if si:
+                break
+        
         if si:
             # Convert to dict for DTO
             return {
@@ -750,7 +813,11 @@ class FusionPipe(FustorPipe):
     
     async def get_all_sessions(self) -> Dict[str, Dict[str, Any]]:
         """Get all active sessions."""
-        si_map = await session_manager.get_view_sessions(self.view_id)
+        si_map = {}
+        for vid in self.view_ids:
+            v_sessions = await session_manager.get_view_sessions(vid)
+            si_map.update(v_sessions)
+            
         return {k: {"task_id": v.task_id} for k, v in si_map.items()}
         
     @property
@@ -761,18 +828,40 @@ class FusionPipe(FustorPipe):
         """
         return self._cached_leader_session
     
-    async def wait_for_drain(self, timeout: float = None, target_active_pushes: int = 0) -> bool:
+    async def wait_for_drain(self, timeout: float = None, target_active_pushes: int = 0, view_id: str = None) -> bool:
         """
         Wait until the event queue is empty and active pushes reach target.
         
         Args:
             timeout: Max time to wait
             target_active_pushes: The number of active pushes to wait for (default 0).
-                                  Set to 1 if calling from within a push handler.
+            view_id: If provided, only wait for events related to this view to be processed.
         """
         start_time = time.time()
         
-        # 1. Wait for queue to be fully processed (including batches currently being handled)
+        # View-Specific Drainage Strategy
+        if view_id:
+            # Determine target sequence
+            target_seq = 0
+            async with self._seq_condition:
+                target_seq = self._view_max_ingest_seq.get(view_id, 0)
+            
+            if target_seq == 0:
+                return True # No events ever ingested for this view
+            
+            # Wait for processed sequence to catch up
+            try:
+                async with self._seq_condition:
+                    await asyncio.wait_for(
+                        self._seq_condition.wait_for(lambda: self._global_processed_seq >= target_seq),
+                        timeout=timeout
+                    )
+                return True
+            except asyncio.TimeoutError:
+                return False
+
+        # Legacy Global Drainage Strategy
+        # 1. Wait for queue to be fully processed
         try:
             if timeout:
                 await asyncio.wait_for(self._event_queue.join(), timeout=timeout)

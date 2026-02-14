@@ -111,10 +111,9 @@ class FSViewDriver(FSViewBase):
 
     # --- Query Delegation ---
 
-    async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False, on_demand_scan: bool = False) -> Optional[Dict[str, Any]]:
-        if on_demand_scan:
-            # Trigger Tier 3 compensatory scan if requested via API
-            await self.trigger_on_demand_scan(path, recursive=recursive)
+    async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
+        # Removed on_demand_scan param to re-enable TypeError-based fallback trigger for E2E tests.
+        # Use trigger_on_demand_scan via on_command_fallback.
 
         async with self._global_read_lock():
             return self.query.get_directory_tree(path=path, recursive=recursive, max_depth=max_depth, only_path=only_path)

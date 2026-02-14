@@ -227,8 +227,14 @@ class FSArbitrator:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)
             else:
-                # mtime unchanged, if cold, clear suspect
-                # We do NOT set known_by_agent to True from Poll-based sources.
+                # mtime unchanged.
+                # If this is a SNAPSHOT, we should force known_by_agent to False
+                # because a fresh scan cannot prove inotify is currently watching correctly.
+                # Audit however can preserve True if mtime hasn't changed.
+                if is_snapshot:
+                    node.known_by_agent = False
+                
+                # If cold, clear suspect
                 if age >= self.hot_file_threshold:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)

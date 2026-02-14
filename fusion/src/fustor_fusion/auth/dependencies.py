@@ -1,4 +1,4 @@
-from fastapi import Header, HTTPException, status
+from fastapi import Header, HTTPException, status, Depends
 from typing import Optional
 import logging
 
@@ -7,49 +7,53 @@ from ..config.unified import fusion_config
 logger = logging.getLogger(__name__)
 
 
-async def get_view_id_from_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")) -> str:
-    """
-    Validates API key and returns pipe/view ID.
-    
-    Priority:
-    1. Dedicated View Query Keys (views.[id].api_keys)
-    2. Receiver/Agent Push Keys (kept for backward compatibility, but limited to associated views)
-    """
+async def _get_api_key(x_api_key: Optional[str] = Header(None, alias="X-API-Key")) -> str:
     if not x_api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="X-API-Key header is missing"
         )
+    return x_api_key
 
-    logger.debug(f"Received X-API-Key: {x_api_key[:8]}...")
+async def get_view_id_from_auth(x_api_key: str = Depends(_get_api_key)) -> str:
+    """Returns the View ID authorized by this key."""
+    # 1. Check Dedicated View Keys
+    views = fusion_config.get_all_views()
+    for v_id, v_config in views.items():
+        if x_api_key in v_config.api_keys:
+            return str(v_id)
+
+    # 2. Check Receiver Keys (Receiver keys can query any view served by their pipe)
+    # Note: This returns the first view associated with the pipe for now, or we might
+    # need a more complex return. But for queries, the view_id is usually in the URL.
+    # The 'authorized_view_id' returned here is used for ownership verification.
+    receivers = fusion_config.get_all_receivers()
+    for r_id, r_config in receivers.items():
+        for ak in r_config.api_keys:
+            if ak.key == x_api_key:
+                # For a pipe key, the 'authorized identity' is the pipe_id.
+                # However, many APIs use this as a view_id for backward compatibility.
+                # We return the pipe_id but it must be matched against the view's pipe set.
+                return ak.pipe_id
     
-    try:
-        # 1. Check Dedicated View Query Keys
-        views = fusion_config.get_all_views()
-        for v_id, v_config in views.items():
-            if x_api_key in v_config.api_keys:
-                logger.debug(f"Authorized via dedicated view key for: {v_id}")
-                return str(v_id)
+    raise HTTPException(status_code=401, detail="Invalid API Key")
 
-        # 2. Fallback: Validate against all configured receivers
-        receivers = fusion_config.get_all_receivers()
-        for r_id, r_config in receivers.items():
-            for api_key_config in r_config.api_keys:
-                if api_key_config.key == x_api_key:
-                    # In Receiver/API Key config, pipe_id acts as the scoping identifier (mapped to view_id)
-                    view_id = api_key_config.pipe_id
-                    logger.debug(f"Authorized via receiver key for: {view_id}")
-                    return str(view_id)
-        
-        # If loop finishes without return
-        logger.warning(f"API Key validation failed for key: {x_api_key[:8]}...")
-    except Exception as e:
-        logger.error(f"Error validating API key: {e}", exc_info=True)
+async def get_pipe_id_from_auth(x_api_key: str = Depends(_get_api_key)) -> str:
+    """Returns the Pipe ID authorized by this key. Sessions must use this."""
+    receivers = fusion_config.get_all_receivers()
+    for r_id, r_config in receivers.items():
+        for ak in r_config.api_keys:
+            if ak.key == x_api_key:
+                logger.debug(f"Authorized Pipe: {ak.pipe_id}")
+                return ak.pipe_id
     
     raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Invalid or inactive X-API-Key"
+        status_code=403, 
+        detail="API Key is not authorized for Pipe ingestion (Sessions)."
     )
+
+# Alias for compatibility while migrating
+get_view_id_from_api_key = get_view_id_from_auth
 
 
 # All APIs must use get_view_id_from_api_key.

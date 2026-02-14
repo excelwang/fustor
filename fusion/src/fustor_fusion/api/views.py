@@ -5,6 +5,7 @@ Data Views API Router Generator.
 
 import logging
 import time
+import asyncio
 from typing import Callable, Any, Optional, Dict
 from fastapi import APIRouter, HTTPException, Depends, status
 from importlib.metadata import entry_points

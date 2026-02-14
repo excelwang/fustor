@@ -70,9 +70,10 @@ async def signal_audit_end(
         wait_tasks = []
         pipes = pm.get_pipes()
         for p in pipes.values():
-                if hasattr(p, 'view_id') and p.view_id == view_id:
-                    if hasattr(p, 'wait_for_drain'):
-                        wait_tasks.append(p.wait_for_drain(timeout=max_wait))
+            if hasattr(p, 'view_ids') and view_id in p.view_ids:
+                if hasattr(p, 'wait_for_drain'):
+                    # Pass view_id for view-aware drainage (optimized)
+                    wait_tasks.append(p.wait_for_drain(timeout=max_wait, view_id=view_id))
         
         if wait_tasks:
             logger.info(f"Waiting for {len(wait_tasks)} pipes to drain before audit end...")

@@ -17,106 +17,103 @@ logger = logging.getLogger("fustor_fusion.api.on_command")
 async def on_command_fallback(view_id: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """
     Execute a remote scan on the Agent when local view query fails.
-    
-    Args:
-        view_id: The view identifier
-        params: Query parameters (e.g., path, limit)
-        
-    Returns:
-        Formatted view data (compatible with standard view response)
-        
-    Raises:
-        Exception: If fallback also fails
     """
     start_time = time.time()
     
-    # 1. Resolve Pipe and Bridge
-    pipe_manager = runtime_objects.pipe_manager
-    if not pipe_manager:
-        raise RuntimeError("Pipe manager not initialized")
-        
-    pipe = pipe_manager.get_pipe(view_id)
-    if not pipe:
-        # Try finding by view_id if pipe_id != view_id
-        # (This is a simplification, assumes 1:1 or accessible by view_id)
-        # In V2, we might need a lookup map, but for now assuming pipe_id=view_id context
-        raise RuntimeError(f"No active pipe found for view {view_id}")
-        
-    bridge = pipe_manager.get_bridge(pipe.id)
-    if not bridge:
-        # Try to find bridge by pipe ID if pipe ID != view ID
-        bridge = pipe_manager.get_bridge(view_id)
-        if not bridge:
-             raise RuntimeError(f"No session bridge found for pipe {pipe.id}")
-
-    # 2. Find Leader Session
-    # We prefer the leader, but any active session with realtime capability works for a scan
-    leader_session_id = pipe.leader_session
-    target_session_id = leader_session_id
-    
-    if not target_session_id:
-        # Fallback: pick any active session
-        # We can implement a more sophisticated selection (e.g., lowest load) later
-        active_sessions = await bridge.get_all_sessions()
-        if active_sessions:
-            target_session_id = next(iter(active_sessions))
-            
-    if not target_session_id:
-        raise RuntimeError(f"No active sessions available for view {view_id} to execute fallback")
-
-    logger.info(f"View {view_id}: Attempting fallback command 'remote_scan' via session {target_session_id}")
-
-    # 3. Construct Command
-    # map API params to Agent command params
-    # API: path, recursive, limit, etc.
-    # Agent Command: path, max_depth, limit
-    cmd_params = {
-        "path": params.get("path", "/"),
-        "max_depth": 1 if not params.get("recursive", False) else params.get("depth", 10),
-        "limit": params.get("limit", 1000),
-        "pattern": params.get("pattern", "*")
-    }
-
-    # 4. Send and Wait
-    from ..config.unified import fusion_config
-    fallback_timeout = fusion_config.fusion.on_command_fallback_timeout
-    
     try:
-        result = await bridge.send_command_and_wait(
-            session_id=target_session_id,
-            command="scan",
-            params={**cmd_params, "job_id": str(start_time)}, # start_time as pseudo job_id
-            timeout=fallback_timeout
-        )
+        # 1. Resolve Pipes
+        pipe_manager = runtime_objects.pipe_manager
+        if not pipe_manager:
+            raise RuntimeError("Pipe manager not initialized")
+
+        p_ids = pipe_manager.resolve_pipes_for_view(view_id)
+        if not p_ids:
+            raise RuntimeError(f"No active pipes found to service view {view_id}")
+
+        # 2. Prepare Parallel Execution
+        from ..config.unified import fusion_config
+        fallback_timeout = fusion_config.fusion.on_command_fallback_timeout
+
+        async def execute_on_pipe(p_id: str) -> Optional[Dict[str, Any]]:
+            pipe = pipe_manager.get_pipe(p_id)
+            if not pipe: return None
+            
+            bridge = pipe_manager.get_bridge(p_id)
+            if not bridge: return None
+
+            # Use leader session or any active session
+            target_session_id = pipe.leader_session
+            if not target_session_id:
+                active_sessions = await bridge.get_all_sessions()
+                if active_sessions:
+                    target_session_id = next(iter(active_sessions))
+            
+            if not target_session_id:
+                return None
+
+            # Construct Command
+            cmd_params = {
+                "path": params.get("path", "/"),
+                "max_depth": 1 if not params.get("recursive", False) else params.get("depth", 10),
+                "limit": params.get("limit", 1000),
+                "pattern": params.get("pattern", "*"),
+                "job_id": str(start_time)
+            }
+
+            try:
+                result = await bridge.send_command_and_wait(
+                    session_id=target_session_id,
+                    command="scan",
+                    params=cmd_params,
+                    timeout=fallback_timeout
+                )
+                return result
+            except Exception as e:
+                logger.warning(f"Fallback failed on pipe {p_id} (session {target_session_id}): {e}")
+                return None
+
+        # 3. Dispatch and Wait
+        results = await asyncio.gather(*[execute_on_pipe(pid) for pid in p_ids])
         
-        # 5. Format Response to match View APIv1
-        # Expect result structure from agent: {"files": [...], "root": "..."}
-        # We need to wrap it to look like a standard view response
+        # 4. Aggregate Results
+        all_entries = []
+        seen_paths = set()
+        found_success = False
         
+        for res in results:
+            if res and "files" in res:
+                found_success = True
+                for entry in res["files"]:
+                    p = entry.get("path")
+                    if p not in seen_paths:
+                        all_entries.append(entry)
+                        seen_paths.add(p)
+
+        if not found_success:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Fallback command failed on all {len(p_ids)} pipes for view {view_id}"
+            )
+
         duration = time.time() - start_time
-        logger.info(f"View {view_id}: Fallback successful in {duration:.3f}s. Items: {len(result.get('files', []))}")
-        
+        logger.info(f"View {view_id}: Fallback successful using {len(p_ids)} pipes. Items: {len(all_entries)}")
+
         return {
             "path": params.get("path", "/"),
-            "entries": result.get("files", []),
+            "entries": all_entries,
             "metadata": {
-                "source": "remote_fallback", # Marker to indicate this came from fallback
+                "source": "remote_fallback",
                 "latency_ms": int(duration * 1000),
-                "agent_id": result.get("agent_id", "unknown"),
+                "pipes_queried": len(p_ids),
+                "successful_pipes": len([r for r in results if r]),
                 "timestamp": time.time()
             }
         }
-    except asyncio.TimeoutError:
-        logger.error(f"View {view_id}: Fallback TIMEOUT after {fallback_timeout}s via session {target_session_id}")
-        raise HTTPException(
-            status_code=504,
-            detail=f"Fallback command timeout: Agent {target_session_id} did not respond within {fallback_timeout}s"
-        )
     except Exception as e:
-        logger.error(f"View {view_id}: Fallback FAILED via session {target_session_id}: {e}")
+        logger.error(f"View {view_id}: Fallback FAILED: {e}")
         raise HTTPException(
             status_code=502,
-            detail=f"Fallback command failed on Agent {target_session_id}: {str(e)}"
+            detail=f"Fallback command failed on view {view_id}: {str(e)}"
         )
 
 

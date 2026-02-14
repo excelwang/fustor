@@ -35,7 +35,7 @@ Usage:
 """
 import asyncio
 import logging
-from typing import Any, Dict, Optional, TYPE_CHECKING
+from typing import Any, Dict, Optional, List, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .fusion_pipe import FusionPipe
@@ -53,8 +53,8 @@ class PipeSessionStore:
     an immediate, consistent view of active sessions and lineages.
     """
     
-    def __init__(self, view_id: str):
-        self.view_id = view_id
+    def __init__(self, view_ids: List[str]):
+        self.view_ids = view_ids
         # {session_id: {agent_id, source_uri}}
         self.lineage_cache: Dict[str, Dict[str, str]] = {}
         # {election_key: set(session_id)}
@@ -125,7 +125,7 @@ class PipeSessionBridge:
         pipe.session_bridge = self
         
         # New State Management (GAP-4)
-        self.store = PipeSessionStore(str(pipe.view_id))
+        self.store = PipeSessionStore(pipe.view_ids)
         
         # Event queue for asynchronous handler notifications in FusionPipe
         self.event_queue = asyncio.Queue()
@@ -162,16 +162,15 @@ class PipeSessionBridge:
         import time
         
         session_id = session_id or str(uuid.uuid4())
-        view_id = str(self._pipe.view_id)
         
         # Use pipe config if not explicitly overridden
         if allow_concurrent_push is None:
             allow_concurrent_push = getattr(self._pipe, 'allow_concurrent_push', True)
 
-        from fustor_fusion.view_state_manager import view_state_manager
-        
-        # Delegate election and role determination to the View Handler
-        # This decouples the bridge from specific consistency models (forest vs standard)
+        # Find a view handler that can resolve leadership.
+        # In M:N, we might have multiple handlers. We pick the first valid one or broadcast.
+        # For now, we use the first view's handler as the authoritative one for the pipe's role.
+        view_id = self._pipe.view_ids[0]
         view_handler = self._pipe.get_view_handler(view_id)
         
         # Fallback for ViewManagerAdapter which might have a prefixed handler_id
@@ -192,10 +191,10 @@ class PipeSessionBridge:
         election_key = session_result.get("election_key", view_id)
         
         # If the view decided we are leader, we might need to lock for concurrent push
-        # (The view might have already done set_authoritative_session, but bridge manages concurrency lock)
         if is_leader:
              self.store.record_leader(session_id, election_key)
              if not allow_concurrent_push:
+                 from fustor_fusion.view_state_manager import view_state_manager
                  # Check for stale lock first (GAP-1 stabilization)
                  locked_sid = await view_state_manager.get_locked_session_id(election_key)
                  if locked_sid:
@@ -215,16 +214,17 @@ class PipeSessionBridge:
                  if not locked:
                       raise ValueError(f"View {election_key} is currently locked by another session")
         
-        # Create in legacy SessionManager
-        session_entry = await self._session_manager.create_session_entry(
-            view_id=view_id,
-            session_id=session_id,
-            task_id=task_id,
-            client_ip=client_ip,
-            allow_concurrent_push=allow_concurrent_push,
-            session_timeout_seconds=session_timeout_seconds,
-            source_uri=source_uri
-        )
+        # Create in legacy SessionManager for EACH view served by this pipe
+        for vid in self._pipe.view_ids:
+            await self._session_manager.create_session_entry(
+                view_id=vid,
+                session_id=session_id,
+                task_id=task_id,
+                client_ip=client_ip,
+                allow_concurrent_push=allow_concurrent_push,
+                session_timeout_seconds=session_timeout_seconds,
+                source_uri=source_uri
+            )
         
         # Synchronously record in local store for immediate use in process_events
         lineage = {}
@@ -284,22 +284,28 @@ class PipeSessionBridge:
         Returns:
             Heartbeat response with role, tasks, etc.
         """
-        view_id = str(self._pipe.view_id)
         pipe_id = self._pipe.id
-        
+       
         # No legacy flag check needed here. 
         # Election status is maintained via _leader_cache and verified/retried below.
         
         commands = []
         
-        # 1. Update legacy SessionManager
-        alive, commands = await self._session_manager.keep_session_alive(
-            view_id=view_id,
-            session_id=session_id,
-            client_ip=client_ip,
-            can_realtime=can_realtime,
-            agent_status=agent_status
-        )
+        # 1. Update legacy SessionManager for ALL served views
+        for vid in self._pipe.view_ids:
+            alive, commands_batch = await self._session_manager.keep_session_alive(
+                view_id=vid,
+                session_id=session_id,
+                client_ip=client_ip,
+                can_realtime=can_realtime,
+                agent_status=agent_status
+            )
+            if alive:
+                # Merge commands from all views (one pipe, multiple views)
+                commands.extend(commands_batch)
+            else:
+                # If it died for one view, we might want to know, but we continue loop
+                logger.debug(f"Session {session_id} expired in SessionManager for view {vid}")
         if not alive:
             return {
                 "status": "error",
@@ -321,25 +327,25 @@ class PipeSessionBridge:
         count = self.store.record_heartbeat(session_id)
         
         if count % self._LEADER_VERIFY_INTERVAL == 0:
-            view_handler = self._pipe.get_view_handler(view_id)
-            if not view_handler:
-                view_handler = self._pipe.find_handler_for_view(view_id)
-            if view_handler:
-                 try:
-                     # Re-run election logic via handler
-                     res = await view_handler.resolve_session_role(session_id, pipe_id=self._pipe.id)
-                     is_leader = (res.get("role") == "leader")
-                     election_key = res.get("election_key", view_id)
-                     
-                     if is_leader:
-                         self.store.record_leader(session_id, election_key)
-                     else:
-                         # Demoted or failed to promote - ensure we don't have stale cache
-                         if election_key in self.store.leader_cache:
-                             self.store.leader_cache[election_key].discard(session_id)
-                             
-                 except Exception as e:
-                     logger.debug(f"Leader promotion check failed during keep_alive: {e}")
+            # Re-verify leadership for all views
+            for vid in self._pipe.view_ids:
+                view_handler = self._pipe.get_view_handler(vid)
+                if not view_handler:
+                    view_handler = self._pipe.find_handler_for_view(vid)
+                if view_handler:
+                     try:
+                         # Re-run election logic via handler
+                         res = await view_handler.resolve_session_role(session_id, pipe_id=self._pipe.id)
+                         is_l = (res.get("role") == "leader")
+                         e_key = res.get("election_key", vid)
+                         
+                         if is_l:
+                             self.store.record_leader(session_id, e_key)
+                         else:
+                             if e_key in self.store.leader_cache:
+                                 self.store.leader_cache[e_key].discard(session_id)
+                     except Exception as e:
+                         logger.debug(f"Leader promotion check failed for view {vid}: {e}")
     
         # 3. Get final status from pipe
         role = await self._pipe.get_session_role(session_id)
@@ -363,7 +369,6 @@ class PipeSessionBridge:
         Returns:
             True if successfully closed
         """
-        view_id = str(self._pipe.view_id)
         # Explicitly release leader/lock just in case terminate_session didn't cover everything
         from fustor_fusion.view_state_manager import view_state_manager
         
@@ -371,11 +376,12 @@ class PipeSessionBridge:
         # But we tracked them in self._leader_cache!
         # Clean up ANY key where this session was leader.
         
-        # Remove from legacy SessionManager
-        await self._session_manager.terminate_session(
-            view_id=view_id,
-            session_id=session_id
-        )
+        # Remove from legacy SessionManager for ALL served views
+        for vid in self._pipe.view_ids:
+            await self._session_manager.terminate_session(
+                view_id=vid,
+                session_id=session_id
+            )
 
         # Synchronously clean up local store
         keys_to_clean = []
@@ -462,12 +468,14 @@ class PipeSessionBridge:
                 **params
             }
             
-            await self._session_manager.queue_command(
-                self._pipe.view_id, 
-                session_id, 
-                command_payload
-            )
-            
+            # Queue to all views (redundant but ensures visibility)
+            for vid in self._pipe.view_ids:
+                await self._session_manager.queue_command(
+                    vid, 
+                    session_id, 
+                    command_payload
+                )
+           
             # 4. Wait for result
             logger.debug(f"Queued command {command} ({cmd_id}) for session {session_id}, waiting {timeout}s...")
             return await asyncio.wait_for(future, timeout=timeout)

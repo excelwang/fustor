@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional
 import time
 import uuid
 
-from ..auth.dependencies import get_view_id_from_api_key
+from ..auth.dependencies import get_pipe_id_from_auth, get_view_id_from_auth
 
 
 from ..config.unified import fusion_config
@@ -77,30 +77,40 @@ async def _check_duplicate_task(
 async def create_session(
     payload: CreateSessionPayload,
     request: Request,
-    view_id: str = Depends(get_view_id_from_api_key),
+    pipe_id: str = Depends(get_pipe_id_from_auth),
 ):
-    view_id = str(view_id)
+    """
+    Creates a new Pipe Session for an Agent.
+    Sessions are strictly bound to a Pipe (ingestion channel).
+    """
     session_id = str(uuid.uuid4())
     client_ip = request.client.host
     
     # Use client-requested timeout if provided, otherwise fallback to server config
-    session_config = _get_session_config(view_id)
+    session_config = _get_session_config(pipe_id)
     session_timeout_seconds = payload.session_timeout_seconds or session_config["session_timeout_seconds"]
 
     if runtime_objects.pipe_manager:
+        # Authentication already gave us the authoritative pipe_id
+        pipe = runtime_objects.pipe_manager.get_pipe(pipe_id)
+        if not pipe:
+            logger.error(f"Pipe '{pipe_id}' not found. Configuration might have changed after authentication.")
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Resource {pipe_id} is not an authorized pipe."
+            )
+        
+        # Now we proceed with session creation on this pipe.
+
         # In the new architecture, we delegate to PipeManager to ensure correct routing
         try:
             client_info = payload.client_info or {}
             client_info["client_ip"] = client_ip
             
-            # TODO: Conceptually, pipe_id and view_id are distinct. Currently view_id is used as 
-            # the p_id because the authentication model (API Key) is tied to the view_id.
-            # A future refactoring should implement a proper mapping between view_id and pipe_id
-            # or allow explicit pipe identification in the payload.
             session_info = await runtime_objects.pipe_manager._on_session_created(
                 session_id=session_id,
                 task_id=payload.task_id,
-                p_id=view_id, # view_id as the p_id
+                p_id=pipe_id, 
                 client_info=client_info,
                 session_timeout_seconds=session_timeout_seconds
             )
@@ -192,88 +202,97 @@ async def create_session(
 async def heartbeat(
     session_id: str,
     request: Request,
-    view_id: str = Depends(get_view_id_from_api_key),
+    pipe_id: str = Depends(get_pipe_id_from_auth),
 ):
-    view_id = str(view_id)
-    si = await session_manager.get_session_info(view_id, session_id)
-    
-    if not si:
-        raise HTTPException(
-            status_code=419,  # Session Obsoleted
-            detail=f"Session {session_id} not found"
-        )
-    
-    is_locked_by_session = await view_state_manager.is_locked_by_session(view_id, session_id)
-    if not is_locked_by_session:
-        await view_state_manager.lock_for_session(view_id, session_id)
-    
+    pipe_id = str(pipe_id)
+    # 1. Lookup Pipe
+    pipe = runtime_objects.pipe_manager.get_pipe(pipe_id) if runtime_objects.pipe_manager else None
+    if not pipe:
+        # Fallback to legacy behavior if pipe manager not active
+        raise HTTPException(status_code=404, detail="Pipe not found")
+
+    # 2. Update via Pipe Runtime (broadcasts to all views)
     payload = await request.json()
     can_realtime = payload.get("can_realtime", False)
-    
-    # Cache agent status if provided (Management Plane Phase 2)
     agent_status = payload.get("agent_status")
-    if agent_status:
-        si.agent_status = agent_status
     
-    success, commands = await session_manager.keep_session_alive(view_id, session_id, client_ip=request.client.host, can_realtime=can_realtime)
-    if not success:  # Should match session existence check above, but for safety
-        logger.warning(f"Session {session_id} not found during heartbeat update (race condition?)")
+    success = await pipe.keep_session_alive(
+        session_id=session_id,
+        can_realtime=can_realtime,
+        agent_status=agent_status
+    )
     
-    is_leader = await view_state_manager.try_become_leader(view_id, session_id)
+    if not success:
+        raise HTTPException(
+            status_code=419,  # Session Obsoleted
+            detail=f"Session {session_id} not found or expired"
+        )
     
-    if is_leader:
-        await view_state_manager.set_authoritative_session(view_id, session_id)
-        
-    role = "leader" if is_leader else "follower"
-
-    return {
-        "status": "ok", 
-        "message": f"Session {session_id} heartbeat updated successfully",
-        "role": role,
-        "is_leader": is_leader,
-        "commands": commands
-    }
+    # 3. Handle leader promotion/commands (Bridge level)
+    bridge = runtime_objects.pipe_manager.get_bridge(pipe_id)
+    res = await bridge.keep_alive(
+        session_id=session_id,
+        client_ip=request.client.host,
+        can_realtime=can_realtime,
+        agent_status=agent_status
+    )
+    
+    return res
 
 
 @session_router.delete("/{session_id}", tags=["Session Management"], summary="End session")
 async def end_session(
     session_id: str,
-    view_id: str = Depends(get_view_id_from_api_key),
+    identity: str = Depends(get_view_id_from_auth),
 ):
-    view_id = str(view_id)
-    success = await session_manager.terminate_session(view_id, session_id)
-    
-    if not success:
-        # Session labels as "not found" but the goal of ending it is achieved
-        logger.info(f"Session {session_id} not found or already terminated. Treating as success.")
-        return {
-            "status": "ok",
-            "message": f"Session {session_id} already terminated"
-        }
-    
-    await view_state_manager.unlock_for_session(view_id, session_id)
-    await view_state_manager.release_leader(view_id, session_id)
-    
-    try:
-        await on_session_close(view_id)
-    except Exception as e:
-        logger.warning(f"Failed to notify view driver instances of session close: {e}")
+    """
+    End a session. 
+    Authorized for Pipe Owners (Pipe Key) and View Admins (View Key).
+    """
+    # 1. Try interpreting identity as Pipe ID
+    if runtime_objects.pipe_manager:
+        bridge = runtime_objects.pipe_manager.get_bridge(identity)
+        if bridge:
+            await bridge.close_session(session_id)
+            return {"status": "ok", "message": f"Session {session_id} terminated on pipe {identity}"}
+        
+        # 2. Case 2: Identity is a View ID (Admin Mode)
+        # Find all pipes serving this view
+        pipes = runtime_objects.pipe_manager.resolve_pipes_for_view(identity)
+        if pipes:
+            closed_count = 0
+            for p_id in pipes:
+                bridge = runtime_objects.pipe_manager.get_bridge(p_id)
+                if bridge:
+                    # Idempotent close
+                    await bridge.close_session(session_id)
+                    closed_count += 1
+            return {"status": "ok", "message": f"Session {session_id} terminated on {closed_count} pipes via View Auth"}
+
+    # Fallback legacy Local Session Manager (if no bridge found)
+    # Treat identity as view_id since legacy SM is view-based
+    await session_manager.terminate_session(identity, session_id)
     
     return {
         "status": "ok",
-        "message": f"Session {session_id} terminated successfully",
+        "message": f"Session {session_id} terminated successfully (Legacy)",
     }
-
-
-@session_router.get("/", tags=["Session Management"], summary="Get current view_id for API Key")
-async def get_authorized_view_info(
-    view_id: str = Depends(get_view_id_from_api_key),
+    
+@session_router.get("/", tags=["Session Management"], summary="Get current authorized identity for API Key")
+async def get_authorized_pipe_info(
+    pipe_id: str = Depends(get_pipe_id_from_auth),
 ):
     """
-    Returns the view_id associated with the provided API key.
-    This replaces the legacy session listing which has been moved to /api/v1/views/{view_id}/sessions
+    Returns the pipe_id and served views associated with the provided API key.
     """
+    views = []
+    if runtime_objects.pipe_manager:
+        pipe = runtime_objects.pipe_manager.get_pipe(pipe_id)
+        if pipe:
+            views = pipe.view_ids
+            
     return {
-        "view_id": view_id,
+        "pipe_id": pipe_id,
+        "views": views,
         "status": "authorized"
     }

@@ -64,7 +64,7 @@ def mock_view_handler():
 @pytest.fixture
 def pipe_config():
     return {
-        "view_id": "mock-view",
+        "view_ids": ["mock-view"],
         "allow_concurrent_push": True,
         "queue_batch_size": 100,
     }
@@ -106,7 +106,7 @@ class TestFusionPipeInit:
     
     @pytest.mark.asyncio
     async def test_config_parsing(self, fusion_pipe):
-        assert fusion_pipe.view_id == "mock-view"
+        assert fusion_pipe.view_ids == ["mock-view"]
         assert fusion_pipe.allow_concurrent_push is True
         assert fusion_pipe.queue_batch_size == 100
     
@@ -115,7 +115,7 @@ class TestFusionPipeInit:
         dto = await fusion_pipe.get_dto() # get_dto is async
         assert dto["id"] == "test-pipe"
         assert dto["state"] == "STOPPED"
-        assert dto["view_id"] == "mock-view"
+        assert dto["view_ids"] == ["mock-view"]
 
 
 class TestFusionPipeLifecycle:
