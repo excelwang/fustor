@@ -263,6 +263,9 @@ class ForestFSViewDriver(ViewDriver):
                 # It returns the node structure (dict) or raises/returns None
                 data = await tree.get_directory_tree(path=path, **kwargs)
                 return pid, {"status": "ok", "data": data}
+            except TypeError as e:
+                # Re-raise TypeError (argument mismatch) so FallbackDriverWrapper can catch it
+                raise e
             except Exception as e:
                 return pid, {"status": "error", "error": str(e)}
 

@@ -85,6 +85,13 @@ class PipeSessionStore:
         """Check if a session is currently recorded as leader for a key."""
         return session_id in self.leader_cache.get(election_key, set())
 
+    def is_any_leader(self, session_id: str) -> bool:
+        """Check if session is leader for ANY election key tracked for this pipe."""
+        for sessions in self.leader_cache.values():
+            if session_id in sessions:
+                return True
+        return False
+
     def record_leader(self, session_id: str, election_key: str):
         """Record leadership status."""
         self.leader_cache.setdefault(election_key, set()).add(session_id)

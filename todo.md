@@ -17,3 +17,4 @@
 
 ## source-fs
 考虑到一个agent可能需要监听十几个fs source。如果每个source都能监控1000万个文件的inotify，cpu、内存开销会有多大？是否要改进。如设置监听年龄上限。
+- [ ] **Architecture**: Revisit `FusionPipe.get_session_role` implementation. Currently uses `is_any_leader` logic (one-size-fits-all) for M:N mapping due to Agent's single-channel nature. Future work should consider per-view role negotiation if Agents need to support mixed Leader/Follower states across different views on the same pipe.

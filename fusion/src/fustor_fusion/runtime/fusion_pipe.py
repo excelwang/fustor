@@ -521,12 +521,11 @@ class FusionPipe(FustorPipe):
         """Get the role of a session (leader/follower)."""
         if not self.session_bridge:
             return "follower"
-        # Check against the bridge store's cache
-        # Note: Roles are per-view in M:N. Here we assume the perspective of the pipe's views.
-        # If this session is leader for ANY of the pipe's views, we consider it a leader from the pipe's perspective.
-        for vid in self.view_ids:
-            if self.session_bridge.store.is_leader(session_id, vid):
-                return "leader"
+        
+        # Check if this session is leader for ANY election key tracked for this pipe
+        if self.session_bridge.store.is_any_leader(session_id):
+            return "leader"
+            
         return "follower"
     
     async def _session_cleanup_loop(self) -> None:

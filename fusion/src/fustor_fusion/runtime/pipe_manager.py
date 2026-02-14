@@ -296,6 +296,10 @@ class FusionPipeManager:
         """Get a specific pipe instance by ID."""
         return self._pipes.get(pipe_id)
 
+    def get_bridge(self, pipe_id: str) -> Optional[Any]:
+        """Get the session bridge for a specific pipe."""
+        return self._bridges.get(pipe_id)
+
     def get_receiver(self, receiver_id: str) -> Optional[Receiver]:
         """
         Get receiver by ID (e.g. 'http-main') or internal signature ID.
@@ -385,8 +389,8 @@ class FusionPipeManager:
         if pipe_id:
             fusion_pipe = self._pipes.get(pipe_id)
             if fusion_pipe:
-                view_id = fusion_pipe.view_id
-                await session_manager.complete_agent_job(view_id, session_id, scan_path, job_id)
+                for vid in fusion_pipe.view_ids:
+                    await session_manager.complete_agent_job(vid, session_id, scan_path, job_id)
                 logger.debug(f"Scan complete (job_id={job_id}) for path {scan_path} on session {session_id}")
 
 # Alias for compatibility
