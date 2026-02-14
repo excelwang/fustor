@@ -16,6 +16,8 @@ As long as the **Control Plane** (Heartbeat, Task Assignment, Status Reporting) 
 2.  **Hot Upgrades**: The Agent can receive new software versions or bytecode for the Data Plane and apply them without losing connection.
 3.  **Config Hot-Reload**: Business logic configurations (which directories to scan, which regex to use) can be updated dynamically to fix issues that caused the Data Plane to crash in the first place.
 
+## 本项目处于关键的核心业务链条上，因此提供的api服务（fs/tree）不可以返回503状态。必须时时刻刻都能提供查询服务。
+
 ## 2. Architecture of Separation
 
 To achieve this, the architecture removes **all** business logic from the core Agent/Fusion runtime.

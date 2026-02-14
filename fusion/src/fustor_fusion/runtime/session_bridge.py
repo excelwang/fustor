@@ -44,6 +44,58 @@ if TYPE_CHECKING:
 logger = logging.getLogger("fustor_fusion.session_bridge")
 
 
+class PipeSessionStore:
+    """
+    Dedicated store for session-related state of a FusionPipe.
+    
+    This object is owned by the PipeSessionBridge and updated synchronously
+    during session creation/closure to ensure the control plane has 
+    an immediate, consistent view of active sessions and lineages.
+    """
+    
+    def __init__(self, view_id: str):
+        self.view_id = view_id
+        # {session_id: {agent_id, source_uri}}
+        self.lineage_cache: Dict[str, Dict[str, str]] = {}
+        # {election_key: set(session_id)}
+        self.leader_cache: Dict[str, set] = {}
+        # session_id -> heartbeat_count
+        self.heartbeat_count: Dict[str, int] = {}
+        
+    def add_session(self, session_id: str, lineage: Dict[str, str]):
+        """Synchronously add session metadata."""
+        self.lineage_cache[session_id] = lineage
+        self.heartbeat_count[session_id] = 0
+        
+    def remove_session(self, session_id: str):
+        """Synchronously remove session metadata."""
+        self.lineage_cache.pop(session_id, None)
+        self.heartbeat_count.pop(session_id, None)
+        # Remove from leader cache
+        for key in list(self.leader_cache.keys()):
+            self.leader_cache[key].discard(session_id)
+            if not self.leader_cache[key]:
+                del self.leader_cache[key]
+
+    def get_lineage(self, session_id: str) -> Dict[str, str]:
+        """Get lineage info for an active session."""
+        return self.lineage_cache.get(session_id, {})
+
+    def is_leader(self, session_id: str, election_key: str) -> bool:
+        """Check if a session is currently recorded as leader for a key."""
+        return session_id in self.leader_cache.get(election_key, set())
+
+    def record_leader(self, session_id: str, election_key: str):
+        """Record leadership status."""
+        self.leader_cache.setdefault(election_key, set()).add(session_id)
+
+    def record_heartbeat(self, session_id: str) -> int:
+        """Increment and return heartbeat count."""
+        count = self.heartbeat_count.get(session_id, 0) + 1
+        self.heartbeat_count[session_id] = count
+        return count
+
+
 class PipeSessionBridge:
     """
     Bridge that synchronizes sessions between FusionPipe and SessionManager.
@@ -69,13 +121,12 @@ class PipeSessionBridge:
         self._pipe = pipe
         self._session_manager = session_manager
         
-        # Performance: Cache authoritative leader status per view
-        # {view_id: set(session_id)}
-        self._leader_cache: Dict[str, set] = {}
+        # New State Management (GAP-4)
+        self.store = PipeSessionStore(str(pipe.view_id))
         
-        # Heartbeat counter for periodic leader validation
-        # Every N heartbeats, verify cache against actual VSM state
-        self._heartbeat_count: Dict[str, int] = {}  # session_id -> count
+        # Event queue for asynchronous handler notifications in FusionPipe
+        self.event_queue = asyncio.Queue()
+        
         self._LEADER_VERIFY_INTERVAL = 5  # Verify every N heartbeats
     
     async def create_session(
@@ -85,7 +136,7 @@ class PipeSessionBridge:
         session_timeout_seconds: Optional[int] = None,
         allow_concurrent_push: Optional[bool] = None,
         session_id: Optional[str] = None,
-        source_uri: Optional[str] = None
+        source_uri: Optional[str] = None, **kwargs
     ) -> Dict[str, Any]:
         """
         Create a session in both Pipe and SessionManager.
@@ -136,13 +187,13 @@ class PipeSessionBridge:
         # If the view decided we are leader, we might need to lock for concurrent push
         # (The view might have already done set_authoritative_session, but bridge manages concurrency lock)
         if is_leader:
-             self._leader_cache.setdefault(election_key, set()).add(session_id)
+             self.store.record_leader(session_id, election_key)
              if not allow_concurrent_push:
                  # We lock on the election key provided by the view (could be scoped or global)
                  await view_state_manager.lock_for_session(election_key, session_id)
         
         # Create in legacy SessionManager
-        await self._session_manager.create_session_entry(
+        session_entry = await self._session_manager.create_session_entry(
             view_id=view_id,
             session_id=session_id,
             task_id=task_id,
@@ -152,8 +203,27 @@ class PipeSessionBridge:
             source_uri=source_uri
         )
         
-        # Create in Pipe
-        # Pass is_leader hint if the pipesupports it
+        # Synchronously record in local store for immediate use in process_events
+        lineage = {}
+        if source_uri:
+            lineage["source_uri"] = source_uri
+        if task_id:
+            lineage["agent_id"] = task_id.split(":")[0] if ":" in task_id else task_id
+            
+        self.store.add_session(session_id, lineage)
+
+        # Enqueue background notification for FusionPipe handlers
+        # This replaces the blocking on_session_created call
+        await self.event_queue.put({
+            "type": "create",
+            "session_id": session_id,
+            "task_id": task_id,
+            "is_leader": is_leader,
+            "kwargs": kwargs
+        })
+        
+        # Pass is_leader hint if the pipesupports it (for local state update if any)
+        # Note: FusionPipe will also consume the queue to notify handlers
         await self._pipe.on_session_created(
             session_id=session_id,
             task_id=task_id,
@@ -161,8 +231,8 @@ class PipeSessionBridge:
             is_leader=is_leader
         )
         
-        # Get role from pipe
-        role = await self._pipe.get_session_role(session_id)
+        # Get role from pipe (now fast since handlers are backgrounded)
+        role = "leader" if is_leader else "follower"
         
         timeout = session_timeout_seconds or 30
         
@@ -225,8 +295,7 @@ class PipeSessionBridge:
         # We delegate this to resolve_session_role again (idempotent "try become leader" check)
         
         # Periodic validation/retry: every N heartbeats
-        count = self._heartbeat_count.get(session_id, 0) + 1
-        self._heartbeat_count[session_id] = count
+        count = self.store.record_heartbeat(session_id)
         
         if count % self._LEADER_VERIFY_INTERVAL == 0:
             view_handler = self._pipe.get_view_handler(view_id)
@@ -240,11 +309,11 @@ class PipeSessionBridge:
                      election_key = res.get("election_key", view_id)
                      
                      if is_leader:
-                         self._leader_cache.setdefault(election_key, set()).add(session_id)
+                         self.store.record_leader(session_id, election_key)
                      else:
                          # Demoted or failed to promote - ensure we don't have stale cache
-                         if election_key in self._leader_cache:
-                             self._leader_cache[election_key].discard(session_id)
+                         if election_key in self.store.leader_cache:
+                             self.store.leader_cache[election_key].discard(session_id)
                              
                  except Exception as e:
                      logger.debug(f"Leader promotion check failed during keep_alive: {e}")
@@ -279,24 +348,29 @@ class PipeSessionBridge:
         # But we tracked them in self._leader_cache!
         # Clean up ANY key where this session was leader.
         
-        keys_to_clean = []
-        for key, sessions in self._leader_cache.items():
-            if session_id in sessions:
-                keys_to_clean.append(key)
-                
         # Remove from legacy SessionManager
         await self._session_manager.terminate_session(
             view_id=view_id,
             session_id=session_id
         )
 
+        # Synchronously clean up local store
+        keys_to_clean = []
+        for key, sessions in self.store.leader_cache.items():
+            if session_id in sessions:
+                keys_to_clean.append(key)
+
         for key in keys_to_clean:
             await view_state_manager.unlock_for_session(key, session_id)
             await view_state_manager.release_leader(key, session_id)
-            self._leader_cache[key].discard(session_id)
         
-        # Remove heartbeat counter
-        self._heartbeat_count.pop(session_id, None)
+        self.store.remove_session(session_id)
+        
+        # Enqueue background notification for FusionPipe handlers
+        await self.event_queue.put({
+            "type": "close",
+            "session_id": session_id
+        })
         
         # Close in Pipe
         await self._pipe.on_session_closed(session_id)

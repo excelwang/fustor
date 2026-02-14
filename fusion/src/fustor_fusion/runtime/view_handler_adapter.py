@@ -232,6 +232,7 @@ class ViewManagerAdapter(ViewHandler):
     
     async def on_session_start(self, **kwargs) -> None:
         """Handle session start for all driver instances."""
+        await self._manager.wait_until_ready()
         await self._manager.on_session_start(**kwargs)
     
     async def on_session_close(self, **kwargs) -> None:
@@ -246,9 +247,10 @@ class ViewManagerAdapter(ViewHandler):
         """
         Determine session role.
         
-        1. Try delegated election (for scoped drivers like ForestFSViewDriver).
-        2. Fallback to global election (for standard drivers).
+        Wait for view manager to be ready before resolving role.
         """
+        await self._manager.wait_until_ready()
+        
         # 1. Try delegated election first
         for driver_instance in self._manager.driver_instances.values():
             if hasattr(driver_instance, 'resolve_session_role'):

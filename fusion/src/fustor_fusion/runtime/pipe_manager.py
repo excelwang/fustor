@@ -152,8 +152,11 @@ class FusionPipeManager:
                 
                 self._pipes[p_id] = fusion_pipe
                 from .session_bridge import create_session_bridge
-                self._bridges[p_id] = create_session_bridge(fusion_pipe)
+                bridge = create_session_bridge(fusion_pipe)
+                self._bridges[p_id] = bridge
                 
+                # Link bridge to pipe for GAP-4 session isolation
+                fusion_pipe.session_bridge = bridge
                 logger.info(f"Initialized FusionPipe: {p_id} with {len(view_handlers)} views")
                 initialized_count += 1
                 

@@ -66,83 +66,118 @@ class ViewManager:
         self.driver_instances: Dict[str, ViewDriver] = {}
         self.logger = logging.getLogger(__name__)
         self.view_id = view_id
+        self._init_done = asyncio.Event()
+        self._init_error: Optional[Exception] = None
+        self._is_initializing = False
+    
+    @property
+    def is_ready(self) -> bool:
+        return self._init_done.is_set()
+
+    async def wait_until_ready(self, timeout: Optional[float] = None):
+        """Wait until initialization is complete."""
+        if timeout:
+            await asyncio.wait_for(self._init_done.wait(), timeout=timeout)
+        else:
+            await self._init_done.wait()
+        
+        if self._init_error:
+            raise self._init_error
     
     async def initialize_driver_instances(self):
         """Initialize view driver instances by loading them from view configs."""
         if not self.view_id:
+            self._init_done.set()
             return
             
-        self.logger.info(f"Initializing view driver instances for view {self.view_id}")
+        if self._is_initializing:
+            await self._init_done.wait()
+            return
+
+        self._is_initializing = True
+        self._init_done.clear()
+        self._init_error = None
         
-        available_drivers = _load_view_drivers()
+        try:
+            self.logger.info(f"Initializing view driver instances for view {self.view_id}")
         
-        # Try loading from fusion_config loader
-        view_config = fusion_config.get_view(self.view_id)
-        logger.debug(f"ViewManager({self.view_id}) initialize_driver_instances. Config found: {view_config is not None}")
-        
-        if view_config:
-            # New Unified Config V2: ViewConfig is a single object, not a list
-            # It maps 1:1 to a view/driver instance.
-            # To support multiple drivers per view_group (if needed), we might need logic change.
-            # But currently, Unified Config defines 'views' as a dict of ViewConfig.
-            # The view_id here corresponds to the config key.
+            available_drivers = _load_view_drivers()
             
-            self.logger.info(f"Using view configuration for view {self.view_id}")
-            # Wrap in list to keep loop structure or refactor
-            view_configs = [view_config]
-             
-            for config in view_configs:
-                view_name = self.view_id # In unified config, key is ID
-                driver_type = config.driver
-                if not driver_type:
-                    self.logger.warning(f"View '{view_name}' config missing 'driver' field, skipping")
-                    continue
-                    
-                driver_cls = available_drivers.get(driver_type)
-                if not driver_cls:
-                    self.logger.error(f"Driver type '{driver_type}' not found for view '{view_name}'. Available: {list(available_drivers.keys())}")
-                    continue
+            # Try loading from fusion_config loader
+            view_config = fusion_config.get_view(self.view_id)
+            logger.debug(f"ViewManager({self.view_id}) initialize_driver_instances. Config found: {view_config is not None}")
+            
+            if view_config:
+                # New Unified Config V2: ViewConfig is a single object, not a list
+                # It maps 1:1 to a view/driver instance.
+                # To support multiple drivers per view_group (if needed), we might need logic change.
+                # But currently, Unified Config defines 'views' as a dict of ViewConfig.
+                # The view_id here corresponds to the config key.
                 
-                # ViewConfig V2 puts driver-specific params in 'driver_params' dict
-                driver_params = config.driver_params
-                
-                try:
-                    driver_instance = driver_cls(
-                        id=view_name,
-                        view_id=self.view_id,
-                        config=driver_params
-                    )
-                    await driver_instance.initialize()
-                    self.driver_instances[view_name] = driver_instance
-                    logger.debug(f"ViewManager({self.view_id}) added driver instance '{view_name}'")
-                    self.logger.info(f"Initialized ViewDriver '{view_name}' (type={driver_type})")
-                except Exception as e:
-                    self.logger.error(f"Failed to initialize ViewDriver '{view_name}': {e}", exc_info=True)
-                    
-        else:
-            # Fallback: Auto-load all found drivers IF config is empty
-            if not fusion_config.get_all_views():
-                 self.logger.info(f"No fusion config file found, auto-loading all installed view drivers")
+                self.logger.info(f"Using view configuration for view {self.view_id}")
+                # Wrap in list to keep loop structure or refactor
+                view_configs = [view_config]
                  
-                 for schema, driver_cls in available_drivers.items():
-                     try:
-                         # For auto-discovery, we use the schema name as the view instance name
-                         # No default config provided
-                         driver_instance = driver_cls(
-                             id=schema,
-                             view_id=self.view_id,
-                             config={}
-                         )
-                         await driver_instance.initialize()
-                         self.driver_instances[schema] = driver_instance
-                         self.logger.info(f"Initialized ViewDriver '{schema}' for view {self.view_id}")
-                     except Exception as e:
-                         self.logger.error(f"Failed to initialize ViewDriver '{schema}': {e}", exc_info=True)
+                for config in view_configs:
+                    view_name = self.view_id # In unified config, key is ID
+                    driver_type = config.driver
+                    if not driver_type:
+                        self.logger.warning(f"View '{view_name}' config missing 'driver' field, skipping")
+                        continue
+                        
+                    driver_cls = available_drivers.get(driver_type)
+                    if not driver_cls:
+                        self.logger.error(f"Driver type '{driver_type}' not found for view '{view_name}'. Available: {list(available_drivers.keys())}")
+                        continue
+                    
+                    # ViewConfig V2 puts driver-specific params in 'driver_params' dict
+                    driver_params = config.driver_params
+                    
+                    try:
+                        driver_instance = driver_cls(
+                            id=view_name,
+                            view_id=self.view_id,
+                            config=driver_params
+                        )
+                        await driver_instance.initialize()
+                        self.driver_instances[view_name] = driver_instance
+                        logger.debug(f"ViewManager({self.view_id}) added driver instance '{view_name}'")
+                        self.logger.info(f"Initialized ViewDriver '{view_name}' (type={driver_type})")
+                    except Exception as e:
+                        self.logger.error(f"Failed to initialize ViewDriver '{view_name}': {e}", exc_info=True)
+                        
             else:
-                 self.logger.info(f"Fusion config active but no views configured for view {self.view_id}")
-
-
-    
+                # Fallback: Auto-load all found drivers IF config is empty
+                if not fusion_config.get_all_views():
+                     self.logger.info(f"No fusion config file found, auto-loading all installed view drivers")
+                     
+                     for schema, driver_cls in available_drivers.items():
+                         try:
+                             # For auto-discovery, we use the schema name as the view instance name
+                             # No default config provided
+                             driver_instance = driver_cls(
+                                 id=schema,
+                                 view_id=self.view_id,
+                                 config={}
+                             )
+                             await driver_instance.initialize()
+                             self.driver_instances[schema] = driver_instance
+                             self.logger.info(f"Initialized ViewDriver '{schema}' for view {self.view_id}")
+                         except Exception as e:
+                             self.logger.error(f"Failed to initialize ViewDriver '{schema}': {e}", exc_info=True)
+                else:
+                     self.logger.info(f"Fusion config active but no views configured for view {self.view_id}")
+        
+        except Exception as e:
+            self._init_error = e
+            self.logger.error(f"ViewManager({self.view_id}) failed to initialize: {e}")
+            raise
+        finally:
+            self._is_initializing = False
+            self._init_done.set()
+            
+            
+                
     async def process_event(self, event: EventBase) -> Dict[str, bool]:
         """Process an event with all driver instances and return results"""
         results = {}
@@ -297,7 +332,8 @@ async def get_cached_view_manager(view_id: str) -> 'ViewManager':
         
         logger.info(f"Creating new view manager for view {v_id_str}")
         new_manager = ViewManager(view_id=v_id_str)
-        await new_manager.initialize_driver_instances()
+        # Note: We do NOT await initialization here anymore to avoid blocking PipeManager.
+        # Initialization will be triggered by the caller (e.g. FusionPipe.start)
         runtime_objects.view_managers[v_id_str] = new_manager
         return new_manager
 

@@ -99,16 +99,18 @@ class FusionPipe(FustorPipe):
         self._view_handlers: Dict[str, ViewHandler] = {}
         for handler in (view_handlers or []):
             self.register_view_handler(handler)
-        # Session tracking - handled centrally via PipeManager/SessionManager
-        self._lock = asyncio.Lock()  # Generic lock for pipestate
+        # Session tracking - handled centrally via PipeSessionBridge (GAP-4)
+        self.session_bridge: Optional[Any] = None  # To be set by PipeManager
         
         # Processing task
         self._processing_task: Optional[asyncio.Task] = None
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._session_event_task: Optional[asyncio.Task] = None
+        self._init_task: Optional[asyncio.Task] = None
+        self._handlers_ready = asyncio.Event()
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=10000)
         self._queue_drained = asyncio.Event()  # Signaled when queue becomes empty
         self._queue_drained.set()  # Initially empty
-        self._active_pushes = 0 # Track concurrent push requests
         
         # Statistics
         self.statistics = {
@@ -118,8 +120,6 @@ class FusionPipe(FustorPipe):
             "sessions_closed": 0,
             "errors": 0,
         }
-        self._cached_leader_session: Optional[str] = None
-        
         # Handler fault isolation
         self._handler_errors: Dict[str, int] = {}  # Per-handler error counts
         self._disabled_handlers: set = set()  # Handlers disabled due to repeated failures
@@ -127,9 +127,6 @@ class FusionPipe(FustorPipe):
         self.HANDLER_TIMEOUT = config.get("handler_timeout", 30.0)  # Seconds
         self.MAX_HANDLER_ERRORS = config.get("max_handler_errors", 50)  # Before disabling
         self.HANDLER_RECOVERY_INTERVAL = config.get("handler_recovery_interval", 60.0) # Seconds cooldown
-        
-        # Lineage cache: session_id -> {agent_id, source_uri}
-        self._session_lineage_cache: Dict[str, Dict[str, str]] = {}
     
     def register_view_handler(self, handler: ViewHandler) -> None:
         """
@@ -175,26 +172,28 @@ class FusionPipe(FustorPipe):
         if self.is_running():
             logger.warning(f"Pipe {self.id} is already running")
             return
+            
+        self._set_state(PipeState.RUNNING, "Starting...")
         
-        logger.info(f"Starting FusionPipe {self.id}")
-        self._set_state(PipeState.RUNNING, "Pipe started")
+        # Initialize all handlers in background
+        self._init_task = asyncio.create_task(self._initialize_handlers())
         
-        # Initialize all handlers
-        for handler in self._view_handlers.values():
-            if hasattr(handler, 'initialize'):
-                await handler.initialize()
-        
-        # Start processing task
+        # Start background tasks
         self._processing_task = asyncio.create_task(
             self._processing_loop(),
             name=f"fusion-pipe-{self.id}"
         )
-        
-        # Start cleanup task
         self._cleanup_task = asyncio.create_task(
             self._session_cleanup_loop(),
             name=f"fusion-pipe-cleanup-{self.id}"
         )
+        
+        # NEW: Asynchronous session notification loop (GAP-4)
+        if self._session_event_task is None:
+            self._session_event_task = asyncio.create_task(
+                self._session_event_loop(),
+                name=f"fusion-pipe-session-events-{self.id}"
+            )
         
         logger.info(f"FusionPipe {self.id} started with {len(self._view_handlers)} view handlers")
     
@@ -202,11 +201,11 @@ class FusionPipe(FustorPipe):
         """Stop the pipe."""
         if not self.is_running():
             return
-        
+            
         logger.info(f"Stopping FusionPipe {self.id}")
-        self._set_state(PipeState.PAUSED, "Pipe stopping")
+        self._set_state(PipeState.STOPPING, "Stopping...")
         
-        # Cancel processing task
+        # 1. Cancel background tasks
         if self._processing_task:
             self._processing_task.cancel()
             try:
@@ -215,21 +214,77 @@ class FusionPipe(FustorPipe):
                 pass
             self._processing_task = None
         
-        # Close all handlers
-        for handler in self._view_handlers.values():
-            if hasattr(handler, 'close'):
-                await handler.close()
-        
-        from ..core.session_manager import session_manager
-        
-        # Clear sessions for this view
-        await session_manager.clear_all_sessions(self.view_id)
-        
-        self._set_state(PipeState.STOPPED, "Pipe stopped")
         if self._cleanup_task:
             self._cleanup_task.cancel()
+            try:
+                await asyncio.wait_for(self._cleanup_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._cleanup_task = None
+        
+        if self._session_event_task:
+            self._session_event_task.cancel()
+            try:
+                await asyncio.wait_for(self._session_event_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._session_event_task = None
+        
+        if self._init_task:
+            self._init_task.cancel()
+            try:
+                await asyncio.wait_for(self._init_task, timeout=5.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+            self._init_task = None
             
+        # 2. Stop all handlers
+        for h_id, handler in self._view_handlers.items():
+            try:
+                if hasattr(handler, 'stop'):
+                    await handler.stop()
+            except Exception as e:
+                logger.error(f"Error stopping handler {h_id}: {e}")
+                
+        self._set_state(PipeState.STOPPED, "Stopped")
         logger.info(f"FusionPipe {self.id} stopped")
+
+    async def _initialize_handlers(self) -> None:
+        """Background task to initialize handlers without blocking Fusion startup."""
+        self._handlers_ready.clear()
+        t0 = time.time()
+        try:
+            handler_count = len(self._view_handlers)
+            logger.info(f"Pipe {self.id}: Initializing {handler_count} handlers in background...")
+            
+            # Parallel initialization for faster startup
+            init_tasks = []
+            for h_id, handler in self._view_handlers.items():
+                if hasattr(handler, 'initialize'):
+                    init_tasks.append(handler.initialize())
+            
+            if init_tasks:
+                await asyncio.gather(*init_tasks)
+            
+            self._handlers_ready.set()
+            duration = time.time() - t0
+            self._set_state(PipeState.RUNNING, "Ready")
+            logger.info(f"Pipe {self.id}: All handlers initialized in {duration:.2f}s")
+            
+        except asyncio.CancelledError:
+            logger.debug(f"Pipe {self.id}: Handler initialization cancelled")
+        except Exception as e:
+            logger.error(f"Pipe {self.id}: Failed to initialize handlers: {e}", exc_info=True)
+            self._set_state(PipeState.RUNNING | PipeState.ERROR, f"Init failed: {e}")
+
+    async def wait_until_ready(self, timeout: float = 30.0) -> bool:
+        """Wait for background initialization to complete."""
+        try:
+            await asyncio.wait_for(self._handlers_ready.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(f"Pipe {self.id}: Timed out waiting for handlers to initialize after {timeout}s")
+            return False
     
     async def _processing_loop(self) -> None:
         """Background loop for processing queued events."""
@@ -237,6 +292,13 @@ class FusionPipe(FustorPipe):
         
         while True:
             try:
+                # 1. Wait for readiness (don't process events if views aren't ready)
+                if not self._handlers_ready.is_set():
+                    logger.debug(f"Pipe {self.id} processing loop: waiting for handlers...")
+                    if not await self.wait_until_ready(timeout=60.0):
+                        await asyncio.sleep(5.0)
+                        continue
+
                 # Wait for events in queue
                 event_batch = await self._event_queue.get()
                 
@@ -340,6 +402,62 @@ class FusionPipe(FustorPipe):
     
     # --- Session Management ---
     
+    async def _session_event_loop(self) -> None:
+        """Background loop to notify handlers of session events without blocking the API/Bridge."""
+        logger.debug(f"Session event loop started for pipe {self.id}")
+        
+        while True:
+            try:
+                if not self.session_bridge:
+                    await asyncio.sleep(1.0)
+                    continue
+                    
+                event = await self.session_bridge.event_queue.get()
+                if event is None:
+                    break
+                    
+                etype = event.get("type")
+                sid = event.get("session_id")
+                
+                # Wait for handlers to be initialized before notifying them
+                if not self._handlers_ready.is_set():
+                    await self.wait_until_ready(timeout=30.0)
+
+                if etype == "create":
+                    tid = event.get("task_id")
+                    is_leader = event.get("is_leader", False)
+                    kwargs = event.get("kwargs", {})
+                    
+                    logger.debug(f"Pipe {self.id}: Notifying handlers of NEW session {sid}")
+                    for handler in self._view_handlers.values():
+                        if hasattr(handler, 'on_session_start'):
+                            try:
+                                await handler.on_session_start(
+                                    session_id=sid,
+                                    task_id=tid,
+                                    is_leader=is_leader,
+                                    **kwargs
+                                )
+                            except Exception as e:
+                                logger.error(f"Handler {handler} failed on_session_start for {sid}: {e}")
+
+                elif etype == "close":
+                    logger.debug(f"Pipe {self.id}: Notifying handlers of CLOSED session {sid}")
+                    for handler in self._view_handlers.values():
+                        if hasattr(handler, 'on_session_close'):
+                            try:
+                                await handler.on_session_close(session_id=sid)
+                            except Exception as e:
+                                logger.error(f"Handler {handler} failed on_session_close for {sid}: {e}")
+                
+                self.session_bridge.event_queue.task_done()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Error in session event loop for pipe {self.id}: {e}", exc_info=True)
+                await asyncio.sleep(1.0)
+
     async def on_session_created(
         self, 
         session_id: str, 
@@ -348,86 +466,17 @@ class FusionPipe(FustorPipe):
         **kwargs
     ) -> None:
         """
-        Handle session creation notification.
-        
-        Args:
-            session_id: The ID of the created session
-            task_id: Originating task ID
-            is_leader: Whether this session has been elected as leader (by bridge)
-            **kwargs: Additional metadata
+        Handle session creation notification (now minimal and non-blocking).
         """
-        # Note: Session creation in backing store is handled by PipeSessionBridge
-        
         self.statistics["sessions_created"] += 1
-        
-        # Build lineage cache for this session
-        session_info = await session_manager.get_session_info(self.view_id, session_id)
-        if session_info:
-            lineage = {}
-            if session_info.source_uri:
-                lineage["source_uri"] = session_info.source_uri
-            if session_info.task_id and ":" in session_info.task_id:
-                lineage["agent_id"] = session_info.task_id.split(":")[0]
-            elif session_info.task_id:
-                lineage["agent_id"] = session_info.task_id
-            if lineage:
-                self._session_lineage_cache[session_id] = lineage
-        
-        # Notify view handlers of session start
-        for handler in self._view_handlers.values():
-            if hasattr(handler, 'on_session_start'):
-                # Pass all available metadata to handlers. 
-                # Scoped drivers (like ForestView) retrieve pipe_id from internal session map.
-                await handler.on_session_start(
-                    session_id=session_id,
-                    task_id=task_id,
-                    is_leader=is_leader,
-                    **kwargs
-                )
-        
-        if is_leader:
-            self._cached_leader_session = session_id
-            
-        logger.info(f"Session {session_id} created for view {self.view_id} (role={'leader' if is_leader else 'follower'})")
+        logger.info(f"Session {session_id} acknowledged by pipe {self.id} (role={'leader' if is_leader else 'follower'})")
     
     async def on_session_closed(self, session_id: str) -> None:
         """
-        Handle session closure notification.
+        Handle session closure notification (now minimal and non-blocking).
         """
-        # Note: Session removal from backing store is handled by PipeSessionBridge
-        
         self.statistics["sessions_closed"] += 1
-        
-        # Clean lineage cache
-        self._session_lineage_cache.pop(session_id, None)
-        
-        from ..view_state_manager import view_state_manager
-
-        if self._cached_leader_session == session_id:
-            self._cached_leader_session = None
-
-        # New Leader Election (Architecture V2)
-        # If a session closes, we need to ensure there is a leader if sessions remain.
-        # We query the session_manager (source of truth) for remaining sessions.
-        remaining_sessions = await session_manager.get_view_sessions(self.view_id)
-        if remaining_sessions:
-            current_leader = await view_state_manager.get_leader(self.view_id)
-            if not current_leader:
-                # No leader, try to elect from remaining
-                for sid in remaining_sessions.keys():
-                    if await view_state_manager.try_become_leader(self.view_id, sid):
-                        logger.info(f"New leader elected for view {self.view_id} after session close: {sid}")
-                        self._cached_leader_session = sid
-                        break
-            else:
-                self._cached_leader_session = current_leader
-        
-        # Notify view handlers of session close
-        for handler in self._view_handlers.values():
-            if hasattr(handler, 'on_session_close'):
-                await handler.on_session_close(session_id=session_id)
-        
-        logger.info(f"Session {session_id} closed for view {self.view_id}")
+        logger.info(f"Session {session_id} closed acknowledgement in pipe {self.id}")
     
     async def keep_session_alive(self, session_id: str, can_realtime: bool = False, agent_status: Optional[Dict[str, Any]] = None) -> bool:
         """Update last activity for a session."""
@@ -442,8 +491,10 @@ class FusionPipe(FustorPipe):
 
     async def get_session_role(self, session_id: str) -> str:
         """Get the role of a session (leader/follower)."""
-        from ..view_state_manager import view_state_manager
-        is_leader = await view_state_manager.is_leader(self.view_id, session_id)
+        if not self.session_bridge:
+            return "follower"
+        # Check against the bridge store's cache
+        is_leader = self.session_bridge.store.is_leader(session_id, str(self.view_id))
         return "leader" if is_leader else "follower"
     
     async def _session_cleanup_loop(self) -> None:
@@ -489,6 +540,10 @@ class FusionPipe(FustorPipe):
             self._queue_drained.clear()
 
         try:
+            # Wait for readiness before accepting events
+            if not await self.wait_until_ready(timeout=60.0):
+                return {"success": False, "error": "Pipe not ready (initialization timeout)"}
+
             self.statistics["events_received"] += len(events)
             logger.debug(f"Pipe {self.id}: Received {len(events)} events from {session_id} (source={source_type})")
             
@@ -512,14 +567,14 @@ class FusionPipe(FustorPipe):
                 logger.warning(f"Pipe {self.id}: Skipped {skipped_count}/{len(events)} malformed events in batch")
             
             # Inject Lineage Info from cache (built at session creation)
-            lineage_meta = self._session_lineage_cache.get(session_id, {})
-            if lineage_meta:
-                for ev in processed_events:
-                    if ev.metadata is None:
-                        # Efficiently inject cached lineage info
-                        ev.metadata = lineage_meta.copy()
-                    else:
-                        ev.metadata.update(lineage_meta)
+            if self.session_bridge:
+                lineage_meta = self.session_bridge.store.get_lineage(session_id)
+                if lineage_meta:
+                    for ev in processed_events:
+                        if ev.metadata is None:
+                            ev.metadata = lineage_meta.copy()
+                        else:
+                            ev.metadata.update(lineage_meta)
 
             # Handle special phases (config_report, etc.)
             if source_type == "config_report":
@@ -637,6 +692,7 @@ class FusionPipe(FustorPipe):
             "leader_session": leader,
             "statistics": self.statistics.copy(),
             "queue_size": self._event_queue.qsize(),
+            "is_ready": self._handlers_ready.is_set(),
         }
     
     async def get_aggregated_stats(self) -> Dict[str, Any]:
