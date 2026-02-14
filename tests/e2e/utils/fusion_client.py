@@ -457,14 +457,19 @@ class FusionClient:
 
     def wait_for_agent_ready(self, agent_id: str, timeout: float = AGENT_READY_TIMEOUT, interval: float = POLL_INTERVAL) -> bool:
         """Wait for an agent to be registered and reporting can_realtime=True."""
+        import logging
+        logger = logging.getLogger(__name__)
         start = time.time()
         while time.time() - start < timeout:
             try:
                 sessions = self.get_sessions()
+                logger.debug(f"wait_for_agent_ready({agent_id}): Current sessions: {[{'agent_id': s.get('agent_id'), 'can_realtime': s.get('can_realtime')} for s in sessions]}")
                 agent_session = next((s for s in sessions if agent_id in s.get("agent_id", "")), None)
                 if agent_session and agent_session.get("can_realtime"):
+                    logger.info(f"Agent {agent_id} is READY (session={agent_session.get('session_id')})")
                     return True
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Error in wait_for_agent_ready: {e}")
                 pass
             time.sleep(interval)
         return False

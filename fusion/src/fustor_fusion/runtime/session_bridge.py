@@ -124,7 +124,7 @@ class PipeSessionBridge:
         
         if view_handler:
              try:
-                 session_result = await view_handler.resolve_session_role(session_id, fusion_pipe_id=self._pipe.id)
+                 session_result = await view_handler.resolve_session_role(session_id, pipe_id=self._pipe.id)
              except Exception as e:
                  logger.error(f"View handler failed to process new session {session_id}: {e}")
                  # Should we fail the session? For now, log and proceed as follower for safety

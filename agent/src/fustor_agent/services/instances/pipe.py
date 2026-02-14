@@ -72,7 +72,7 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
 
         if self.get_instance(id):
             self.logger.warning(f"Pipe instance '{id}' is already running or being managed.")
-            return StartResult(pipe_id=id, success=True, skipped=True)
+            return StartResult(agent_pipe_id=id, success=True, skipped=True)
 
         pipe_config = self.pipe_config_service.get_config(id)
         if not pipe_config:
@@ -80,12 +80,12 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
             self.logger.error(error_msg)
             if raise_on_error:
                 raise NotFoundError(error_msg)
-            return StartResult(pipe_id=id, success=False, error=error_msg)
+            return StartResult(agent_pipe_id=id, success=False, error=error_msg)
         self.logger.debug(f"Found pipe config for {id}")
 
         if pipe_config.disabled:
             self.logger.info(f"Pipe instance '{id}' will not be started because its configuration is disabled.")
-            return StartResult(pipe_id=id, success=True, skipped=True)
+            return StartResult(agent_pipe_id=id, success=True, skipped=True)
 
         source_config = self.source_config_service.get_config(pipe_config.source)
         if not source_config:
@@ -93,7 +93,7 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
             self.logger.error(error_msg)
             if raise_on_error:
                 raise NotFoundError(error_msg)
-            return StartResult(pipe_id=id, success=False, error=error_msg)
+            return StartResult(agent_pipe_id=id, success=False, error=error_msg)
         self.logger.debug(f"Found source config for {id}")
         
         sender_config = self.sender_config_service.get_config(pipe_config.sender)
@@ -102,7 +102,7 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
             self.logger.error(error_msg)
             if raise_on_error:
                 raise NotFoundError(error_msg)
-            return StartResult(pipe_id=id, success=False, error=error_msg)
+            return StartResult(agent_pipe_id=id, success=False, error=error_msg)
         self.logger.debug(f"Found sender config for {id}")
         
         self.logger.info(f"Attempting to start pipe instance '{id}'...")
@@ -182,7 +182,7 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
             await pipe.start()
             
             self.logger.info(f"Pipe instance '{id}' start initiated successfully.")
-            return StartResult(pipe_id=id, success=True)
+            return StartResult(agent_pipe_id=id, success=True)
 
         except (AttributeError, KeyError) as e:
             # Provide more specific error messages for configuration issues
@@ -198,7 +198,7 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
                 self.pool.pop(id)
             if raise_on_error:
                 raise ValueError(friendly_msg) from e
-            return StartResult(pipe_id=id, success=False, error=friendly_msg)
+            return StartResult(agent_pipe_id=id, success=False, error=friendly_msg)
             
         except Exception as e:
             self.logger.error(f"Failed to start pipe instance '{id}': {e}", exc_info=True)
@@ -206,7 +206,7 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
                 self.pool.pop(id)
             if raise_on_error:
                 raise
-            return StartResult(pipe_id=id, success=False, error=str(e))
+            return StartResult(agent_pipe_id=id, success=False, error=str(e))
 
 
 
@@ -309,7 +309,7 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
         for pid, result in zip(enabled_ids, results):
             if isinstance(result, Exception):
                 self.logger.error(f"Unexpected error starting pipe '{pid}': {result}")
-                normalized_results.append(StartResult(pipe_id=pid, success=False, error=str(result)))
+                normalized_results.append(StartResult(agent_pipe_id=pid, success=False, error=str(result)))
             else:
                 normalized_results.append(result)
         
@@ -323,7 +323,7 @@ class PipeInstanceService(BaseInstanceService, PipeInstanceServiceInterface): # 
         # Log failures for visibility
         for r in normalized_results:
             if not r.success:
-                self.logger.error(f"  - {r.pipe_id}: {r.error}")
+                self.logger.error(f"  - {r.agent_pipe_id}: {r.error}")
         
         return {
             "started": started,

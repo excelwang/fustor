@@ -34,8 +34,9 @@ class PipeLeaderMixin:
                 # Flag is set inside _run_snapshot_sync on success.
                 # If _handle_fatal_error swallowed the error, .result() returns None
                 # but _initial_snapshot_done remains False — which is correct.
-                if self._initial_snapshot_done:
+                if not self._initial_snapshot_done:
                     logger.info(f"Pipe {self.id}: Initial snapshot sync phase complete")
+                    self._initial_snapshot_done = True
             except asyncio.CancelledError:
                 logger.debug(f"Pipe {self.id}: Snapshot sync phase task was cancelled")
             except Exception as e:
@@ -69,7 +70,8 @@ class PipeLeaderMixin:
                     self.session_id, [], {"phase": "snapshot", "is_final": True}
                 )
                 
-            self._initial_snapshot_done = True
+            # Initial snapshot flag is now set by the monitor loop in _run_leader_sequence
+            # to ensure the "complete" log is correctly triggered once.
         except Exception as e:
             # Lifecycle mixin provides this
             await self._handle_fatal_error(e)

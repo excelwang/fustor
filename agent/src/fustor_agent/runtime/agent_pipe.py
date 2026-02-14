@@ -424,7 +424,7 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin, PipeCommandMixi
 
     async def _run_message_sync(self) -> None:
         """Execute realtime message sync phase."""
-        logger.debug(f"Pipe {self.id}: Starting message sync phase (Unified Bus Mode)")
+        logger.info(f"Pipe {self.id}: Starting message sync phase (Unified Bus Mode)")
         self._set_state(self.state | PipeState.MESSAGE_SYNC)
         
         try:

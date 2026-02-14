@@ -1,3 +1,4 @@
+from typing import Optional, Dict, Any
 from pydantic import BaseModel, Field
 from fustor_core.event import EventBase
 
@@ -11,3 +12,4 @@ class EventCreate(EventBase):
 
 class EventResponse(ResponseBase, EventBase):
     id: str
+    metadata: Optional[Dict[str, Any]] = None

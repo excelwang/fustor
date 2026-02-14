@@ -40,7 +40,7 @@
 
 采用 **Forest View** 架构 (`view-fs-forest`)，对外表现为单一 View，对内管理多棵 FS Tree。
 
-- **Symmetry**: 保持 Source ↔ View 的逻辑对等性，Forest View 内部为每个 Source 维护一个独立的子树。
+- **Symmetry**: 保持 Source ↔ View 的逻辑对等性，Forest View 内部为每组 Source (即每个 FusionPipe) 维护一个独立的子树。
 - **Routing**: Forest View 接收所有 FusionPipe 的数据，根据 `fusion_pipe_id` 将事件路由到内部对应的子树。
 - **Reuse**: 内部子树直接复用 `FSViewDriver` 的逻辑（Arbitration, Audit, Consistency）。
 

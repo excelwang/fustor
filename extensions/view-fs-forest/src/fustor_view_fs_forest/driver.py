@@ -30,15 +30,15 @@ class ForestFSViewDriver(ViewDriver):
         super().__init__(id, view_id, config)
         self.logger = logger
         
-        # Map: fusion_pipe_id -> FSViewDriver instance
+        # Map: pipe_id -> FSViewDriver instance
         self._trees: Dict[str, FSViewDriver] = {}
         self._tree_lock = asyncio.Lock()
         
-        # Map: session_id -> fusion_pipe_id (for lifecycle routing)
-        self._session_to_fusion_pipe: Dict[str, str] = {}
+        # Map: session_id -> pipe_id (for lifecycle routing)
+        self._session_to_pipe: Dict[str, str] = {}
         
         # We share configuration with sub-trees, but might want to inject overrides
-        # Sub-trees will have view_id = "{forest_id}:{fusion_pipe_id}"
+        # Sub-trees will have view_id = "{forest_id}:{pipe_id}"
         pass
 
     async def initialize(self):
@@ -50,19 +50,19 @@ class ForestFSViewDriver(ViewDriver):
         """
         Determine session role with SCOPED leader election (per-tree).
         """
-        fusion_pipe_id = kwargs.get("fusion_pipe_id") or kwargs.get("pipe_id")
-        if not fusion_pipe_id:
+        pipe_id = kwargs.get("pipe_id") or kwargs.get("fusion_pipe_id")
+        if not pipe_id:
             # Try to infer or fallback
-            return {"role": "follower", "error": "fusion_pipe_id required for ForestView session"}
+            return {"role": "follower", "error": "pipe_id required for ForestView session"}
 
         from fustor_fusion.view_state_manager import view_state_manager
-        election_id = f"{self.view_id}:{fusion_pipe_id}"
+        election_id = f"{self.view_id}:{pipe_id}"
             
         # Register session mapping internally
-        self._session_to_fusion_pipe[session_id] = fusion_pipe_id
+        self._session_to_pipe[session_id] = pipe_id
         
         # Ensure tree exists so it's ready for events
-        await self._get_or_create_tree(fusion_pipe_id)
+        await self._get_or_create_tree(pipe_id)
 
         is_leader = await view_state_manager.try_become_leader(election_id, session_id)
         
@@ -76,43 +76,43 @@ class ForestFSViewDriver(ViewDriver):
 
     async def process_event(self, event: Any) -> bool:
         """
-        Route event to the correct internal tree based on fusion_pipe_id.
+        Route event to the correct internal tree based on pipe_id.
         """
         metadata = getattr(event, "metadata", {}) or {}
-        fusion_pipe_id = metadata.get("fusion_pipe_id") or metadata.get("pipe_id")
+        pipe_id = metadata.get("pipe_id") or metadata.get("fusion_pipe_id")
         
-        if not fusion_pipe_id:
+        if not pipe_id:
             # Metadata injection failed or legacy event?
-            # We cannot route without fusion_pipe_id in Forest mode.
-            self.logger.warning(f"ForestView received event without 'fusion_pipe_id' metadata. Dropping. Event ID: {getattr(event, 'event_id', 'unknown')}")
+            # We cannot route without pipe_id in Forest mode.
+            self.logger.warning(f"ForestView received event without 'pipe_id' metadata. Dropping. Event ID: {getattr(event, 'event_id', 'unknown')}")
             return False
 
-        tree = await self._get_or_create_tree(fusion_pipe_id)
+        tree = await self._get_or_create_tree(pipe_id)
         return await tree.process_event(event)
 
-    async def _get_or_create_tree(self, fusion_pipe_id: str) -> FSViewDriver:
+    async def _get_or_create_tree(self, pipe_id: str) -> FSViewDriver:
         """Lazy initialization of internal tree for a given pipe."""
-        if fusion_pipe_id not in self._trees:
+        if pipe_id not in self._trees:
             async with self._tree_lock:
-                if fusion_pipe_id not in self._trees:
-                    self.logger.info(f"Creating new internal FS Tree for fusion_pipe_id='{fusion_pipe_id}'")
+                if pipe_id not in self._trees:
+                    self.logger.info(f"Creating new internal FS Tree for pipe_id='{pipe_id}'")
                     
                     # Construct a scoped ID for the sub-tree
                     # Use a colon separator which is standard for namespacing
-                    sub_view_id = f"{self.view_id}:{fusion_pipe_id}"
+                    sub_view_id = f"{self.view_id}:{pipe_id}"
                     
                     # Create the sub-driver
                     tree = FSViewDriver(
-                        id=f"{self.id}:{fusion_pipe_id}",
+                        id=f"{self.id}:{pipe_id}",
                         view_id=sub_view_id,
                         config=self.config
                     )
                     
                     # Initialize it immediately
                     await tree.initialize()
-                    self._trees[fusion_pipe_id] = tree
+                    self._trees[pipe_id] = tree
                     
-        return self._trees[fusion_pipe_id]
+        return self._trees[pipe_id]
 
     async def get_data_view(self, **kwargs) -> Any:
         """
@@ -294,13 +294,13 @@ class ForestFSViewDriver(ViewDriver):
                  await tree.on_session_start(**kwargs)
              return
 
-        fusion_pipe_id = self._session_to_fusion_pipe.get(session_id) or kwargs.get("fusion_pipe_id") or kwargs.get("pipe_id")
-        if fusion_pipe_id:
-             self._session_to_fusion_pipe[session_id] = fusion_pipe_id
-             tree = await self._get_or_create_tree(fusion_pipe_id)
+        pipe_id = self._session_to_pipe.get(session_id) or kwargs.get("pipe_id") or kwargs.get("fusion_pipe_id")
+        if pipe_id:
+             self._session_to_pipe[session_id] = pipe_id
+             tree = await self._get_or_create_tree(pipe_id)
              await tree.on_session_start(**kwargs)
         else:
-             self.logger.warning(f"ForestView {self.view_id}: session {session_id} has no fusion_pipe_id mapping, cannot route to tree.")
+             self.logger.warning(f"ForestView {self.view_id}: session {session_id} has no pipe_id mapping, cannot route to tree.")
 
     async def on_session_close(self, **kwargs):
         """Delegate session close and cleanup mapping."""
@@ -310,16 +310,16 @@ class ForestFSViewDriver(ViewDriver):
                  await tree.on_session_close(**kwargs)
              return
 
-        fusion_pipe_id = self._session_to_fusion_pipe.pop(session_id, None)
-        if fusion_pipe_id and fusion_pipe_id in self._trees:
-            await self._trees[fusion_pipe_id].on_session_close(**kwargs)
+        pipe_id = self._session_to_pipe.pop(session_id, None)
+        if pipe_id and pipe_id in self._trees:
+            await self._trees[pipe_id].on_session_close(**kwargs)
     
     async def on_snapshot_complete(self, session_id: str, **kwargs) -> None:
         """Mark scoped view key for this session's sub-tree."""
-        fusion_pipe_id = (kwargs.get("metadata") or {}).get("fusion_pipe_id") or (kwargs.get("metadata") or {}).get("pipe_id") or self._session_to_fusion_pipe.get(session_id)
-        if fusion_pipe_id:
+        pipe_id = (kwargs.get("metadata") or {}).get("pipe_id") or (kwargs.get("metadata") or {}).get("fusion_pipe_id") or self._session_to_pipe.get(session_id)
+        if pipe_id:
             from fustor_fusion.view_state_manager import view_state_manager
-            scoped_key = f"{self.view_id}:{fusion_pipe_id}"
+            scoped_key = f"{self.view_id}:{pipe_id}"
             await view_state_manager.set_snapshot_complete(scoped_key, session_id)
             self.logger.debug(f"ForestView {self.view_id}: Marked scoped tree {scoped_key} snapshot complete")
 
@@ -348,4 +348,4 @@ class ForestFSViewDriver(ViewDriver):
              if tasks:
                  await asyncio.gather(*tasks)
              self._trees.clear()
-             self._session_to_fusion_pipe.clear()
+             self._session_to_pipe.clear()

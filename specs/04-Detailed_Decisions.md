@@ -15,9 +15,9 @@
 
 | # | 问题 | 选项/说明 |
 |---|------|---------|
-| 2.1 | 一个 **Fusion Pipe** 是否可以绑定多个 **View**？ | A) 1:1（每个 Pipe 固定一个 View）<br>B) 1:N（一个 Pipe 分发到多个 View） |
-| 2.2 | 一个 **View** 是否可以接收多个 **Fusion Pipe** 的事件？ | A) 1:1<br>B) N:1（多个 Pipe 聚合到一个 View） |
-| 2.3 | **Receiver** 与 **Fusion Pipe** 的关系？ | A) 1:1（每个 Receiver 独占一个 Pipe）<br>B) 1:N（一个 Receiver 可服务多个 Pipe）<br>C) N:1（多个 Receiver 可指向同一 Pipe） |
+| 2.1 | 一个 **FusionPipe** 是否可以绑定多个 **View**？ | A) 1:1（每个 FusionPipe 固定一个 View）<br>B) 1:N（一个 FusionPipe 分发到多个 View） |
+| 2.2 | 一个 **View** 是否可以接收多个 **FusionPipe** 的事件？ | A) 1:1<br>B) N:1（多个 FusionPipe 聚合到一个 View） |
+| 2.3 | **Receiver** 与 **FusionPipe** 的关系？ | A) 1:1（每个 Receiver 独占一个 FusionPipe）<br>B) 1:N（一个 Receiver 可服务多个 FusionPipe）<br>C) N:1（多个 Receiver 可指向同一 FusionPipe） |
 
 ---
 
@@ -27,8 +27,8 @@
 |---|------|---------|
 | 3.1 | 多个 **Session** 同时写入同一 **View**，如何处理冲突？ | A) LogicalClock 仲裁（谁的 mtime 更新谁生效）<br>B) 最后写入者胜出<br>C) 其他机制？ |
 | 3.2 | **Leader/Follower** 机制是否保留？ | A) 保留（Snapshot 只接受 Leader）<br>B) 废弃（所有 Session 平等） |
-| 3.3 | **LogicalClock** 是哪个层级的组件？ | A) View 级别（每个 View 一个）<br>B) Pipe 级别<br>C) Session 级别（每个 Session 独立） |
-| 3.4 | **审计周期**（audit start/end）是哪个层级的？ | A) Session 级别（每个 Session 独立审计）<br>B) View 级别（所有 Session 共享一个审计状态）<br>C) Pipe 级别 |
+| 3.3 | **LogicalClock** 是哪个层级的组件？ | A) View 级别（每个 View 一个）<br>B) FusionPipe 级别<br>C) Session 级别（每个 Session 独立） |
+| 3.4 | **审计周期**（audit start/end）是哪个层级的？ | A) Session 级别（每个 Session 独立审计）<br>B) View 级别（所有 Session 共享一个审计状态）<br>C) FusionPipe 级别 |
 
 ---
 
@@ -38,7 +38,7 @@
 |---|------|---------|
 | 4.1 | Session 关闭（正常或超时）后，**View 状态**如何处理？ | A) 保留内存树，等待新 Session<br>B) 清空内存树<br>C) 取决于配置 |
 | 4.2 | **所有 Session 都关闭**后，View 应该做什么？ | A) 保持待命状态<br>B) 重置盲区列表但保留树<br>C) 完全重置 |
-| 4.3 | Session 超时设置在哪里配置？ | A) Pipe 配置<br>B) Receiver 配置<br>C) 全局配置 |
+| 4.3 | Session 超时设置在哪里配置？ | A) FusionPipe 配置<br>B) Receiver 配置<br>C) 全局配置 |
 
 ---
 
@@ -46,9 +46,9 @@
 
 | # | 问题 | 选项/说明 |
 |---|------|---------|
-| 5.1 | 一个 **API Key** 可以访问多个 **Fusion Pipe** 吗？ | A) 1:1（每个 Key 固定一个 Pipe）<br>B) 1:N（一个 Key 可访问多个 Pipe） |
-| 5.2 | 如果 5.1 是 1:N，如何在请求中指定目标 Pipe？ | A) URL 路径中<br>B) 请求头中<br>C) 请求体中 |
-| 5.3 | 废弃 View 后，原来的 `view_id` 概念如何映射？ | A) 用 pipe_id 替代<br>B) 用 view_id 替代<br>C) 用 receiver_id 替代 |
+| 5.1 | 一个 **API Key** 可以访问多个 **FusionPipe** 吗？ | A) 1:1（每个 Key 固定一个 FusionPipe）<br>B) 1:N（一个 Key 可访问多个 FusionPipe） |
+| 5.2 | 如果 5.1 是 1:N，如何在请求中指定目标 FusionPipe？ | A) URL 路径中<br>B) 请求头中<br>C) 请求体中 |
+| 5.3 | 废弃 View 后，原来的 `view_id` 概念如何映射？ | A) 用 fusion_pipe_id 替代<br>B) 用 view_id 替代<br>C) 用 receiver_id 替代 |
 
 ---
 
@@ -62,7 +62,7 @@
 | 6.4 | **Tombstone 列表** | View 级别 | ？ |
 | 6.5 | **审计跳过优化**（parent mtime 未变则跳过） | Source 级别 | ？ |
 | 6.6 | **热文件检测**（hot_file_threshold） | View 级别 | ？ |
-| 6.7 | **断点续传**（从 latest_index 恢复） | View 级别 | ？移到 Session？ |
+| 6.7 | **断点续传**（从 latest_index 恢复） | View 级别 | ？移到 Session？ (AgentPipe/FusionPipe 级) |
 
 ---
 
@@ -114,7 +114,7 @@
 
 ## 优先需要您确认的关键问题
 
-1. **2.1 / 2.2 / 2.3**: Receiver → Pipe → View 的关系基数
+1. **2.1 / 2.2 / 2.3**: Receiver → FusionPipe → View 的关系基数
 2. **3.2**: Leader/Follower 是否保留
 3. **3.3 / 3.4**: LogicalClock 和审计周期的层级
 4. **5.3**: view_id 的替代策略
@@ -140,13 +140,13 @@
 4.1 提供接口让各视图自行决定。
 4.2 如何视图是live类型的则选C，否者选A。
 4.3 A。由fusion一侧决定后通过agent创建session请求的响应消息告知agent。agent发送心跳的间隔为超时值的一半。
-5.1 api key是transport级别的，不是pipe级别的吧，因此是B
-5.2 pipe是上层的业务逻辑，身份认证是下层的传输机制，sender/receiver与pipe的对应关系在配置文件里，而不需要在消息体或路径上配置。
+5.1 api key是transport级别的，不是 FusionPipe 级别的吧，因此是B
+5.2 FusionPipe 是上层的业务逻辑，身份认证是下层的传输机制，sender/receiver与 FusionPipe 的对应关系在配置文件里，而不需要在消息体或路径上配置。
 5.3 用view_id替代。
 6.1 保留在view-fs和source-fs。
 6.2、6.3、6.4、6.6 保留在view-fs
-6.5 保留在source-fs、view-fs
-6.7 pipe级别的。
+6.8 保留在source-fs、view-fs
+6.7 FusionPipe 级别的。
 7 采纳全部建议。
 8.1 agent-pipes-config/ 
 8.2、8.3、8.4 OK
@@ -169,14 +169,14 @@
 │                           核心关系确认                                                │
 ├─────────────────────────────────────────────────────────────────────────────────────┤
 │                                                                                      │
-│   Receiver : Fusion Pipe = 1 : N                                                 │
-│   (一个 Receiver 可服务多个 Pipe)                                                 │
+│   Receiver : FusionPipe = 1 : N                                                  │
+│   (一个 Receiver 可服务多个 FusionPipe)                                          │
 │                                                                                      │
-│   Fusion Pipe : View = 1 : N                                                     │
+│   FusionPipe : View = 1 : N                                                      │
 │   (一个 Pipe 可分发到多个 View)                                                   │
 │                                                                                      │
-│   View : Fusion Pipe = N : 1                                                     │
-│   (一个 View 可接收多个 Pipe 的事件)                                               │
+│   View : FusionPipe = N : 1                                                      │
+│   (一个 View 可接收多个 FusionPipe 的事件)                                         │
 │                                                                                      │
 │   ───────────────────────────────────────────────────────────────────────────────── │
 │                                                                                      │
@@ -218,9 +218,9 @@
 
 | # | 问题 | 确认答案 |
 |---|------|---------|
-| 2.1 | Fusion Pipe : View | **B) 1:N（一个 Pipe 分发到多个 View）** |
-| 2.2 | View : Fusion Pipe | **B) N:1（一个 View 可接收多个 Pipe）** |
-| 2.3 | Receiver : Fusion Pipe | **B) 1:N（一个 Receiver 可服务多个 Pipe）** |
+| 2.1 | FusionPipe : View | **B) 1:N（一个 FusionPipe 分发到多个 View）** |
+| 2.2 | View : FusionPipe | **B) N:1（一个 View 可接收多个 FusionPipe）** |
+| 2.3 | Receiver : FusionPipe | **B) 1:N（一个 Receiver 可服务多个 FusionPipe）** |
 
 ## 并发与一致性
 
@@ -229,7 +229,7 @@
 | 3.1 | 多 Session 冲突处理 | **遵循一致性方案（LogicalClock 仲裁）** |
 | 3.2 | Leader/Follower | **fs 特有设计，保留在 view-fs** |
 | 3.3 | LogicalClock 层级 | **A) View 级别** |
-| 3.4 | 审计周期层级 | **B) View 级别，fs 特有** |
+| 3.4 | 审计周期层级 | **B) View 级别，fs 特有** | (断点续传: FusionPipe 级别) |
 
 ## Session 生命周期
 
@@ -237,7 +237,7 @@
 |---|------|---------| 
 | 4.1 | Session 关闭后 View 状态 | **提供接口让 View 自行决定** |
 | 4.2 | 所有 Session 关闭后 | **live 类型清空，否则保留** |
-| 4.3 | Session 超时配置位置 | **Pipe 配置，通过响应告知 Agent** |
+| 4.3 | Session 超时配置位置 | **FusionPipe 配置，通过响应告知 Agent** |
 
 ### 4.2 详细说明：Live 模式 View 的全量清理
 
@@ -265,7 +265,7 @@
 | 6.1 | Sentinel 机制 | view-fs, source-fs |
 | 6.2-6.4, 6.6 | Blind-spot, Suspect, Tombstone, 热文件 | view-fs |
 | 6.5 | 审计跳过优化 | source-fs, view-fs |
-| 6.7 | 断点续传 | **Pipe 级别** |
+| 6.7 | 断点续传 | **FusionPipe 级别** |
 
 ## 配置目录
 
