@@ -12,7 +12,7 @@ def mock_pipe():
     # Mock get_view_handler to return a handler
     mock_handler = AsyncMock()
     # Default behavior: standard leader
-    mock_handler.on_session_created.return_value = {"role": "leader"}
+    mock_handler.resolve_session_role.return_value = {"role": "leader"}
     pipe.get_view_handler.return_value = mock_handler
     
     # Force locking behavior for tests
@@ -27,12 +27,12 @@ def mock_session_manager():
 
 @pytest.mark.asyncio
 async def test_create_session_delegation(mock_pipe, mock_session_manager):
-    """Test that SessionBridge delegates election to handler.on_session_created."""
+    """Test that SessionBridge delegates election to handler.resolve_session_role."""
     bridge = PipeSessionBridge(mock_pipe, mock_session_manager)
     
     # Setup handler response
     mock_handler = mock_pipe.get_view_handler.return_value
-    mock_handler.on_session_created.return_value = {
+    mock_handler.resolve_session_role.return_value = {
         "role": "leader", 
         "election_key": "view:pipe-1"
     }
@@ -47,7 +47,7 @@ async def test_create_session_delegation(mock_pipe, mock_session_manager):
         )
         
         # 2. Verify delegation
-        mock_handler.on_session_created.assert_called_with("sess-1", "pipe-1")
+        mock_handler.resolve_session_role.assert_called_with("sess-1", "pipe-1")
         
         # 3. Verify locking on returned election key
         mock_vsm.lock_for_session.assert_called_with("view:pipe-1", "sess-1")
@@ -58,7 +58,7 @@ async def test_create_session_follower(mock_pipe, mock_session_manager):
     bridge = PipeSessionBridge(mock_pipe, mock_session_manager)
     
     mock_handler = mock_pipe.get_view_handler.return_value
-    mock_handler.on_session_created.return_value = {
+    mock_handler.resolve_session_role.return_value = {
         "role": "follower", 
         "election_key": "view:pipe-1"
     }

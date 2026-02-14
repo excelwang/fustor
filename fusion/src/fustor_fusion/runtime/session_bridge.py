@@ -119,7 +119,7 @@ class PipeSessionBridge:
         
         if view_handler:
              try:
-                 session_result = await view_handler.on_session_created(session_id, getattr(self._pipe, 'pipe_id', None))
+                 session_result = await view_handler.resolve_session_role(session_id, getattr(self._pipe, 'pipe_id', None))
              except Exception as e:
                  logger.error(f"View handler failed to process new session {session_id}: {e}")
                  # Should we fail the session? For now, log and proceed as follower for safety
@@ -217,7 +217,7 @@ class PipeSessionBridge:
         )
         
         # 3. Try to become leader (Follower promotion) if not known leader
-        # We delegate this to on_session_created again (idempotent "try become leader" check)
+        # We delegate this to resolve_session_role again (idempotent "try become leader" check)
         
         # Periodic validation/retry: every N heartbeats
         count = self._heartbeat_count.get(session_id, 0) + 1
@@ -228,7 +228,7 @@ class PipeSessionBridge:
             if view_handler:
                  try:
                      # Re-run election logic via handler
-                     res = await view_handler.on_session_created(session_id, getattr(self._pipe, 'pipe_id', None))
+                     res = await view_handler.resolve_session_role(session_id, getattr(self._pipe, 'pipe_id', None))
                      is_leader = (res.get("role") == "leader")
                      election_key = res.get("election_key", view_id)
                      

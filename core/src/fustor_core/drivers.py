@@ -110,9 +110,15 @@ class ViewDriver(ABC):
         pass
 
 
-    async def on_session_created(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Calculates session role and metadata.
+        Determine the role (leader/follower) for a newly created session.
+        
+        Called by the SessionBridge during session creation to delegate
+        election logic to the specific ViewDriver implementation.
+        
+        This is NOT the same as on_session_start(), which is a lifecycle
+        hook called AFTER session creation to reset internal state.
         
         Args:
             session_id: The ID of the session being created

@@ -42,9 +42,9 @@ class ForestFSViewDriver(ViewDriver):
         # Nothing specific to init for the forest container yet.
         pass
 
-    async def on_session_created(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Handle session creation with SCOPED leader election (per-tree).
+        Determine session role with SCOPED leader election (per-tree).
         """
         from fustor_fusion.view_state_manager import view_state_manager
         election_id = f"{self.view_id}:{pipe_id}"

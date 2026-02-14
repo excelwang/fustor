@@ -58,9 +58,9 @@ class FSViewDriver(FSViewBase):
         async with self._global_read_lock():
             return self.arbitrator.cleanup_expired_suspects()
 
-    async def on_session_created(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Handle session creation with standard leader election.
+        Determine session role with standard (global) leader election.
         """
         from fustor_fusion.view_state_manager import view_state_manager
         

@@ -165,12 +165,15 @@ class ViewHandler(Handler):
         """
         raise NotImplementedError
     
-    async def on_session_created(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
+    async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Handle session creation and determine role.
+        Determine the role (leader/follower) for a newly created session.
+        
+        Called by SessionBridge to delegate election logic.
+        Not to be confused with on_session_start() which resets state.
         
         Returns:
-            Dict with 'role', etc.
+            Dict with 'role', 'election_key', etc.
         """
         return {"role": "leader"}
     
