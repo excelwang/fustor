@@ -33,6 +33,9 @@ class ForestFSViewDriver(ViewDriver):
         self._trees: Dict[str, FSViewDriver] = {}
         self._tree_lock = asyncio.Lock()
         
+        # Map: session_id -> pipe_id (for lifecycle routing)
+        self._session_to_pipe: Dict[str, str] = {}
+        
         # We share configuration with sub-trees, but might want to inject overrides
         # Sub-trees will have view_id = "{forest_id}:{pipe_id}"
         pass
@@ -53,9 +56,10 @@ class ForestFSViewDriver(ViewDriver):
         election_id = f"{self.view_id}:{pipe_id}"
             
         # Register session mapping internally
-        if pipe_id:
-             # Ensure tree exists so it's ready for events
-             await self._get_or_create_tree(pipe_id)
+        self._session_to_pipe[session_id] = pipe_id
+        
+        # Ensure tree exists so it's ready for events
+        await self._get_or_create_tree(pipe_id)
 
         is_leader = await view_state_manager.try_become_leader(election_id, session_id)
         
@@ -113,6 +117,40 @@ class ForestFSViewDriver(ViewDriver):
         For Forest, this might default to full tree aggregation.
         """
         return await self.get_directory_tree(**kwargs)
+
+    async def get_directory_stats(self) -> Dict[str, Any]:
+        """
+        Aggregate stats from all internal trees.
+        Required by metadata limit checker in API.
+        """
+        total_items = 0
+        total_size = 0
+        max_latency = 0.0
+        max_staleness = 0.0
+        suspect_count = 0
+        
+        # Snapshot current trees safely
+        current_trees = list(self._trees.values())
+        
+        for tree in current_trees:
+            try:
+                stats = await tree.get_directory_stats()
+                total_items += stats.get("item_count", 0)
+                total_size += stats.get("total_size", 0)
+                max_latency = max(max_latency, stats.get("latency_ms", 0.0))
+                max_staleness = max(max_staleness, stats.get("staleness_seconds", 0.0))
+                suspect_count += stats.get("suspect_file_count", 0)
+            except Exception as e:
+                self.logger.warning(f"Failed to get stats from sub-tree: {e}")
+                
+        return {
+            "item_count": total_items,
+            "total_size": total_size,
+            "latency_ms": max_latency,
+            "staleness_seconds": max_staleness,
+            "suspect_file_count": suspect_count,
+            "tree_count": len(current_trees)
+        }
 
     # --- Aggregation API Methods ---
 
@@ -219,6 +257,41 @@ class ForestFSViewDriver(ViewDriver):
             
         return result
 
+    # --- Lifecycle and Audit Delegation ---
+    
+    async def on_session_start(self, session_id: Optional[str] = None):
+        """Delegate session start to the specific tree for this session."""
+        if not session_id:
+             # Broadcast if no session_id (unlikely in new architecture)
+             for tree in self._trees.values():
+                 await tree.on_session_start()
+             return
+
+        pipe_id = self._session_to_pipe.get(session_id)
+        if pipe_id and pipe_id in self._trees:
+            await self._trees[pipe_id].on_session_start()
+
+    async def on_session_close(self, session_id: Optional[str] = None):
+        """Delegate session close and cleanup mapping."""
+        if not session_id:
+             for tree in self._trees.values():
+                 await tree.on_session_close()
+             return
+
+        pipe_id = self._session_to_pipe.pop(session_id, None)
+        if pipe_id and pipe_id in self._trees:
+            await self._trees[pipe_id].on_session_close()
+
+    async def handle_audit_start(self):
+        """Broadcast audit start to all trees."""
+        for tree in self._trees.values():
+            await tree.handle_audit_start()
+
+    async def handle_audit_end(self):
+        """Broadcast audit end to all trees."""
+        for tree in self._trees.values():
+            await tree.handle_audit_end()
+
     # --- Passthrough for other lifecycle methods if needed ---
     
     async def cleanup_expired_suspects(self):
@@ -234,3 +307,4 @@ class ForestFSViewDriver(ViewDriver):
              if tasks:
                  await asyncio.gather(*tasks)
              self._trees.clear()
+             self._session_to_pipe.clear()

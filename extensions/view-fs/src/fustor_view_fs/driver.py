@@ -77,7 +77,7 @@ class FSViewDriver(FSViewBase):
             "election_key": self.view_id
         }
 
-    async def on_session_start(self):
+    async def on_session_start(self, session_id: Optional[str] = None):
         """Handles new session lifecycle."""
         async with self._global_exclusive_lock():
             # If we were in an audit, it's now invalid
@@ -91,7 +91,7 @@ class FSViewDriver(FSViewBase):
             
             self.logger.debug(f"New session sequence started. Cleared audit buffer and blind-spot lists.")
 
-    async def on_session_close(self):
+    async def on_session_close(self, session_id: Optional[str] = None):
         """
         Handle individual session close.
         

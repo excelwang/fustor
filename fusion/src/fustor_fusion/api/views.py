@@ -324,8 +324,10 @@ async def list_view_sessions(view_id: str, authorized_view_id: str = Depends(get
     
     from ..core.session_manager import session_manager
     from ..view_state_manager import view_state_manager
+    from .. import runtime_objects
     
     sessions = await session_manager.get_view_sessions(view_id)
+    pipe = runtime_objects.pipe_manager.get_pipe(view_id)
     
     session_list = []
     for session_id, session_info in sessions.items():
@@ -342,7 +344,13 @@ async def list_view_sessions(view_id: str, authorized_view_id: str = Depends(get
             "session_timeout_seconds": session_info.session_timeout_seconds
         }
         
-        is_leader = await view_state_manager.is_leader(view_id, session_id)
+        if pipe:
+            # Prefer Pipe's role check (handles Forest Mode scoped election)
+            role = await pipe.get_session_role(session_id)
+            is_leader = (role == "leader")
+        else:
+            is_leader = await view_state_manager.is_leader(view_id, session_id)
+            
         session_data["role"] = "leader" if is_leader else "follower"
         session_data["can_snapshot"] = is_leader
         session_data["can_audit"] = is_leader

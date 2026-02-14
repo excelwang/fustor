@@ -114,7 +114,11 @@ class PipeSessionBridge:
         
         # Delegate election and role determination to the View Handler
         # This decouples the bridge from specific consistency models (forest vs standard)
+        # Try direct ID first, then ViewManager prefix
         view_handler = self._pipe.get_view_handler(view_id)
+        if not view_handler:
+            view_handler = self._pipe.get_view_handler(f"view-manager-{view_id}")
+            
         session_result = {"role": "leader"} # Default fallback
         
         if view_handler:
@@ -225,6 +229,8 @@ class PipeSessionBridge:
         
         if count % self._LEADER_VERIFY_INTERVAL == 0:
             view_handler = self._pipe.get_view_handler(view_id)
+            if not view_handler:
+                view_handler = self._pipe.get_view_handler(f"view-manager-{view_id}")
             if view_handler:
                  try:
                      # Re-run election logic via handler

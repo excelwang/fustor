@@ -351,7 +351,7 @@ class FusionPipe(Pipe):
         # Notify view handlers of session start
         for handler in self._view_handlers.values():
             if hasattr(handler, 'on_session_start'):
-                await handler.on_session_start()
+                await handler.on_session_start(session_id=session_id)
         
         if is_leader:
             self._cached_leader_session = session_id
@@ -393,7 +393,7 @@ class FusionPipe(Pipe):
         # Notify view handlers of session close
         for handler in self._view_handlers.values():
             if hasattr(handler, 'on_session_close'):
-                await handler.on_session_close()
+                await handler.on_session_close(session_id=session_id)
         
         logger.info(f"Session {session_id} closed for view {self.view_id}")
     
@@ -518,6 +518,14 @@ class FusionPipe(Pipe):
                     # Mark primary view complete
                     await view_state_manager.set_snapshot_complete(self.view_id, session_id)
                     logger.info(f"Pipe {self.id}: Marked view {self.view_id} as snapshot complete.")
+                    
+                    # Also mark scoped view key (for ForestView) using source_uri
+                    lineage = self._session_lineage_cache.get(session_id, {})
+                    source_uri = lineage.get("source_uri")
+                    if source_uri:
+                         scoped_key = f"{self.view_id}:{source_uri}"
+                         await view_state_manager.set_snapshot_complete(scoped_key, session_id)
+                         logger.debug(f"Pipe {self.id}: Also marked scoped view {scoped_key} as complete.")
                     
                     # Also mark all other handlers' views as complete if they are different
                     for h_id, handler in self._view_handlers.items():

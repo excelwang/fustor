@@ -177,11 +177,11 @@ class ViewHandler(Handler):
         """
         return {"role": "leader"}
     
-    async def on_session_start(self) -> None:
+    async def on_session_start(self, session_id: Optional[str] = None) -> None:
         """Called when a new Agent session starts."""
         pass
     
-    async def on_session_close(self) -> None:
+    async def on_session_close(self, session_id: Optional[str] = None) -> None:
         """Called when an Agent session terminates."""
         pass
     

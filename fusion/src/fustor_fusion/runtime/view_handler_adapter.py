@@ -114,15 +114,23 @@ class ViewDriverAdapter(ViewHandler):
             return await self._driver.resolve_session_role(session_id, pipe_id)
         return {"role": "leader"}
     
-    async def on_session_start(self) -> None:
+    async def on_session_start(self, session_id: Optional[str] = None) -> None:
         """Handle session start - delegates state reset to driver."""
         if hasattr(self._driver, 'on_session_start'):
-            await self._driver.on_session_start()
+            # FSViewDriver might not support session_id yet, but we'll adapt it later if needed
+            # For now, ViewDriverAdapter just passes it along
+            try:
+                await self._driver.on_session_start(session_id=session_id)
+            except TypeError:
+                await self._driver.on_session_start()
     
-    async def on_session_close(self) -> None:
+    async def on_session_close(self, session_id: Optional[str] = None) -> None:
         """Handle session close."""
         if hasattr(self._driver, 'on_session_close'):
-            await self._driver.on_session_close()
+            try:
+                await self._driver.on_session_close(session_id=session_id)
+            except TypeError:
+                await self._driver.on_session_close()
     
     async def handle_audit_start(self) -> None:
         """Handle audit start."""
@@ -225,13 +233,13 @@ class ViewManagerAdapter(ViewHandler):
             "driver_instances": self._manager.get_available_driver_ids()
         }
     
-    async def on_session_start(self) -> None:
+    async def on_session_start(self, session_id: Optional[str] = None) -> None:
         """Handle session start for all driver instances."""
-        await self._manager.on_session_start()
+        await self._manager.on_session_start(session_id=session_id)
     
-    async def on_session_close(self) -> None:
+    async def on_session_close(self, session_id: Optional[str] = None) -> None:
         """Handle session close for all driver instances."""
-        await self._manager.on_session_close()
+        await self._manager.on_session_close(session_id=session_id)
     
     async def resolve_session_role(self, session_id: str, pipe_id: Optional[str] = None) -> Dict[str, Any]:
         """
@@ -243,7 +251,14 @@ class ViewManagerAdapter(ViewHandler):
                 res = await driver_instance.resolve_session_role(session_id, pipe_id)
                 if res.get("role") == "leader":
                     return res
-        return {"role": "leader"} # Default fallback
+        # Fallback: Perform global election for standard drivers that don't implement scoped election
+        from ..view_state_manager import view_state_manager
+        # Try to acquire global leadership for this view
+        is_leader = await view_state_manager.try_become_leader(self._manager.view_id, session_id)
+        if is_leader:
+            await view_state_manager.set_authoritative_session(self._manager.view_id, session_id)
+            
+        return {"role": "leader" if is_leader else "follower"}
     
     async def handle_audit_start(self) -> None:
         """Handle audit start for all driver instances."""
