@@ -63,21 +63,30 @@ class FallbackDriverWrapper:
         self._view_id = view_id
         
     def __getattr__(self, name):
-        return getattr(self._driver, name)
-        
+        attr = getattr(self._driver, name)
+        if callable(attr) and asyncio.iscoroutinefunction(attr):
+            async def wrapped(*args, **kwargs):
+                try:
+                    return await attr(*args, **kwargs)
+                except Exception as e:
+                    # In Gap P0-3, we fallback to on-demand agent scan on failure
+                    logger.warning(f"View {self._view_id} method '{name}' failed ({e}), triggering On-Command Fallback...")
+                    try:
+                        return await on_command_fallback(self._view_id, kwargs)
+                    except Exception as fallback_e:
+                        logger.error(f"Fallback failed for {self._view_id}: {fallback_e}")
+                        # Re-raise original error to not mask root cause
+                        raise e
+            return wrapped
+        return attr
+
     async def get_data_view(self, **kwargs):
+        # Explicit override for standard ABC method
         try:
             return await self._driver.get_data_view(**kwargs)
         except Exception as e:
-            # Only fallback on specific availability errors or if configured?
-            # For P0 implementation, we try fallback on any failure + warning
             logger.warning(f"View {self._view_id} primary query failed ({e}), triggering On-Command Fallback...")
-            try:
-                return await on_command_fallback(self._view_id, kwargs)
-            except Exception as fallback_e:
-                logger.error(f"Fallback failed for {self._view_id}: {fallback_e}")
-                # Re-raise original error to not mask the root cause if fallback also fails
-                raise e
+            return await on_command_fallback(self._view_id, kwargs)
 
 
 def make_metadata_limit_checker(view_name: str) -> Callable:

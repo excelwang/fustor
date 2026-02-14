@@ -75,7 +75,13 @@ def create_fs_router(get_driver_func, check_snapshot_func, get_view_id_dep, chec
                 logger.warning(f"Driver for view {view_id} does not support on-demand scan")
         
         effective_recursive = recursive if max_depth is None else True
-        result = await driver.get_directory_tree(path, recursive=effective_recursive, max_depth=max_depth, only_path=only_path)
+        result = await driver.get_directory_tree(
+            path, 
+            recursive=effective_recursive, 
+            max_depth=max_depth, 
+            only_path=only_path,
+            on_demand_scan=on_demand_scan  # This triggers Fallback if driver doesn't explicitly handle it
+        )
         
         # Check if there's a pending job for this path
         job_pending = False

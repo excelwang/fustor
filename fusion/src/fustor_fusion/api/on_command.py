@@ -85,7 +85,7 @@ async def on_command_fallback(view_id: str, params: Dict[str, Any]) -> Dict[str,
         result = await bridge.send_command_and_wait(
             session_id=target_session_id,
             command="scan",
-            params={**cmd_params, "job_id": start_time}, # start_time as pseudo job_id or rely on bridge cmd_id
+            params={**cmd_params, "job_id": str(start_time)}, # start_time as pseudo job_id
             timeout=fallback_timeout
         )
         

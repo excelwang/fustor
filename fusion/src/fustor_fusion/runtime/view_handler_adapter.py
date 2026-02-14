@@ -136,8 +136,8 @@ class ViewDriverAdapter(ViewHandler):
 
     async def reset_audit_tracking(self) -> None:
         """Force reset any internal audit tracking state."""
-        if hasattr(self._driver, '_audit_start_time'):
-            self._driver._audit_start_time = None
+        if hasattr(self._driver, 'audit_start_time'):
+            self._driver.audit_start_time = None
 
     async def on_snapshot_complete(self, session_id: str, **kwargs) -> None:
         """Handle snapshot complete."""
@@ -163,7 +163,7 @@ class ViewDriverAdapter(ViewHandler):
     @property
     def audit_start_time(self) -> Optional[float]:
         """Get the audit start time from the underlying driver."""
-        return getattr(self._driver, '_audit_start_time', None)
+        return getattr(self._driver, 'audit_start_time', None)
 
 
 class ViewManagerAdapter(ViewHandler):
@@ -292,8 +292,8 @@ class ViewManagerAdapter(ViewHandler):
     async def reset_audit_tracking(self) -> None:
         """Force reset any internal audit tracking state for all drivers."""
         for driver_instance in self._manager.driver_instances.values():
-            if hasattr(driver_instance, '_audit_start_time'):
-                driver_instance._audit_start_time = None
+            if hasattr(driver_instance, 'audit_start_time'):
+                driver_instance.audit_start_time = None
     
     async def reset(self) -> None:
         """Reset all driver instances."""
@@ -317,7 +317,7 @@ class ViewManagerAdapter(ViewHandler):
     def audit_start_time(self) -> Optional[float]:
         """Get the earliest audit start time from any underlying driver."""
         times = [
-            getattr(d, '_audit_start_time', None) 
+            getattr(d, 'audit_start_time', None) 
             for d in self._manager.driver_instances.values()
         ]
         active_times = [t for t in times if t is not None]

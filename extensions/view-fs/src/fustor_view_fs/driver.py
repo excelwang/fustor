@@ -111,9 +111,9 @@ class FSViewDriver(FSViewBase):
 
     # --- Query Delegation ---
 
-    async def get_directory_tree(self, path: str = "/", **kwargs) -> Optional[Dict[str, Any]]:
+    async def get_directory_tree(self, path: str = "/", recursive: bool = True, max_depth: Optional[int] = None, only_path: bool = False) -> Optional[Dict[str, Any]]:
         async with self._global_read_lock():
-            return self.query.get_directory_tree(path=path, **kwargs)
+            return self.query.get_directory_tree(path=path, recursive=recursive, max_depth=max_depth, only_path=only_path)
 
     async def get_blind_spot_list(self) -> Dict[str, Any]:
         async with self._global_read_lock():

@@ -212,6 +212,9 @@ async def run_sentinel_check(pipe: "AgentPipe") -> None:
     logger.debug(f"Pipe {pipe.id}: Running sentinel check")
     
     try:
+        # P1-2: Heartbeat for zombie detection
+        pipe._task_last_active["sentinel"] = asyncio.get_event_loop().time()
+        
         # 1. Fetch tasks from Fusion
         task_batch = await pipe.sender_handler.get_sentinel_tasks()
         
