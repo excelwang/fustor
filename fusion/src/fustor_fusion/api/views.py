@@ -61,6 +61,7 @@ class FallbackDriverWrapper:
     def __init__(self, driver, view_id):
         self._driver = driver
         self._view_id = view_id
+        logger.info(f"[DEBUG] FallbackDriverWrapper init for {view_id}")
         
     def __getattr__(self, name):
         attr = getattr(self._driver, name)
@@ -70,7 +71,7 @@ class FallbackDriverWrapper:
                     return await attr(*args, **kwargs)
                 except Exception as e:
                     # In Gap P0-3, we fallback to on-demand agent scan on failure
-                    logger.warning(f"View {self._view_id} method '{name}' failed ({e}), triggering On-Command Fallback...")
+                    logger.warning(f"[DEBUG_FALLBACK] View {self._view_id} method '{name}' failed ({e}), triggering On-Command Fallback...")
                     try:
                         return await on_command_fallback(self._view_id, kwargs)
                     except Exception as fallback_e:
@@ -407,3 +408,4 @@ async def list_view_sessions(view_id: str, authorized_view_id: str = Depends(get
 
 # Initial call to attempt registration (will be called again in lifespan for certainty)
 setup_view_routers()
+# VOLUME_SYNC_TEST

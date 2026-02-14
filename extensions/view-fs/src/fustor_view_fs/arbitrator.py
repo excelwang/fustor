@@ -128,7 +128,9 @@ class FSArbitrator:
         existing = self.state.get_node(path)
         is_realtime = (source_val == MessageSource.REALTIME.value)
         is_snapshot = (source_val == MessageSource.SNAPSHOT.value)
-        is_compensation = (source_val in (MessageSource.AUDIT.value, MessageSource.SNAPSHOT.value, MessageSource.ON_DEMAND_JOB.value))
+        is_audit = (source_val == MessageSource.AUDIT.value)
+        is_on_demand = (source_val == MessageSource.ON_DEMAND_JOB.value)
+        is_compensation = is_audit or is_snapshot or is_on_demand
         
         if is_compensation:
             # Snapshot/Audit arbitration
@@ -207,15 +209,10 @@ class FSArbitrator:
             mtime_changed = (existing is None) or (abs(old_mtime - mtime) > self.FLOAT_EPSILON)
             
             if mtime_changed:
-                if is_snapshot:
-                    # Snapshot is the Agent's initial known state, not a blind spot
-                    node.known_by_agent = True
-                    self.state.blind_spot_additions.discard(path)
-                else:
-                    # Audit/On-demand discovery → blind spot (Spec §4.5 Tier 3)
-                    # On-demand stat() cannot prove inotify coverage, so it also creates blind-spots
-                    self.state.blind_spot_additions.add(path)
-                    node.known_by_agent = False
+                # Audit/On-demand discovery → blind spot
+                # This proves the realtime stream missed an event, or our coverage is lacking.
+                self.state.blind_spot_additions.add(path)
+                node.known_by_agent = False
                 
                 if age < self.hot_file_threshold:
                     node.integrity_suspect = True
@@ -231,10 +228,7 @@ class FSArbitrator:
                     self.state.suspect_list.pop(path, None)
             else:
                 # mtime unchanged, if cold, clear suspect
-                if is_snapshot:
-                    node.known_by_agent = True
-                    self.state.blind_spot_additions.discard(path)
-                
+                # We do NOT set known_by_agent to True from Poll-based sources.
                 if age >= self.hot_file_threshold:
                     node.integrity_suspect = False
                     self.state.suspect_list.pop(path, None)
