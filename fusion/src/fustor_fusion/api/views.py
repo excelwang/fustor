@@ -83,23 +83,49 @@ class FallbackDriverWrapper:
         return attr
 
     async def get_data_view(self, **kwargs):
-        # Explicit override for standard ABC method
+        # Explicit override for standard ABC method to centralize readiness check + fallback
         try:
-            # Optimize: If not ready, fail fast to trigger fallback
-            # This pairs with the bypass in make_readiness_checker
-            if runtime_objects.on_command_fallback:
-                from ..view_state_manager import view_state_manager
-                is_ready = await view_state_manager.is_snapshot_complete(self._view_id)
-                if not is_ready:
-                    # Raise error to trigger the catch block below
-                    raise RuntimeError(f"View {self._view_id} is not ready (Snapshot pending)")
+            # 1. Centralized Readiness Check
+            from ..view_state_manager import view_state_manager
+            
+            # Check Leadership & Snapshot
+            state = await view_state_manager.get_state(self._view_id)
+            has_leader = state and state.authoritative_session_id
+            is_snapshot_complete = await view_state_manager.is_snapshot_complete(self._view_id)
+            
+            if not (has_leader and is_snapshot_complete):
+                 # Force fallback
+                 raise RuntimeError("View Not Ready")
 
+            # 2. Attempt Primary Driver
             return await self._driver.get_data_view(**kwargs)
+
         except Exception as e:
-            if runtime_objects.on_command_fallback:
-                logger.warning(f"View {self._view_id} primary query failed ({e}), triggering On-Command Fallback...")
-                return await runtime_objects.on_command_fallback(self._view_id, kwargs)
-            raise e
+            # 3. Fallback Mechanism
+            # Check if fallback handler is registered (it should be if fusion-mgmt is installed)
+            if hasattr(runtime_objects, "on_command_fallback") and runtime_objects.on_command_fallback:
+                logger.warning(f"View {self._view_id} primary/readiness failed ({e}), triggering On-Command Fallback...")
+                try:
+                    return await runtime_objects.on_command_fallback(self._view_id, kwargs)
+                except Exception as fallback_e:
+                    logger.error(f"Fallback failed for {self._view_id}: {fallback_e}")
+                    # If fallback fails, we must expose the original reason (e.g. 503 if not ready)
+                    if str(e) == "View Not Ready":
+                         raise HTTPException(
+                            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                            detail=f"View '{self._view_id}' is unavailable and fallback failed: {fallback_e}",
+                            headers={"Retry-After": "5"}
+                        )
+                    raise e
+            else:
+                # No fallback capability
+                if str(e) == "View Not Ready":
+                     raise HTTPException(
+                        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                        detail=f"View '{self._view_id}' is performing initial synchronization",
+                        headers={"Retry-After": "5"}
+                    )
+                raise e
 
 
 def make_metadata_limit_checker(view_name: str) -> Callable:
@@ -267,7 +293,9 @@ def setup_view_routers():
                         checker = None
                         limit_checker = None
                     else:
-                        checker = make_readiness_checker(view_name)
+                        # GAP-V1 Fix: Remove readiness checker dependency. 
+                        # We rely on FallbackDriverWrapper to handle readiness + fallback.
+                        checker = None 
                         limit_checker = make_metadata_limit_checker(view_name)
                     
                     router = create_func(
