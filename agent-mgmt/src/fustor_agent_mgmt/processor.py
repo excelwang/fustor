@@ -5,7 +5,7 @@ import signal
 import shutil
 from typing import Dict, List, Any, Optional
 
-from fustor_agent_sdk.interfaces import CommandProcessorInterface
+from fustor_agent_sdk.interfaces import CommandProcessorInterface, PipeInterface
 
 logger = logging.getLogger("fustor_agent.mgmt")
 
@@ -15,16 +15,16 @@ class CommandProcessor(CommandProcessorInterface):
     Handles commands from Fusion (e.g., on-demand scans, reload, stop).
     """
 
-    async def initialize(self, pipe: Any) -> None:
+    async def initialize(self, pipe: PipeInterface) -> None:
         """Initialize the processor (placeholder for any setup)."""
         logger.debug(f"CommandProcessor initialized for Pipe {pipe.id}")
 
-    async def process_commands(self, pipe: Any, commands: List[Dict[str, Any]]) -> None:
+    async def process_commands(self, pipe: PipeInterface, commands: List[Dict[str, Any]]) -> None:
         """Process commands received from Fusion."""
         for cmd in commands:
             try:
                 cmd_type = cmd.get("type")
-                logger.info(f"Pipe {pipe.id}: Received command '{cmd_type}'")
+                logger.debug(f"Pipe {pipe.id}: Received command '{cmd_type}'")
                 
                 if cmd_type == "scan":
                     await self._handle_command_scan(pipe, cmd)
@@ -43,7 +43,7 @@ class CommandProcessor(CommandProcessorInterface):
             except Exception as e:
                 logger.error(f"Pipe {pipe.id}: Error processing command {cmd}: {e}")
 
-    async def _handle_command_scan(self, pipe: Any, cmd: Dict[str, Any]) -> None:
+    async def _handle_command_scan(self, pipe: PipeInterface, cmd: Dict[str, Any]) -> None:
         """Handle 'scan' command."""
         path = cmd.get("path")
         recursive = cmd.get("recursive", True)
@@ -61,7 +61,7 @@ class CommandProcessor(CommandProcessorInterface):
         else:
             logger.warning(f"Pipe {pipe.id}: Source handler does not support 'scan_path' for On-Demand scan")
 
-    async def _run_on_demand_job(self, pipe: Any, path: str, recursive: bool, job_id: Optional[str] = None) -> None:
+    async def _run_on_demand_job(self, pipe: PipeInterface, path: str, recursive: bool, job_id: Optional[str] = None) -> None:
         """Run the actual find task."""
         try:
             # Use iterator from source handler
@@ -98,7 +98,7 @@ class CommandProcessor(CommandProcessorInterface):
         except Exception as e:
             logger.error(f"Pipe {pipe.id}: On-demand scan failed: {e}")
 
-    def _handle_command_reload(self, pipe: Any) -> None:
+    def _handle_command_reload(self, pipe: PipeInterface) -> None:
         """Handle 'reload_config' command."""
         logger.info(f"Pipe {pipe.id}: Received remote reload command. Sending SIGHUP.")
         try:
@@ -106,7 +106,7 @@ class CommandProcessor(CommandProcessorInterface):
         except Exception as e:
             logger.error(f"Pipe {pipe.id}: Failed to send SIGHUP for reload: {e}")
 
-    async def _handle_command_stop_pipe(self, pipe: Any, cmd: Dict[str, Any]) -> None:
+    async def _handle_command_stop_pipe(self, pipe: PipeInterface, cmd: Dict[str, Any]) -> None:
         """Handle 'stop_pipe' command."""
         target_agent_pipe_id = cmd.get("agent_pipe_id") or cmd.get("pipe_id")
         if not target_agent_pipe_id:
@@ -119,7 +119,7 @@ class CommandProcessor(CommandProcessorInterface):
         else:
             logger.debug(f"Pipe {pipe.id}: stop_pipe command for '{target_agent_pipe_id}' (not me, ignoring)")
 
-    def _handle_command_update_config(self, pipe: Any, cmd: Dict[str, Any]) -> None:
+    def _handle_command_update_config(self, pipe: PipeInterface, cmd: Dict[str, Any]) -> None:
         """Handle 'update_config' command."""
         config_yaml = cmd.get("config_yaml")
         filename = cmd.get("filename", "default.yaml")
@@ -169,7 +169,7 @@ class CommandProcessor(CommandProcessorInterface):
             if backup_path.exists():
                 shutil.copy2(backup_path, target_path)
 
-    def _handle_command_report_config(self, pipe: Any, cmd: Dict[str, Any]) -> None:
+    def _handle_command_report_config(self, pipe: PipeInterface, cmd: Dict[str, Any]) -> None:
         """Handle 'report_config' command."""
         filename = cmd.get("filename", "default.yaml")
         from fustor_core.common import get_fustor_home_dir
@@ -200,7 +200,7 @@ class CommandProcessor(CommandProcessorInterface):
         except Exception as e:
             logger.error(f"Pipe {pipe.id}: Failed to report config: {e}")
 
-    async def _handle_command_upgrade(self, pipe: Any, cmd: Dict[str, Any]) -> None:
+    async def _handle_command_upgrade(self, pipe: PipeInterface, cmd: Dict[str, Any]) -> None:
         """Handle 'upgrade' command."""
         version = cmd.get("version")
         if not version:

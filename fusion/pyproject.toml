@@ -12,8 +12,7 @@ dependencies = [
     "pydantic-settings",
     "httpx",
     "orjson",
-    "fustor-core",
-    "fustor-fusion-sdk"
+    "fustor-core"
 ]
 [[project.authors]]
 name = "Huajin Wang"

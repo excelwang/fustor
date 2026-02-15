@@ -213,12 +213,20 @@ def create_app() -> FastAPI:
 def _load_management_extensions(app):
     """Discover and mount management routers via entry points."""
     from importlib.metadata import entry_points
+    from fastapi import APIRouter
     # In Python 3.10+, entry_points() returns an EntryPoints object that can be queried by group
     try:
         eps = entry_points(group="fustor_fusion.management_routers")
         for ep in eps:
             try:
-                router = ep.load()
+                obj = ep.load()
+                if callable(obj) and not isinstance(obj, APIRouter):
+                    # Factory function
+                    router = obj()
+                else:
+                    # Direct router instance
+                    router = obj
+                
                 app.include_router(router, prefix="/api/v1/mgmt")
                 logger.info(f"Loaded management extension: {ep.name}")
             except Exception as e:

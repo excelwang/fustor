@@ -5,8 +5,14 @@ from fastapi.responses import HTMLResponse
 import os
 from fustor_fusion import runtime_objects
 
-# Register fallback for core views
-runtime_objects.on_command_fallback = on_command_fallback
+# Register fallback explicitly during app startup, not on import
+
+
+def setup():
+    """Initialize the management extension and return the router."""
+    # Register fallback
+    runtime_objects.on_command_fallback = on_command_fallback
+    return router
 
 router = APIRouter()
 

@@ -184,16 +184,15 @@ class PipeSessionBridge:
         if not view_handler:
             view_handler = self._pipe.find_handler_for_view(view_id)
         
-        # Default to follower - safer than leader if handler not found
-        session_result = {"role": "follower"}
+        session_result = {"role": "leader"} # Default fallback
         
         if view_handler:
              try:
                  session_result = await view_handler.resolve_session_role(session_id, pipe_id=self._pipe.id)
              except Exception as e:
                  logger.error(f"View handler failed to process new session {session_id}: {e}")
-                 # Default to follower on error for safety
-                 session_result = {"role": "follower"}
+                 # Should we fail the session? For now, log and proceed as leader (optimistic)
+                 session_result = {"role": "leader"}
         else:
              logger.warning(f"No view handler found for view {view_id}, defaulting to follower role")
 

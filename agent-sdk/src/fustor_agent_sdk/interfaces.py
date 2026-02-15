@@ -194,3 +194,23 @@ class CommandProcessorInterface(Protocol):
     async def initialize(self, pipe: Any) -> None:
         """Initialize the command processor for a specific pipe."""
         ...
+
+class PipeInterface(Protocol):
+    """
+    Interface for AgentPipe to be used by extensions (L3).
+    Ensures type safety and coupling control.
+    """
+    id: str
+    session_id: str
+    source_handler: Any 
+    sender_handler: Any
+    batch_size: int
+    
+    def map_batch(self, events: List[Any]) -> List[Any]:
+        ...
+        
+    async def stop(self) -> None:
+        ...
+        
+    def has_active_session(self) -> bool:
+        ...

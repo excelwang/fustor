@@ -6,13 +6,12 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "fustor-core",
-    "fustor-fusion-sdk",
     "fastapi",
     "pydantic>=2.0.0"
 ]
 
 [project.entry-points."fustor_fusion.management_routers"]
-mgmt = "fustor_fusion_mgmt:router"
+mgmt = "fustor_fusion_mgmt:setup"
 
 [build-system]
 requires = ["hatchling"]
