@@ -61,7 +61,6 @@ class FallbackDriverWrapper:
     def __init__(self, driver, view_id):
         self._driver = driver
         self._view_id = view_id
-        logger.info(f"[DEBUG] FallbackDriverWrapper init for {view_id}")
         
     def __getattr__(self, name):
         attr = getattr(self._driver, name)
@@ -86,6 +85,15 @@ class FallbackDriverWrapper:
     async def get_data_view(self, **kwargs):
         # Explicit override for standard ABC method
         try:
+            # Optimize: If not ready, fail fast to trigger fallback
+            # This pairs with the bypass in make_readiness_checker
+            if runtime_objects.on_command_fallback:
+                from ..view_state_manager import view_state_manager
+                is_ready = await view_state_manager.is_snapshot_complete(self._view_id)
+                if not is_ready:
+                    # Raise error to trigger the catch block below
+                    raise RuntimeError(f"View {self._view_id} is not ready (Snapshot pending)")
+
             return await self._driver.get_data_view(**kwargs)
         except Exception as e:
             if runtime_objects.on_command_fallback:
@@ -150,6 +158,11 @@ def make_readiness_checker(view_name: str) -> Callable:
         from ..view_state_manager import view_state_manager
         state = await view_state_manager.get_state(view_name)
         if not state or not state.authoritative_session_id:
+            # GAP-V1 Fix: If fallback is enabled, don't 503. Let the wrapper handle it.
+            if runtime_objects.on_command_fallback:
+                 logger.warning(f"View '{view_name}': No leader session. Allowing request for On-Command Fallback.")
+                 return
+            
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=f"View '{view_name}': No active leader session. Ensure at least one agent is running.",
@@ -158,6 +171,11 @@ def make_readiness_checker(view_name: str) -> Callable:
             
         is_snapshot_complete = await view_state_manager.is_snapshot_complete(view_name)
         if not is_snapshot_complete:
+            # GAP-V1 Fix: If fallback is enabled, don't 503.
+            if runtime_objects.on_command_fallback:
+                 logger.warning(f"View '{view_name}': Snapshot pending. Allowing request for On-Command Fallback.")
+                 return
+
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail=f"View '{view_name}': Initial snapshot sync phase in progress (Leader is scanning storage)",

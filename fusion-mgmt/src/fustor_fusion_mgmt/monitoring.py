@@ -10,7 +10,7 @@ monitoring_router = APIRouter()
 async def list_pipes():
     """List all managed pipes."""
     if runtime_objects.pipe_manager is None:
-        raise HTTPException(status_code=500, detail="Fusion Runtime Not Ready (PipeManager is None)")
+        return {"data": {}, "meta": {"status": "initializing", "message": "Fusion Runtime Loading"}}
     pipes = runtime_objects.pipe_manager.get_pipes()
     return {pid: await p.get_dto() for pid, p in pipes.items()}
 
@@ -18,7 +18,10 @@ async def list_pipes():
 async def get_pipe_info(pipe_id: str):
     """Get detailed information about a specific pipe."""
     if runtime_objects.pipe_manager is None:
-        raise HTTPException(status_code=500, detail="Fusion Runtime Not Ready (PipeManager is None)")
+        # Return empty/initializing for specific ID too, or 404? 
+        # Better to say initializing so client knows to retry.
+        return {"id": pipe_id, "meta": {"status": "initializing"}}
+        
     pipe = runtime_objects.pipe_manager.get_pipe(pipe_id)
     if not pipe:
         raise HTTPException(status_code=404, detail="Pipe not found")
@@ -30,7 +33,12 @@ async def get_global_stats(
 ):
     """Get synchronization process metrics for the authorized pipe."""
     if runtime_objects.pipe_manager is None:
-        raise HTTPException(status_code=500, detail="Fusion Runtime Not Ready (PipeManager is None)")
+        return {
+            "events_received": 0, 
+            "events_processed": 0, 
+            "errors": 0,
+            "meta": {"status": "initializing"}
+        }
 
     pipe = runtime_objects.pipe_manager.get_pipe(view_id)
     if not pipe:

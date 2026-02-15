@@ -146,8 +146,25 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin):
         else:
             logger.debug(f"Pipe {self.id}: Received {len(commands)} commands but management extension is not installed.")
 
+    # Class-level cache for processor class to avoid O(N) entry_point scans per instance
+    _mgmt_processor_factory = None
+    _mgmt_processor_checked = False
+
     def _load_mgmt_processor(self) -> Optional[Any]:
-        """Dynamically load the L3 management processor if available."""
+        """Dynamically load the L3 management processor if available (Cached)."""
+        # 1. Use cached factory/class if available
+        if AgentPipe._mgmt_processor_factory:
+             try:
+                 return AgentPipe._mgmt_processor_factory()
+             except Exception as e:
+                 logger.error(f"Pipe {self.id}: Failed to instantiate cached management processor: {e}")
+                 return None
+                 
+        # 2. If already checked and nothing found, return None
+        if AgentPipe._mgmt_processor_checked:
+            return None
+
+        # 3. First time check (Expensive O(N) scan)
         from importlib.metadata import entry_points
         try:
             # Use fustor_agent.command_processors entry point group
@@ -155,13 +172,19 @@ class AgentPipe(FustorPipe, PipeLifecycleMixin, PipeLeaderMixin):
             for ep in eps:
                 try:
                     processor_class = ep.load()
-                    processor = processor_class()
-                    logger.debug(f"Pipe {self.id}: Loaded management extension '{ep.name}'")
-                    return processor
+                    # verify callable
+                    if callable(processor_class):
+                        AgentPipe._mgmt_processor_factory = processor_class
+                        AgentPipe._mgmt_processor_checked = True
+                        logger.info(f"Loaded management extension '{ep.name}' (cached for future pipes)")
+                        return processor_class()
                 except Exception as e:
                     logger.warning(f"Pipe {self.id}: Failed to load management extension '{ep.name}': {e}")
         except Exception:
             pass
+            
+        # Mark as checked so we don't scan again
+        AgentPipe._mgmt_processor_checked = True
         return None
 
     def _build_agent_status(self) -> Dict[str, Any]:
