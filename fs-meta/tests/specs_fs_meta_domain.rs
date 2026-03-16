@@ -1,5 +1,7 @@
 #[path = "common.rs"]
 mod common;
+#[path = "path_support.rs"]
+mod path_support;
 #[path = "specs/test_contracts_data_boundary_slow.rs"]
 mod test_contracts_data_boundary_slow;
 #[path = "specs/test_contracts_fs_meta_domain.rs"]

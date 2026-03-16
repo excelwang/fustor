@@ -775,9 +775,7 @@ impl SinkFileMeta {
         boundary: Arc<dyn ChannelIoSubset>,
         node_id: NodeId,
     ) -> Result<()> {
-        if !lock_or_recover(&self.endpoint_tasks, "sink.start_runtime_endpoints")
-            .is_empty()
-        {
+        if !lock_or_recover(&self.endpoint_tasks, "sink.start_runtime_endpoints").is_empty() {
             return Ok(());
         }
 
@@ -876,8 +874,7 @@ impl SinkFileMeta {
                                 root_specs: internal_query_root_specs.clone(),
                                 host_object_grants: internal_query_host_object_grants.clone(),
                                 visibility_lag: internal_query_visibility_lag.clone(),
-                                pending_stream_events: internal_query_pending_stream_events
-                                    .clone(),
+                                pending_stream_events: internal_query_pending_stream_events.clone(),
                                 unit_control: internal_query_unit_control.clone(),
                                 shutdown: CancellationToken::new(),
                                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),

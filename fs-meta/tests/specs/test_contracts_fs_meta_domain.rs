@@ -2,8 +2,6 @@
 //!
 //! ASSERTION ROUTE: Provide traceable verification anchors for domain-level cross-module contracts.
 
-use std::path::PathBuf;
-
 use crate::common::{
     assert_l1_contract, assert_runtime_orchestrated_multiprocess_config_apply_e2e,
     assert_single_entrypoint_distributed_apply_e2e,
@@ -12,10 +10,7 @@ use capanix_app_sdk::runtime::{ConfigValue, NodeId};
 use serde_yaml::{Mapping, Value};
 
 fn read_fs_meta_spec_file(path: &str) -> String {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from)
-        .expect("fs-meta container root");
+    let root = crate::path_support::fs_meta_root();
     let normalized = path.strip_prefix("fs-meta/").unwrap_or(path);
     let resolved = match normalized {
         "Cargo.toml" => root.join("app/Cargo.toml"),
@@ -1025,6 +1020,9 @@ fn test_fs_meta_http_api_boundary_contract() {
     assert!(l3.contains("groups[].initial_audit_completed"));
     assert!(l3.contains("groups[].overflow_pending_audit"));
     assert!(l3.contains("observation-evidence boundary"));
+    assert!(l3.contains("optional facade-pending diagnostics"));
+    assert!(l3.contains("`facade.pending`"));
+    assert!(l3.contains("retry_attempts"));
     assert_domain_fs_meta_contract_test(
         "CONTRACTS.API_BOUNDARY.FS_META_HTTP_API_BOUNDARY",
         "test_fs_meta_http_api_boundary_contract",
@@ -1298,9 +1296,11 @@ fn test_release_generation_cutover_contract() {
     assert!(l3.contains("ObservationEligibilityCutover"));
     assert!(l3.contains("observation_eligible"));
     assert!(l3.contains("status/health surfaces expose the current observation evidence"));
+    assert!(l3.contains("facade.pending"));
     assert!(l3.contains("initial_audit_completed"));
     assert!(l1.contains("rebuilding in-memory observation/projection state"));
     assert!(l1.contains("reaching app-owned `observation_eligible`"));
+    assert!(l1.contains("optional facade-pending retry diagnostics"));
     assert!(l1.contains("trusted external materialized `/tree` and `/stats` exposure"));
     assert!(l1.contains("`/on-demand-force-find` remains a freshness path"));
     assert!(l1.contains("STATEFUL_APP_OBSERVATION_PLANE_OPT_IN"));
@@ -1548,10 +1548,7 @@ fn projection_http_runtime_coverage_moved_to_inprocess_projection_api_unit_tests
 
 #[test]
 fn test_single_formal_specs_tree_layout() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .map(PathBuf::from)
-        .expect("fs-meta container root");
+    let root = crate::path_support::fs_meta_root();
     assert!(!root.join("specs/app").exists());
     assert!(!root.join("specs/cli").exists());
     assert!(!root.join("specs/PRODUCT_DEPLOYMENT.md").exists());

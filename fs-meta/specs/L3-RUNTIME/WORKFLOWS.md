@@ -307,11 +307,12 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 1. new generation receives current authoritative truth inputs: monitoring roots revision, runtime grants view, and authoritative journal continuation.
 2. source/sink rebuild observation state until the active scan-enabled primary groups have replayed current authoritative truth inputs into materialized state and satisfied the required first-audit/materialized health catch-up.
 3. status/health surfaces expose the current observation evidence through source audit timing, degraded roots, and per-group materialized readiness markers such as `initial_audit_completed` and `overflow_pending_audit`.
-4. app computes `observation_eligible` from first-audit completion on active scan-enabled primary groups, materialized degraded/overflow state, and stale-writer fencing state.
-5. if `observation_eligible` is not yet satisfied, fs-meta keeps materialized `/tree` and `/stats` on the previous eligible generation or returns explicit not-ready/degraded observation state; query readability, internal route availability, or partial rebuild output are not sufficient to treat the generation as current truth. `/on-demand-force-find` stays a freshness path.
-6. once `observation_eligible` is satisfied, trusted external materialized `/tree` and `/stats` exposure is promoted to the new generation and older generation observations are no longer authoritative.
-7. stale generation control/data paths remain fenced so old observations cannot be re-promoted after cutover.
-8. stale generations remain fenced after cutover so older observations cannot reclaim trusted external facade/query ownership.
+4. if facade activation is still pending after runtime proof or listener retry, status/health surfaces additionally expose optional `facade.pending` diagnostics (`reason`, `runtime_exposure_confirmed`, retry counters, and last error timing) so operators can tell cutover waiting from generic liveness.
+5. app computes `observation_eligible` from first-audit completion on active scan-enabled primary groups, materialized degraded/overflow state, and stale-writer fencing state.
+6. if `observation_eligible` is not yet satisfied, fs-meta keeps materialized `/tree` and `/stats` on the previous eligible generation or returns explicit not-ready/degraded observation state; query readability, internal route availability, or partial rebuild output are not sufficient to treat the generation as current truth. `/on-demand-force-find` stays a freshness path.
+7. once `observation_eligible` is satisfied, trusted external materialized `/tree` and `/stats` exposure is promoted to the new generation and older generation observations are no longer authoritative.
+8. stale generation control/data paths remain fenced so old observations cannot be re-promoted after cutover.
+9. stale generations remain fenced after cutover so older observations cannot reclaim trusted external facade/query ownership.
 
 ## [workflow] ProductConfigSplit
 

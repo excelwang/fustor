@@ -41,6 +41,7 @@ fn process_worker_request(
 ) -> (SinkWorkerResponse, bool, Option<PostReplyAction>) {
     match request {
         SinkWorkerRequest::Init { node_id, config } => {
+            eprintln!("fs_meta_sink_worker: received Init for node_id={node_id}");
             let mut source_cfg = SourceConfig::default();
             source_cfg.roots = config.roots;
             source_cfg.host_object_grants = config.host_object_grants;
@@ -56,15 +57,25 @@ fn process_worker_request(
                     state.sink = Some(inner);
                     state.node_id = Some(NodeId(node_id));
                     state.endpoints_started = false;
+                    eprintln!("fs_meta_sink_worker: Init completed");
                     (SinkWorkerResponse::Ack, false, None)
                 }
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false, None),
+                Err(err) => {
+                    eprintln!("fs_meta_sink_worker: Init failed: {err}");
+                    (SinkWorkerResponse::Error(err.to_string()), false, None)
+                }
             }
         }
         SinkWorkerRequest::Start => match state.sink.as_ref() {
-            Some(_) if state.endpoints_started => (SinkWorkerResponse::Ack, false, None),
+            Some(_) if state.endpoints_started => {
+                eprintln!("fs_meta_sink_worker: Start ignored; endpoints already started");
+                (SinkWorkerResponse::Ack, false, None)
+            }
             Some(_) => (
-                SinkWorkerResponse::Ack,
+                {
+                    eprintln!("fs_meta_sink_worker: Start acknowledged; deferring endpoint startup");
+                    SinkWorkerResponse::Ack
+                },
                 false,
                 Some(PostReplyAction::StartRuntimeEndpoints),
             ),
@@ -314,6 +325,7 @@ fn run_sink_worker_primitive_loop(
                     let Some(node_id) = state.node_id.clone() else {
                         continue;
                     };
+                    eprintln!("fs_meta_sink_worker: starting runtime endpoints");
                     sink.start_runtime_endpoints(io_boundary.clone(), node_id)
                         .map_err(|err| {
                             std::io::Error::other(format!(
@@ -321,6 +333,7 @@ fn run_sink_worker_primitive_loop(
                             ))
                         })?;
                     state.endpoints_started = true;
+                    eprintln!("fs_meta_sink_worker: runtime endpoints started");
                 }
             }
         }

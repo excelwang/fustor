@@ -26,6 +26,7 @@ use crate::workers::source::SourceFacade;
 
 use super::auth::AuthService;
 use super::config::ResolvedApiConfig;
+use super::facade_status::SharedFacadePendingStatusCell;
 use super::handlers;
 use super::state::ApiState;
 
@@ -55,6 +56,7 @@ pub async fn spawn(
     runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     source: Arc<SourceFacade>,
     sink: Arc<SinkFacade>,
+    facade_pending: SharedFacadePendingStatusCell,
 ) -> Result<ApiServerHandle> {
     cfg.auth
         .ensure_materialized()
@@ -73,6 +75,7 @@ pub async fn spawn(
         sink,
         auth,
         projection_policy,
+        facade_pending,
     };
     refresh_policy_from_host_object_grants(
         &state.projection_policy,

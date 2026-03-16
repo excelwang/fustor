@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_app_sdk::runtime::NodeId;
 
+use super::facade_status::SharedFacadePendingStatusCell;
 use crate::query::api::ProjectionPolicy;
 use crate::workers::sink::SinkFacade;
 use crate::workers::source::SourceFacade;
@@ -17,4 +18,5 @@ pub struct ApiState {
     pub sink: Arc<SinkFacade>,
     pub auth: Arc<AuthService>,
     pub projection_policy: Arc<RwLock<ProjectionPolicy>>,
+    pub facade_pending: SharedFacadePendingStatusCell,
 }

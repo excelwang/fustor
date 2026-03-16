@@ -668,21 +668,11 @@ fn scope_unit_intent_to_scope_worker_intent(doc: &Value) -> Result<Value, String
 }
 
 fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")))
+    crate::path_support::workspace_root()
 }
 
 fn capanix_repo_root() -> PathBuf {
-    if let Ok(path) = std::env::var("CAPANIX_REPO") {
-        return PathBuf::from(path);
-    }
-    repo_root()
-        .join("../capanix")
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("/home/huajin/capanix"))
+    crate::path_support::capanix_repo_root()
 }
 
 fn cluster_lock() -> MutexGuard<'static, ()> {

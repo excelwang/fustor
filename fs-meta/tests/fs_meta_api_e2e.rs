@@ -1,5 +1,7 @@
 #![cfg(target_os = "linux")]
 
+#[path = "path_support.rs"]
+mod path_support;
 #[path = "e2e/support/mod.rs"]
 mod support;
 #[path = "e2e/test_http_api_matrix.rs"]

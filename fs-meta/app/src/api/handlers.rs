@@ -20,13 +20,14 @@ use crate::workers::source::SourceObservabilitySnapshot;
 
 use super::auth::SessionPrincipal;
 use super::errors::ApiError;
+use super::facade_status::SharedFacadePendingStatus;
 use super::state::ApiState;
 use super::types::{
     CreateQueryApiKeyRequest, CreateQueryApiKeyResponse, DegradedRoot, LoginRequest, LoginResponse,
     QueryApiKeysResponse, RescanResponse, RevokeQueryApiKeyResponse, RootEntry, RootPreviewItem,
     RootSelectorEntry, RootUpdateEntry, RootsPreviewResponse, RootsResponse, RootsUpdateRequest,
-    RootsUpdateResponse, RuntimeGrantsResponse, StatusResponse, StatusSink, StatusSinkGroup,
-    StatusSource, StatusSourceConcreteRoot, StatusSourceLogicalRoot,
+    RootsUpdateResponse, RuntimeGrantsResponse, StatusFacade, StatusFacadePending, StatusResponse,
+    StatusSink, StatusSinkGroup, StatusSource, StatusSourceConcreteRoot, StatusSourceLogicalRoot,
 };
 
 pub async fn login(
@@ -101,6 +102,12 @@ pub async fn status(
                 })
                 .collect(),
         },
+        facade: state
+            .facade_pending
+            .read()
+            .ok()
+            .and_then(|pending| pending.clone())
+            .map(status_facade_from_pending),
     }))
 }
 
@@ -374,6 +381,26 @@ fn status_source_from_observability(source: SourceObservabilitySnapshot) -> Stat
             source_primary_by_group,
             last_force_find_runner_by_group,
             force_find_inflight_groups,
+        },
+    }
+}
+
+fn status_facade_from_pending(pending: SharedFacadePendingStatus) -> StatusFacade {
+    StatusFacade {
+        pending: StatusFacadePending {
+            route_key: pending.route_key,
+            generation: pending.generation,
+            resource_ids: pending.resource_ids,
+            runtime_managed: pending.runtime_managed,
+            runtime_exposure_confirmed: pending.runtime_exposure_confirmed,
+            reason: pending.reason.as_str().to_string(),
+            retry_attempts: pending.retry_attempts,
+            pending_since_us: pending.pending_since_us,
+            last_error: pending.last_error,
+            last_attempt_at_us: pending.last_attempt_at_us,
+            last_error_at_us: pending.last_error_at_us,
+            retry_backoff_ms: pending.retry_backoff_ms,
+            next_retry_at_us: pending.next_retry_at_us,
         },
     }
 }

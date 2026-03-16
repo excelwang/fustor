@@ -1,7 +1,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::{FSMetaConfig, api, source};
+use crate::api::facade_status::{
+    FacadePendingReason, SharedFacadePendingStatus, SharedFacadePendingStatusCell,
+    shared_facade_pending_status_cell,
+};
 use crate::query::TreeGroupPayload;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryNode, SubtreeStats};
 use crate::runtime::execution_units;
@@ -11,6 +14,7 @@ use crate::runtime::orchestration::{
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkWorkerClient};
 use crate::workers::source::{SourceFacade, SourceWorkerClient};
+use crate::{FSMetaConfig, api, source};
 use async_trait::async_trait;
 use capanix_app_sdk::raw::{
     BoundaryContext, ChannelAttachReply, ChannelAttachRequest, ChannelBoundary,
@@ -25,10 +29,10 @@ use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryA
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
+use crate::sink::SinkFileMeta;
 #[cfg(test)]
 use crate::source::config::SourceConfig;
 use crate::source::config::{SinkExecutionMode, SourceExecutionMode};
-use crate::sink::SinkFileMeta;
 
 // Canonical fs-meta app authoring flows through `app-sdk`; direct runtime-api use
 // is confined to narrow infra seams such as boundary conversion helpers.
@@ -55,6 +59,13 @@ struct PendingFacadeActivation {
     resolved: api::config::ResolvedApiConfig,
 }
 
+fn now_us() -> u64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => d.as_micros() as u64,
+        Err(_) => 0,
+    }
+}
+
 pub struct FSMetaApp {
     config: FSMetaConfig,
     node_id: NodeId,
@@ -64,7 +75,7 @@ pub struct FSMetaApp {
     pump_task: Mutex<Option<JoinHandle<()>>>,
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
-    facade_reconcile_task: Arc<Mutex<Option<JoinHandle<()>>>>,
+    facade_pending_status: SharedFacadePendingStatusCell,
     facade_gate: RuntimeUnitGate,
 }
 
@@ -169,7 +180,7 @@ impl FSMetaApp {
             pump_task: Mutex::new(None),
             api_task: Arc::new(Mutex::new(None)),
             pending_facade: Arc::new(Mutex::new(None)),
-            facade_reconcile_task: Arc::new(Mutex::new(None)),
+            facade_pending_status: shared_facade_pending_status_cell(),
             facade_gate: RuntimeUnitGate::new(
                 "fs-meta",
                 &[execution_units::FACADE_RUNTIME_UNIT_ID],
@@ -411,6 +422,7 @@ impl FSMetaApp {
         Self::try_spawn_pending_facade_from_parts(
             self.api_task.clone(),
             self.pending_facade.clone(),
+            self.facade_pending_status.clone(),
             self.node_id.clone(),
             self.runtime_boundary.clone(),
             self.source.clone(),
@@ -422,6 +434,7 @@ impl FSMetaApp {
     async fn try_spawn_pending_facade_from_parts(
         api_task: Arc<Mutex<Option<FacadeActivation>>>,
         pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
+        facade_pending_status: SharedFacadePendingStatusCell,
         node_id: NodeId,
         runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
         source: Arc<SourceFacade>,
@@ -444,6 +457,7 @@ impl FSMetaApp {
                 }) {
                     pending_guard.take();
                 }
+                Self::clear_pending_facade_status(&facade_pending_status);
                 return Ok(true);
             }
             api_task_guard.is_some()
@@ -463,6 +477,7 @@ impl FSMetaApp {
             runtime_boundary,
             source,
             sink,
+            facade_pending_status.clone(),
         )
         .await?;
 
@@ -490,6 +505,7 @@ impl FSMetaApp {
         }) {
             pending_guard.take();
         }
+        Self::clear_pending_facade_status(&facade_pending_status);
         drop(pending_guard);
         if let Some(current) = previous {
             current.handle.shutdown(Duration::from_secs(2)).await;
@@ -497,43 +513,170 @@ impl FSMetaApp {
         Ok(true)
     }
 
-    async fn ensure_facade_reconcile_task(&self) {
-        let mut guard = self.facade_reconcile_task.lock().await;
-        if guard.as_ref().is_some_and(|task| !task.is_finished()) {
-            return;
+    fn facade_retry_backoff(retry_attempts: u64) -> Duration {
+        match retry_attempts {
+            0 | 1 => Duration::ZERO,
+            2 => Duration::from_secs(2),
+            3 => Duration::from_secs(4),
+            4 => Duration::from_secs(8),
+            5 => Duration::from_secs(16),
+            _ => Duration::from_secs(30),
         }
-        let api_task = self.api_task.clone();
-        let pending_facade = self.pending_facade.clone();
-        let source = self.source.clone();
-        let sink = self.sink.clone();
-        let node_id = self.node_id.clone();
-        let runtime_boundary = self.runtime_boundary.clone();
-        *guard = Some(tokio::spawn(async move {
-            loop {
-                if pending_facade.lock().await.is_none() {
-                    return;
-                }
-                match Self::try_spawn_pending_facade_from_parts(
-                    api_task.clone(),
-                    pending_facade.clone(),
-                    node_id.clone(),
-                    runtime_boundary.clone(),
-                    source.clone(),
-                    sink.clone(),
-                )
-                .await
-                {
-                    Ok(true) => return,
-                    Ok(false) => tokio::time::sleep(Duration::from_millis(50)).await,
-                    Err(err) => {
-                        log::warn!(
-                            "fs-meta facade reconcile waiting for observation_eligible: {err}"
-                        );
-                        tokio::time::sleep(Duration::from_millis(250)).await;
-                    }
-                }
+    }
+
+    fn pending_status_matches(
+        status: &SharedFacadePendingStatus,
+        pending: &PendingFacadeActivation,
+    ) -> bool {
+        status.route_key == pending.route_key
+            && status.generation == pending.generation
+            && status.resource_ids == pending.resource_ids
+    }
+
+    fn clear_pending_facade_status(status_cell: &SharedFacadePendingStatusCell) {
+        if let Ok(mut guard) = status_cell.write() {
+            *guard = None;
+        }
+    }
+
+    fn set_pending_facade_status_waiting(
+        status_cell: &SharedFacadePendingStatusCell,
+        pending: &PendingFacadeActivation,
+    ) {
+        let pending_since_us = status_cell
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().and_then(|status| {
+                    Self::pending_status_matches(status, pending).then_some(status.pending_since_us)
+                })
+            })
+            .unwrap_or_else(now_us);
+        if let Ok(mut guard) = status_cell.write() {
+            *guard = Some(SharedFacadePendingStatus {
+                route_key: pending.route_key.clone(),
+                generation: pending.generation,
+                resource_ids: pending.resource_ids.clone(),
+                runtime_managed: pending.runtime_managed,
+                runtime_exposure_confirmed: pending.runtime_exposure_confirmed,
+                reason: FacadePendingReason::AwaitingRuntimeExposure,
+                retry_attempts: 0,
+                pending_since_us,
+                last_error: None,
+                last_attempt_at_us: None,
+                last_error_at_us: None,
+                retry_backoff_ms: None,
+                next_retry_at_us: None,
+            });
+        }
+    }
+
+    fn record_pending_facade_retry_error(
+        status_cell: &SharedFacadePendingStatusCell,
+        pending: &PendingFacadeActivation,
+        err: &CnxError,
+    ) {
+        let now = now_us();
+        let (retry_attempts, pending_since_us) = status_cell
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().and_then(|status| {
+                    Self::pending_status_matches(status, pending).then_some((
+                        status.retry_attempts.saturating_add(1),
+                        status.pending_since_us,
+                    ))
+                })
+            })
+            .unwrap_or((1, now));
+        let backoff = Self::facade_retry_backoff(retry_attempts);
+        let next_retry_at_us = now.saturating_add(backoff.as_micros() as u64);
+        if let Ok(mut guard) = status_cell.write() {
+            *guard = Some(SharedFacadePendingStatus {
+                route_key: pending.route_key.clone(),
+                generation: pending.generation,
+                resource_ids: pending.resource_ids.clone(),
+                runtime_managed: pending.runtime_managed,
+                runtime_exposure_confirmed: pending.runtime_exposure_confirmed,
+                reason: FacadePendingReason::RetryingAfterError,
+                retry_attempts,
+                pending_since_us,
+                last_error: Some(err.to_string()),
+                last_attempt_at_us: Some(now),
+                last_error_at_us: Some(now),
+                retry_backoff_ms: Some(backoff.as_millis() as u64),
+                next_retry_at_us: Some(next_retry_at_us),
+            });
+        }
+    }
+
+    fn pending_facade_retry_due(
+        status_cell: &SharedFacadePendingStatusCell,
+        pending: &PendingFacadeActivation,
+    ) -> bool {
+        let now = now_us();
+        status_cell
+            .read()
+            .ok()
+            .and_then(|guard| {
+                guard.as_ref().and_then(|status| {
+                    Self::pending_status_matches(status, pending).then_some(
+                        status
+                            .next_retry_at_us
+                            .map_or(true, |deadline| deadline <= now),
+                    )
+                })
+            })
+            .unwrap_or(true)
+    }
+
+    async fn pending_facade_snapshot_for(
+        &self,
+        route_key: &str,
+        generation: u64,
+    ) -> Option<PendingFacadeActivation> {
+        self.pending_facade
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|pending| {
+                (pending.route_key == route_key && pending.generation == generation)
+                    .then_some(pending.clone())
+            })
+    }
+
+    async fn retry_pending_facade(
+        &self,
+        route_key: &str,
+        generation: u64,
+        from_tick: bool,
+    ) -> Result<()> {
+        let Some(pending) = self
+            .pending_facade_snapshot_for(route_key, generation)
+            .await
+        else {
+            return Ok(());
+        };
+        let has_active = self.api_task.lock().await.is_some();
+        if has_active && !pending.runtime_exposure_confirmed {
+            Self::set_pending_facade_status_waiting(&self.facade_pending_status, &pending);
+            return Ok(());
+        }
+        if from_tick && !Self::pending_facade_retry_due(&self.facade_pending_status, &pending) {
+            return Ok(());
+        }
+        match self.try_spawn_pending_facade().await {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                Self::record_pending_facade_retry_error(
+                    &self.facade_pending_status,
+                    &pending,
+                    &err,
+                );
+                log::warn!("fs-meta facade pending activation retry failed: {err}");
+                Ok(())
             }
-        }));
+        }
     }
 
     async fn apply_facade_activate(
@@ -595,7 +738,7 @@ impl FSMetaApp {
             }
         }
         let runtime_exposure_confirmed = !runtime_managed;
-        *self.pending_facade.lock().await = Some(PendingFacadeActivation {
+        let pending = PendingFacadeActivation {
             route_key: route_key.to_string(),
             generation,
             resource_ids: candidate_resource_ids,
@@ -604,17 +747,12 @@ impl FSMetaApp {
             runtime_managed,
             runtime_exposure_confirmed,
             resolved,
-        });
+        };
+        *self.pending_facade.lock().await = Some(pending.clone());
         if !self.try_spawn_pending_facade().await? {
-            self.ensure_facade_reconcile_task().await;
+            Self::set_pending_facade_status_waiting(&self.facade_pending_status, &pending);
         }
         Ok(())
-    }
-
-    async fn stop_facade_reconcile_task(&self) {
-        if let Some(task) = self.facade_reconcile_task.lock().await.take() {
-            task.abort();
-        }
     }
 
     async fn shutdown_active_facade(&self) {
@@ -642,7 +780,7 @@ impl FSMetaApp {
             return Ok(());
         }
         *self.pending_facade.lock().await = None;
-        self.stop_facade_reconcile_task().await;
+        Self::clear_pending_facade_status(&self.facade_pending_status);
         self.shutdown_active_facade().await;
         Ok(())
     }
@@ -844,6 +982,9 @@ impl RuntimeBoundaryApp for FSMetaApp {
                             unit.unit_id(),
                             generation
                         );
+                    } else {
+                        self.retry_pending_facade(&route_key, generation, true)
+                            .await?;
                     }
                 }
                 FacadeControlSignal::ExposureConfirmed {
@@ -862,9 +1003,9 @@ impl RuntimeBoundaryApp for FSMetaApp {
                     } else if self
                         .confirm_pending_facade_exposure(&route_key, generation)
                         .await
-                        && !self.try_spawn_pending_facade().await?
                     {
-                        self.ensure_facade_reconcile_task().await;
+                        self.retry_pending_facade(&route_key, generation, false)
+                            .await?;
                     }
                 }
                 FacadeControlSignal::RuntimeHostObjectGrantsChanged { .. }
@@ -876,7 +1017,7 @@ impl RuntimeBoundaryApp for FSMetaApp {
 
     async fn close(&self) -> Result<()> {
         *self.pending_facade.lock().await = None;
-        self.stop_facade_reconcile_task().await;
+        Self::clear_pending_facade_status(&self.facade_pending_status);
         self.shutdown_active_facade().await;
         self.source.close().await?;
         self.sink.close().await?;
@@ -1127,7 +1268,10 @@ mod tests {
         encode_runtime_host_object_grants_changed_envelope,
         encode_trusted_exposure_confirmed_envelope, encode_worker_tick_envelope,
     };
+    use reqwest::Client;
+    use serde_json::json;
     use std::fs;
+    use std::net::TcpListener;
     use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
@@ -1264,6 +1408,21 @@ mod tests {
             interfaces: vec!["posix-fs".to_string(), "inotify".to_string()],
             active: true,
         }
+    }
+
+    fn reserve_bind_addr() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind temp listener");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        addr.to_string()
+    }
+
+    fn facade_pending_status(app: &FSMetaApp) -> SharedFacadePendingStatus {
+        app.facade_pending_status
+            .read()
+            .expect("read facade pending status")
+            .clone()
+            .expect("facade pending status present")
     }
 
     fn mk_source_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) -> Event {
@@ -1573,6 +1732,7 @@ mod tests {
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
+            app.facade_pending_status.clone(),
         )
         .await
         {
@@ -1667,6 +1827,7 @@ mod tests {
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
+            app.facade_pending_status.clone(),
         )
         .await
         {
@@ -1726,6 +1887,243 @@ mod tests {
             2
         );
         assert!(app.pending_facade.lock().await.is_none());
+        app.close().await.expect("close fs-meta app");
+    }
+
+    #[tokio::test]
+    async fn facade_retry_waits_for_worker_tick_instead_of_background_polling() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let cfg = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-1", tmp.path())],
+                ..in_process_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: "single-app-listener".to_string(),
+                local_listener_resources: vec![api::config::ApiListenerResource {
+                    resource_id: "single-app-listener".to_string(),
+                    bind_addr: bind_addr.clone(),
+                }],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        };
+        let app = FSMetaApp::with_boundaries(
+            cfg,
+            NodeId("single-app-node".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app");
+        let existing = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["single-app-listener".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.facade_pending_status.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            generation: 1,
+            resource_ids: vec!["single-app-listener".to_string()],
+            handle: existing,
+        });
+
+        app.apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            FACADE_CONTROL_ROUTE_KEY,
+            2,
+            &[capanix_route_proto::BoundScope {
+                scope_id: "test-root".to_string(),
+                resource_ids: vec!["single-app-listener".to_string()],
+            }],
+        )
+        .await
+        .expect("apply facade activate");
+
+        let waiting = facade_pending_status(&app);
+        assert_eq!(waiting.reason, FacadePendingReason::AwaitingRuntimeExposure);
+        assert_eq!(waiting.retry_attempts, 0);
+
+        app.on_control_frame(&[trusted_exposure_confirmed_envelope(
+            execution_units::FACADE_RUNTIME_UNIT_ID,
+            2,
+        )])
+        .await
+        .expect("handle exposure confirmed");
+
+        let after_confirm = facade_pending_status(&app);
+        assert_eq!(
+            after_confirm.reason,
+            FacadePendingReason::RetryingAfterError
+        );
+        assert_eq!(after_confirm.retry_attempts, 1);
+        assert!(
+            after_confirm
+                .last_error
+                .as_deref()
+                .is_some_and(|msg| msg.contains("fs-meta api bind failed")),
+            "expected bind failure in pending status: {:?}",
+            after_confirm.last_error
+        );
+
+        tokio::time::sleep(Duration::from_millis(350)).await;
+        let without_tick = facade_pending_status(&app);
+        assert_eq!(
+            without_tick.retry_attempts, 1,
+            "pending retry attempts must stay idle until another runtime pulse arrives"
+        );
+
+        app.on_control_frame(&[tick_envelope(execution_units::FACADE_RUNTIME_UNIT_ID, 2)])
+            .await
+            .expect("handle worker tick");
+
+        let after_tick = facade_pending_status(&app);
+        assert_eq!(after_tick.reason, FacadePendingReason::RetryingAfterError);
+        assert_eq!(after_tick.retry_attempts, 2);
+        app.close().await.expect("close fs-meta app");
+    }
+
+    #[tokio::test]
+    async fn status_reports_facade_pending_retry_diagnostics() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let cfg = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-1", tmp.path())],
+                ..in_process_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: "single-app-listener".to_string(),
+                local_listener_resources: vec![api::config::ApiListenerResource {
+                    resource_id: "single-app-listener".to_string(),
+                    bind_addr: bind_addr.clone(),
+                }],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        };
+        let app = FSMetaApp::with_boundaries(
+            cfg,
+            NodeId("single-app-node".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app");
+        let existing = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["single-app-listener".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.facade_pending_status.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            generation: 1,
+            resource_ids: vec!["single-app-listener".to_string()],
+            handle: existing,
+        });
+
+        app.apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            FACADE_CONTROL_ROUTE_KEY,
+            2,
+            &[capanix_route_proto::BoundScope {
+                scope_id: "test-root".to_string(),
+                resource_ids: vec!["single-app-listener".to_string()],
+            }],
+        )
+        .await
+        .expect("apply facade activate");
+        app.on_control_frame(&[trusted_exposure_confirmed_envelope(
+            execution_units::FACADE_RUNTIME_UNIT_ID,
+            2,
+        )])
+        .await
+        .expect("handle exposure confirmed");
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(
+            login.status().is_success(),
+            "login failed: {}",
+            login.status()
+        );
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token");
+        let status = client
+            .get(format!("http://{bind_addr}/api/fs-meta/v1/status"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("status request");
+        assert!(
+            status.status().is_success(),
+            "status failed: {}",
+            status.status()
+        );
+        let status_body: serde_json::Value = status.json().await.expect("decode status");
+        assert_eq!(
+            status_body["facade"]["pending"]["reason"],
+            serde_json::Value::String("retrying_after_error".to_string())
+        );
+        assert_eq!(status_body["facade"]["pending"]["generation"], 2);
+        assert_eq!(
+            status_body["facade"]["pending"]["runtime_exposure_confirmed"],
+            serde_json::Value::Bool(true)
+        );
+        assert!(
+            status_body["facade"]["pending"]["retry_attempts"]
+                .as_u64()
+                .is_some_and(|attempts| attempts >= 1)
+        );
+        assert!(
+            status_body["facade"]["pending"]["last_error"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("fs-meta api bind failed"))
+        );
         app.close().await.expect("close fs-meta app");
     }
 

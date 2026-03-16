@@ -262,9 +262,7 @@ dependencies = [
  "capanix-app-sdk",
  "capanix-host-adapter-fs-meta",
  "capanix-host-fs-types",
- "capanix-kernel-api",
  "capanix-route-proto",
- "capanix-runtime-api",
  "crossbeam-channel",
  "futures-core",
  "futures-util",
@@ -367,6 +365,7 @@ dependencies = [
  "futures-core",
  "serde",
  "serde_json",
+ "tokio-util",
  "tracing",
 ]
 
@@ -412,6 +411,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_bytes",
+ "tokio-util",
  "tracing",
 ]
 
@@ -424,6 +424,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_bytes",
+ "tokio-util",
  "tracing",
 ]
 
@@ -840,7 +841,25 @@ dependencies = [
 name = "fustor-specs-root"
 version = "0.0.0"
 dependencies = [
+ "anyhow",
+ "base64",
+ "bytes",
+ "capanix-app-fs-meta",
+ "capanix-app-sdk",
+ "capanix-host-fs-types",
+ "capanix-kernel-api",
+ "capanix-route-proto",
+ "capanix-runtime-api",
  "capanix-specs-vocabulary",
+ "reqwest",
+ "ring",
+ "rmp-serde",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]

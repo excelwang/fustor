@@ -140,9 +140,38 @@ pub struct StatusSink {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct StatusFacadePending {
+    pub route_key: String,
+    pub generation: u64,
+    pub resource_ids: Vec<String>,
+    pub runtime_managed: bool,
+    pub runtime_exposure_confirmed: bool,
+    pub reason: String,
+    pub retry_attempts: u64,
+    pub pending_since_us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_attempt_at_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error_at_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_backoff_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub next_retry_at_us: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusFacade {
+    pub pending: StatusFacadePending,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StatusResponse {
     pub source: StatusSource,
     pub sink: StatusSink,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub facade: Option<StatusFacade>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -5,11 +5,22 @@ use std::path::PathBuf;
 
 use crate::app_support::combined_source_text;
 
-fn read_app_spec(rel: &str) -> String {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn fs_meta_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(PathBuf::from)
-        .expect("fs-meta container root");
+        .expect("fs-meta container root")
+}
+
+fn workspace_root() -> PathBuf {
+    fs_meta_root()
+        .parent()
+        .map(PathBuf::from)
+        .expect("workspace root")
+}
+
+fn read_app_spec(rel: &str) -> String {
+    let root = fs_meta_root();
     let normalized = rel.strip_prefix("fs-meta/").unwrap_or(rel);
     let path = match normalized {
         "Cargo.toml" => root.join("app/Cargo.toml"),
@@ -17,6 +28,42 @@ fn read_app_spec(rel: &str) -> String {
         _ => root.join(normalized),
     };
     fs::read_to_string(path).expect("read app spec file")
+}
+
+fn read_workspace_manifest() -> String {
+    fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read workspace manifest")
+}
+
+fn is_dependency_section(section: &str) -> bool {
+    matches!(section, "dependencies" | "dev-dependencies" | "build-dependencies")
+        || section.starts_with("target.")
+            && (section.ends_with(".dependencies")
+                || section.ends_with(".dev-dependencies")
+                || section.ends_with(".build-dependencies"))
+}
+
+fn manifest_has_dependency(manifest: &str, dep_name: &str) -> bool {
+    let mut current_section = None::<String>;
+    for line in manifest.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            current_section = Some(trimmed[1..trimmed.len() - 1].to_string());
+            continue;
+        }
+        let Some(section) = current_section.as_deref() else {
+            continue;
+        };
+        if !is_dependency_section(section) || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let Some((name, _)) = trimmed.split_once('=') else {
+            continue;
+        };
+        if name.trim() == dep_name {
+            return true;
+        }
+    }
+    false
 }
 
 #[test]
@@ -37,18 +84,7 @@ fn domain_contract_consumption_only() {
 fn app_sdk_authoring_path_is_primary() {
     let spec = read_app_spec("specs/L2-ARCHITECTURE.md");
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
-    let runtime_manifest = read_app_spec("Cargo.toml");
-    let runtime_dependencies_section = runtime_manifest
-        .split("[dependencies]")
-        .nth(1)
-        .and_then(|rest| rest.split("\n[").next())
-        .unwrap_or("");
     let app_manifest = read_app_spec("app/Cargo.toml");
-    let app_dependencies_section = app_manifest
-        .split("[dependencies]")
-        .nth(1)
-        .and_then(|rest| rest.split("\n[").next())
-        .unwrap_or("");
     let app_lib = read_app_spec("app/src/lib.rs");
     let source_mod = read_app_spec("src/source/mod.rs");
     let sink_mod = read_app_spec("src/sink/mod.rs");
@@ -65,13 +101,27 @@ fn app_sdk_authoring_path_is_primary() {
         "MUST NOT directly depend on or reference `capanix-kernel-api`, `capanix-unit-entry-macros`, or `capanix-unit-sidecar`"
     ));
     assert!(app_manifest.contains("publish = false"));
-    assert!(runtime_dependencies_section.contains("capanix-app-sdk"));
-    assert!(!runtime_dependencies_section.contains("capanix-kernel-api"));
-    assert!(!app_dependencies_section.contains("capanix-runtime-api"));
-    assert!(!app_dependencies_section.contains("capanix-kernel-api"));
-    assert!(!app_dependencies_section.contains("capanix-unit-sidecar"));
-    assert!(!app_dependencies_section.contains("capanix-unit-entry-macros"));
-    assert!(!app_dependencies_section.contains("capanix-app-fs-meta-worker-"));
+    assert!(manifest_has_dependency(&app_manifest, "capanix-app-sdk"));
+    assert!(!manifest_has_dependency(&app_manifest, "capanix-runtime-api"));
+    assert!(!manifest_has_dependency(&app_manifest, "capanix-kernel-api"));
+    assert!(!manifest_has_dependency(&app_manifest, "capanix-unit-sidecar"));
+    assert!(!manifest_has_dependency(&app_manifest, "capanix-unit-entry-macros"));
+    assert!(!manifest_has_dependency(
+        &app_manifest,
+        "capanix-app-fs-meta-worker-source"
+    ));
+    assert!(!manifest_has_dependency(
+        &app_manifest,
+        "capanix-app-fs-meta-worker-sink"
+    ));
+    assert!(!manifest_has_dependency(
+        &app_manifest,
+        "capanix-app-fs-meta-worker-scan"
+    ));
+    assert!(!manifest_has_dependency(
+        &app_manifest,
+        "capanix-app-fs-meta-worker-facade"
+    ));
     assert!(app_lib.contains("pub struct FSMetaConfig"));
     assert!(app_lib.contains("capanix_app_sdk"));
     assert!(!app_lib.contains("use capanix_runtime_api"));
@@ -526,7 +576,7 @@ fn source_and_sink_worker_server_bootstrap_live_in_artifact_crates() {
 #[test]
 fn crate_ownership_and_dependency_rules_are_explicit() {
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
-    let root_manifest = read_app_spec("Cargo.toml");
+    let root_manifest = read_workspace_manifest();
     let app_manifest = read_app_spec("app/Cargo.toml");
     let tooling_manifest = read_app_spec("tooling/Cargo.toml");
     let transport_manifest = read_app_spec("runtime-support/Cargo.toml");

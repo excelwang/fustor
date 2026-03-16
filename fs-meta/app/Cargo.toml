@@ -16,14 +16,6 @@ path = "../tests/app_specs.rs"
 name = "cli_specs"
 path = "../tests/cli_specs.rs"
 
-[[test]]
-name = "fs_meta_api_e2e"
-path = "../tests/fs_meta_api_e2e.rs"
-
-[[test]]
-name = "specs_fs_meta_domain"
-path = "../tests/specs_fs_meta_domain.rs"
-
 [dependencies]
 anyhow = "1"
 capanix-host-adapter-fs-meta = { workspace = true }
@@ -53,8 +45,6 @@ tokio-util = { workspace = true, features = ["rt"] }
 tower-http = { version = "0.5", features = ["cors"] }
 
 [dev-dependencies]
-capanix-kernel-api = { workspace = true }
-capanix-runtime-api = "0.1.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 tempfile = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

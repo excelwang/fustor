@@ -65,3 +65,31 @@ tokio-util = "0.7"
 
 [dependencies]
 capanix-specs-vocabulary = { workspace = true }
+
+[dev-dependencies]
+anyhow = "1"
+base64 = "0.22"
+bytes = { workspace = true }
+capanix-app-fs-meta = { workspace = true }
+capanix-app-sdk = { workspace = true }
+capanix-host-fs-types = { workspace = true }
+capanix-kernel-api = { workspace = true }
+capanix-route-proto = { workspace = true }
+capanix-runtime-api = "0.1.0"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+ring = "0.17"
+rmp-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+sha2 = "0.10"
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[[test]]
+name = "specs_fs_meta_domain"
+path = "fs-meta/tests/specs_fs_meta_domain.rs"
+
+[[test]]
+name = "fs_meta_api_e2e"
+path = "fs-meta/tests/fs_meta_api_e2e.rs"
