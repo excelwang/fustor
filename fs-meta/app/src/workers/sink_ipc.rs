@@ -23,6 +23,7 @@ pub enum SinkWorkerRequest {
         node_id: String,
         config: SinkWorkerInitConfig,
     },
+    Start,
     UpdateLogicalRoots {
         roots: Vec<RootSpec>,
         host_object_grants: Vec<GrantedMountRoot>,

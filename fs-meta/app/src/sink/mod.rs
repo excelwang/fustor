@@ -738,6 +738,288 @@ impl SinkFileMeta {
         Ok(sink)
     }
 
+    pub fn with_state_boundary_deferred_runtime_endpoints(
+        state_boundary: Arc<dyn StateBoundary>,
+        source_cfg: SourceConfig,
+    ) -> Result<Self> {
+        let authority = AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
+            .map_err(|err| {
+                CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
+            })?;
+        let state = SinkStateCell::new(&source_cfg, CommitBoundary::new(authority));
+        let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
+        let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
+        let visibility_lag = Arc::new(Mutex::new(VisibilityLagTelemetry::default()));
+        let pending_stream_events = Arc::new(Mutex::new(VecDeque::new()));
+        let unit_control = Arc::new(RuntimeUnitGate::new_runtime_managed(
+            "sink-file-meta",
+            SINK_RUNTIME_UNITS,
+        ));
+        let sink = Self {
+            state,
+            root_specs,
+            host_object_grants,
+            visibility_lag,
+            pending_stream_events,
+            unit_control,
+            shutdown: CancellationToken::new(),
+            endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        sink.reconcile_runtime_groups(&source_cfg.host_object_grants)?;
+        Ok(sink)
+    }
+
+    pub fn start_runtime_endpoints(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+        node_id: NodeId,
+    ) -> Result<()> {
+        if !lock_or_recover(&self.endpoint_tasks, "sink.start_runtime_endpoints")
+            .is_empty()
+        {
+            return Ok(());
+        }
+
+        let adapter =
+            exchange_host_adapter(boundary.clone(), node_id.clone(), default_route_bindings());
+        let routes = default_route_bindings();
+
+        let query_state = self.state.clone();
+        let node_id_cloned = node_id.clone();
+        let query_root_specs = self.root_specs.clone();
+        let query_host_object_grants = self.host_object_grants.clone();
+        let query_visibility_lag = self.visibility_lag.clone();
+        let query_pending_stream_events = self.pending_stream_events.clone();
+        let query_unit_control = self.unit_control.clone();
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
+            log::info!(
+                "bound route listening on {}.{} for sink {}",
+                ROUTE_TOKEN_FS_META,
+                METHOD_QUERY,
+                node_id_cloned.0
+            );
+            let endpoint = ManagedEndpointTask::spawn(
+                boundary.clone(),
+                route,
+                format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
+                self.shutdown.clone(),
+                move |requests| {
+                    let mut responses = Vec::new();
+                    for req in requests {
+                        if let Ok(params) =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        {
+                            let sink_impl = SinkFileMeta {
+                                state: query_state.clone(),
+                                root_specs: query_root_specs.clone(),
+                                host_object_grants: query_host_object_grants.clone(),
+                                visibility_lag: query_visibility_lag.clone(),
+                                pending_stream_events: query_pending_stream_events.clone(),
+                                unit_control: query_unit_control.clone(),
+                                shutdown: CancellationToken::new(),
+                                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                            };
+                            let mut events =
+                                sink_impl.materialized_query(&params).unwrap_or_default();
+                            for event in &mut events {
+                                let mut meta = event.metadata().clone();
+                                meta.correlation_id = req.metadata().correlation_id;
+                                responses.push(Event::new(
+                                    meta,
+                                    Bytes::copy_from_slice(event.payload_bytes()),
+                                ));
+                            }
+                        } else {
+                            log::warn!("bound route failed to parse InternalQueryRequest");
+                        }
+                    }
+                    responses
+                },
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_runtime_endpoints.query_tasks",
+            )
+            .push(endpoint);
+        }
+
+        let internal_query_state = self.state.clone();
+        let internal_query_root_specs = self.root_specs.clone();
+        let internal_query_host_object_grants = self.host_object_grants.clone();
+        let internal_query_visibility_lag = self.visibility_lag.clone();
+        let internal_query_pending_stream_events = self.pending_stream_events.clone();
+        let internal_query_unit_control = self.unit_control.clone();
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
+            log::info!(
+                "bound route listening on {}.{} for sink {}",
+                ROUTE_TOKEN_FS_META_INTERNAL,
+                METHOD_SINK_QUERY,
+                node_id_cloned.0
+            );
+            let endpoint = ManagedEndpointTask::spawn(
+                boundary.clone(),
+                route,
+                format!(
+                    "sink:{}:{}",
+                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY
+                ),
+                self.shutdown.clone(),
+                move |requests| {
+                    let mut responses = Vec::new();
+                    for req in requests {
+                        if let Ok(params) =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        {
+                            let sink_impl = SinkFileMeta {
+                                state: internal_query_state.clone(),
+                                root_specs: internal_query_root_specs.clone(),
+                                host_object_grants: internal_query_host_object_grants.clone(),
+                                visibility_lag: internal_query_visibility_lag.clone(),
+                                pending_stream_events: internal_query_pending_stream_events
+                                    .clone(),
+                                unit_control: internal_query_unit_control.clone(),
+                                shutdown: CancellationToken::new(),
+                                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                            };
+                            let mut events =
+                                sink_impl.materialized_query(&params).unwrap_or_default();
+                            for event in &mut events {
+                                let mut meta = event.metadata().clone();
+                                meta.correlation_id = req.metadata().correlation_id;
+                                responses.push(Event::new(
+                                    meta,
+                                    Bytes::copy_from_slice(event.payload_bytes()),
+                                ));
+                            }
+                        } else {
+                            log::warn!("bound route failed to parse InternalQueryRequest");
+                        }
+                    }
+                    responses
+                },
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_runtime_endpoints.internal_query_tasks",
+            )
+            .push(endpoint);
+        }
+
+        const FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS: u64 = 750;
+        let node_id_proxy = node_id.clone();
+        let proxy_adapter = adapter.clone();
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_FIND) {
+            log::info!(
+                "bound route listening on {}.{} for sink {}",
+                ROUTE_TOKEN_FS_META,
+                METHOD_FIND,
+                node_id_proxy.0
+            );
+            let endpoint = ManagedEndpointTask::spawn(
+                boundary.clone(),
+                route,
+                format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_FIND),
+                self.shutdown.clone(),
+                move |requests| {
+                    let mut responses = Vec::new();
+
+                    for req in requests {
+                        let _params = match rmp_serde::from_slice::<InternalQueryRequest>(
+                            req.payload_bytes(),
+                        ) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                log::warn!(
+                                    "find proxy failed to parse InternalQueryRequest: {:?}",
+                                    e
+                                );
+                                responses.push(build_error_marker_event(
+                                    &node_id_proxy,
+                                    req.metadata().correlation_id,
+                                    "find proxy invalid request payload",
+                                ));
+                                continue;
+                            }
+                        };
+
+                        match proxy_adapter.call_collect(
+                            ROUTE_TOKEN_FS_META_INTERNAL,
+                            METHOD_SOURCE_FIND,
+                            Bytes::copy_from_slice(req.payload_bytes()),
+                            Duration::from_secs(60),
+                            Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
+                        ) {
+                            Ok(source_events) => {
+                                for event in source_events {
+                                    let mut meta = event.metadata().clone();
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    responses.push(Event::new(
+                                        meta,
+                                        Bytes::copy_from_slice(event.payload_bytes()),
+                                    ));
+                                }
+                            }
+                            Err(e) => {
+                                log::error!("find proxy upstream route call failed: {:?}", e);
+                                responses.push(build_error_marker_event(
+                                    &node_id_proxy,
+                                    req.metadata().correlation_id,
+                                    "find proxy upstream request failed",
+                                ));
+                            }
+                        }
+                    }
+                    responses
+                },
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_runtime_endpoints.find_tasks",
+            )
+            .push(endpoint);
+        }
+
+        let stream_state = self.state.clone();
+        let stream_root_specs = self.root_specs.clone();
+        let stream_host_object_grants = self.host_object_grants.clone();
+        let stream_visibility_lag = self.visibility_lag.clone();
+        let stream_unit_control = self.unit_control.clone();
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
+            let stream_sink = Arc::new(SinkFileMeta {
+                state: stream_state,
+                root_specs: stream_root_specs,
+                host_object_grants: stream_host_object_grants,
+                visibility_lag: stream_visibility_lag,
+                pending_stream_events: self.pending_stream_events.clone(),
+                unit_control: stream_unit_control,
+                shutdown: CancellationToken::new(),
+                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+            });
+            let stream_sink_ready = stream_sink.clone();
+            let stream_sink_apply = stream_sink.clone();
+            let endpoint = ManagedEndpointTask::spawn_stream(
+                boundary,
+                route,
+                format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+                self.shutdown.clone(),
+                move || stream_sink_ready.has_scheduled_stream_targets(),
+                move |events| {
+                    if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
+                        log::error!("sink stream ingest failed: {:?}", err);
+                    }
+                },
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_runtime_endpoints.stream_tasks",
+            )
+            .push(endpoint);
+        }
+
+        Ok(())
+    }
+
     fn apply_activate_signal(
         &self,
         unit: SinkRuntimeUnit,

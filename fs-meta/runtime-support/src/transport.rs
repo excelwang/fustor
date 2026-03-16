@@ -1,8 +1,9 @@
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use capanix_app_sdk::raw::ChannelIoSubset;
@@ -38,6 +39,9 @@ impl RuntimeSupportPaths {
     }
 }
 
+const WORKER_BRIDGE_READY_TIMEOUT: Duration = Duration::from_secs(8);
+const WORKER_BRIDGE_READY_POLL: Duration = Duration::from_millis(50);
+
 impl RuntimeSupportTransport {
     pub(crate) fn spawn<T>(
         node_id: &NodeId,
@@ -62,10 +66,17 @@ impl RuntimeSupportTransport {
 
         let stdout_log = open_log_file(&paths.stdout_log_path, "stdout")?;
         let stderr_log = open_log_file(&paths.stderr_log_path, "stderr")?;
-        let child =
+        let mut child =
             spawn_worker_process(bin_path, &paths.worker_socket_path, stdout_log, stderr_log)?;
-        let bridge =
-            RuntimeSupportBridge::spawn(paths.worker_socket_path.clone(), boundary.clone());
+        let (mut bridge, ready_rx) =
+            RuntimeSupportBridge::spawn(paths.worker_socket_path.clone(), boundary.clone())?;
+        if let Err(err) = wait_for_bridge_ready(&mut child, &paths.worker_socket_path, ready_rx) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bridge.join();
+            let _ = fs::remove_file(&paths.worker_socket_path);
+            return Err(err);
+        }
         let data_boundary: Arc<dyn ChannelIoSubset> = boundary;
         let route = BoundRouteClient::open(data_boundary, route_key, node_id.clone())?;
 
@@ -133,6 +144,57 @@ fn spawn_worker_process(
                 bin_path.display()
             ))
         })
+}
+
+fn wait_for_bridge_ready(
+    child: &mut Child,
+    worker_socket_path: &Path,
+    ready_rx: Receiver<std::result::Result<(), String>>,
+) -> Result<()> {
+    let deadline = Instant::now() + WORKER_BRIDGE_READY_TIMEOUT;
+    loop {
+        match ready_rx.try_recv() {
+            Ok(Ok(())) => return Ok(()),
+            Ok(Err(message)) => {
+                return Err(CnxError::TransportClosed(format!(
+                    "worker bridge connect failed ({}): {message}",
+                    worker_socket_path.display()
+                )));
+            }
+            Err(TryRecvError::Disconnected) => {
+                return Err(CnxError::TransportClosed(format!(
+                    "worker bridge stopped before ready ({})",
+                    worker_socket_path.display()
+                )));
+            }
+            Err(TryRecvError::Empty) => {}
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                return Err(CnxError::TransportClosed(format!(
+                    "worker process exited before ready ({}) with status {status}",
+                    worker_socket_path.display()
+                )));
+            }
+            Ok(None) => {}
+            Err(err) => {
+                return Err(CnxError::Internal(format!(
+                    "check worker process status failed ({}): {err}",
+                    worker_socket_path.display()
+                )));
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err(CnxError::TransportClosed(format!(
+                "worker bridge readiness timeout ({})",
+                worker_socket_path.display()
+            )));
+        }
+
+        std::thread::sleep(WORKER_BRIDGE_READY_POLL);
+    }
 }
 
 fn now_us() -> u64 {

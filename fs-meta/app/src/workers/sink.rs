@@ -19,6 +19,7 @@ use crate::workers::sink_ipc::{
 
 const SINK_WORKER_INIT_RPC_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_INIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
+const SINK_WORKER_START_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
     let mut selected = None::<QueryNode>;
@@ -295,6 +296,19 @@ impl SinkWorkerClient {
                 ))),
             },
         )?;
+
+        match client
+            .conn
+            .call_with_timeout(SinkWorkerRequest::Start, SINK_WORKER_START_RPC_TIMEOUT)?
+        {
+            SinkWorkerResponse::Ack => {}
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for start: {:?}",
+                    other
+                )));
+            }
+        }
 
         Ok(client)
     }
