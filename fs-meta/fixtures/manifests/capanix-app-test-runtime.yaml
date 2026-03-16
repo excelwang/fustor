@@ -1,0 +1,9 @@
+ports:
+  - route_token: app-test-runtime.events
+    use_port: events
+    dispatch_tag: stream
+    pattern: stream
+    route_key: route.app-declare-runtime:v1
+    roles:
+      - serve
+      - use

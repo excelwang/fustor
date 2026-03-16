@@ -1,0 +1,153 @@
+# fs-meta 产品部署指南
+
+## 概览
+
+fs-meta 的正式用户路径分成两段：
+
+1. 先部署 `capanix` 底座集群，并在线登记 mount-root 资源导出。
+2. 再部署 `fs-meta` 产品，登录 fs-meta 管理面，发现 runtime grants，并配置 `roots`。
+
+正式路径固定为：用户维护 bootstrap config、在线资源公告、fs-meta 产品配置与版本投放；roots 通过 `ui/` 在线选择，不要求手填 selector。
+
+## 第 1 步：准备 capanix 底座
+
+最小集群规格文件只保留：
+
+```yaml
+domain_id: local
+nodes:
+  - node_id: capanix-node-1
+    addr: 127.0.0.1:19401
+  - node_id: capanix-node-2
+    addr: 127.0.0.1:19402
+```
+
+生成完整节点物料：
+
+```bash
+cnxctl cluster scaffold --spec fs-meta/fixtures/examples/capanix-cluster.yaml --out ./cluster-out
+source ./cluster-out/admin.env
+./cluster-out/start-all.sh
+```
+
+生成后的每节点 `config.yaml` 仍然存在，但它是派生产物，用于审计和导出，不是正式长期维护入口。
+
+## 第 2 步：在线登记资源导出
+
+集群启动后，再在线登记资源目录，而不是把 `announced_resources` 写进 bootstrap 配置：
+
+```bash
+cnxctl -s ./cluster-out/nodes/capanix-node-1/home/core.sock \
+  resource announce \
+  --node-id capanix-node-1 \
+  --source /absolute/path/to/data
+```
+
+该命令会自动推导：
+
+1. `resource_kind=fs`
+2. `mount_hint=source`
+3. `owner_uid` / `owner_gid` / `mode`
+4. 稳定的 `resource_id`
+
+查看当前资源目录：
+
+```bash
+cnxctl -s ./cluster-out/nodes/capanix-node-1/home/core.sock resource list --output json
+```
+
+## 第 3 步：部署 fs-meta
+
+正式部署入口：
+
+```bash
+fsmeta deploy --socket ./cluster-out/nodes/capanix-node-1/home/core.sock --config fs-meta/docs/examples/fs-meta.yaml
+```
+
+`fs-meta.yaml` 正式配置面只保留：
+
+```yaml
+api:
+  facade_resource_id: fs-meta-tcp-listener
+auth:
+  bootstrap_management:
+    username: admin
+```
+
+说明：
+
+1. `fsmeta deploy` 默认以 `roots=[]` 启动服务。
+2. app target、manifest、desired-state document、runtime subscriptions、source/sink execution wiring、auth 文件路径等内部细节由 CLI 自动生成。
+3. deploy 完成后会输出 `api_facade_resource_id`、一次性的 bootstrap 管理员凭据和内部 state 目录。
+
+## 第 4 步：登录并勾选 monitoring roots
+
+登录入口：
+
+```text
+POST /api/fs-meta/v1/session/login
+```
+
+登录后，先读取 runtime grants：
+
+```text
+GET /api/fs-meta/v1/runtime/grants
+```
+
+正式产品前端流程固定为：
+
+1. 从 grants 列表勾选资源。
+2. 保存前调用 preview，确认命中的 grants 和最终 monitor paths。
+3. 保存 roots。
+4. 需要时再触发 rescan。
+
+当前正式写接口：
+
+```text
+GET  /api/fs-meta/v1/monitoring/roots
+POST /api/fs-meta/v1/monitoring/roots/preview
+PUT  /api/fs-meta/v1/monitoring/roots
+POST /api/fs-meta/v1/index/rescan
+```
+
+正式 UI 不再暴露 `mount_point / host_ref / host_ip / fs_source / fs_type / watch / scan / audit_interval_ms` 的手工编辑表单。
+
+## 业务参数分层
+
+在当前基线中，操作员真正配置的是三类东西：
+
+1. **部署期 bootstrap 参数**：`api.facade_resource_id` 与初始 `auth.bootstrap_management`。
+2. **在线业务范围参数**：通过 `runtime grants -> monitoring roots preview/apply` 决定监控哪些 mount-root resources。
+3. **运行期修复动作**：通过 `POST /api/fs-meta/v1/index/rescan` 触发显式补扫。
+
+以下内容不是正式业务参数面：
+
+1. app target / desired-state 细节。
+2. runtime subscriptions / source-sink execution wiring / internal execution identities。
+3. 任何仅用于内部 bind/run realization 的声明 carrier 字段。
+4. 任何要求用户直接手改 node manifest 或 release desired-state 文档的流程。
+
+## 升级版本
+
+fs-meta 的升级以单 app 边界的 release generation cutover 为主，而不是手工编辑内部 desired-state 文档：
+
+1. 准备新的 fs-meta 二进制发布物。
+2. 仍通过同一 `fsmeta deploy` 入口提交新版本。
+3. runtime 在同一 app 边界下激活新 generation，但可信对外 exposure 继续停留在上一代 eligible generation，直到新 generation 完成追平。
+4. 当前 monitoring roots 与 runtime grants 被重放为新 generation 的 authoritative truth 输入，不要求用户重新录入。
+5. 新 generation 的内存 observation/projection state 通过 baseline scan / audit / manual rescan 路径重建；对 active scan-enabled primary groups，只有首次 audit 完成并清除 materialized degraded/overflow 阻断后，才达到 app-owned `observation_eligible`。新 generation 上出现部分 query/readability 并不代表已经具备 materialized `/tree`/`/stats` cutover readiness。
+6. 只有在 `observation_eligible` 达成后，可信对外 materialized `/tree` 和 `/stats` 结果才切换到新 generation；`/on-demand-force-find` 作为 freshness path 可以更早可用；对外 `api_base_url` 与产品 API 命名空间保持稳定。
+
+## 本地体验
+
+本地单机体验入口仍然保留：
+
+```bash
+fsmeta local start --workdir .fsmeta-local --config fs-meta/docs/examples/fs-meta.yaml
+```
+
+该模式用于单机试跑和前端联调，不替代正式的 capanix + fs-meta 两段式部署路径。
+
+## 非正式路径
+
+当前产品路径不再暴露静态监听地址。operator 通过 `api.facade_resource_id` 选择被公告的 `tcp_listener` 资源，并继续使用 deploy / `ui/` / runtime grants 路径。

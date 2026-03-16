@@ -1,0 +1,21 @@
+[package]
+name = "capanix-app-fs-meta-worker-sink"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+description = "Internal fs-meta sink-worker artifact package"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fs_meta_sink_worker"
+path = "src/main.rs"
+
+[dependencies]
+capanix-app-fs-meta = { workspace = true }
+capanix-app-sdk = { workspace = true }
+capanix-unit-sidecar = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }

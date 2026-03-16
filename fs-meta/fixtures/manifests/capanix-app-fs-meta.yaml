@@ -1,0 +1,34 @@
+ports:
+  - route_token: fs-meta.internal
+    use_port: facade_control
+    dispatch_tag: facade_control
+    pattern: stream
+    route_key: fs-meta.internal.facade-control:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta.events
+    use_port: stream
+    dispatch_tag: stream
+    pattern: stream
+    route_key: fs-meta.events:v1
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta
+    use_port: query
+    dispatch_tag: query
+    pattern: request_reply
+    route_key: find:v1.find
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta
+    use_port: find
+    dispatch_tag: find
+    pattern: request_reply
+    route_key: on-demand-force-find:v1.on-demand-force-find
+    roles:
+      - serve
+      - use

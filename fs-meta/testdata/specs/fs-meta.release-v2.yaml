@@ -1,0 +1,69 @@
+schema_version: release-v2
+apps:
+  -
+    id: capanix-app-fs-meta
+    config:
+      roots:
+        - id: nfs1
+          selector:
+            mount_point: /mnt/nfs1
+          subpath_scope: /
+          watch: true
+          scan: true
+        - id: nfs2
+          selector:
+            mount_point: /mnt/nfs2
+          subpath_scope: /
+          watch: true
+          scan: true
+      api:
+        enabled: true
+        facade_resource_id: fs-meta-tcp-listener
+    runtime:
+      control_subscriptions:
+        - runtime.host_object_grants.changed
+      app_scopes:
+        - scope_id: nfs1
+          unit_scopes:
+            - unit_id: runtime.exec.sink
+              eligibility: resource_visible_nodes
+              cardinality: one
+            - unit_id: runtime.exec.source
+              eligibility: scope_members
+              cardinality: all
+            - unit_id: runtime.exec.scan
+              eligibility: scope_members
+              cardinality: all
+        - scope_id: nfs2
+          unit_scopes:
+            - unit_id: runtime.exec.sink
+              eligibility: resource_visible_nodes
+              cardinality: one
+            - unit_id: runtime.exec.source
+              eligibility: scope_members
+              cardinality: all
+            - unit_id: runtime.exec.scan
+              eligibility: scope_members
+              cardinality: all
+        - scope_id: fs-meta-tcp-listener
+          resource_ids:
+            - fs-meta-tcp-listener
+          unit_scopes:
+            - unit_id: runtime.exec.facade
+              eligibility: resource_visible_nodes
+              cardinality: one
+      units:
+        runtime.exec.scan:
+          interval_ms: 30000
+          enabled: true
+        runtime.exec.facade:
+          enabled: true
+      state_carrier:
+        enabled: true
+        units:
+          runtime.exec.scan:
+            enabled: false
+          runtime.exec.facade:
+            enabled: true
+    policy:
+      generation: 1

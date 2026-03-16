@@ -1,0 +1,6 @@
+domain_id: local
+nodes:
+  - node_id: capanix-node-1
+    addr: 127.0.0.1:19401
+  - node_id: capanix-node-2
+    addr: 127.0.0.1:19402

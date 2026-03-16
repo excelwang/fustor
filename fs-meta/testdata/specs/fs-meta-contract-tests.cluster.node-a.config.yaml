@@ -1,0 +1,41 @@
+schema_version: v5
+node_id: fs-meta-cluster-node-a
+seeds:
+  - "127.0.0.1:39001"
+  - "127.0.0.1:39002"
+management_peers:
+  - domain_id: local
+    node_id: "fs-meta-cluster-node-b"
+    addr: "127.0.0.1:39002"
+
+trust_bundle:
+  version: dev
+  node_keys: []
+  management_domains: []
+  owner_keys: []
+  ingress_keys: []
+
+node_delegations: []
+
+announced_resources:
+  - resource_id: nfs1
+    node_id: fs-meta-cluster-node-a
+    resource_kind: fs
+    source: /mnt/nfs1
+    mount_hint: /mnt/nfs1
+    owner_uid: 1000
+    owner_gid: 1000
+    mode: 493
+  - resource_id: nfs2
+    node_id: fs-meta-cluster-node-a
+    resource_kind: fs
+    source: /mnt/nfs2
+    mount_hint: /mnt/nfs2
+    owner_uid: 1000
+    owner_gid: 1000
+    mode: 493
+resource_limits:
+  max_channels: 512
+  max_processes: 128
+  channel_buffer_size: 1024
+  max_audit_entries: 8192

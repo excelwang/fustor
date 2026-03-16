@@ -1,0 +1,23 @@
+[package]
+name = "capanix-app-fs-meta-worker-source"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+description = "Internal fs-meta source-worker artifact package"
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "fs_meta_source_worker"
+path = "src/main.rs"
+
+[dependencies]
+capanix-app-fs-meta = { workspace = true }
+capanix-app-sdk = { workspace = true }
+capanix-unit-sidecar = { workspace = true }
+bytes = { workspace = true }
+futures-util = "0.3"
+log = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }

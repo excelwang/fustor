@@ -1,0 +1,15 @@
+[package]
+name = "capanix-app-test-runtime"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+capanix-app-test-runtime-app = { path = "app" }
+capanix-app-sdk = "0.1.0"
+capanix-unit-entry-macros = "0.1.0"

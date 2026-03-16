@@ -1,0 +1,24 @@
+name: fs-meta-api-e2e-real-nfs
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"
+
+concurrency:
+  group: fs-meta-api-e2e-real-nfs-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fs-meta-api-e2e-real-nfs:
+    runs-on: [self-hosted, linux, privileged]
+    env:
+      DATANIX_REAL_NFS_E2E: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+      - name: Run real-NFS 5-node fs-meta API E2E
+        run: ./fs-meta/scripts/fs-meta-api-e2e-real-nfs.sh

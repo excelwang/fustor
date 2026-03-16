@@ -1,0 +1,14 @@
+[package]
+name = "capanix-app-fs-meta-runtime-support"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Internal fs-meta runtime support helper crate"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bytes = { workspace = true }
+capanix-app-sdk = { workspace = true }
+capanix-unit-sidecar = { workspace = true }

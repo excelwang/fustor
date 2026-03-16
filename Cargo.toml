@@ -1,0 +1,67 @@
+[package]
+name = "fustor-specs-root"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "Standalone fs-meta root crate for repository-level tests and vocabulary exports"
+
+[lib]
+path = "src/lib.rs"
+
+[workspace]
+resolver = "2"
+members = [
+    ".",
+    "fs-meta/app",
+    "fs-meta/tooling",
+    "fs-meta/worker-facade",
+    "fs-meta/worker-scan",
+    "fs-meta/worker-source",
+    "fs-meta/worker-sink",
+    "fs-meta/runtime-support",
+]
+default-members = [
+    ".",
+    "fs-meta/app",
+    "fs-meta/tooling",
+    "fs-meta/worker-facade",
+    "fs-meta/worker-scan",
+    "fs-meta/worker-source",
+    "fs-meta/worker-sink",
+    "fs-meta/runtime-support",
+]
+
+[workspace.dependencies]
+capanix-app-fs-meta = { version = "0.1.0", path = "fs-meta/app" }
+capanix-app-fs-meta-tooling = { version = "0.1.0", path = "fs-meta/tooling" }
+capanix-app-fs-meta-worker-facade = { version = "0.1.0", path = "fs-meta/worker-facade" }
+capanix-app-fs-meta-worker-scan = { version = "0.1.0", path = "fs-meta/worker-scan" }
+capanix-app-fs-meta-worker-sink = { version = "0.1.0", path = "fs-meta/worker-sink" }
+capanix-app-fs-meta-worker-source = { version = "0.1.0", path = "fs-meta/worker-source" }
+capanix-app-fs-meta-runtime-support = { version = "0.1.0", path = "fs-meta/runtime-support" }
+capanix-app-sdk = "0.1.0"
+capanix-config = "0.1.0"
+capanix-daemon = "0.1.0"
+capanix-host-adapter-fs-meta = "0.1.0"
+capanix-host-fs-types = "0.1.0"
+capanix-kernel = "0.1.0"
+capanix-kernel-api = "0.1.0"
+capanix-route-proto = "0.1.0"
+capanix-specs-vocabulary = "0.0.0"
+capanix-unit-entry-macros = "0.1.0"
+capanix-unit-sidecar = "0.1.0"
+async-stream = "0.3"
+async-trait = "0.1"
+bytes = "1"
+crossbeam-channel = "0.5"
+futures-core = "0.3"
+log = "0.4"
+rmp-serde = "1"
+serde = "1"
+serde_bytes = "0.11"
+tempfile = "3"
+tokio = "1"
+tokio-util = "0.7"
+
+[dependencies]
+capanix-specs-vocabulary = { workspace = true }

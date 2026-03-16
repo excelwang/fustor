@@ -1,0 +1,34 @@
+[package]
+name = "capanix-app-fs-meta-tooling"
+version = "0.1.0"
+edition = "2024"
+publish = false
+autobins = false
+description = "Internal fs-meta product tooling package"
+
+[features]
+default = []
+local-daemon = ["dep:capanix-daemon"]
+
+[[bin]]
+name = "fsmeta"
+path = "src/bin/fsmeta.rs"
+
+[[bin]]
+name = "capanixd-fs-meta"
+path = "src/bin/capanixd-fs-meta.rs"
+required-features = ["local-daemon"]
+
+[dependencies]
+anyhow = "1"
+capanix-app-fs-meta = { workspace = true }
+capanix-daemon = { workspace = true, optional = true }
+capanix-host-adapter-fs-meta = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+uuid = { version = "1", features = ["v4"] }

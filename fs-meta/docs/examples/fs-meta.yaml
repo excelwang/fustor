@@ -1,0 +1,5 @@
+api:
+  facade_resource_id: fs-meta-tcp-listener
+auth:
+  bootstrap_management:
+    username: admin
