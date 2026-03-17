@@ -26,7 +26,8 @@ pub struct OperatorSession {
     candidate_base_urls: Vec<String>,
     username: String,
     password: String,
-    token: String,
+    management_token: String,
+    query_api_key: String,
 }
 
 impl FsMetaApiClient {
@@ -93,6 +94,18 @@ impl FsMetaApiClient {
 
     pub fn rescan_raw(&self, token: &str) -> Result<ApiResponse, String> {
         self.post_json_raw("/index/rescan", token, &json!({}))
+    }
+
+    pub fn create_query_api_key(&self, token: &str, label: &str) -> Result<Value, String> {
+        self.ensure_success(self.create_query_api_key_raw(token, label)?)
+    }
+
+    pub fn create_query_api_key_raw(
+        &self,
+        token: &str,
+        label: &str,
+    ) -> Result<ApiResponse, String> {
+        self.post_json_raw("/query-api-keys", token, &json!({ "label": label }))
     }
 
     pub fn stats(&self, token: &str, query: &[(&str, String)]) -> Result<Value, String> {
@@ -277,12 +290,14 @@ impl OperatorSession {
             return Err("no facade base URLs provided".into());
         }
         let (client, token) = login_first_available(&candidate_base_urls, &username, &password)?;
+        let query_api_key = provision_query_api_key(&client, &token, &username)?;
         Ok(Self {
             client,
             candidate_base_urls,
             username,
             password,
-            token,
+            management_token: token,
+            query_api_key,
         })
     }
 
@@ -295,12 +310,14 @@ impl OperatorSession {
         let password = password.into();
         let primary_base_url = client.base_url.clone();
         let token = extract_token(client.login(&username, &password)?)?;
+        let query_api_key = provision_query_api_key(&client, &token, &username)?;
         Ok(Self {
             client,
             candidate_base_urls: vec![primary_base_url],
             username,
             password,
-            token,
+            management_token: token,
+            query_api_key,
         })
     }
 
@@ -309,67 +326,91 @@ impl OperatorSession {
     }
 
     pub fn token(&self) -> &str {
-        &self.token
+        &self.management_token
+    }
+
+    pub fn query_api_key(&self) -> &str {
+        &self.query_api_key
     }
 
     pub fn relogin(&mut self) -> Result<(), String> {
-        self.token = extract_token(self.client.login(&self.username, &self.password)?)?;
+        self.management_token = extract_token(self.client.login(&self.username, &self.password)?)?;
+        self.query_api_key =
+            provision_query_api_key(&self.client, &self.management_token, &self.username)?;
         Ok(())
     }
 
     pub fn status(&mut self) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.status(token))
+        self.with_management_reauth(|client, token| client.status(token))
     }
 
     pub fn runtime_grants(&mut self) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.runtime_grants(token))
+        self.with_management_reauth(|client, token| client.runtime_grants(token))
     }
 
     pub fn monitoring_roots(&mut self) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.monitoring_roots(token))
+        self.with_management_reauth(|client, token| client.monitoring_roots(token))
     }
 
     pub fn preview_roots(&mut self, roots: &Value) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.preview_roots(token, roots))
+        self.with_management_reauth(|client, token| client.preview_roots(token, roots))
     }
 
     pub fn update_roots(&mut self, roots: &Value) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.update_roots(token, roots))
+        self.with_management_reauth(|client, token| client.update_roots(token, roots))
     }
 
     pub fn rescan(&mut self) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.rescan(token))
+        self.with_management_reauth(|client, token| client.rescan(token))
     }
 
     pub fn stats(&mut self, query: &[(&str, String)]) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.stats(token, query))
+        self.with_query_reauth(|client, query_api_key| client.stats(query_api_key, query))
     }
 
     pub fn bound_route_metrics(&mut self) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.bound_route_metrics(token))
+        self.with_query_reauth(|client, query_api_key| client.bound_route_metrics(query_api_key))
     }
 
     pub fn tree(&mut self, query: &[(&str, String)]) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.tree(token, query))
+        self.with_query_reauth(|client, query_api_key| client.tree(query_api_key, query))
     }
 
     pub fn force_find(&mut self, query: &[(&str, String)]) -> Result<Value, String> {
-        self.with_reauth(|client, token| client.force_find(token, query))
+        self.with_query_reauth(|client, query_api_key| client.force_find(query_api_key, query))
     }
 
-    fn with_reauth<T>(
+    fn with_management_reauth<T>(
         &mut self,
         op: impl Fn(&FsMetaApiClient, &str) -> Result<T, String>,
     ) -> Result<T, String> {
-        match op(&self.client, &self.token) {
+        match op(&self.client, &self.management_token) {
             Ok(value) => Ok(value),
             Err(err) if is_invalid_session_error(&err) => {
                 self.reconnect_and_login()?;
-                op(&self.client, &self.token)
+                op(&self.client, &self.management_token)
             }
             Err(err) if is_transport_error(&err) => {
                 self.reconnect_and_login()?;
-                op(&self.client, &self.token)
+                op(&self.client, &self.management_token)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
+    fn with_query_reauth<T>(
+        &mut self,
+        op: impl Fn(&FsMetaApiClient, &str) -> Result<T, String>,
+    ) -> Result<T, String> {
+        match op(&self.client, &self.query_api_key) {
+            Ok(value) => Ok(value),
+            Err(err) if is_invalid_query_api_key_error(&err) => {
+                self.reconnect_and_login()?;
+                op(&self.client, &self.query_api_key)
+            }
+            Err(err) if is_transport_error(&err) => {
+                self.reconnect_and_login()?;
+                op(&self.client, &self.query_api_key)
             }
             Err(err) => Err(err),
         }
@@ -380,14 +421,16 @@ impl OperatorSession {
         loop {
             let attempt = if self.candidate_base_urls.len() <= 1 {
                 self.relogin()
-                    .map(|_| (self.client.clone(), self.token.clone()))
+                    .map(|_| (self.client.clone(), self.management_token.clone()))
             } else {
                 login_first_available(&self.candidate_base_urls, &self.username, &self.password)
             };
             match attempt {
                 Ok((client, token)) => {
+                    let query_api_key = provision_query_api_key(&client, &token, &self.username)?;
                     self.client = client;
-                    self.token = token;
+                    self.management_token = token;
+                    self.query_api_key = query_api_key;
                     return Ok(());
                 }
                 Err(err) => {
@@ -406,6 +449,10 @@ impl OperatorSession {
 
 pub fn is_invalid_session_error(err: &str) -> bool {
     err.contains("\"error\":\"invalid session token\"") || err.contains("invalid session token")
+}
+
+pub fn is_invalid_query_api_key_error(err: &str) -> bool {
+    err.contains("\"error\":\"invalid query api key\"") || err.contains("invalid query api key")
 }
 
 pub fn is_transport_error(err: &str) -> bool {
@@ -450,4 +497,28 @@ fn login_first_available(
         }
     }
     Err(format!("no reachable facade base URL: {last_err}"))
+}
+
+fn provision_query_api_key(
+    client: &FsMetaApiClient,
+    management_token: &str,
+    username: &str,
+) -> Result<String, String> {
+    let created = client.create_query_api_key(
+        management_token,
+        &format!("e2e-{}-{}", username, unique_suffix()),
+    )?;
+    created
+        .get("api_key")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| format!("query api key response missing api_key: {created}"))
+}
+
+fn unique_suffix() -> String {
+    let micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros())
+        .unwrap_or_default();
+    format!("{}-{micros}", std::process::id())
 }

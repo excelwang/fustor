@@ -60,6 +60,7 @@ pub enum SourceWorkerRequest {
     ResolveGroupIdForObjectRef {
         object_ref: String,
     },
+    PublishManualRescanSignal,
     TriggerRescanWhenReady,
     OnControlFrame {
         envelopes: Vec<ControlEnvelope>,

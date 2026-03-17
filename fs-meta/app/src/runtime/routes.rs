@@ -16,6 +16,7 @@ pub const METHOD_STREAM: &str = "stream";
 pub const METHOD_SINK_QUERY: &str = "sink.query";
 pub const METHOD_SOURCE_FIND: &str = "source.find";
 pub const METHOD_SOURCE_RESCAN: &str = "source.rescan";
+pub const METHOD_SOURCE_RESCAN_CONTROL: &str = "source.rescan.control";
 
 pub const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
 pub const ROUTE_KEY_QUERY: &str = "find:v1.find";
@@ -24,6 +25,7 @@ pub const ROUTE_KEY_FACADE_CONTROL: &str = "fs-meta.internal.facade-control:v1";
 pub const ROUTE_KEY_SINK_QUERY_INTERNAL: &str = "materialized-find:v1";
 pub const ROUTE_KEY_SOURCE_FIND_INTERNAL: &str = "source-on-demand-force-find:v1";
 pub const ROUTE_KEY_SOURCE_RESCAN_INTERNAL: &str = "source-manual-rescan:v1";
+pub const ROUTE_KEY_SOURCE_RESCAN_CONTROL: &str = "source-manual-rescan-control:v1";
 pub const ROUTE_KEY_FACADE_SOURCE_RESCAN_CONTROL: &str = "facade-source-manual-rescan:v1";
 
 fn scoped_internal_route_key(base: &str, node_id: &str) -> String {
@@ -82,6 +84,11 @@ pub fn default_route_bindings() -> Arc<RouteLookupTable> {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SOURCE_RESCAN.into(),
             route: RouteKey(ROUTE_KEY_SOURCE_RESCAN_INTERNAL.into()),
+        },
+        RouteLookup {
+            route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
+            use_port: METHOD_SOURCE_RESCAN_CONTROL.into(),
+            route: RouteKey(ROUTE_KEY_SOURCE_RESCAN_CONTROL.into()),
         },
         RouteLookup {
             route_token: ROUTE_TOKEN_HOST_OBJECT.into(),

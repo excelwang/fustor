@@ -8,10 +8,10 @@ use crate::api::facade_status::{
 use crate::query::TreeGroupPayload;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryNode, SubtreeStats};
 use crate::runtime::execution_units;
-use crate::runtime::routes::ROUTE_KEY_FACADE_CONTROL;
 use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, split_app_control_signals,
 };
+use crate::runtime::routes::ROUTE_KEY_FACADE_CONTROL;
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkWorkerClientHandle};
 use crate::workers::source::{SourceFacade, SourceWorkerClientHandle};
@@ -71,7 +71,6 @@ pub(crate) fn shared_tokio_runtime() -> &'static tokio::runtime::Runtime {
             .expect("build shared fs-meta tokio runtime")
     })
 }
-
 
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -207,15 +206,12 @@ impl FSMetaApp {
             ));
         }
 
-        let sink_is_worker = self.sink.is_worker();
-        let source_is_worker = self.source.is_worker();
-
-        if !sink_is_worker {
+        if !self.sink.is_worker() {
             self.sink.ensure_started()?;
         }
 
         let mut guard = self.pump_task.lock().await;
-        if guard.is_none() && !source_is_worker {
+        if guard.is_none() {
             *guard = self
                 .source
                 .start(self.sink.clone(), self.runtime_boundary.clone())
@@ -241,7 +237,10 @@ impl FSMetaApp {
         ids.into_iter().collect()
     }
 
-    fn runtime_scoped_facade_group_ids(source: &SourceFacade, sink: &SinkFacade) -> Result<Vec<String>> {
+    fn runtime_scoped_facade_group_ids(
+        source: &SourceFacade,
+        sink: &SinkFacade,
+    ) -> Result<Vec<String>> {
         let mut source_groups = source.scheduled_source_group_ids()?.unwrap_or_default();
         let mut scan_groups = source.scheduled_scan_group_ids()?.unwrap_or_default();
         source_groups.extend(scan_groups);
@@ -296,13 +295,11 @@ impl FSMetaApp {
         if !pending.group_ids.is_empty() {
             return Ok(pending.group_ids.iter().cloned().collect());
         }
-        Ok(Self::facade_candidate_group_ids(
-            source,
-            sink,
-            &pending.bound_scopes,
-        )?
-        .into_iter()
-        .collect())
+        Ok(
+            Self::facade_candidate_group_ids(source, sink, &pending.bound_scopes)?
+                .into_iter()
+                .collect(),
+        )
     }
 
     #[cfg(test)]
@@ -417,7 +414,10 @@ impl FSMetaApp {
 
         sink.ensure_started()?;
 
-        eprintln!("fs_meta_runtime_app: spawning facade api server generation={} route_key={} resources={:?}", pending.generation, pending.route_key, pending.resource_ids);
+        eprintln!(
+            "fs_meta_runtime_app: spawning facade api server generation={} route_key={} resources={:?}",
+            pending.generation, pending.route_key, pending.resource_ids
+        );
         let handle = api::spawn(
             pending.resolved.clone(),
             node_id,
@@ -436,7 +436,10 @@ impl FSMetaApp {
             })
         };
         if !still_pending {
-            eprintln!("fs_meta_runtime_app: shutting down stale facade handle generation={} route_key={}", pending.generation, pending.route_key);
+            eprintln!(
+                "fs_meta_runtime_app: shutting down stale facade handle generation={} route_key={}",
+                pending.generation, pending.route_key
+            );
             handle.shutdown(Duration::from_secs(2)).await;
             return Ok(false);
         }
@@ -456,7 +459,10 @@ impl FSMetaApp {
         Self::clear_pending_facade_status(&facade_pending_status);
         drop(pending_guard);
         if let Some(current) = previous {
-            eprintln!("fs_meta_runtime_app: shutting down previous active facade generation={}", current.generation);
+            eprintln!(
+                "fs_meta_runtime_app: shutting down previous active facade generation={}",
+                current.generation
+            );
             current.handle.shutdown(Duration::from_secs(2)).await;
         }
         Ok(true)
@@ -701,7 +707,10 @@ impl FSMetaApp {
     async fn shutdown_active_facade(&self) {
         eprintln!("fs_meta_runtime_app: shutdown_active_facade");
         if let Some(current) = self.api_task.lock().await.take() {
-            eprintln!("fs_meta_runtime_app: shutting down previous active facade generation={}", current.generation);
+            eprintln!(
+                "fs_meta_runtime_app: shutting down previous active facade generation={}",
+                current.generation
+            );
             current.handle.shutdown(Duration::from_secs(2)).await;
         }
     }

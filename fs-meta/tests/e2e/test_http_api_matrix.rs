@@ -546,7 +546,7 @@ fn run_query_matrix(
     )?;
     assert_error(
         session.client().tree_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", file_path.to_string()),
                 ("path_b64", B64URL.encode(file_path.as_bytes())),
@@ -637,7 +637,7 @@ fn run_query_matrix(
 
     assert_error(
         session.client().tree_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", "/".to_string()),
                 ("entry_page_size", "10001".to_string()),
@@ -714,7 +714,7 @@ fn run_query_matrix(
     }
     assert_error(
         session.client().tree_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", "/".to_string()),
                 ("group_after", tree_next_group.clone()),
@@ -725,7 +725,7 @@ fn run_query_matrix(
     )?;
     assert_error(
         session.client().tree_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", "/".to_string()),
                 ("entry_after", tree_next_entry_after.clone()),
@@ -768,7 +768,7 @@ fn run_query_matrix(
     }
     assert_error(
         session.client().force_find_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),
@@ -781,7 +781,7 @@ fn run_query_matrix(
     )?;
     assert_error(
         session.client().force_find_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),
@@ -793,7 +793,7 @@ fn run_query_matrix(
     )?;
     assert_error(
         session.client().force_find_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),
@@ -805,7 +805,7 @@ fn run_query_matrix(
     )?;
     assert_error(
         session.client().force_find_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", "/".to_string()),
                 ("entry_after", force_find_next_entry_after.clone()),
@@ -816,7 +816,7 @@ fn run_query_matrix(
     )?;
     assert_error(
         session.client().tree_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),
@@ -829,7 +829,7 @@ fn run_query_matrix(
     )?;
     assert_error(
         session.client().force_find_raw(
-            session.token(),
+            session.query_api_key(),
             &[
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),

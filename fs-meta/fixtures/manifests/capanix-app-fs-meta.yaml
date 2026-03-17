@@ -32,3 +32,30 @@ ports:
     roles:
       - serve
       - use
+  - route_token: fs-meta.internal
+    use_port: source.find
+    dispatch_tag: source_find
+    pattern: request_reply
+    route_key: source-on-demand-force-find:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta.internal
+    use_port: source.rescan
+    dispatch_tag: source_rescan
+    pattern: request_reply
+    route_key: source-manual-rescan:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta.internal
+    use_port: source.rescan.control
+    dispatch_tag: source_rescan_control
+    pattern: stream
+    route_key: source-manual-rescan-control:v1
+    visibility: internal
+    roles:
+      - serve
+      - use

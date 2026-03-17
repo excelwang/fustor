@@ -129,10 +129,10 @@ fn scenario_force_find_execution_semantics(
     }
 
     let thread_client = session.client().clone();
-    let thread_token = session.token().to_string();
+    let thread_query_api_key = session.query_api_key().to_string();
     let inflight_join = thread::spawn(move || {
         thread_client.force_find_raw(
-            &thread_token,
+            &thread_query_api_key,
             &[
                 ("path", "/force-find-stress".to_string()),
                 ("recursive", "true".to_string()),
@@ -146,7 +146,7 @@ fn scenario_force_find_execution_semantics(
     )?;
 
     let same_group = session.client().force_find_raw(
-        session.token(),
+        session.query_api_key(),
         &[
             ("path", "/force-find-stress".to_string()),
             ("recursive", "true".to_string()),

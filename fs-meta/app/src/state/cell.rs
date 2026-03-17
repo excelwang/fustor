@@ -1,16 +1,19 @@
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 use capanix_app_sdk::CnxError;
 use capanix_app_sdk::raw::{BoundaryContext, StateBoundary};
 #[cfg(test)]
 use capanix_app_sdk::runtime::in_memory_state_boundary;
 use capanix_app_sdk::runtime::{
-    StateCellHandle, StateCellReadRequest, StateCellWriteRequest, StateClass,
+    StateCellHandle, StateCellReadRequest, StateCellWatchRequest, StateCellWriteRequest, StateClass,
 };
 
 const AUTHORITY_JOURNAL_MAX_ENTRIES: usize = 4_096;
 const AUTHORITY_SCHEMA_REV: u64 = 1;
+const SIGNAL_SCHEMA_REV: u64 = 1;
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_micros() as u64,
@@ -58,6 +61,14 @@ fn authority_handle(scope: &str) -> StateCellHandle {
     }
 }
 
+fn signal_handle(scope: &str, signal: &str) -> StateCellHandle {
+    StateCellHandle {
+        cell_id: format!("fs-meta.signal.{signal}.{scope}"),
+        schema_rev: SIGNAL_SCHEMA_REV,
+        state_class: StateClass::Authoritative,
+    }
+}
+
 fn local_state_boundary_bridge(scope: &str) -> BoundaryContext {
     BoundaryContext::for_worker(scope)
 }
@@ -75,6 +86,199 @@ pub(crate) struct AuthorityJournal {
     handle: StateCellHandle,
     state_boundary: Arc<dyn StateBoundary>,
     state: Arc<Mutex<AuthoritySnapshot>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct SignalSnapshot {
+    scope: String,
+    signal: String,
+    seq: u64,
+    requested_at_us: u64,
+    requested_by: String,
+}
+
+impl SignalSnapshot {
+    fn empty(scope: &str, signal: &str) -> Self {
+        Self {
+            scope: scope.to_string(),
+            signal: signal.to_string(),
+            seq: 0,
+            requested_at_us: 0,
+            requested_by: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SignalEvent {
+    pub offset: u64,
+    pub seq: u64,
+    pub requested_at_us: u64,
+    pub requested_by: String,
+}
+
+#[derive(Clone)]
+pub(crate) struct SignalCell {
+    scope: Arc<str>,
+    signal: Arc<str>,
+    handle: StateCellHandle,
+    state_boundary: Arc<dyn StateBoundary>,
+    state: Arc<Mutex<SignalSnapshot>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SignalWatchReply {
+    next_offset: u64,
+    updates: Vec<SignalWatchUpdate>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct SignalWatchUpdate {
+    offset: u64,
+    payload_b64: String,
+}
+
+impl SignalCell {
+    pub(crate) fn from_state_boundary(
+        scope: &str,
+        signal: &str,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> std::io::Result<Self> {
+        let handle = signal_handle(scope, signal);
+        let loaded = match state_boundary.statecell_read(
+            local_state_boundary_bridge(scope),
+            StateCellReadRequest {
+                handle: handle.clone(),
+            },
+        ) {
+            Ok(resp) => {
+                if resp.status != "ok" {
+                    return Err(std::io::Error::other(format!(
+                        "statecell_read failed for signal={signal} scope={scope}: status={}",
+                        resp.status
+                    )));
+                }
+                if resp.payload.is_empty() {
+                    SignalSnapshot::empty(scope, signal)
+                } else {
+                    let decoded: SignalSnapshot =
+                        rmp_serde::from_slice(&resp.payload).map_err(|err| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("decode signal snapshot failed: {err}"),
+                            )
+                        })?;
+                    if decoded.scope != scope || decoded.signal != signal {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "signal snapshot mismatch: expected {signal}@{scope}, got {}@{}",
+                                decoded.signal, decoded.scope
+                            ),
+                        ));
+                    }
+                    decoded
+                }
+            }
+            Err(err) if is_statecell_not_found(&err) => SignalSnapshot::empty(scope, signal),
+            Err(err) => {
+                return Err(std::io::Error::other(format!(
+                    "statecell_read failed for signal={signal} scope={scope}: {err}"
+                )));
+            }
+        };
+        Ok(Self {
+            scope: Arc::<str>::from(scope),
+            signal: Arc::<str>::from(signal),
+            handle,
+            state_boundary,
+            state: Arc::new(Mutex::new(loaded)),
+        })
+    }
+
+    pub(crate) fn current_seq(&self) -> u64 {
+        match self.state.lock() {
+            Ok(state) => state.seq,
+            Err(poisoned) => poisoned.into_inner().seq,
+        }
+    }
+
+    pub(crate) fn emit(&self, requested_by: &str) -> Result<u64, CnxError> {
+        let (payload, seq) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| CnxError::Internal("signal state lock poisoned".into()))?;
+            state.seq = state.seq.wrapping_add(1);
+            state.requested_at_us = now_us();
+            state.requested_by = requested_by.to_string();
+            let payload = rmp_serde::to_vec_named(&*state).map_err(|err| {
+                CnxError::Internal(format!("encode signal snapshot failed: {err}"))
+            })?;
+            (payload, state.seq)
+        };
+        let result = self.state_boundary.statecell_write(
+            local_state_boundary_bridge(&self.scope),
+            StateCellWriteRequest {
+                handle: self.handle.clone(),
+                payload,
+                lease_epoch: Some(seq),
+            },
+        )?;
+        if result.status != "committed" && result.status != "ok" {
+            return Err(CnxError::Internal(format!(
+                "statecell_write returned non-committed status for signal={} scope={}: {}",
+                self.signal, self.scope, result.status
+            )));
+        }
+        Ok(seq)
+    }
+
+    pub(crate) fn watch_since(
+        &self,
+        from_offset: u64,
+    ) -> Result<(u64, Vec<SignalEvent>), CnxError> {
+        let response = match self.state_boundary.statecell_watch(
+            local_state_boundary_bridge(&self.scope),
+            StateCellWatchRequest {
+                handle: self.handle.clone(),
+                from_offset: Some(from_offset),
+            },
+        ) {
+            Ok(response) => response,
+            Err(err) if is_statecell_not_found(&err) => return Ok((from_offset, Vec::new())),
+            Err(err) => return Err(err),
+        };
+        if response.status != "ok" {
+            return Err(CnxError::Internal(format!(
+                "statecell_watch failed for signal={} scope={}: {}",
+                self.signal, self.scope, response.status
+            )));
+        }
+        let payload: SignalWatchReply =
+            serde_json::from_slice(&response.payload).map_err(|err| {
+                CnxError::Internal(format!("decode signal watch payload failed: {err}"))
+            })?;
+        let mut events = Vec::with_capacity(payload.updates.len());
+        for update in payload.updates {
+            let raw = B64.decode(update.payload_b64).map_err(|err| {
+                CnxError::Internal(format!("decode signal watch payload base64 failed: {err}"))
+            })?;
+            let snapshot: SignalSnapshot = rmp_serde::from_slice(&raw).map_err(|err| {
+                CnxError::Internal(format!("decode signal watch snapshot failed: {err}"))
+            })?;
+            if snapshot.scope != self.scope.as_ref() || snapshot.signal != self.signal.as_ref() {
+                continue;
+            }
+            events.push(SignalEvent {
+                offset: update.offset,
+                seq: snapshot.seq,
+                requested_at_us: snapshot.requested_at_us,
+                requested_by: snapshot.requested_by,
+            });
+        }
+        Ok((payload.next_offset, events))
+    }
 }
 
 impl AuthorityJournal {

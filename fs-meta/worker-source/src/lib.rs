@@ -154,12 +154,8 @@ fn process_worker_request(
                     );
                 };
                 eprintln!("fs_meta_source_worker: materializing runtime on Start");
-                match FSMetaSource::with_boundaries_and_state(
-                    config,
-                    node_id,
-                    None,
-                    state_boundary,
-                ) {
+                match FSMetaSource::with_boundaries_and_state(config, node_id, None, state_boundary)
+                {
                     Ok(inner) => {
                         state.source = Some(Arc::new(inner));
                         eprintln!("fs_meta_source_worker: Start runtime materialized");
@@ -181,6 +177,10 @@ fn process_worker_request(
                 };
                 if let Err(err) = source.start_runtime_endpoints(boundary.clone()) {
                     eprintln!("fs_meta_source_worker: Start runtime endpoints failed: {err}");
+                    return (SourceWorkerResponse::Error(err.to_string()), false);
+                }
+                if let Err(err) = block_on_runtime(runtime, source.start_manual_rescan_watch()) {
+                    eprintln!("fs_meta_source_worker: Start manual rescan watch failed: {err}");
                     return (SourceWorkerResponse::Error(err.to_string()), false);
                 }
                 eprintln!("fs_meta_source_worker: acquiring source stream before Ack");
@@ -346,6 +346,16 @@ fn process_worker_request(
                 ),
             }
         }
+        SourceWorkerRequest::PublishManualRescanSignal => match state.source.as_ref() {
+            Some(source) => match source.publish_manual_rescan_signal() {
+                Ok(()) => (SourceWorkerResponse::Ack, false),
+                Err(err) => (classify_source_worker_error(err), false),
+            },
+            None => (
+                SourceWorkerResponse::Error("source worker not initialized".into()),
+                false,
+            ),
+        },
         SourceWorkerRequest::TriggerRescanWhenReady => match state.source.as_ref() {
             Some(source) => {
                 eprintln!("fs_meta_source_worker: received TriggerRescanWhenReady");

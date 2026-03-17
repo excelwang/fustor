@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use axum::{
     Json,
@@ -8,13 +7,12 @@ use axum::{
     http::{HeaderMap, header},
 };
 use bytes::Bytes;
-use capanix_host_adapter_fs_meta::HostAdapter;
+use capanix_app_sdk::Event;
+use capanix_app_sdk::raw::{BoundaryContext, ChannelKey, ChannelSendRequest};
+use capanix_app_sdk::runtime::EventMetadata;
 
 use crate::query::api::refresh_policy_from_host_object_grants;
-use crate::runtime::routes::{
-    METHOD_SOURCE_RESCAN, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-};
-use crate::runtime::seam::exchange_host_adapter;
+use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use crate::workers::source::SourceObservabilitySnapshot;
 
@@ -232,23 +230,28 @@ pub async fn rescan(
     headers: HeaderMap,
 ) -> Result<Json<RescanResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
-    if state.source.is_worker() {
-        state.source.trigger_rescan_when_ready().await?;
-    } else if let Some(boundary) = state.runtime_boundary.as_ref() {
-        let adapter = exchange_host_adapter(
-            boundary.clone(),
-            state.node_id.clone(),
-            default_route_bindings(),
-        );
-        adapter
-            .call_collect(
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SOURCE_RESCAN,
-                Bytes::new(),
-                Duration::from_secs(10),
-                Duration::from_millis(250),
+    if let Some(boundary) = state.runtime_boundary.as_ref() {
+        boundary
+            .channel_send(
+                BoundaryContext::default(),
+                ChannelSendRequest {
+                    channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
+                    events: vec![Event::new(
+                        EventMetadata {
+                            origin_id: state.node_id.clone(),
+                            timestamp_us: 0,
+                            logical_ts: None,
+                            correlation_id: None,
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        Bytes::new(),
+                    )],
+                },
             )
-            .map_err(|err| ApiError::internal(format!("manual rescan route call failed: {err}")))?;
+            .map_err(|err| {
+                ApiError::internal(format!("manual rescan control stream send failed: {err}"))
+            })?;
     } else {
         state.source.trigger_rescan_when_ready().await?;
     }

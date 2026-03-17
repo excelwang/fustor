@@ -11,8 +11,8 @@ pub(crate) mod query;
 pub(crate) mod tree;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -1275,7 +1275,8 @@ impl SinkFileMeta {
         let _ = std::thread::Builder::new()
             .name("fs-meta-sink-runtime-refresh".to_string())
             .spawn(move || {
-                crate::runtime_app::shared_tokio_runtime().block_on(sink.runtime_group_refresh_loop());
+                crate::runtime_app::shared_tokio_runtime()
+                    .block_on(sink.runtime_group_refresh_loop());
             });
     }
 

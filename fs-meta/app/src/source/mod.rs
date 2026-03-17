@@ -50,8 +50,8 @@ use crate::runtime::orchestration::{
     SourceControlSignal, SourceRuntimeUnit, source_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
-    METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-    source_rescan_route_key_for,
+    METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_RESCAN_CONTROL,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, source_rescan_route_key_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
@@ -59,7 +59,7 @@ use crate::source::drift::DriftEstimator;
 use crate::source::scanner::ParallelScanner;
 use crate::source::sentinel::{HealthSignal, Sentinel, SentinelAction, SentinelConfig};
 use crate::source::watcher::WatchManager;
-use crate::state::cell::AuthorityJournal;
+use crate::state::cell::{AuthorityJournal, SignalCell};
 use crate::state::commit_boundary::CommitBoundary;
 
 #[cfg(test)]
@@ -77,6 +77,8 @@ const EPOCH0_SCAN_DELAY_DEFAULT_MS: u64 = 10_000;
 const EPOCH0_SCAN_DELAY_MAX_MS: u64 = 300_000;
 const RESCAN_READY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const RESCAN_READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const MANUAL_RESCAN_SIGNAL_NAME: &str = "manual_rescan";
+const MANUAL_RESCAN_WATCH_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 fn epoch0_scan_delay_ms_from_raw(raw: Option<&str>, default_ms: u64) -> u64 {
     raw.and_then(|value| value.trim().parse::<u64>().ok())
@@ -312,6 +314,10 @@ pub struct FSMetaSource {
     shutdown: CancellationToken,
     /// Source runtime mutable-state carrier boundary.
     state_cell: SourceStateCell,
+    /// Cluster-wide manual-rescan request carrier.
+    manual_rescan_signal: SignalCell,
+    /// Background watcher that fans cluster manual-rescan requests into local primary roots.
+    manual_rescan_watch_task: Arc<Mutex<Option<JoinHandle<()>>>>,
     /// Monotonic runtime host-object-grants version guard.
     host_object_grants_version: Arc<AtomicU64>,
     /// Runtime control gating snapshot keyed by unit id.
@@ -1499,10 +1505,19 @@ impl FSMetaSource {
         let logical_root_fanout =
             Self::compute_logical_root_fanout(&root_specs, &initial_host_object_grants);
         let fanout_health = Arc::new(Mutex::new(FanoutHealthState::default()));
-        let authority = AuthorityJournal::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, state_boundary)
-            .map_err(|err| {
+        let authority =
+            AuthorityJournal::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, state_boundary.clone())
+                .map_err(|err| {
                 CnxError::InvalidInput(format!("source statecell authority init failed: {err}"))
             })?;
+        let manual_rescan_signal = SignalCell::from_state_boundary(
+            SOURCE_RUNTIME_UNIT_ID,
+            MANUAL_RESCAN_SIGNAL_NAME,
+            state_boundary,
+        )
+        .map_err(|err| {
+            CnxError::InvalidInput(format!("source manual-rescan signal init failed: {err}"))
+        })?;
         let commit_boundary = CommitBoundary::new(authority);
         Self::set_logical_root_health(
             &fanout_health,
@@ -1535,6 +1550,8 @@ impl FSMetaSource {
                 fanout_health,
                 commit_boundary,
             ),
+            manual_rescan_signal,
+            manual_rescan_watch_task: Arc::new(Mutex::new(None)),
             host_object_grants_version: Arc::new(AtomicU64::new(0)),
             unit_control,
             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -1923,14 +1940,179 @@ impl FSMetaSource {
         if !lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints").is_empty() {
             return Ok(());
         }
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| handle.block_on(self.start_manual_rescan_watch()))?;
+        }
 
+        let roots_cloned = self.state_cell.roots_handle();
         let rescan_roots = self.state_cell.roots_handle();
         let rescan_fanout_health = self.state_cell.fanout_health_handle();
+        let drift_cloned = self.drift_estimator.clone();
+        let clock_cloned = self.logical_clock.clone();
+        let node_id_cloned = self.node_id.clone();
         let node_id_rescan = self.node_id.clone();
         let node_id_rescan_scoped = self.node_id.clone();
         let rescan_roots_scoped = rescan_roots.clone();
         let rescan_fanout_health_scoped = rescan_fanout_health.clone();
         let routes = default_route_bindings();
+
+        match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
+            Ok(route) => {
+                log::info!(
+                    "bound route listening on {}.{} for deferred source {}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_FIND,
+                    node_id_cloned.0
+                );
+                let endpoint_task = ManagedEndpointTask::spawn(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "source:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND
+                    ),
+                    self.shutdown.clone(),
+                    move |requests| {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            if let Ok(params) =
+                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            {
+                                if params.transport != QueryTransport::ForceFind {
+                                    log::warn!(
+                                        "boundary endpoint rejected non-force-find transport"
+                                    );
+                                    responses.push(build_error_marker_event(
+                                        &node_id_cloned,
+                                        req.metadata().correlation_id,
+                                        "force-find source invalid request transport",
+                                    ));
+                                    continue;
+                                }
+                                log::info!(
+                                    "Executing live scan for on-demand-force-find: path={:?}, recursive={}",
+                                    params.scope.path,
+                                    params.scope.recursive
+                                );
+                                let mut all_events = Vec::new();
+                                let mut object_to_group = HashMap::<String, String>::new();
+                                let roots_snapshot =
+                                    lock_or_recover(&roots_cloned, "source.endpoint.roots").clone();
+                                for root in roots_snapshot.iter() {
+                                    if let Some(selected_group) = &params.scope.selected_group
+                                        && selected_group != &root.logical_root_id
+                                    {
+                                        continue;
+                                    }
+                                    object_to_group.insert(
+                                        root.object_ref.clone(),
+                                        root.logical_root_id.clone(),
+                                    );
+                                    if !root.active {
+                                        if params.scope.selected_group.as_deref()
+                                            == Some(root.logical_root_id.as_str())
+                                        {
+                                            responses.push(build_error_marker_event(
+                                                &NodeId(root.logical_root_id.clone()),
+                                                req.metadata().correlation_id,
+                                                "force-find source target group is inactive",
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    let logical_fallback =
+                                        !target_matches_any_object_monitor_prefix(
+                                            &params.scope.path,
+                                            &roots_snapshot,
+                                        );
+                                    let path_for_root = map_target_path_to_root(
+                                        &params.scope.path,
+                                        &root.monitor_path,
+                                        logical_fallback,
+                                    );
+                                    let Some(path_for_root) = path_for_root else {
+                                        continue;
+                                    };
+                                    match root.scanner.scan_targeted(
+                                        &path_for_root,
+                                        params.scope.recursive,
+                                        params.scope.max_depth,
+                                        &drift_cloned,
+                                        &clock_cloned,
+                                    ) {
+                                        Ok(mut events) => all_events.append(&mut events),
+                                        Err(e) => {
+                                            log::error!(
+                                                "live scan failed for object {}: {:?}",
+                                                root.object_ref,
+                                                e
+                                            );
+                                            all_events.push(build_error_marker_event(
+                                                &NodeId(root.object_ref.clone()),
+                                                req.metadata().correlation_id,
+                                                "force-find source scan failed",
+                                            ));
+                                        }
+                                    }
+                                }
+                                match encode_force_find_grouped_events(
+                                    &all_events,
+                                    &params.scope.path,
+                                    params.scope.recursive,
+                                    params.scope.max_depth,
+                                    params.op,
+                                    &object_to_group,
+                                ) {
+                                    Ok(grouped_events) => {
+                                        for event in grouped_events {
+                                            let mut meta = event.metadata().clone();
+                                            meta.correlation_id = req.metadata().correlation_id;
+                                            responses.push(Event::new(
+                                                meta,
+                                                bytes::Bytes::copy_from_slice(
+                                                    event.payload_bytes(),
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        log::error!(
+                                            "boundary endpoint failed to encode grouped force-find response: {:?}",
+                                            err
+                                        );
+                                        responses.push(build_error_marker_event(
+                                            &node_id_cloned,
+                                            req.metadata().correlation_id,
+                                            "force-find source response encoding failed",
+                                        ));
+                                    }
+                                }
+                            } else {
+                                log::warn!(
+                                    "boundary endpoint failed to parse InternalQueryRequest"
+                                );
+                                responses.push(build_error_marker_event(
+                                    &node_id_cloned,
+                                    req.metadata().correlation_id,
+                                    "force-find source invalid request payload",
+                                ));
+                            }
+                        }
+                        responses
+                    },
+                );
+                lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints.tasks")
+                    .push(endpoint_task);
+            }
+            Err(err) => {
+                log::error!(
+                    "failed to resolve deferred source bound route {}.{}: {:?}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_FIND,
+                    err
+                );
+            }
+        }
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
             Ok(route) => {
@@ -2022,6 +2204,88 @@ impl FSMetaSource {
                     "failed to resolve deferred source bound route {}.{}: {:?}",
                     ROUTE_TOKEN_FS_META_INTERNAL,
                     METHOD_SOURCE_RESCAN,
+                    err
+                );
+            }
+        }
+
+        match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN_CONTROL) {
+            Ok(route) => {
+                log::info!(
+                    "bound stream listening on {}.{} for deferred source {}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_RESCAN_CONTROL,
+                    self.node_id.0
+                );
+                let control_roots = self.state_cell.roots_handle();
+                let control_fanout_health = self.state_cell.fanout_health_handle();
+                let control_node_id = self.node_id.clone();
+                let endpoint_task = ManagedEndpointTask::spawn_stream(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "source:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN_CONTROL
+                    ),
+                    self.shutdown.clone(),
+                    move || true,
+                    move |_events| {
+                        eprintln!(
+                            "fs_meta_source: source.rescan control stream received node={}",
+                            control_node_id.0
+                        );
+                        let expected = lock_or_recover(
+                            &control_roots,
+                            "source.rescan.control_stream.roots.expected",
+                        )
+                        .iter()
+                        .filter(|root| root.is_group_primary && root.spec.scan)
+                        .map(FSMetaSource::root_runtime_key)
+                        .collect::<Vec<_>>();
+                        if !expected.is_empty() {
+                            let deadline = std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
+                            loop {
+                                let ready = {
+                                    let health = lock_or_recover(
+                                        &control_fanout_health,
+                                        "source.rescan.control_stream.health",
+                                    );
+                                    expected.iter().all(|root_key| {
+                                        health
+                                            .object_ref
+                                            .get(root_key)
+                                            .is_some_and(|status| status == "running")
+                                    })
+                                };
+                                if ready || std::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                std::thread::sleep(RESCAN_READY_POLL_INTERVAL);
+                            }
+                        }
+                        let roots_snapshot = lock_or_recover(
+                            &control_roots,
+                            "source.rescan.control_stream.roots.trigger",
+                        )
+                        .clone();
+                        FSMetaSource::request_rescan_on_primary_roots(
+                            &roots_snapshot,
+                            Some(&control_fanout_health),
+                            "manual",
+                        );
+                    },
+                );
+                lock_or_recover(
+                    &self.endpoint_tasks,
+                    "source.start_runtime_endpoints.control_stream_tasks",
+                )
+                .push(endpoint_task);
+            }
+            Err(err) => {
+                log::error!(
+                    "failed to resolve deferred source stream route {}.{}: {:?}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_RESCAN_CONTROL,
                     err
                 );
             }
@@ -2281,12 +2545,67 @@ impl FSMetaSource {
     }
 
     pub fn source_primary_by_group_snapshot(&self) -> BTreeMap<String, String> {
-        let roots = lock_or_recover(&self.state_cell.roots, "source.source_primary.snapshot");
-        roots
-            .iter()
-            .filter(|root| root.is_group_primary)
-            .map(|root| (root.logical_root_id.clone(), root.object_ref.clone()))
-            .collect()
+        Self::compute_group_primary_by_logical_root(
+            &self.logical_roots_snapshot(),
+            &self.host_object_grants_snapshot(),
+            None,
+        )
+        .into_iter()
+        .collect()
+    }
+
+    pub fn publish_manual_rescan_signal(&self) -> Result<()> {
+        self.manual_rescan_signal
+            .emit(&self.node_id.0)
+            .map(|_| ())
+            .map_err(|err| {
+                CnxError::Internal(format!("publish manual rescan signal failed: {err}"))
+            })
+    }
+
+    pub async fn start_manual_rescan_watch(&self) -> Result<()> {
+        let mut task_slot = lock_or_recover(
+            &self.manual_rescan_watch_task,
+            "source.manual_rescan_watch.start",
+        );
+        if task_slot.as_ref().is_some_and(|task| !task.is_finished()) {
+            return Ok(());
+        }
+
+        let source = self.clone();
+        let shutdown = self.shutdown.clone();
+        let initial_seq = self.manual_rescan_signal.current_seq();
+        *task_slot = Some(tokio::spawn(async move {
+            let mut offset = 0_u64;
+            let mut last_seq = initial_seq;
+            loop {
+                match source.manual_rescan_signal.watch_since(offset) {
+                    Ok((next_offset, updates)) => {
+                        offset = next_offset;
+                        for update in updates {
+                            if update.seq <= last_seq {
+                                continue;
+                            }
+                            last_seq = update.seq;
+                            eprintln!(
+                                "fs_meta_source: observed cluster manual rescan signal seq={} requested_by={}",
+                                update.seq, update.requested_by
+                            );
+                            source.trigger_rescan_when_ready().await;
+                        }
+                    }
+                    Err(err) => {
+                        log::warn!("source manual rescan watch failed: {err}");
+                    }
+                }
+
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(MANUAL_RESCAN_WATCH_POLL_INTERVAL) => {}
+                }
+            }
+        }));
+        Ok(())
     }
 
     pub fn force_find_inflight_groups_snapshot(&self) -> Vec<String> {
@@ -2925,6 +3244,7 @@ impl FSMetaSource {
                 "fs-meta realtime watch requires linux host".into(),
             ));
         }
+        self.start_manual_rescan_watch().await?;
         let (out_tx, mut out_rx) = mpsc::channel::<Vec<Event>>(512);
         *lock_or_recover(&self.state_cell.stream_tx, "source.pub.stream_tx") = Some(out_tx.clone());
         *lock_or_recover(&self.state, "source.pub.state") = LifecycleState::Scanning;
@@ -3513,6 +3833,14 @@ impl RuntimeBoundaryApp for FSMetaSource {
         for task in &mut endpoint_tasks {
             task.shutdown(Duration::from_secs(2)).await;
         }
+        if let Some(task) = lock_or_recover(
+            &self.manual_rescan_watch_task,
+            "source.close.manual_rescan_watch",
+        )
+        .take()
+        {
+            task.abort();
+        }
         *lock_or_recover(&self.state, "source.close.state") = LifecycleState::Closed;
         Ok(())
     }
@@ -4090,6 +4418,40 @@ mod tests {
             non_primary_rx.expect("non-primary receiver").try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
         ));
+    }
+
+    #[test]
+    fn source_primary_snapshot_reports_cluster_primary_assignment() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+        cfg.host_object_grants = vec![
+            test_export("node-a::exp1", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+            test_export("node-z::exp2", "node-z", "10.0.0.12", "/mnt/nfs1", true),
+        ];
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-z".to_string()), None)
+            .expect("init source");
+
+        let local_roots = lock_or_recover(
+            &source.state_cell.roots,
+            "test.source_primary_snapshot.local_roots",
+        )
+        .clone();
+        assert_eq!(
+            local_roots.len(),
+            1,
+            "local node should only materialize local member"
+        );
+        assert!(
+            !local_roots[0].is_group_primary,
+            "local member is not the lexical cluster primary in this setup"
+        );
+
+        let snapshot = source.source_primary_by_group_snapshot();
+        assert_eq!(
+            snapshot.get("nfs1").map(String::as_str),
+            Some("node-a::exp1"),
+            "snapshot must report authoritative cluster primary, not local-only primary state"
+        );
     }
 
     #[tokio::test]

@@ -258,6 +258,10 @@ impl SourceWorkerClientHandle {
         self.with_started_retry(|client| client.force_find(params.clone()))
     }
 
+    pub fn publish_manual_rescan_signal(&self) -> Result<()> {
+        self.with_started_retry(|client| client.publish_manual_rescan_signal())
+    }
+
     pub fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
         self.start()?;
         self.client()?.on_control_frame(envelopes)
@@ -493,6 +497,13 @@ impl SourceFacade {
         match self {
             Self::Local(source) => source.force_find(params),
             Self::Worker(client) => client.force_find(params.clone()),
+        }
+    }
+
+    pub fn publish_manual_rescan_signal(&self) -> Result<()> {
+        match self {
+            Self::Local(source) => source.publish_manual_rescan_signal(),
+            Self::Worker(client) => client.publish_manual_rescan_signal(),
         }
     }
 
@@ -1169,6 +1180,15 @@ impl SourceWorkerClient {
             result.as_ref().map(|_| ()).map_err(|err| err.to_string())
         );
         result
+    }
+
+    pub fn publish_manual_rescan_signal(&self) -> Result<()> {
+        self.conn.control_frames(
+            &[source_worker_bootstrap_frame(
+                &SourceWorkerRequest::PublishManualRescanSignal,
+            )?],
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )
     }
 
     pub fn close(&self) -> Result<()> {

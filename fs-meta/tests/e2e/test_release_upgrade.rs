@@ -158,7 +158,11 @@ pub fn run() -> Result<(), String> {
         ));
     }
 
-    let (stop, worker) = spawn_light_polling(base_url, session.token().to_string());
+    let (stop, worker) = spawn_light_polling(
+        base_url,
+        session.token().to_string(),
+        session.query_api_key().to_string(),
+    );
     let steady_cpu = measure_steady_cpu(&cluster, &app_id)?;
     let summary = measure_cpu_budget(
         &baseline_cpu,
@@ -211,7 +215,11 @@ fn measure_steady_cpu(
     Ok(by_node)
 }
 
-fn spawn_light_polling(base_url: String, token: String) -> (Arc<AtomicBool>, JoinHandle<()>) {
+fn spawn_light_polling(
+    base_url: String,
+    management_token: String,
+    query_api_key: String,
+) -> (Arc<AtomicBool>, JoinHandle<()>) {
     let stop = Arc::new(AtomicBool::new(false));
     let stop_clone = Arc::clone(&stop);
     let handle = thread::spawn(move || {
@@ -219,13 +227,13 @@ fn spawn_light_polling(base_url: String, token: String) -> (Arc<AtomicBool>, Joi
             return;
         };
         while !stop_clone.load(Ordering::Relaxed) {
-            let _ = client.status(&token);
+            let _ = client.status(&management_token);
             let _ = client.tree(
-                &token,
+                &query_api_key,
                 &[("path", "/".to_string()), ("recursive", "true".to_string())],
             );
             let _ = client.stats(
-                &token,
+                &query_api_key,
                 &[("path", "/".to_string()), ("recursive", "true".to_string())],
             );
             thread::sleep(Duration::from_secs(5));
