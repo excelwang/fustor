@@ -61,6 +61,15 @@ impl UnitControlGate {
             None => true,
         }
     }
+
+    fn sync_active_scopes(&mut self, unit_id: &str, bound_scopes: &[BoundScope]) {
+        let Some(state) = self.units.get_mut(unit_id) else {
+            return;
+        };
+        for route in state.routes.values_mut().filter(|route| route.active) {
+            route.bound_scopes = bound_scopes.to_vec();
+        }
+    }
 }
 
 /// Shared runtime unit control gate for fs-meta modules.
@@ -156,6 +165,20 @@ impl RuntimeUnitGate {
             .lock()
             .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
         Ok(gate.accepts_tick(unit_id, route_key, generation))
+    }
+
+    pub(crate) fn sync_active_scopes(
+        &self,
+        unit_id: &str,
+        bound_scopes: &[BoundScope],
+    ) -> Result<()> {
+        self.validate_runtime_unit(unit_id)?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
+        gate.sync_active_scopes(unit_id, bound_scopes);
+        Ok(())
     }
 
     pub(crate) fn has_runtime_state(&self) -> bool {

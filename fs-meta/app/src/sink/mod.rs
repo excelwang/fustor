@@ -449,10 +449,24 @@ impl SinkFileMeta {
         state_boundary: Arc<dyn StateBoundary>,
         source_cfg: SourceConfig,
     ) -> Result<Self> {
-        let authority = AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
-            .map_err(|err| {
-                CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
-            })?;
+        Self::with_boundaries_and_state_inner(node_id, boundary, state_boundary, source_cfg, false)
+    }
+
+    fn with_boundaries_and_state_inner(
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        state_boundary: Arc<dyn StateBoundary>,
+        source_cfg: SourceConfig,
+        defer_authority_read: bool,
+    ) -> Result<Self> {
+        let authority = if defer_authority_read {
+            AuthorityJournal::deferred_from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
+        } else {
+            AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
+        }
+        .map_err(|err| {
+            CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
+        })?;
         let state = SinkStateCell::new(&source_cfg, CommitBoundary::new(authority));
         let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
         let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
@@ -742,10 +756,11 @@ impl SinkFileMeta {
         state_boundary: Arc<dyn StateBoundary>,
         source_cfg: SourceConfig,
     ) -> Result<Self> {
-        let authority = AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
-            .map_err(|err| {
-                CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
-            })?;
+        let authority =
+            AuthorityJournal::deferred_from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
+                .map_err(|err| {
+                    CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
+                })?;
         let state = SinkStateCell::new(&source_cfg, CommitBoundary::new(authority));
         let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
         let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
@@ -1261,6 +1276,15 @@ impl SinkFileMeta {
     ) -> Result<()> {
         let root_count = roots.len();
         let grant_count = host_object_grants.len();
+        let bound_scopes = roots
+            .iter()
+            .map(|root| capanix_route_proto::BoundScope {
+                scope_id: root.id.clone(),
+                resource_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        self.unit_control
+            .sync_active_scopes(SINK_RUNTIME_UNIT_ID, &bound_scopes)?;
         let mut root_specs = self
             .root_specs
             .write()

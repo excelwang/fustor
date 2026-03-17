@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
 
+use capanix_app_fs_meta::query::request::{InternalQueryRequest, QueryOp, QueryScope};
 use capanix_app_fs_meta::{FSMetaApp, FSMetaConfig};
 use capanix_app_sdk::RuntimeBoundaryApp;
 use capanix_app_sdk::runtime::{ConfigValue, NodeId};
@@ -317,6 +318,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = FSMetaApp::new(config, NodeId(node_id.clone()))?;
     app.start().await?;
+    let worker_scopes = roots_env
+        .iter()
+        .map(|root| BoundScope {
+            scope_id: root.id.clone(),
+            resource_ids: Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    let source_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
+        route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+        worker_id: "runtime.exec.source".to_string(),
+        lease: None,
+        generation: 1,
+        expires_at_ms: 60_000,
+        bound_scopes: worker_scopes.clone(),
+    }))
+    .map_err(|e| format!("encode source activate envelope failed: {e}"))?;
+    let scan_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
+        route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+        worker_id: "runtime.exec.scan".to_string(),
+        lease: None,
+        generation: 1,
+        expires_at_ms: 60_000,
+        bound_scopes: worker_scopes.clone(),
+    }))
+    .map_err(|e| format!("encode scan activate envelope failed: {e}"))?;
+    let sink_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
+        route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+        worker_id: "runtime.exec.sink".to_string(),
+        lease: None,
+        generation: 1,
+        expires_at_ms: 60_000,
+        bound_scopes: worker_scopes.clone(),
+    }))
+    .map_err(|e| format!("encode sink activate envelope failed: {e}"))?;
     let facade_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
         route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
         worker_id: "runtime.exec.facade".to_string(),
@@ -329,7 +364,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }],
     }))
     .map_err(|e| format!("encode facade activate envelope failed: {e}"))?;
-    app.on_control_frame(&[facade_activate]).await?;
+    app.on_control_frame(&[
+        source_activate,
+        scan_activate,
+        sink_activate,
+        facade_activate,
+    ])
+    .await?;
+    wait_for_fixture_query_ready(&app).await?;
     println!("FS_META_API_FIXTURE_READY {bind_addr}");
 
     wait_for_shutdown().await;
@@ -351,5 +393,56 @@ async fn wait_for_shutdown() {
     #[cfg(not(unix))]
     {
         let _ = tokio::signal::ctrl_c().await;
+    }
+}
+
+async fn wait_for_fixture_query_ready(app: &FSMetaApp) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let request = InternalQueryRequest::materialized(
+        QueryOp::Tree,
+        QueryScope {
+            path: b"/".to_vec(),
+            recursive: false,
+            max_depth: Some(0),
+            selected_group: None,
+        },
+        None,
+    );
+    let mut iteration = 0u64;
+    loop {
+        iteration += 1;
+        let source_ready = app
+            .source_status_snapshot()
+            .map(|status| !status.concrete_roots.is_empty())
+            .unwrap_or(false);
+        let sink_ready = app
+            .sink_status_snapshot()
+            .map(|status| {
+                !status.groups.is_empty()
+                    && status.live_nodes > 0
+                    && status
+                        .groups
+                        .iter()
+                        .all(|group| group.initial_audit_completed)
+            })
+            .unwrap_or(false);
+        let query_ready = match app.query_tree(&request).await {
+            Ok(groups) => !groups.is_empty(),
+            Err(capanix_app_sdk::CnxError::NotReady(_)) => false,
+            Err(err) => {
+                eprintln!("fs_meta_api_fixture: waiting for initial query readiness: {err}");
+                false
+            }
+        };
+        if iteration % 10 == 0 && source_ready && !sink_ready {
+            let _ = app.trigger_rescan_when_ready().await;
+        }
+        if source_ready && sink_ready && query_ready {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Box::new(std::io::Error::other("Timeout")));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }

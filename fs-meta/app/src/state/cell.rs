@@ -78,6 +78,18 @@ pub(crate) struct AuthorityJournal {
 }
 
 impl AuthorityJournal {
+    pub(crate) fn deferred_from_state_boundary(
+        scope: &str,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            scope: Arc::<str>::from(scope),
+            handle: authority_handle(scope),
+            state_boundary,
+            state: Arc::new(Mutex::new(AuthoritySnapshot::empty(scope))),
+        })
+    }
+
     pub(crate) fn from_state_boundary(
         scope: &str,
         state_boundary: Arc<dyn StateBoundary>,

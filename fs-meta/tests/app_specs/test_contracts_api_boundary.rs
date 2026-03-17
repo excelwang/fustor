@@ -64,18 +64,73 @@ fn create_query_api_key(base: &str, management_token: &str, label: &str) -> (Str
     (api_key, key_id)
 }
 
-fn wait_for_group_keys(
+fn status_sink_group_ids(resp: &HttpResponse) -> BTreeSet<String> {
+    resp.json
+        .as_ref()
+        .and_then(|value| value.get("sink"))
+        .and_then(|value| value.get("groups"))
+        .and_then(|value| value.as_array())
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(|group| group.get("group_id").and_then(|value| value.as_str()))
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn status_sink_groups_ready(resp: &HttpResponse, expected: Option<&BTreeSet<String>>) -> bool {
+    if resp.status != 200 {
+        return false;
+    }
+    let Some(groups) = resp
+        .json
+        .as_ref()
+        .and_then(|value| value.get("sink"))
+        .and_then(|value| value.get("groups"))
+        .and_then(|value| value.as_array())
+    else {
+        return false;
+    };
+    if groups.is_empty() {
+        return false;
+    }
+    if let Some(expected) = expected {
+        let keys: BTreeSet<String> = groups
+            .iter()
+            .filter_map(|group| group.get("group_id").and_then(|value| value.as_str()))
+            .map(ToString::to_string)
+            .collect();
+        if &keys != expected {
+            return false;
+        }
+    }
+    groups.iter().all(|group| {
+        group
+            .get("initial_audit_completed")
+            .and_then(|value| value.as_bool())
+            == Some(true)
+    })
+}
+
+fn wait_for_status_sink_groups(
     base: &str,
-    token: &str,
-    path: &str,
-    expected: &BTreeSet<String>,
+    admin_token: &str,
+    expected: Option<&BTreeSet<String>>,
 ) -> HttpResponse {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut last = None;
     while Instant::now() < deadline {
-        let resp = http_json(base, "GET", path, Some(token), None).expect("query endpoint");
-        let keys = response_group_keys(&resp);
-        if &keys == expected {
+        let resp = http_json(
+            base,
+            "GET",
+            "/api/fs-meta/v1/status",
+            Some(admin_token),
+            None,
+        )
+        .expect("status endpoint");
+        if status_sink_groups_ready(&resp, expected) {
             return resp;
         }
         last = Some(resp);
@@ -83,8 +138,9 @@ fn wait_for_group_keys(
     }
     let last = last.expect("at least one response before timeout");
     panic!(
-        "group keys for {path} did not converge; expected={expected:?} got={:?} body={}",
-        response_group_keys(&last),
+        "sink groups did not become ready; expected={expected:?} last_status={} got={:?} body={}",
+        last.status,
+        status_sink_group_ids(&last),
         last.body
     );
 }
@@ -556,6 +612,7 @@ fn blackbox_management_api_contract() {
     .expect("tree with management session");
     assert_eq!(tree_with_management_session.status, 401);
 
+    wait_for_status_sink_groups(base, &admin_token, None);
     let tree_with_query_key = http_json(
         base,
         "GET",
@@ -564,6 +621,11 @@ fn blackbox_management_api_contract() {
         None,
     )
     .expect("tree with query key");
+    assert_eq!(
+        tree_with_query_key.status, 200,
+        "body={}",
+        tree_with_query_key.body
+    );
     assert_eq!(
         tree_with_query_key.status, 200,
         "body={}",
@@ -588,6 +650,11 @@ fn blackbox_management_api_contract() {
         None,
     )
     .expect("stats with query key");
+    assert_eq!(
+        stats_with_query_key.status, 200,
+        "body={}",
+        stats_with_query_key.body
+    );
     assert_eq!(
         stats_with_query_key.status, 200,
         "body={}",
@@ -697,9 +764,13 @@ fn blackbox_group_reconfiguration_updates_query_and_force_find_groups() {
     let initial_groups = BTreeSet::from(["root-a".to_string(), "root-b".to_string()]);
     let tree_query = "/api/fs-meta/v1/tree?path=/";
     let force_find_query = "/api/fs-meta/v1/on-demand-force-find?path=/";
-    let tree_resp = wait_for_group_keys(base, &query_api_key, tree_query, &initial_groups);
+    wait_for_status_sink_groups(base, &admin_token, Some(&initial_groups));
+    let tree_resp = http_json(base, "GET", tree_query, Some(&query_api_key), None)
+        .expect("tree initial groups");
+    assert_eq!(tree_resp.status, 200, "body={}", tree_resp.body);
     assert_eq!(response_group_keys(&tree_resp), initial_groups);
-    let force_resp = wait_for_group_keys(base, &query_api_key, force_find_query, &initial_groups);
+    let force_resp = http_json(base, "GET", force_find_query, Some(&query_api_key), None)
+        .expect("force-find initial groups");
     assert_eq!(response_group_keys(&force_resp), initial_groups);
 
     let split_groups = BTreeSet::from([
@@ -724,9 +795,13 @@ fn blackbox_group_reconfiguration_updates_query_and_force_find_groups() {
     .expect("split roots update");
     assert_eq!(split_update.status, 200, "body={}", split_update.body);
 
-    let tree_resp = wait_for_group_keys(base, &query_api_key, tree_query, &split_groups);
+    wait_for_status_sink_groups(base, &admin_token, Some(&split_groups));
+    let tree_resp =
+        http_json(base, "GET", tree_query, Some(&query_api_key), None).expect("tree split groups");
+    assert_eq!(tree_resp.status, 200, "body={}", tree_resp.body);
     assert_eq!(response_group_keys(&tree_resp), split_groups);
-    let force_resp = wait_for_group_keys(base, &query_api_key, force_find_query, &split_groups);
+    let force_resp = http_json(base, "GET", force_find_query, Some(&query_api_key), None)
+        .expect("force-find split groups");
     assert_eq!(response_group_keys(&force_resp), split_groups);
 
     let removed_groups =
@@ -747,8 +822,12 @@ fn blackbox_group_reconfiguration_updates_query_and_force_find_groups() {
     .expect("remove roots update");
     assert_eq!(remove_update.status, 200, "body={}", remove_update.body);
 
-    let tree_resp = wait_for_group_keys(base, &query_api_key, tree_query, &removed_groups);
+    wait_for_status_sink_groups(base, &admin_token, Some(&removed_groups));
+    let tree_resp = http_json(base, "GET", tree_query, Some(&query_api_key), None)
+        .expect("tree removed groups");
+    assert_eq!(tree_resp.status, 200, "body={}", tree_resp.body);
     assert_eq!(response_group_keys(&tree_resp), removed_groups);
-    let force_resp = wait_for_group_keys(base, &query_api_key, force_find_query, &removed_groups);
+    let force_resp = http_json(base, "GET", force_find_query, Some(&query_api_key), None)
+        .expect("force-find removed groups");
     assert_eq!(response_group_keys(&force_resp), removed_groups);
 }

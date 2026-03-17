@@ -11,4 +11,5 @@ path = "src/lib.rs"
 [dependencies]
 bytes = { workspace = true }
 capanix-app-sdk = { workspace = true }
+capanix-kernel-api = { workspace = true }
 capanix-unit-sidecar = { workspace = true }

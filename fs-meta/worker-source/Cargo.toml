@@ -15,6 +15,7 @@ path = "src/main.rs"
 
 [dependencies]
 capanix-app-fs-meta = { workspace = true }
+capanix-app-fs-meta-runtime-support = { workspace = true }
 capanix-app-sdk = { workspace = true }
 capanix-unit-sidecar = { workspace = true }
 bytes = { workspace = true }

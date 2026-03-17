@@ -1156,10 +1156,16 @@ fn test_runtime_support_transport_supervision_contracts() {
     assert!(l2.contains("MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping"));
     assert!(l3.contains("ExternalWorkerBootstrapTransport"));
     assert!(l3.contains("ExternalWorkerRetryAndErrorClassification"));
+    assert!(l3.contains("direct control-plane startup handshake"));
+    assert!(l3.contains("`Ping` / `Init` / `Start` / `Close` / `OnControlFrame`"));
     assert!(transport.contains("spawn_worker_process("));
-    assert!(transport.contains(".arg(\"--worker-socket\")"));
-    assert!(transport.contains("worker_socket_path"));
+    assert!(transport.contains("on_control_frame("));
+    assert!(transport.contains(".arg(\"--worker-control-socket\")"));
+    assert!(transport.contains(".arg(\"--worker-data-socket\")"));
+    assert!(transport.contains("control_socket_path"));
+    assert!(transport.contains("data_socket_path"));
     assert!(typed_client.contains("effective_rpc_timeout(deadline, rpc_timeout)"));
+    assert!(typed_client.contains("control_frames(&envelopes, attempt_timeout)"));
     assert!(errors.contains("CnxError::Timeout => CnxError::Timeout"));
     assert!(errors.contains("CnxError::TransportClosed"));
 }
@@ -1177,9 +1183,12 @@ fn test_scan_worker_alias_bootstrap_contract() {
     assert!(l2.contains("`scan-worker` is a distinct operator-visible worker role"));
     assert!(l2.contains("dedicated `run_scan_worker_server(...)` entry while still sharing lower-level source-runtime helpers internally"));
     assert!(l3.contains("ScanWorkerAliasBootstrap"));
-    assert!(l3.contains("reuses the `worker-source` server bootstrap"));
-    assert!(scan_lib.contains("run_source_worker_server(worker_socket_path)"));
-    assert!(scan_main.contains("run_scan_worker_server(&socket_path)"));
+    assert!(l3.contains("reuses lower-level source-runtime helpers internally via `run_scan_worker_runtime_loop(...)`"));
+    assert!(scan_lib.contains("run_scan_worker_server("));
+    assert!(scan_lib.contains("run_scan_worker_runtime_loop(boundary, io_boundary, &runtime)"));
+    assert!(scan_main.contains("run_scan_worker_server("));
+    assert!(scan_main.contains("&control_socket_path"));
+    assert!(scan_main.contains("&data_socket_path"));
     assert!(orchestration.contains("SOURCE_SCAN_RUNTIME_UNIT_ID => Some(SourceRuntimeUnit::Scan)"));
     assert!(config.contains("workers.source.mode and workers.scan.mode must match while source-worker and scan-worker still share one realization"));
 }
@@ -1530,19 +1539,15 @@ fn projection_http_runtime_coverage_moved_to_inprocess_projection_api_unit_tests
     let projection_api = read_fs_meta_spec_file("fs-meta/app/src/query/api.rs");
     assert!(projection_api.contains("force_find_group_order_file_count_top_bucket_inprocess"));
     assert!(projection_api.contains("force_find_group_order_file_age_top_bucket_inprocess"));
-    assert!(
-        projection_api
-            .contains("force_find_group_order_file_age_keeps_empty_groups_eligible_inprocess")
-    );
+    assert!(projection_api
+        .contains("force_find_group_order_file_age_keeps_empty_groups_eligible_inprocess"));
     assert!(
         projection_api.contains("force_find_defaults_to_group_key_multi_group_response_inprocess")
     );
     assert!(projection_api.contains("force_find_defaults_when_query_params_omitted_inprocess"));
     assert!(projection_api.contains("projection_rpc_metrics_endpoint_shape_inprocess"));
-    assert!(
-        projection_api
-            .contains("force_find_rejects_status_only_and_keeps_pagination_axis_inprocess")
-    );
+    assert!(projection_api
+        .contains("force_find_rejects_status_only_and_keeps_pagination_axis_inprocess"));
     assert!(projection_api.contains("namespace_projection_endpoints_removed_inprocess"));
 }
 
@@ -1553,30 +1558,23 @@ fn test_single_formal_specs_tree_layout() {
     assert!(!root.join("specs/cli").exists());
     assert!(!root.join("specs/PRODUCT_DEPLOYMENT.md").exists());
     assert!(!root.join("specs/fs-meta-contract-tests.config.md").exists());
-    assert!(
-        !root
-            .join("specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
-            .exists()
-    );
-    assert!(
-        !root
-            .join("specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
-            .exists()
-    );
+    assert!(!root
+        .join("specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
+        .exists());
+    assert!(!root
+        .join("specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
+        .exists());
     assert!(!root.join("specs/fs-meta.release-v2.yaml").exists());
     assert!(root.join("docs/PRODUCT_DEPLOYMENT.md").exists());
     assert!(root.join("docs/examples/fs-meta.yaml").exists());
-    assert!(
-        root.join("testdata/specs/fs-meta-contract-tests.config.md")
-            .exists()
-    );
-    assert!(
-        root.join("testdata/specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
-            .exists()
-    );
-    assert!(
-        root.join("testdata/specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
-            .exists()
-    );
+    assert!(root
+        .join("testdata/specs/fs-meta-contract-tests.config.md")
+        .exists());
+    assert!(root
+        .join("testdata/specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
+        .exists());
+    assert!(root
+        .join("testdata/specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
+        .exists());
     assert!(root.join("testdata/specs/fs-meta.release-v2.yaml").exists());
 }

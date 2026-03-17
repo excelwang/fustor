@@ -3,22 +3,22 @@
 
 use super::api_client::FsMetaApiClient;
 use super::control_protocol::{
-    AnnouncedResourceExport, ControlEnvelope, CtlRequest, CtlResponse,
-    canonical_ctl_command_value_bytes,
+    canonical_ctl_command_value_bytes, AnnouncedResourceExport, ControlEnvelope, CtlRequest,
+    CtlResponse,
 };
 use super::runtime_admin::{
     canonical_runtime_admin_command_value_bytes, decode_runtime_admin_or_kernel_response_value,
     encode_runtime_admin_request_value,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use capanix_app_fs_meta::{
-    RootSpec,
     api::config::{ApiAuthConfig, BootstrapAdminConfig},
-    product::{FsMetaReleaseSpec, build_release_doc_value},
+    product::{build_release_doc_value, FsMetaReleaseSpec},
+    RootSpec,
 };
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -429,12 +429,10 @@ impl Cluster5 {
         let mut value = build_release_doc_value(&spec);
         value["target_generation"] = json!(generation);
         value["units"][0]["startup"]["path"] = json!(app_path.to_string_lossy().to_string());
-        value["units"][0]["startup"]["manifest"] = json!(
-            repo_root()
-                .join("fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml")
-                .display()
-                .to_string()
-        );
+        value["units"][0]["startup"]["manifest"] = json!(repo_root()
+            .join("fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml")
+            .display()
+            .to_string());
         value["units"][0]["config"]["workers"] = json!({
             "source": {
                 "mode": "external",
@@ -452,7 +450,7 @@ impl Cluster5 {
         value["units"][0]["version"] = json!(format!("real-nfs-{generation}"));
         value["units"][0]["restart_policy"] = json!("Never");
         value["units"][0]["policy"]["generation"] = json!(generation);
-        value["units"][0]["policy"]["replicas"] = json!(self.nodes.len() as i64);
+        value["units"][0]["policy"]["replicas"] = json!(1_i64);
         scope_unit_intent_to_scope_worker_intent(&value)
     }
 
@@ -795,40 +793,40 @@ fn try_find_cnxctl_bin() -> Option<PathBuf> {
         root.join("target/debug/cnxctl"),
         root.join(".target/debug/cnxctl"),
     ];
-    if let Some(found) = candidates.iter().find(|p| p.exists()) {
-        return Some(found.clone());
-    }
-
-    let mut cargo_bins = Vec::<PathBuf>::new();
-    if let Ok(bin) = std::env::var("CARGO") {
-        cargo_bins.push(PathBuf::from(bin));
-    }
-    cargo_bins.push(PathBuf::from("cargo"));
-    if let Ok(home) = std::env::var("HOME") {
-        cargo_bins.push(PathBuf::from(home).join(".cargo/bin/cargo"));
-    }
-
-    static BUILD_OK: OnceLock<bool> = OnceLock::new();
-    if !*BUILD_OK.get_or_init(|| {
-        for cargo_bin in &cargo_bins {
-            let status = Command::new(cargo_bin)
-                .current_dir(&root)
-                .arg("build")
-                .arg("-p")
-                .arg("capanix-cli")
-                .arg("--bin")
-                .arg("cnxctl")
-                .status();
-            let Ok(status) = status else {
-                continue;
-            };
-            if status.success() {
-                return true;
-            }
+    let watch_paths = vec![root.join("Cargo.lock"), root.join("crates")];
+    if let Some(found) = candidates.iter().find(|p| p.exists()).cloned() {
+        if !should_rebuild_binary(&found, &watch_paths) {
+            return Some(found);
         }
-        false
-    }) {
-        return None;
+    }
+
+    for cargo_bin in [
+        std::env::var("CARGO").ok().map(PathBuf::from),
+        Some(PathBuf::from("cargo")),
+        std::env::var("HOME")
+            .ok()
+            .map(|home| PathBuf::from(home).join(".cargo/bin/cargo")),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let status = Command::new(&cargo_bin)
+            .current_dir(&root)
+            .arg("build")
+            .arg("-p")
+            .arg("capanix-cli")
+            .arg("--bin")
+            .arg("cnxctl")
+            .status();
+        let Ok(status) = status else {
+            continue;
+        };
+        if !status.success() {
+            continue;
+        }
+        if let Some(found) = candidates.iter().find(|p| p.exists()) {
+            return Some(found.clone());
+        }
     }
 
     candidates.iter().find(|p| p.exists()).cloned()
@@ -1031,10 +1029,15 @@ fn resolve_fs_meta_worker_bin(kind: &str) -> Option<PathBuf> {
                 root.join("Cargo.lock"),
                 root.join("fs-meta/worker-source/src"),
                 root.join("fs-meta/worker-source/Cargo.toml"),
+                root.join("fs-meta/runtime-support/src"),
+                root.join("fs-meta/runtime-support/Cargo.toml"),
                 root.join("fs-meta/app/src/workers/source.rs"),
                 root.join("fs-meta/app/src/workers/source_ipc.rs"),
                 root.join("fs-meta/app/src/source"),
                 root.join("fs-meta/app/src"),
+                capanix_repo_root().join("Cargo.lock"),
+                capanix_repo_root().join("crates/unit-sidecar/src"),
+                capanix_repo_root().join("crates/unit-sidecar/Cargo.toml"),
             ],
         ),
         "sink" => (
@@ -1044,10 +1047,15 @@ fn resolve_fs_meta_worker_bin(kind: &str) -> Option<PathBuf> {
                 root.join("Cargo.lock"),
                 root.join("fs-meta/worker-sink/src"),
                 root.join("fs-meta/worker-sink/Cargo.toml"),
+                root.join("fs-meta/runtime-support/src"),
+                root.join("fs-meta/runtime-support/Cargo.toml"),
                 root.join("fs-meta/app/src/workers/sink.rs"),
                 root.join("fs-meta/app/src/workers/sink_ipc.rs"),
                 root.join("fs-meta/app/src/sink"),
                 root.join("fs-meta/app/src"),
+                capanix_repo_root().join("Cargo.lock"),
+                capanix_repo_root().join("crates/unit-sidecar/src"),
+                capanix_repo_root().join("crates/unit-sidecar/Cargo.toml"),
             ],
         ),
         _ => return None,

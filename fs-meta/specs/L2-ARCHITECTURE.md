@@ -140,7 +140,7 @@ version: 2.8.0
 13. Ordinary app-facing business/runtime modules default to the `capanix-app-sdk` curated re-export / raw-helper path; production business/runtime paths in the app package do not keep direct `capanix-runtime-api`, `capanix-kernel-api`, or `capanix-unit-sidecar` imports, while explicit test/dev fixtures may still depend on `capanix-runtime-api` for protocol assertions.
 14. The app package consumes `app-sdk`, product-owned `runtime-support`, `host-adapter-fs-meta`, `host-fs-types`, and `route-proto` as upstream authorities/support carriers; `product` remains the bounded product-facing CLI/tooling namespace, while `query`, `product::release_doc`, and `workers` may remain public package-local operational/test support surfaces without becoming product or platform authority.
 15. External-worker realization helpers remain confined to explicit worker runtime seams and low-level support crates; the app package may consume only the bounded typed worker transport/client surface from `runtime-support`, not raw bridge/bootstrap primitives.
-16. The upstream bridge-realization seam is low-level carrier glue only; `fs-meta/runtime-support/` owns worker child-process bootstrap, log/socket ownership, retry clipping, and lifecycle supervision, while worker artifact crates own only their explicit server entry/bootstrap functions.
+16. The upstream bridge-realization seam is low-level carrier glue only; `fs-meta/runtime-support/` owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision, while worker artifact crates own only their explicit server entry/bootstrap functions.
 17. The canonical worker transport contract preserves `Timeout` / `TransportClosed` categories and applies wall-clock total-timeout clipping before retry; transport failures are not flattened into a generic peer-error bucket.
 18. `embedded` workers share the host process; `external` workers run in dedicated worker processes.
 19. Constructor/bootstrap faults surface as typed `CnxError` / `init_error`; runtime task join failures and worker/bootstrap faults are handled as app/task-local errors or explicit degraded behavior rather than routine production `panic!` / `expect!` flow.
@@ -168,7 +168,7 @@ version: 2.8.0
 
 1. `fs-meta/` is the product container only; it is not a Cargo package and owns no code-level business authority.
 2. `fs-meta/app/` is the only product app package; it owns package-local config/types plus API/query/orchestration/business composition and MUST stay `publish = false`.
-3. `fs-meta/runtime-support/` is the only crate that owns worker child-process bootstrap, socket/log path materialization, retry clipping, and low-level external-worker transport supervision for fs-meta.
+3. `fs-meta/runtime-support/` is the only crate that owns worker child-process bootstrap, control/data socket/log path materialization, direct control-plane startup/management, retry clipping, and low-level external-worker transport supervision for fs-meta.
 4. `fs-meta/worker-facade/` owns the embedded `facade-worker` artifact entry and fixture binary surface; it does not own business/query semantics.
 5. `fs-meta/worker-source/` owns the `source-worker` external artifact/runtime entry and `run_source_worker_server(...)` bootstrap.
 6. `fs-meta/worker-sink/` owns the `sink-worker` external artifact/runtime entry and `run_sink_worker_server(...)` bootstrap.

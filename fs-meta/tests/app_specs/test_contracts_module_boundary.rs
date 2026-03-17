@@ -35,11 +35,13 @@ fn read_workspace_manifest() -> String {
 }
 
 fn is_dependency_section(section: &str) -> bool {
-    matches!(section, "dependencies" | "dev-dependencies" | "build-dependencies")
-        || section.starts_with("target.")
-            && (section.ends_with(".dependencies")
-                || section.ends_with(".dev-dependencies")
-                || section.ends_with(".build-dependencies"))
+    matches!(
+        section,
+        "dependencies" | "dev-dependencies" | "build-dependencies"
+    ) || section.starts_with("target.")
+        && (section.ends_with(".dependencies")
+            || section.ends_with(".dev-dependencies")
+            || section.ends_with(".build-dependencies"))
 }
 
 fn manifest_has_dependency(manifest: &str, dep_name: &str) -> bool {
@@ -102,10 +104,22 @@ fn app_sdk_authoring_path_is_primary() {
     ));
     assert!(app_manifest.contains("publish = false"));
     assert!(manifest_has_dependency(&app_manifest, "capanix-app-sdk"));
-    assert!(!manifest_has_dependency(&app_manifest, "capanix-runtime-api"));
-    assert!(!manifest_has_dependency(&app_manifest, "capanix-kernel-api"));
-    assert!(!manifest_has_dependency(&app_manifest, "capanix-unit-sidecar"));
-    assert!(!manifest_has_dependency(&app_manifest, "capanix-unit-entry-macros"));
+    assert!(!manifest_has_dependency(
+        &app_manifest,
+        "capanix-runtime-api"
+    ));
+    assert!(!manifest_has_dependency(
+        &app_manifest,
+        "capanix-kernel-api"
+    ));
+    assert!(!manifest_has_dependency(
+        &app_manifest,
+        "capanix-unit-sidecar"
+    ));
+    assert!(!manifest_has_dependency(
+        &app_manifest,
+        "capanix-unit-entry-macros"
+    ));
     assert!(!manifest_has_dependency(
         &app_manifest,
         "capanix-app-fs-meta-worker-source"

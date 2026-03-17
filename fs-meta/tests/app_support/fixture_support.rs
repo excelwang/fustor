@@ -114,7 +114,7 @@ impl FsMetaApiFixture {
             .spawn()
             .map_err(|e| format!("spawn fixture failed: {e}"))?;
 
-        wait_fixture_ready(&api_base_url, &mut child, &stderr_log)?;
+        wait_fixture_ready(&api_base_url, &mut child, &stdout_log, &stderr_log)?;
 
         Ok(Self {
             child,
@@ -256,42 +256,42 @@ fn latest_mtime_recursive(path: &Path) -> Option<SystemTime> {
 fn wait_fixture_ready(
     api_base_url: &str,
     child: &mut Child,
+    stdout_log: &Path,
     stderr_log: &Path,
 ) -> Result<(), String> {
+    const READY_MARKER: &str = "FS_META_API_FIXTURE_READY";
     let deadline = Instant::now() + Duration::from_secs(60);
     while Instant::now() < deadline {
         if let Some(status) = child
             .try_wait()
             .map_err(|e| format!("poll fixture process failed: {e}"))?
         {
+            let stdout = std::fs::read_to_string(stdout_log).unwrap_or_default();
             let stderr = std::fs::read_to_string(stderr_log).unwrap_or_default();
             return Err(format!(
-                "fixture exited before ready (status={status})\nstderr:\n{stderr}"
+                "fixture exited before ready (status={status})
+stdout:
+{stdout}
+stderr:
+{stderr}"
             ));
         }
-        let probe = http_json(
-            api_base_url,
-            "POST",
-            "/api/fs-meta/v1/session/login",
-            None,
-            Some(&serde_json::json!({
-                "username":"operator",
-                "password":"operator123"
-            })),
-        );
-        if let Ok(resp) = probe {
-            if resp.status == 200 {
-                return Ok(());
-            }
+        let stdout = std::fs::read_to_string(stdout_log).unwrap_or_default();
+        if stdout.lines().any(|line| line.contains(READY_MARKER)) {
+            return Ok(());
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+    let stdout = std::fs::read_to_string(stdout_log).unwrap_or_default();
     let stderr = std::fs::read_to_string(stderr_log).unwrap_or_default();
     Err(format!(
-        "fixture readiness timeout for {api_base_url}\nstderr:\n{stderr}"
+        "fixture readiness timeout for {api_base_url}
+stdout:
+{stdout}
+stderr:
+{stderr}"
     ))
 }
-
 pub fn http_json(
     api_base_url: &str,
     method: &str,

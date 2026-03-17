@@ -37,6 +37,7 @@ pub struct ApiServerHandle {
 
 impl ApiServerHandle {
     pub async fn shutdown(self, timeout: Duration) {
+        eprintln!("fs_meta_api_server: shutdown requested");
         self.shutdown.cancel();
         match tokio::time::timeout(timeout, self.join).await {
             Ok(Ok(())) => {}
@@ -83,6 +84,7 @@ pub async fn spawn(
     );
     let app = router(state)?;
 
+    eprintln!("fs_meta_api_server: binding {}", cfg.bind_addr);
     let listener = tokio::net::TcpListener::bind(&cfg.bind_addr)
         .await
         .map_err(|e| CnxError::InvalidInput(format!("fs-meta api bind failed: {e}")))?;
@@ -90,7 +92,10 @@ pub async fn spawn(
     let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();
 
+    eprintln!("fs_meta_api_server: bound {}", cfg.bind_addr);
+    let bind_addr_for_log = cfg.bind_addr.clone();
     let join = tokio::spawn(async move {
+        eprintln!("fs_meta_api_server: serving {}", bind_addr_for_log);
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
             shutdown_signal.cancelled().await;
         });
@@ -98,6 +103,7 @@ pub async fn spawn(
         if let Err(err) = server.await {
             log::error!("fs-meta api server failed: {:?}", err);
         }
+        eprintln!("fs_meta_api_server: serve loop ended {}", bind_addr_for_log);
     });
 
     Ok(ApiServerHandle { shutdown, join })

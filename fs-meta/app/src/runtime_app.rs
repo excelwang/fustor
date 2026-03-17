@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use crate::api::facade_status::{
@@ -12,8 +12,8 @@ use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, split_app_control_signals,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
-use crate::workers::sink::{SinkFacade, SinkWorkerClient};
-use crate::workers::source::{SourceFacade, SourceWorkerClient};
+use crate::workers::sink::{SinkFacade, SinkWorkerClientHandle};
+use crate::workers::source::{SourceFacade, SourceWorkerClientHandle};
 use crate::{FSMetaConfig, api, source};
 use async_trait::async_trait;
 use capanix_app_sdk::raw::{
@@ -59,6 +59,22 @@ struct PendingFacadeActivation {
     resolved: api::config::ResolvedApiConfig,
 }
 
+fn shared_tokio_runtime() -> &'static tokio::runtime::Runtime {
+    static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+    RUNTIME.get_or_init(|| {
+        let worker_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(1, 2))
+            .unwrap_or(1);
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name("fs-meta-shared-runtime")
+            .enable_all()
+            .build()
+            .expect("build shared fs-meta tokio runtime")
+    })
+}
+
+
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_micros() as u64,
@@ -73,6 +89,7 @@ pub struct FSMetaApp {
     source: Arc<SourceFacade>,
     sink: Arc<SinkFacade>,
     pump_task: Mutex<Option<JoinHandle<()>>>,
+    bootstrap_task: Mutex<Option<JoinHandle<()>>>,
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
     facade_pending_status: SharedFacadePendingStatusCell,
@@ -123,11 +140,9 @@ impl FSMetaApp {
                         data: channel_boundary.clone(),
                         state: state_boundary.clone(),
                     });
-                    let client = SourceWorkerClient::spawn(&node_id, &config.source, pair)
-                        .map_err(|err| {
-                            CnxError::InvalidInput(format!("source worker init failed: {err}"))
-                        })?;
-                    Arc::new(SourceFacade::worker(Arc::new(client)))
+                    Arc::new(SourceFacade::worker(Arc::new(
+                        SourceWorkerClientHandle::new(node_id.clone(), config.source.clone(), pair),
+                    )))
                 }
                 None => {
                     return Err(CnxError::InvalidInput(
@@ -158,11 +173,11 @@ impl FSMetaApp {
                         data: channel_boundary.clone(),
                         state: state_boundary.clone(),
                     });
-                    let client = SinkWorkerClient::spawn(&node_id, &sink_source_cfg, pair)
-                        .map_err(|err| {
-                            CnxError::InvalidInput(format!("sink worker init failed: {err}"))
-                        })?;
-                    Arc::new(SinkFacade::worker(Arc::new(client)))
+                    Arc::new(SinkFacade::worker(Arc::new(SinkWorkerClientHandle::new(
+                        node_id.clone(),
+                        sink_source_cfg.clone(),
+                        pair,
+                    ))))
                 }
                 None => {
                     return Err(CnxError::InvalidInput(
@@ -178,6 +193,7 @@ impl FSMetaApp {
             source,
             sink,
             pump_task: Mutex::new(None),
+            bootstrap_task: Mutex::new(None),
             api_task: Arc::new(Mutex::new(None)),
             pending_facade: Arc::new(Mutex::new(None)),
             facade_pending_status: shared_facade_pending_status_cell(),
@@ -194,39 +210,47 @@ impl FSMetaApp {
                 "api.enabled must be true; fs-meta management API boundary is mandatory".into(),
             ));
         }
+
+        let sink_is_worker = self.sink.is_worker();
+        let source_is_worker = self.source.is_worker();
+
+        if !sink_is_worker {
+            self.sink.ensure_started()?;
+        }
+
         let mut guard = self.pump_task.lock().await;
-        if guard.is_none() {
+        if guard.is_none() && !source_is_worker {
             *guard = self
                 .source
                 .start(self.sink.clone(), self.runtime_boundary.clone())
                 .await?;
         }
-        if self.runtime_boundary.is_none() {
-            self.wait_for_local_initial_materialization(Duration::from_secs(2))
-                .await?;
-        }
-        Ok(())
-    }
+        drop(guard);
 
-    async fn wait_for_local_initial_materialization(&self, timeout: Duration) -> Result<()> {
-        if !self
-            .source
-            .logical_roots_snapshot()?
-            .iter()
-            .any(|root| root.scan)
-        {
-            return Ok(());
-        }
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if self.sink.shadow_time_us()? > 0 {
-                return Ok(());
+        if sink_is_worker || source_is_worker {
+            let mut bootstrap_guard = self.bootstrap_task.lock().await;
+            if bootstrap_guard.is_none() {
+                let sink = self.sink.clone();
+                let source = self.source.clone();
+                let boundary = self.runtime_boundary.clone();
+                *bootstrap_guard = Some(tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    if sink.is_worker() {
+                        if let Err(err) = sink.ensure_started() {
+                            log::error!("fs-meta deferred sink worker bootstrap failed: {err}");
+                            return;
+                        }
+                    }
+                    if source.is_worker() {
+                        if let Err(err) = source.start(sink.clone(), boundary).await {
+                            log::error!("fs-meta deferred source worker bootstrap failed: {err}");
+                        }
+                    }
+                }));
             }
-            if tokio::time::Instant::now() >= deadline {
-                return Err(CnxError::Timeout);
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
         }
+
+        Ok(())
     }
 
     fn facade_candidate_resource_ids(
@@ -471,6 +495,7 @@ impl FSMetaApp {
         // readiness is enforced at the query surface so `/on-demand-force-find`
         // can become available earlier.
 
+        eprintln!("fs_meta_runtime_app: spawning facade api server generation={} route_key={} resources={:?}", pending.generation, pending.route_key, pending.resource_ids);
         let handle = api::spawn(
             pending.resolved.clone(),
             node_id,
@@ -489,6 +514,7 @@ impl FSMetaApp {
             })
         };
         if !still_pending {
+            eprintln!("fs_meta_runtime_app: shutting down stale facade handle generation={} route_key={}", pending.generation, pending.route_key);
             handle.shutdown(Duration::from_secs(2)).await;
             return Ok(false);
         }
@@ -508,6 +534,7 @@ impl FSMetaApp {
         Self::clear_pending_facade_status(&facade_pending_status);
         drop(pending_guard);
         if let Some(current) = previous {
+            eprintln!("fs_meta_runtime_app: shutting down previous active facade generation={}", current.generation);
             current.handle.shutdown(Duration::from_secs(2)).await;
         }
         Ok(true)
@@ -756,7 +783,9 @@ impl FSMetaApp {
     }
 
     async fn shutdown_active_facade(&self) {
+        eprintln!("fs_meta_runtime_app: shutdown_active_facade");
         if let Some(current) = self.api_task.lock().await.take() {
+            eprintln!("fs_meta_runtime_app: shutting down previous active facade generation={}", current.generation);
             current.handle.shutdown(Duration::from_secs(2)).await;
         }
     }
@@ -842,12 +871,24 @@ impl FSMetaApp {
         Ok(agg)
     }
 
+    pub fn source_status_snapshot(&self) -> Result<crate::source::SourceStatusSnapshot> {
+        self.source.status_snapshot()
+    }
+
+    pub fn sink_status_snapshot(&self) -> Result<crate::sink::SinkStatusSnapshot> {
+        self.sink.status_snapshot()
+    }
+
+    pub async fn trigger_rescan_when_ready(&self) -> Result<()> {
+        self.source.trigger_rescan_when_ready().await
+    }
+
     pub fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
         self.sink.query_node(path)
     }
 }
 
-struct RuntimeBoundaryPair {
+pub(crate) struct RuntimeBoundaryPair {
     control: Arc<dyn ChannelBoundary>,
     data: Arc<dyn ChannelIoSubset>,
     state: Arc<dyn StateBoundary>,
@@ -1024,6 +1065,9 @@ impl RuntimeBoundaryApp for FSMetaApp {
         if let Some(handle) = self.pump_task.lock().await.take() {
             handle.abort();
         }
+        if let Some(handle) = self.bootstrap_task.lock().await.take() {
+            handle.abort();
+        }
         Ok(())
     }
 }
@@ -1031,7 +1075,6 @@ impl RuntimeBoundaryApp for FSMetaApp {
 pub struct FSMetaRuntimeApp {
     inner: Option<Arc<FSMetaApp>>,
     init_error: Option<String>,
-    runtime: Option<Arc<tokio::runtime::Runtime>>,
 }
 
 impl FSMetaRuntimeApp {
@@ -1044,16 +1087,6 @@ impl FSMetaRuntimeApp {
 
     fn inner_arc(&self) -> Result<Arc<FSMetaApp>> {
         self.inner.clone().ok_or_else(|| {
-            CnxError::InvalidInput(
-                self.init_error
-                    .clone()
-                    .unwrap_or_else(|| "fs-meta runtime init failed".to_string()),
-            )
-        })
-    }
-
-    fn runtime_arc(&self) -> Result<Arc<tokio::runtime::Runtime>> {
-        self.runtime.clone().ok_or_else(|| {
             CnxError::InvalidInput(
                 self.init_error
                     .clone()
@@ -1096,53 +1129,43 @@ impl FSMetaRuntimeApp {
         state_boundary: Arc<dyn StateBoundary>,
         data_boundary: Option<Arc<dyn ChannelIoSubset>>,
     ) -> Self {
+        fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+            if let Some(msg) = payload.downcast_ref::<String>() {
+                return msg.clone();
+            }
+            if let Some(msg) = payload.downcast_ref::<&'static str>() {
+                return (*msg).to_string();
+            }
+            "unknown panic payload".to_string()
+        }
+
         // Some embeddings still load fs-meta in-process, but that boundary is
         // non-isolating; constructor failures must stay on `init_error`
         // instead of crossing the ABI as a panic/abort path.
-        let manifest_cfg = match ordinary_boundary.app_manifest_config() {
-            Some(cfg) => cfg,
-            None => {
-                return Self {
-                    inner: None,
-                    init_error: Some(
-                        "roots[] is required (missing app manifest config)".to_string(),
-                    ),
-                    runtime: None,
-                };
-            }
-        };
-        let node_id = match Self::required_runtime_local_host_ref(&manifest_cfg) {
-            Ok(node_id) => node_id,
-            Err(err) => {
-                return Self {
-                    inner: None,
-                    init_error: Some(Self::init_error_message(err)),
-                    runtime: None,
-                };
-            }
-        };
-        let cfg = FSMetaConfig::from_manifest_config(&manifest_cfg);
-        match cfg {
-            Ok(cfg) => {
-                let runtime = tokio::runtime::Builder::new_multi_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|err| {
-                        CnxError::Internal(format!("failed to build fs-meta runtime: {err}"))
-                    });
-                let runtime = match runtime {
-                    Ok(rt) => Arc::new(rt),
-                    Err(err) => {
-                        let msg = Self::init_error_message(err);
-                        log::error!("fs-meta runtime init failed (build runtime): {msg}");
-                        return Self {
-                            inner: None,
-                            init_error: Some(msg),
-                            runtime: None,
-                        };
-                    }
-                };
-                match FSMetaApp::with_boundaries_and_state(
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let manifest_cfg = match ordinary_boundary.app_manifest_config() {
+                Some(cfg) => cfg,
+                None => {
+                    return Self {
+                        inner: None,
+                        init_error: Some(
+                            "roots[] is required (missing app manifest config)".to_string(),
+                        ),
+                    };
+                }
+            };
+            let node_id = match Self::required_runtime_local_host_ref(&manifest_cfg) {
+                Ok(node_id) => node_id,
+                Err(err) => {
+                    return Self {
+                        inner: None,
+                        init_error: Some(Self::init_error_message(err)),
+                    };
+                }
+            };
+            let cfg = FSMetaConfig::from_manifest_config(&manifest_cfg);
+            match cfg {
+                Ok(cfg) => match FSMetaApp::with_boundaries_and_state(
                     cfg,
                     node_id,
                     data_boundary,
@@ -1152,7 +1175,6 @@ impl FSMetaRuntimeApp {
                     Ok(inner) => Self {
                         inner: Some(Arc::new(inner)),
                         init_error: None,
-                        runtime: Some(runtime),
                     },
                     Err(err) => {
                         let msg = Self::init_error_message(err);
@@ -1160,18 +1182,31 @@ impl FSMetaRuntimeApp {
                         Self {
                             inner: None,
                             init_error: Some(msg),
-                            runtime: None,
                         }
+                    }
+                },
+                Err(err) => {
+                    let msg = Self::init_error_message(err);
+                    log::error!("fs-meta runtime init failed (manifest config): {msg}");
+                    Self {
+                        inner: None,
+                        init_error: Some(msg),
                     }
                 }
             }
-            Err(err) => {
-                let msg = Self::init_error_message(err);
-                log::error!("fs-meta runtime init failed (manifest config): {msg}");
+        }));
+
+        match result {
+            Ok(app) => app,
+            Err(payload) => {
+                let msg = format!(
+                    "fs-meta runtime init panicked during constructor: {}",
+                    panic_message(payload)
+                );
+                log::error!("{msg}");
                 Self {
                     inner: None,
                     init_error: Some(msg),
-                    runtime: None,
                 }
             }
         }
@@ -1197,57 +1232,48 @@ impl FSMetaRuntimeApp {
 impl RuntimeBoundaryApp for FSMetaRuntimeApp {
     async fn start(&self) -> Result<()> {
         let inner = self.inner_arc()?;
-        let runtime = self.runtime_arc()?;
-        runtime
-            .handle()
-            .spawn(async move { inner.start().await })
-            .await
-            .map_err(|err| CnxError::Internal(format!("fs-meta runtime task join failed: {err}")))?
+        if tokio::runtime::Handle::try_current().is_ok() {
+            inner.start().await
+        } else {
+            shared_tokio_runtime().block_on(inner.start())
+        }
     }
 
     async fn send(&self, events: &[Event]) -> Result<()> {
         let inner = self.inner_arc()?;
-        let batch = events.to_vec();
-        let runtime = self.runtime_arc()?;
-        runtime
-            .handle()
-            .spawn(async move { inner.send(&batch).await })
-            .await
-            .map_err(|err| CnxError::Internal(format!("fs-meta runtime task join failed: {err}")))?
+        if tokio::runtime::Handle::try_current().is_ok() {
+            inner.send(events).await
+        } else {
+            shared_tokio_runtime().block_on(inner.send(events))
+        }
     }
 
     async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
         let inner = self.inner_arc()?;
-        let runtime = self.runtime_arc()?;
-        runtime
-            .handle()
-            .spawn(async move { inner.recv(opts).await })
-            .await
-            .map_err(|err| CnxError::Internal(format!("fs-meta runtime task join failed: {err}")))?
+        if tokio::runtime::Handle::try_current().is_ok() {
+            inner.recv(opts).await
+        } else {
+            shared_tokio_runtime().block_on(inner.recv(opts))
+        }
     }
 
     async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let inner = self.inner_arc()?;
-        let frames = envelopes.to_vec();
-        let runtime = self.runtime_arc()?;
-        runtime
-            .handle()
-            .spawn(async move { inner.on_control_frame(&frames).await })
-            .await
-            .map_err(|err| CnxError::Internal(format!("fs-meta runtime task join failed: {err}")))?
+        if tokio::runtime::Handle::try_current().is_ok() {
+            inner.on_control_frame(envelopes).await
+        } else {
+            shared_tokio_runtime().block_on(inner.on_control_frame(envelopes))
+        }
     }
 
     async fn close(&self) -> Result<()> {
         match self.inner_arc() {
             Ok(inner) => {
-                let runtime = self.runtime_arc()?;
-                runtime
-                    .handle()
-                    .spawn(async move { inner.close().await })
-                    .await
-                    .map_err(|err| {
-                        CnxError::Internal(format!("fs-meta runtime task join failed: {err}"))
-                    })?
+                if tokio::runtime::Handle::try_current().is_ok() {
+                    inner.close().await
+                } else {
+                    shared_tokio_runtime().block_on(inner.close())
+                }
             }
             Err(_) => Ok(()),
         }
@@ -1272,7 +1298,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::net::TcpListener;
-    use std::sync::Arc;
+    use std::sync::{Arc, OnceLock};
     use std::time::Duration;
     use tempfile::tempdir;
 

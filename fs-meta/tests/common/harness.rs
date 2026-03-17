@@ -1,8 +1,8 @@
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use capanix_kernel_api::control::CtlCommand as KernelCtlCommand;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::fs::File;
@@ -17,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use super::control_protocol::{
-    ControlEnvelope, CtlRequest, CtlResponse, canonical_ctl_command_value_bytes,
+    canonical_ctl_command_value_bytes, ControlEnvelope, CtlRequest, CtlResponse,
 };
 use super::runtime_admin::{
     canonical_runtime_admin_command_value_bytes, decode_runtime_admin_or_kernel_response_value,

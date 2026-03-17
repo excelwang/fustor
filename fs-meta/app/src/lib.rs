@@ -11,9 +11,9 @@ pub mod source;
 mod state;
 pub mod workers;
 
-pub use source::config::{GrantedMountRoot, RootSelector, RootSpec};
 pub use query::GroupReliability;
 pub use runtime_app::{FSMetaApp, FSMetaRuntimeApp};
+pub use source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use source::config::{SinkExecutionMode, SourceConfig, SourceExecutionMode, WorkerMode};
 
 #[derive(Clone, Debug)]

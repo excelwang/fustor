@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Duration;
 
 use capanix_app_sdk::raw::{
@@ -14,6 +15,8 @@ enum EndpointJoin {
     Thread(std::thread::JoinHandle<()>),
 }
 
+const ENDPOINT_TASK_READY_TIMEOUT: Duration = Duration::from_secs(2);
+
 pub(crate) struct ManagedEndpointTask {
     name: String,
     shutdown: CancellationToken,
@@ -26,6 +29,27 @@ impl ManagedEndpointTask {
             EndpointJoin::Tokio(tokio::task::spawn_blocking(runner))
         } else {
             EndpointJoin::Thread(std::thread::spawn(runner))
+        }
+    }
+
+    fn spawn_join_with_ready(
+        runner: impl FnOnce() + Send + 'static,
+    ) -> (EndpointJoin, Receiver<()>) {
+        let (ready_tx, ready_rx) = sync_channel(1);
+        let join = Self::spawn_join(move || {
+            let _ = ready_tx.send(());
+            runner();
+        });
+        (join, ready_rx)
+    }
+
+    fn wait_until_ready(name: &str, ready_rx: Receiver<()>) {
+        if ready_rx.recv_timeout(ENDPOINT_TASK_READY_TIMEOUT).is_err() {
+            log::warn!(
+                "endpoint task {} did not report ready within {:?}",
+                name,
+                ENDPOINT_TASK_READY_TIMEOUT
+            );
         }
     }
 
@@ -45,7 +69,8 @@ impl ManagedEndpointTask {
         let handler = Arc::new(handler);
         let runner =
             move || run_endpoint_loop(boundary, route, join_name, shutdown_for_task, handler);
-        let join = Self::spawn_join(runner);
+        let (join, ready_rx) = Self::spawn_join_with_ready(runner);
+        Self::wait_until_ready(&name_owned, ready_rx);
 
         Self {
             name: name_owned,
@@ -81,7 +106,8 @@ impl ManagedEndpointTask {
                 handler,
             )
         };
-        let join = Self::spawn_join(runner);
+        let (join, ready_rx) = Self::spawn_join_with_ready(runner);
+        Self::wait_until_ready(&name_owned, ready_rx);
 
         Self {
             name: name_owned,

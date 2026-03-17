@@ -15,3 +15,6 @@ path = "src/main.rs"
 
 [dependencies]
 capanix-app-fs-meta-worker-source = { workspace = true }
+capanix-app-sdk = { workspace = true }
+capanix-unit-sidecar = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }

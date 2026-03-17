@@ -6,12 +6,12 @@ use crate::support::cpu_budget::{assert_cpu_budget, measure_cpu_budget};
 use crate::support::nfs_lab::NfsLab;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
 use capanix_app_fs_meta::{RootSelector, RootSpec};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
 use std::thread;
 use std::thread::JoinHandle;

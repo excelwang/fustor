@@ -1356,6 +1356,16 @@ impl FSMetaSource {
         boundary: Option<Arc<dyn ChannelIoSubset>>,
         state_boundary: Arc<dyn StateBoundary>,
     ) -> Result<Self> {
+        Self::with_boundaries_and_state_inner(config, node_id, boundary, state_boundary, false)
+    }
+
+    fn with_boundaries_and_state_inner(
+        config: SourceConfig,
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        state_boundary: Arc<dyn StateBoundary>,
+        defer_authority_read: bool,
+    ) -> Result<Self> {
         let initial_host_object_grants = config.host_object_grants.clone();
         let root_specs = config.effective_roots().map_err(CnxError::InvalidInput)?;
         let drift_estimator = Arc::new(Mutex::new(DriftEstimator::new(
@@ -1376,12 +1386,14 @@ impl FSMetaSource {
         let logical_root_fanout =
             Self::compute_logical_root_fanout(&root_specs, &initial_host_object_grants);
         let fanout_health = Arc::new(Mutex::new(FanoutHealthState::default()));
-        let authority =
-            AuthorityJournal::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, state_boundary).map_err(
-                |err| {
-                    CnxError::InvalidInput(format!("source statecell authority init failed: {err}"))
-                },
-            )?;
+        let authority = if defer_authority_read {
+            AuthorityJournal::deferred_from_state_boundary(SOURCE_RUNTIME_UNIT_ID, state_boundary)
+        } else {
+            AuthorityJournal::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, state_boundary)
+        }
+        .map_err(|err| {
+            CnxError::InvalidInput(format!("source statecell authority init failed: {err}"))
+        })?;
         let commit_boundary = CommitBoundary::new(authority);
         Self::set_logical_root_health(
             &fanout_health,
@@ -1691,6 +1703,19 @@ impl FSMetaSource {
         Ok(source)
     }
 
+    pub fn with_boundaries_and_state_deferred_runtime_endpoints(
+        config: SourceConfig,
+        node_id: NodeId,
+        boundary: Arc<dyn ChannelIoSubset>,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> Result<Self> {
+        Self::with_boundaries_and_state_inner(config, node_id, Some(boundary), state_boundary, true)
+    }
+
+    pub fn start_runtime_endpoints(&self, _boundary: Arc<dyn ChannelIoSubset>) -> Result<()> {
+        Ok(())
+    }
+
     /// Current lifecycle state.
     #[allow(dead_code)]
     pub fn state(&self) -> LifecycleState {
@@ -1933,6 +1958,17 @@ impl FSMetaSource {
         let fanout = Self::compute_logical_root_fanout(&root_specs, &host_object_grants);
         let root_count = root_specs.len();
         let grant_count = host_object_grants.len();
+        let bound_scopes = root_specs
+            .iter()
+            .map(|root| BoundScope {
+                scope_id: root.id.clone(),
+                resource_ids: Vec::new(),
+            })
+            .collect::<Vec<_>>();
+        self.unit_control
+            .sync_active_scopes(SourceRuntimeUnit::Source.unit_id(), &bound_scopes)?;
+        self.unit_control
+            .sync_active_scopes(SourceRuntimeUnit::Scan.unit_id(), &bound_scopes)?;
 
         *lock_or_recover(
             &self.state_cell.logical_roots,
@@ -2553,8 +2589,48 @@ impl FSMetaSource {
         }
 
         let watch_manager = if root.spec.watch {
-            let watch_backend = match root.host_fs.watch_session_open() {
-                Ok(backend) => Box::new(backend),
+            match root.host_fs.watch_session_open() {
+                Ok(backend) => match WatchManager::new(
+                    &config,
+                    root_path.clone(),
+                    root.emit_prefix.clone(),
+                    Box::new(backend),
+                ) {
+                    Ok(manager) => {
+                        let manager = Arc::new(Mutex::new(manager));
+                        let schedule_result = {
+                            let mut mgr =
+                                lock_or_recover(&manager, "source.root_stream.root_schedule");
+                            mgr.schedule(&root_path)
+                        };
+                        if let Err(err) = schedule_result {
+                            log::warn!(
+                                "root {} watch schedule failed ({}); continuing with scan/audit",
+                                root.spec.id,
+                                err
+                            );
+                            Self::set_object_last_error(
+                                &fanout_health,
+                                &root_key,
+                                format!("root watch schedule failed: {err}"),
+                            );
+                        }
+                        Some(manager)
+                    }
+                    Err(err) => {
+                        log::warn!(
+                            "root {} watch manager init failed ({}); degrading to scan-only",
+                            root.spec.id,
+                            err
+                        );
+                        Self::set_object_last_error(
+                            &fanout_health,
+                            &root_key,
+                            format!("root watch manager init failed: {err}"),
+                        );
+                        None
+                    }
+                },
                 Err(err) => {
                     let actions = sentinel.process(HealthSignal::WatchInitFailed {
                         root_key: root_key.clone(),
@@ -2566,40 +2642,19 @@ impl FSMetaSource {
                         Some(&root.rescan_tx),
                         Some(&fanout_health),
                     );
-                    Self::set_object_last_error(&fanout_health, &root_key, err.to_string());
-                    return Err(CnxError::NotSupported(format!(
-                        "failed to initialize host watch backend: {err}"
-                    )));
+                    log::warn!(
+                        "root {} watch backend init failed ({}); degrading to scan-only",
+                        root.spec.id,
+                        err
+                    );
+                    Self::set_object_last_error(
+                        &fanout_health,
+                        &root_key,
+                        format!("failed to initialize host watch backend: {err}"),
+                    );
+                    None
                 }
-            };
-            let manager = Arc::new(Mutex::new(
-                WatchManager::new(
-                    &config,
-                    root_path.clone(),
-                    root.emit_prefix.clone(),
-                    watch_backend,
-                )
-                .map_err(|e| {
-                    CnxError::Internal(format!("failed to initialize watch manager: {e}"))
-                })?,
-            ));
-            let schedule_result = {
-                let mut mgr = lock_or_recover(&manager, "source.root_stream.root_schedule");
-                mgr.schedule(&root_path)
-            };
-            if let Err(e) = schedule_result {
-                log::warn!(
-                    "root {} watch schedule failed ({}); continuing with scan/audit",
-                    root.spec.id,
-                    e
-                );
-                Self::set_object_last_error(
-                    &fanout_health,
-                    &root_key,
-                    format!("root watch schedule failed: {e}"),
-                );
             }
-            Some(manager)
         } else {
             None
         };

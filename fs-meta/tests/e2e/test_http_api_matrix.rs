@@ -5,10 +5,10 @@ use crate::support::cluster5::Cluster5;
 use crate::support::nfs_lab::NfsLab;
 use crate::support::oracle::FsTreeOracle;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
-use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+use base64::Engine;
 use capanix_app_fs_meta::{RootSelector, RootSpec};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::thread;
@@ -48,11 +48,17 @@ pub fn run() -> Result<(), String> {
         .map(|addr| format!("http://{addr}"))
         .collect::<Vec<_>>();
 
+    eprintln!("[fs-meta-api-matrix] step=login-matrix");
     run_login_matrix(&client)?;
+    eprintln!("[fs-meta-api-matrix] step=operator-login-many");
     let mut session = OperatorSession::login_many(candidate_base_urls, "operator", "operator123")?;
+    eprintln!("[fs-meta-api-matrix] step=initial-rescan");
     session.rescan()?;
+    eprintln!("[fs-meta-api-matrix] step=status-and-grants");
     run_status_and_grants_checks(&client, &mut session, &lab)?;
+    eprintln!("[fs-meta-api-matrix] step=roots-matrix");
     run_roots_matrix(&client, &mut session, &lab)?;
+    eprintln!("[fs-meta-api-matrix] step=query-matrix");
     run_query_matrix(&cluster, &mut session, &lab)?;
 
     let metrics = session.bound_route_metrics()?;
@@ -99,6 +105,7 @@ fn run_status_and_grants_checks(
         "invalid session token",
     )?;
 
+    eprintln!("[fs-meta-api-matrix] substep=status");
     let status = session.status()?;
     let source = status
         .get("source")
@@ -118,6 +125,7 @@ fn run_status_and_grants_checks(
         return Err(format!("expected live sink nodes in status: {status}"));
     }
 
+    eprintln!("[fs-meta-api-matrix] substep=runtime-grants");
     let grants = session.runtime_grants()?;
     let rows = grants
         .get("grants")
@@ -157,6 +165,7 @@ fn run_roots_matrix(
     session: &mut OperatorSession,
     lab: &NfsLab,
 ) -> Result<(), String> {
+    eprintln!("[fs-meta-api-matrix] substep=monitoring-roots-current");
     let current = session.monitoring_roots()?;
     let current_rows = current
         .get("roots")
@@ -316,6 +325,7 @@ fn run_roots_matrix(
         "duplicate",
     )?;
 
+    eprintln!("[fs-meta-api-matrix] substep=single-root-apply");
     let single_root = vec![root_spec("nfs1", &lab.export_source("nfs1"))];
     let put = client.update_roots_raw(session.token(), &roots_payload(&single_root))?;
     assert_status(put.status, 200, "single-root apply")?;
@@ -334,6 +344,7 @@ fn run_roots_matrix(
             .unwrap_or(false))
     })?;
 
+    eprintln!("[fs-meta-api-matrix] substep=restore-roots");
     let restore = client.update_roots_raw(session.token(), &roots_payload(&roots))?;
     assert_status(restore.status, 200, "restore roots")?;
     session.rescan()?;
@@ -353,6 +364,7 @@ fn run_query_matrix(
     session: &mut OperatorSession,
     lab: &NfsLab,
 ) -> Result<(), String> {
+    eprintln!("[fs-meta-api-matrix] substep=query-matrix-rescan");
     session.rescan()?;
     wait_until(
         Duration::from_secs(90),

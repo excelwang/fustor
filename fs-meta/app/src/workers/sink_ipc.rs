@@ -7,7 +7,35 @@ use crate::query::request::InternalQueryRequest;
 use crate::sink::{SinkStatusSnapshot, VisibilityLagSample};
 use crate::source::config::{GrantedMountRoot, RootSpec};
 
-pub const SINK_WORKER_ROUTE_KEY: &str = "fs-meta.sink-worker:v1";
+pub const SINK_WORKER_CONTROL_ROUTE_KEY: &str = "fs-meta.sink-worker.rpc:v1";
+pub const WORKER_CONTROL_ROUTE_KEY_ENV: &str = "FS_META_WORKER_CONTROL_ROUTE_KEY";
+pub const SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND: &str = "fs-meta.sink-worker.bootstrap:v1";
+
+fn scoped_worker_control_route_key(base: &str, node_id: &str) -> String {
+    let suffix: String = node_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    match base.rsplit_once(':') {
+        Some((stem, version)) => format!("{stem}.{suffix}:{version}"),
+        None => format!("{base}.{suffix}"),
+    }
+}
+
+pub fn sink_worker_control_route_key_for(node_id: &str) -> String {
+    scoped_worker_control_route_key(SINK_WORKER_CONTROL_ROUTE_KEY, node_id)
+}
+
+pub fn sink_worker_control_route_key_from_env() -> String {
+    std::env::var(WORKER_CONTROL_ROUTE_KEY_ENV)
+        .unwrap_or_else(|_| SINK_WORKER_CONTROL_ROUTE_KEY.to_string())
+}
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SinkWorkerInitConfig {
@@ -19,6 +47,7 @@ pub struct SinkWorkerInitConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum SinkWorkerRequest {
+    Ping,
     Init {
         node_id: String,
         config: SinkWorkerInitConfig,

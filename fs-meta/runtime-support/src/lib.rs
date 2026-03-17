@@ -1,4 +1,5 @@
 mod bridge;
+mod control;
 mod error;
 mod transport;
 mod typed_client;
@@ -8,6 +9,7 @@ pub mod __private {
     pub use capanix_app_sdk::{CnxError, Result};
 }
 
+pub use control::{decode_control_payload, encode_control_frame};
 pub use typed_client::{TypedWorkerClient, TypedWorkerRpc};
 
 #[macro_export]

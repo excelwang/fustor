@@ -14,7 +14,7 @@ use capanix_app_sdk::runtime::{ConfigValue, EventMetadata, NodeId, RecvOpts};
 use capanix_app_sdk::{Event, RuntimeBoundaryApp};
 use capanix_host_fs_types::{FileMetaRecord, UnixStat};
 use capanix_route_proto::{
-    BoundScope, ExecActivate, ExecControl, encode_exec_control_envelope, now_ms,
+    encode_exec_control_envelope, now_ms, BoundScope, ExecActivate, ExecControl,
 };
 use tempfile::TempDir;
 

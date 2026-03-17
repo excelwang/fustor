@@ -1,5 +1,5 @@
 use capanix_app_sdk::runtime::NodeId;
-use capanix_kernel_api::control::{CtlCommand, canonical_ctl_command_bytes};
+use capanix_kernel_api::control::{canonical_ctl_command_bytes, CtlCommand};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 

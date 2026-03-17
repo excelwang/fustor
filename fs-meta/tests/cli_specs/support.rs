@@ -38,7 +38,7 @@ pub fn package_manifest_text() -> String {
             .expect("fs-meta container root")
             .join("tooling/Cargo.toml"),
     )
-        .expect("read fs-meta cli manifest")
+    .expect("read fs-meta cli manifest")
 }
 
 pub fn launcher_source_text() -> String {

@@ -485,13 +485,11 @@ pub(crate) fn scenario_peer_membership_change_discipline() -> Result<(), String>
                 ));
             }
 
-            cfg["management_peers"] = json!(
-                peers_before
-                    .iter()
-                    .filter(|p| p["node_id"].as_str() != Some(peer_node_id.as_str()))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            );
+            cfg["management_peers"] = json!(peers_before
+                .iter()
+                .filter(|p| p["node_id"].as_str() != Some(peer_node_id.as_str()))
+                .cloned()
+                .collect::<Vec<_>>());
 
             let node_keys = cfg["trust_bundle"]["node_keys"]
                 .as_array_mut()

@@ -2,8 +2,8 @@
 #![allow(dead_code)]
 
 use reqwest::blocking::{Client, Response};
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
-use serde_json::{Value, json};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use serde_json::{json, Value};
 use std::time::Duration;
 
 const RECONNECT_RETRY_WINDOW: Duration = Duration::from_secs(30);

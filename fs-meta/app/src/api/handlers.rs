@@ -232,7 +232,9 @@ pub async fn rescan(
     headers: HeaderMap,
 ) -> Result<Json<RescanResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
-    if let Some(boundary) = state.runtime_boundary.as_ref() {
+    if state.source.is_worker() {
+        state.source.trigger_rescan_when_ready().await?;
+    } else if let Some(boundary) = state.runtime_boundary.as_ref() {
         let adapter = exchange_host_adapter(
             boundary.clone(),
             state.node_id.clone(),

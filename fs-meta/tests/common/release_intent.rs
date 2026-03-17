@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 pub(crate) fn release_v2_doc_to_scope_unit_intent_value(doc: &Value) -> Result<Value, String> {
     let apps = doc
