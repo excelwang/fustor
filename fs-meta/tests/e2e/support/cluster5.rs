@@ -50,6 +50,22 @@ const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
 ];
 const NODE_NAMES: &[&str] = &["node-a", "node-b", "node-c", "node-d", "node-e"];
 
+fn trace_command_name(command: &Value) -> String {
+    command
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>")
+        .to_string()
+}
+
+fn trace_exports_summary(command: &Value) -> String {
+    command
+        .get("exports")
+        .and_then(Value::as_array)
+        .map(|rows| format!(" exports={}", rows.len()))
+        .unwrap_or_default()
+}
+
 #[derive(Clone)]
 pub struct NodeIdentity {
     pub name: String,
@@ -214,7 +230,9 @@ impl Cluster5 {
     pub fn runtime_admin_ok(&self, node_name: &str, command: Value) -> Result<Value, String> {
         let node = self.node(node_name)?;
         let mut last_err = String::new();
-        for _ in 0..3 {
+        let command_name = trace_command_name(&command);
+        let command_summary = trace_exports_summary(&command);
+        for attempt in 0..3 {
             let seq = next_auth_seq_global();
             let nonce = format!("{}-{node_name}", unique_suffix());
             let auth = signed_auth_for_runtime_admin_command(
@@ -224,9 +242,36 @@ impl Cluster5 {
                 &nonce,
                 "local-admin-ed25519-1",
             );
+            let started = Instant::now();
+            eprintln!(
+                "cluster5: runtime-admin begin node={} command={} attempt={}{}",
+                node_name,
+                command_name,
+                attempt + 1,
+                command_summary
+            );
             match request_runtime_admin_ok(&node.socket_path, command.clone(), auth) {
-                Ok(v) => return Ok(v),
+                Ok(v) => {
+                    eprintln!(
+                        "cluster5: runtime-admin ok node={} command={} attempt={} elapsed_ms={}{}",
+                        node_name,
+                        command_name,
+                        attempt + 1,
+                        started.elapsed().as_millis(),
+                        command_summary
+                    );
+                    return Ok(v);
+                }
                 Err(e) => {
+                    eprintln!(
+                        "cluster5: runtime-admin err node={} command={} attempt={} elapsed_ms={}{} error={}",
+                        node_name,
+                        command_name,
+                        attempt + 1,
+                        started.elapsed().as_millis(),
+                        command_summary,
+                        e
+                    );
                     if e.contains("\"code\":\"replay_detected\"") {
                         last_err = e;
                         continue;
@@ -248,13 +293,47 @@ impl Cluster5 {
         let cnxctl_bin = try_find_cnxctl_bin().ok_or_else(|| {
             "cnxctl binary not found; build capanix-cli or set CNXCTL_BIN".to_string()
         })?;
+        let app_id = release
+            .get("app_id")
+            .or_else(|| release.get("app_id"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>")
+            .to_string();
+        let generation = release
+            .get("target_generation")
+            .and_then(Value::as_i64)
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
         let file = write_temp_json("relation-target-apply", &release)?;
         let file_arg = file.to_string_lossy().to_string();
-        run_cnxctl_json(
+        let started = Instant::now();
+        eprintln!(
+            "cluster5: apply-release begin node={} app_id={} generation={}",
+            node_name, app_id, generation
+        );
+        let result = run_cnxctl_json(
             &cnxctl_bin,
             &node.socket_path,
             ["app", "apply", file_arg.as_str()],
-        )
+        );
+        match &result {
+            Ok(_) => eprintln!(
+                "cluster5: apply-release ok node={} app_id={} generation={} elapsed_ms={}",
+                node_name,
+                app_id,
+                generation,
+                started.elapsed().as_millis()
+            ),
+            Err(err) => eprintln!(
+                "cluster5: apply-release err node={} app_id={} generation={} elapsed_ms={} error={}",
+                node_name,
+                app_id,
+                generation,
+                started.elapsed().as_millis(),
+                err
+            ),
+        }
+        result
     }
 
     pub fn clear_release(&self, node_name: &str, app_id: &str) -> Result<Value, String> {
@@ -288,6 +367,11 @@ impl Cluster5 {
     pub fn announce_resources_clusterwide(&self, exports: Vec<Value>) -> Result<(), String> {
         let exports = serde_json::from_value::<Vec<AnnouncedResourceExport>>(json!(exports))
             .map_err(|e| format!("decode announced exports: {e}"))?;
+        eprintln!(
+            "cluster5: announce-resources-clusterwide begin nodes={} exports={}",
+            self.nodes.len(),
+            exports.len()
+        );
         for node in &self.nodes {
             self.runtime_admin_ok(
                 &node.name,
@@ -297,6 +381,11 @@ impl Cluster5 {
                 }),
             )?;
         }
+        eprintln!(
+            "cluster5: announce-resources-clusterwide ok nodes={} exports={}",
+            self.nodes.len(),
+            exports.len()
+        );
         Ok(())
     }
 

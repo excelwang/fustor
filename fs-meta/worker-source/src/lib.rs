@@ -47,6 +47,13 @@ struct SourceWorkerState {
     pump_task: Option<JoinHandle<()>>,
 }
 
+fn classify_source_worker_error(err: CnxError) -> SourceWorkerResponse {
+    match err {
+        CnxError::InvalidInput(message) => SourceWorkerResponse::InvalidInput(message),
+        other => SourceWorkerResponse::Error(other.to_string()),
+    }
+}
+
 async fn stop_source_runtime_with_timeouts(
     state: &mut SourceWorkerState,
     join_timeout: Duration,
@@ -147,10 +154,10 @@ fn process_worker_request(
                     );
                 };
                 eprintln!("fs_meta_source_worker: materializing runtime on Start");
-                match FSMetaSource::with_boundaries_and_state_deferred_runtime_endpoints(
+                match FSMetaSource::with_boundaries_and_state(
                     config,
                     node_id,
-                    boundary.clone(),
+                    None,
                     state_boundary,
                 ) {
                     Ok(inner) => {
@@ -172,34 +179,24 @@ fn process_worker_request(
                         false,
                     );
                 };
-                eprintln!("fs_meta_source_worker: scheduling source stream after Ack");
+                if let Err(err) = source.start_runtime_endpoints(boundary.clone()) {
+                    eprintln!("fs_meta_source_worker: Start runtime endpoints failed: {err}");
+                    return (SourceWorkerResponse::Error(err.to_string()), false);
+                }
+                eprintln!("fs_meta_source_worker: acquiring source stream before Ack");
                 let source = source.clone();
-                let boundary = boundary.clone();
-                state.pump_task = Some(runtime.spawn(async move {
-                    eprintln!("fs_meta_source_worker: starting source stream after Ack");
-                    match source.pub_().await {
-                        Ok(mut stream) => {
-                            eprintln!("fs_meta_source_worker: source stream ready after Ack");
-                            while let Some(batch) = stream.next().await {
-                                if let Err(err) = boundary.channel_send(
-                                    BoundaryContext::default(),
-                                    ChannelSendRequest {
-                                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                                        events: batch,
-                                    },
-                                ) {
-                                    eprintln!(
-                                        "fs_meta_source_worker: source pump failed to publish source batch on stream route: {:?}",
-                                        err
-                                    );
-                                }
-                            }
-                        }
-                        Err(err) => {
-                            eprintln!("fs_meta_source_worker: Start stream acquisition failed after Ack: {err}");
-                        }
+                let stream = match block_on_runtime(runtime, source.pub_()) {
+                    Ok(stream) => stream,
+                    Err(err) => {
+                        eprintln!("fs_meta_source_worker: Start stream acquisition failed: {err}");
+                        return (SourceWorkerResponse::Error(err.to_string()), false);
                     }
-                }));
+                };
+                state.pump_task = Some(start_source_pump_with_stream(
+                    stream,
+                    boundary.clone(),
+                    runtime,
+                ));
             } else {
                 eprintln!("fs_meta_source_worker: source pump already running");
             }
@@ -208,7 +205,7 @@ fn process_worker_request(
         SourceWorkerRequest::UpdateLogicalRoots { roots } => match state.source.as_ref() {
             Some(source) => match runtime.block_on(source.update_logical_roots(roots)) {
                 Ok(_) => (SourceWorkerResponse::Ack, false),
-                Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
+                Err(err) => (classify_source_worker_error(err), false),
             },
             None => (
                 SourceWorkerResponse::Error("source worker not initialized".into()),

@@ -8,6 +8,7 @@ use crate::api::facade_status::{
 use crate::query::TreeGroupPayload;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryNode, SubtreeStats};
 use crate::runtime::execution_units;
+use crate::runtime::routes::ROUTE_KEY_FACADE_CONTROL;
 use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, split_app_control_signals,
 };
@@ -37,9 +38,6 @@ use crate::source::config::{SinkExecutionMode, SourceExecutionMode};
 // Canonical fs-meta app authoring flows through `app-sdk`; direct runtime-api use
 // is confined to narrow infra seams such as boundary conversion helpers.
 
-#[cfg(test)]
-const FACADE_CONTROL_ROUTE_KEY: &str = "fs-meta.internal.facade-control:v1";
-
 struct FacadeActivation {
     generation: u64,
     resource_ids: Vec<String>,
@@ -59,7 +57,7 @@ struct PendingFacadeActivation {
     resolved: api::config::ResolvedApiConfig,
 }
 
-fn shared_tokio_runtime() -> &'static tokio::runtime::Runtime {
+pub(crate) fn shared_tokio_runtime() -> &'static tokio::runtime::Runtime {
     static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
         let worker_threads = std::thread::available_parallelism()
@@ -89,7 +87,6 @@ pub struct FSMetaApp {
     source: Arc<SourceFacade>,
     sink: Arc<SinkFacade>,
     pump_task: Mutex<Option<JoinHandle<()>>>,
-    bootstrap_task: Mutex<Option<JoinHandle<()>>>,
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
     facade_pending_status: SharedFacadePendingStatusCell,
@@ -193,7 +190,6 @@ impl FSMetaApp {
             source,
             sink,
             pump_task: Mutex::new(None),
-            bootstrap_task: Mutex::new(None),
             api_task: Arc::new(Mutex::new(None)),
             pending_facade: Arc::new(Mutex::new(None)),
             facade_pending_status: shared_facade_pending_status_cell(),
@@ -227,29 +223,6 @@ impl FSMetaApp {
         }
         drop(guard);
 
-        if sink_is_worker || source_is_worker {
-            let mut bootstrap_guard = self.bootstrap_task.lock().await;
-            if bootstrap_guard.is_none() {
-                let sink = self.sink.clone();
-                let source = self.source.clone();
-                let boundary = self.runtime_boundary.clone();
-                *bootstrap_guard = Some(tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                    if sink.is_worker() {
-                        if let Err(err) = sink.ensure_started() {
-                            log::error!("fs-meta deferred sink worker bootstrap failed: {err}");
-                            return;
-                        }
-                    }
-                    if source.is_worker() {
-                        if let Err(err) = source.start(sink.clone(), boundary).await {
-                            log::error!("fs-meta deferred source worker bootstrap failed: {err}");
-                        }
-                    }
-                }));
-            }
-        }
-
         Ok(())
     }
 
@@ -268,62 +241,11 @@ impl FSMetaApp {
         ids.into_iter().collect()
     }
 
-    fn runtime_scoped_facade_group_ids(
-        source: &SourceFacade,
-        sink: &SinkFacade,
-        allow_local_fallback: bool,
-    ) -> Result<Vec<String>> {
-        let local_source_groups = || {
-            source
-                .status_snapshot()
-                .map(|status| {
-                    status
-                        .concrete_roots
-                        .into_iter()
-                        .filter(|root| root.active)
-                        .map(|root| root.logical_root_id)
-                        .collect::<std::collections::BTreeSet<_>>()
-                })
-                .unwrap_or_default()
-        };
-        let local_scan_groups = || {
-            source
-                .status_snapshot()
-                .map(|status| {
-                    status
-                        .concrete_roots
-                        .into_iter()
-                        .filter(|root| root.active && root.scan_enabled)
-                        .map(|root| root.logical_root_id)
-                        .collect::<std::collections::BTreeSet<_>>()
-                })
-                .unwrap_or_default()
-        };
-        let local_sink_groups = || {
-            sink.status_snapshot()
-                .map(|status| {
-                    status
-                        .groups
-                        .into_iter()
-                        .map(|group| group.group_id)
-                        .collect::<std::collections::BTreeSet<_>>()
-                })
-                .unwrap_or_default()
-        };
-
+    fn runtime_scoped_facade_group_ids(source: &SourceFacade, sink: &SinkFacade) -> Result<Vec<String>> {
         let mut source_groups = source.scheduled_source_group_ids()?.unwrap_or_default();
-        if allow_local_fallback && source_groups.is_empty() {
-            source_groups = local_source_groups();
-        }
         let mut scan_groups = source.scheduled_scan_group_ids()?.unwrap_or_default();
-        if allow_local_fallback && scan_groups.is_empty() {
-            scan_groups = local_scan_groups();
-        }
         source_groups.extend(scan_groups);
         let mut sink_groups = sink.scheduled_group_ids()?.unwrap_or_default();
-        if allow_local_fallback && sink_groups.is_empty() {
-            sink_groups = local_sink_groups();
-        }
         if !source_groups.is_empty() && !sink_groups.is_empty() {
             return Ok(source_groups.intersection(&sink_groups).cloned().collect());
         }
@@ -337,7 +259,6 @@ impl FSMetaApp {
         source: &SourceFacade,
         sink: &SinkFacade,
         bound_scopes: &[capanix_route_proto::BoundScope],
-        allow_local_fallback: bool,
     ) -> Result<Vec<String>> {
         let logical_root_ids = source
             .logical_roots_snapshot()?
@@ -363,7 +284,7 @@ impl FSMetaApp {
         if !ids.is_empty() {
             return Ok(ids.into_iter().collect());
         }
-        Self::runtime_scoped_facade_group_ids(source, sink, allow_local_fallback)
+        Self::runtime_scoped_facade_group_ids(source, sink)
     }
 
     #[cfg(test)]
@@ -379,7 +300,6 @@ impl FSMetaApp {
             source,
             sink,
             &pending.bound_scopes,
-            !pending.runtime_managed,
         )?
         .into_iter()
         .collect())
@@ -494,6 +414,8 @@ impl FSMetaApp {
         // runtime confirms external exposure; materialized `/tree` and `/stats`
         // readiness is enforced at the query surface so `/on-demand-force-find`
         // can become available earlier.
+
+        sink.ensure_started()?;
 
         eprintln!("fs_meta_runtime_app: spawning facade api server generation={} route_key={} resources={:?}", pending.generation, pending.route_key, pending.resource_ids);
         let handle = api::spawn(
@@ -731,12 +653,6 @@ impl FSMetaApp {
         }
         let candidate_resource_ids = Self::facade_candidate_resource_ids(bound_scopes);
         let runtime_managed = self.runtime_boundary.is_some();
-        let candidate_group_ids = Self::facade_candidate_group_ids(
-            self.source.as_ref(),
-            self.sink.as_ref(),
-            bound_scopes,
-            !runtime_managed,
-        )?;
         let resolved = self
             .config
             .api
@@ -770,7 +686,7 @@ impl FSMetaApp {
             generation,
             resource_ids: candidate_resource_ids,
             bound_scopes: bound_scopes.to_vec(),
-            group_ids: candidate_group_ids,
+            group_ids: Vec::new(),
             runtime_managed,
             runtime_exposure_confirmed,
             resolved,
@@ -984,14 +900,6 @@ impl RuntimeBoundaryApp for FSMetaApp {
 
     async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
-        if !source_signals.is_empty() {
-            self.source
-                .apply_orchestration_signals(&source_signals)
-                .await?;
-        }
-        if !sink_signals.is_empty() {
-            self.sink.apply_orchestration_signals(&sink_signals).await?;
-        }
         for signal in facade_signals {
             match signal {
                 FacadeControlSignal::Activate {
@@ -1053,6 +961,14 @@ impl RuntimeBoundaryApp for FSMetaApp {
                 | FacadeControlSignal::Passthrough => {}
             }
         }
+        if !source_signals.is_empty() {
+            self.source
+                .apply_orchestration_signals(&source_signals)
+                .await?;
+        }
+        if !sink_signals.is_empty() {
+            self.sink.apply_orchestration_signals(&sink_signals).await?;
+        }
         Ok(())
     }
 
@@ -1063,9 +979,6 @@ impl RuntimeBoundaryApp for FSMetaApp {
         self.source.close().await?;
         self.sink.close().await?;
         if let Some(handle) = self.pump_task.lock().await.take() {
-            handle.abort();
-        }
-        if let Some(handle) = self.bootstrap_task.lock().await.take() {
             handle.abort();
         }
         Ok(())
@@ -1328,7 +1241,7 @@ mod tests {
 
     fn activate_envelope(unit_id: &str) -> ControlEnvelope {
         encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             worker_id: unit_id.to_string(),
             lease: None,
             generation: 1,
@@ -1353,7 +1266,7 @@ mod tests {
         generation: u64,
     ) -> ControlEnvelope {
         encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             worker_id: unit_id.to_string(),
             lease: None,
             generation,
@@ -1396,7 +1309,7 @@ mod tests {
     #[allow(dead_code)]
     fn tick_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
         encode_worker_tick_envelope(&WorkerTick {
-            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             worker_id: unit_id.to_string(),
             generation,
             at_ms: 1,
@@ -1407,7 +1320,7 @@ mod tests {
     #[allow(dead_code)]
     fn trusted_exposure_confirmed_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
         encode_trusted_exposure_confirmed_envelope(&TrustedExposureConfirmed {
-            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             worker_id: unit_id.to_string(),
             generation,
             confirmed_at_us: 1,
@@ -1778,7 +1691,7 @@ mod tests {
 
         app.apply_facade_activate(
             FacadeRuntimeUnit::Facade,
-            FACADE_CONTROL_ROUTE_KEY,
+            ROUTE_KEY_FACADE_CONTROL,
             2,
             &[capanix_route_proto::BoundScope {
                 scope_id: "test-root".to_string(),
@@ -1805,8 +1718,8 @@ mod tests {
             pending.resource_ids,
             vec!["single-app-listener".to_string()]
         );
-        assert_eq!(pending.group_ids, vec!["test-root".to_string()]);
-        assert_eq!(pending.route_key, FACADE_CONTROL_ROUTE_KEY);
+        assert!(pending.group_ids.is_empty());
+        assert_eq!(pending.route_key, ROUTE_KEY_FACADE_CONTROL);
         assert!(pending.runtime_managed);
         assert!(!pending.runtime_exposure_confirmed);
         app.close().await.expect("close fs-meta app");
@@ -1871,7 +1784,7 @@ mod tests {
             handle: existing,
         });
         let readiness_pending = PendingFacadeActivation {
-            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
             bound_scopes: vec![capanix_route_proto::BoundScope {
@@ -1976,7 +1889,7 @@ mod tests {
 
         app.apply_facade_activate(
             FacadeRuntimeUnit::Facade,
-            FACADE_CONTROL_ROUTE_KEY,
+            ROUTE_KEY_FACADE_CONTROL,
             2,
             &[capanix_route_proto::BoundScope {
                 scope_id: "test-root".to_string(),
@@ -2089,7 +2002,7 @@ mod tests {
 
         app.apply_facade_activate(
             FacadeRuntimeUnit::Facade,
-            FACADE_CONTROL_ROUTE_KEY,
+            ROUTE_KEY_FACADE_CONTROL,
             2,
             &[capanix_route_proto::BoundScope {
                 scope_id: "test-root".to_string(),
@@ -2188,7 +2101,7 @@ mod tests {
         .expect("init app");
 
         let pending = PendingFacadeActivation {
-            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
             bound_scopes: vec![capanix_route_proto::BoundScope {
@@ -2247,7 +2160,7 @@ mod tests {
         .expect("init app");
 
         let pending = PendingFacadeActivation {
-            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
             bound_scopes: vec![capanix_route_proto::BoundScope {
@@ -2368,7 +2281,7 @@ mod tests {
         );
 
         let pending = PendingFacadeActivation {
-            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
             bound_scopes: vec![capanix_route_proto::BoundScope {

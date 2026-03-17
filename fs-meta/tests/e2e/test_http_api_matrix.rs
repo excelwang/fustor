@@ -33,20 +33,21 @@ pub fn run() -> Result<(), String> {
         cluster.build_fs_meta_release(&app_id, &facade_resource_id, roots.clone(), 1, true)?;
     cluster.apply_release("node-a", release)?;
 
-    let base_url = cluster.wait_http_login_ready(
-        &facade_addrs
-            .iter()
-            .map(|addr| format!("http://{addr}"))
-            .collect::<Vec<_>>(),
-        "operator",
-        "operator123",
-        Duration::from_secs(120),
-    )?;
-    let client = FsMetaApiClient::new(base_url)?;
     let candidate_base_urls = facade_addrs
         .iter()
         .map(|addr| format!("http://{addr}"))
         .collect::<Vec<_>>();
+    let base_url = cluster.wait_http_login_ready(
+        &candidate_base_urls,
+        "operator",
+        "operator123",
+        Duration::from_secs(120),
+    )?;
+    eprintln!(
+        "[fs-meta-api-matrix] base_url={} candidates={:?}",
+        base_url, candidate_base_urls
+    );
+    let client = FsMetaApiClient::new(base_url)?;
 
     eprintln!("[fs-meta-api-matrix] step=login-matrix");
     run_login_matrix(&client)?;
@@ -417,6 +418,7 @@ fn run_query_matrix(
         ],
     )?;
 
+    eprintln!("[fs-meta-api-matrix] substep=query-all-tree");
     let all_tree = session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
     let all_groups = all_tree
         .get("groups")
@@ -431,6 +433,7 @@ fn run_query_matrix(
         FsTreeOracle::grouped_tree_response(&all_mounts, "/", true, None, 1_000, "group-key", 64)?;
     assert_json_eq("all groups tree", &all_tree, &expected_all_tree)?;
 
+    eprintln!("[fs-meta-api-matrix] substep=query-non-recursive-tree");
     let tree_non_recursive = session.tree(&[
         ("path", "/data".to_string()),
         ("recursive", "false".to_string()),
@@ -450,6 +453,7 @@ fn run_query_matrix(
         &expected_non_recursive,
     )?;
 
+    eprintln!("[fs-meta-api-matrix] substep=query-max-depth-tree");
     let tree_max_depth = session.tree(&[
         ("path", "/nested".to_string()),
         ("recursive", "true".to_string()),
@@ -466,6 +470,7 @@ fn run_query_matrix(
     )?;
     assert_json_eq("max_depth tree", &tree_max_depth, &expected_max_depth)?;
 
+    eprintln!("[fs-meta-api-matrix] substep=query-force-find-all");
     let find_all =
         session.force_find(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
     let expected_find_all = FsTreeOracle::grouped_force_find_response(
@@ -509,11 +514,13 @@ fn run_query_matrix(
         ));
     }
 
+    eprintln!("[fs-meta-api-matrix] substep=query-stats");
     let stats = session.stats(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
     let expected_stats = FsTreeOracle::stats_response(&all_mounts, "/", true, None)?;
     assert_json_eq("nfs1 stats", &stats, &expected_stats)?;
 
     let file_path = "/nested/child/deep.txt";
+    eprintln!("[fs-meta-api-matrix] substep=query-file-tree");
     let file_tree = session.tree(&[
         ("path", file_path.to_string()),
         ("recursive", "true".to_string()),
@@ -881,6 +888,7 @@ fn run_query_matrix(
         ));
     }
 
+    eprintln!("[fs-meta-api-matrix] substep=query-live-force-find");
     let live_force_find = session.force_find(&[
         ("path", "/live-only".to_string()),
         ("recursive", "true".to_string()),

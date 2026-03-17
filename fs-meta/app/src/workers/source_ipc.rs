@@ -80,6 +80,7 @@ pub enum SourceWorkerResponse {
     LastForceFindRunnerByGroup(BTreeMap<String, String>),
     ForceFindInflightGroups(Vec<String>),
     ResolveGroupIdForObjectRef(Option<String>),
+    InvalidInput(String),
     Error(String),
 }
 

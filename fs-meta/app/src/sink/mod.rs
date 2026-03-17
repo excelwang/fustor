@@ -12,6 +12,7 @@ pub(crate) mod tree;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
@@ -414,6 +415,7 @@ impl SinkStateCell {
 /// Concurrency model:
 /// - `send()` takes write lock on SinkState (exclusive)
 /// - `recv()` / `req()` + query handlers take read lock (shared)
+#[derive(Clone)]
 pub struct SinkFileMeta {
     state: SinkStateCell,
     root_specs: Arc<RwLock<Vec<RootSpec>>>,
@@ -423,6 +425,8 @@ pub struct SinkFileMeta {
     unit_control: Arc<RuntimeUnitGate>,
     shutdown: CancellationToken,
     endpoint_tasks: Arc<Mutex<Vec<ManagedEndpointTask>>>,
+    runtime_refresh_dirty: Arc<AtomicBool>,
+    runtime_refresh_running: Arc<AtomicBool>,
 }
 
 impl SinkFileMeta {
@@ -457,16 +461,12 @@ impl SinkFileMeta {
         boundary: Option<Arc<dyn ChannelIoSubset>>,
         state_boundary: Arc<dyn StateBoundary>,
         source_cfg: SourceConfig,
-        defer_authority_read: bool,
+        _defer_authority_read: bool,
     ) -> Result<Self> {
-        let authority = if defer_authority_read {
-            AuthorityJournal::deferred_from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
-        } else {
-            AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
-        }
-        .map_err(|err| {
-            CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
-        })?;
+        let authority = AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
+            .map_err(|err| {
+                CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
+            })?;
         let state = SinkStateCell::new(&source_cfg, CommitBoundary::new(authority));
         let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
         let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
@@ -486,6 +486,8 @@ impl SinkFileMeta {
             unit_control: unit_control.clone(),
             shutdown: CancellationToken::new(),
             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+            runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+            runtime_refresh_running: Arc::new(AtomicBool::new(false)),
         };
 
         if boundary.is_some() {
@@ -532,6 +534,8 @@ impl SinkFileMeta {
                                     unit_control: query_unit_control.clone(),
                                     shutdown: CancellationToken::new(),
                                     endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                    runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                                    runtime_refresh_running: Arc::new(AtomicBool::new(false)),
                                 };
                                 let mut events =
                                     sink_impl.materialized_query(&params).unwrap_or_default();
@@ -597,6 +601,8 @@ impl SinkFileMeta {
                                     unit_control: internal_query_unit_control.clone(),
                                     shutdown: CancellationToken::new(),
                                     endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                    runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                                    runtime_refresh_running: Arc::new(AtomicBool::new(false)),
                                 };
                                 let mut events =
                                     sink_impl.materialized_query(&params).unwrap_or_default();
@@ -650,7 +656,7 @@ impl SinkFileMeta {
                         let mut responses = Vec::new();
 
                         for req in requests {
-                            let _params = match rmp_serde::from_slice::<InternalQueryRequest>(
+                            let params = match rmp_serde::from_slice::<InternalQueryRequest>(
                                 req.payload_bytes(),
                             ) {
                                 Ok(p) => p,
@@ -676,6 +682,11 @@ impl SinkFileMeta {
                                 Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
                             ) {
                                 Ok(source_events) => {
+                                    eprintln!(
+                                        "fs_meta_sink: public find proxy ok node={} events={}",
+                                        node_id_proxy.0,
+                                        source_events.len()
+                                    );
                                     for event in source_events {
                                         let mut meta = event.metadata().clone();
                                         meta.correlation_id = req.metadata().correlation_id;
@@ -686,6 +697,10 @@ impl SinkFileMeta {
                                     }
                                 }
                                 Err(e) => {
+                                    eprintln!(
+                                        "fs_meta_sink: public find proxy err node={} err={}",
+                                        node_id_proxy.0, e
+                                    );
                                     log::error!("find proxy upstream route call failed: {:?}", e);
                                     responses.push(build_error_marker_event(
                                         &node_id_proxy,
@@ -723,6 +738,8 @@ impl SinkFileMeta {
                     unit_control: stream_unit_control,
                     shutdown: CancellationToken::new(),
                     endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                    runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                    runtime_refresh_running: Arc::new(AtomicBool::new(false)),
                 });
                 let stream_sink_ready = stream_sink.clone();
                 let stream_sink_apply = stream_sink.clone();
@@ -749,39 +766,6 @@ impl SinkFileMeta {
             }
         }
 
-        Ok(sink)
-    }
-
-    pub fn with_state_boundary_deferred_runtime_endpoints(
-        state_boundary: Arc<dyn StateBoundary>,
-        source_cfg: SourceConfig,
-    ) -> Result<Self> {
-        let authority =
-            AuthorityJournal::deferred_from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
-                .map_err(|err| {
-                    CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
-                })?;
-        let state = SinkStateCell::new(&source_cfg, CommitBoundary::new(authority));
-        let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
-        let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
-        let visibility_lag = Arc::new(Mutex::new(VisibilityLagTelemetry::default()));
-        let pending_stream_events = Arc::new(Mutex::new(VecDeque::new()));
-        let unit_control = Arc::new(RuntimeUnitGate::new_runtime_managed(
-            "sink-file-meta",
-            SINK_RUNTIME_UNITS,
-        ));
-        let sink = Self {
-            state,
-            root_specs,
-            host_object_grants,
-            visibility_lag,
-            pending_stream_events,
-            unit_control,
-            shutdown: CancellationToken::new(),
-            endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-        };
-
-        sink.reconcile_runtime_groups(&source_cfg.host_object_grants)?;
         Ok(sink)
     }
 
@@ -832,6 +816,8 @@ impl SinkFileMeta {
                                 unit_control: query_unit_control.clone(),
                                 shutdown: CancellationToken::new(),
                                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                                runtime_refresh_running: Arc::new(AtomicBool::new(false)),
                             };
                             let mut events =
                                 sink_impl.materialized_query(&params).unwrap_or_default();
@@ -893,6 +879,8 @@ impl SinkFileMeta {
                                 unit_control: internal_query_unit_control.clone(),
                                 shutdown: CancellationToken::new(),
                                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                                runtime_refresh_running: Arc::new(AtomicBool::new(false)),
                             };
                             let mut events =
                                 sink_impl.materialized_query(&params).unwrap_or_default();
@@ -1007,6 +995,8 @@ impl SinkFileMeta {
                 unit_control: stream_unit_control,
                 shutdown: CancellationToken::new(),
                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                runtime_refresh_running: Arc::new(AtomicBool::new(false)),
             });
             let stream_sink_ready = stream_sink.clone();
             let stream_sink_apply = stream_sink.clone();
@@ -1166,6 +1156,11 @@ impl SinkFileMeta {
         let mut validated = 0usize;
         let mut pending_host_object_grants: Option<Vec<GrantedMountRoot>> = None;
         let mut refresh_runtime_groups = false;
+        eprintln!(
+            "fs_meta_sink: apply_orchestration_signals count={} has_runtime_state={}",
+            signals.len(),
+            self.unit_control.has_runtime_state()
+        );
         for signal in signals {
             match signal {
                 SinkControlSignal::Activate {
@@ -1236,12 +1231,17 @@ impl SinkFileMeta {
             }
         }
 
-        if let Some(host_object_grants) = pending_host_object_grants {
+        eprintln!(
+            "fs_meta_sink: orchestration validated={} refresh_runtime_groups={} scheduled_groups={:?} scheduled_stream_targets={:?}",
+            validated,
+            refresh_runtime_groups,
+            self.scheduled_group_ids()?,
+            self.scheduled_stream_object_refs()?
+        );
+        if let Some(host_object_grants) = pending_host_object_grants.as_ref() {
             *self.host_object_grants.write().map_err(|_| {
                 CnxError::Internal("Sink host_object_grants lock poisoned".into())
             })? = host_object_grants.clone();
-            self.reconcile_runtime_groups(&host_object_grants)?;
-            self.flush_buffered_stream_events()?;
             self.state.record_authoritative_commit(
                 "runtime.exec.host_object_grants.changed",
                 format!(
@@ -1253,13 +1253,67 @@ impl SinkFileMeta {
                     host_object_grants.len()
                 ),
             );
-        } else if refresh_runtime_groups {
-            let grants = self.logical_grants_snapshot()?;
-            self.reconcile_runtime_groups(&grants)?;
-            self.flush_buffered_stream_events()?;
+        }
+        if pending_host_object_grants.is_some() || refresh_runtime_groups {
+            self.schedule_runtime_group_refresh();
         }
         log::debug!("sink-file-meta accepted {} control envelope(s)", validated);
         Ok(())
+    }
+
+    fn schedule_runtime_group_refresh(&self) {
+        self.runtime_refresh_dirty.store(true, Ordering::Release);
+        if self
+            .runtime_refresh_running
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+
+        let sink = self.clone();
+        let _ = std::thread::Builder::new()
+            .name("fs-meta-sink-runtime-refresh".to_string())
+            .spawn(move || {
+                crate::runtime_app::shared_tokio_runtime().block_on(sink.runtime_group_refresh_loop());
+            });
+    }
+
+    async fn runtime_group_refresh_loop(self) {
+        loop {
+            self.runtime_refresh_dirty.store(false, Ordering::Release);
+            let result = self.logical_grants_snapshot().and_then(|grants| {
+                self.reconcile_runtime_groups(&grants)?;
+                self.flush_buffered_stream_events()
+            });
+            if let Err(err) = result {
+                if !self.shutdown.is_cancelled() {
+                    log::error!("sink runtime refresh failed: {err}");
+                }
+            }
+            if self.shutdown.is_cancelled() || !self.runtime_refresh_dirty.load(Ordering::Acquire) {
+                break;
+            }
+        }
+
+        self.runtime_refresh_running.store(false, Ordering::Release);
+        if self.shutdown.is_cancelled() {
+            return;
+        }
+        if self.runtime_refresh_dirty.load(Ordering::Acquire)
+            && self
+                .runtime_refresh_running
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            let sink = self.clone();
+            let _ = std::thread::Builder::new()
+                .name("fs-meta-sink-runtime-refresh".to_string())
+                .spawn(move || {
+                    crate::runtime_app::shared_tokio_runtime()
+                        .block_on(sink.runtime_group_refresh_loop());
+                });
+        }
     }
 
     fn logical_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
@@ -1770,7 +1824,7 @@ impl RuntimeBoundaryApp for SinkFileMeta {
     /// on_control_frame: ingress-only boundary; decode to typed signals first.
     async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let signals = sink_control_signals_from_envelopes(envelopes)?;
-        self.apply_orchestration_signals(&signals).await
+        self.apply_orchestration_signals(&signals).await.map(|_| ())
     }
 
     /// Graceful shutdown.

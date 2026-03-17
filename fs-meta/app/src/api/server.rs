@@ -1,3 +1,4 @@
+use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -9,7 +10,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
 };
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
@@ -30,22 +30,37 @@ use super::facade_status::SharedFacadePendingStatusCell;
 use super::handlers;
 use super::state::ApiState;
 
+enum ApiServerJoin {
+    Thread(std::thread::JoinHandle<()>),
+}
+
 pub struct ApiServerHandle {
     shutdown: CancellationToken,
-    join: JoinHandle<()>,
+    join: Option<ApiServerJoin>,
 }
 
 impl ApiServerHandle {
-    pub async fn shutdown(self, timeout: Duration) {
+    pub async fn shutdown(mut self, timeout: Duration) {
         eprintln!("fs_meta_api_server: shutdown requested");
         self.shutdown.cancel();
-        match tokio::time::timeout(timeout, self.join).await {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                log::warn!("fs-meta api server join failed: {:?}", err);
-            }
-            Err(_) => {
-                log::warn!("fs-meta api server shutdown timed out");
+        let Some(join) = self.join.take() else {
+            return;
+        };
+        match join {
+            ApiServerJoin::Thread(join) => {
+                let blocking_join = tokio::task::spawn_blocking(move || join.join());
+                match tokio::time::timeout(timeout, blocking_join).await {
+                    Ok(Ok(Ok(()))) => {}
+                    Ok(Ok(Err(err))) => {
+                        log::warn!("fs-meta api server thread panicked: {:?}", err);
+                    }
+                    Ok(Err(err)) => {
+                        log::warn!("fs-meta api server join wrapper failed: {:?}", err);
+                    }
+                    Err(_) => {
+                        log::warn!("fs-meta api server shutdown timed out");
+                    }
+                }
             }
         }
     }
@@ -67,7 +82,7 @@ pub async fn spawn(
     })?);
 
     let initial_policy =
-        projection_policy_from_host_object_grants(&source.host_object_grants_snapshot()?);
+        projection_policy_from_host_object_grants(&source.cached_host_object_grants_snapshot()?);
     let projection_policy = Arc::new(RwLock::new(initial_policy));
     let state = ApiState {
         node_id,
@@ -80,33 +95,86 @@ pub async fn spawn(
     };
     refresh_policy_from_host_object_grants(
         &state.projection_policy,
-        &state.source.host_object_grants_snapshot()?,
+        &state.source.cached_host_object_grants_snapshot()?,
     );
     let app = router(state)?;
 
-    eprintln!("fs_meta_api_server: binding {}", cfg.bind_addr);
-    let listener = tokio::net::TcpListener::bind(&cfg.bind_addr)
-        .await
-        .map_err(|e| CnxError::InvalidInput(format!("fs-meta api bind failed: {e}")))?;
-
     let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();
-
-    eprintln!("fs_meta_api_server: bound {}", cfg.bind_addr);
     let bind_addr_for_log = cfg.bind_addr.clone();
-    let join = tokio::spawn(async move {
-        eprintln!("fs_meta_api_server: serving {}", bind_addr_for_log);
-        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-            shutdown_signal.cancelled().await;
+    let (ready_tx, ready_rx) = sync_channel(1);
+
+    let join = ApiServerJoin::Thread(std::thread::spawn(move || {
+        let worker_threads = std::thread::available_parallelism()
+            .map(|n| n.get().clamp(4, 8))
+            .unwrap_or(4);
+        let runtime = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(worker_threads)
+            .thread_name("fs-meta-api")
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                let _ = ready_tx.send(Err(format!("fs-meta api runtime build failed: {err}")));
+                return;
+            }
+        };
+
+        runtime.block_on(async move {
+            eprintln!("fs_meta_api_server: binding {}", bind_addr_for_log);
+            let listener = match tokio::net::TcpListener::bind(&bind_addr_for_log).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    let _ = ready_tx.send(Err(format!("fs-meta api bind failed: {err}")));
+                    return;
+                }
+            };
+            let _ = ready_tx.send(Ok(()));
+            eprintln!("fs_meta_api_server: bound {}", bind_addr_for_log);
+            eprintln!("fs_meta_api_server: serving {}", bind_addr_for_log);
+            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                shutdown_signal.cancelled().await;
+            });
+
+            if let Err(err) = server.await {
+                log::error!("fs-meta api server failed: {:?}", err);
+            }
+            eprintln!("fs_meta_api_server: serve loop ended {}", bind_addr_for_log);
         });
+    }));
 
-        if let Err(err) = server.await {
-            log::error!("fs-meta api server failed: {:?}", err);
+    let ready = tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(10)))
+        .await
+        .map_err(|err| {
+            CnxError::Internal(format!("fs-meta api server ready wait join failed: {err}"))
+        })?;
+    match ready {
+        Ok(Ok(())) => Ok(ApiServerHandle {
+            shutdown,
+            join: Some(join),
+        }),
+        Ok(Err(err)) => {
+            shutdown.cancel();
+            match join {
+                ApiServerJoin::Thread(join) => {
+                    let _ = tokio::task::spawn_blocking(move || join.join()).await;
+                }
+            }
+            Err(CnxError::InvalidInput(err))
         }
-        eprintln!("fs_meta_api_server: serve loop ended {}", bind_addr_for_log);
-    });
-
-    Ok(ApiServerHandle { shutdown, join })
+        Err(err) => {
+            shutdown.cancel();
+            match join {
+                ApiServerJoin::Thread(join) => {
+                    let _ = tokio::task::spawn_blocking(move || join.join()).await;
+                }
+            }
+            Err(CnxError::InvalidInput(format!(
+                "fs-meta api bind readiness timed out: {err:?}"
+            )))
+        }
+    }
 }
 
 fn router(state: ApiState) -> Result<Router> {

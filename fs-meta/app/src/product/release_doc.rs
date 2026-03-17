@@ -1,4 +1,8 @@
 use crate::api::config::ApiAuthConfig;
+use crate::runtime::execution_units::SINK_RUNTIME_UNIT_ID;
+use crate::runtime::routes::{
+    ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
+};
 use crate::source::config::RootSpec;
 
 #[derive(Debug, Clone)]
@@ -48,6 +52,7 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
                 "runtime": {
                     "control_subscriptions": ["runtime.host_object_grants.changed"],
                     "app_scopes": build_app_scopes_json(spec),
+                    "route_units": build_route_units_json(),
                     "units": {
                         "runtime.exec.scan": {
                             "interval_ms": 30000,
@@ -75,6 +80,35 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
             }
         ]
     })
+}
+
+fn request_reply_activation_route_key(base: &str) -> String {
+    format!("{base}.req")
+}
+
+fn stream_activation_route_key(base: &str) -> String {
+    format!("{base}.stream")
+}
+
+fn build_route_units_json() -> serde_json::Value {
+    let mut route_units = serde_json::Map::new();
+    route_units.insert(
+        stream_activation_route_key(ROUTE_KEY_FACADE_CONTROL),
+        serde_json::json!(["runtime.exec.facade"]),
+    );
+    route_units.insert(
+        request_reply_activation_route_key(ROUTE_KEY_QUERY),
+        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+    );
+    route_units.insert(
+        request_reply_activation_route_key(ROUTE_KEY_FORCE_FIND),
+        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+    );
+    route_units.insert(
+        stream_activation_route_key(ROUTE_KEY_EVENTS),
+        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+    );
+    serde_json::Value::Object(route_units)
 }
 
 fn build_app_scopes_json(spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {

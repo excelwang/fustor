@@ -89,6 +89,7 @@ pub enum SinkWorkerResponse {
     StatusSnapshot(SinkStatusSnapshot),
     VisibilityLagSamples(Vec<VisibilityLagSample>),
     Events(Vec<Event>),
+    InvalidInput(String),
     Error(String),
 }
 

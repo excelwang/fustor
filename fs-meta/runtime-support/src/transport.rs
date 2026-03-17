@@ -98,7 +98,7 @@ impl RuntimeSupportTransport {
         ) {
             let _ = child.kill();
             let _ = child.wait();
-            bridge.join();
+            bridge.join_async();
             let _ = fs::remove_file(&paths.control_socket_path);
             let _ = fs::remove_file(&paths.data_socket_path);
             return Err(err);
@@ -149,11 +149,11 @@ impl RuntimeSupportTransport {
         if let Some(mut shutdown) = shutdown {
             let _ = shutdown.child.kill();
             let _ = shutdown.child.wait();
-            self.bridge.join();
+            self.bridge.join_async();
             let _ = fs::remove_file(&shutdown.control_socket_path);
             let _ = fs::remove_file(&shutdown.data_socket_path);
         } else {
-            self.bridge.join();
+            self.bridge.join_async();
         }
     }
 }

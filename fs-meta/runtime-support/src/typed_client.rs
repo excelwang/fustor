@@ -63,9 +63,9 @@ impl<Rpc: TypedWorkerRpc> TypedWorkerClient<Rpc> {
         timeout: Duration,
     ) -> Result<Rpc::Response> {
         let payload = Rpc::encode_request(&request)?;
-        let replies = self
-            .transport
-            .ask(Bytes::from(payload), timeout, Rpc::unavailable_label())?;
+        let replies =
+            self.transport
+                .ask(Bytes::from(payload), timeout, Rpc::unavailable_label())?;
         let first = first_reply(&replies)?;
         let response = Rpc::decode_response(first.payload_bytes())?;
         Rpc::into_result(response)

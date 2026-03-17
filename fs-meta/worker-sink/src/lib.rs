@@ -34,6 +34,13 @@ struct SinkWorkerState {
     endpoints_started: bool,
 }
 
+fn classify_sink_worker_error(err: CnxError) -> SinkWorkerResponse {
+    match err {
+        CnxError::InvalidInput(message) => SinkWorkerResponse::InvalidInput(message),
+        other => SinkWorkerResponse::Error(other.to_string()),
+    }
+}
+
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_micros() as u64,
@@ -59,7 +66,9 @@ fn process_worker_request(
                 Duration::from_millis(config.sink_tombstone_ttl_ms.max(1));
             source_cfg.sink_tombstone_tolerance_us = config.sink_tombstone_tolerance_us;
             source_cfg.sink_execution_mode = SinkExecutionMode::InProcess;
-            match SinkFileMeta::with_state_boundary_deferred_runtime_endpoints(
+            match SinkFileMeta::with_boundaries_and_state(
+                NodeId(node_id.clone()),
+                None,
                 state_boundary,
                 source_cfg,
             ) {
@@ -116,7 +125,7 @@ fn process_worker_request(
         } => match state.sink.as_ref() {
             Some(sink) => match sink.update_logical_roots(roots, &host_object_grants) {
                 Ok(_) => (SinkWorkerResponse::Ack, false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                Err(err) => (classify_sink_worker_error(err), false),
             },
             None => (
                 SinkWorkerResponse::Error("sink worker not initialized".into()),
