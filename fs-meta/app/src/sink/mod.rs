@@ -1175,6 +1175,76 @@ impl SinkFileMeta {
         Ok(())
     }
 
+    pub fn start_stream_endpoint(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+        node_id: NodeId,
+    ) -> Result<()> {
+        eprintln!(
+            "fs_meta_sink: start_stream_endpoint requested node={}",
+            node_id.0
+        );
+        if !lock_or_recover(&self.endpoint_tasks, "sink.start_stream_endpoint").is_empty() {
+            eprintln!(
+                "fs_meta_sink: start_stream_endpoint skipped node={} reason=already-started",
+                node_id.0
+            );
+            return Ok(());
+        }
+
+        let routes = default_route_bindings();
+        let stream_state = self.state.clone();
+        let stream_root_specs = self.root_specs.clone();
+        let stream_host_object_grants = self.host_object_grants.clone();
+        let stream_visibility_lag = self.visibility_lag.clone();
+        let stream_unit_control = self.unit_control.clone();
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
+            eprintln!(
+                "fs_meta_sink: start_stream_endpoint binding route={} node={}",
+                route.0, node_id.0
+            );
+            log::info!(
+                "bound stream route listening on {}.{} for sink {}",
+                ROUTE_TOKEN_FS_META_EVENTS,
+                METHOD_STREAM,
+                node_id.0
+            );
+            let stream_sink = Arc::new(SinkFileMeta {
+                state: stream_state,
+                root_specs: stream_root_specs,
+                host_object_grants: stream_host_object_grants,
+                visibility_lag: stream_visibility_lag,
+                pending_stream_events: self.pending_stream_events.clone(),
+                unit_control: stream_unit_control,
+                shutdown: self.shutdown.clone(),
+                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                runtime_refresh_running: Arc::new(AtomicBool::new(false)),
+            });
+            let stream_sink_ready = stream_sink.clone();
+            let stream_sink_apply = stream_sink.clone();
+            let endpoint = ManagedEndpointTask::spawn_stream(
+                boundary,
+                route,
+                format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+                self.shutdown.clone(),
+                move || stream_sink_ready.has_scheduled_stream_targets(),
+                move |events| {
+                    if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
+                        log::error!("sink stream ingest failed: {:?}", err);
+                    }
+                },
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_stream_endpoint.endpoint_tasks",
+            )
+            .push(endpoint);
+        }
+
+        Ok(())
+    }
+
     fn apply_activate_signal(
         &self,
         unit: SinkRuntimeUnit,
@@ -1208,7 +1278,16 @@ impl SinkFileMeta {
     }
 
     fn scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
-        Ok(None)
+        let Some(bound_scopes) = self.scheduled_bound_scopes()? else {
+            return Ok(None);
+        };
+        Ok(Some(
+            bound_scopes
+                .into_iter()
+                .map(|scope| scope.scope_id)
+                .filter(|scope_id| !scope_id.trim().is_empty())
+                .collect(),
+        ))
     }
 
     pub fn scheduled_group_ids_snapshot(&self) -> Result<Option<BTreeSet<String>>> {
@@ -1216,7 +1295,30 @@ impl SinkFileMeta {
     }
 
     fn scheduled_stream_object_refs(&self) -> Result<Option<BTreeSet<String>>> {
-        Ok(None)
+        let Some(allowed_groups) = self.scheduled_group_ids()? else {
+            return Ok(None);
+        };
+        if allowed_groups.is_empty() {
+            return Ok(Some(BTreeSet::new()));
+        }
+        let roots = self
+            .root_specs
+            .read()
+            .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
+            .clone();
+        let grants = self.logical_grants_snapshot()?;
+        let mut object_refs = BTreeSet::new();
+        for root in roots {
+            if !allowed_groups.contains(&root.id) {
+                continue;
+            }
+            for grant in &grants {
+                if root.selector.matches(grant) {
+                    object_refs.insert(grant.object_ref.clone());
+                }
+            }
+        }
+        Ok(Some(object_refs))
     }
 
     fn reconcile_runtime_groups(&self, host_object_grants: &[GrantedMountRoot]) -> Result<()> {
@@ -1904,6 +2006,19 @@ impl SinkFileMeta {
         for (group_id, group) in &state.groups {
             if selected_group.is_some_and(|selected| selected != group_id.as_str()) {
                 continue;
+            }
+            if request.op == QueryOp::Tree {
+                let sample_path = group
+                    .tree
+                    .iter()
+                    .map(|(path, _)| String::from_utf8_lossy(path).into_owned())
+                    .next();
+                eprintln!(
+                    "fs_meta_sink: materialized_query group={} query_path={} sample_path={:?}",
+                    group_id,
+                    String::from_utf8_lossy(&dir_path),
+                    sample_path
+                );
             }
             let payload = match request.op {
                 QueryOp::Tree => {

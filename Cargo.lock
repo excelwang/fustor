@@ -857,6 +857,7 @@ dependencies = [
  "capanix-route-proto",
  "capanix-runtime-api",
  "capanix-specs-vocabulary",
+ "libc",
  "reqwest",
  "ring",
  "rmp-serde",

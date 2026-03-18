@@ -347,6 +347,30 @@ fn process_worker_request(
                 false,
             ),
         },
+        SourceWorkerRequest::ForceFind { request } => match state.source.as_ref() {
+            Some(source) => {
+                eprintln!(
+                    "fs_meta_source_worker: ForceFind selected_group={:?} recursive={} path={}",
+                    request.scope.selected_group,
+                    request.scope.recursive,
+                    String::from_utf8_lossy(&request.scope.path)
+                );
+                match source.force_find(&request) {
+                    Ok(events) => {
+                        eprintln!(
+                            "fs_meta_source_worker: ForceFind response events={}",
+                            events.len()
+                        );
+                        (SourceWorkerResponse::Events(events), false)
+                    }
+                    Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
+                }
+            }
+            None => (
+                SourceWorkerResponse::Error("source worker not initialized".into()),
+                false,
+            ),
+        },
         SourceWorkerRequest::ResolveGroupIdForObjectRef { object_ref } => {
             match state.source.as_ref() {
                 Some(source) => (

@@ -1,23 +1,18 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
 use capanix_app_fs_meta_runtime_support::{
     TypedWorkerClient, TypedWorkerRpc, encode_control_frame,
 };
 use capanix_app_sdk::raw::{BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest};
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
 use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryApp};
-use capanix_host_adapter_fs_meta::HostAdapter;
 use futures_util::StreamExt;
 use tokio::task::JoinHandle;
 
 use crate::query::request::InternalQueryRequest;
 use crate::runtime::orchestration::SourceControlSignal;
-use crate::runtime::routes::{
-    METHOD_SOURCE_FIND, ROUTE_KEY_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-};
-use crate::runtime::seam::exchange_host_adapter;
+use crate::runtime::routes::ROUTE_KEY_EVENTS;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig, SourceExecutionMode};
 use crate::source::{FSMetaSource, SourceStatusSnapshot};
 use crate::workers::sink::SinkFacade;
@@ -29,7 +24,6 @@ use crate::workers::source_ipc::{
 const SOURCE_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
-const SOURCE_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_INIT_RPC_TIMEOUT: Duration = Duration::from_secs(120);
 const SOURCE_WORKER_INIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(240);
 const SOURCE_WORKER_START_RPC_TIMEOUT: Duration = Duration::from_secs(180);
@@ -1154,21 +1148,16 @@ impl SourceWorkerClient {
     }
 
     pub fn force_find(&self, params: InternalQueryRequest) -> Result<Vec<Event>> {
-        let adapter = exchange_host_adapter(
-            self.data_boundary.clone(),
-            self.node_id.clone(),
-            default_route_bindings(),
-        );
-        let payload = rmp_serde::to_vec(&params).map_err(|err| {
-            CnxError::Internal(format!("source worker force-find encode failed: {err}"))
-        })?;
-        adapter.call_collect(
-            ROUTE_TOKEN_FS_META_INTERNAL,
-            METHOD_SOURCE_FIND,
-            Bytes::from(payload),
+        match self.conn.call_with_timeout(
+            SourceWorkerRequest::ForceFind { request: params },
             SOURCE_WORKER_FORCE_FIND_TIMEOUT,
-            SOURCE_WORKER_FORCE_FIND_REPLY_IDLE_GRACE,
-        )
+        )? {
+            SourceWorkerResponse::Events(events) => Ok(events),
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for force-find: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {

@@ -1,13 +1,15 @@
 use crate::api::config::ApiAuthConfig;
 use crate::runtime::execution_units::{
-    SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
+    QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
 use crate::runtime::routes::{
     ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
-    ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
-    ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+    ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL,
+    ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
+    ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
 };
 use crate::source::config::RootSpec;
+use capanix_app_sdk::runtime::{RouteKey, RoutePlanMode, RoutePlanSpec};
 
 #[derive(Debug, Clone)]
 pub struct FsMetaReleaseSpec {
@@ -39,6 +41,7 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
         "schema_version": "scope-unit-intent-v1",
         "target_id": spec.app_id,
         "target_generation": generation_now(),
+        "route_plans": build_route_plans_json(spec),
         "units": [
             {
                 "unit_id": spec.app_id,
@@ -58,6 +61,12 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
                     "app_scopes": build_app_scopes_json(spec),
                     "route_units": build_route_units_json(),
                     "units": {
+                        "runtime.exec.query": {
+                            "enabled": true
+                        },
+                        "runtime.exec.query-peer": {
+                            "enabled": true
+                        },
                         "runtime.exec.scan": {
                             "interval_ms": 30000,
                             "enabled": true
@@ -69,6 +78,9 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
                     "state_carrier": {
                         "enabled": true,
                         "units": {
+                            "runtime.exec.query": {
+                                "enabled": false
+                            },
                             "runtime.exec.scan": {
                                 "enabled": false
                             },
@@ -84,6 +96,21 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
             }
         ]
     })
+}
+
+fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
+    let mut plans = Vec::new();
+    plans.push(serde_json::to_value(RoutePlanSpec {
+        route_key: RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)),
+        mode: RoutePlanMode::FanOut,
+        peers: Vec::new(),
+    }).unwrap_or_else(|_| serde_json::json!({})));
+    plans.push(serde_json::to_value(RoutePlanSpec {
+        route_key: RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)),
+        mode: RoutePlanMode::FanOut,
+        peers: Vec::new(),
+    }).unwrap_or_else(|_| serde_json::json!({})));
+    plans
 }
 
 fn request_reply_activation_route_key(base: &str) -> String {
@@ -102,7 +129,7 @@ fn build_route_units_json() -> serde_json::Value {
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_FIND_INTERNAL),
-        serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+        serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
@@ -114,15 +141,19 @@ fn build_route_units_json() -> serde_json::Value {
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_QUERY),
-        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+        serde_json::json!([QUERY_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_QUERY_INTERNAL),
         serde_json::json!([SINK_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
+        request_reply_activation_route_key(ROUTE_KEY_SINK_QUERY_PROXY),
+        serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
+    );
+    route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL),
-        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+        serde_json::json!([QUERY_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_FORCE_FIND),
@@ -130,7 +161,7 @@ fn build_route_units_json() -> serde_json::Value {
     );
     route_units.insert(
         stream_activation_route_key(ROUTE_KEY_EVENTS),
-        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+        serde_json::json!([SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID]),
     );
     serde_json::Value::Object(route_units)
 }
@@ -152,6 +183,11 @@ fn facade_app_scope_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
         "unit_scopes": [
             {
                 "unit_id": "runtime.exec.facade",
+                "eligibility": "resource_visible_nodes",
+                "cardinality": "one"
+            },
+            {
+                "unit_id": "runtime.exec.query",
                 "eligibility": "resource_visible_nodes",
                 "cardinality": "one"
             }
@@ -205,6 +241,11 @@ fn root_spec_app_scope_json(root: &RootSpec) -> serde_json::Value {
             "unit_id": "runtime.exec.source",
             "eligibility": "scope_members",
             "cardinality": "all"
+        }));
+        unit_scopes.push(serde_json::json!({
+            "unit_id": "runtime.exec.query-peer",
+            "eligibility": "resource_visible_nodes",
+            "cardinality": "one"
         }));
     }
     if root.scan {

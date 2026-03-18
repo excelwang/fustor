@@ -76,6 +76,7 @@ capanix-host-fs-types = { workspace = true }
 capanix-kernel-api = { workspace = true }
 capanix-route-proto = { workspace = true }
 capanix-runtime-api = "0.1.0"
+libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 ring = "0.17"
 rmp-serde = { workspace = true }

@@ -7,11 +7,16 @@ use crate::api::facade_status::{
 };
 use crate::query::TreeGroupPayload;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryNode, SubtreeStats};
+use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, split_app_control_signals,
 };
-use crate::runtime::routes::ROUTE_KEY_FACADE_CONTROL;
+use crate::runtime::routes::{
+    METHOD_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_QUERY,
+    ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
+};
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkWorkerClientHandle};
 use crate::workers::source::{SourceFacade, SourceWorkerClientHandle};
@@ -23,7 +28,7 @@ use capanix_app_sdk::raw::{
     ChannelSendRequest, StateBoundary,
 };
 use capanix_app_sdk::runtime::{
-    ConfigValue, ControlEnvelope, KernelResultEnvelope, LogLevel, NodeId, RecvOpts,
+    ConfigValue, ControlEnvelope, EventMetadata, KernelResultEnvelope, LogLevel, NodeId, RecvOpts,
     StateCellReadRequest, StateCellWatchRequest, StateCellWriteRequest, in_memory_state_boundary,
 };
 use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryApp};
@@ -79,6 +84,84 @@ fn now_us() -> u64 {
     }
 }
 
+fn attached_serving_nodes(
+    control_boundary: Arc<dyn ChannelBoundary>,
+    route_token: &str,
+    use_port: &str,
+    timeout: Duration,
+) -> Result<Vec<NodeId>> {
+    let replies = control_boundary.channel_attach(
+        BoundaryContext::default(),
+        ChannelAttachRequest {
+            route_token: route_token.to_string(),
+            use_port: use_port.to_string(),
+            timeout_ms: Some(timeout.as_millis() as u64),
+        },
+    )?;
+    let mut nodes = std::collections::BTreeSet::<String>::new();
+    let mut out = Vec::new();
+    for reply in replies {
+        if !reply.ok {
+            continue;
+        }
+        if nodes.insert(reply.serving_node.0.clone()) {
+            out.push(reply.serving_node);
+        }
+    }
+    Ok(out)
+}
+
+fn sink_query_owner_nodes_for_request(
+    source: &SourceFacade,
+    request: &InternalQueryRequest,
+) -> Result<Vec<NodeId>> {
+    let roots = source.logical_roots_snapshot()?;
+    let grants = source.host_object_grants_snapshot()?;
+    let selected_group = request.scope.selected_group.as_deref();
+    let mut out = Vec::new();
+    let mut seen = std::collections::BTreeSet::<String>::new();
+    for root in roots {
+        if selected_group.is_some_and(|selected| selected != root.id.as_str()) {
+            continue;
+        }
+        let mut member_ids = grants
+            .iter()
+            .filter(|grant| root.selector.matches(grant))
+            .map(|grant| (grant.object_ref.clone(), grant.active))
+            .collect::<Vec<_>>();
+        member_ids.sort_by(|a, b| a.0.cmp(&b.0));
+        let primary_object_ref = member_ids
+            .iter()
+            .find_map(|(object_ref, active)| active.then(|| object_ref.clone()))
+            .or_else(|| member_ids.first().map(|(object_ref, _)| object_ref.clone()));
+        let Some(primary_object_ref) = primary_object_ref else {
+            continue;
+        };
+        let Some((node_id, _)) = primary_object_ref.split_once("::") else {
+            continue;
+        };
+        if seen.insert(node_id.to_string()) {
+            out.push(NodeId(node_id.to_string()));
+        }
+    }
+    Ok(out)
+}
+
+fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
+    match unit {
+        FacadeRuntimeUnit::Facade => {
+            route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+        }
+        FacadeRuntimeUnit::Query => {
+            route_key == format!("{}.req", ROUTE_KEY_QUERY)
+                || route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
+        }
+        FacadeRuntimeUnit::QueryPeer => {
+            route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
+        }
+    }
+}
+
 pub struct FSMetaApp {
     config: FSMetaConfig,
     node_id: NodeId,
@@ -88,6 +171,8 @@ pub struct FSMetaApp {
     sink: Arc<SinkFacade>,
     query_sink: Arc<SinkFacade>,
     pump_task: Mutex<Option<JoinHandle<()>>>,
+    runtime_endpoint_tasks: Mutex<Vec<ManagedEndpointTask>>,
+    runtime_endpoint_routes: Mutex<std::collections::BTreeSet<String>>,
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
     facade_pending_status: SharedFacadePendingStatusCell,
@@ -194,12 +279,18 @@ impl FSMetaApp {
             sink,
             query_sink,
             pump_task: Mutex::new(None),
+            runtime_endpoint_tasks: Mutex::new(Vec::new()),
+            runtime_endpoint_routes: Mutex::new(std::collections::BTreeSet::new()),
             api_task: Arc::new(Mutex::new(None)),
             pending_facade: Arc::new(Mutex::new(None)),
             facade_pending_status: shared_facade_pending_status_cell(),
             facade_gate: RuntimeUnitGate::new(
                 "fs-meta",
-                &[execution_units::FACADE_RUNTIME_UNIT_ID],
+                &[
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    execution_units::QUERY_RUNTIME_UNIT_ID,
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                ],
             ),
         })
     }
@@ -223,6 +314,281 @@ impl FSMetaApp {
         }
         drop(guard);
 
+        self.ensure_runtime_proxy_endpoints_started().await?;
+
+        Ok(())
+    }
+
+    async fn ensure_runtime_proxy_endpoints_started(&self) -> Result<()> {
+        let Some(boundary) = self.runtime_boundary.clone() else {
+            return Ok(());
+        };
+        let mut tasks = self.runtime_endpoint_tasks.lock().await;
+        let mut spawned_routes = self.runtime_endpoint_routes.lock().await;
+        let routes = default_route_bindings();
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
+            let query_active = self
+                .facade_gate
+                .unit_state(execution_units::QUERY_RUNTIME_UNIT_ID)?
+                .map(|(active, _)| active)
+                .unwrap_or(false);
+            if !query_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as query ingress owner, or already running.
+            } else {
+            let boundary_for_calls = self.runtime_boundary.clone().ok_or_else(|| {
+                CnxError::InvalidInput("fs-meta public query requires runtime boundary".into())
+            })?;
+            let caller_node = self.node_id.clone();
+            eprintln!(
+                "fs_meta_runtime_app: spawning public query endpoint route={}",
+                route.0
+            );
+            let endpoint = ManagedEndpointTask::spawn(
+                boundary.clone(),
+                route,
+                format!("app:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
+                tokio_util::sync::CancellationToken::new(),
+                move |requests| {
+                    let mut responses = Vec::new();
+                    for req in requests {
+                        let Ok(params) =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        else {
+                            continue;
+                        };
+                        eprintln!(
+                            "fs_meta_runtime_app: public query request selected_group={:?} recursive={} path={}",
+                            params.scope.selected_group,
+                            params.scope.recursive,
+                            String::from_utf8_lossy(&params.scope.path)
+                        );
+                        let result: Result<Vec<Event>> = (|| {
+                            let adapter = crate::runtime::seam::exchange_host_adapter(
+                                boundary_for_calls.clone(),
+                                caller_node.clone(),
+                                crate::runtime::routes::default_route_bindings(),
+                            );
+                            let payload = rmp_serde::to_vec(&params).map_err(|err| {
+                                CnxError::Internal(format!(
+                                    "encode public query request failed: {err}"
+                                ))
+                            })?;
+                            capanix_host_adapter_fs_meta::HostAdapter::call_collect(
+                                &adapter,
+                                ROUTE_TOKEN_FS_META_INTERNAL,
+                                crate::runtime::routes::METHOD_SINK_QUERY_PROXY,
+                                bytes::Bytes::from(payload),
+                                Duration::from_secs(30),
+                                Duration::from_millis(750),
+                            )
+                        })();
+                        match result {
+                            Ok(mut events) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: public query response events={}",
+                                    events.len()
+                                );
+                                for event in &mut events {
+                                    let mut meta = event.metadata().clone();
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    responses.push(Event::new(
+                                        meta,
+                                        bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: public query failed err={}",
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    responses
+                },
+            );
+            tasks.push(endpoint);
+            }
+        }
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
+            let query_active = self
+                .facade_gate
+                .unit_state(execution_units::QUERY_RUNTIME_UNIT_ID)?
+                .map(|(active, _)| active)
+                .unwrap_or(false);
+            if !query_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as query ingress owner, or already running.
+            } else {
+            let sink = self.sink.clone();
+            eprintln!(
+                "fs_meta_runtime_app: spawning sink status endpoint route={}",
+                route.0
+            );
+            let endpoint = ManagedEndpointTask::spawn(
+                boundary.clone(),
+                route,
+                format!("app:{}:{}", ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS),
+                tokio_util::sync::CancellationToken::new(),
+                move |requests| {
+                    let mut responses = Vec::new();
+                    for req in requests {
+                        match sink.status_snapshot_nonblocking() {
+                            Ok(snapshot) if !snapshot.groups.is_empty() => {
+                                if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                    responses.push(Event::new(
+                                        EventMetadata {
+                                            origin_id: req.metadata().origin_id.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        bytes::Bytes::from(payload),
+                                    ));
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(err) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: sink status endpoint failed err={}",
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    responses
+                },
+            );
+            tasks.push(endpoint);
+            }
+        }
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY) {
+            let query_peer_active = self
+                .facade_gate
+                .unit_state(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)?
+                .map(|(active, _)| active)
+                .unwrap_or(false);
+            if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as peer query owner, or already running.
+            } else {
+            eprintln!(
+                "fs_meta_runtime_app: spawning sink query proxy endpoint route={}",
+                route.0
+            );
+            let sink = self.sink.clone();
+            let endpoint = ManagedEndpointTask::spawn(
+                boundary.clone(),
+                route,
+                format!("app:{}:{}", ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY),
+                tokio_util::sync::CancellationToken::new(),
+                move |requests| {
+                    let mut responses = Vec::new();
+                    for req in requests {
+                        let Ok(params) =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        else {
+                            continue;
+                        };
+                        eprintln!(
+                            "fs_meta_runtime_app: sink query proxy request selected_group={:?} recursive={} path={}",
+                            params.scope.selected_group,
+                            params.scope.recursive,
+                            String::from_utf8_lossy(&params.scope.path)
+                        );
+                        let result = sink.materialized_query_nonblocking(&params);
+                        match result {
+                            Ok(mut events) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: sink query proxy response events={}",
+                                    events.len()
+                                );
+                                for event in &mut events {
+                                    let mut meta = event.metadata().clone();
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    responses.push(Event::new(
+                                        meta,
+                                        bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: sink query proxy failed err={}",
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    responses
+                },
+            );
+            tasks.push(endpoint);
+            }
+        }
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
+            let query_peer_active = self
+                .facade_gate
+                .unit_state(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)?
+                .map(|(active, _)| active)
+                .unwrap_or(false);
+            if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as peer query owner, or already running.
+            } else {
+            eprintln!(
+                "fs_meta_runtime_app: spawning source find proxy endpoint route={}",
+                route.0
+            );
+            let source = self.source.clone();
+            let endpoint = ManagedEndpointTask::spawn(
+                boundary.clone(),
+                route,
+                format!("app:{}:{}", ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND),
+                tokio_util::sync::CancellationToken::new(),
+                move |requests| {
+                    let mut responses = Vec::new();
+                    for req in requests {
+                        let Ok(params) =
+                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                        else {
+                            continue;
+                        };
+                        eprintln!(
+                            "fs_meta_runtime_app: source find proxy request selected_group={:?} recursive={} path={}",
+                            params.scope.selected_group,
+                            params.scope.recursive,
+                            String::from_utf8_lossy(&params.scope.path)
+                        );
+                        match source.force_find(&params) {
+                            Ok(mut events) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: source find proxy response events={}",
+                                    events.len()
+                                );
+                                for event in &mut events {
+                                    let mut meta = event.metadata().clone();
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    responses.push(Event::new(
+                                        meta,
+                                        bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: source find proxy failed err={}",
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    responses
+                },
+            );
+            tasks.push(endpoint);
+            }
+        }
         Ok(())
     }
 
@@ -460,6 +826,12 @@ impl FSMetaApp {
             resource_ids: pending.resource_ids.clone(),
             handle,
         });
+        eprintln!(
+            "fs_meta_runtime_app: facade handle active generation={} route_key={} resources={:?}",
+            pending.generation,
+            pending.route_key,
+            pending.resource_ids
+        );
         let mut pending_guard = pending_facade.lock().await;
         if pending_guard.as_ref().is_some_and(|candidate| {
             candidate.generation == pending.generation
@@ -652,6 +1024,16 @@ impl FSMetaApp {
         generation: u64,
         bound_scopes: &[capanix_route_proto::BoundScope],
     ) -> Result<()> {
+        eprintln!(
+            "fs_meta_runtime_app: apply_facade_activate unit={} route_key={} generation={} scopes={}",
+            unit.unit_id(),
+            route_key,
+            generation,
+            bound_scopes.len()
+        );
+        if !facade_route_key_matches(unit, route_key) {
+            return Ok(());
+        }
         // Facade activation is a runtime-owned generation/bind/run handoff carrier.
         // Trusted external observation remains subordinate to package-local
         // observation_eligible and projection catch-up; activation alone does
@@ -668,6 +1050,10 @@ impl FSMetaApp {
             );
             return Ok(());
         }
+        let facade_control_route_key = format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
+        if matches!(unit, FacadeRuntimeUnit::Query) || route_key != facade_control_route_key {
+            return Ok(());
+        }
         let candidate_resource_ids = Self::facade_candidate_resource_ids(bound_scopes);
         let runtime_managed = self.runtime_boundary.is_some();
         let resolved = self
@@ -681,19 +1067,20 @@ impl FSMetaApp {
                 ))
             })?;
         {
-            let api_task = self.api_task.lock().await;
-            if let Some(current) = api_task.as_ref()
-                && current.generation == generation
+            let mut api_task = self.api_task.lock().await;
+            if let Some(current) = api_task.as_mut()
                 && current.resource_ids == candidate_resource_ids
             {
+                current.generation = generation;
                 drop(api_task);
                 let mut pending = self.pending_facade.lock().await;
-                if pending.as_ref().is_some_and(|candidate| {
-                    candidate.generation == generation
-                        && candidate.resource_ids == candidate_resource_ids
-                }) {
+                if pending
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.resource_ids == candidate_resource_ids)
+                {
                     pending.take();
                 }
+                Self::clear_pending_facade_status(&self.facade_pending_status);
                 return Ok(());
             }
         }
@@ -710,6 +1097,12 @@ impl FSMetaApp {
         };
         *self.pending_facade.lock().await = Some(pending.clone());
         if !self.try_spawn_pending_facade().await? {
+            eprintln!(
+                "fs_meta_runtime_app: pending facade generation={} route_key={} awaiting_runtime_exposure={}",
+                pending.generation,
+                pending.route_key,
+                !pending.runtime_exposure_confirmed
+            );
             Self::set_pending_facade_status_waiting(&self.facade_pending_status, &pending);
         }
         Ok(())
@@ -732,6 +1125,15 @@ impl FSMetaApp {
         route_key: &str,
         generation: u64,
     ) -> Result<()> {
+        eprintln!(
+            "fs_meta_runtime_app: apply_facade_deactivate unit={} route_key={} generation={}",
+            unit.unit_id(),
+            route_key,
+            generation
+        );
+        if !facade_route_key_matches(unit, route_key) {
+            return Ok(());
+        }
         let unit_id = unit.unit_id();
         let accepted = self
             .facade_gate
@@ -756,6 +1158,9 @@ impl FSMetaApp {
         route_key: &str,
         generation: u64,
     ) -> Result<bool> {
+        if !facade_route_key_matches(unit, route_key) {
+            return Ok(false);
+        }
         self.facade_gate
             .accept_tick(unit.unit_id(), route_key, generation)
     }
@@ -904,6 +1309,7 @@ impl StateBoundary for RuntimeBoundaryPair {
     }
 }
 
+
 #[async_trait]
 impl RuntimeBoundaryApp for FSMetaApp {
     async fn start(&self) -> Result<()> {
@@ -919,6 +1325,7 @@ impl RuntimeBoundaryApp for FSMetaApp {
     }
 
     async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
+        self.ensure_runtime_proxy_endpoints_started().await?;
         let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
         for signal in facade_signals {
             match signal {
@@ -951,7 +1358,9 @@ impl RuntimeBoundaryApp for FSMetaApp {
                             unit.unit_id(),
                             generation
                         );
-                    } else {
+                    } else if matches!(unit, FacadeRuntimeUnit::Facade)
+                        && route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                    {
                         self.retry_pending_facade(&route_key, generation, true)
                             .await?;
                     }
@@ -969,7 +1378,9 @@ impl RuntimeBoundaryApp for FSMetaApp {
                             unit.unit_id(),
                             generation
                         );
-                    } else if self
+                    } else if matches!(unit, FacadeRuntimeUnit::Facade)
+                        && route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+                        && self
                         .confirm_pending_facade_exposure(&route_key, generation)
                         .await
                     {
@@ -989,6 +1400,7 @@ impl RuntimeBoundaryApp for FSMetaApp {
         if !sink_signals.is_empty() {
             self.sink.apply_orchestration_signals(&sink_signals).await?;
         }
+        self.ensure_runtime_proxy_endpoints_started().await?;
         Ok(())
     }
 
@@ -998,6 +1410,10 @@ impl RuntimeBoundaryApp for FSMetaApp {
         self.shutdown_active_facade().await;
         self.source.close().await?;
         self.sink.close().await?;
+        let mut endpoint_tasks = std::mem::take(&mut *self.runtime_endpoint_tasks.lock().await);
+        for task in &mut endpoint_tasks {
+            task.shutdown(Duration::from_secs(2)).await;
+        }
         if let Some(handle) = self.pump_task.lock().await.take() {
             handle.abort();
         }
@@ -1692,6 +2108,8 @@ mod tests {
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
             app.facade_pending_status.clone(),
         )
         .await
@@ -1788,6 +2206,8 @@ mod tests {
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
             app.facade_pending_status.clone(),
         )
         .await
@@ -1892,6 +2312,8 @@ mod tests {
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
             app.facade_pending_status.clone(),
         )
         .await
@@ -2006,6 +2428,8 @@ mod tests {
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
             app.facade_pending_status.clone(),
         )
         .await

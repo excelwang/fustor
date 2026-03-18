@@ -254,7 +254,7 @@ fn run_stream_loop<F, G>(
     G: Fn() -> bool + Send + Sync + 'static,
 {
     let ctx = BoundaryContext::default();
-    let stream_channel = ChannelKey(format!("{}.stream", route.0));
+    let stream_channel = ChannelKey(route.0.clone());
 
     loop {
         if shutdown_for_task.is_cancelled() {
@@ -289,6 +289,54 @@ fn run_stream_loop<F, G>(
         }
 
         handler(events);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    struct RecordingBoundary {
+        recv_keys: Mutex<Vec<String>>,
+    }
+
+    impl RecordingBoundary {
+        fn new() -> Self {
+            Self {
+                recv_keys: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ChannelIoSubset for RecordingBoundary {
+        fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            self.recv_keys
+                .lock()
+                .expect("recv_keys lock")
+                .push(request.channel_key.0);
+            Err(CnxError::Internal("stop after first recv".into()))
+        }
+    }
+
+    #[test]
+    fn stream_loop_uses_exact_route_key_without_double_suffix() {
+        let boundary = Arc::new(RecordingBoundary::new());
+        run_stream_loop(
+            boundary.clone(),
+            RouteKey("fs-meta.events:v1.stream".into()),
+            "test-stream".into(),
+            CancellationToken::new(),
+            Arc::new(|| true),
+            Arc::new(|_events: Vec<Event>| {}),
+        );
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(recv_keys, vec!["fs-meta.events:v1.stream".to_string()]);
     }
 }
 

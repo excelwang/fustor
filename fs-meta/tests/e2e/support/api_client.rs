@@ -8,6 +8,8 @@ use std::time::Duration;
 
 const RECONNECT_RETRY_WINDOW: Duration = Duration::from_secs(30);
 const RECONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const HTTP_TIMEOUT_DEFAULT: Duration = Duration::from_secs(45);
+const HTTP_TIMEOUT_FORCE_FIND: Duration = Duration::from_secs(75);
 
 #[derive(Debug, Clone)]
 pub struct ApiResponse {
@@ -33,7 +35,6 @@ pub struct OperatorSession {
 impl FsMetaApiClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self, String> {
         let client = Client::builder()
-            .timeout(Duration::from_secs(45))
             .build()
             .map_err(|e| format!("build reqwest client failed: {e}"))?;
         Ok(Self {
@@ -166,6 +167,7 @@ impl FsMetaApiClient {
         let mut req = self
             .client
             .get(self.url(path))
+            .timeout(self.request_timeout(path))
             .headers(self.auth_headers(token)?);
         for (key, value) in query {
             req = req.query(&[(key, value)]);
@@ -189,6 +191,7 @@ impl FsMetaApiClient {
         self.decode(
             self.client
                 .post(self.url(path))
+                .timeout(self.request_timeout(path))
                 .headers(self.auth_headers(token)?)
                 .json(body)
                 .send()
@@ -204,6 +207,7 @@ impl FsMetaApiClient {
         self.decode(
             self.client
                 .post(self.url(path))
+                .timeout(self.request_timeout(path))
                 .header(CONTENT_TYPE, "application/json")
                 .json(body)
                 .send()
@@ -224,6 +228,7 @@ impl FsMetaApiClient {
         self.decode(
             self.client
                 .put(self.url(path))
+                .timeout(self.request_timeout(path))
                 .headers(self.auth_headers(token)?)
                 .json(body)
                 .send()
@@ -241,6 +246,13 @@ impl FsMetaApiClient {
                 format!("/{path}")
             }
         )
+    }
+
+    fn request_timeout(&self, path: &str) -> Duration {
+        match path {
+            "/on-demand-force-find" => HTTP_TIMEOUT_FORCE_FIND,
+            _ => HTTP_TIMEOUT_DEFAULT,
+        }
     }
 
     fn auth_headers(&self, token: &str) -> Result<HeaderMap, String> {

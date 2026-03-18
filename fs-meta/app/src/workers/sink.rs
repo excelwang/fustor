@@ -237,6 +237,10 @@ impl SinkWorkerClientHandle {
             &self.config,
             self.boundary.clone(),
         )?);
+        eprintln!(
+            "fs_meta_runtime_app: sink worker spawn backtrace\n{:?}",
+            std::backtrace::Backtrace::capture()
+        );
         let client = {
             let mut guard = self
                 .client
@@ -287,6 +291,19 @@ impl SinkWorkerClientHandle {
         Ok(snapshot)
     }
 
+    pub fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+        match self.existing_client()? {
+            Some(client) => match client.status_snapshot() {
+                Ok(snapshot) => {
+                    self.update_cached_status_snapshot(snapshot.clone())?;
+                    Ok(snapshot)
+                }
+                Err(_) => self.cached_status_snapshot(),
+            },
+            None => self.cached_status_snapshot(),
+        }
+    }
+
     pub fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
         self.client()?.scheduled_group_ids()
     }
@@ -301,6 +318,13 @@ impl SinkWorkerClientHandle {
 
     pub fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
         self.with_started_retry(|client| client.materialized_query(request.clone()))
+    }
+
+    pub fn materialized_query_nonblocking(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
+        match self.existing_client()? {
+            Some(client) => client.materialized_query(request),
+            None => Ok(Vec::new()),
+        }
     }
 
     pub fn subtree_stats(&self, path: Vec<u8>) -> Result<Vec<Event>> {
@@ -384,6 +408,17 @@ impl SinkFacade {
         }
     }
 
+    pub fn start_stream_endpoint(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+        node_id: NodeId,
+    ) -> Result<()> {
+        match self {
+            Self::Local(sink) => sink.start_stream_endpoint(boundary, node_id),
+            Self::Worker(_) => Ok(()),
+        }
+    }
+
     pub fn update_logical_roots(
         &self,
         roots: Vec<crate::source::config::RootSpec>,
@@ -420,6 +455,13 @@ impl SinkFacade {
         match self {
             Self::Local(sink) => sink.status_snapshot(),
             Self::Worker(client) => client.status_snapshot(),
+        }
+    }
+
+    pub fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+        match self {
+            Self::Local(sink) => sink.status_snapshot(),
+            Self::Worker(client) => client.status_snapshot_nonblocking(),
         }
     }
 
@@ -469,6 +511,13 @@ impl SinkFacade {
         match self {
             Self::Local(sink) => sink.materialized_query(request),
             Self::Worker(client) => client.materialized_query(request.clone()),
+        }
+    }
+
+    pub fn materialized_query_nonblocking(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
+        match self {
+            Self::Local(sink) => sink.materialized_query(request),
+            Self::Worker(client) => client.materialized_query_nonblocking(request.clone()),
         }
     }
 

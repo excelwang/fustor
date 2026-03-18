@@ -386,7 +386,7 @@ fn run_query_matrix(
             };
             let ready = tree
                 .get("groups")
-                .and_then(Value::as_object)
+                .and_then(Value::as_array)
                 .map(|groups| {
                     groups.len() >= 3
                         && group_total_nodes(&tree, "nfs1") > 0
@@ -1308,6 +1308,22 @@ fn normalize_tree_like_json(value: &mut Value) {
             let is_dir = map.get("is_dir").and_then(Value::as_bool).unwrap_or(false);
             if is_dir {
                 map.insert("modified_time_us".into(), Value::Number(0u64.into()));
+            }
+            if map
+                .get("next_cursor")
+                .is_some_and(|value| matches!(value, Value::String(_)))
+            {
+                map.insert("next_cursor".into(), Value::Null);
+            }
+            if map
+                .get("next_entry_after")
+                .is_some_and(|value| matches!(value, Value::String(_)))
+            {
+                map.insert("next_entry_after".into(), Value::Null);
+            }
+            if map.contains_key("id") && map.contains_key("expires_at_ms") {
+                map.insert("id".into(), Value::String("oracle-pit".into()));
+                map.insert("expires_at_ms".into(), Value::Number(0u64.into()));
             }
             for child in map.values_mut() {
                 normalize_tree_like_json(child);

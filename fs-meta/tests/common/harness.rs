@@ -9,6 +9,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,6 +36,23 @@ const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
     "process_read",
     "tx_execute",
 ];
+
+fn configure_test_child_process(cmd: &mut Command) {
+    cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                return Err(std::io::Error::other(
+                    "parent exited before capanixd child completed exec",
+                ));
+            }
+            Ok(())
+        });
+    }
+}
 
 #[derive(Clone)]
 struct NodeIdentity {
@@ -575,6 +593,7 @@ impl RunningNode {
             cmd.env_remove("CAPANIX_ADMIN_SK_B64");
             cmd.env_remove("DATANIX_ADMIN_SK_B64");
         }
+        configure_test_child_process(&mut cmd);
         let child = cmd.spawn().map_err(|e| format!("spawn capanixd: {e}"))?;
         Ok(Self {
             node_id: node.node_id.clone(),
@@ -625,6 +644,7 @@ impl Drop for RunningNode {
         if self.child.try_wait().ok().flatten().is_some() {
             return;
         }
+        let _ = unsafe { libc::killpg(self.child.id() as i32, libc::SIGKILL) };
         let _ = self.child.kill();
         let _ = self.child.wait();
     }

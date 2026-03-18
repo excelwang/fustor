@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use capanix_app_sdk::runtime::ControlEnvelope;
-use capanix_app_sdk::{CnxError, Result};
+use capanix_app_sdk::{CnxError, Event, Result};
 
+use crate::query::request::InternalQueryRequest;
 use crate::source::SourceStatusSnapshot;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 
@@ -57,6 +58,9 @@ pub enum SourceWorkerRequest {
     SourcePrimaryByGroupSnapshot,
     LastForceFindRunnerByGroupSnapshot,
     ForceFindInflightGroupsSnapshot,
+    ForceFind {
+        request: InternalQueryRequest,
+    },
     ResolveGroupIdForObjectRef {
         object_ref: String,
     },
@@ -80,6 +84,7 @@ pub enum SourceWorkerResponse {
     SourcePrimaryByGroup(BTreeMap<String, String>),
     LastForceFindRunnerByGroup(BTreeMap<String, String>),
     ForceFindInflightGroups(Vec<String>),
+    Events(Vec<Event>),
     ResolveGroupIdForObjectRef(Option<String>),
     InvalidInput(String),
     Error(String),

@@ -9,7 +9,7 @@ use axum::{
 use capanix_app_sdk::runtime::AppControlDispatchRequest;
 use capanix_app_sdk::raw::BoundaryContext;
 
-use crate::query::api::{refresh_policy_from_host_object_grants, route_sink_status_snapshot};
+use crate::query::api::refresh_policy_from_host_object_grants;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use crate::workers::source::SourceObservabilitySnapshot;
@@ -47,14 +47,15 @@ pub async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
 
-    let sink_status = match state.query_runtime_boundary.clone() {
-        Some(boundary) => route_sink_status_snapshot(
-            boundary,
-            state.node_id.clone(),
-            std::time::Duration::from_secs(30),
-        )
-        .await?,
-        None => state.sink.status_snapshot()?,
+    let sink_status = match state.sink.status_snapshot_nonblocking() {
+        Ok(snapshot) => snapshot,
+        Err(err) if state.sink.is_worker() => {
+            log::warn!("status falling back to default sink snapshot: {err}");
+            Default::default()
+        }
+        Err(err) => {
+            return Err(ApiError::internal(format!("sink status failed: {err}")));
+        }
     };
     let source = match state.source.observability_snapshot() {
         Ok(snapshot) => snapshot,
@@ -149,15 +150,27 @@ pub async fn roots_preview(
     Json(req): Json<RootsUpdateRequest>,
 ) -> Result<Json<RootsPreviewResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
-    let roots = req
-        .roots
-        .into_iter()
-        .map(root_spec_from_update)
-        .collect::<Result<Vec<_>, _>>()?;
+    eprintln!(
+        "fs_meta_api: roots_preview request roots={}",
+        req.roots.len()
+    );
+    let mut roots = Vec::with_capacity(req.roots.len());
+    for entry in req.roots {
+        match root_spec_from_update(entry) {
+            Ok(root) => roots.push(root),
+            Err(err) => {
+                eprintln!("fs_meta_api: roots_preview invalid input: {}", err.message);
+                return Err(err);
+            }
+        }
+    }
     let grants = state
         .source
         .host_object_grants_snapshot()
-        .map_err(|err| ApiError::internal(format!("source grants snapshot failed: {err}")))?;
+        .map_err(|err| {
+            eprintln!("fs_meta_api: roots_preview grants snapshot failed: {err}");
+            ApiError::internal(format!("source grants snapshot failed: {err}"))
+        })?;
     Ok(Json(preview_roots(&roots, &grants)?))
 }
 
@@ -172,6 +185,8 @@ pub async fn roots_put(
         .into_iter()
         .map(root_spec_from_update)
         .collect::<Result<Vec<_>, _>>()?;
+    validate_unique_root_ids(&roots)?;
+    eprintln!("fs_meta_api: roots_put request roots={}", roots.len());
 
     let grants = state
         .source
@@ -188,14 +203,32 @@ pub async fn roots_put(
     let previous_source_roots = state.source.logical_roots_snapshot().map_err(|err| {
         ApiError::internal(format!("source logical roots snapshot failed: {err}"))
     })?;
-    let previous_sink_roots = state.sink.logical_roots_snapshot()?;
     let previous_grants = grants.clone();
     // roots apply updates app-owned authoritative root/group definitions and
     // refreshes source/sink state against current runtime grants and bound
     // scopes. It does not make the API the owner of runtime bind/run
     // realization.
-    state.source.update_logical_roots(roots.clone()).await?;
+    state.source.update_logical_roots(roots.clone()).await.map_err(|err| {
+        eprintln!("fs_meta_api: roots_put source update failed: {err}");
+        err
+    })?;
+    if state.sink.is_worker() {
+        refresh_policy_from_host_object_grants(&state.projection_policy, &grants);
+        return Ok(Json(RootsUpdateResponse {
+            roots_count: state
+                .source
+                .logical_roots_snapshot()
+                .map_err(|snapshot_err| {
+                    ApiError::internal(format!(
+                        "source logical roots snapshot failed: {snapshot_err}"
+                    ))
+                })?
+                .len(),
+        }));
+    }
+    let previous_sink_roots = state.sink.logical_roots_snapshot()?;
     if let Err(err) = state.sink.update_logical_roots(roots.clone(), &grants) {
+        eprintln!("fs_meta_api: roots_put sink sync failed: {err}");
         let sink_rollback = state
             .sink
             .update_logical_roots(previous_sink_roots, &previous_grants);
@@ -319,6 +352,19 @@ fn preview_roots(
         preview,
         unmatched_roots,
     })
+}
+
+fn validate_unique_root_ids(roots: &[RootSpec]) -> Result<(), ApiError> {
+    let mut ids = BTreeSet::new();
+    for root in roots {
+        if !ids.insert(root.id.clone()) {
+            return Err(ApiError::bad_request(format!(
+                "duplicate root id '{}'",
+                root.id
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn status_source_from_observability(source: SourceObservabilitySnapshot) -> StatusSource {

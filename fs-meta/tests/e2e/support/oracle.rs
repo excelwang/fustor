@@ -135,17 +135,21 @@ impl FsTreeOracle {
             }
         }
         let root_node = nodes.iter().find(|node| node.path == query_root);
+        let empty_group = nodes.is_empty();
         let root = if let Some(root_node) = root_node {
             let mut obj = Map::new();
             obj.insert("path".into(), Value::String(root_node.path.clone()));
             maybe_insert_b64(&mut obj, "path_b64", root_node.path.as_bytes());
-            obj.insert("size".into(), json!(root_node.size));
+            obj.insert(
+                "size".into(),
+                json!(display_size(root_node.size, root_node.is_dir, force_find)),
+            );
             obj.insert("modified_time_us".into(), json!(root_node.modified_time_us));
             obj.insert("is_dir".into(), json!(root_node.is_dir));
             obj.insert("exists".into(), json!(true));
             obj.insert(
                 "has_children".into(),
-                json!(has_children.contains(&root_node.path)),
+                json!(logical_path_has_children(mount_path, &root_node.path)),
             );
             Value::Object(obj)
         } else {
@@ -166,31 +170,31 @@ impl FsTreeOracle {
             .into_iter()
             .filter(|node| node.path != query_root)
             .map(|node| {
-                let parent_path =
-                    parent_logical_path(&node.path).unwrap_or_else(|| "/".to_string());
-                let depth = if parent_path == "/" {
-                    node.path
-                        .trim_start_matches('/')
-                        .split('/')
-                        .filter(|seg| !seg.is_empty())
-                        .count()
-                } else {
-                    node.path
-                        .trim_start_matches('/')
-                        .split('/')
-                        .filter(|seg| !seg.is_empty())
-                        .count()
-                };
+                let node_segments = node
+                    .path
+                    .trim_start_matches('/')
+                    .split('/')
+                    .filter(|seg| !seg.is_empty())
+                    .count();
+                let query_segments = query_root
+                    .trim_start_matches('/')
+                    .split('/')
+                    .filter(|seg| !seg.is_empty())
+                    .count();
+                let depth = node_segments.saturating_sub(query_segments);
                 let mut obj = Map::new();
                 obj.insert("path".into(), Value::String(node.path.clone()));
                 maybe_insert_b64(&mut obj, "path_b64", node.path.as_bytes());
                 obj.insert("depth".into(), json!(depth));
-                obj.insert("size".into(), json!(node.size));
+                obj.insert(
+                    "size".into(),
+                    json!(display_size(node.size, node.is_dir, force_find)),
+                );
                 obj.insert("modified_time_us".into(), json!(node.modified_time_us));
                 obj.insert("is_dir".into(), json!(node.is_dir));
                 obj.insert(
                     "has_children".into(),
-                    json!(has_children.contains(&node.path)),
+                    json!(node.is_dir && logical_path_has_children(mount_path, &node.path)),
                 );
                 Value::Object(obj)
             })
@@ -202,8 +206,12 @@ impl FsTreeOracle {
         Ok(json!({
             "group": group_key,
             "status": "ok",
-            "reliable": force_find,
-            "unreliable_reason": if force_find { Value::Null } else { Value::String("Unattested".into()) },
+            "reliable": force_find || empty_group,
+            "unreliable_reason": if force_find || empty_group {
+                Value::Null
+            } else {
+                Value::String("Unattested".into())
+            },
             "stability": {
                 "mode": "none",
                 "state": "not-evaluated",
@@ -215,6 +223,7 @@ impl FsTreeOracle {
             "meta": {
                 "metadata_mode": "full",
                 "metadata_available": true,
+                "withheld_reason": Value::Null,
             },
             "root": root,
             "entries": entries,
@@ -262,6 +271,7 @@ impl FsTreeOracle {
             "meta": {
                 "metadata_mode": "full",
                 "metadata_available": true,
+                "withheld_reason": Value::Null,
                 "limit_applied": limit,
                 "total_nodes": total_nodes,
                 "returned_nodes": nodes.len(),
@@ -306,11 +316,15 @@ impl FsTreeOracle {
         max_depth: Option<usize>,
     ) -> Result<Value, String> {
         let nodes = collect_nodes(mount_path, query_path, recursive, max_depth)?;
+        let query_root = normalize_logical_path(query_path);
         let mut total_files = 0u64;
         let mut total_dirs = 0u64;
         let mut total_size = 0u64;
         let mut latest_file_mtime_us = None::<u64>;
         for node in &nodes {
+            if node.path == query_root {
+                continue;
+            }
             if node.is_dir {
                 total_dirs += 1;
             } else {
@@ -326,7 +340,7 @@ impl FsTreeOracle {
         Ok(json!({
             "status": "ok",
             "data": {
-                "total_nodes": nodes.len() as u64,
+                "total_nodes": (total_files + total_dirs) as u64,
                 "total_files": total_files,
                 "total_dirs": total_dirs,
                 "total_size": total_size,
@@ -493,6 +507,14 @@ fn collect_nodes(
     Ok(nodes)
 }
 
+fn display_size(size: u64, is_dir: bool, force_find: bool) -> u64 {
+    if is_dir && !force_find {
+        0
+    } else {
+        size
+    }
+}
+
 fn visit(
     fs_path: &Path,
     logical_path: &str,
@@ -511,7 +533,7 @@ fn visit(
         } else {
             root_file_name_for_query_path(logical_path)
         },
-        size: if meta.is_dir() { 0 } else { meta.len() },
+        size: meta.len(),
         modified_time_us: modified_time_us(&meta).unwrap_or(0),
         is_dir: meta.is_dir(),
     });
@@ -556,6 +578,17 @@ fn fs_path_for_query(mount_path: &Path, query_path: &str) -> PathBuf {
         return mount_path.to_path_buf();
     }
     mount_path.join(query_path.trim_start_matches('/'))
+}
+
+fn logical_path_has_children(mount_path: &Path, logical_path: &str) -> bool {
+    let fs_path = fs_path_for_query(mount_path, logical_path);
+    if !fs_path.is_dir() {
+        return false;
+    }
+    fs::read_dir(&fs_path)
+        .ok()
+        .and_then(|mut rows| rows.next())
+        .is_some()
 }
 
 fn join_logical_path(parent: &str, child_name: &str) -> String {

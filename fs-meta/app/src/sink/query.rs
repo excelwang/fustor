@@ -263,10 +263,10 @@ fn page_root_from_rebased_nodes(nodes: &[RebasedNode<'_>], query_path: &[u8]) ->
     let root_node = nodes
         .iter()
         .find(|mapped| mapped.path.as_slice() == query_path);
+    let has_children = nodes
+        .iter()
+        .any(|candidate| parent_path_bytes(&candidate.path).as_deref() == Some(query_path));
     if let Some(root) = root_node {
-        let has_children = nodes
-            .iter()
-            .any(|candidate| parent_path_bytes(&candidate.path).as_deref() == Some(query_path));
         return TreePageRoot {
             path: root.path.clone(),
             size: root.node.size,
@@ -286,10 +286,8 @@ fn page_root_from_rebased_nodes(nodes: &[RebasedNode<'_>], query_path: &[u8]) ->
         size: 0,
         modified_time_us: 0,
         is_dir: true,
-        exists: false,
-        has_children: nodes
-            .iter()
-            .any(|candidate| candidate.path.as_slice() != query_path),
+        exists: query_path == b"/" && (has_children || !nodes.is_empty()),
+        has_children,
     }
 }
 
@@ -461,7 +459,7 @@ pub fn get_materialized_tree_payload(
     quiet_window_ms: Option<u64>,
     last_coverage_recovered_at: Option<Instant>,
 ) -> TreeGroupPayload {
-    let direct_query = tree.has_path(dir_path) || dir_path.is_empty() || dir_path == b"/";
+    let direct_query = tree.has_path(dir_path);
     if direct_query {
         let direct = get_directory_tree(
             tree,

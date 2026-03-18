@@ -25,6 +25,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +50,23 @@ const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
     "boundary_read_self",
 ];
 const NODE_NAMES: &[&str] = &["node-a", "node-b", "node-c", "node-d", "node-e"];
+
+fn configure_test_child_process(cmd: &mut Command) {
+    cmd.process_group(0);
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() == 1 {
+                return Err(std::io::Error::other(
+                    "parent exited before capanixd child completed exec",
+                ));
+            }
+            Ok(())
+        });
+    }
+}
 
 fn trace_command_name(command: &Value) -> String {
     command
@@ -750,6 +768,7 @@ fn scope_unit_intent_to_scope_worker_intent(doc: &Value) -> Result<Value, String
         "schema_version": "scope-worker-intent-v1",
         "target_id": target_id,
         "target_generation": target_generation,
+        "route_plans": doc.get("route_plans").cloned().unwrap_or_else(|| json!([])),
         "workers": workers,
     }))
 }
@@ -1338,6 +1357,7 @@ impl RunningNode {
             cmd.env_remove("CAPANIX_ADMIN_SK_B64");
             cmd.env_remove("DATANIX_ADMIN_SK_B64");
         }
+        configure_test_child_process(&mut cmd);
         let child = cmd.spawn().map_err(|e| format!("spawn capanixd: {e}"))?;
         Ok(Self {
             name: node.name.clone(),
@@ -1389,6 +1409,7 @@ impl RunningNode {
 impl Drop for RunningNode {
     fn drop(&mut self) {
         if self.child.try_wait().ok().flatten().is_none() {
+            let _ = unsafe { libc::killpg(self.child.id() as i32, libc::SIGKILL) };
             let _ = self.child.kill();
             let _ = self.child.wait();
         }

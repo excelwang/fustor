@@ -7,8 +7,8 @@ use capanix_route_proto::{
 };
 
 use crate::runtime::execution_units::{
-    FACADE_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID,
-    SOURCE_SCAN_RUNTIME_UNIT_ID,
+    FACADE_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID,
+    SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
 
 pub(crate) const MANUAL_RESCAN_CONTROL_FRAME_KIND: &str =
@@ -52,12 +52,16 @@ impl SinkRuntimeUnit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FacadeRuntimeUnit {
     Facade,
+    Query,
+    QueryPeer,
 }
 
 impl FacadeRuntimeUnit {
     pub(crate) fn unit_id(self) -> &'static str {
         match self {
             Self::Facade => FACADE_RUNTIME_UNIT_ID,
+            Self::Query => QUERY_RUNTIME_UNIT_ID,
+            Self::QueryPeer => QUERY_PEER_RUNTIME_UNIT_ID,
         }
     }
 }
@@ -194,6 +198,8 @@ fn sink_unit_from_id(unit_id: &str) -> Option<SinkRuntimeUnit> {
 fn facade_unit_from_id(unit_id: &str) -> Option<FacadeRuntimeUnit> {
     match unit_id {
         FACADE_RUNTIME_UNIT_ID => Some(FacadeRuntimeUnit::Facade),
+        QUERY_RUNTIME_UNIT_ID => Some(FacadeRuntimeUnit::Query),
+        QUERY_PEER_RUNTIME_UNIT_ID => Some(FacadeRuntimeUnit::QueryPeer),
         _ => None,
     }
 }

@@ -141,10 +141,21 @@ fn encode_force_find_grouped_events(
             .unwrap_or(origin.clone());
         grouped_by_group.entry(group_id).or_default().push(query);
     }
+    let all_group_ids = object_to_group
+        .values()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
 
     let mut out = Vec::new();
-    for (group_id, responses) in grouped_by_group {
-        let query = merge_query_responses(responses);
+    for group_id in all_group_ids {
+        let query = grouped_by_group
+            .remove(&group_id)
+            .map(merge_query_responses)
+            .unwrap_or(RawQueryResult {
+                nodes: Vec::new(),
+                reliable: true,
+                unreliable_reason: None,
+            });
         let payload = match op {
             QueryOp::Tree => {
                 let payload = tree_group_payload_from_query_response(
@@ -294,6 +305,13 @@ pub(crate) enum RescanReason {
     Periodic,
 }
 
+fn should_process_rescan_reason(current_is_group_primary: bool, reason: RescanReason) -> bool {
+    match reason {
+        RescanReason::Manual => true,
+        RescanReason::Periodic | RescanReason::Overflow => current_is_group_primary,
+    }
+}
+
 /// Lifecycle state of the source app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleState {
@@ -354,6 +372,8 @@ struct RootRuntime {
     mtime_cache: Arc<Mutex<HashMap<std::path::PathBuf, f64>>>,
     epoch_counter: Arc<Mutex<u64>>,
     rescan_tx: tokio::sync::broadcast::Sender<RescanReason>,
+    manual_rescan_pending: Arc<AtomicBool>,
+    manual_rescan_notify: Arc<tokio::sync::Notify>,
 }
 
 struct RootTaskHandle {
@@ -942,7 +962,7 @@ impl FSMetaSource {
                 concrete.id = format!("{}@{}", root.id, member.object_ref);
                 concrete.watch = root.watch && source_scheduled;
                 concrete.scan = root.scan && scan_scheduled;
-                let emit_prefix = monitor_path.clone();
+                let emit_prefix = root.subpath_scope.clone();
                 let host_fs = match resolve_host_fs_facade(
                     monitor_path.clone(),
                     boundary.clone(),
@@ -987,6 +1007,8 @@ impl FSMetaSource {
                     mtime_cache: Arc::new(Mutex::new(HashMap::new())),
                     epoch_counter: Arc::new(Mutex::new(0)),
                     rescan_tx,
+                    manual_rescan_pending: Arc::new(AtomicBool::new(false)),
+                    manual_rescan_notify: Arc::new(tokio::sync::Notify::new()),
                 });
             }
         }
@@ -1470,7 +1492,8 @@ impl FSMetaSource {
             if let Some(health) = fanout_health {
                 Self::mark_root_rescan_requested(health, &Self::root_runtime_key(root), reason);
             }
-            let _ = root.rescan_tx.send(RescanReason::Manual);
+            root.manual_rescan_pending.store(true, Ordering::Release);
+            root.manual_rescan_notify.notify_one();
         }
     }
 
@@ -1630,8 +1653,10 @@ impl FSMetaSource {
                                         ));
                                         continue;
                                     }
-                                    log::info!(
-                                        "Executing live scan for on-demand-force-find: path={:?}, recursive={}",
+                                    eprintln!(
+                                        "fs_meta_source: route force-find request correlation={:?} selected_group={:?} path={:?} recursive={}",
+                                        req.metadata().correlation_id,
+                                        params.scope.selected_group,
                                         params.scope.path,
                                         params.scope.recursive
                                     );
@@ -1706,6 +1731,11 @@ impl FSMetaSource {
                                         &object_to_group,
                                     ) {
                                         Ok(grouped_events) => {
+                                            eprintln!(
+                                                "fs_meta_source: route force-find response correlation={:?} groups_events={}",
+                                                req.metadata().correlation_id,
+                                                grouped_events.len()
+                                            );
                                             for event in grouped_events {
                                                 let mut meta = event.metadata().clone();
                                                 meta.correlation_id = req.metadata().correlation_id;
@@ -2010,8 +2040,10 @@ impl FSMetaSource {
                                     ));
                                     continue;
                                 }
-                                log::info!(
-                                    "Executing live scan for on-demand-force-find: path={:?}, recursive={}",
+                                eprintln!(
+                                    "fs_meta_source: route force-find request correlation={:?} selected_group={:?} path={:?} recursive={}",
+                                    req.metadata().correlation_id,
+                                    params.scope.selected_group,
                                     params.scope.path,
                                     params.scope.recursive
                                 );
@@ -2085,6 +2117,11 @@ impl FSMetaSource {
                                     &object_to_group,
                                 ) {
                                     Ok(grouped_events) => {
+                                        eprintln!(
+                                            "fs_meta_source: route force-find response correlation={:?} groups_events={}",
+                                            req.metadata().correlation_id,
+                                            grouped_events.len()
+                                        );
                                         for event in grouped_events {
                                             let mut meta = event.metadata().clone();
                                             meta.correlation_id = req.metadata().correlation_id;
@@ -3536,6 +3573,8 @@ impl FSMetaSource {
         let rescan_mtime_cache = Arc::clone(&root.mtime_cache);
         let rescan_epoch = Arc::clone(&root.epoch_counter);
         let rescan_watch = watch_manager;
+        let manual_rescan_pending = Arc::clone(&root.manual_rescan_pending);
+        let manual_rescan_notify = Arc::clone(&root.manual_rescan_notify);
         let audit_interval = root
             .spec
             .audit_interval_ms
@@ -3562,7 +3601,7 @@ impl FSMetaSource {
             loop {
                 let current_is_group_primary =
                     Self::root_current_is_group_primary(&roots_handle, &root_key);
-                let rescan_open = rescan_channel_open && current_is_group_primary;
+                let rescan_open = rescan_channel_open;
                 let periodic_open = periodic_channel_open && current_is_group_primary;
                 tokio::select! {
                     _ = global_shutdown.cancelled() => break,
@@ -3580,8 +3619,75 @@ impl FSMetaSource {
                         );
                         let _ = root.rescan_tx.send(RescanReason::Periodic);
                     }
+                    _ = manual_rescan_notify.notified(), if rescan_channel_open => {
+                        if !manual_rescan_pending.swap(false, Ordering::AcqRel) {
+                            continue;
+                        }
+                        let reason = RescanReason::Manual;
+                        let reason_label = "manual";
+                        let audit_started_at_us = now_us();
+                        eprintln!(
+                            "fs_meta_source: starting {} rescan root_key={}",
+                            reason_label,
+                            root_key
+                        );
+                        Self::mark_root_audit_start(
+                            &fanout_health,
+                            &root_key,
+                            reason_label,
+                            audit_started_at_us,
+                        );
+                        let scanner = Arc::clone(&rescan_scanner);
+                        let de = Arc::clone(&rescan_drift);
+                        let clk = Arc::clone(&rescan_clock);
+                        let cache = Arc::clone(&rescan_mtime_cache);
+                        let epoch = Arc::clone(&rescan_epoch);
+                        let wm = rescan_watch.clone();
+                        let rescan_batches = tokio::task::spawn_blocking(move || {
+                            let mut c = lock_or_recover(&cache, "source.root.rescan.mtime_cache");
+                            let mut ep = lock_or_recover(&epoch, "source.root.rescan.epoch_counter");
+                            let current_epoch = *ep;
+                            *ep += 1;
+                            scanner.scan_audit(current_epoch, &mut c, &de, &clk, wm)
+                        }).await;
+                        Self::mark_root_audit_completed(
+                            &fanout_health,
+                            &root_key,
+                            audit_started_at_us,
+                            now_us(),
+                        );
+                        match rescan_batches {
+                            Ok(batches) => {
+                                eprintln!(
+                                    "fs_meta_source: {} rescan produced batches={} root_key={}",
+                                    reason_label,
+                                    batches.len(),
+                                    root_key
+                                );
+                                for (idx, batch) in batches.into_iter().enumerate() {
+                                    eprintln!(
+                                        "fs_meta_source: rescan enqueue/yield batch_index={} len={} root_key={}",
+                                        idx,
+                                        batch.len(),
+                                        root_key
+                                    );
+                                    yield batch;
+                                }
+                            }
+                            Err(err) => {
+                                Self::set_object_last_error(
+                                    &fanout_health,
+                                    &root_key,
+                                    format!("rescan join failed: {err}"),
+                                );
+                            }
+                        }
+                    }
                     rescan = rescan_rx.recv(), if rescan_open => match rescan {
                         Ok(reason) => {
+                            if !should_process_rescan_reason(current_is_group_primary, reason) {
+                                continue;
+                            }
                             if matches!(reason, RescanReason::Overflow) {
                                 Self::mark_root_overflow_observed(&fanout_health, &root_key);
                                 let actions = sentinel.process(HealthSignal::WatchOverflow {
@@ -5114,6 +5220,19 @@ mod tests {
             .try_recv()
             .expect("sentinel trigger_rescan must publish a rescan signal");
         assert!(matches!(reason, RescanReason::Manual));
+    }
+
+    #[test]
+    fn manual_rescan_is_processed_even_when_primary_flag_is_false() {
+        assert!(should_process_rescan_reason(false, RescanReason::Manual));
+    }
+
+    #[test]
+    fn periodic_and_overflow_rescan_still_require_primary() {
+        assert!(!should_process_rescan_reason(false, RescanReason::Periodic));
+        assert!(!should_process_rescan_reason(false, RescanReason::Overflow));
+        assert!(should_process_rescan_reason(true, RescanReason::Periodic));
+        assert!(should_process_rescan_reason(true, RescanReason::Overflow));
     }
 
     #[test]

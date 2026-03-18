@@ -13,6 +13,7 @@ ports:
     dispatch_tag: stream
     pattern: stream
     route_key: fs-meta.events:v1
+    visibility: internal
     roles:
       - serve
       - use
@@ -37,6 +38,15 @@ ports:
     dispatch_tag: sink_query
     pattern: request_reply
     route_key: materialized-find:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta.internal
+    use_port: sink.query.proxy
+    dispatch_tag: sink_query_proxy
+    pattern: request_reply
+    route_key: materialized-find-proxy:v1
     visibility: internal
     roles:
       - serve
