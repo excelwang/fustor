@@ -13,7 +13,7 @@ use axum::{
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
-use capanix_app_sdk::raw::ChannelIoSubset;
+use capanix_app_sdk::raw::{ChannelBoundary, ChannelIoSubset};
 use capanix_app_sdk::runtime::NodeId;
 use capanix_app_sdk::{CnxError, Result};
 
@@ -69,9 +69,12 @@ impl ApiServerHandle {
 pub async fn spawn(
     cfg: ResolvedApiConfig,
     node_id: NodeId,
+    runtime_control: Option<Arc<dyn ChannelBoundary>>,
     runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     source: Arc<SourceFacade>,
     sink: Arc<SinkFacade>,
+    query_sink: Arc<SinkFacade>,
+    query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     facade_pending: SharedFacadePendingStatusCell,
 ) -> Result<ApiServerHandle> {
     cfg.auth
@@ -86,9 +89,12 @@ pub async fn spawn(
     let projection_policy = Arc::new(RwLock::new(initial_policy));
     let state = ApiState {
         node_id,
+        runtime_control,
         runtime_boundary,
+        query_runtime_boundary,
         source,
         sink,
+        query_sink,
         auth,
         projection_policy,
         facade_pending,
@@ -189,8 +195,10 @@ fn router(state: ApiState) -> Result<Router> {
         ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
     let projection_router = create_inprocess_router(
-        state.sink.clone(),
+        state.query_sink.clone(),
         state.source.clone(),
+        state.query_runtime_boundary.clone(),
+        state.node_id.clone(),
         state.projection_policy.clone(),
     )
     .layer(middleware::from_fn_with_state(

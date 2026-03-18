@@ -594,23 +594,40 @@ fn spawn_local_source_pump(
     boundary: Option<Arc<dyn ChannelIoSubset>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        tokio::pin!(stream);
-        while let Some(batch) = stream.next().await {
-            if let Some(boundary) = boundary.as_ref() {
-                if let Err(err) = boundary.channel_send(
-                    BoundaryContext::default(),
-                    ChannelSendRequest {
-                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                        events: batch,
-                    },
-                ) {
-                    log::error!(
-                        "fs-meta app pump failed to publish source batch on stream route: {:?}",
-                        err
-                    );
+        if let Some(boundary) = boundary {
+            let rt = tokio::runtime::Handle::current();
+            let (queue_tx, mut queue_rx) = tokio::sync::mpsc::channel::<Vec<Event>>(512);
+            let send_task = tokio::task::spawn_blocking(move || {
+                while let Some(batch) = rt.block_on(queue_rx.recv()) {
+                    if let Err(err) = boundary.channel_send(
+                        BoundaryContext::default(),
+                        ChannelSendRequest {
+                            channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                            events: batch,
+                        },
+                    ) {
+                        log::error!(
+                            "fs-meta app pump failed to publish source batch on stream route: {:?}",
+                            err
+                        );
+                        break;
+                    }
                 }
-            } else if let Err(err) = sink.send(&batch).await {
-                log::error!("fs-meta app pump failed to apply batch: {:?}", err);
+            });
+            tokio::pin!(stream);
+            while let Some(batch) = stream.next().await {
+                if queue_tx.send(batch).await.is_err() {
+                    break;
+                }
+            }
+            drop(queue_tx);
+            let _ = send_task.await;
+        } else {
+            tokio::pin!(stream);
+            while let Some(batch) = stream.next().await {
+                if let Err(err) = sink.send(&batch).await {
+                    log::error!("fs-meta app pump failed to apply batch: {:?}", err);
+                }
             }
         }
     })

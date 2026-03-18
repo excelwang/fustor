@@ -17,6 +17,10 @@ use crate::query::tree::{
 use crate::sink::SinkStatusSnapshot;
 use crate::source::SourceStatusSnapshot;
 use crate::source::config::GrantedMountRoot;
+use crate::runtime::routes::{
+    ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_INTERNAL,
+    ROUTE_KEY_SINK_STATUS_INTERNAL,
+};
 use crate::workers::sink::SinkFacade;
 use crate::workers::source::SourceFacade;
 use axum::{
@@ -30,9 +34,12 @@ use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD as B64, URL_SAFE_NO_PAD as B64URL},
 };
+use bytes::Bytes;
 // bound_route_metrics_snapshot remains an app-sdk helper for transport
 // diagnostics; ordinary app-facing imports in this module stay on app-sdk.
-use capanix_app_sdk::{CnxError, Event, bound_route_metrics_snapshot};
+use capanix_app_sdk::runtime::{NodeId, RouteKey};
+use capanix_app_sdk::{BoundRouteClient, CnxError, Event, bound_route_metrics_snapshot};
+use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_host_fs_types::query::StabilityMode;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -178,6 +185,12 @@ impl ProjectionPolicy {
 enum QueryBackend {
     InProcess {
         sink: Arc<SinkFacade>,
+        source: Arc<SourceFacade>,
+    },
+    Route {
+        sink: Arc<SinkFacade>,
+        boundary: Arc<dyn ChannelIoSubset>,
+        origin_id: NodeId,
         source: Arc<SourceFacade>,
     },
 }
@@ -328,12 +341,91 @@ fn materialized_query_readiness_error(
     ))
 }
 
-fn ensure_materialized_queries_ready(state: &ApiState) -> Result<(), CnxError> {
+fn merge_sink_status_snapshots(mut snapshots: Vec<SinkStatusSnapshot>) -> SinkStatusSnapshot {
+    if snapshots.is_empty() {
+        return SinkStatusSnapshot::default();
+    }
+    if snapshots.len() == 1 {
+        return snapshots.pop().unwrap_or_default();
+    }
+
+    let mut groups = BTreeMap::<String, crate::sink::SinkGroupStatusSnapshot>::new();
+    for snapshot in snapshots {
+        for group in snapshot.groups {
+            groups
+                .entry(group.group_id.clone())
+                .and_modify(|current| {
+                    let current_score = (
+                        u8::from(current.initial_audit_completed),
+                        current.total_nodes,
+                        current.live_nodes,
+                        current.shadow_time_us,
+                    );
+                    let incoming_score = (
+                        u8::from(group.initial_audit_completed),
+                        group.total_nodes,
+                        group.live_nodes,
+                        group.shadow_time_us,
+                    );
+                    if incoming_score > current_score {
+                        *current = group.clone();
+                    }
+                })
+                .or_insert(group);
+        }
+    }
+
+    let mut merged = SinkStatusSnapshot::default();
+    merged.groups = groups.into_values().collect();
+    merged.groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
+    for group in &merged.groups {
+        merged.live_nodes += group.live_nodes;
+        merged.tombstoned_count += group.tombstoned_count;
+        merged.attested_count += group.attested_count;
+        merged.suspect_count += group.suspect_count;
+        merged.blind_spot_count += group.blind_spot_count;
+        merged.estimated_heap_bytes += group.estimated_heap_bytes;
+        merged.shadow_time_us = merged.shadow_time_us.max(group.shadow_time_us);
+    }
+    merged
+}
+
+pub(crate) async fn route_sink_status_snapshot(
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    timeout: Duration,
+) -> Result<SinkStatusSnapshot, CnxError> {
+    let route = BoundRouteClient::open(
+        boundary,
+        RouteKey(ROUTE_KEY_SINK_STATUS_INTERNAL.to_string()),
+        origin_id,
+    )?;
+    let events = run_blocking_query(move || route.ask(Bytes::new(), timeout), timeout).await?;
+    let snapshots = events
+        .into_iter()
+        .map(|event| {
+            rmp_serde::from_slice::<SinkStatusSnapshot>(event.payload_bytes()).map_err(|err| {
+                CnxError::Internal(format!("decode sink status snapshot failed: {err}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(merge_sink_status_snapshots(snapshots))
+}
+
+async fn ensure_materialized_queries_ready(state: &ApiState) -> Result<(), CnxError> {
     let (Some(source), Some(sink)) = (&state.readiness_source, &state.readiness_sink) else {
         return Ok(());
     };
     let source_status = source.status_snapshot()?;
-    let sink_status = sink.status_snapshot()?;
+    let sink_status = match &state.backend {
+        QueryBackend::Route {
+            boundary,
+            origin_id,
+            ..
+        } => route_sink_status_snapshot(boundary.clone(), origin_id.clone(), Duration::from_secs(30))
+            .await?,
+        QueryBackend::InProcess { .. } => sink.status_snapshot()?,
+    };
     if let Some(message) = materialized_query_readiness_error(&source_status, &sink_status) {
         return Err(CnxError::NotReady(message));
     }
@@ -883,13 +975,27 @@ fn build_force_find_tree_request(
 pub fn create_inprocess_router(
     sink: Arc<SinkFacade>,
     source: Arc<SourceFacade>,
+    runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+    origin_id: NodeId,
     policy: Arc<RwLock<ProjectionPolicy>>,
 ) -> Router {
+    eprintln!(
+        "fs_meta_query_api: create router backend={}",
+        if runtime_boundary.is_some() { "route" } else { "inprocess" }
+    );
     let state = ApiState {
-        backend: QueryBackend::InProcess {
-            sink: sink.clone(),
-            source: source.clone(),
-        },
+        backend: runtime_boundary.map_or_else(
+            || QueryBackend::InProcess {
+                sink: sink.clone(),
+                source: source.clone(),
+            },
+            |boundary| QueryBackend::Route {
+                sink: sink.clone(),
+                boundary,
+                origin_id,
+                source: source.clone(),
+            },
+        ),
         policy,
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
         readiness_source: Some(source),
@@ -933,6 +1039,41 @@ async fn query_materialized_events(
         QueryBackend::InProcess { sink, .. } => {
             run_blocking_query(move || sink.materialized_query(&params), timeout).await
         }
+        QueryBackend::Route { sink, source, .. } => {
+            let primary_by_group = source.source_primary_by_group_snapshot()?;
+            let host_ref_by_object_ref = source
+                .cached_host_object_grants_snapshot()?
+                .into_iter()
+                .map(|grant| (grant.object_ref, grant.host_ref))
+                .collect::<BTreeMap<_, _>>();
+            let group_ids = match params.scope.selected_group.clone() {
+                Some(group_id) => vec![group_id],
+                None => primary_by_group.keys().cloned().collect::<Vec<_>>(),
+            };
+            run_blocking_query(
+                move || {
+                    let mut all_events = Vec::new();
+                    for group_id in group_ids {
+                        let Some(primary_object_ref) = primary_by_group.get(&group_id) else {
+                            continue;
+                        };
+                        let Some(host_ref) = host_ref_by_object_ref.get(primary_object_ref) else {
+                            return Err(CnxError::Internal(format!(
+                                "missing host_ref for source primary object_ref '{primary_object_ref}'"
+                            )));
+                        };
+                        let mut request = params.clone();
+                        request.scope.selected_group = Some(group_id.clone());
+                        let events =
+                            sink.materialized_query_via_node(&NodeId(host_ref.clone()), &request)?;
+                        all_events.extend(events);
+                    }
+                    Ok(all_events)
+                },
+                timeout,
+            )
+            .await
+        }
     }
 }
 
@@ -944,6 +1085,13 @@ async fn query_force_find_events(
     match backend {
         QueryBackend::InProcess { source, .. } => {
             run_blocking_query(move || source.force_find(&params), timeout).await
+        }
+        QueryBackend::Route { boundary, origin_id, .. } => {
+            let route =
+                BoundRouteClient::open(boundary, RouteKey(ROUTE_KEY_FORCE_FIND.to_string()), origin_id)?;
+            let payload = rmp_serde::to_vec_named(&params)
+                .map_err(|err| CnxError::Internal(format!("encode force-find query failed: {err}")))?;
+            run_blocking_query(move || route.ask(Bytes::from(payload), timeout), timeout).await
         }
     }
 }
@@ -1121,7 +1269,7 @@ async fn collect_group_rankings(
                 }
                 candidates.push(GroupRank {
                     group_key,
-                    rank_metric: Some(state.per_origin_total_files.values().copied().sum()),
+                    rank_metric: state.per_origin_total_files.values().copied().max(),
                 });
             }
             GroupOrder::FileAge => {
@@ -1155,18 +1303,46 @@ fn decode_materialized_selected_group_response(
     policy: &ProjectionPolicy,
     selected_group: &str,
 ) -> Result<TreeGroupPayload, CnxError> {
+    fn payload_score(payload: &TreeGroupPayload) -> (u8, usize, bool, u64) {
+        (
+            u8::from(payload.root.exists),
+            payload.entries.len(),
+            payload.root.has_children,
+            payload.root.modified_time_us,
+        )
+    }
+
     let mut last_decode_error = None::<String>;
+    let mut best = None::<TreeGroupPayload>;
     for event in events {
         if event_group_key(policy, event) != selected_group {
             continue;
         }
         match rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes()) {
-            Ok(MaterializedQueryPayload::Tree(payload)) => return Ok(payload),
+            Ok(MaterializedQueryPayload::Tree(payload)) => {
+                eprintln!(
+                    "fs_meta_query_api: decode group={} root_exists={} entries={} has_children={} modified_time_us={}",
+                    selected_group,
+                    payload.root.exists,
+                    payload.entries.len(),
+                    payload.root.has_children,
+                    payload.root.modified_time_us
+                );
+                let replace = best
+                    .as_ref()
+                    .is_none_or(|current| payload_score(&payload) > payload_score(current));
+                if replace {
+                    best = Some(payload);
+                }
+            }
             Ok(MaterializedQueryPayload::Stats(_)) => {
                 last_decode_error = Some("unexpected stats payload for tree query".into());
             }
             Err(err) => last_decode_error = Some(err.to_string()),
         }
+    }
+    if let Some(payload) = best {
+        return Ok(payload);
     }
     Err(CnxError::Internal(last_decode_error.unwrap_or_else(|| {
         format!("tree query returned no payload for requested group '{selected_group}'")
@@ -1956,7 +2132,7 @@ async fn get_stats(
         Ok(params) => params,
         Err(err) => return error_response_with_context(err, None),
     };
-    if let Err(err) = ensure_materialized_queries_ready(&state) {
+    if let Err(err) = ensure_materialized_queries_ready(&state).await {
         return error_response_with_context(err, Some(&params.path));
     }
     let request = build_materialized_stats_request(&params.path, params.recursive, None);
@@ -1994,7 +2170,7 @@ async fn get_tree(
     if let Err(err) = validate_tree_query_params(&params) {
         return error_response_with_context(err, Some(&path_for_error));
     }
-    if let Err(err) = ensure_materialized_queries_ready(&state) {
+    if let Err(err) = ensure_materialized_queries_ready(&state).await {
         return error_response_with_context(err, Some(&path_for_error));
     }
     match query_tree_page_response(&state, &policy, &params, policy.query_timeout()).await {

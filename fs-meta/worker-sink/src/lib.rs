@@ -190,10 +190,24 @@ fn process_worker_request(
             ),
         },
         SinkWorkerRequest::MaterializedQuery { request } => match state.sink.as_ref() {
-            Some(sink) => match sink.materialized_query(&request) {
-                Ok(events) => (SinkWorkerResponse::Events(events), false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-            },
+            Some(sink) => {
+                eprintln!(
+                    "fs_meta_sink_worker: MaterializedQuery selected_group={:?} recursive={} path={}",
+                    request.scope.selected_group,
+                    request.scope.recursive,
+                    String::from_utf8_lossy(&request.scope.path)
+                );
+                match sink.materialized_query(&request) {
+                    Ok(events) => {
+                        eprintln!(
+                            "fs_meta_sink_worker: MaterializedQuery response events={}",
+                            events.len()
+                        );
+                        (SinkWorkerResponse::Events(events), false)
+                    }
+                    Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                }
+            }
             None => (
                 SinkWorkerResponse::Error("sink worker not initialized".into()),
                 false,

@@ -472,6 +472,28 @@ impl SinkFacade {
         }
     }
 
+    pub fn materialized_query_via_node(
+        &self,
+        node_id: &NodeId,
+        request: &InternalQueryRequest,
+    ) -> Result<Vec<Event>> {
+        match self {
+            Self::Local(sink) => sink.materialized_query(request),
+            Self::Worker(client) => {
+                if client.node_id == *node_id {
+                    client.materialized_query(request.clone())
+                } else {
+                    let remote = SinkWorkerClientHandle::new(
+                        node_id.clone(),
+                        client.config.clone(),
+                        client.boundary.clone(),
+                    );
+                    remote.materialized_query(request.clone())
+                }
+            }
+        }
+    }
+
     pub fn subtree_stats(&self, path: &[u8]) -> Result<Vec<Event>> {
         match self {
             Self::Local(sink) => sink.materialized_query(&InternalQueryRequest::materialized(

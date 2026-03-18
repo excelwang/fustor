@@ -1,4 +1,4 @@
-use capanix_app_sdk::runtime::ControlEnvelope;
+use capanix_app_sdk::runtime::{ControlEnvelope, ControlFrame};
 use capanix_app_sdk::{CnxError, Result};
 use capanix_route_proto::{
     BoundScope, ExecControl, RuntimeHostObjectGrantsChanged, TrustedExposureConfirmed,
@@ -10,6 +10,16 @@ use crate::runtime::execution_units::{
     FACADE_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID,
     SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
+
+pub(crate) const MANUAL_RESCAN_CONTROL_FRAME_KIND: &str =
+    "fs-meta.manual-rescan-control:v1";
+
+pub(crate) fn encode_manual_rescan_envelope() -> Result<ControlEnvelope> {
+    Ok(ControlEnvelope::Frame(ControlFrame {
+        kind: MANUAL_RESCAN_CONTROL_FRAME_KIND.to_string(),
+        payload: Vec::new(),
+    }))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SourceRuntimeUnit {
@@ -77,6 +87,9 @@ pub(crate) enum SourceControlSignal {
         changed: RuntimeHostObjectGrantsChanged,
         envelope: ControlEnvelope,
     },
+    ManualRescan {
+        envelope: ControlEnvelope,
+    },
     Passthrough(ControlEnvelope),
 }
 
@@ -86,7 +99,8 @@ impl SourceControlSignal {
             Self::Activate { envelope, .. }
             | Self::Deactivate { envelope, .. }
             | Self::Tick { envelope, .. }
-            | Self::RuntimeHostObjectGrantsChanged { envelope, .. } => envelope.clone(),
+            | Self::RuntimeHostObjectGrantsChanged { envelope, .. }
+            | Self::ManualRescan { envelope, .. } => envelope.clone(),
             Self::Passthrough(envelope) => envelope.clone(),
         }
     }
@@ -254,6 +268,15 @@ pub(crate) fn source_control_signals_from_envelopes(
         if let Some(changed) = decode_runtime_host_object_grants_changed_envelope(envelope)? {
             signals.push(SourceControlSignal::RuntimeHostObjectGrantsChanged {
                 changed,
+                envelope: envelope.clone(),
+            });
+            continue;
+        }
+
+        if let ControlEnvelope::Frame(frame) = envelope
+            && frame.kind == MANUAL_RESCAN_CONTROL_FRAME_KIND
+        {
+            signals.push(SourceControlSignal::ManualRescan {
                 envelope: envelope.clone(),
             });
             continue;
@@ -474,6 +497,15 @@ pub(crate) fn split_app_control_signals(
                 envelope: envelope.clone(),
             });
             facade.push(FacadeControlSignal::RuntimeHostObjectGrantsChanged { _changed: changed });
+            continue;
+        }
+
+        if let ControlEnvelope::Frame(frame) = envelope
+            && frame.kind == MANUAL_RESCAN_CONTROL_FRAME_KIND
+        {
+            source.push(SourceControlSignal::ManualRescan {
+                envelope: envelope.clone(),
+            });
             continue;
         }
 

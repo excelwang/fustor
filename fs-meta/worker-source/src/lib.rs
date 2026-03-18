@@ -91,22 +91,37 @@ fn start_source_pump_with_stream<S>(
 where
     S: futures_util::Stream<Item = Vec<Event>> + Send + 'static,
 {
+    let runtime_handle = runtime.clone();
     runtime.spawn(async move {
+        let (queue_tx, mut queue_rx) = tokio::sync::mpsc::channel::<Vec<Event>>(512);
+        let send_boundary = boundary.clone();
+        let send_runtime = runtime_handle.clone();
+        let send_task = tokio::task::spawn_blocking(move || {
+            while let Some(batch) = send_runtime.block_on(queue_rx.recv()) {
+                if let Err(err) = send_boundary.channel_send(
+                    BoundaryContext::default(),
+                    ChannelSendRequest {
+                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                        events: batch,
+                    },
+                ) {
+                    log::error!(
+                        "source worker pump failed to publish source batch on stream route: {:?}",
+                        err
+                    );
+                    break;
+                }
+            }
+        });
+
         futures_util::pin_mut!(stream);
         while let Some(batch) = stream.next().await {
-            if let Err(err) = boundary.channel_send(
-                BoundaryContext::default(),
-                ChannelSendRequest {
-                    channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                    events: batch,
-                },
-            ) {
-                log::error!(
-                    "source worker pump failed to publish source batch on stream route: {:?}",
-                    err
-                );
+            if queue_tx.send(batch).await.is_err() {
+                break;
             }
         }
+        drop(queue_tx);
+        let _ = send_task.await;
     })
 }
 

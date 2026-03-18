@@ -4,8 +4,8 @@ use crate::runtime::execution_units::{
 };
 use crate::runtime::routes::{
     ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
-    ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
-    ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+    ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
+    ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
 };
 use crate::source::config::RootSpec;
 
@@ -114,6 +114,14 @@ fn build_route_units_json() -> serde_json::Value {
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_QUERY),
+        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+    );
+    route_units.insert(
+        request_reply_activation_route_key(ROUTE_KEY_SINK_QUERY_INTERNAL),
+        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
+    );
+    route_units.insert(
+        request_reply_activation_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL),
         serde_json::json!([SINK_RUNTIME_UNIT_ID]),
     );
     route_units.insert(

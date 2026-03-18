@@ -45,7 +45,8 @@ use crate::runtime::orchestration::{
     SinkControlSignal, SinkRuntimeUnit, sink_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
-    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SOURCE_FIND, METHOD_STREAM,
+    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
+    METHOD_STREAM,
     ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL,
     default_route_bindings,
 };
@@ -430,6 +431,10 @@ pub struct SinkFileMeta {
 }
 
 impl SinkFileMeta {
+    pub(crate) fn apply_stream_batch(&self, events: &[Event]) -> Result<()> {
+        self.ingest_stream_events(events)
+    }
+
     /// Create a new sink app.
     #[allow(dead_code)]
     pub fn new(node_id: NodeId) -> Result<Self> {
@@ -525,6 +530,12 @@ impl SinkFileMeta {
                             if let Ok(params) =
                                 rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
                             {
+                                eprintln!(
+                                    "fs_meta_sink: query endpoint request selected_group={:?} recursive={} path={}",
+                                    params.scope.selected_group,
+                                    params.scope.recursive,
+                                    String::from_utf8_lossy(&params.scope.path)
+                                );
                                 let sink_impl = SinkFileMeta {
                                     state: query_state.clone(),
                                     root_specs: query_root_specs.clone(),
@@ -539,6 +550,10 @@ impl SinkFileMeta {
                                 };
                                 let mut events =
                                     sink_impl.materialized_query(&params).unwrap_or_default();
+                                eprintln!(
+                                    "fs_meta_sink: query endpoint response events={}",
+                                    events.len()
+                                );
                                 for event in &mut events {
                                     let mut meta = event.metadata().clone();
                                     meta.correlation_id = req.metadata().correlation_id;
@@ -591,6 +606,12 @@ impl SinkFileMeta {
                             if let Ok(params) =
                                 rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
                             {
+                                eprintln!(
+                                    "fs_meta_sink: internal query endpoint request selected_group={:?} recursive={} path={}",
+                                    params.scope.selected_group,
+                                    params.scope.recursive,
+                                    String::from_utf8_lossy(&params.scope.path)
+                                );
                                 let sink_impl = SinkFileMeta {
                                     state: internal_query_state.clone(),
                                     root_specs: internal_query_root_specs.clone(),
@@ -606,6 +627,10 @@ impl SinkFileMeta {
                                 };
                                 let mut events =
                                     sink_impl.materialized_query(&params).unwrap_or_default();
+                                eprintln!(
+                                    "fs_meta_sink: internal query endpoint response events={}",
+                                    events.len()
+                                );
                                 for event in &mut events {
                                     let mut meta = event.metadata().clone();
                                     meta.correlation_id = req.metadata().correlation_id;
@@ -628,6 +653,72 @@ impl SinkFileMeta {
                     "failed to resolve route lookup for {}.{}",
                     ROUTE_TOKEN_FS_META_INTERNAL,
                     METHOD_SINK_QUERY
+                );
+            }
+
+            let internal_status_state = state.clone();
+            let internal_status_root_specs = root_specs.clone();
+            let internal_status_host_object_grants = host_object_grants.clone();
+            let internal_status_visibility_lag = visibility_lag.clone();
+            let internal_status_pending_stream_events = pending_stream_events.clone();
+            let internal_status_unit_control = unit_control.clone();
+            if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
+                log::info!(
+                    "bound route listening on {}.{} for sink {}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SINK_STATUS,
+                    node_id_cloned.0
+                );
+                let endpoint = ManagedEndpointTask::spawn(
+                    sys.clone(),
+                    route,
+                    format!(
+                        "sink:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
+                    ),
+                    sink.shutdown.clone(),
+                    move |requests| {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            let sink_impl = SinkFileMeta {
+                                state: internal_status_state.clone(),
+                                root_specs: internal_status_root_specs.clone(),
+                                host_object_grants: internal_status_host_object_grants.clone(),
+                                visibility_lag: internal_status_visibility_lag.clone(),
+                                pending_stream_events: internal_status_pending_stream_events
+                                    .clone(),
+                                unit_control: internal_status_unit_control.clone(),
+                                shutdown: CancellationToken::new(),
+                                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                                runtime_refresh_running: Arc::new(AtomicBool::new(false)),
+                            };
+                            if let Ok(snapshot) = sink_impl.status_snapshot()
+                                && let Ok(payload) = rmp_serde::to_vec_named(&snapshot)
+                            {
+                                responses.push(Event::new(
+                                    EventMetadata {
+                                        origin_id: req.metadata().origin_id.clone(),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: req.metadata().correlation_id,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    },
+                                    Bytes::from(payload),
+                                ));
+                            }
+                        }
+                        responses
+                    },
+                );
+                lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
+                    .push(endpoint);
+            } else {
+                log::error!(
+                    "failed to resolve route lookup for {}.{}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SINK_STATUS
                 );
             }
 
@@ -906,6 +997,68 @@ impl SinkFileMeta {
             .push(endpoint);
         }
 
+        let internal_status_state = self.state.clone();
+        let internal_status_root_specs = self.root_specs.clone();
+        let internal_status_host_object_grants = self.host_object_grants.clone();
+        let internal_status_visibility_lag = self.visibility_lag.clone();
+        let internal_status_pending_stream_events = self.pending_stream_events.clone();
+        let internal_status_unit_control = self.unit_control.clone();
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
+            log::info!(
+                "bound route listening on {}.{} for sink {}",
+                ROUTE_TOKEN_FS_META_INTERNAL,
+                METHOD_SINK_STATUS,
+                node_id_cloned.0
+            );
+            let endpoint = ManagedEndpointTask::spawn(
+                boundary.clone(),
+                route,
+                format!(
+                    "sink:{}:{}",
+                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
+                ),
+                self.shutdown.clone(),
+                move |requests| {
+                    let mut responses = Vec::new();
+                    for req in requests {
+                        let sink_impl = SinkFileMeta {
+                            state: internal_status_state.clone(),
+                            root_specs: internal_status_root_specs.clone(),
+                            host_object_grants: internal_status_host_object_grants.clone(),
+                            visibility_lag: internal_status_visibility_lag.clone(),
+                            pending_stream_events: internal_status_pending_stream_events.clone(),
+                            unit_control: internal_status_unit_control.clone(),
+                            shutdown: CancellationToken::new(),
+                            endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                            runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                            runtime_refresh_running: Arc::new(AtomicBool::new(false)),
+                        };
+                        if let Ok(snapshot) = sink_impl.status_snapshot()
+                            && let Ok(payload) = rmp_serde::to_vec_named(&snapshot)
+                        {
+                            responses.push(Event::new(
+                                EventMetadata {
+                                    origin_id: req.metadata().origin_id.clone(),
+                                    timestamp_us: now_us(),
+                                    logical_ts: None,
+                                    correlation_id: req.metadata().correlation_id,
+                                    ingress_auth: None,
+                                    trace: None,
+                                },
+                                Bytes::from(payload),
+                            ));
+                        }
+                    }
+                    responses
+                },
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_runtime_endpoints.internal_status_tasks",
+            )
+            .push(endpoint);
+        }
+
         const FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS: u64 = 750;
         let node_id_proxy = node_id.clone();
         let proxy_adapter = adapter.clone();
@@ -1055,9 +1208,7 @@ impl SinkFileMeta {
     }
 
     fn scheduled_group_ids(&self) -> Result<Option<BTreeSet<String>>> {
-        Ok(self
-            .scheduled_bound_scopes()?
-            .map(|rows| rows.into_iter().map(|row| row.scope_id).collect()))
+        Ok(None)
     }
 
     pub fn scheduled_group_ids_snapshot(&self) -> Result<Option<BTreeSet<String>>> {
@@ -1065,36 +1216,7 @@ impl SinkFileMeta {
     }
 
     fn scheduled_stream_object_refs(&self) -> Result<Option<BTreeSet<String>>> {
-        let Some(rows) = self.scheduled_bound_scopes()? else {
-            return Ok(None);
-        };
-        let mut object_refs = BTreeSet::new();
-        let mut scheduled_groups = BTreeSet::new();
-        for row in rows {
-            scheduled_groups.insert(row.scope_id);
-            for resource_id in row.resource_ids {
-                let trimmed = resource_id.trim();
-                if !trimmed.is_empty() {
-                    object_refs.insert(trimmed.to_string());
-                }
-            }
-        }
-        if !scheduled_groups.is_empty() {
-            let roots = self
-                .root_specs
-                .read()
-                .map_err(|_| CnxError::Internal("Sink root_specs lock poisoned".into()))?
-                .clone();
-            let grants = self.logical_grants_snapshot()?;
-            for grant in grants {
-                if roots.iter().any(|root| {
-                    scheduled_groups.contains(&root.id) && root.selector.matches(&grant)
-                }) {
-                    object_refs.insert(grant.object_ref);
-                }
-            }
-        }
-        Ok(Some(object_refs))
+        Ok(None)
     }
 
     fn reconcile_runtime_groups(&self, host_object_grants: &[GrantedMountRoot]) -> Result<()> {
@@ -1459,7 +1581,7 @@ impl SinkFileMeta {
 
     fn has_scheduled_stream_targets(&self) -> bool {
         self.scheduled_stream_object_refs()
-            .map(|targets| targets.is_some_and(|targets| !targets.is_empty()))
+            .map(|targets| targets.is_none_or(|targets| !targets.is_empty()))
             .unwrap_or(false)
     }
 
@@ -1467,6 +1589,20 @@ impl SinkFileMeta {
         if events.is_empty() {
             return Ok(());
         }
+        let control_count = events
+            .iter()
+            .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok())
+            .count();
+        eprintln!(
+            "fs_meta_sink: ingest_stream_events received={} control={} data={} first_origin={}",
+            events.len(),
+            control_count,
+            events.len().saturating_sub(control_count),
+            events
+                .first()
+                .map(|event| event.metadata().origin_id.0.as_str())
+                .unwrap_or("<none>")
+        );
 
         let configured = self.configured_stream_object_refs()?;
         let scheduled = self.scheduled_stream_object_refs()?.unwrap_or_default();
@@ -1557,6 +1693,11 @@ impl SinkFileMeta {
         let mut pending_lag_samples = Vec::new();
         let mut control_events = 0usize;
         let mut data_events = 0usize;
+        let mut created = 0usize;
+        let mut modified = 0usize;
+        let mut deleted = 0usize;
+        let mut ignored = 0usize;
+        let mut touched_groups = BTreeSet::new();
         let mut state = self.state.write()?;
         let mut accepted = Vec::with_capacity(events.len());
 
@@ -1580,6 +1721,7 @@ impl SinkFileMeta {
             let object_ref = event.metadata().origin_id.0.clone();
             let (group_id, is_group_primary, group_state) =
                 state.ensure_group_state_mut(&object_ref)?;
+            touched_groups.insert(group_id.clone());
             group_state.clock.advance(event.metadata().timestamp_us);
 
             let payload = event.payload_bytes();
@@ -1663,6 +1805,12 @@ impl SinkFileMeta {
                 }
                 ProcessOutcome::Ignored => false,
             };
+            match outcome {
+                ProcessOutcome::UpsertCreated => created += 1,
+                ProcessOutcome::UpsertModified => modified += 1,
+                ProcessOutcome::DeleteApplied => deleted += 1,
+                ProcessOutcome::Ignored => ignored += 1,
+            }
             if write_significant {
                 group_state
                     .tree
@@ -1699,6 +1847,36 @@ impl SinkFileMeta {
             log::debug!(
                 "sink-file-meta skipped {} out-of-scope event(s) while applying stream batch",
                 skipped_events
+            );
+        }
+
+        if !touched_groups.is_empty() {
+            let state = self.state.read()?;
+            let summary = touched_groups
+                .into_iter()
+                .filter_map(|group_id| {
+                    state.groups.get(&group_id).map(|group| {
+                        format!(
+                            "{}:nodes={} live={} initial_audit_completed={}",
+                            group_id,
+                            group.tree.node_count(),
+                            query::get_health_stats(&group.tree, &group.clock).live_nodes,
+                            group.initial_audit_completed
+                        )
+                    })
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            eprintln!(
+                "fs_meta_sink: apply_events summary total={} control={} data={} created={} modified={} deleted={} ignored={} groups=[{}]",
+                events.len(),
+                control_events,
+                data_events,
+                created,
+                modified,
+                deleted,
+                ignored,
+                summary
             );
         }
 

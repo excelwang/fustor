@@ -6,13 +6,11 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, header},
 };
-use bytes::Bytes;
-use capanix_app_sdk::Event;
-use capanix_app_sdk::raw::{BoundaryContext, ChannelKey, ChannelSendRequest};
-use capanix_app_sdk::runtime::EventMetadata;
+use capanix_app_sdk::runtime::AppControlDispatchRequest;
+use capanix_app_sdk::raw::BoundaryContext;
 
-use crate::query::api::refresh_policy_from_host_object_grants;
-use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
+use crate::query::api::{refresh_policy_from_host_object_grants, route_sink_status_snapshot};
+use crate::runtime::orchestration::encode_manual_rescan_envelope;
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use crate::workers::source::SourceObservabilitySnapshot;
 
@@ -49,7 +47,15 @@ pub async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
 
-    let sink_status = state.sink.status_snapshot()?;
+    let sink_status = match state.query_runtime_boundary.clone() {
+        Some(boundary) => route_sink_status_snapshot(
+            boundary,
+            state.node_id.clone(),
+            std::time::Duration::from_secs(30),
+        )
+        .await?,
+        None => state.sink.status_snapshot()?,
+    };
     let source = match state.source.observability_snapshot() {
         Ok(snapshot) => snapshot,
         Err(err) if state.source.is_worker() => {
@@ -230,27 +236,20 @@ pub async fn rescan(
     headers: HeaderMap,
 ) -> Result<Json<RescanResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
-    if let Some(boundary) = state.runtime_boundary.as_ref() {
+    if let Some(boundary) = state.runtime_control.as_ref() {
         boundary
-            .channel_send(
+            .dispatch_control_frames(
                 BoundaryContext::default(),
-                ChannelSendRequest {
-                    channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
-                    events: vec![Event::new(
-                        EventMetadata {
-                            origin_id: state.node_id.clone(),
-                            timestamp_us: 0,
-                            logical_ts: None,
-                            correlation_id: None,
-                            ingress_auth: None,
-                            trace: None,
-                        },
-                        Bytes::new(),
-                    )],
+                AppControlDispatchRequest {
+                    worker_ids: vec!["runtime.exec.source".to_string()],
+                    scope_ids: Vec::new(),
+                    envelopes: vec![encode_manual_rescan_envelope().map_err(|err| {
+                        ApiError::internal(format!("manual rescan envelope encode failed: {err}"))
+                    })?],
                 },
             )
             .map_err(|err| {
-                ApiError::internal(format!("manual rescan control stream send failed: {err}"))
+                ApiError::internal(format!("manual rescan control dispatch failed: {err}"))
             })?;
     } else {
         state.source.trigger_rescan_when_ready().await?;

@@ -671,6 +671,22 @@ impl FSMetaSource {
                 SourceControlSignal::RuntimeHostObjectGrantsChanged { changed, .. } => {
                     actions.push(PendingAction::UpdateHostObjectGrants(changed.clone()));
                 }
+                SourceControlSignal::ManualRescan { .. } => {
+                    eprintln!(
+                        "fs_meta_source: manual rescan control envelope received node={}",
+                        self.node_id.0
+                    );
+                    let roots_snapshot = lock_or_recover(
+                        &self.state_cell.roots,
+                        "source.control.manual_rescan.roots",
+                    )
+                    .clone();
+                    FSMetaSource::request_rescan_on_primary_roots(
+                        &roots_snapshot,
+                        Some(&self.state_cell.fanout_health),
+                        "manual",
+                    );
+                }
                 SourceControlSignal::Passthrough(_) => {
                     return Err(CnxError::NotSupported(
                         "source-fs-meta: unsupported control envelope".into(),
@@ -1446,6 +1462,11 @@ impl FSMetaSource {
             if !root.is_group_primary {
                 continue;
             }
+            eprintln!(
+                "fs_meta_source: queue {} rescan for primary root_key={}",
+                reason,
+                Self::root_runtime_key(root)
+            );
             if let Some(health) = fanout_health {
                 Self::mark_root_rescan_requested(health, &Self::root_runtime_key(root), reason);
             }
@@ -2853,6 +2874,11 @@ impl FSMetaSource {
                             if task_cancel.is_cancelled() || global_shutdown.is_cancelled() {
                                 break;
                             }
+                            eprintln!(
+                                "fs_meta_source: root task forwarding batch len={} root_key={}",
+                                batch.len(),
+                                root_key
+                            );
                             if out_tx.send(batch).await.is_err() {
                                 Self::update_root_task_slot_health(
                                     &fanout_health,
@@ -3289,9 +3315,20 @@ impl FSMetaSource {
             if global_shutdown.is_cancelled() || task_shutdown.is_cancelled() {
                 return Err(CnxError::ChannelClosed);
             }
+            eprintln!(
+                "fs_meta_source: probing root availability root_key={} path={}",
+                root_key,
+                root_path.display()
+            );
             match root.host_fs.metadata(&root_path) {
                 Ok(_) => break,
                 Err(e) => {
+                    eprintln!(
+                        "fs_meta_source: root unavailable root_key={} path={} err={}",
+                        root_key,
+                        root_path.display(),
+                        e
+                    );
                     Self::update_object_health(
                         &fanout_health,
                         &root_key,
@@ -3420,6 +3457,7 @@ impl FSMetaSource {
                     "initial_scan",
                     audit_started_at_us,
                 );
+                let initial_scan_root_key_for_scan = initial_scan_root_key.clone();
 
                 let scan_result = tokio::task::spawn_blocking(move || {
                     let mut cache =
@@ -3433,11 +3471,22 @@ impl FSMetaSource {
                     };
                     let batches =
                         scanner.scan_audit(epoch, &mut cache, &drift_est, &clock, scan_watch_mgr);
-                    for batch in batches {
+                    eprintln!(
+                        "fs_meta_source: initial scan produced batches={} root_key={}",
+                        batches.len(),
+                        initial_scan_root_key_for_scan
+                    );
+                    for (idx, batch) in batches.into_iter().enumerate() {
                         if scan_global_shutdown.is_cancelled() || scan_task_shutdown.is_cancelled()
                         {
                             return;
                         }
+                        eprintln!(
+                            "fs_meta_source: initial scan enqueue batch_index={} len={} root_key={}",
+                            idx,
+                            batch.len(),
+                            initial_scan_root_key_for_scan
+                        );
                         if scan_tx.blocking_send(batch).is_err() {
                             return;
                         }
@@ -3495,6 +3544,11 @@ impl FSMetaSource {
 
         let output_stream = stream! {
             while let Some(batch) = scan_rx.recv().await {
+                eprintln!(
+                    "fs_meta_source: root_stream yielding initial batch len={} root_key={}",
+                    batch.len(),
+                    root_key
+                );
                 yield batch;
             }
             let mut audit_tick = tokio::time::interval(audit_interval);
@@ -3548,6 +3602,11 @@ impl FSMetaSource {
                                 RescanReason::Overflow => "overflow",
                             };
                             let audit_started_at_us = now_us();
+                            eprintln!(
+                                "fs_meta_source: starting {} rescan root_key={}",
+                                reason_label,
+                                root_key
+                            );
                             Self::mark_root_audit_start(
                                 &fanout_health,
                                 &root_key,
@@ -3575,7 +3634,19 @@ impl FSMetaSource {
                             );
                             match rescan_batches {
                                 Ok(batches) => {
-                                    for batch in batches {
+                                    eprintln!(
+                                        "fs_meta_source: {} rescan produced batches={} root_key={}",
+                                        reason_label,
+                                        batches.len(),
+                                        root_key
+                                    );
+                                    for (idx, batch) in batches.into_iter().enumerate() {
+                                        eprintln!(
+                                            "fs_meta_source: rescan enqueue/yield batch_index={} len={} root_key={}",
+                                            idx,
+                                            batch.len(),
+                                            root_key
+                                        );
                                         yield batch;
                                     }
                                 }

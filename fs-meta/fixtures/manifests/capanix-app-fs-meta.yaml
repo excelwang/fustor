@@ -33,6 +33,24 @@ ports:
       - serve
       - use
   - route_token: fs-meta.internal
+    use_port: sink.query
+    dispatch_tag: sink_query
+    pattern: request_reply
+    route_key: materialized-find:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta.internal
+    use_port: sink.status
+    dispatch_tag: sink_status
+    pattern: request_reply
+    route_key: sink-status:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta.internal
     use_port: source.find
     dispatch_tag: source_find
     pattern: request_reply

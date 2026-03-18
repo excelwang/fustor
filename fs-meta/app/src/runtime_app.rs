@@ -82,9 +82,11 @@ fn now_us() -> u64 {
 pub struct FSMetaApp {
     config: FSMetaConfig,
     node_id: NodeId,
+    runtime_control_boundary: Option<Arc<dyn ChannelBoundary>>,
     runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     source: Arc<SourceFacade>,
     sink: Arc<SinkFacade>,
+    query_sink: Arc<SinkFacade>,
     pump_task: Mutex<Option<JoinHandle<()>>>,
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
@@ -153,7 +155,7 @@ impl FSMetaApp {
                     node_id.clone(),
                     boundary.clone(),
                     state_boundary.clone(),
-                    sink_source_cfg,
+                    sink_source_cfg.clone(),
                 )?,
             ))),
             SinkExecutionMode::WorkerProcess => match boundary.clone() {
@@ -182,12 +184,15 @@ impl FSMetaApp {
                 }
             },
         };
+        let query_sink = sink.clone();
         Ok(Self {
             config,
             node_id,
+            runtime_control_boundary: ordinary_boundary.clone(),
             runtime_boundary: boundary,
             source,
             sink,
+            query_sink,
             pump_task: Mutex::new(None),
             api_task: Arc::new(Mutex::new(None)),
             pending_facade: Arc::new(Mutex::new(None)),
@@ -209,7 +214,6 @@ impl FSMetaApp {
         if !self.sink.is_worker() {
             self.sink.ensure_started()?;
         }
-
         let mut guard = self.pump_task.lock().await;
         if guard.is_none() {
             *guard = self
@@ -365,9 +369,12 @@ impl FSMetaApp {
             self.pending_facade.clone(),
             self.facade_pending_status.clone(),
             self.node_id.clone(),
+            self.runtime_control_boundary.clone(),
             self.runtime_boundary.clone(),
             self.source.clone(),
             self.sink.clone(),
+            self.query_sink.clone(),
+            self.runtime_boundary.clone(),
         )
         .await
     }
@@ -377,9 +384,12 @@ impl FSMetaApp {
         pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
         facade_pending_status: SharedFacadePendingStatusCell,
         node_id: NodeId,
+        runtime_control_boundary: Option<Arc<dyn ChannelBoundary>>,
         runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
         source: Arc<SourceFacade>,
         sink: Arc<SinkFacade>,
+        query_sink: Arc<SinkFacade>,
+        query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     ) -> Result<bool> {
         let Some(pending) = pending_facade.lock().await.clone() else {
             return Ok(false);
@@ -412,8 +422,6 @@ impl FSMetaApp {
         // readiness is enforced at the query surface so `/on-demand-force-find`
         // can become available earlier.
 
-        sink.ensure_started()?;
-
         eprintln!(
             "fs_meta_runtime_app: spawning facade api server generation={} route_key={} resources={:?}",
             pending.generation, pending.route_key, pending.resource_ids
@@ -421,9 +429,12 @@ impl FSMetaApp {
         let handle = api::spawn(
             pending.resolved.clone(),
             node_id,
+            runtime_control_boundary,
             runtime_boundary,
             source,
             sink,
+            query_sink,
+            query_runtime_boundary,
             facade_pending_status.clone(),
         )
         .await?;
@@ -1677,6 +1688,7 @@ mod tests {
                 .resolve_for_candidate_ids(&["single-app-listener".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
+            app.runtime_control_boundary.clone(),
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
@@ -1772,6 +1784,7 @@ mod tests {
                 .resolve_for_candidate_ids(&["single-app-listener".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
+            app.runtime_control_boundary.clone(),
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
@@ -1875,6 +1888,7 @@ mod tests {
                 .resolve_for_candidate_ids(&["single-app-listener".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
+            app.runtime_control_boundary.clone(),
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
@@ -1988,6 +2002,7 @@ mod tests {
                 .resolve_for_candidate_ids(&["single-app-listener".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
+            app.runtime_control_boundary.clone(),
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
