@@ -329,11 +329,28 @@ impl Cluster5 {
             "cluster5: apply-release begin node={} app_id={} generation={}",
             node_name, app_id, generation
         );
-        let result = run_cnxctl_json(
-            &cnxctl_bin,
-            &node.socket_path,
-            ["app", "apply", file_arg.as_str()],
-        );
+        let mut result = Err("apply release not attempted".to_string());
+        for attempt in 1..=8 {
+            result = run_cnxctl_json(
+                &cnxctl_bin,
+                &node.socket_path,
+                ["app", "apply", file_arg.as_str()],
+            );
+            match &result {
+                Ok(_) => break,
+                Err(err) if err.contains("tx busy") => {
+                    eprintln!(
+                        "cluster5: apply-release retry node={} app_id={} generation={} attempt={} reason=tx_busy",
+                        node_name,
+                        app_id,
+                        generation,
+                        attempt
+                    );
+                    std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+                }
+                Err(_) => break,
+            }
+        }
         match &result {
             Ok(_) => eprintln!(
                 "cluster5: apply-release ok node={} app_id={} generation={} elapsed_ms={}",
