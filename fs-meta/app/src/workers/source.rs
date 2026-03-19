@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use crate::workers::source_ipc::{
     decode_response, encode_request, source_worker_control_route_key_for,
 };
 
-const SOURCE_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+const SOURCE_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SOURCE_WORKER_INIT_RPC_TIMEOUT: Duration = Duration::from_secs(120);
@@ -297,7 +298,7 @@ impl SourceWorkerClientHandle {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SourceObservabilitySnapshot {
     pub lifecycle_state: String,
     pub host_object_grants_version: u64,
@@ -589,33 +590,52 @@ fn spawn_local_source_pump(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Some(boundary) = boundary {
-            let rt = tokio::runtime::Handle::current();
-            let (queue_tx, mut queue_rx) = tokio::sync::mpsc::channel::<Vec<Event>>(512);
-            let send_task = tokio::task::spawn_blocking(move || {
-                while let Some(batch) = rt.block_on(queue_rx.recv()) {
-                    if let Err(err) = boundary.channel_send(
-                        BoundaryContext::default(),
-                        ChannelSendRequest {
-                            channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                            events: batch,
-                        },
-                    ) {
-                        log::error!(
-                            "fs-meta app pump failed to publish source batch on stream route: {:?}",
-                            err
-                        );
-                        break;
-                    }
-                }
-            });
+            let mut lanes =
+                HashMap::<String, (tokio::sync::mpsc::UnboundedSender<Vec<Event>>, JoinHandle<()>)>::new();
             tokio::pin!(stream);
             while let Some(batch) = stream.next().await {
-                if queue_tx.send(batch).await.is_err() {
+                let lane = batch
+                    .first()
+                    .map(|event| event.metadata().origin_id.0.clone())
+                    .unwrap_or_else(|| "__empty__".to_string());
+                let lane_tx = if let Some((tx, _)) = lanes.get(&lane) {
+                    tx.clone()
+                } else {
+                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
+                    let send_boundary = boundary.clone();
+                    let lane_name = lane.clone();
+                    let task = tokio::task::spawn_blocking(move || {
+                        while let Some(batch) = rx.blocking_recv() {
+                            if let Err(err) = send_boundary.channel_send(
+                                BoundaryContext::default(),
+                                ChannelSendRequest {
+                                    channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                                    events: batch,
+                                },
+                            ) {
+                                log::error!(
+                                    "fs-meta app pump failed to publish source batch on stream route lane={}: {:?}",
+                                    lane_name,
+                                    err
+                                );
+                                break;
+                            }
+                        }
+                    });
+                    lanes.insert(lane.clone(), (tx.clone(), task));
+                    tx
+                };
+                if lane_tx.send(batch).is_err() {
                     break;
                 }
             }
-            drop(queue_tx);
-            let _ = send_task.await;
+            let mut tasks = Vec::with_capacity(lanes.len());
+            for (_, (_, task)) in lanes.drain() {
+                tasks.push(task);
+            }
+            for task in tasks {
+                let _ = task.await;
+            }
         } else {
             tokio::pin!(stream);
             while let Some(batch) = stream.next().await {

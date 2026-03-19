@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex, RwLock};
 
 use capanix_app_sdk::raw::{ChannelBoundary, ChannelIoSubset};
 use capanix_app_sdk::runtime::NodeId;
@@ -16,6 +17,7 @@ pub struct ApiState {
     pub runtime_control: Option<Arc<dyn ChannelBoundary>>,
     pub runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     pub query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+    pub force_find_inflight: Arc<Mutex<BTreeSet<String>>>,
     pub source: Arc<SourceFacade>,
     pub sink: Arc<SinkFacade>,
     pub query_sink: Arc<SinkFacade>,

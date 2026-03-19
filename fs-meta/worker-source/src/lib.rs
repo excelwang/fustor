@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -91,41 +92,66 @@ fn start_source_pump_with_stream<S>(
 where
     S: futures_util::Stream<Item = Vec<Event>> + Send + 'static,
 {
-    let runtime_handle = runtime.clone();
     runtime.spawn(async move {
-        let (queue_tx, mut queue_rx) = tokio::sync::mpsc::channel::<Vec<Event>>(512);
-        let send_boundary = boundary.clone();
-        let send_runtime = runtime_handle.clone();
-        let send_task = tokio::task::spawn_blocking(move || {
-            while let Some(batch) = send_runtime.block_on(queue_rx.recv()) {
-                eprintln!(
-                    "fs_meta_source_worker: publish batch len={}",
-                    batch.len()
-                );
-                if let Err(err) = send_boundary.channel_send(
-                    BoundaryContext::default(),
-                    ChannelSendRequest {
-                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                        events: batch,
-                    },
-                ) {
-                    log::error!(
-                        "source worker pump failed to publish source batch on stream route: {:?}",
-                        err
-                    );
-                    break;
-                }
-            }
-        });
+        let mut lanes =
+            HashMap::<String, (tokio::sync::mpsc::UnboundedSender<Vec<Event>>, JoinHandle<()>)>::new();
 
         futures_util::pin_mut!(stream);
         while let Some(batch) = stream.next().await {
-            if queue_tx.send(batch).await.is_err() {
+            let lane = batch
+                .first()
+                .map(|event| event.metadata().origin_id.0.clone())
+                .unwrap_or_else(|| "__empty__".to_string());
+            if batch.len() > 50 {
+                eprintln!(
+                    "fs_meta_source_worker: queue stream batch len={} lane={}",
+                    batch.len(),
+                    lane
+                );
+            }
+            let lane_tx = if let Some((tx, _)) = lanes.get(&lane) {
+                tx.clone()
+            } else {
+                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
+                let send_boundary = boundary.clone();
+                let lane_name = lane.clone();
+                let task = tokio::task::spawn_blocking(move || {
+                    while let Some(batch) = rx.blocking_recv() {
+                        eprintln!(
+                            "fs_meta_source_worker: publish batch len={} lane={}",
+                            batch.len(),
+                            lane_name
+                        );
+                        if let Err(err) = send_boundary.channel_send(
+                            BoundaryContext::default(),
+                            ChannelSendRequest {
+                                channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                                events: batch,
+                            },
+                        ) {
+                            log::error!(
+                                "source worker pump failed to publish source batch on stream route lane={}: {:?}",
+                                lane_name,
+                                err
+                            );
+                            break;
+                        }
+                    }
+                });
+                lanes.insert(lane.clone(), (tx.clone(), task));
+                tx
+            };
+            if lane_tx.send(batch).is_err() {
                 break;
             }
         }
-        drop(queue_tx);
-        let _ = send_task.await;
+        let mut tasks = Vec::with_capacity(lanes.len());
+        for (_, (_, task)) in lanes.drain() {
+            tasks.push(task);
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
     })
 }
 
@@ -328,12 +354,17 @@ fn process_worker_request(
             ),
         },
         SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot => match state.source.as_ref() {
-            Some(source) => (
-                SourceWorkerResponse::LastForceFindRunnerByGroup(
-                    source.last_force_find_runner_by_group_snapshot(),
-                ),
-                false,
-            ),
+            Some(source) => {
+                let snapshot = source.last_force_find_runner_by_group_snapshot();
+                eprintln!(
+                    "fs_meta_source_worker: LastForceFindRunnerByGroupSnapshot {:?}",
+                    snapshot
+                );
+                (
+                    SourceWorkerResponse::LastForceFindRunnerByGroup(snapshot),
+                    false,
+                )
+            }
             None => (
                 SourceWorkerResponse::Error("source worker not initialized".into()),
                 false,

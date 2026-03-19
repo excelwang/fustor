@@ -138,9 +138,20 @@ pub fn missing_item_detection(
     audit_start_time: Instant,
     epoch_manager: &EpochManager,
 ) -> Vec<Vec<u8>> {
+    fn sort_deepest_first(paths: &mut [Vec<u8>]) {
+        paths.sort_by(|left, right| {
+            let left_depth = left.iter().filter(|&&b| b == b'/').count();
+            let right_depth = right.iter().filter(|&&b| b == b'/').count();
+            right_depth
+                .cmp(&left_depth)
+                .then_with(|| right.len().cmp(&left.len()))
+                .then_with(|| right.cmp(left))
+        });
+    }
+
     let now = Instant::now();
 
-    let stale_paths: Vec<Vec<u8>> = tree
+    let mut stale_paths: Vec<Vec<u8>> = tree
         .iter()
         .filter(|(path, node)| {
             // Skip tombstoned nodes
@@ -166,6 +177,7 @@ pub fn missing_item_detection(
         })
         .map(|(path, _)| path.to_vec())
         .collect();
+    sort_deepest_first(&mut stale_paths);
 
     // Remove stale nodes (spec says tree.remove, NOT tombstone)
     for path in &stale_paths {
@@ -178,7 +190,7 @@ pub fn missing_item_detection(
     }
 
     // Tombstone TTL cleanup: remove expired tombstones
-    let expired_tombstones: Vec<Vec<u8>> = tree
+    let mut expired_tombstones: Vec<Vec<u8>> = tree
         .iter()
         .filter(|(_, node)| {
             node.is_tombstoned
@@ -188,6 +200,7 @@ pub fn missing_item_detection(
         })
         .map(|(path, _)| path.to_vec())
         .collect();
+    sort_deepest_first(&mut expired_tombstones);
 
     for path in &expired_tombstones {
         log::debug!(
@@ -310,6 +323,31 @@ mod tests {
         assert!(removed.is_empty());
         assert!(tree.get(b"/expired").is_none());
         assert!(tree.get(b"/active").is_some());
+    }
+
+    #[test]
+    fn test_mid_removes_nested_stale_paths_without_panicking() {
+        let mut tree = MaterializedTree::new();
+        tree.insert(b"/stale".to_vec(), make_node(b"/stale", true, 0));
+        tree.insert(b"/stale/nested".to_vec(), make_node(b"/stale/nested", true, 0));
+        tree.insert(
+            b"/stale/nested/file.txt".to_vec(),
+            make_node(b"/stale/nested/file.txt", false, 0),
+        );
+
+        let removed = missing_item_detection(&mut tree, 1, Instant::now(), &EpochManager::new());
+
+        assert_eq!(
+            removed,
+            vec![
+                b"/stale/nested/file.txt".to_vec(),
+                b"/stale/nested".to_vec(),
+                b"/stale".to_vec()
+            ]
+        );
+        assert!(tree.get(b"/stale").is_none());
+        assert!(tree.get(b"/stale/nested").is_none());
+        assert!(tree.get(b"/stale/nested/file.txt").is_none());
     }
 
     #[test]

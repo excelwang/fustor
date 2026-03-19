@@ -13,8 +13,9 @@ use crate::runtime::orchestration::{
     FacadeControlSignal, FacadeRuntimeUnit, split_app_control_signals,
 };
 use crate::runtime::routes::{
-    METHOD_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_QUERY,
-    ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
+    METHOD_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
+    METHOD_SOURCE_STATUS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_PROXY,
+    ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -44,6 +45,7 @@ use crate::source::config::{SinkExecutionMode, SourceExecutionMode};
 // is confined to narrow infra seams such as boundary conversion helpers.
 
 struct FacadeActivation {
+    route_key: String,
     generation: u64,
     resource_ids: Vec<String>,
     handle: api::ApiServerHandle,
@@ -467,6 +469,63 @@ impl FSMetaApp {
             tasks.push(endpoint);
             }
         }
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS) {
+            let query_peer_active = self
+                .facade_gate
+                .unit_state(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)?
+                .map(|(active, _)| active)
+                .unwrap_or(false);
+            if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as peer source-status owner, or already running.
+            } else {
+            let source = self.source.clone();
+            eprintln!(
+                "fs_meta_runtime_app: spawning source status endpoint route={}",
+                route.0
+            );
+            let endpoint = ManagedEndpointTask::spawn(
+                boundary.clone(),
+                route,
+                format!("app:{}:{}", ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS),
+                tokio_util::sync::CancellationToken::new(),
+                move |requests| {
+                    let mut responses = Vec::new();
+                    for req in requests {
+                        match source.observability_snapshot() {
+                            Ok(snapshot) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: source status endpoint response groups={} runners={}",
+                                    snapshot.source_primary_by_group.len(),
+                                    snapshot.last_force_find_runner_by_group.len()
+                                );
+                                if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                    responses.push(Event::new(
+                                        EventMetadata {
+                                            origin_id: req.metadata().origin_id.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        bytes::Bytes::from(payload),
+                                    ));
+                                }
+                            }
+                            Err(err) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: source status endpoint failed err={}",
+                                    err
+                                );
+                            }
+                        }
+                    }
+                    responses
+                },
+            );
+            tasks.push(endpoint);
+            }
+        }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY) {
             let query_peer_active = self
                 .facade_gate
@@ -766,13 +825,13 @@ impl FSMetaApp {
         let replacing_existing = {
             let api_task_guard = api_task.lock().await;
             if let Some(current) = api_task_guard.as_ref()
-                && current.generation == pending.generation
+                && current.route_key == pending.route_key
                 && current.resource_ids == pending.resource_ids
             {
                 drop(api_task_guard);
                 let mut pending_guard = pending_facade.lock().await;
                 if pending_guard.as_ref().is_some_and(|candidate| {
-                    candidate.generation == pending.generation
+                    candidate.route_key == pending.route_key
                         && candidate.resource_ids == pending.resource_ids
                 }) {
                     pending_guard.take();
@@ -825,6 +884,7 @@ impl FSMetaApp {
         }
 
         let previous = api_task.lock().await.replace(FacadeActivation {
+            route_key: pending.route_key.clone(),
             generation: pending.generation,
             resource_ids: pending.resource_ids.clone(),
             handle,
@@ -2126,6 +2186,7 @@ mod tests {
             Err(err) => panic!("spawn active facade: {err}"),
         };
         *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             generation: 1,
             resource_ids: vec!["single-app-listener".to_string()],
             handle: existing,
@@ -2224,6 +2285,7 @@ mod tests {
             Err(err) => panic!("spawn active facade: {err}"),
         };
         *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             generation: 1,
             resource_ids: vec!["single-app-listener".to_string()],
             handle: existing,
@@ -2330,6 +2392,7 @@ mod tests {
             Err(err) => panic!("spawn active facade: {err}"),
         };
         *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             generation: 1,
             resource_ids: vec!["single-app-listener".to_string()],
             handle: existing,
@@ -2446,6 +2509,7 @@ mod tests {
             Err(err) => panic!("spawn active facade: {err}"),
         };
         *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
             generation: 1,
             resource_ids: vec!["single-app-listener".to_string()],
             handle: existing,

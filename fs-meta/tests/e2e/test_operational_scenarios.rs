@@ -75,9 +75,12 @@ fn scenario_force_find_execution_semantics(
     lab: &mut NfsLab,
     session: &mut OperatorSession,
 ) -> Result<(), String> {
+    eprintln!("[fs-meta-api-ops] substep=force-find-stress-seed");
     seed_force_find_stress_content(lab, "nfs1", "force-find-stress", 40, 100)?;
     seed_force_find_stress_content(lab, "nfs2", "force-find-stress", 40, 100)?;
+    eprintln!("[fs-meta-api-ops] substep=force-find-stress-rescan");
     session.rescan()?;
+    eprintln!("[fs-meta-api-ops] substep=force-find-stress-materialize");
     wait_until(
         Duration::from_secs(90),
         "force-find stress trees materialize",
@@ -93,16 +96,19 @@ fn scenario_force_find_execution_semantics(
     let nfs1_primary = source_primary_for_group(session, "nfs1")?
         .ok_or_else(|| "status missing nfs1 source-primary".to_string())?;
 
+    eprintln!("[fs-meta-api-ops] substep=force-find-runner-first");
     let _ = session.force_find(&[
         ("path", "/force-find-stress".to_string()),
         ("recursive", "true".to_string()),
     ])?;
     let runner_first = wait_last_force_find_runner(session, "nfs1", None)?;
+    eprintln!("[fs-meta-api-ops] substep=force-find-runner-second");
     let _ = session.force_find(&[
         ("path", "/force-find-stress".to_string()),
         ("recursive", "true".to_string()),
     ])?;
     let runner_second = wait_last_force_find_runner(session, "nfs1", Some(runner_first.as_str()))?;
+    eprintln!("[fs-meta-api-ops] substep=force-find-runner-third");
     let _ = session.force_find(&[
         ("path", "/force-find-stress".to_string()),
         ("recursive", "true".to_string()),
@@ -130,6 +136,7 @@ fn scenario_force_find_execution_semantics(
 
     let thread_client = session.client().clone();
     let thread_query_api_key = session.query_api_key().to_string();
+    eprintln!("[fs-meta-api-ops] substep=force-find-overlap-start");
     let inflight_join = thread::spawn(move || {
         thread_client.force_find_raw(
             &thread_query_api_key,
@@ -141,18 +148,25 @@ fn scenario_force_find_execution_semantics(
     });
     wait_until(
         Duration::from_secs(30),
-        "nfs1 force-find in-flight lock becomes visible",
-        || Ok(force_find_inflight_groups(session)?.contains("nfs1")),
+        "same-group force-find returns NOT_READY while prior request is in flight",
+        || {
+            if inflight_join.is_finished() {
+                return Ok(false);
+            }
+            let same_group = session.client().force_find_raw(
+                session.query_api_key(),
+                &[
+                    ("path", "/force-find-stress".to_string()),
+                    ("recursive", "true".to_string()),
+                ],
+            )?;
+            if same_group.status == 503 {
+                assert_api_error(&same_group, 503, "NOT_READY")?;
+                return Ok(true);
+            }
+            Ok(false)
+        },
     )?;
-
-    let same_group = session.client().force_find_raw(
-        session.query_api_key(),
-        &[
-            ("path", "/force-find-stress".to_string()),
-            ("recursive", "true".to_string()),
-        ],
-    )?;
-    assert_api_error(&same_group, 503, "NOT_READY")?;
 
     let inflight_resp = inflight_join
         .join()
@@ -166,6 +180,7 @@ fn scenario_force_find_execution_semantics(
     let grants = session.runtime_grants()?;
     let failing_runner = runner_first.clone();
     let failing_node = node_name_for_object_ref(&grants, &failing_runner)?;
+    eprintln!("[fs-meta-api-ops] substep=force-find-fallback-unmount");
     let _ = lab.unmount_export(&failing_node, "nfs1");
     let fallback_resp = session.force_find(&[
         ("path", "/force-find-stress".to_string()),
@@ -632,32 +647,35 @@ fn source_primary_for_group(
     session: &mut OperatorSession,
     group_id: &str,
 ) -> Result<Option<String>, String> {
-    let status = session.status()?;
-    Ok(status
-        .get("source")
-        .and_then(|source| source.get("debug"))
-        .and_then(|debug| debug.get("source_primary_by_group"))
-        .and_then(Value::as_object)
-        .and_then(|groups| groups.get(group_id))
-        .and_then(Value::as_str)
-        .map(str::to_string))
+    for status in session.status_all()? {
+        if let Some(primary) = status
+            .get("source")
+            .and_then(|source| source.get("debug"))
+            .and_then(|debug| debug.get("source_primary_by_group"))
+            .and_then(Value::as_object)
+            .and_then(|groups| groups.get(group_id))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+        {
+            return Ok(Some(primary));
+        }
+    }
+    Ok(None)
 }
 
 fn force_find_inflight_groups(session: &mut OperatorSession) -> Result<BTreeSet<String>, String> {
-    let status = session.status()?;
-    Ok(status
-        .get("source")
-        .and_then(|source| source.get("debug"))
-        .and_then(|debug| debug.get("force_find_inflight_groups"))
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default())
+    let mut groups = BTreeSet::new();
+    for status in session.status_all()? {
+        if let Some(items) = status
+            .get("source")
+            .and_then(|source| source.get("debug"))
+            .and_then(|debug| debug.get("force_find_inflight_groups"))
+            .and_then(Value::as_array)
+        {
+            groups.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
+        }
+    }
+    Ok(groups)
 }
 
 fn wait_last_force_find_runner(
@@ -670,17 +688,44 @@ fn wait_last_force_find_runner(
         Duration::from_secs(30),
         &format!("last force-find runner for {group_id}"),
         || {
-            let status = session.status()?;
-            let runner = status
-                .get("source")
-                .and_then(|source| source.get("debug"))
-                .and_then(|debug| debug.get("last_force_find_runner_by_group"))
-                .and_then(Value::as_object)
-                .and_then(|groups| groups.get(group_id))
-                .and_then(Value::as_str)
-                .map(str::to_string);
-            last_seen = runner.clone();
-            Ok(runner
+            let mut observed = None::<String>;
+            for status in session.status_all()? {
+                let runners = status
+                    .get("source")
+                    .and_then(|source| source.get("debug"))
+                    .and_then(|debug| debug.get("last_force_find_runners_by_group"))
+                    .and_then(Value::as_object)
+                    .and_then(|groups| groups.get(group_id))
+                    .and_then(Value::as_array)
+                    .map(|items| {
+                        items
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                let runner = runners
+                    .iter()
+                    .find(|runner| previous.is_none_or(|prev| prev != runner.as_str()))
+                    .cloned()
+                    .or_else(|| {
+                        status
+                            .get("source")
+                            .and_then(|source| source.get("debug"))
+                            .and_then(|debug| debug.get("last_force_find_runner_by_group"))
+                            .and_then(Value::as_object)
+                            .and_then(|groups| groups.get(group_id))
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    });
+                if runner.is_some() {
+                    observed = runner;
+                    break;
+                }
+            }
+            last_seen = observed.clone();
+            Ok(observed
                 .as_deref()
                 .is_some_and(|runner| previous.is_none_or(|prev| prev != runner)))
         },

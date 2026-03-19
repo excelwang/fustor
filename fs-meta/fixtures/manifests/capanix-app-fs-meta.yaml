@@ -61,6 +61,15 @@ ports:
       - serve
       - use
   - route_token: fs-meta.internal
+    use_port: source.status
+    dispatch_tag: source_status
+    pattern: request_reply
+    route_key: source-status:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta.internal
     use_port: source.find
     dispatch_tag: source_find
     pattern: request_reply

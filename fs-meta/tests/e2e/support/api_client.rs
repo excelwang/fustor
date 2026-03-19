@@ -357,6 +357,39 @@ impl OperatorSession {
         self.with_management_reauth(|client, token| client.status(token))
     }
 
+    pub fn status_all(&mut self) -> Result<Vec<Value>, String> {
+        for attempt in 0..2 {
+            let mut statuses = Vec::new();
+            let mut last_err = None::<String>;
+            let mut should_reauth = false;
+            for base_url in &self.candidate_base_urls {
+                let client = FsMetaApiClient::new(base_url.clone())?;
+                match client.status(&self.management_token) {
+                    Ok(status) => statuses.push(status),
+                    Err(err) if is_invalid_session_error(&err) => {
+                        should_reauth = true;
+                        last_err = Some(err);
+                    }
+                    Err(err) if is_transport_error(&err) => {
+                        last_err = Some(err);
+                    }
+                    Err(err) => {
+                        last_err = Some(err);
+                    }
+                }
+            }
+            if !statuses.is_empty() {
+                return Ok(statuses);
+            }
+            if attempt == 0 && should_reauth {
+                self.reconnect_and_login()?;
+                continue;
+            }
+            return Err(last_err.unwrap_or_else(|| "no status responses available".to_string()));
+        }
+        Err("status_all retry loop exhausted".to_string())
+    }
+
     pub fn runtime_grants(&mut self) -> Result<Value, String> {
         self.with_management_reauth(|client, token| client.runtime_grants(token))
     }

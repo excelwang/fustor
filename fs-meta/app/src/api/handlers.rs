@@ -1,16 +1,21 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json,
     extract::{Path, State},
     http::{HeaderMap, header},
 };
+use bytes::Bytes;
 use capanix_app_sdk::Event;
 use capanix_app_sdk::raw::{BoundaryContext, ChannelKey, ChannelSendRequest};
-use capanix_app_sdk::runtime::EventMetadata;
+use capanix_app_sdk::runtime::{EventMetadata, NodeId};
+use capanix_app_sdk::{CnxError, raw::ChannelIoSubset};
+use capanix_host_adapter_fs_meta::HostAdapter;
 
+use crate::runtime::routes::{METHOD_SOURCE_STATUS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings};
+use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
 use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
 use crate::query::api::refresh_policy_from_host_object_grants;
@@ -60,7 +65,7 @@ pub async fn status(
             return Err(ApiError::internal(format!("sink status failed: {err}")));
         }
     };
-    let source = match state.source.observability_snapshot() {
+    let local_source = match state.source.observability_snapshot() {
         Ok(snapshot) => snapshot,
         Err(err) if state.source.is_worker() => {
             log::warn!("status falling back to degraded source snapshot: {err}");
@@ -72,6 +77,38 @@ pub async fn status(
             return Err(ApiError::internal(format!("source status failed: {err}")));
         }
     };
+    let (source, runner_sets) = match state.query_runtime_boundary.clone() {
+        Some(boundary) => match route_source_observability_snapshot(
+            boundary,
+            state.node_id.clone(),
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok((snapshot, runner_sets)) => (merge_source_observability(local_source, snapshot), runner_sets),
+            Err(CnxError::Timeout)
+            | Err(CnxError::TransportClosed(_))
+            | Err(CnxError::ProtocolViolation(_)) => {
+                let runner_sets = local_source
+                    .last_force_find_runner_by_group
+                    .iter()
+                    .map(|(group, runner)| (group.clone(), vec![runner.clone()]))
+                    .collect::<BTreeMap<_, _>>();
+                (local_source, runner_sets)
+            }
+            Err(err) => {
+                return Err(ApiError::internal(format!("source status route failed: {err}")));
+            }
+        },
+        None => {
+            let runner_sets = local_source
+                .last_force_find_runner_by_group
+                .iter()
+                .map(|(group, runner)| (group.clone(), vec![runner.clone()]))
+                .collect::<BTreeMap<_, _>>();
+            (local_source, runner_sets)
+        }
+    };
     let live_source_nodes = source
         .grants
         .iter()
@@ -79,9 +116,23 @@ pub async fn status(
         .map(|grant| grant.host_ip.clone())
         .collect::<BTreeSet<_>>()
         .len() as u64;
+    let gate_inflight = state
+        .force_find_inflight
+        .lock()
+        .map(|guard| guard.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut merged_inflight = source.force_find_inflight_groups.clone();
+    merged_inflight.extend(gate_inflight);
+    merged_inflight.sort();
+    merged_inflight.dedup();
+    eprintln!(
+        "fs_meta_api_status: source runners={:?} inflight={:?}",
+        runner_sets,
+        merged_inflight
+    );
 
     Ok(Json(StatusResponse {
-        source: status_source_from_observability(source),
+        source: status_source_from_observability(source, runner_sets, merged_inflight),
         sink: StatusSink {
             live_nodes: sink_status.live_nodes.max(live_source_nodes),
             tombstoned_count: sink_status.tombstoned_count,
@@ -387,7 +438,11 @@ fn validate_unique_root_ids(roots: &[RootSpec]) -> Result<(), ApiError> {
     Ok(())
 }
 
-fn status_source_from_observability(source: SourceObservabilitySnapshot) -> StatusSource {
+fn status_source_from_observability(
+    source: SourceObservabilitySnapshot,
+    runner_sets: BTreeMap<String, Vec<String>>,
+    force_find_inflight_groups: Vec<String>,
+) -> StatusSource {
     let SourceObservabilitySnapshot {
         lifecycle_state,
         host_object_grants_version,
@@ -450,9 +505,156 @@ fn status_source_from_observability(source: SourceObservabilitySnapshot) -> Stat
         debug: super::types::StatusSourceDebug {
             source_primary_by_group,
             last_force_find_runner_by_group,
+            last_force_find_runners_by_group: runner_sets,
             force_find_inflight_groups,
         },
     }
+}
+
+async fn route_source_observability_snapshot(
+    boundary: std::sync::Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    timeout: Duration,
+) -> Result<(SourceObservabilitySnapshot, BTreeMap<String, Vec<String>>), CnxError> {
+    let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
+    let events: Vec<Event> = tokio::task::spawn_blocking(move || -> Result<Vec<Event>, CnxError> {
+        adapter.call_collect(
+            ROUTE_TOKEN_FS_META_INTERNAL,
+            METHOD_SOURCE_STATUS,
+            Bytes::new(),
+            timeout,
+            Duration::from_secs(5),
+        )
+    })
+    .await
+    .map_err(|err| CnxError::Internal(format!("source status route join failed: {err}")))??;
+    let snapshots = events
+        .into_iter()
+        .map(|event| {
+            rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes()).map_err(
+                |err| CnxError::Internal(format!("decode source observability failed: {err}")),
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let runner_sets = source_runner_sets(&snapshots);
+    Ok((merge_source_observability_snapshots(snapshots), runner_sets))
+}
+
+fn merge_source_observability(
+    mut local: SourceObservabilitySnapshot,
+    aggregated: SourceObservabilitySnapshot,
+) -> SourceObservabilitySnapshot {
+    local.source_primary_by_group = aggregated.source_primary_by_group;
+    local.last_force_find_runner_by_group = aggregated.last_force_find_runner_by_group;
+    local.force_find_inflight_groups = aggregated.force_find_inflight_groups;
+    local
+}
+
+fn merge_source_observability_snapshots(
+    snapshots: Vec<SourceObservabilitySnapshot>,
+) -> SourceObservabilitySnapshot {
+    let mut iter = snapshots.into_iter();
+    let Some(mut merged) = iter.next() else {
+        return SourceObservabilitySnapshot {
+            lifecycle_state: "unknown".to_string(),
+            host_object_grants_version: 0,
+            grants: Vec::new(),
+            logical_roots: Vec::new(),
+            status: Default::default(),
+            source_primary_by_group: BTreeMap::new(),
+            last_force_find_runner_by_group: BTreeMap::new(),
+            force_find_inflight_groups: Vec::new(),
+        };
+    };
+
+    let mut logical_root_map = merged
+        .status
+        .logical_roots
+        .iter()
+        .cloned()
+        .map(|entry| (entry.root_id.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut concrete_root_map = merged
+        .status
+        .concrete_roots
+        .iter()
+        .cloned()
+        .map(|entry| (entry.root_key.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut degraded_root_map = merged
+        .status
+        .degraded_roots
+        .iter()
+        .cloned()
+        .collect::<BTreeMap<_, _>>();
+    let mut grant_map = merged
+        .grants
+        .iter()
+        .cloned()
+        .map(|entry| (entry.object_ref.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut root_map = merged
+        .logical_roots
+        .iter()
+        .cloned()
+        .map(|entry| (entry.id.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut inflight = merged
+        .force_find_inflight_groups
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+
+    for snapshot in iter {
+        merged.host_object_grants_version =
+            merged.host_object_grants_version.max(snapshot.host_object_grants_version);
+        merged.source_primary_by_group.extend(snapshot.source_primary_by_group);
+        merged
+            .last_force_find_runner_by_group
+            .extend(snapshot.last_force_find_runner_by_group);
+        inflight.extend(snapshot.force_find_inflight_groups);
+        for grant in snapshot.grants {
+            grant_map.entry(grant.object_ref.clone()).or_insert(grant);
+        }
+        for root in snapshot.logical_roots {
+            root_map.entry(root.id.clone()).or_insert(root);
+        }
+        for entry in snapshot.status.logical_roots {
+            logical_root_map.entry(entry.root_id.clone()).or_insert(entry);
+        }
+        for entry in snapshot.status.concrete_roots {
+            concrete_root_map.entry(entry.root_key.clone()).or_insert(entry);
+        }
+        for (root_key, reason) in snapshot.status.degraded_roots {
+            degraded_root_map.entry(root_key).or_insert(reason);
+        }
+    }
+
+    merged.grants = grant_map.into_values().collect();
+    merged.logical_roots = root_map.into_values().collect();
+    merged.status.logical_roots = logical_root_map.into_values().collect();
+    merged.status.concrete_roots = concrete_root_map.into_values().collect();
+    merged.status.degraded_roots = degraded_root_map.into_iter().collect();
+    merged.force_find_inflight_groups = inflight.into_iter().collect();
+    merged
+}
+
+fn source_runner_sets(
+    snapshots: &[SourceObservabilitySnapshot],
+) -> BTreeMap<String, Vec<String>> {
+    let mut by_group = BTreeMap::<String, BTreeSet<String>>::new();
+    for snapshot in snapshots {
+        for (group, runner) in &snapshot.last_force_find_runner_by_group {
+            by_group
+                .entry(group.clone())
+                .or_default()
+                .insert(runner.clone());
+        }
+    }
+    by_group
+        .into_iter()
+        .map(|(group, runners)| (group, runners.into_iter().collect()))
+        .collect()
 }
 
 fn status_facade_from_pending(pending: SharedFacadePendingStatus) -> StatusFacade {

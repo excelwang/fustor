@@ -513,7 +513,7 @@ struct SourceStateCell {
     logical_roots: Arc<Mutex<Vec<RootSpec>>>,
     roots: Arc<Mutex<Vec<RootRuntime>>>,
     root_tasks: Arc<Mutex<HashMap<String, RootTaskEntry>>>,
-    stream_tx: Arc<Mutex<Option<mpsc::Sender<Vec<Event>>>>>,
+    stream_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<Event>>>>>,
     manual_rescan_intents: Arc<Mutex<HashMap<String, ManualRescanIntent>>>,
     logical_root_fanout: Arc<Mutex<HashMap<String, Vec<GrantedMountRoot>>>>,
     fanout_health: Arc<Mutex<FanoutHealthState>>,
@@ -2848,7 +2848,7 @@ impl FSMetaSource {
     fn spawn_root_task(
         &self,
         root: RootRuntime,
-        out_tx: mpsc::Sender<Vec<Event>>,
+        out_tx: mpsc::UnboundedSender<Vec<Event>>,
         role: RootTaskRole,
         revision: u64,
     ) -> RootTaskHandle {
@@ -2926,7 +2926,7 @@ impl FSMetaSource {
                                 batch.len(),
                                 root_key
                             );
-                            if out_tx.send(batch).await.is_err() {
+                            if out_tx.send(batch).is_err() {
                                 Self::update_root_task_slot_health(
                                     &fanout_health,
                                     &root_key,
@@ -3395,7 +3395,7 @@ impl FSMetaSource {
             ));
         }
         self.start_manual_rescan_watch().await?;
-        let (out_tx, mut out_rx) = mpsc::channel::<Vec<Event>>(512);
+        let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<Event>>();
         *lock_or_recover(&self.state_cell.stream_tx, "source.pub.stream_tx") = Some(out_tx.clone());
         *lock_or_recover(&self.state, "source.pub.state") = LifecycleState::Scanning;
         let roots_snapshot = lock_or_recover(&self.state_cell.roots, "source.pub.roots").clone();
@@ -3408,7 +3408,15 @@ impl FSMetaSource {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     batch = out_rx.recv() => match batch {
-                        Some(events) if !events.is_empty() => yield events,
+                        Some(events) if !events.is_empty() => {
+                            if events.len() > 50 {
+                                eprintln!(
+                                    "fs_meta_source: pub stream yielding batch len={}",
+                                    events.len()
+                                );
+                            }
+                            yield events
+                        },
                         Some(_) => {},
                         None => break,
                     }
@@ -4040,6 +4048,12 @@ impl FSMetaSource {
                 }
                 if let Some(idx) = winner {
                     rr.insert(group_id.clone(), (idx + 1) % len);
+                    eprintln!(
+                        "fs_meta_source: force-find winner group={} runner={} next_index={}",
+                        group_id,
+                        candidates[idx].0.object_ref,
+                        (idx + 1) % len
+                    );
                     last_runner.insert(group_id.clone(), candidates[idx].0.object_ref.clone());
                 }
             }
@@ -4931,7 +4945,7 @@ mod tests {
         let mut stale_signature = desired_signature.clone();
         stale_signature.watch = !desired_signature.watch;
 
-        let (out_tx, _out_rx) = mpsc::channel::<Vec<Event>>(8);
+        let (out_tx, _out_rx) = mpsc::unbounded_channel::<Vec<Event>>();
         *lock_or_recover(&source.state_cell.stream_tx, "test.fallback.stream_tx") = Some(out_tx);
         source
             .state_cell

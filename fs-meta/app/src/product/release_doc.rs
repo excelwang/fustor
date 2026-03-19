@@ -6,6 +6,7 @@ use crate::runtime::routes::{
     ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
     ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL,
     ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
+    ROUTE_KEY_SOURCE_STATUS_INTERNAL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
 };
 use crate::source::config::RootSpec;
@@ -116,6 +117,11 @@ fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
         peers: Vec::new(),
     }).unwrap_or_else(|_| serde_json::json!({})));
     plans.push(serde_json::to_value(RoutePlanSpec {
+        route_key: RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)),
+        mode: RoutePlanMode::FanOut,
+        peers: Vec::new(),
+    }).unwrap_or_else(|_| serde_json::json!({})));
+    plans.push(serde_json::to_value(RoutePlanSpec {
         route_key: RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)),
         mode: RoutePlanMode::FanOut,
         peers: Vec::new(),
@@ -163,6 +169,10 @@ fn build_route_units_json() -> serde_json::Value {
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL),
+        serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
+    );
+    route_units.insert(
+        request_reply_activation_route_key(ROUTE_KEY_SOURCE_STATUS_INTERNAL),
         serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
     );
     route_units.insert(

@@ -107,6 +107,7 @@ pub struct StatusSource {
 pub struct StatusSourceDebug {
     pub source_primary_by_group: BTreeMap<String, String>,
     pub last_force_find_runner_by_group: BTreeMap<String, String>,
+    pub last_force_find_runners_by_group: BTreeMap<String, Vec<String>>,
     pub force_find_inflight_groups: Vec<String>,
 }
 

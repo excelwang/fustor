@@ -31,6 +31,7 @@ const SINK_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
+const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(25);
 
 fn is_sink_worker_not_initialized(err: &CnxError) -> bool {
     matches!(err, CnxError::PeerError(message) if message == "sink worker not initialized")
@@ -888,7 +889,7 @@ impl SinkWorkerClient {
     pub fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
         match self.conn.call_with_timeout(
             SinkWorkerRequest::MaterializedQuery { request },
-            Duration::from_secs(5),
+            SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
         )? {
             SinkWorkerResponse::Events(events) => Ok(events),
             other => Err(CnxError::ProtocolViolation(format!(

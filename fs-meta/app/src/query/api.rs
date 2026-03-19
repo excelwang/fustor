@@ -19,12 +19,12 @@ use crate::sink::SinkStatusSnapshot;
 use crate::source::SourceStatusSnapshot;
 use crate::source::config::GrantedMountRoot;
 use crate::runtime::routes::{
-    METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND, ROUTE_TOKEN_FS_META_INTERNAL,
-    default_route_bindings,
+    METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND, METHOD_SOURCE_STATUS,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::workers::sink::SinkFacade;
-use crate::workers::source::SourceFacade;
+use crate::workers::source::{SourceFacade, SourceObservabilitySnapshot};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -45,7 +45,7 @@ use capanix_host_adapter_fs_meta::HostAdapter;
 use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_host_fs_types::query::StabilityMode;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -204,8 +204,29 @@ struct ApiState {
     backend: QueryBackend,
     policy: Arc<RwLock<ProjectionPolicy>>,
     pit_store: Arc<Mutex<QueryPitStore>>,
+    force_find_inflight: Arc<Mutex<BTreeSet<String>>>,
     readiness_source: Option<Arc<SourceFacade>>,
     readiness_sink: Option<Arc<SinkFacade>>,
+}
+
+struct ForceFindInflightGuard {
+    inflight: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    groups: Vec<String>,
+}
+
+impl Drop for ForceFindInflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut inflight) = self.inflight.lock() {
+            for group in &self.groups {
+                inflight.remove(group);
+            }
+            eprintln!(
+                "fs_meta_query_api: force-find inflight release groups={:?} remaining={:?}",
+                self.groups,
+                inflight
+            );
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1063,6 +1084,7 @@ pub fn create_inprocess_router(
     runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     origin_id: NodeId,
     policy: Arc<RwLock<ProjectionPolicy>>,
+    force_find_inflight: Arc<Mutex<BTreeSet<String>>>,
 ) -> Router {
     eprintln!(
         "fs_meta_query_api: create router backend={}",
@@ -1083,6 +1105,7 @@ pub fn create_inprocess_router(
         ),
         policy,
         pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
+        force_find_inflight,
         readiness_source: Some(source),
         readiness_sink: Some(sink),
     };
@@ -2523,12 +2546,108 @@ async fn get_force_find(
     if let Err(err) = validate_force_find_params(&params) {
         return error_response_with_context(err, Some(&path_for_error));
     }
+    let force_find_groups = match resolve_force_find_groups(&state, &params) {
+        Ok(groups) => groups,
+        Err(err) => return error_response_with_context(err, Some(&path_for_error)),
+    };
+    let _guard = match acquire_force_find_groups(&state, force_find_groups) {
+        Ok(guard) => guard,
+        Err(err) => return error_response_with_context(err, Some(&path_for_error)),
+    };
     match query_force_find_page_response(&state, &policy, &params, policy.force_find_timeout())
         .await
     {
         Ok(resp) => Json(resp).into_response(),
         Err(err) => error_response_with_context(err, Some(&path_for_error)),
     }
+}
+
+fn resolve_force_find_groups(
+    state: &ApiState,
+    _params: &NormalizedApiParams,
+) -> Result<Vec<String>, CnxError> {
+    match &state.backend {
+        QueryBackend::InProcess { source, .. } => Ok(source
+            .observability_snapshot()?
+            .source_primary_by_group
+            .into_keys()
+            .collect()),
+        QueryBackend::Route {
+            boundary,
+            origin_id,
+            source,
+            ..
+        } => {
+            let local = source.observability_snapshot().ok();
+            let mut groups = route_source_group_ids(boundary.clone(), origin_id.clone(), Duration::from_secs(30))
+                .or_else(|_| {
+                    local
+                        .clone()
+                        .map(|snapshot| snapshot.source_primary_by_group.into_keys().collect())
+                        .ok_or(CnxError::Timeout)
+                })?;
+            groups.sort();
+            groups.dedup();
+            Ok(groups)
+        }
+    }
+}
+
+fn acquire_force_find_groups(
+    state: &ApiState,
+    groups: Vec<String>,
+) -> Result<ForceFindInflightGuard, CnxError> {
+    let mut inflight = state
+        .force_find_inflight
+        .lock()
+        .map_err(|_| CnxError::Internal("force-find inflight lock poisoned".into()))?;
+    if let Some(group) = groups.iter().find(|group| inflight.contains(*group)) {
+        eprintln!(
+            "fs_meta_query_api: force-find inflight conflict requested={:?} active={:?}",
+            groups,
+            inflight
+        );
+        return Err(CnxError::NotReady(format!(
+            "force-find already running for group: {group}"
+        )));
+    }
+    for group in &groups {
+        inflight.insert(group.clone());
+    }
+    eprintln!(
+        "fs_meta_query_api: force-find inflight acquire groups={:?} active={:?}",
+        groups,
+        inflight
+    );
+    drop(inflight);
+    Ok(ForceFindInflightGuard {
+        inflight: state.force_find_inflight.clone(),
+        groups,
+    })
+}
+
+fn route_source_group_ids(
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    timeout: Duration,
+) -> Result<Vec<String>, CnxError> {
+    let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
+    let events = adapter.call_collect(
+        ROUTE_TOKEN_FS_META_INTERNAL,
+        METHOD_SOURCE_STATUS,
+        Bytes::new(),
+        timeout,
+        ROUTE_COLLECT_IDLE_GRACE,
+    )?;
+    let mut groups = BTreeSet::new();
+    for event in events {
+        let snapshot: SourceObservabilitySnapshot =
+            rmp_serde::from_slice(event.payload_bytes()).map_err(|err| {
+                CnxError::Internal(format!("decode source observability failed: {err}"))
+            })?;
+        groups.extend(snapshot.source_primary_by_group.into_keys());
+    }
+    Ok(groups.into_iter().collect())
 }
 
 async fn get_bound_route_metrics() -> impl IntoResponse {
@@ -2638,6 +2757,7 @@ mod tests {
                     None,
                     NodeId("test-node".into()),
                     policy,
+                    Arc::new(Mutex::new(BTreeSet::new())),
                 ),
             }
         }

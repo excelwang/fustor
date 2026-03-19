@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
 use std::sync::mpsc::sync_channel;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::{
@@ -87,11 +88,13 @@ pub async fn spawn(
     let initial_policy =
         projection_policy_from_host_object_grants(&source.cached_host_object_grants_snapshot()?);
     let projection_policy = Arc::new(RwLock::new(initial_policy));
+    let force_find_inflight = Arc::new(Mutex::new(BTreeSet::new()));
     let state = ApiState {
         node_id,
         runtime_control,
         runtime_boundary,
         query_runtime_boundary,
+        force_find_inflight: force_find_inflight.clone(),
         source,
         sink,
         query_sink,
@@ -200,6 +203,7 @@ fn router(state: ApiState) -> Result<Router> {
         state.query_runtime_boundary.clone(),
         state.node_id.clone(),
         state.projection_policy.clone(),
+        state.force_find_inflight.clone(),
     )
     .layer(middleware::from_fn_with_state(
         state.auth.clone(),
