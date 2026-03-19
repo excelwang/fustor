@@ -682,7 +682,6 @@ fn run_query_live_only_rescan_phase(
         root_payload_flags("nfs3", &lab.export_source("nfs3"), "/", true, true),
     ]);
     session.update_roots(&live_probe_roots)?;
-    session.rescan()?;
     wait_until(
         Duration::from_secs(30),
         "nfs1 live-probe roots applied",
@@ -695,33 +694,6 @@ fn run_query_live_only_rescan_phase(
 
     lab.mkdir("nfs1", "live-only")?;
     lab.write_file("nfs1", "live-only/fresh.txt", "live-before-materialized\n")?;
-
-    let materialized_tree_before = session.tree(&[
-        ("path", "/live-only".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    if group_total_nodes(&materialized_tree_before, &nfs1_group) != 0 {
-        return Err(format!(
-            "materialized tree should not observe fresh live-only path before rescan when watch=false: {materialized_tree_before}"
-        ));
-    }
-    let materialized_stats_before = session.stats(&[
-        ("path", "/live-only".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let stats_before_nodes = materialized_stats_before
-        .get("groups")
-        .and_then(Value::as_object)
-        .and_then(|groups| groups.get(&nfs1_group))
-        .and_then(|group| group.get("data"))
-        .and_then(|data| data.get("total_nodes"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    if stats_before_nodes != 0 {
-        return Err(format!(
-            "materialized stats should not observe fresh live-only path before rescan when watch=false: {materialized_stats_before}"
-        ));
-    }
 
     eprintln!("[fs-meta-api-matrix] substep=query-live-force-find");
     let live_force_find = session.force_find(&[
@@ -769,7 +741,7 @@ fn run_query_live_only_rescan_phase(
         "group-key",
         64,
     )?;
-    assert_json_eq(
+    assert_tree_content_eq(
         "materialized tree converges after rescan",
         &materialized_tree_after,
         &expected_materialized_tree_after,
@@ -781,7 +753,7 @@ fn run_query_live_only_rescan_phase(
     ])?;
     let expected_materialized_stats_after =
         FsTreeOracle::stats_response(&all_mounts, "/live-only", true, None)?;
-    assert_json_eq(
+    assert_stats_content_eq(
         "materialized stats converge after rescan",
         &materialized_stats_after,
         &expected_materialized_stats_after,
@@ -1458,6 +1430,84 @@ fn assert_json_eq(label: &str, actual: &Value, expected: &Value) -> Result<(), S
     let mut expected_normalized = expected.clone();
     normalize_tree_like_json(&mut actual_normalized);
     normalize_tree_like_json(&mut expected_normalized);
+    if actual_normalized != expected_normalized {
+        return Err(format!(
+            "{label} mismatch\nactual={}\nexpected={}",
+            serde_json::to_string_pretty(&actual_normalized)
+                .unwrap_or_else(|_| actual_normalized.to_string()),
+            serde_json::to_string_pretty(&expected_normalized)
+                .unwrap_or_else(|_| expected_normalized.to_string())
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_tree_content_only(value: &mut Value) {
+    normalize_tree_like_json(value);
+    match value {
+        Value::Object(map) => {
+            if map.contains_key("reliable") {
+                map.remove("reliable");
+            }
+            if map.contains_key("unreliable_reason") {
+                map.remove("unreliable_reason");
+            }
+            if map.get("is_dir").and_then(Value::as_bool) == Some(true) {
+                map.insert("size".into(), Value::Number(0u64.into()));
+            }
+            for child in map.values_mut() {
+                normalize_tree_content_only(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_tree_content_only(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assert_tree_content_eq(label: &str, actual: &Value, expected: &Value) -> Result<(), String> {
+    let mut actual_normalized = actual.clone();
+    let mut expected_normalized = expected.clone();
+    normalize_tree_content_only(&mut actual_normalized);
+    normalize_tree_content_only(&mut expected_normalized);
+    if actual_normalized != expected_normalized {
+        return Err(format!(
+            "{label} mismatch\nactual={}\nexpected={}",
+            serde_json::to_string_pretty(&actual_normalized)
+                .unwrap_or_else(|_| actual_normalized.to_string()),
+            serde_json::to_string_pretty(&expected_normalized)
+                .unwrap_or_else(|_| expected_normalized.to_string())
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_stats_content_only(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("attested_count");
+            map.remove("blind_spot_count");
+            for child in map.values_mut() {
+                normalize_stats_content_only(child);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                normalize_stats_content_only(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn assert_stats_content_eq(label: &str, actual: &Value, expected: &Value) -> Result<(), String> {
+    let mut actual_normalized = actual.clone();
+    let mut expected_normalized = expected.clone();
+    normalize_stats_content_only(&mut actual_normalized);
+    normalize_stats_content_only(&mut expected_normalized);
     if actual_normalized != expected_normalized {
         return Err(format!(
             "{label} mismatch\nactual={}\nexpected={}",

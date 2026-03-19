@@ -264,6 +264,11 @@ fn run_stream_loop<F, G>(
             std::thread::sleep(Duration::from_millis(50));
             continue;
         }
+        eprintln!(
+            "fs_meta_runtime_endpoint: stream loop recv route={} task={}",
+            stream_channel.0,
+            join_name
+        );
         let events = match boundary.channel_recv(
             ctx.clone(),
             ChannelRecvRequest {
@@ -273,20 +278,27 @@ fn run_stream_loop<F, G>(
         ) {
             Ok(events) => events,
             Err(CnxError::Timeout) => continue,
-            Err(CnxError::NotSupported(_))
-            | Err(CnxError::NotReady(_))
-            | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ChannelClosed)
-            | Err(CnxError::LinkError(_)) => {
+            Err(err @ CnxError::NotSupported(_))
+            | Err(err @ CnxError::NotReady(_))
+            | Err(err @ CnxError::TransportClosed(_))
+            | Err(err @ CnxError::ChannelClosed)
+            | Err(err @ CnxError::LinkError(_)) => {
                 eprintln!(
-                    "fs_meta_runtime_endpoint: transient stream recv gap task={} route={}",
+                    "fs_meta_runtime_endpoint: transient stream recv gap task={} route={} err={:?}",
                     join_name,
-                    stream_channel.0
+                    stream_channel.0,
+                    err
                 );
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
             }
             Err(err) => {
+                eprintln!(
+                    "fs_meta_runtime_endpoint: terminal stream recv failure task={} route={} err={:?}",
+                    join_name,
+                    stream_channel.0,
+                    err
+                );
                 log::warn!(
                     "stream task {} recv failed for {}: {:?}",
                     join_name,
@@ -302,6 +314,11 @@ fn run_stream_loop<F, G>(
         }
 
         handler(events);
+        eprintln!(
+            "fs_meta_runtime_endpoint: stream loop handler returned route={} task={}",
+            stream_channel.0,
+            join_name
+        );
     }
 }
 

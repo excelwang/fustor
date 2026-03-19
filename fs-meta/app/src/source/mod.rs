@@ -2313,50 +2313,29 @@ impl FSMetaSource {
                     ),
                     self.shutdown.clone(),
                     move || true,
-                    move |_events| {
+                    move |events| {
                         eprintln!(
-                            "fs_meta_source: source.rescan control stream received node={}",
-                            control_node_id.0
+                            "fs_meta_source: source.rescan control stream received node={} events={}",
+                            control_node_id.0,
+                            events.len()
                         );
-                        let expected = lock_or_recover(
-                            &control_roots,
-                            "source.rescan.control_stream.roots.expected",
-                        )
-                        .iter()
-                        .filter(|root| root.is_group_primary && root.spec.scan)
-                        .map(FSMetaSource::root_runtime_key)
-                        .collect::<Vec<_>>();
-                        if !expected.is_empty() {
-                            let deadline = std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
-                            loop {
-                                let ready = {
-                                    let health = lock_or_recover(
-                                        &control_fanout_health,
-                                        "source.rescan.control_stream.health",
-                                    );
-                                    expected.iter().all(|root_key| {
-                                        health
-                                            .object_ref
-                                            .get(root_key)
-                                            .is_some_and(|status| status == "running")
-                                    })
-                                };
-                                if ready || std::time::Instant::now() >= deadline {
-                                    break;
-                                }
-                                std::thread::sleep(RESCAN_READY_POLL_INTERVAL);
-                            }
-                        }
                         let roots_snapshot = lock_or_recover(
                             &control_roots,
                             "source.rescan.control_stream.roots.trigger",
                         )
                         .clone();
-                        FSMetaSource::request_rescan_on_primary_roots(
-                            &roots_snapshot,
-                            Some(&control_fanout_health),
-                            Some(&control_manual_rescan_intents),
-                            "manual",
+                        for _ in 0..events.len() {
+                            FSMetaSource::request_rescan_on_primary_roots(
+                                &roots_snapshot,
+                                Some(&control_fanout_health),
+                                Some(&control_manual_rescan_intents),
+                                "manual",
+                            );
+                        }
+                        eprintln!(
+                            "fs_meta_source: source.rescan control stream handled node={} events={}",
+                            control_node_id.0,
+                            events.len()
                         );
                     },
                 );
@@ -3042,6 +3021,7 @@ impl FSMetaSource {
 
         let mut removed_absent = Vec::<(String, RootTaskEntry)>::new();
         let mut stale_candidates = Vec::<(String, RootTaskSlot)>::new();
+        let mut watch_disable_replacements = Vec::<RootTaskReplacementFallback>::new();
         let mut replacement_waits = Vec::<(
             String,
             RootTaskSignature,
@@ -3079,6 +3059,21 @@ impl FSMetaSource {
                         }
                     }
                     Some(existing_entry) => {
+                        if existing_entry.active.signature.watch && !signature.watch {
+                            if let Some(stale) = existing_entry.candidate.take() {
+                                stale_candidates.push((key.clone(), stale));
+                                Self::clear_root_task_candidate_health(
+                                    &self.state_cell.fanout_health,
+                                    key,
+                                );
+                            }
+                            watch_disable_replacements.push(RootTaskReplacementFallback {
+                                key: key.clone(),
+                                root: root.clone(),
+                                expected_signature: signature.clone(),
+                            });
+                            continue;
+                        }
                         let mut candidate_ready = None;
                         if let Some(candidate) = existing_entry.candidate.as_ref() {
                             if candidate.signature == *signature {
@@ -3155,6 +3150,67 @@ impl FSMetaSource {
                 true,
             );
             Self::clear_root_task_candidate_health(&self.state_cell.fanout_health, &key);
+        }
+
+        let mut forced_ready = Vec::<tokio::sync::watch::Receiver<bool>>::new();
+        let mut extracted_forced = Vec::<(RootTaskReplacementFallback, RootTaskEntry)>::new();
+        {
+            let mut tasks = lock_or_recover(
+                &self.state_cell.root_tasks,
+                "source.reconcile.root_tasks.watch_disable",
+            );
+            for replacement in watch_disable_replacements {
+                if let Some(entry) = tasks.remove(&replacement.key) {
+                    extracted_forced.push((replacement, entry));
+                }
+            }
+        }
+
+        for (replacement, entry) in extracted_forced {
+            Self::cancel_root_task_slot(
+                &self.state_cell.fanout_health,
+                &replacement.key,
+                entry.active,
+                true,
+            )
+            .await;
+            if let Some(candidate) = entry.candidate {
+                candidate.handle.cancel.cancel();
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+                Self::clear_root_task_candidate_health(
+                    &self.state_cell.fanout_health,
+                    &replacement.key,
+                );
+            }
+            let revision = self.state_cell.next_root_task_revision();
+            let handle = self.spawn_root_task(
+                replacement.root.clone(),
+                out_tx.clone(),
+                RootTaskRole::Active,
+                revision,
+            );
+            forced_ready.push(handle.ready_rx.clone());
+            lock_or_recover(
+                &self.state_cell.root_tasks,
+                "source.reconcile.root_tasks.watch_disable.replace",
+            )
+            .insert(
+                replacement.key.clone(),
+                RootTaskEntry {
+                    active: RootTaskSlot {
+                        revision,
+                        signature: replacement.expected_signature,
+                        handle,
+                    },
+                    candidate: None,
+                },
+            );
+        }
+
+        if !forced_ready.is_empty() {
+            let _ = Self::wait_for_task_handles_ready(&mut forced_ready, Duration::from_secs(2))
+                .await;
         }
 
         if !removed_absent.is_empty() && !added_ready.is_empty() {
@@ -4074,14 +4130,6 @@ impl RuntimeBoundaryApp for FSMetaSource {
     }
 }
 
-impl Drop for FSMetaSource {
-    fn drop(&mut self) {
-        // Ensure shutdown is signalled even if close() was never called.
-        // This prevents blocking watch/scan tasks from hanging forever.
-        self.shutdown.cancel();
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4194,6 +4242,23 @@ mod tests {
             .iter()
             .map(|event| event.metadata().origin_id.0.clone())
             .collect()
+    }
+
+    #[test]
+    fn dropping_source_clone_does_not_cancel_shared_shutdown() {
+        let source = build_source(vec![test_export(
+            "node-a",
+            "node-a",
+            "10.0.0.11",
+            "/mnt/nfs1",
+            true,
+        )]);
+        let clone = source.clone();
+        drop(clone);
+        assert!(
+            !source.shutdown.is_cancelled(),
+            "dropping a clone must not cancel the shared source runtime shutdown token"
+        );
     }
 
     #[tokio::test]

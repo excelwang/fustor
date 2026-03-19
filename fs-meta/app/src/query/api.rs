@@ -2023,7 +2023,12 @@ async fn build_force_find_pit_session(
     };
     let mut groups = Vec::with_capacity(rankings.len());
     for rank in rankings {
-        match decode_force_find_selected_group_response(&events, policy, &rank.group_key) {
+        match decode_force_find_selected_group_response(
+            &events,
+            policy,
+            &rank.group_key,
+            &params.path,
+        ) {
             Ok(payload) => {
                 groups.push(GroupPitSnapshot {
                     group: rank.group_key,
@@ -2156,6 +2161,7 @@ fn decode_force_find_selected_group_response(
     events: &[Event],
     policy: &ProjectionPolicy,
     selected_group: &str,
+    query_path: &[u8],
 ) -> Result<TreeGroupPayload, CnxError> {
     let mut successes = Vec::<TreeGroupPayload>::new();
     let mut errors = Vec::<String>::new();
@@ -2178,6 +2184,21 @@ fn decode_force_find_selected_group_response(
         }
     }
     if successes.is_empty() {
+        if errors.is_empty() {
+            return Ok(TreeGroupPayload {
+                reliability: GroupReliability::from_reason(None),
+                stability: TreeStability::not_evaluated(),
+                root: TreePageRoot {
+                    path: query_path.to_vec(),
+                    size: 0,
+                    modified_time_us: 0,
+                    is_dir: true,
+                    exists: false,
+                    has_children: false,
+                },
+                entries: Vec::new(),
+            });
+        }
         let detail = errors
             .first()
             .cloned()

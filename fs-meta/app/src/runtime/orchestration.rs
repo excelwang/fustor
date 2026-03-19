@@ -14,10 +14,20 @@ use crate::runtime::execution_units::{
 pub(crate) const MANUAL_RESCAN_CONTROL_FRAME_KIND: &str =
     "fs-meta.manual-rescan-control:v1";
 
-pub(crate) fn encode_manual_rescan_envelope() -> Result<ControlEnvelope> {
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ManualRescanControlPayload {
+    pub requested_at_us: u64,
+}
+
+pub(crate) fn encode_manual_rescan_envelope(requested_at_us: u64) -> Result<ControlEnvelope> {
     Ok(ControlEnvelope::Frame(ControlFrame {
         kind: MANUAL_RESCAN_CONTROL_FRAME_KIND.to_string(),
-        payload: Vec::new(),
+        payload: rmp_serde::to_vec_named(&ManualRescanControlPayload { requested_at_us })
+            .map_err(|err| {
+                CnxError::Internal(format!(
+                    "encode manual rescan control payload failed: {err}"
+                ))
+            })?,
     }))
 }
 

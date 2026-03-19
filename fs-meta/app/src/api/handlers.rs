@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json,
@@ -273,7 +274,11 @@ pub async fn rescan(
     let _ = authorize_management(&state, &headers)?;
     if let Some(boundary) = state.runtime_boundary.as_ref() {
         eprintln!("fs_meta_api: rescan via runtime_boundary node={}", state.node_id.0);
-        let envelope = encode_manual_rescan_envelope().map_err(|err| {
+        let requested_at_us = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or(0);
+        let envelope = encode_manual_rescan_envelope(requested_at_us).map_err(|err| {
             ApiError::internal(format!("manual rescan envelope encode failed: {err}"))
         })?;
         let payload = rmp_serde::to_vec_named(&envelope).map_err(|err| {
