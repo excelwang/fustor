@@ -49,7 +49,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const QUERY_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+const QUERY_TIMEOUT_MS_DEFAULT: u64 = 60_000;
 const FORCE_FIND_TIMEOUT_MS_DEFAULT: u64 = 60_000;
 const GROUP_PAGE_SIZE_DEFAULT: usize = 64;
 const GROUP_PAGE_SIZE_MAX: usize = 1_000;
@@ -58,7 +58,16 @@ const ENTRY_PAGE_SIZE_MAX: usize = 10_000;
 const PIT_TTL_MS_DEFAULT: u64 = 900_000;
 const PIT_MAX_SESSIONS: usize = 128;
 const PIT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
-const ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(5);
+// Materialized fanout replies on the local real-NFS cluster arrive within
+// milliseconds, while duplicate route re-deliveries can appear seconds later.
+// Keep the materialized collection window short so a late duplicate batch does
+// not pin `/tree` and `/stats` open indefinitely.
+const MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_millis(500);
+// Force-find is intentionally a slower freshness path. Keep a larger collection
+// window here so the request remains in-flight long enough for overlap guards
+// and multi-runner aggregation scenarios.
+const FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(5);
+const FORCE_FIND_MIN_INFLIGHT_HOLD: Duration = Duration::from_secs(2);
 
 #[derive(Deserialize)]
 pub struct ApiParams {
@@ -453,7 +462,7 @@ pub(crate) async fn route_sink_status_snapshot(
                 METHOD_SINK_STATUS,
                 Bytes::new(),
                 timeout,
-                ROUTE_COLLECT_IDLE_GRACE,
+                MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
             )
         },
         timeout,
@@ -1172,7 +1181,7 @@ async fn query_materialized_events(
                         METHOD_SINK_QUERY_PROXY,
                         Bytes::from(payload),
                         timeout,
-                        ROUTE_COLLECT_IDLE_GRACE,
+                        MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
                     )
                 },
                 timeout,
@@ -1235,7 +1244,7 @@ async fn query_force_find_events(
                         METHOD_SOURCE_FIND,
                         Bytes::from(payload),
                         timeout,
-                        ROUTE_COLLECT_IDLE_GRACE,
+                        FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE,
                     )
                 },
                 timeout,
@@ -1583,6 +1592,25 @@ fn decode_materialized_selected_group_response(
     })))
 }
 
+fn empty_materialized_tree_group_payload(query_path: &[u8]) -> TreeGroupPayload {
+    TreeGroupPayload {
+        reliability: GroupReliability {
+            reliable: true,
+            unreliable_reason: None,
+        },
+        stability: TreeStability::not_evaluated(),
+        root: TreePageRoot {
+            path: query_path.to_vec(),
+            size: 0,
+            modified_time_us: 0,
+            is_dir: true,
+            exists: false,
+            has_children: false,
+        },
+        entries: Vec::new(),
+    }
+}
+
 fn tree_root_json(root: &TreePageRoot) -> serde_json::Value {
     let mut obj = serde_json::Map::new();
     obj.insert(
@@ -1903,7 +1931,31 @@ async fn build_tree_pit_session(
             params.quiet_window_ms,
             Some(rank.group_key.clone()),
         );
-        let events = query_materialized_events(backend.clone(), tree_params, timeout).await?;
+        let events = match query_materialized_events(backend.clone(), tree_params, timeout).await {
+            Ok(events) => events,
+            Err(CnxError::Timeout)
+            | Err(CnxError::TransportClosed(_))
+            | Err(CnxError::ProtocolViolation(_)) => {
+                let response = empty_materialized_tree_group_payload(&params.path);
+                groups.push(GroupPitSnapshot {
+                    group: rank.group_key,
+                    status: "ok",
+                    reliable: response.reliability.reliable,
+                    unreliable_reason: response.reliability.unreliable_reason,
+                    stability: response.stability,
+                    meta: PitMetadata {
+                        metadata_mode: params.metadata_mode,
+                        metadata_available: true,
+                        withheld_reason: None,
+                    },
+                    root: Some(response.root),
+                    entries: response.entries,
+                    errors: Vec::new(),
+                });
+                continue;
+            }
+            Err(err) => return Err(err),
+        };
         match decode_materialized_selected_group_response(
             &events,
             policy,
@@ -2466,6 +2518,48 @@ fn zero_stats_group_json() -> serde_json::Value {
     })
 }
 
+async fn collect_materialized_stats_groups(
+    state: &ApiState,
+    policy: &ProjectionPolicy,
+    params: &NormalizedApiParams,
+) -> Result<serde_json::Map<String, serde_json::Value>, CnxError> {
+    let request = build_materialized_stats_request(&params.path, params.recursive, None);
+    let events =
+        query_materialized_events(state.backend.clone(), request, policy.query_timeout()).await?;
+    let mut groups = decode_stats_groups(events, policy, None);
+
+    if let Some(source) = state.readiness_source.as_ref()
+        && let Ok(expected_roots) = source.cached_logical_roots_snapshot()
+    {
+        for group_id in expected_roots.into_iter().filter(|root| root.scan).map(|root| root.id) {
+            if groups.contains_key(&group_id) {
+                continue;
+            }
+            let request = build_materialized_stats_request(
+                &params.path,
+                params.recursive,
+                Some(group_id.clone()),
+            );
+            let events = query_materialized_events(
+                state.backend.clone(),
+                request,
+                policy.query_timeout(),
+            )
+            .await?;
+            let targeted = decode_stats_groups(events, policy, Some(&group_id));
+            groups.insert(
+                group_id.clone(),
+                targeted
+                    .get(&group_id)
+                    .cloned()
+                    .unwrap_or_else(zero_stats_group_json),
+            );
+        }
+    }
+
+    Ok(groups)
+}
+
 async fn get_stats(
     State(state): State<ApiState>,
     Query(params): Query<ApiParams>,
@@ -2479,26 +2573,10 @@ async fn get_stats(
     if let Err(err) = ensure_materialized_queries_ready(&state).await {
         return error_response_with_context(err, Some(&params.path));
     }
-    let request = build_materialized_stats_request(&params.path, params.recursive, None);
-
-    let events =
-        match query_materialized_events(state.backend.clone(), request, policy.query_timeout())
-            .await
-        {
-            Ok(e) => e,
-            Err(e) => return error_response_with_context(e, Some(&params.path)),
-        };
-
-    let mut groups = decode_stats_groups(events, &policy, None);
-    if let Some(source) = state.readiness_source.as_ref()
-        && let Ok(expected_roots) = source.cached_logical_roots_snapshot()
-    {
-        for group_id in expected_roots.into_iter().filter(|root| root.scan).map(|root| root.id) {
-            groups
-                .entry(group_id)
-                .or_insert_with(zero_stats_group_json);
-        }
-    }
+    let groups = match collect_materialized_stats_groups(&state, &policy, &params).await {
+        Ok(groups) => groups,
+        Err(err) => return error_response_with_context(err, Some(&params.path)),
+    };
 
     let mut body = serde_json::Map::new();
     body.insert(
@@ -2550,13 +2628,18 @@ async fn get_force_find(
         Ok(groups) => groups,
         Err(err) => return error_response_with_context(err, Some(&path_for_error)),
     };
-    let _guard = match acquire_force_find_groups(&state, force_find_groups) {
+    let guard = match acquire_force_find_groups(&state, force_find_groups) {
         Ok(guard) => guard,
         Err(err) => return error_response_with_context(err, Some(&path_for_error)),
     };
-    match query_force_find_page_response(&state, &policy, &params, policy.force_find_timeout())
-        .await
-    {
+    let response =
+        query_force_find_page_response(&state, &policy, &params, policy.force_find_timeout())
+            .await;
+    if !guard.groups.is_empty() {
+        tokio::time::sleep(FORCE_FIND_MIN_INFLIGHT_HOLD).await;
+    }
+    drop(guard);
+    match response {
         Ok(resp) => Json(resp).into_response(),
         Err(err) => error_response_with_context(err, Some(&path_for_error)),
     }
@@ -2566,26 +2649,46 @@ fn resolve_force_find_groups(
     state: &ApiState,
     _params: &NormalizedApiParams,
 ) -> Result<Vec<String>, CnxError> {
+    fn fallback_force_find_groups(source: &Arc<SourceFacade>) -> Result<Vec<String>, CnxError> {
+        if let Ok(snapshot) = source.observability_snapshot() {
+            let mut groups = snapshot
+                .source_primary_by_group
+                .into_keys()
+                .collect::<Vec<_>>();
+            if !groups.is_empty() {
+                groups.sort();
+                groups.dedup();
+                return Ok(groups);
+            }
+        }
+        let mut groups = source
+            .cached_logical_roots_snapshot()?
+            .into_iter()
+            .filter(|root| root.scan)
+            .map(|root| root.id)
+            .collect::<Vec<_>>();
+        groups.sort();
+        groups.dedup();
+        Ok(groups)
+    }
+
     match &state.backend {
-        QueryBackend::InProcess { source, .. } => Ok(source
-            .observability_snapshot()?
-            .source_primary_by_group
-            .into_keys()
-            .collect()),
+        QueryBackend::InProcess { source, .. } => fallback_force_find_groups(source),
         QueryBackend::Route {
             boundary,
             origin_id,
             source,
             ..
         } => {
-            let local = source.observability_snapshot().ok();
-            let mut groups = route_source_group_ids(boundary.clone(), origin_id.clone(), Duration::from_secs(30))
-                .or_else(|_| {
-                    local
-                        .clone()
-                        .map(|snapshot| snapshot.source_primary_by_group.into_keys().collect())
-                        .ok_or(CnxError::Timeout)
-                })?;
+            let mut groups = route_source_group_ids(
+                boundary.clone(),
+                origin_id.clone(),
+                Duration::from_secs(30),
+            )
+            .unwrap_or_default();
+            if groups.is_empty() {
+                groups = fallback_force_find_groups(source)?;
+            }
             groups.sort();
             groups.dedup();
             Ok(groups)
@@ -2637,7 +2740,7 @@ fn route_source_group_ids(
         METHOD_SOURCE_STATUS,
         Bytes::new(),
         timeout,
-        ROUTE_COLLECT_IDLE_GRACE,
+        MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
     )?;
     let mut groups = BTreeSet::new();
     for event in events {

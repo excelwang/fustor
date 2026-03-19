@@ -271,11 +271,15 @@ impl NfsLab {
         };
         let status = sudo_status(["umount", path.to_string_lossy().as_ref()])?;
         if !status.success() {
-            return Err(format!(
-                "umount {} failed with status {}",
-                path.display(),
-                status
-            ));
+            let fallback = sudo_status(["umount", "-f", "-l", path.to_string_lossy().as_ref()])?;
+            if !fallback.success() {
+                return Err(format!(
+                    "umount {} failed with status {}; fallback umount -f -l failed with status {}",
+                    path.display(),
+                    status,
+                    fallback
+                ));
+            }
         }
         Ok(())
     }

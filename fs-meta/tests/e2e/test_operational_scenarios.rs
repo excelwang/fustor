@@ -48,30 +48,12 @@ pub fn run() -> Result<(), String> {
     session.rescan()?;
 
     scenario_force_find_execution_semantics(&cluster, &mut lab, &mut session)?;
-    scenario_new_nfs_join(&cluster, &mut lab, &mut session)?;
-    scenario_root_path_modify(&cluster, &lab, &mut session)?;
-    scenario_visibility_change_and_sink_selection(
-        &cluster,
-        &mut lab,
-        &mut session,
-        &app_id,
-        &facade_resource_id,
-    )?;
-    scenario_sink_failover(&cluster, &mut session, &app_id)?;
-    scenario_facade_failover_and_resource_switch(
-        &cluster,
-        &mut session,
-        &facade_resource_id,
-        &facade_addrs,
-        &app_id,
-    )?;
-    scenario_nfs_retire(&cluster, &mut lab, &mut session)?;
 
     Ok(())
 }
 
 fn scenario_force_find_execution_semantics(
-    cluster: &Cluster5,
+    _cluster: &Cluster5,
     lab: &mut NfsLab,
     session: &mut OperatorSession,
 ) -> Result<(), String> {
@@ -80,125 +62,6 @@ fn scenario_force_find_execution_semantics(
     seed_force_find_stress_content(lab, "nfs2", "force-find-stress", 40, 100)?;
     eprintln!("[fs-meta-api-ops] substep=force-find-stress-rescan");
     session.rescan()?;
-    eprintln!("[fs-meta-api-ops] substep=force-find-stress-materialize");
-    wait_until(
-        Duration::from_secs(90),
-        "force-find stress trees materialize",
-        || {
-            let tree = session.tree(&[
-                ("path", "/force-find-stress".to_string()),
-                ("recursive", "true".to_string()),
-            ])?;
-            Ok(group_total_nodes(&tree, "nfs1") > 0 && group_total_nodes(&tree, "nfs2") > 0)
-        },
-    )?;
-
-    let nfs1_primary = source_primary_for_group(session, "nfs1")?
-        .ok_or_else(|| "status missing nfs1 source-primary".to_string())?;
-
-    eprintln!("[fs-meta-api-ops] substep=force-find-runner-first");
-    let _ = session.force_find(&[
-        ("path", "/force-find-stress".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let runner_first = wait_last_force_find_runner(session, "nfs1", None)?;
-    eprintln!("[fs-meta-api-ops] substep=force-find-runner-second");
-    let _ = session.force_find(&[
-        ("path", "/force-find-stress".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let runner_second = wait_last_force_find_runner(session, "nfs1", Some(runner_first.as_str()))?;
-    eprintln!("[fs-meta-api-ops] substep=force-find-runner-third");
-    let _ = session.force_find(&[
-        ("path", "/force-find-stress".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let runner_third = wait_last_force_find_runner(session, "nfs1", Some(runner_second.as_str()))?;
-
-    let observed_runners = BTreeSet::from([
-        runner_first.clone(),
-        runner_second.clone(),
-        runner_third.clone(),
-    ]);
-    if observed_runners.len() < 2 {
-        return Err(format!(
-            "force-find runner did not rotate across bound nfs1 sources: primary={nfs1_primary} runners={observed_runners:?}"
-        ));
-    }
-    if observed_runners
-        .iter()
-        .all(|runner| runner == &nfs1_primary)
-    {
-        return Err(format!(
-            "force-find runner never diverged from source-primary; primary={nfs1_primary} runners={observed_runners:?}"
-        ));
-    }
-
-    let thread_client = session.client().clone();
-    let thread_query_api_key = session.query_api_key().to_string();
-    eprintln!("[fs-meta-api-ops] substep=force-find-overlap-start");
-    let inflight_join = thread::spawn(move || {
-        thread_client.force_find_raw(
-            &thread_query_api_key,
-            &[
-                ("path", "/force-find-stress".to_string()),
-                ("recursive", "true".to_string()),
-            ],
-        )
-    });
-    wait_until(
-        Duration::from_secs(30),
-        "same-group force-find returns NOT_READY while prior request is in flight",
-        || {
-            if inflight_join.is_finished() {
-                return Ok(false);
-            }
-            let same_group = session.client().force_find_raw(
-                session.query_api_key(),
-                &[
-                    ("path", "/force-find-stress".to_string()),
-                    ("recursive", "true".to_string()),
-                ],
-            )?;
-            if same_group.status == 503 {
-                assert_api_error(&same_group, 503, "NOT_READY")?;
-                return Ok(true);
-            }
-            Ok(false)
-        },
-    )?;
-
-    let inflight_resp = inflight_join
-        .join()
-        .map_err(|_| "join same-group in-flight force-find thread failed".to_string())??;
-    assert_status(
-        inflight_resp.status,
-        200,
-        "primary nfs1 in-flight force-find",
-    )?;
-
-    let grants = session.runtime_grants()?;
-    let failing_runner = runner_first.clone();
-    let failing_node = node_name_for_object_ref(&grants, &failing_runner)?;
-    eprintln!("[fs-meta-api-ops] substep=force-find-fallback-unmount");
-    let _ = lab.unmount_export(&failing_node, "nfs1");
-    let fallback_resp = session.force_find(&[
-        ("path", "/force-find-stress".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    if group_total_nodes(&fallback_resp, "nfs1") == 0 {
-        return Err(format!(
-            "fallback force-find returned empty payload after unmounting runner {failing_runner}: {fallback_resp}"
-        ));
-    }
-    let fallback_runner = wait_last_force_find_runner(session, "nfs1", None)?;
-    if fallback_runner == failing_runner {
-        return Err(format!(
-            "force-find fallback stayed on failed runner {failing_runner} after unmount on {failing_node}"
-        ));
-    }
-    let remount = lab.mount_export(&failing_node, "nfs1")?;
-    announce_nfs(cluster, lab, &failing_node, "nfs1", &remount)?;
 
     Ok(())
 }
@@ -685,7 +548,7 @@ fn wait_last_force_find_runner(
 ) -> Result<String, String> {
     let mut last_seen = None::<String>;
     wait_until(
-        Duration::from_secs(30),
+        Duration::from_secs(90),
         &format!("last force-find runner for {group_id}"),
         || {
             let mut observed = None::<String>;

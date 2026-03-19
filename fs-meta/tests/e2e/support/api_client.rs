@@ -48,6 +48,13 @@ impl FsMetaApiClient {
         self.ensure_success(self.login_raw(username, password)?)
     }
 
+    pub fn with_base_url(&self, base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            client: self.client.clone(),
+        }
+    }
+
     pub fn login_raw(&self, username: &str, password: &str) -> Result<ApiResponse, String> {
         self.post_json_noauth_raw(
             "/session/login",
@@ -430,17 +437,35 @@ impl OperatorSession {
         &mut self,
         op: impl Fn(&FsMetaApiClient, &str) -> Result<T, String>,
     ) -> Result<T, String> {
-        match op(&self.client, &self.management_token) {
-            Ok(value) => Ok(value),
-            Err(err) if is_invalid_session_error(&err) => {
-                self.reconnect_and_login()?;
-                op(&self.client, &self.management_token)
+        let deadline = std::time::Instant::now() + RECONNECT_RETRY_WINDOW;
+        let mut last_err = None::<String>;
+        loop {
+            let mut saw_reauthable_error = false;
+            for base_url in self.prioritized_base_urls() {
+                let client = self.client.with_base_url(base_url.clone());
+                match op(&client, &self.management_token) {
+                    Ok(value) => {
+                        self.client = client;
+                        return Ok(value);
+                    }
+                    Err(err) if is_invalid_session_error(&err) => {
+                        saw_reauthable_error = true;
+                        last_err = Some(format!("{base_url}: {err}"));
+                    }
+                    Err(err) if is_transport_error(&err) => {
+                        saw_reauthable_error = true;
+                        last_err = Some(format!("{base_url}: {err}"));
+                    }
+                    Err(err) => return Err(err),
+                }
             }
-            Err(err) if is_transport_error(&err) => {
-                self.reconnect_and_login()?;
-                op(&self.client, &self.management_token)
+            if !saw_reauthable_error || std::time::Instant::now() >= deadline {
+                return Err(last_err.unwrap_or_else(|| {
+                    "management operation failed without a recoverable candidate".to_string()
+                }));
             }
-            Err(err) => Err(err),
+            self.reconnect_and_login()?;
+            std::thread::sleep(RECONNECT_RETRY_INTERVAL);
         }
     }
 
@@ -448,17 +473,35 @@ impl OperatorSession {
         &mut self,
         op: impl Fn(&FsMetaApiClient, &str) -> Result<T, String>,
     ) -> Result<T, String> {
-        match op(&self.client, &self.query_api_key) {
-            Ok(value) => Ok(value),
-            Err(err) if is_invalid_query_api_key_error(&err) => {
-                self.reconnect_and_login()?;
-                op(&self.client, &self.query_api_key)
+        let deadline = std::time::Instant::now() + RECONNECT_RETRY_WINDOW;
+        let mut last_err = None::<String>;
+        loop {
+            let mut saw_reauthable_error = false;
+            for base_url in self.prioritized_base_urls() {
+                let client = self.client.with_base_url(base_url.clone());
+                match op(&client, &self.query_api_key) {
+                    Ok(value) => {
+                        self.client = client;
+                        return Ok(value);
+                    }
+                    Err(err) if is_invalid_query_api_key_error(&err) => {
+                        saw_reauthable_error = true;
+                        last_err = Some(format!("{base_url}: {err}"));
+                    }
+                    Err(err) if is_transport_error(&err) => {
+                        saw_reauthable_error = true;
+                        last_err = Some(format!("{base_url}: {err}"));
+                    }
+                    Err(err) => return Err(err),
+                }
             }
-            Err(err) if is_transport_error(&err) => {
-                self.reconnect_and_login()?;
-                op(&self.client, &self.query_api_key)
+            if !saw_reauthable_error || std::time::Instant::now() >= deadline {
+                return Err(last_err.unwrap_or_else(|| {
+                    "query operation failed without a recoverable candidate".to_string()
+                }));
             }
-            Err(err) => Err(err),
+            self.reconnect_and_login()?;
+            std::thread::sleep(RECONNECT_RETRY_INTERVAL);
         }
     }
 
@@ -490,6 +533,21 @@ impl OperatorSession {
                 }
             }
         }
+    }
+
+    fn prioritized_base_urls(&self) -> Vec<String> {
+        let current = self.client.base_url.trim_end_matches('/').to_string();
+        let mut ordered = Vec::new();
+        if !current.is_empty() {
+            ordered.push(current);
+        }
+        for base_url in &self.candidate_base_urls {
+            let normalized = base_url.trim_end_matches('/').to_string();
+            if !normalized.is_empty() && !ordered.contains(&normalized) {
+                ordered.push(normalized);
+            }
+        }
+        ordered
     }
 }
 

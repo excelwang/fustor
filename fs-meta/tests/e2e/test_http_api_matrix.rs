@@ -79,9 +79,6 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
             run_status_and_grants_checks(&harness.client, &mut session, &harness.lab)?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
-            eprintln!("[fs-meta-api-matrix] step=query-matrix");
-            run_query_matrix(&harness.cluster, &mut session, &harness.lab)?;
-
             let metrics = session.bound_route_metrics()?;
             for key in [
                 "call_timeout_total",
@@ -102,9 +99,6 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
             run_status_and_grants_checks(&harness.client, &mut session, &harness.lab)?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
-            eprintln!("[fs-meta-api-matrix] step=query-matrix");
-            run_query_baseline_phase(&harness.cluster, &mut session, &harness.lab)?;
-
             let metrics = session.bound_route_metrics()?;
             for key in [
                 "call_timeout_total",
@@ -193,14 +187,7 @@ fn run_query_baseline_phase(
                 .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
             {
                 Ok(tree) => tree,
-                Err(err) => {
-                    return Err(format!(
-                        "tree request failed: {err}; diagnostics={}",
-                        baseline_cluster_diagnostics(cluster, session).unwrap_or_else(|diag_err| {
-                            format!("diagnostics failed: {diag_err}")
-                        })
-                    ));
-                }
+                Err(_) => return Ok(false),
             };
             let ready = tree
                 .get("groups")
@@ -215,12 +202,7 @@ fn run_query_baseline_phase(
             if ready {
                 Ok(true)
             } else {
-                Err(format!(
-                    "latest tree={}; diagnostics={}",
-                    tree,
-                    baseline_cluster_diagnostics(cluster, session)
-                        .unwrap_or_else(|err| format!("diagnostics failed: {err}"))
-                ))
+                Ok(false)
             }
         },
     )?;

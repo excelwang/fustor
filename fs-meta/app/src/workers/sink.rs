@@ -31,7 +31,7 @@ const SINK_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
-const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(25);
+const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn is_sink_worker_not_initialized(err: &CnxError) -> bool {
     matches!(err, CnxError::PeerError(message) if message == "sink worker not initialized")
