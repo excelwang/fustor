@@ -3614,32 +3614,40 @@ impl FSMetaSource {
 
         let output_stream = stream! {
             let mut audit_tick = tokio::time::interval(audit_interval);
+            let mut scan_channel_open = true;
             let mut periodic_channel_open = root.spec.scan && !audit_interval.is_zero();
             let mut watch_channel_open = watch_handle.is_some();
+            let mut last_manual_dispatch_target = 0_u64;
             if periodic_channel_open {
                 audit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 // Discard immediate first tick so periodic scan starts after one full interval.
                 audit_tick.tick().await;
             }
             let mut rescan_channel_open = root.spec.scan;
-            let dispatch_pending_manual = || {
-                let should_dispatch = {
+            let mut dispatch_pending_manual = |last_manual_dispatch_target: &mut u64| {
+                let requested_target = {
                     let intents = lock_or_recover(
                         &manual_rescan_intents,
                         "source.root.manual_rescan_intents.dispatch_check",
                     );
                     intents
                         .get(&root_key)
-                        .is_some_and(|intent| intent.requested > intent.completed)
+                        .and_then(|intent| {
+                            (intent.requested > intent.completed).then_some(intent.requested)
+                        })
+                        .unwrap_or(0)
                 };
-                if should_dispatch {
-                    let _ = root.rescan_tx.send(RescanReason::Manual);
+                if requested_target > *last_manual_dispatch_target {
+                    if root.rescan_tx.send(RescanReason::Manual).is_ok() {
+                        *last_manual_dispatch_target = requested_target;
+                    }
                 }
             };
             if rescan_channel_open {
-                dispatch_pending_manual();
+                dispatch_pending_manual(&mut last_manual_dispatch_target);
             }
             loop {
+                dispatch_pending_manual(&mut last_manual_dispatch_target);
                 let current_is_group_primary =
                     Self::root_current_is_group_primary(&roots_handle, &root_key);
                 let rescan_open = rescan_channel_open;
@@ -3647,7 +3655,7 @@ impl FSMetaSource {
                 tokio::select! {
                     _ = global_shutdown.cancelled() => break,
                     _ = task_shutdown.cancelled() => break,
-                    batch = scan_rx.recv() => match batch {
+                    batch = scan_rx.recv(), if scan_channel_open => match batch {
                         Some(batch) => {
                             eprintln!(
                                 "fs_meta_source: root_stream yielding scan batch len={} root_key={}",
@@ -3657,7 +3665,7 @@ impl FSMetaSource {
                             yield batch;
                         }
                         None => {
-                            rescan_channel_open = false;
+                            scan_channel_open = false;
                         }
                     },
                     batch = watch_rx.recv(), if watch_channel_open => match batch {
@@ -3791,6 +3799,9 @@ impl FSMetaSource {
                                         );
                                         let entry = intents.entry(root_key.clone()).or_default();
                                         entry.completed = entry.completed.max(target);
+                                        if entry.completed >= last_manual_dispatch_target {
+                                            last_manual_dispatch_target = entry.completed;
+                                        }
                                     }
                                 }
                                 Err(err) => {
@@ -3810,6 +3821,9 @@ impl FSMetaSource {
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                     }
+                }
+                if !scan_channel_open && !watch_channel_open && !rescan_channel_open {
+                    break;
                 }
             }
             if let Some(handle) = watch_handle {

@@ -273,6 +273,19 @@ fn run_stream_loop<F, G>(
         ) {
             Ok(events) => events,
             Err(CnxError::Timeout) => continue,
+            Err(CnxError::NotSupported(_))
+            | Err(CnxError::NotReady(_))
+            | Err(CnxError::TransportClosed(_))
+            | Err(CnxError::ChannelClosed)
+            | Err(CnxError::LinkError(_)) => {
+                eprintln!(
+                    "fs_meta_runtime_endpoint: transient stream recv gap task={} route={}",
+                    join_name,
+                    stream_channel.0
+                );
+                std::thread::sleep(Duration::from_millis(50));
+                continue;
+            }
             Err(err) => {
                 log::warn!(
                     "stream task {} recv failed for {}: {:?}",
@@ -299,12 +312,21 @@ mod tests {
 
     struct RecordingBoundary {
         recv_keys: Mutex<Vec<String>>,
+        fail_once: Mutex<bool>,
     }
 
     impl RecordingBoundary {
         fn new() -> Self {
             Self {
                 recv_keys: Mutex::new(Vec::new()),
+                fail_once: Mutex::new(false),
+            }
+        }
+
+        fn fail_once() -> Self {
+            Self {
+                recv_keys: Mutex::new(Vec::new()),
+                fail_once: Mutex::new(true),
             }
         }
     }
@@ -319,6 +341,11 @@ mod tests {
                 .lock()
                 .expect("recv_keys lock")
                 .push(request.channel_key.0);
+            let mut fail_once = self.fail_once.lock().expect("fail_once lock");
+            if *fail_once {
+                *fail_once = false;
+                return Err(CnxError::NotSupported("transient attach gap".into()));
+            }
             Err(CnxError::Internal("stop after first recv".into()))
         }
     }
@@ -337,6 +364,28 @@ mod tests {
 
         let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
         assert_eq!(recv_keys, vec!["fs-meta.events:v1.stream".to_string()]);
+    }
+
+    #[test]
+    fn stream_loop_retries_transient_recv_errors() {
+        let boundary = Arc::new(RecordingBoundary::fail_once());
+        run_stream_loop(
+            boundary.clone(),
+            RouteKey("fs-meta.events:v1.stream".into()),
+            "test-stream".into(),
+            CancellationToken::new(),
+            Arc::new(|| true),
+            Arc::new(|_events: Vec<Event>| {}),
+        );
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec![
+                "fs-meta.events:v1.stream".to_string(),
+                "fs-meta.events:v1.stream".to_string()
+            ]
+        );
     }
 }
 

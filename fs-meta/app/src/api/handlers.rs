@@ -10,9 +10,9 @@ use capanix_app_sdk::Event;
 use capanix_app_sdk::raw::{BoundaryContext, ChannelKey, ChannelSendRequest};
 use capanix_app_sdk::runtime::EventMetadata;
 
-use crate::query::api::refresh_policy_from_host_object_grants;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
 use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
+use crate::query::api::refresh_policy_from_host_object_grants;
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use crate::workers::source::SourceObservabilitySnapshot;
 

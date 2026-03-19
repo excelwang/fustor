@@ -14,16 +14,131 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MatrixMode {
+    Full,
+    QueryBaselineOnly,
+    LiveOnlyOnly,
+}
+
+impl MatrixMode {
+    fn app_prefix(self) -> &'static str {
+        match self {
+            Self::Full => "fs-meta-api-matrix",
+            Self::QueryBaselineOnly => "fs-meta-api-matrix-baseline",
+            Self::LiveOnlyOnly => "fs-meta-api-matrix-live-only",
+        }
+    }
+}
+
+struct MatrixHarness {
+    cluster: Cluster5,
+    lab: NfsLab,
+    client: FsMetaApiClient,
+    candidate_base_urls: Vec<String>,
+}
+
 pub fn run() -> Result<(), String> {
+    run_mode(MatrixMode::Full)
+}
+
+pub fn run_query_baseline_only() -> Result<(), String> {
+    run_mode(MatrixMode::QueryBaselineOnly)
+}
+
+pub fn run_live_only_rescan_only() -> Result<(), String> {
+    run_mode(MatrixMode::LiveOnlyOnly)
+}
+
+fn run_mode(mode: MatrixMode) -> Result<(), String> {
     if let Some(reason) = skip_unless_real_nfs_enabled() {
         eprintln!("[fs-meta-api-matrix] skipped: {reason}");
         return Ok(());
     }
 
+    let harness = build_matrix_harness(mode.app_prefix())?;
+    eprintln!(
+        "[fs-meta-api-matrix] candidates={:?}",
+        harness.candidate_base_urls
+    );
+
+    eprintln!("[fs-meta-api-matrix] step=login-matrix");
+    run_login_matrix(&harness.client)?;
+    eprintln!("[fs-meta-api-matrix] step=operator-login-many");
+    let mut session = OperatorSession::login_many(
+        harness.candidate_base_urls.clone(),
+        "operator",
+        "operator123",
+    )?;
+    eprintln!("[fs-meta-api-matrix] step=initial-rescan");
+    session.rescan()?;
+
+    match mode {
+        MatrixMode::Full => {
+            eprintln!("[fs-meta-api-matrix] step=status-and-grants");
+            run_status_and_grants_checks(&harness.client, &mut session, &harness.lab)?;
+            eprintln!("[fs-meta-api-matrix] step=roots-matrix");
+            run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
+            eprintln!("[fs-meta-api-matrix] step=query-matrix");
+            run_query_matrix(&harness.cluster, &mut session, &harness.lab)?;
+
+            let metrics = session.bound_route_metrics()?;
+            for key in [
+                "call_timeout_total",
+                "correlation_mismatch_total",
+                "uncorrelated_reply_total",
+                "recv_loop_iterations",
+                "pending_calls",
+            ] {
+                if !metrics.get(key).is_some_and(Value::is_number) {
+                    return Err(format!(
+                        "bound-route-metrics missing numeric key {key}: {metrics}"
+                    ));
+                }
+            }
+        }
+        MatrixMode::QueryBaselineOnly => {
+            eprintln!("[fs-meta-api-matrix] step=status-and-grants");
+            run_status_and_grants_checks(&harness.client, &mut session, &harness.lab)?;
+            eprintln!("[fs-meta-api-matrix] step=roots-matrix");
+            run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
+            eprintln!("[fs-meta-api-matrix] step=query-matrix");
+            run_query_baseline_phase(&harness.cluster, &mut session, &harness.lab)?;
+
+            let metrics = session.bound_route_metrics()?;
+            for key in [
+                "call_timeout_total",
+                "correlation_mismatch_total",
+                "uncorrelated_reply_total",
+                "recv_loop_iterations",
+                "pending_calls",
+            ] {
+                if !metrics.get(key).is_some_and(Value::is_number) {
+                    return Err(format!(
+                        "bound-route-metrics missing numeric key {key}: {metrics}"
+                    ));
+                }
+            }
+        }
+        MatrixMode::LiveOnlyOnly => {
+            eprintln!("[fs-meta-api-matrix] step=status-and-grants");
+            run_status_and_grants_checks(&harness.client, &mut session, &harness.lab)?;
+        }
+    }
+
+    if matches!(mode, MatrixMode::LiveOnlyOnly) {
+        eprintln!("[fs-meta-api-matrix] step=query-live-only");
+        run_query_live_only_rescan_phase(&harness.cluster, &mut session, &harness.lab)?;
+    }
+
+    Ok(())
+}
+
+fn build_matrix_harness(app_prefix: &str) -> Result<MatrixHarness, String> {
     let mut lab = NfsLab::start()?;
     seed_baseline_content(&lab)?;
     let cluster = Cluster5::start()?;
-    let app_id = format!("fs-meta-api-matrix-{}", unique_suffix());
+    let app_id = format!("{app_prefix}-{}", unique_suffix());
     let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
     let facade_addrs = reserve_http_addrs(2)?;
     install_baseline_resources(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
@@ -43,324 +158,27 @@ pub fn run() -> Result<(), String> {
         "operator123",
         Duration::from_secs(120),
     )?;
-    eprintln!(
-        "[fs-meta-api-matrix] base_url={} candidates={:?}",
-        base_url, candidate_base_urls
-    );
     let client = FsMetaApiClient::new(base_url)?;
 
-    eprintln!("[fs-meta-api-matrix] step=login-matrix");
-    run_login_matrix(&client)?;
-    eprintln!("[fs-meta-api-matrix] step=operator-login-many");
-    let mut session = OperatorSession::login_many(candidate_base_urls, "operator", "operator123")?;
-    eprintln!("[fs-meta-api-matrix] step=initial-rescan");
-    session.rescan()?;
-    eprintln!("[fs-meta-api-matrix] step=status-and-grants");
-    run_status_and_grants_checks(&client, &mut session, &lab)?;
-    eprintln!("[fs-meta-api-matrix] step=roots-matrix");
-    run_roots_matrix(&client, &mut session, &lab)?;
-    eprintln!("[fs-meta-api-matrix] step=query-matrix");
-    run_query_matrix(&cluster, &mut session, &lab)?;
-
-    let metrics = session.bound_route_metrics()?;
-    for key in [
-        "call_timeout_total",
-        "correlation_mismatch_total",
-        "uncorrelated_reply_total",
-        "recv_loop_iterations",
-        "pending_calls",
-    ] {
-        if !metrics.get(key).is_some_and(Value::is_number) {
-            return Err(format!(
-                "bound-route-metrics missing numeric key {key}: {metrics}"
-            ));
-        }
-    }
-
-    Ok(())
-}
-
-fn run_login_matrix(client: &FsMetaApiClient) -> Result<(), String> {
-    assert_error(
-        client.login_raw("", "")?,
-        400,
-        "username/password must not be empty",
-    )?;
-    assert_error(client.login_raw("operator", "wrong-pass")?, 401, "invalid")?;
-    let login = client.login_raw("operator", "operator123")?;
-    assert_status(login.status, 200, "valid login")?;
-    if login.body.get("token").and_then(Value::as_str).is_none() {
-        return Err(format!("login response missing token: {}", login.body));
-    }
-    Ok(())
-}
-
-fn run_status_and_grants_checks(
-    client: &FsMetaApiClient,
-    session: &mut OperatorSession,
-    lab: &NfsLab,
-) -> Result<(), String> {
-    assert_error(
-        client.get_json_raw("/status", "bad-token")?,
-        401,
-        "invalid session token",
-    )?;
-
-    eprintln!("[fs-meta-api-matrix] substep=status");
-    let status = session.status()?;
-    let source = status
-        .get("source")
-        .ok_or_else(|| format!("status missing source: {status}"))?;
-    let sink = status
-        .get("sink")
-        .ok_or_else(|| format!("status missing sink: {status}"))?;
-    if source
-        .get("grants_count")
-        .and_then(Value::as_u64)
-        .unwrap_or(0)
-        < 3
-    {
-        return Err(format!("expected at least 3 grants in status: {status}"));
-    }
-    if sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
-        return Err(format!("expected live sink nodes in status: {status}"));
-    }
-
-    eprintln!("[fs-meta-api-matrix] substep=runtime-grants");
-    let grants = session.runtime_grants()?;
-    let rows = grants
-        .get("grants")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("runtime grants missing array: {grants}"))?;
-    let nfs_rows = rows
-        .iter()
-        .filter(|row| row.get("fs_type").and_then(Value::as_str) == Some("nfs"))
-        .count();
-    let listener_rows = rows
-        .iter()
-        .filter(|row| row.get("fs_type").and_then(Value::as_str) == Some("tcp_listener"))
-        .count();
-    if nfs_rows != 9 || listener_rows != 2 || rows.len() != 11 {
-        return Err(format!(
-            "expected 11 runtime grants rows (9 nfs + 2 tcp_listener), got {} total / {} nfs / {} listeners: {grants}",
-            rows.len(),
-            nfs_rows,
-            listener_rows
-        ));
-    }
-    for export_name in ["nfs1", "nfs2", "nfs3"] {
-        if !rows.iter().any(|row| {
-            row.get("fs_source").and_then(Value::as_str)
-                == Some(lab.export_source(export_name).as_str())
-        }) {
-            return Err(format!(
-                "runtime grants missing export {export_name}: {grants}"
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn run_roots_matrix(
-    client: &FsMetaApiClient,
-    session: &mut OperatorSession,
-    lab: &NfsLab,
-) -> Result<(), String> {
-    eprintln!("[fs-meta-api-matrix] substep=monitoring-roots-current");
-    let current = session.monitoring_roots()?;
-    let current_rows = current
-        .get("roots")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("monitoring_roots missing roots array: {current}"))?;
-    if current_rows.len() != 3 {
-        return Err(format!("expected 3 roots from release doc, got {current}"));
-    }
-
-    let empty_preview = client.preview_roots_raw(session.token(), &json!([]))?;
-    assert_status(empty_preview.status, 200, "empty roots preview")?;
-    if empty_preview
-        .body
-        .get("preview")
-        .and_then(Value::as_array)
-        .map(|items| !items.is_empty())
-        .unwrap_or(true)
-    {
-        return Err(format!(
-            "empty roots preview should return no preview rows: {}",
-            empty_preview.body
-        ));
-    }
-
-    let roots = baseline_roots(lab);
-    let preview = client.preview_roots_raw(session.token(), &roots_payload(&roots))?;
-    assert_status(preview.status, 200, "baseline roots preview")?;
-    if preview
-        .body
-        .get("preview")
-        .and_then(Value::as_array)
-        .map(|items| items.len())
-        != Some(3)
-    {
-        return Err(format!("expected 3 preview rows: {}", preview.body));
-    }
-    if preview
-        .body
-        .get("unmatched_roots")
-        .and_then(Value::as_array)
-        .map(|items| !items.is_empty())
-        .unwrap_or(true)
-    {
-        return Err(format!(
-            "baseline preview unexpectedly has unmatched roots: {}",
-            preview.body
-        ));
-    }
-
-    assert_error(
-        client.preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "",
-                "selector": { "fs_source": lab.export_source("nfs1") },
-                "subpath_scope": "/",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
-        400,
-        "roots[].id must not be empty",
-    )?;
-    assert_error(
-        client.preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "bad-subpath",
-                "selector": { "fs_source": lab.export_source("nfs1") },
-                "subpath_scope": "relative",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
-        400,
-        "subpath_scope",
-    )?;
-    assert_error(
-        client.preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "missing-selector",
-                "selector": {},
-                "subpath_scope": "/",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
-        400,
-        "selector",
-    )?;
-    assert_error(
-        client.preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "no-watch-scan",
-                "selector": { "fs_source": lab.export_source("nfs1") },
-                "subpath_scope": "/",
-                "watch": false,
-                "scan": false
-            }]),
-        )?,
-        400,
-        "watch",
-    )?;
-    assert_error(
-        client.preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "legacy-path",
-                "path": "/legacy",
-                "selector": { "fs_source": lab.export_source("nfs1") },
-                "subpath_scope": "/",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
-        400,
-        "roots[].path is forbidden",
-    )?;
-    assert_error(
-        client.preview_roots_raw(
-            session.token(),
-            &json!([{
-                "id": "legacy-source-locator",
-                "source_locator": "legacy://nfs1",
-                "selector": { "fs_source": lab.export_source("nfs1") },
-                "subpath_scope": "/",
-                "watch": true,
-                "scan": true
-            }]),
-        )?,
-        400,
-        "roots[].source_locator is forbidden",
-    )?;
-    assert_error(
-        client.update_roots_raw(
-            session.token(),
-            &json!([
-                {
-                    "id": "dup",
-                    "selector": { "fs_source": lab.export_source("nfs1") },
-                    "subpath_scope": "/",
-                    "watch": true,
-                    "scan": true
-                },
-                {
-                    "id": "dup",
-                    "selector": { "fs_source": lab.export_source("nfs2") },
-                    "subpath_scope": "/",
-                    "watch": true,
-                    "scan": true
-                }
-            ]),
-        )?,
-        400,
-        "duplicate",
-    )?;
-
-    eprintln!("[fs-meta-api-matrix] substep=single-root-apply");
-    let single_root = vec![root_spec("nfs1", &lab.export_source("nfs1"))];
-    let put = client.update_roots_raw(session.token(), &roots_payload(&single_root))?;
-    assert_status(put.status, 200, "single-root apply")?;
-    if put.body.get("roots_count").and_then(Value::as_u64) != Some(1) {
-        return Err(format!("single-root apply did not converge: {}", put.body));
-    }
-    session.rescan()?;
-    wait_until(Duration::from_secs(30), "single root visible", || {
-        let roots = session.monitoring_roots()?;
-        Ok(roots
-            .get("roots")
-            .and_then(Value::as_array)
-            .map(|items| {
-                items.len() == 1 && items[0].get("id").and_then(Value::as_str) == Some("nfs1")
-            })
-            .unwrap_or(false))
-    })?;
-
-    eprintln!("[fs-meta-api-matrix] substep=restore-roots");
-    let restore = client.update_roots_raw(session.token(), &roots_payload(&roots))?;
-    assert_status(restore.status, 200, "restore roots")?;
-    session.rescan()?;
-    wait_until(Duration::from_secs(30), "restore baseline roots", || {
-        let roots = session.monitoring_roots()?;
-        Ok(roots
-            .get("roots")
-            .and_then(Value::as_array)
-            .map(|items| items.len() == 3)
-            .unwrap_or(false))
-    })?;
-    Ok(())
+    Ok(MatrixHarness {
+        cluster,
+        lab,
+        client,
+        candidate_base_urls,
+    })
 }
 
 fn run_query_matrix(
+    cluster: &Cluster5,
+    session: &mut OperatorSession,
+    lab: &NfsLab,
+) -> Result<(), String> {
+    run_query_baseline_phase(cluster, session, lab)?;
+    run_query_live_only_rescan_phase(cluster, session, lab)?;
+    Ok(())
+}
+
+fn run_query_baseline_phase(
     cluster: &Cluster5,
     session: &mut OperatorSession,
     lab: &NfsLab,
@@ -408,7 +226,6 @@ fn run_query_matrix(
     )?;
 
     let grants = session.runtime_grants()?;
-    let nfs1_group = "nfs1".to_string();
     let all_mounts = group_mount_pairs_for_roots(
         &grants,
         &[
@@ -840,6 +657,24 @@ fn run_query_matrix(
         400,
         "entry_after cursor does not match the requested force-find scope",
     )?;
+    Ok(())
+}
+
+fn run_query_live_only_rescan_phase(
+    _cluster: &Cluster5,
+    session: &mut OperatorSession,
+    lab: &NfsLab,
+) -> Result<(), String> {
+    let grants = session.runtime_grants()?;
+    let nfs1_group = "nfs1".to_string();
+    let all_mounts = group_mount_pairs_for_roots(
+        &grants,
+        &[
+            ("nfs1", &lab.export_source("nfs1")),
+            ("nfs2", &lab.export_source("nfs2")),
+            ("nfs3", &lab.export_source("nfs3")),
+        ],
+    )?;
 
     let live_probe_roots = json!([
         root_payload_flags("nfs1", &lab.export_source("nfs1"), "/", false, true),
@@ -964,6 +799,286 @@ fn run_query_matrix(
         },
     )?;
 
+    Ok(())
+}
+
+fn run_login_matrix(client: &FsMetaApiClient) -> Result<(), String> {
+    assert_error(
+        client.login_raw("", "")?,
+        400,
+        "username/password must not be empty",
+    )?;
+    assert_error(client.login_raw("operator", "wrong-pass")?, 401, "invalid")?;
+    let login = client.login_raw("operator", "operator123")?;
+    assert_status(login.status, 200, "valid login")?;
+    if login.body.get("token").and_then(Value::as_str).is_none() {
+        return Err(format!("login response missing token: {}", login.body));
+    }
+    Ok(())
+}
+
+fn run_status_and_grants_checks(
+    client: &FsMetaApiClient,
+    session: &mut OperatorSession,
+    lab: &NfsLab,
+) -> Result<(), String> {
+    assert_error(
+        client.get_json_raw("/status", "bad-token")?,
+        401,
+        "invalid session token",
+    )?;
+
+    eprintln!("[fs-meta-api-matrix] substep=status");
+    let status = session.status()?;
+    let source = status
+        .get("source")
+        .ok_or_else(|| format!("status missing source: {status}"))?;
+    let sink = status
+        .get("sink")
+        .ok_or_else(|| format!("status missing sink: {status}"))?;
+    if source
+        .get("grants_count")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        < 3
+    {
+        return Err(format!("expected at least 3 grants in status: {status}"));
+    }
+    if sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
+        return Err(format!("expected live sink nodes in status: {status}"));
+    }
+
+    eprintln!("[fs-meta-api-matrix] substep=runtime-grants");
+    let grants = session.runtime_grants()?;
+    let rows = grants
+        .get("grants")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("runtime grants missing array: {grants}"))?;
+    let nfs_rows = rows
+        .iter()
+        .filter(|row| row.get("fs_type").and_then(Value::as_str) == Some("nfs"))
+        .count();
+    let listener_rows = rows
+        .iter()
+        .filter(|row| row.get("fs_type").and_then(Value::as_str) == Some("tcp_listener"))
+        .count();
+    if nfs_rows != 9 || listener_rows != 2 || rows.len() != 11 {
+        return Err(format!(
+            "expected 11 runtime grants rows (9 nfs + 2 tcp_listener), got {} total / {} nfs / {} listeners: {grants}",
+            rows.len(),
+            nfs_rows,
+            listener_rows
+        ));
+    }
+    for export_name in ["nfs1", "nfs2", "nfs3"] {
+        if !rows.iter().any(|row| {
+            row.get("fs_source").and_then(Value::as_str)
+                == Some(lab.export_source(export_name).as_str())
+        }) {
+            return Err(format!(
+                "runtime grants missing export {export_name}: {grants}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn run_roots_matrix(
+    client: &FsMetaApiClient,
+    session: &mut OperatorSession,
+    lab: &NfsLab,
+) -> Result<(), String> {
+    eprintln!("[fs-meta-api-matrix] substep=monitoring-roots-current");
+    let current = session.monitoring_roots()?;
+    let current_rows = current
+        .get("roots")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("monitoring_roots missing roots array: {current}"))?;
+    if current_rows.len() != 3 {
+        return Err(format!("expected 3 roots from release doc, got {current}"));
+    }
+
+    let empty_preview = client.preview_roots_raw(session.token(), &json!([]))?;
+    assert_status(empty_preview.status, 200, "empty roots preview")?;
+    if empty_preview
+        .body
+        .get("preview")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(true)
+    {
+        return Err(format!(
+            "empty roots preview should return no preview rows: {}",
+            empty_preview.body
+        ));
+    }
+
+    let roots = baseline_roots(lab);
+    let preview = client.preview_roots_raw(session.token(), &roots_payload(&roots))?;
+    assert_status(preview.status, 200, "baseline roots preview")?;
+    if preview
+        .body
+        .get("preview")
+        .and_then(Value::as_array)
+        .map(|items| items.len())
+        != Some(3)
+    {
+        return Err(format!("expected 3 preview rows: {}", preview.body));
+    }
+    if preview
+        .body
+        .get("unmatched_roots")
+        .and_then(Value::as_array)
+        .map(|items| !items.is_empty())
+        .unwrap_or(true)
+    {
+        return Err(format!(
+            "baseline preview unexpectedly has unmatched roots: {}",
+            preview.body
+        ));
+    }
+
+    assert_error(
+        client.preview_roots_raw(
+            session.token(),
+            &json!([{
+                "id": "",
+                "selector": { "fs_source": lab.export_source("nfs1") },
+                "subpath_scope": "/",
+                "watch": true,
+                "scan": true
+            }]),
+        )?,
+        400,
+        "roots[].id must not be empty",
+    )?;
+    assert_error(
+        client.preview_roots_raw(
+            session.token(),
+            &json!([{
+                "id": "bad-subpath",
+                "selector": { "fs_source": lab.export_source("nfs1") },
+                "subpath_scope": "relative",
+                "watch": true,
+                "scan": true
+            }]),
+        )?,
+        400,
+        "subpath_scope",
+    )?;
+    assert_error(
+        client.preview_roots_raw(
+            session.token(),
+            &json!([{
+                "id": "missing-selector",
+                "selector": {},
+                "subpath_scope": "/",
+                "watch": true,
+                "scan": true
+            }]),
+        )?,
+        400,
+        "selector",
+    )?;
+    assert_error(
+        client.preview_roots_raw(
+            session.token(),
+            &json!([{
+                "id": "no-watch-scan",
+                "selector": { "fs_source": lab.export_source("nfs1") },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": false
+            }]),
+        )?,
+        400,
+        "watch",
+    )?;
+    assert_error(
+        client.preview_roots_raw(
+            session.token(),
+            &json!([{
+                "id": "legacy-path",
+                "path": "/legacy",
+                "selector": { "fs_source": lab.export_source("nfs1") },
+                "subpath_scope": "/",
+                "watch": true,
+                "scan": true
+            }]),
+        )?,
+        400,
+        "roots[].path is forbidden",
+    )?;
+    assert_error(
+        client.preview_roots_raw(
+            session.token(),
+            &json!([{
+                "id": "legacy-source-locator",
+                "source_locator": "legacy://nfs1",
+                "selector": { "fs_source": lab.export_source("nfs1") },
+                "subpath_scope": "/",
+                "watch": true,
+                "scan": true
+            }]),
+        )?,
+        400,
+        "roots[].source_locator is forbidden",
+    )?;
+    assert_error(
+        client.update_roots_raw(
+            session.token(),
+            &json!([
+                {
+                    "id": "dup",
+                    "selector": { "fs_source": lab.export_source("nfs1") },
+                    "subpath_scope": "/",
+                    "watch": true,
+                    "scan": true
+                },
+                {
+                    "id": "dup",
+                    "selector": { "fs_source": lab.export_source("nfs2") },
+                    "subpath_scope": "/",
+                    "watch": true,
+                    "scan": true
+                }
+            ]),
+        )?,
+        400,
+        "duplicate",
+    )?;
+
+    eprintln!("[fs-meta-api-matrix] substep=single-root-apply");
+    let single_root = vec![root_spec("nfs1", &lab.export_source("nfs1"))];
+    let put = client.update_roots_raw(session.token(), &roots_payload(&single_root))?;
+    assert_status(put.status, 200, "single-root apply")?;
+    if put.body.get("roots_count").and_then(Value::as_u64) != Some(1) {
+        return Err(format!("single-root apply did not converge: {}", put.body));
+    }
+    session.rescan()?;
+    wait_until(Duration::from_secs(30), "single root visible", || {
+        let roots = session.monitoring_roots()?;
+        Ok(roots
+            .get("roots")
+            .and_then(Value::as_array)
+            .map(|items| {
+                items.len() == 1 && items[0].get("id").and_then(Value::as_str) == Some("nfs1")
+            })
+            .unwrap_or(false))
+    })?;
+
+    eprintln!("[fs-meta-api-matrix] substep=restore-roots");
+    let restore = client.update_roots_raw(session.token(), &roots_payload(&roots))?;
+    assert_status(restore.status, 200, "restore roots")?;
+    session.rescan()?;
+    wait_until(Duration::from_secs(30), "restore baseline roots", || {
+        let roots = session.monitoring_roots()?;
+        Ok(roots
+            .get("roots")
+            .and_then(Value::as_array)
+            .map(|items| items.len() == 3)
+            .unwrap_or(false))
+    })?;
     Ok(())
 }
 
