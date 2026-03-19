@@ -29,9 +29,10 @@ where
 }
 
 struct SinkWorkerState {
-    sink: Option<SinkFileMeta>,
+    sink: Option<Arc<SinkFileMeta>>,
     node_id: Option<NodeId>,
     endpoints_started: bool,
+    send_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Event>>>,
 }
 
 fn classify_sink_worker_error(err: CnxError) -> SinkWorkerResponse {
@@ -73,9 +74,10 @@ fn process_worker_request(
                 source_cfg,
             ) {
                 Ok(inner) => {
-                    state.sink = Some(inner);
+                    state.sink = Some(Arc::new(inner));
                     state.node_id = Some(NodeId(node_id));
                     state.endpoints_started = false;
+                    state.send_tx = None;
                     eprintln!("fs_meta_sink_worker: Init completed");
                     (SinkWorkerResponse::Ack, false)
                 }
@@ -104,6 +106,21 @@ fn process_worker_request(
                 );
                 match sink.start_runtime_endpoints(io_boundary, node_id) {
                     Ok(()) => {
+                        if state.send_tx.is_none() {
+                            let (send_tx, mut send_rx) =
+                                tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
+                            let sink_for_send = sink.clone();
+                            runtime.spawn(async move {
+                                while let Some(events) = send_rx.recv().await {
+                                    if let Err(err) = sink_for_send.send(&events).await {
+                                        eprintln!(
+                                            "fs_meta_sink_worker: async Send apply failed: {err}"
+                                        );
+                                    }
+                                }
+                            });
+                            state.send_tx = Some(send_tx);
+                        }
                         state.endpoints_started = true;
                         eprintln!("fs_meta_sink_worker: runtime endpoints started before Ack");
                         (SinkWorkerResponse::Ack, false)
@@ -214,9 +231,21 @@ fn process_worker_request(
             ),
         },
         SinkWorkerRequest::Send { events } => match state.sink.as_ref() {
-            Some(sink) => match block_on_runtime(runtime, sink.send(&events)) {
-                Ok(_) => (SinkWorkerResponse::Ack, false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+            Some(sink) => match state.send_tx.as_ref() {
+                Some(send_tx) => match send_tx.send(events) {
+                    Ok(()) => (SinkWorkerResponse::Ack, false),
+                    Err(err) => (
+                        SinkWorkerResponse::Error(format!(
+                            "sink worker send queue unavailable: {} event(s) dropped",
+                            err.0.len()
+                        )),
+                        false,
+                    ),
+                },
+                None => match block_on_runtime(runtime, sink.send(&events)) {
+                    Ok(_) => (SinkWorkerResponse::Ack, false),
+                    Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                },
             },
             None => (
                 SinkWorkerResponse::Error("sink worker not initialized".into()),
@@ -246,6 +275,7 @@ fn process_worker_request(
             ),
         },
         SinkWorkerRequest::Close => {
+            state.send_tx.take();
             if let Some(sink) = state.sink.as_ref() {
                 let _ = block_on_runtime(runtime, sink.close());
             }
@@ -271,6 +301,7 @@ pub fn run_sink_worker_server(
         sink: None,
         node_id: None,
         endpoints_started: false,
+        send_tx: None,
     }));
     let runtime_handle = runtime.handle().clone();
     let boundary_holder: Arc<Mutex<Option<(Arc<dyn StateBoundary>, Arc<dyn ChannelIoSubset>)>>> =

@@ -156,10 +156,7 @@ impl NfsLab {
         relative: &str,
         content: &str,
     ) -> Result<PathBuf, String> {
-        let path = self
-            .exports_dir
-            .join(export_name)
-            .join(normalize_relative(relative)?);
+        let path = self.mutable_export_path(export_name, relative)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("create parent for {} failed: {e}", path.display()))?;
@@ -181,10 +178,7 @@ impl NfsLab {
         relative: &str,
         content: &str,
     ) -> Result<PathBuf, String> {
-        let path = self
-            .exports_dir
-            .join(export_name)
-            .join(normalize_relative(relative)?);
+        let path = self.mutable_export_path(export_name, relative)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("create parent for {} failed: {e}", path.display()))?;
@@ -194,19 +188,13 @@ impl NfsLab {
     }
 
     pub fn mkdir(&self, export_name: &str, relative: &str) -> Result<PathBuf, String> {
-        let path = self
-            .exports_dir
-            .join(export_name)
-            .join(normalize_relative(relative)?);
+        let path = self.mutable_export_path(export_name, relative)?;
         fs::create_dir_all(&path).map_err(|e| format!("mkdir {} failed: {e}", path.display()))?;
         Ok(path)
     }
 
     pub fn remove_path(&self, export_name: &str, relative: &str) -> Result<(), String> {
-        let path = self
-            .exports_dir
-            .join(export_name)
-            .join(normalize_relative(relative)?);
+        let path = self.mutable_export_path(export_name, relative)?;
         if !path.exists() {
             return Ok(());
         }
@@ -226,6 +214,21 @@ impl NfsLab {
         format!("127.0.0.1:{}", self.exports_dir.join(export_name).display())
     }
 
+    fn mutable_export_root(&self, export_name: &str) -> PathBuf {
+        self.mounted
+            .iter()
+            .find_map(|((_, export), mount_path)| {
+                (export == export_name).then(|| mount_path.clone())
+            })
+            .unwrap_or_else(|| self.exports_dir.join(export_name))
+    }
+
+    fn mutable_export_path(&self, export_name: &str, relative: &str) -> Result<PathBuf, String> {
+        Ok(self
+            .mutable_export_root(export_name)
+            .join(normalize_relative(relative)?))
+    }
+
     pub fn mount_export(&mut self, node_name: &str, export_name: &str) -> Result<PathBuf, String> {
         let export_dir = self.exports_dir.join(export_name);
         if !export_dir.exists() {
@@ -240,7 +243,7 @@ impl NfsLab {
             "-t",
             "nfs",
             "-o",
-            "vers=4,tcp,timeo=50,retrans=1",
+            "vers=4,tcp,timeo=50,retrans=1,noac,actimeo=0,lookupcache=none,nordirplus",
             source.as_str(),
             mount_dir.to_string_lossy().as_ref(),
         ])?;

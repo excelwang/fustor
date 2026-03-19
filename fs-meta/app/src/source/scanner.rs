@@ -271,6 +271,14 @@ impl ParallelScanner {
         Ok(events)
     }
 
+    pub fn reset_audit_caches_for_manual_rescan(&self) {
+        lock_or_recover(
+            &self.dir_state_cache,
+            "scanner.reset_audit_caches_for_manual_rescan.dir_state_cache",
+        )
+        .clear();
+    }
+
     /// Parallel directory walk with work-stealing queue.
     fn parallel_walk(
         &self,

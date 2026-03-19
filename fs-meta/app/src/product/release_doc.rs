@@ -101,7 +101,17 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
 fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
     let mut plans = Vec::new();
     plans.push(serde_json::to_value(RoutePlanSpec {
+        route_key: RouteKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
+        mode: RoutePlanMode::FanOut,
+        peers: Vec::new(),
+    }).unwrap_or_else(|_| serde_json::json!({})));
+    plans.push(serde_json::to_value(RoutePlanSpec {
         route_key: RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)),
+        mode: RoutePlanMode::FanOut,
+        peers: Vec::new(),
+    }).unwrap_or_else(|_| serde_json::json!({})));
+    plans.push(serde_json::to_value(RoutePlanSpec {
+        route_key: RouteKey(format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)),
         mode: RoutePlanMode::FanOut,
         peers: Vec::new(),
     }).unwrap_or_else(|_| serde_json::json!({})));
@@ -153,7 +163,7 @@ fn build_route_units_json() -> serde_json::Value {
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL),
-        serde_json::json!([QUERY_RUNTIME_UNIT_ID]),
+        serde_json::json!([QUERY_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_FORCE_FIND),
@@ -161,7 +171,7 @@ fn build_route_units_json() -> serde_json::Value {
     );
     route_units.insert(
         stream_activation_route_key(ROUTE_KEY_EVENTS),
-        serde_json::json!([SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID]),
+        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
     );
     serde_json::Value::Object(route_units)
 }

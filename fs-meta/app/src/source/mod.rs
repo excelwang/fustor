@@ -372,8 +372,12 @@ struct RootRuntime {
     mtime_cache: Arc<Mutex<HashMap<std::path::PathBuf, f64>>>,
     epoch_counter: Arc<Mutex<u64>>,
     rescan_tx: tokio::sync::broadcast::Sender<RescanReason>,
-    manual_rescan_pending: Arc<AtomicBool>,
-    manual_rescan_notify: Arc<tokio::sync::Notify>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct ManualRescanIntent {
+    requested: u64,
+    completed: u64,
 }
 
 struct RootTaskHandle {
@@ -510,6 +514,7 @@ struct SourceStateCell {
     roots: Arc<Mutex<Vec<RootRuntime>>>,
     root_tasks: Arc<Mutex<HashMap<String, RootTaskEntry>>>,
     stream_tx: Arc<Mutex<Option<mpsc::Sender<Vec<Event>>>>>,
+    manual_rescan_intents: Arc<Mutex<HashMap<String, ManualRescanIntent>>>,
     logical_root_fanout: Arc<Mutex<HashMap<String, Vec<GrantedMountRoot>>>>,
     fanout_health: Arc<Mutex<FanoutHealthState>>,
     host_object_grants: Arc<Mutex<Vec<GrantedMountRoot>>>,
@@ -531,6 +536,7 @@ impl SourceStateCell {
             roots: Arc::new(Mutex::new(roots)),
             root_tasks: Arc::new(Mutex::new(HashMap::new())),
             stream_tx: Arc::new(Mutex::new(None)),
+            manual_rescan_intents: Arc::new(Mutex::new(HashMap::new())),
             logical_root_fanout: Arc::new(Mutex::new(logical_root_fanout)),
             fanout_health,
             host_object_grants: Arc::new(Mutex::new(host_object_grants)),
@@ -556,6 +562,10 @@ impl SourceStateCell {
 
     fn fanout_health_handle(&self) -> Arc<Mutex<FanoutHealthState>> {
         self.fanout_health.clone()
+    }
+
+    fn manual_rescan_intents_handle(&self) -> Arc<Mutex<HashMap<String, ManualRescanIntent>>> {
+        self.manual_rescan_intents.clone()
     }
 
     fn record_authoritative_commit(&self, op: &str, detail: String) {
@@ -704,6 +714,7 @@ impl FSMetaSource {
                     FSMetaSource::request_rescan_on_primary_roots(
                         &roots_snapshot,
                         Some(&self.state_cell.fanout_health),
+                        Some(&self.state_cell.manual_rescan_intents),
                         "manual",
                     );
                 }
@@ -1007,8 +1018,6 @@ impl FSMetaSource {
                     mtime_cache: Arc::new(Mutex::new(HashMap::new())),
                     epoch_counter: Arc::new(Mutex::new(0)),
                     rescan_tx,
-                    manual_rescan_pending: Arc::new(AtomicBool::new(false)),
-                    manual_rescan_notify: Arc::new(tokio::sync::Notify::new()),
                 });
             }
         }
@@ -1478,22 +1487,31 @@ impl FSMetaSource {
     fn request_rescan_on_primary_roots(
         roots: &[RootRuntime],
         fanout_health: Option<&Arc<Mutex<FanoutHealthState>>>,
+        manual_rescan_intents: Option<&Arc<Mutex<HashMap<String, ManualRescanIntent>>>>,
         reason: &str,
     ) {
         for root in roots {
             if !root.is_group_primary {
                 continue;
             }
+            let root_key = Self::root_runtime_key(root);
             eprintln!(
                 "fs_meta_source: queue {} rescan for primary root_key={}",
                 reason,
-                Self::root_runtime_key(root)
+                root_key
             );
             if let Some(health) = fanout_health {
-                Self::mark_root_rescan_requested(health, &Self::root_runtime_key(root), reason);
+                Self::mark_root_rescan_requested(health, &root_key, reason);
             }
-            root.manual_rescan_pending.store(true, Ordering::Release);
-            root.manual_rescan_notify.notify_one();
+            if reason == "manual"
+                && let Some(intents) = manual_rescan_intents
+            {
+                let mut intents =
+                    lock_or_recover(intents, "source.manual_rescan_intents.queue");
+                let entry = intents.entry(root_key).or_default();
+                entry.requested = entry.requested.saturating_add(1);
+                let _ = root.rescan_tx.send(RescanReason::Manual);
+            }
         }
     }
 
@@ -1612,6 +1630,7 @@ impl FSMetaSource {
             let roots_cloned = source.state_cell.roots_handle();
             let rescan_roots = source.state_cell.roots_handle();
             let rescan_fanout_health = source.state_cell.fanout_health_handle();
+            let rescan_manual_intents = source.state_cell.manual_rescan_intents_handle();
             let drift_cloned = drift_estimator.clone();
             let clock_cloned = logical_clock.clone();
             let node_id_cloned = node_id.clone();
@@ -1619,6 +1638,7 @@ impl FSMetaSource {
             let node_id_rescan_scoped = node_id.clone();
             let rescan_roots_scoped = rescan_roots.clone();
             let rescan_fanout_health_scoped = rescan_fanout_health.clone();
+            let rescan_manual_intents_scoped = rescan_manual_intents.clone();
             let routes = default_route_bindings();
             match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
                 Ok(route) => {
@@ -1850,6 +1870,7 @@ impl FSMetaSource {
                             FSMetaSource::request_rescan_on_primary_roots(
                                 &roots_snapshot,
                                 Some(&rescan_fanout_health),
+                                Some(&rescan_manual_intents),
                                 "manual",
                             );
                             eprintln!(
@@ -1950,6 +1971,7 @@ impl FSMetaSource {
                         FSMetaSource::request_rescan_on_primary_roots(
                             &roots_snapshot,
                             Some(&rescan_fanout_health_scoped),
+                            Some(&rescan_manual_intents_scoped),
                             "manual",
                         );
                         eprintln!(
@@ -1998,6 +2020,7 @@ impl FSMetaSource {
         let roots_cloned = self.state_cell.roots_handle();
         let rescan_roots = self.state_cell.roots_handle();
         let rescan_fanout_health = self.state_cell.fanout_health_handle();
+        let rescan_manual_intents = self.state_cell.manual_rescan_intents_handle();
         let drift_cloned = self.drift_estimator.clone();
         let clock_cloned = self.logical_clock.clone();
         let node_id_cloned = self.node_id.clone();
@@ -2005,6 +2028,7 @@ impl FSMetaSource {
         let node_id_rescan_scoped = self.node_id.clone();
         let rescan_roots_scoped = rescan_roots.clone();
         let rescan_fanout_health_scoped = rescan_fanout_health.clone();
+        let rescan_manual_intents_scoped = rescan_manual_intents.clone();
         let routes = default_route_bindings();
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
@@ -2228,6 +2252,7 @@ impl FSMetaSource {
                         FSMetaSource::request_rescan_on_primary_roots(
                             &roots_snapshot,
                             Some(&rescan_fanout_health),
+                            Some(&rescan_manual_intents),
                             "manual",
                         );
                         eprintln!(
@@ -2277,6 +2302,7 @@ impl FSMetaSource {
                 );
                 let control_roots = self.state_cell.roots_handle();
                 let control_fanout_health = self.state_cell.fanout_health_handle();
+                let control_manual_rescan_intents = self.state_cell.manual_rescan_intents_handle();
                 let control_node_id = self.node_id.clone();
                 let endpoint_task = ManagedEndpointTask::spawn_stream(
                     boundary.clone(),
@@ -2329,6 +2355,7 @@ impl FSMetaSource {
                         FSMetaSource::request_rescan_on_primary_roots(
                             &roots_snapshot,
                             Some(&control_fanout_health),
+                            Some(&control_manual_rescan_intents),
                             "manual",
                         );
                     },
@@ -2407,6 +2434,7 @@ impl FSMetaSource {
                     FSMetaSource::request_rescan_on_primary_roots(
                         &roots_snapshot,
                         Some(&rescan_fanout_health_scoped),
+                        Some(&rescan_manual_intents_scoped),
                         "manual",
                     );
                     eprintln!(
@@ -2455,6 +2483,7 @@ impl FSMetaSource {
         Self::request_rescan_on_primary_roots(
             &roots,
             Some(&self.state_cell.fanout_health),
+            Some(&self.state_cell.manual_rescan_intents),
             "manual",
         );
     }
@@ -2854,6 +2883,7 @@ impl FSMetaSource {
         let logical_clock = self.logical_clock.clone();
         let fanout_health = self.state_cell.fanout_health_handle();
         let roots_handle = self.state_cell.roots_handle();
+        let manual_rescan_intents = self.state_cell.manual_rescan_intents_handle();
         let sentinel = self.sentinel.clone();
         let apply_startup_delay = self.boundary.is_some();
         let join = tokio::spawn(async move {
@@ -2881,6 +2911,7 @@ impl FSMetaSource {
                     sentinel.clone(),
                     fanout_health.clone(),
                     roots_handle.clone(),
+                    manual_rescan_intents.clone(),
                     root_key.clone(),
                 )
                 .await;
@@ -3342,6 +3373,7 @@ impl FSMetaSource {
         sentinel: Arc<Sentinel>,
         fanout_health: Arc<Mutex<FanoutHealthState>>,
         roots_handle: Arc<Mutex<Vec<RootRuntime>>>,
+        manual_rescan_intents: Arc<Mutex<HashMap<String, ManualRescanIntent>>>,
         root_key: String,
     ) -> Result<Pin<Box<dyn Stream<Item = Vec<Event>> + Send>>> {
         let root_path = root.monitor_path.clone();
@@ -3459,6 +3491,7 @@ impl FSMetaSource {
         };
 
         let (scan_tx, mut scan_rx) = mpsc::channel::<Vec<Event>>(256);
+        let rescan_scan_tx = scan_tx.clone();
         if root.spec.scan && Self::root_current_is_group_primary(&roots_handle, &root_key) {
             let scanner = Arc::clone(&root.scanner);
             let drift_est = Arc::clone(&drift_estimator);
@@ -3573,8 +3606,6 @@ impl FSMetaSource {
         let rescan_mtime_cache = Arc::clone(&root.mtime_cache);
         let rescan_epoch = Arc::clone(&root.epoch_counter);
         let rescan_watch = watch_manager;
-        let manual_rescan_pending = Arc::clone(&root.manual_rescan_pending);
-        let manual_rescan_notify = Arc::clone(&root.manual_rescan_notify);
         let audit_interval = root
             .spec
             .audit_interval_ms
@@ -3582,22 +3613,32 @@ impl FSMetaSource {
             .unwrap_or(config.audit_interval);
 
         let output_stream = stream! {
-            while let Some(batch) = scan_rx.recv().await {
-                eprintln!(
-                    "fs_meta_source: root_stream yielding initial batch len={} root_key={}",
-                    batch.len(),
-                    root_key
-                );
-                yield batch;
-            }
             let mut audit_tick = tokio::time::interval(audit_interval);
             let mut periodic_channel_open = root.spec.scan && !audit_interval.is_zero();
+            let mut watch_channel_open = watch_handle.is_some();
             if periodic_channel_open {
                 audit_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                 // Discard immediate first tick so periodic scan starts after one full interval.
                 audit_tick.tick().await;
             }
             let mut rescan_channel_open = root.spec.scan;
+            let dispatch_pending_manual = || {
+                let should_dispatch = {
+                    let intents = lock_or_recover(
+                        &manual_rescan_intents,
+                        "source.root.manual_rescan_intents.dispatch_check",
+                    );
+                    intents
+                        .get(&root_key)
+                        .is_some_and(|intent| intent.requested > intent.completed)
+                };
+                if should_dispatch {
+                    let _ = root.rescan_tx.send(RescanReason::Manual);
+                }
+            };
+            if rescan_channel_open {
+                dispatch_pending_manual();
+            }
             loop {
                 let current_is_group_primary =
                     Self::root_current_is_group_primary(&roots_handle, &root_key);
@@ -3606,10 +3647,25 @@ impl FSMetaSource {
                 tokio::select! {
                     _ = global_shutdown.cancelled() => break,
                     _ = task_shutdown.cancelled() => break,
-                    batch = watch_rx.recv() => match batch {
+                    batch = scan_rx.recv() => match batch {
+                        Some(batch) => {
+                            eprintln!(
+                                "fs_meta_source: root_stream yielding scan batch len={} root_key={}",
+                                batch.len(),
+                                root_key
+                            );
+                            yield batch;
+                        }
+                        None => {
+                            rescan_channel_open = false;
+                        }
+                    },
+                    batch = watch_rx.recv(), if watch_channel_open => match batch {
                         Some(events) if !events.is_empty() => yield events,
                         Some(_) => {},
-                        None => break,
+                        None => {
+                            watch_channel_open = false;
+                        },
                     },
                     _ = audit_tick.tick(), if periodic_open => {
                         Self::mark_root_rescan_requested(
@@ -3618,70 +3674,6 @@ impl FSMetaSource {
                             "periodic",
                         );
                         let _ = root.rescan_tx.send(RescanReason::Periodic);
-                    }
-                    _ = manual_rescan_notify.notified(), if rescan_channel_open => {
-                        if !manual_rescan_pending.swap(false, Ordering::AcqRel) {
-                            continue;
-                        }
-                        let reason = RescanReason::Manual;
-                        let reason_label = "manual";
-                        let audit_started_at_us = now_us();
-                        eprintln!(
-                            "fs_meta_source: starting {} rescan root_key={}",
-                            reason_label,
-                            root_key
-                        );
-                        Self::mark_root_audit_start(
-                            &fanout_health,
-                            &root_key,
-                            reason_label,
-                            audit_started_at_us,
-                        );
-                        let scanner = Arc::clone(&rescan_scanner);
-                        let de = Arc::clone(&rescan_drift);
-                        let clk = Arc::clone(&rescan_clock);
-                        let cache = Arc::clone(&rescan_mtime_cache);
-                        let epoch = Arc::clone(&rescan_epoch);
-                        let wm = rescan_watch.clone();
-                        let rescan_batches = tokio::task::spawn_blocking(move || {
-                            let mut c = lock_or_recover(&cache, "source.root.rescan.mtime_cache");
-                            let mut ep = lock_or_recover(&epoch, "source.root.rescan.epoch_counter");
-                            let current_epoch = *ep;
-                            *ep += 1;
-                            scanner.scan_audit(current_epoch, &mut c, &de, &clk, wm)
-                        }).await;
-                        Self::mark_root_audit_completed(
-                            &fanout_health,
-                            &root_key,
-                            audit_started_at_us,
-                            now_us(),
-                        );
-                        match rescan_batches {
-                            Ok(batches) => {
-                                eprintln!(
-                                    "fs_meta_source: {} rescan produced batches={} root_key={}",
-                                    reason_label,
-                                    batches.len(),
-                                    root_key
-                                );
-                                for (idx, batch) in batches.into_iter().enumerate() {
-                                    eprintln!(
-                                        "fs_meta_source: rescan enqueue/yield batch_index={} len={} root_key={}",
-                                        idx,
-                                        batch.len(),
-                                        root_key
-                                    );
-                                    yield batch;
-                                }
-                            }
-                            Err(err) => {
-                                Self::set_object_last_error(
-                                    &fanout_health,
-                                    &root_key,
-                                    format!("rescan join failed: {err}"),
-                                );
-                            }
-                        }
                     }
                     rescan = rescan_rx.recv(), if rescan_open => match rescan {
                         Ok(reason) => {
@@ -3707,6 +3699,16 @@ impl FSMetaSource {
                                 RescanReason::Periodic => "periodic",
                                 RescanReason::Overflow => "overflow",
                             };
+                            let manual_requested_target = if matches!(reason, RescanReason::Manual) {
+                                lock_or_recover(
+                                    &manual_rescan_intents,
+                                    "source.root.manual_rescan_intents.requested_target",
+                                )
+                                .get(&root_key)
+                                .map(|intent| intent.requested)
+                            } else {
+                                None
+                            };
                             let audit_started_at_us = now_us();
                             eprintln!(
                                 "fs_meta_source: starting {} rescan root_key={}",
@@ -3725,8 +3727,13 @@ impl FSMetaSource {
                             let cache = Arc::clone(&rescan_mtime_cache);
                             let epoch = Arc::clone(&rescan_epoch);
                             let wm = rescan_watch.clone();
+                            let manual_full_audit = matches!(reason, RescanReason::Manual);
                             let rescan_batches = tokio::task::spawn_blocking(move || {
                                 let mut c = lock_or_recover(&cache, "source.root.rescan.mtime_cache");
+                                if manual_full_audit {
+                                    c.clear();
+                                    scanner.reset_audit_caches_for_manual_rescan();
+                                }
                                 let mut ep = lock_or_recover(&epoch, "source.root.rescan.epoch_counter");
                                 let current_epoch = *ep;
                                 *ep += 1;
@@ -3746,14 +3753,44 @@ impl FSMetaSource {
                                         batches.len(),
                                         root_key
                                     );
-                                    for (idx, batch) in batches.into_iter().enumerate() {
+                                for (idx, batch) in batches.into_iter().enumerate() {
+                                    if matches!(reason, RescanReason::Manual) {
+                                        let data_paths = batch
+                                            .iter()
+                                            .filter_map(|event| {
+                                                rmp_serde::from_slice::<capanix_host_fs_types::FileMetaRecord>(
+                                                    event.payload_bytes(),
+                                                )
+                                                .ok()
+                                                .map(|record| {
+                                                    String::from_utf8_lossy(&record.path).into_owned()
+                                                })
+                                            })
+                                            .collect::<Vec<_>>();
                                         eprintln!(
-                                            "fs_meta_source: rescan enqueue/yield batch_index={} len={} root_key={}",
+                                            "fs_meta_source: manual rescan batch_index={} data_paths={:?} root_key={}",
                                             idx,
-                                            batch.len(),
+                                            data_paths,
                                             root_key
                                         );
-                                        yield batch;
+                                    }
+                                    eprintln!(
+                                        "fs_meta_source: rescan enqueue/yield batch_index={} len={} root_key={}",
+                                        idx,
+                                        batch.len(),
+                                        root_key
+                                        );
+                                        if rescan_scan_tx.send(batch).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                    if let Some(target) = manual_requested_target {
+                                        let mut intents = lock_or_recover(
+                                            &manual_rescan_intents,
+                                            "source.root.manual_rescan_intents.mark_completed",
+                                        );
+                                        let entry = intents.entry(root_key.clone()).or_default();
+                                        entry.completed = entry.completed.max(target);
                                     }
                                 }
                                 Err(err) => {

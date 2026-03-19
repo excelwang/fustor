@@ -6,11 +6,13 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, header},
 };
-use capanix_app_sdk::runtime::AppControlDispatchRequest;
-use capanix_app_sdk::raw::BoundaryContext;
+use capanix_app_sdk::Event;
+use capanix_app_sdk::raw::{BoundaryContext, ChannelKey, ChannelSendRequest};
+use capanix_app_sdk::runtime::EventMetadata;
 
 use crate::query::api::refresh_policy_from_host_object_grants;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
+use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use crate::workers::source::SourceObservabilitySnapshot;
 
@@ -269,22 +271,35 @@ pub async fn rescan(
     headers: HeaderMap,
 ) -> Result<Json<RescanResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
-    if let Some(boundary) = state.runtime_control.as_ref() {
-        boundary
-            .dispatch_control_frames(
-                BoundaryContext::default(),
-                AppControlDispatchRequest {
-                    worker_ids: vec!["runtime.exec.source".to_string()],
-                    scope_ids: Vec::new(),
-                    envelopes: vec![encode_manual_rescan_envelope().map_err(|err| {
-                        ApiError::internal(format!("manual rescan envelope encode failed: {err}"))
-                    })?],
-                },
-            )
-            .map_err(|err| {
-                ApiError::internal(format!("manual rescan control dispatch failed: {err}"))
-            })?;
+    if let Some(boundary) = state.runtime_boundary.as_ref() {
+        eprintln!("fs_meta_api: rescan via runtime_boundary node={}", state.node_id.0);
+        let envelope = encode_manual_rescan_envelope().map_err(|err| {
+            ApiError::internal(format!("manual rescan envelope encode failed: {err}"))
+        })?;
+        let payload = rmp_serde::to_vec_named(&envelope).map_err(|err| {
+            ApiError::internal(format!("manual rescan envelope serialize failed: {err}"))
+        })?;
+        boundary.channel_send(
+            BoundaryContext::default(),
+            ChannelSendRequest {
+                channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
+                events: vec![Event::new(
+                    EventMetadata {
+                        origin_id: state.node_id.clone(),
+                        timestamp_us: 0,
+                        logical_ts: None,
+                        correlation_id: None,
+                        ingress_auth: None,
+                        trace: None,
+                    },
+                    bytes::Bytes::from(payload),
+                )],
+            },
+        ).map_err(|err| {
+            ApiError::internal(format!("manual rescan control send failed: {err}"))
+        })?;
     } else {
+        eprintln!("fs_meta_api: rescan via local source node={}", state.node_id.0);
         state.source.trigger_rescan_when_ready().await?;
     }
     Ok(Json(RescanResponse { accepted: true }))

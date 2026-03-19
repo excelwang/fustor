@@ -47,7 +47,7 @@ capanix-host-fs-types = "0.1.0"
 capanix-kernel = "0.1.0"
 capanix-kernel-api = "0.1.0"
 capanix-route-proto = "0.1.0"
-capanix-specs-vocabulary = "0.0.0"
+capanix-specs-vocabulary = { version = "0.0.0", path = "../capanix/crates/specs-vocabulary" }
 capanix-unit-entry-macros = "0.1.0"
 capanix-unit-sidecar = "0.1.0"
 async-stream = "0.3"

@@ -1870,6 +1870,15 @@ impl SinkFileMeta {
 
             let record: capanix_host_fs_types::FileMetaRecord = rmp_serde::from_slice(payload)
                 .map_err(|e| CnxError::InvalidInput(format!("invalid file-meta payload: {e}")))?;
+            if record.path.starts_with(b"/live-only") {
+                eprintln!(
+                    "fs_meta_sink: live-only record received group={} path={} kind={:?} audit_skipped={}",
+                    group_id,
+                    String::from_utf8_lossy(&record.path),
+                    record.event_kind,
+                    record.audit_skipped
+                );
+            }
             data_events += 1;
             if record.audit_skipped {
                 group_state

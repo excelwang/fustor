@@ -98,6 +98,10 @@ where
         let send_runtime = runtime_handle.clone();
         let send_task = tokio::task::spawn_blocking(move || {
             while let Some(batch) = send_runtime.block_on(queue_rx.recv()) {
+                eprintln!(
+                    "fs_meta_source_worker: publish batch len={}",
+                    batch.len()
+                );
                 if let Err(err) = send_boundary.channel_send(
                     BoundaryContext::default(),
                     ChannelSendRequest {

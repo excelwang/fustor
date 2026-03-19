@@ -35,6 +35,7 @@ pub struct OperatorSession {
 impl FsMetaApiClient {
     pub fn new(base_url: impl Into<String>) -> Result<Self, String> {
         let client = Client::builder()
+            .pool_max_idle_per_host(0)
             .build()
             .map_err(|e| format!("build reqwest client failed: {e}"))?;
         Ok(Self {

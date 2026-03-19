@@ -58,6 +58,7 @@ const ENTRY_PAGE_SIZE_MAX: usize = 10_000;
 const PIT_TTL_MS_DEFAULT: u64 = 900_000;
 const PIT_MAX_SESSIONS: usize = 128;
 const PIT_MAX_TOTAL_BYTES: usize = 64 * 1024 * 1024;
+const ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(5);
 
 #[derive(Deserialize)]
 pub struct ApiParams {
@@ -431,7 +432,7 @@ pub(crate) async fn route_sink_status_snapshot(
                 METHOD_SINK_STATUS,
                 Bytes::new(),
                 timeout,
-                Duration::from_millis(750),
+                ROUTE_COLLECT_IDLE_GRACE,
             )
         },
         timeout,
@@ -1148,7 +1149,7 @@ async fn query_materialized_events(
                         METHOD_SINK_QUERY_PROXY,
                         Bytes::from(payload),
                         timeout,
-                        Duration::from_millis(750),
+                        ROUTE_COLLECT_IDLE_GRACE,
                     )
                 },
                 timeout,
@@ -1211,7 +1212,7 @@ async fn query_force_find_events(
                         METHOD_SOURCE_FIND,
                         Bytes::from(payload),
                         timeout,
-                        Duration::from_millis(750),
+                        ROUTE_COLLECT_IDLE_GRACE,
                     )
                 },
                 timeout,

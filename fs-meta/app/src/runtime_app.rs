@@ -379,7 +379,7 @@ impl FSMetaApp {
                                 crate::runtime::routes::METHOD_SINK_QUERY_PROXY,
                                 bytes::Bytes::from(payload),
                                 Duration::from_secs(30),
-                                Duration::from_millis(750),
+                                Duration::from_secs(5),
                             )
                         })();
                         match result {
@@ -412,13 +412,13 @@ impl FSMetaApp {
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
-            let query_active = self
+            let query_peer_active = self
                 .facade_gate
-                .unit_state(execution_units::QUERY_RUNTIME_UNIT_ID)?
+                .unit_state(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)?
                 .map(|(active, _)| active)
                 .unwrap_or(false);
-            if !query_active || !spawned_routes.insert(route.0.clone()) {
-                // Not currently selected as query ingress owner, or already running.
+            if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as peer sink-status owner, or already running.
             } else {
             let sink = self.sink.clone();
             eprintln!(
@@ -434,7 +434,11 @@ impl FSMetaApp {
                     let mut responses = Vec::new();
                     for req in requests {
                         match sink.status_snapshot_nonblocking() {
-                            Ok(snapshot) if !snapshot.groups.is_empty() => {
+                            Ok(snapshot) => {
+                                eprintln!(
+                                    "fs_meta_runtime_app: sink status endpoint response groups={}",
+                                    snapshot.groups.len()
+                                );
                                 if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
                                     responses.push(Event::new(
                                         EventMetadata {
@@ -449,7 +453,6 @@ impl FSMetaApp {
                                     ));
                                 }
                             }
-                            Ok(_) => {}
                             Err(err) => {
                                 eprintln!(
                                     "fs_meta_runtime_app: sink status endpoint failed err={}",
