@@ -17,12 +17,14 @@
 
 1. 产品部署文档：`../docs/PRODUCT_DEPLOYMENT.md`
 2. 用户示例配置：`../docs/examples/`
-3. contract-test / regression yaml 与 release 示例：`../testdata/specs/`
-4. 可运行 fixture apps / manifests / runtime artifacts：`../fixtures/`
-5. 规格校验脚本：`../scripts/validate_specs.sh`
+3. 工程治理与规格校验规则：`../docs/ENGINEERING_GOVERNANCE.md`
+4. 上游 capanix 规格对齐审计：`../docs/UPSTREAM_SPEC_ALIGNMENT.md`
+5. contract-test / regression yaml 与 release 示例：`../testdata/specs/`
+6. 可运行 fixture apps / manifests / runtime artifacts：`../fixtures/`
+7. 规格校验脚本：`../scripts/validate_specs.sh`
 
 ## 作用域
 
 1. 本目录只记录正式 L0-L3 规格，不再承载并列 `app/` 或 `cli/` 子规格树。
-2. 本目录不再放产品部署手册、contract-test 配置或 release 示例。
-3. 目录评审、crate 边界评审、worker 拓扑评审均以本目录中的主规格为唯一权威。
+2. 本目录不再放工程治理、产品部署手册、contract-test 配置或 release 示例。
+3. 产品行为、域边界与运行时 ownership 评审以本目录中的主规格为唯一 formal authority。

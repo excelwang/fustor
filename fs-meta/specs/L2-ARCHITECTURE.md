@@ -1,5 +1,5 @@
 ---
-version: 2.8.1
+version: 3.0.0
 ---
 
 # L2: fs-meta Domain Architecture
@@ -144,8 +144,8 @@ version: 2.8.1
 14. Ordinary app-facing business modules default to the `capanix-app-sdk` curated re-export / raw-helper path; narrow runtime glue, orchestration, and protocol-boundary seams MAY directly consume `capanix-runtime-api`, while production business/runtime modules in the app package do not depend on `capanix-kernel-api` or `capanix-unit-sidecar`.
 15. The app package consumes `app-sdk`, product-owned `runtime-support`, `host-adapter-fs-meta`, `host-fs-types`, and `route-proto` as upstream authorities/support carriers; `product` remains the bounded product-facing CLI/tooling namespace, while `query`, `product::release_doc`, and `workers` may remain public package-local operational/test support surfaces without becoming product or platform authority.
 16. External-worker realization helpers remain confined to explicit worker runtime seams and low-level support crates; the app package may consume only the bounded typed worker transport/client surface from `runtime-support`, not raw bridge/bootstrap primitives.
-17. The upstream bridge-realization seam is low-level carrier glue only; `fs-meta/runtime-support/` owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision, while worker artifact crates own only their explicit server entry/bootstrap functions.
-18. The canonical worker transport contract preserves `Timeout` / `TransportClosed` categories and applies wall-clock total-timeout clipping before retry; transport failures are not flattened into a generic peer-error bucket.
+17. The upstream bridge-realization seam is low-level carrier glue only; `fs-meta/runtime-support/` is the only crate that owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision, while worker artifact crates own only their explicit server entry/bootstrap functions.
+18. The canonical worker transport contract MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping before retry; transport failures are not flattened into a generic peer-error bucket.
 19. `embedded` workers share the host process; `external` workers run in dedicated worker processes.
 20. Constructor/bootstrap faults surface as typed `CnxError` / `init_error`; runtime local-execution join failures and worker/bootstrap faults are handled as app-local or local-execution-local errors or explicit degraded behavior rather than routine production `panic!` / `expect!` flow.
 21. Package-local implementation env seams remain bounded tuning knobs; `FS_META_SOURCE_SCAN_WORKERS`, `FS_META_SOURCE_AUDIT_INTERVAL_MS`, `FS_META_SOURCE_THROTTLE_INTERVAL_MS`, `FS_META_SINK_TOMBSTONE_TTL_MS`, `FS_META_SINK_TOMBSTONE_TOLERANCE_US`, and `FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS` tune implementation behavior without redefining truth, cutover, or query-surface contracts.
@@ -159,34 +159,10 @@ version: 2.8.1
 5. The optional `capanixd-fs-meta` launcher composes `capanix_daemon::run_with_host_passthrough_bootstrap(...)` with `capanix_host_adapter_fs_meta::spawn_host_passthrough_endpoint`; it does not bind sockets, construct runtime control services, or start runtime directly.
 6. CLI remains a request client only: it does not own bind/run realization, route convergence, route target selection, or `state/effect observation plane` meaning such as `observation_eligible`.
 
-## ARCHITECTURE.REPOSITORY_TOPOLOGY
+## ARCHITECTURE.GOVERNANCE_REFERENCE
 
-1. `fs-meta/specs/` is the only formal fs-meta specification tree; `specs/app/` and `specs/cli/` are not parallel authority roots.
-2. Formal specs are limited to `L0-GLOSSARY`, `L0-VISION`, `L1-CONTRACTS`, `L2-ARCHITECTURE`, and `L3-RUNTIME/*`.
-3. Product/operator documentation lives under `fs-meta/docs/`; deployment examples live under `fs-meta/docs/examples/`.
-4. Contract-test fixtures, release examples, and regression materials live under `fs-meta/testdata/specs/`; they are not part of the formal specification tree.
-5. Runnable fixture apps, fixture manifests, and runtime artifacts live under `fs-meta/fixtures/`; they are not part of the formal specification tree but are first-class repo topology for tests and examples.
-6. The specs validation helper lives under `fs-meta/scripts/validate_specs.sh` and validates the single formal spec tree against fs-meta contract tests.
-
-## ARCHITECTURE.CRATE_OWNERSHIP
-
-1. `fs-meta/` is the product container only; it is not a Cargo package and owns no code-level business authority.
-2. `fs-meta/app/` is the only product app package; it owns package-local config/types plus API/query/orchestration/business composition and MUST stay `publish = false`.
-3. `fs-meta/runtime-support/` is the only crate that owns worker child-process bootstrap, control/data socket/log path materialization, direct control-plane startup/management, retry clipping, and low-level external-worker transport supervision for fs-meta.
-4. `fs-meta/worker-facade/` owns the embedded `facade-worker` artifact entry and fixture binary surface; it does not own business/query semantics.
-5. `fs-meta/worker-source/` owns the `source-worker` external artifact/runtime entry and `run_source_worker_server(...)` bootstrap.
-6. `fs-meta/worker-sink/` owns the `sink-worker` external artifact/runtime entry and `run_sink_worker_server(...)` bootstrap.
-7. `fs-meta/worker-scan/` owns the `scan-worker` executable artifact identity and `run_scan_worker_server(...)` entry; current implementation may reuse lower-level source-worker runtime helpers internally without reusing source-worker artifact identity.
-8. `fs-meta/tooling/` owns operator CLI binaries and optional local-dev daemon composition only; it does not own worker bootstrap/runtime planning semantics.
-
-## ARCHITECTURE.DEPENDENCY_RULES
-
-1. `fs-meta/app/` MUST NOT depend on `capanix-kernel-api`, worker artifact crates, the low-level external-worker bridge crate, or the embedded-entry macro crate; it MAY depend on the bounded typed transport/client surface in `fs-meta/runtime-support/`.
-2. `fs-meta/tooling/` MAY depend on bounded `product` types and optional daemon/bootstrap seams, but MUST NOT depend on worker runtime internals or reimplement worker bootstrap.
-3. `fs-meta/runtime-support/` MAY depend on the low-level external-worker bridge crate only as the bridge runner; it owns fs-meta worker bootstrap semantics and MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping.
-4. `fs-meta/worker-facade/` MAY depend on `fs-meta/app` and the embedded-entry macro crate for embedded artifact realization, but realization wiring MUST stay artifact-local.
-5. `fs-meta/worker-source/` and `fs-meta/worker-sink/` MAY depend on `fs-meta/app` and the low-level external-worker bridge crate to host external worker servers; app business modules MUST NOT depend back on those artifact crates.
-6. `fs-meta/worker-scan/` MAY depend on `worker-source` lower-level runtime helpers while the scan server entry intentionally forwards into shared source-runtime implementation; if scan runtime semantics diverge, `L2` MUST be updated before changing that dependency.
+1. Repo topology, crate ownership, dependency rules, and validation workflow are engineering-governance material rather than formal runtime architecture.
+2. Those constraints live in `fs-meta/docs/ENGINEERING_GOVERNANCE.md`; formal architecture keeps only product/runtime ownership and interaction boundaries.
 
 ## ARCHITECTURE.WORKER_ROLE_TO_ARTIFACT_MAP
 

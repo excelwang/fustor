@@ -1,4 +1,5 @@
-version: 1.0.1
+---
+version: 3.0.0
 ---
 
 # L3 Runtime: fs-meta Observation Cutover

@@ -82,6 +82,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &mut session,
                 &harness.lab,
                 harness.facade_count,
+                false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
@@ -109,6 +110,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &mut session,
                 &harness.lab,
                 harness.facade_count,
+                false,
             )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
@@ -136,6 +138,7 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
                 &mut session,
                 &harness.lab,
                 harness.facade_count,
+                false,
             )?;
         }
     }
@@ -209,7 +212,7 @@ fn run_query_baseline_phase(
                 let _ = session.rescan();
                 last_rescan_at = std::time::Instant::now();
             }
-            let tree = match session
+                let tree = match session
                 .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
             {
                 Ok(tree) => tree,
@@ -239,7 +242,9 @@ fn run_query_baseline_phase(
                 let status = session
                     .status()
                     .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
-                Err(format!("tree={tree}; status={status}"))
+                let diagnostics = baseline_cluster_diagnostics(cluster, session)
+                    .unwrap_or_else(|diag_err| json!({ "diagnostics_error": diag_err }).to_string());
+                Err(format!("tree={tree}; status={status}; diagnostics={diagnostics}"))
             }
         },
     )?;
@@ -773,6 +778,7 @@ fn run_status_and_grants_checks(
     session: &mut OperatorSession,
     lab: &NfsLab,
     facade_count: usize,
+    require_sink_groups: bool,
 ) -> Result<(), String> {
     assert_error(
         client.get_json_raw("/status", "bad-token")?,
@@ -781,6 +787,43 @@ fn run_status_and_grants_checks(
     )?;
 
     eprintln!("[fs-meta-api-matrix] substep=status");
+    wait_until(
+        Duration::from_secs(120),
+        "status sink groups become available",
+        || {
+            let status = session.status()?;
+            let source = match status.get("source") {
+                Some(source) => source,
+                None => return Ok(false),
+            };
+            let sink = match status.get("sink") {
+                Some(sink) => sink,
+                None => return Ok(false),
+            };
+            if source
+                .get("grants_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                < 3
+            {
+                return Ok(false);
+            }
+            if sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
+                return Ok(false);
+            }
+            let Some(groups) = sink.get("groups").and_then(Value::as_array) else {
+                return Ok(!require_sink_groups);
+            };
+            if groups.is_empty() && require_sink_groups {
+                return Ok(false);
+            }
+            Ok(groups.iter().all(|group| {
+                group
+                    .get("shadow_lag_us")
+                    .is_some_and(Value::is_number)
+            }))
+        },
+    )?;
     let metrics_before = session.bound_route_metrics()?;
     let status = session.status()?;
     let metrics_after = session.bound_route_metrics()?;
@@ -801,19 +844,19 @@ fn run_status_and_grants_checks(
     if sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
         return Err(format!("expected live sink nodes in status: {status}"));
     }
-    let sink_groups = sink
-        .get("groups")
-        .and_then(Value::as_array)
-        .ok_or_else(|| format!("status missing sink.groups array: {status}"))?;
-    if sink_groups.is_empty() {
-        return Err(format!("expected non-empty sink.groups in status: {status}"));
-    }
-    for group in sink_groups {
-        if !group.get("shadow_lag_us").is_some_and(Value::is_number) {
-            return Err(format!(
-                "status sink group missing numeric shadow_lag_us: {group}"
-            ));
+    if let Some(sink_groups) = sink.get("groups").and_then(Value::as_array) {
+        if require_sink_groups && sink_groups.is_empty() {
+            return Err(format!("expected non-empty sink.groups in status: {status}"));
         }
+        for group in sink_groups {
+            if !group.get("shadow_lag_us").is_some_and(Value::is_number) {
+                return Err(format!(
+                    "status sink group missing numeric shadow_lag_us: {group}"
+                ));
+            }
+        }
+    } else if require_sink_groups {
+        return Err(format!("status missing sink.groups array: {status}"));
     }
     let timeouts_before = metrics_before
         .get("call_timeout_total")

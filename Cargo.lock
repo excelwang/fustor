@@ -299,8 +299,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "capanix-app-fs-meta",
+ "capanix-config",
  "capanix-daemon",
  "capanix-host-adapter-fs-meta",
+ "capanix-runtime-api",
  "clap",
  "libc",
  "reqwest",

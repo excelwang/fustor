@@ -77,8 +77,9 @@ auth:
 说明：
 
 1. `fsmeta deploy` 默认以 `roots=[]` 启动服务。
-2. app target、manifest、desired-state document、runtime subscriptions、source/sink execution wiring、auth 文件路径等内部细节由 CLI 自动生成。
-3. deploy 完成后会输出 `api_facade_resource_id`、一次性的 bootstrap 管理员凭据和内部 state 目录。
+2. `fsmeta deploy` 消费共享的 `capanix-config` 配置/manifest/intention 编译语义以及 daemon/runtime ingress，而不是重新发明第二套平台配置语义。
+3. app target、manifest、desired-state document、runtime subscriptions、source/sink execution wiring、auth 文件路径等内部细节由 CLI 自动生成。
+4. deploy 完成后会输出 `api_facade_resource_id`、一次性的 bootstrap 管理员凭据和内部 state 目录。
 
 ## 第 4 步：登录并勾选 monitoring roots
 

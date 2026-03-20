@@ -508,10 +508,10 @@ fn worker_mode_failure_boundary_is_explicit() {
         architecture.contains("upstream bridge-realization seam is low-level carrier glue only")
     );
     assert!(architecture.contains(
-        "`fs-meta/runtime-support/` owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision"
+        "`fs-meta/runtime-support/` is the only crate that owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision"
     ));
     assert!(architecture.contains(
-        "The canonical worker transport contract preserves `Timeout` / `TransportClosed` categories"
+        "The canonical worker transport contract MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping"
     ));
     assert!(workflow.contains(
         "product-facing failure domains are expressed only as `embedded` versus `external` workers"
@@ -676,6 +676,7 @@ fn source_and_sink_worker_server_bootstrap_live_in_artifact_crates() {
 
 #[test]
 fn crate_ownership_and_dependency_rules_are_explicit() {
+    let governance = read_app_spec("docs/ENGINEERING_GOVERNANCE.md");
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
     let root_manifest = read_workspace_manifest();
     let app_manifest = read_app_spec("app/Cargo.toml");
@@ -683,15 +684,15 @@ fn crate_ownership_and_dependency_rules_are_explicit() {
     let transport_manifest = read_app_spec("runtime-support/Cargo.toml");
     let scan_manifest = read_app_spec("worker-scan/Cargo.toml");
 
-    assert!(l2.contains("## ARCHITECTURE.CRATE_OWNERSHIP"));
-    assert!(l2.contains(
+    assert!(governance.contains("## ENGINEERING_GOVERNANCE.CRATE_OWNERSHIP"));
+    assert!(governance.contains(
         "`fs-meta/runtime-support/` is the only crate that owns worker child-process bootstrap"
     ));
-    assert!(l2.contains(
+    assert!(governance.contains(
         "`fs-meta/worker-scan/` owns the `scan-worker` executable artifact identity and `run_scan_worker_server(...)` entry"
     ));
-    assert!(l2.contains("## ARCHITECTURE.DEPENDENCY_RULES"));
-    assert!(l2.contains("`fs-meta/app/` MUST NOT depend on `capanix-kernel-api`, worker artifact crates, the low-level external-worker bridge crate, or the embedded-entry macro crate; it MAY depend on the bounded typed transport/client surface in `fs-meta/runtime-support/`."));
+    assert!(governance.contains("## ENGINEERING_GOVERNANCE.DEPENDENCY_RULES"));
+    assert!(governance.contains("`fs-meta/app/` does not depend on `capanix-kernel-api`, worker artifact crates, low-level external-worker bridge crate or embedded-entry macro crate"));
     assert!(l2.contains("## ARCHITECTURE.WORKER_ROLE_TO_ARTIFACT_MAP"));
     assert!(l2.contains("`scan-worker` is a distinct operator-visible worker role"));
     assert!(l2.contains("dedicated `run_scan_worker_server(...)` entry while still sharing lower-level source-runtime helpers internally"));
@@ -717,6 +718,8 @@ fn formal_specs_tree_is_single_and_non_spec_materials_live_outside_specs() {
             .exists()
     );
     assert!(root.join("docs/PRODUCT_DEPLOYMENT.md").exists());
+    assert!(root.join("docs/ENGINEERING_GOVERNANCE.md").exists());
+    assert!(root.join("docs/UPSTREAM_SPEC_ALIGNMENT.md").exists());
     assert!(root.join("docs/examples/fs-meta.yaml").exists());
     assert!(
         root.join("testdata/specs/fs-meta-contract-tests.config.md")

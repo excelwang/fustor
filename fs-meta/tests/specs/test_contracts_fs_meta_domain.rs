@@ -704,7 +704,7 @@ fn test_projection_view_contracts_are_migrated_to_main_specs() {
     assert!(projection_api.contains("\"latest_file_mtime_us\": stats.latest_file_mtime_us"));
 }
 
-// @verify_spec("CONTRACTS.FAILURE_ISOLATION_BOUNDARY.INTERFACE_TASK_OR_WORKER_FAILURE_CONTAINMENT_TARGET", mode="system")
+// @verify_spec("CONTRACTS.FAILURE_ISOLATION_BOUNDARY.INTERFACE_LOCAL_EXECUTION_OR_WORKER_FAILURE_CONTAINMENT_TARGET", mode="system")
 // @verify_spec("CONTRACTS.FAILURE_ISOLATION_BOUNDARY.EXECUTION_FAILURE_DOMAINS_ARE_EXPLICIT", mode="system")
 #[test]
 fn test_interface_endpoints_use_managed_task_lifecycle_and_bounded_shutdown() {

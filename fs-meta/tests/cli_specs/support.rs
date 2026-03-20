@@ -41,6 +41,17 @@ pub fn package_manifest_text() -> String {
     .expect("read fs-meta cli manifest")
 }
 
+pub fn fsmeta_source_text() -> String {
+    fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .map(PathBuf::from)
+            .expect("fs-meta container root")
+            .join("tooling/src/bin/fsmeta.rs"),
+    )
+    .expect("read fs-meta cli source")
+}
+
 pub fn launcher_source_text() -> String {
     fs::read_to_string(
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))

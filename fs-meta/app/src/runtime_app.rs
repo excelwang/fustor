@@ -836,6 +836,7 @@ impl FSMetaApp {
         let Some(pending) = pending_facade.lock().await.clone() else {
             return Ok(false);
         };
+        let mut same_resource_replacement = None::<(String, Vec<String>, u64)>;
         let replacing_existing = {
             let api_task_guard = api_task.lock().await;
             if let Some(current) = api_task_guard.as_ref()
@@ -855,10 +856,43 @@ impl FSMetaApp {
                 Self::clear_pending_facade_status(&facade_pending_status);
                 return Ok(true);
             }
+            if let Some(current) = api_task_guard.as_ref()
+                && current.route_key == pending.route_key
+                && current.resource_ids == pending.resource_ids
+            {
+                same_resource_replacement = Some((
+                    current.route_key.clone(),
+                    current.resource_ids.clone(),
+                    current.generation,
+                ));
+            }
             api_task_guard.is_some()
         };
         if replacing_existing && !pending.runtime_exposure_confirmed {
             return Ok(false);
+        }
+        if let Some((route_key, resource_ids, generation)) = same_resource_replacement.take() {
+            let mut api_task_guard = api_task.lock().await;
+            if api_task_guard.as_ref().is_some_and(|active| {
+                active.route_key == route_key
+                    && active.resource_ids == resource_ids
+                    && active.generation == generation
+            }) {
+                if let Some(active) = api_task_guard.as_mut() {
+                    active.generation = pending.generation;
+                }
+                drop(api_task_guard);
+                let mut pending_guard = pending_facade.lock().await;
+                if pending_guard.as_ref().is_some_and(|candidate| {
+                    candidate.route_key == pending.route_key
+                        && candidate.resource_ids == pending.resource_ids
+                        && candidate.generation == pending.generation
+                }) {
+                    pending_guard.take();
+                }
+                Self::clear_pending_facade_status(&facade_pending_status);
+                return Ok(true);
+            }
         }
         // Cold start has no prior facade to retain, so runtime confirmation is
         // sufficient to bring up the process. Replacement also proceeds once
@@ -1152,6 +1186,7 @@ impl FSMetaApp {
         {
             let mut api_task = self.api_task.lock().await;
             if let Some(current) = api_task.as_mut()
+                && current.route_key == route_key
                 && current.resource_ids == candidate_resource_ids
                 && current.generation == generation
             {
@@ -1160,7 +1195,10 @@ impl FSMetaApp {
                 let mut pending = self.pending_facade.lock().await;
                 if pending
                     .as_ref()
-                    .is_some_and(|candidate| candidate.resource_ids == candidate_resource_ids)
+                    .is_some_and(|candidate| {
+                        candidate.route_key == route_key
+                            && candidate.resource_ids == candidate_resource_ids
+                    })
                 {
                     pending.take();
                 }
@@ -2072,9 +2110,9 @@ mod tests {
             },
             api: api::ApiConfig {
                 enabled: true,
-                facade_resource_id: "single-app-listener".to_string(),
+                facade_resource_id: "listener-a".to_string(),
                 local_listener_resources: vec![api::config::ApiListenerResource {
-                    resource_id: "single-app-listener".to_string(),
+                    resource_id: "listener-a".to_string(),
                     bind_addr: "127.0.0.1:0".to_string(),
                 }],
                 auth: api::ApiAuthConfig {
@@ -2157,103 +2195,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn facade_activate_keeps_prior_active_until_pending_generation_is_eligible() {
-        let tmp = tempdir().expect("create temp dir");
-        let (passwd_path, shadow_path) = write_auth_files(&tmp);
-        let cfg = FSMetaConfig {
-            source: SourceConfig {
-                roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
-                host_object_grants: vec![granted_mount_root("single-app-node::root-1", tmp.path())],
-                ..in_process_source_config()
-            },
-            api: api::ApiConfig {
-                enabled: true,
-                facade_resource_id: "single-app-listener".to_string(),
-                local_listener_resources: vec![api::config::ApiListenerResource {
-                    resource_id: "single-app-listener".to_string(),
-                    bind_addr: "127.0.0.1:0".to_string(),
-                }],
-                auth: api::ApiAuthConfig {
-                    passwd_path,
-                    shadow_path,
-                    ..api::ApiAuthConfig::default()
-                },
-            },
-        };
-        let app = FSMetaApp::with_boundaries(
-            cfg,
-            NodeId("single-app-node".into()),
-            Some(Arc::new(NoopBoundary)),
-        )
-        .expect("init app");
-        let existing = match api::spawn(
-            app.config
-                .api
-                .resolve_for_candidate_ids(&["single-app-listener".to_string()])
-                .expect("resolve facade config"),
-            app.node_id.clone(),
-            app.runtime_control_boundary.clone(),
-            app.runtime_boundary.clone(),
-            app.source.clone(),
-            app.sink.clone(),
-            app.query_sink.clone(),
-            app.runtime_boundary.clone(),
-            app.facade_pending_status.clone(),
-        )
-        .await
-        {
-            Ok(handle) => handle,
-            Err(CnxError::InvalidInput(msg))
-                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
-            {
-                return;
-            }
-            Err(err) => panic!("spawn active facade: {err}"),
-        };
-        *app.api_task.lock().await = Some(FacadeActivation {
-            route_key: facade_control_stream_route(),
-            generation: 1,
-            resource_ids: vec!["single-app-listener".to_string()],
-            handle: existing,
-        });
-
-        app.apply_facade_activate(
-            FacadeRuntimeUnit::Facade,
-            &facade_control_stream_route(),
-            2,
-            &[capanix_route_proto::BoundScope {
-                scope_id: "test-root".to_string(),
-                resource_ids: vec!["single-app-listener".to_string()],
-            }],
-        )
-        .await
-        .expect("apply facade activate");
-
-        let active_guard = app.api_task.lock().await;
-        let active = active_guard.as_ref().expect("prior active facade retained");
-        assert_eq!(active.generation, 1);
-        assert_eq!(active.resource_ids, vec!["single-app-listener".to_string()]);
-        drop(active_guard);
-
-        let pending = app
-            .pending_facade
-            .lock()
-            .await
-            .clone()
-            .expect("pending facade recorded");
-        assert_eq!(pending.generation, 2);
-        assert_eq!(
-            pending.resource_ids,
-            vec!["single-app-listener".to_string()]
-        );
-        assert!(pending.group_ids.is_empty());
-        assert_eq!(pending.route_key, facade_control_stream_route());
-        assert!(pending.runtime_managed);
-        assert!(!pending.runtime_exposure_confirmed);
-        app.close().await.expect("close fs-meta app");
-    }
-
-    #[tokio::test]
     async fn facade_cutover_replaces_previous_after_runtime_confirmation_even_before_tree_ready() {
         let tmp = tempdir().expect("create temp dir");
         let root = tmp.path().join("root-a");
@@ -2288,7 +2229,7 @@ mod tests {
         let existing = match api::spawn(
             app.config
                 .api
-                .resolve_for_candidate_ids(&["single-app-listener".to_string()])
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
             app.runtime_control_boundary.clone(),
@@ -2374,11 +2315,17 @@ mod tests {
             },
             api: api::ApiConfig {
                 enabled: true,
-                facade_resource_id: "single-app-listener".to_string(),
-                local_listener_resources: vec![api::config::ApiListenerResource {
-                    resource_id: "single-app-listener".to_string(),
-                    bind_addr: bind_addr.clone(),
-                }],
+                facade_resource_id: "listener-a".to_string(),
+                local_listener_resources: vec![
+                    api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    },
+                    api::config::ApiListenerResource {
+                        resource_id: "listener-b".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    },
+                ],
                 auth: api::ApiAuthConfig {
                     passwd_path,
                     shadow_path,
@@ -2395,7 +2342,7 @@ mod tests {
         let existing = match api::spawn(
             app.config
                 .api
-                .resolve_for_candidate_ids(&["single-app-listener".to_string()])
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
             app.runtime_control_boundary.clone(),
@@ -2419,7 +2366,7 @@ mod tests {
         *app.api_task.lock().await = Some(FacadeActivation {
             route_key: facade_control_stream_route(),
             generation: 1,
-            resource_ids: vec!["single-app-listener".to_string()],
+            resource_ids: vec!["listener-a".to_string()],
             handle: existing,
         });
 
@@ -2429,7 +2376,7 @@ mod tests {
             2,
             &[capanix_route_proto::BoundScope {
                 scope_id: "test-root".to_string(),
-                resource_ids: vec!["single-app-listener".to_string()],
+                resource_ids: vec!["listener-b".to_string()],
             }],
         )
         .await
@@ -2491,11 +2438,17 @@ mod tests {
             },
             api: api::ApiConfig {
                 enabled: true,
-                facade_resource_id: "single-app-listener".to_string(),
-                local_listener_resources: vec![api::config::ApiListenerResource {
-                    resource_id: "single-app-listener".to_string(),
-                    bind_addr: bind_addr.clone(),
-                }],
+                facade_resource_id: "listener-a".to_string(),
+                local_listener_resources: vec![
+                    api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    },
+                    api::config::ApiListenerResource {
+                        resource_id: "listener-b".to_string(),
+                        bind_addr: bind_addr.clone(),
+                    },
+                ],
                 auth: api::ApiAuthConfig {
                     passwd_path,
                     shadow_path,
@@ -2512,7 +2465,7 @@ mod tests {
         let existing = match api::spawn(
             app.config
                 .api
-                .resolve_for_candidate_ids(&["single-app-listener".to_string()])
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
             app.runtime_control_boundary.clone(),
@@ -2536,7 +2489,7 @@ mod tests {
         *app.api_task.lock().await = Some(FacadeActivation {
             route_key: facade_control_stream_route(),
             generation: 1,
-            resource_ids: vec!["single-app-listener".to_string()],
+            resource_ids: vec!["listener-a".to_string()],
             handle: existing,
         });
 
@@ -2546,7 +2499,7 @@ mod tests {
             2,
             &[capanix_route_proto::BoundScope {
                 scope_id: "test-root".to_string(),
-                resource_ids: vec!["single-app-listener".to_string()],
+                resource_ids: vec!["listener-b".to_string()],
             }],
         )
         .await

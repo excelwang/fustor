@@ -1,38 +1,39 @@
-version: 2.2.0
+---
+version: 3.0.0
 ---
 
 # L0: fs-meta Domain Vision
 
 > Mission: 在 Capanix 上以单一 fs-meta 域 authority 与单一 app 产品边界提供文件元数据能力，
-> 对外暴露稳定 HTTP 与 `query`/`find` 接口；内部执行职责、隔离形态与升级/故障恢复路径保持可演进，
-> 业务协议语义继续由 fs-meta app 自身拥有，升级通过 release-generation cutover 完成。
+> 对外暴露稳定产品接口与可审计的 observation 结果；内部执行职责、隔离形态与升级/故障恢复路径可以演进，
+> 但 domain meaning 继续由 fs-meta 自身拥有。
 
 ## In-Scope
 
 ### VISION.DOMAIN_IDENTITY
 
 1. **FS_META_DOMAIN_CONSTITUTION**: User wants one fs-meta 域级 authority/宪法层，统一约束 `app/shared-types` 的跨组件语义，避免重复定义和漂移。
-2. **MODULE_ROLE_BOUNDARY**: User wants fs-meta app 对外表现为一个整体；内部执行职责固定覆盖 facade/query ingress、live source observation、scan/audit、以及 materialized index maintenance，且外部 HTTP facade 固定归属于该单 app 边界，共享类型层继续负责稳定类型契约。
-3. **BINARY_APP_RUNTIME**: User wants runtime 以共享进程或专属进程两类隔离形态承载这些内部职责，保证升级与故障隔离能力，同时不把 realization-mechanic 词汇提升为产品语义。
+2. **MODULE_ROLE_BOUNDARY**: User wants fs-meta 对外表现为一个整体产品边界；内部职责可以拆分为 facade/query ingress、live source observation、scan/audit 和 materialized index maintenance，但不应把这些内部边界升级成多产品语义。
+3. **BINARY_APP_RUNTIME**: User wants runtime 以共享进程或专属进程两类隔离形态承载这些职责，保证升级与故障隔离能力，同时不把 realization-mechanic 词汇提升为产品语义。
 4. **META_INDEX_DOMAIN_OWNERSHIP**: User wants `meta-index` 归属 fs-meta 域服务，不进入 kernel 业务状态。
 
 ### VISION.KERNEL_RELATION
 
-1. **GENERIC_KERNEL_MECHANISM_CONSUMPTION**: User wants fs-meta 只消费 kernel 的薄 runtime ABI 与通用 route/channel-attach 机制，不依赖业务化内核接口或内核自带业务方法目录。
+1. **GENERIC_KERNEL_MECHANISM_CONSUMPTION**: User wants fs-meta 只建立在通用的 runtime ABI、bind/route/grant 和 channel-attach 机制之上，不依赖 fs-meta-specific platform primitives。
 2. **POLICY_OUTSIDE_KERNEL_FOR_GROUPING**: User wants“按挂载路径分组”作为域策略而不是 kernel 语义。
-3. **HOST_ADAPTER_SDK_TRANSLATION_OWNERSHIP**: User wants宿主本地 facade/ABI 适配归通用 `host-adapter-sdk`，不放在 fs-meta 业务代码，也不把宿主 host-operation 当作分布式契约。
-4. **RESOURCE_BOUND_LOCAL_HOST_PROGRAMMING**: User wants资源绑定 source 单元在绑定宿主上通过公共 host-fs facade 编程，而不是依赖位置透明的远程宿主操作目录。
-5. **THIN_RUNTIME_ABI_CONSUMPTION**: User wants fs-meta run 只消费薄 runtime ABI（run context、grants、control events、channel hooks），而不是依赖宽而杂的 kernel 方法目录。
-6. **APP_OWNS_OPAQUE_PORT_MEANING**: User wants fs-meta 内部 query/find/source/sink 接线保持 app-owned opaque port 语义；kernel/runtime 只负责 route 与 channel。
+3. **HOST_ADAPTER_SDK_TRANSLATION_OWNERSHIP**: User wants宿主本地 facade/ABI 适配归 host-adapter 层，不放在 fs-meta 域策略里，也不把宿主 host-operation 当作分布式契约。
+4. **RESOURCE_BOUND_LOCAL_HOST_PROGRAMMING**: User wants资源绑定 source 行为在绑定宿主上通过公共 host-fs facade 编程，而不是依赖远程宿主操作语义。
+5. **THIN_RUNTIME_ABI_CONSUMPTION**: User wants fs-meta run 只消费薄 runtime ABI，而不是依赖宽而杂的 platform verb 目录。
+6. **APP_OWNS_OPAQUE_PORT_MEANING**: User wants fs-meta 内部 query、find、source、sink 协调保持 app-owned opaque port 语义；kernel/runtime 只负责 route 与 channel。
 
 ### VISION.QUERY_OUTCOME
 
 1. **QUERY_PATH_AVAILABILITY**: User wants稳定低延迟 `query` 路径，面向物化索引。
 2. **FIND_PATH_AVAILABILITY**: User wants `find` 路径支持实时探测/强制新鲜视图。
-3. **UNIFIED_FOREST_RESPONSE**: User wants查询路径共享一致的 observation semantics、selection vocabulary 与 failure visibility，便于上层 CLI/UI 复用；`/tree` 与 `/on-demand-force-find` 可以保留各自的 path-specific response envelope，而不是被迫使用完全相同的 payload shape。
+3. **UNIFIED_FOREST_RESPONSE**: User wants查询路径共享一致的 observation semantics、selection vocabulary 与 failure visibility，便于上层 CLI/UI 复用；不同路径可以保留各自的 payload 细节，但必须属于同一家 grouped-result 模型。
 4. **PARTIAL_FAILURE_ISOLATION**: User wants单组失败不会拖垮整次查询，系统返回可观测部分成功结果。
-5. **GROUP_ORDER_MULTI_GROUP_QUERY**: User wants `/tree` 与 `/on-demand-force-find` 直接返回多组结果；group bucket 排序只由 `group_order=group-key|file-count|file-age` 定义，客户端若只想取 1 组，应通过 `group_page_size=1` 达成，而不是依赖 `best=true` 一类单组选组参数。
-6. **QUERY_HTTP_FACADE**: User wants query path 通过稳定 HTTP 入口输出 JSON（`/tree`、`/stats`、`/on-demand-force-find`），并保持参数默认行为可预测。
+5. **GROUP_ORDER_MULTI_GROUP_QUERY**: User wants `/tree` 与 `/on-demand-force-find` 直接返回多组结果；分组排序应该是显式查询轴，而不是隐藏的单组选主逻辑。
+6. **QUERY_HTTP_FACADE**: User wants query path 通过稳定 HTTP 入口输出 JSON，并保持参数默认行为可预测。
 7. **RESOURCE_SCOPED_DOMAIN_HTTP_FACADE**: User wants对外 HTTP facade 由 facade resource 驱动的 one-cardinality facade 承担，固定归属于 fs-meta 域 app authority，而不是提升为 kernel/runtime 语义 authority。
 8. **STATELESS_QUERY_PROXY_AGGREGATION**: User wants投影层按请求实时转发与聚合，不维护成员注册表或缓存式 peer 状态。
 9. **QUERY_TRANSPORT_DIAGNOSTICS**: User wants投影层暴露 RPC 传输诊断计数，便于排查 timeout/correlation 异常。
@@ -47,10 +48,10 @@ version: 2.2.0
 
 ### VISION.OBSERVATION_CONVERGENCE
 
-1. **AUTHORITATIVE_TRUTH_LEDGER**: User wants fs-meta 明确区分 authoritative truth 与对外观测结果，并让权威变更有正式提交账本可追踪。
+1. **AUTHORITATIVE_TRUTH_LEDGER**: User wants fs-meta 明确区分 authoritative truth 与对外 observation，并让权威变更有正式 truth ledger 可追踪。
 2. **OBSERVATION_IS_NOT_TRUTH**: User wants `/tree`、`/stats`、`/on-demand-force-find` 等对外结果被视为 observation/projection，而不是自动等同于当前权威真值。
 3. **OBSERVATION_ELIGIBILITY_BEFORE_EXPOSURE**: User wants新 generation 或新实例只有在 replay 当前 truth 并把 observation 追平到可接受状态后，才对外承担可信结果暴露。
-4. **CROSS_RELATION_DRIFT_VISIBILITY**: User wants fs-meta 在 facade ownership、bind/run 结果、以及 materialized observation plane 对可信结果发生分歧时显式暴露 degraded/failure evidence，而不是静默输出半新半旧结果。
+4. **CROSS_RELATION_DRIFT_VISIBILITY**: User wants fs-meta 在 facade ownership、bind/run 结果和 materialized observation plane 对可信结果发生分歧时显式暴露 degraded/failure evidence，而不是静默输出半新半旧结果。
 
 ### VISION.API_BOUNDARY
 
@@ -61,7 +62,7 @@ version: 2.2.0
 
 ### VISION.EVOLUTION_AND_OPERATIONS
 
-1. **PRODUCT_CONFIGURATION_SPLIT**: User wants正式部署只暴露薄 bootstrap 配置面，而把业务监控范围配置留给产品 API 在运行时基于 runtime grants 完成。
+1. **PRODUCT_CONFIGURATION_SPLIT**: User wants正式部署只暴露薄 bootstrap 配置面，而把业务监控范围配置留给产品 API 在运行时基于 runtime grants 完成，不把 platform-owned config/intention semantics 重新发明成 fs-meta 私有配置模型。
 2. **RELEASE_GENERATION_UPGRADE**: User wants新版本 fs-meta 通过单 app 边界的 release-generation cutover 升级，而不是手工编辑内部 desired-state 文档或节点 manifest。
 
 ### VISION.APP_SCOPE

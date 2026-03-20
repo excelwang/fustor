@@ -1,6 +1,8 @@
 //! L1 Contract Tests — fs-meta CLI package scope.
 
-use crate::support::{combined_source_text, launcher_source_text, package_manifest_text};
+use crate::support::{
+    combined_source_text, fsmeta_source_text, launcher_source_text, package_manifest_text,
+};
 
 #[test]
 // @verify_spec("CONTRACTS.CLI_SCOPE.PRODUCT_DEPLOYMENT_CLIENT_ONLY", mode="system")
@@ -20,15 +22,20 @@ fn product_deployment_client_only() {
 #[test]
 // @verify_spec("CONTRACTS.CLI_SCOPE.DOMAIN_BOUNDARY_CONSUMPTION_ONLY", mode="system")
 fn domain_boundary_consumption_only() {
-    let source = combined_source_text();
+    let source = fsmeta_source_text();
+    let manifest = package_manifest_text();
     assert!(
-        source.contains("product::{")
-            && source.contains("build_release_doc_value")
+        source.contains("build_release_doc_value")
+            && source.contains("ScopeWorkerIntentDoc")
+            && source.contains("compile_scope_worker_intent_doc")
             && source.contains("ControlClient")
-            && source.contains("apply_relation_target_value")
+            && source.contains("apply_relation_target_intent")
             && source.contains("clear_relation_target")
             && source.contains("run_cnxctl")
             && source.contains("resolve_cnxctl_bin")
+            && source.contains("\"scope-worker-intent-v1\"")
+            && manifest.contains("capanix-config = { workspace = true }")
+            && manifest.contains("capanix-runtime-api = \"0.1.0\"")
             && !source.contains("CtlCommand::RelationTargetApply")
             && !source.contains("CtlCommand::RelationTargetClear")
     );

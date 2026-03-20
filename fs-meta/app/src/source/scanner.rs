@@ -240,9 +240,18 @@ impl ParallelScanner {
             self.root_path.join(path_str.trim_start_matches('/'))
         };
 
-        let meta = metadata_with_retry(self.host_fs.as_ref(), &target).map_err(|e| {
-            CnxError::Internal(format!("stat failed for {}: {e}", target.display()))
-        })?;
+        let meta = match metadata_with_retry(self.host_fs.as_ref(), &target) {
+            Ok(meta) => meta,
+            Err(err) if err.kind() == io::ErrorKind::NotFound && target != self.root_path => {
+                return Ok(Vec::new());
+            }
+            Err(err) => {
+                return Err(CnxError::Internal(format!(
+                    "stat failed for {}: {err}",
+                    target.display()
+                )));
+            }
+        };
 
         let mut records = Vec::new();
 

@@ -1,10 +1,14 @@
-version: 2.20.2
+---
+version: 3.0.0
 ---
 
 # L1: fs-meta Domain Contracts
 
 > Subject: `fs-meta System` at domain boundaries.
 > Pattern: `[fs-meta System] MUST ...`
+> Traceability: this file defines fs-meta-owned contracts while consuming
+> upstream owner constraints from root `capanix/specs` and the directly used
+> Capanix module specs.
 
 ---
 
@@ -244,6 +248,7 @@ version: 2.20.2
    > Covers L0: VISION.PRODUCT_CONFIGURATION_SPLIT
    > Responsibility: prevent operators from editing internal desired-state/runtime policy details as business configuration.
    > Verification: product deployment docs keep `fs-meta.yaml` limited to bootstrap API/auth concerns; deploy defaults to `roots=[]`; operators configure monitoring roots through `/runtime/grants`, `/monitoring/roots/preview`, and `/monitoring/roots`.
+   > Verification: fs-meta consumes shared `capanix-config` manifest/config and intent-compilation semantics through upstream deploy/runtime boundaries rather than redefining path precedence, manifest discovery, or relation-target meaning inside fs-meta specs.
 4. **RELEASE_GENERATION_CUTOVER**: **fs-meta System** MUST realize upgrades as higher-target-generation replacement on one fs-meta app boundary while preserving the product API base and replaying current monitoring roots/runtime grants into the new generation.
    > Covers L0: VISION.RELEASE_GENERATION_UPGRADE
    > Responsibility: make binary upgrades explicit at the app package boundary while keeping authoritative truth replay and externally visible observations separate.

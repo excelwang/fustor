@@ -5284,6 +5284,39 @@ mod tests {
     }
 
     #[test]
+    fn force_find_missing_subpath_returns_empty_group_payload_instead_of_error() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base = std::env::temp_dir().join(format!("fs-meta-force-find-missing-subpath-{unique}"));
+        std::fs::create_dir_all(&base).expect("create base root");
+
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![RootSpec::new("nfs1", base.clone())];
+        cfg.host_object_grants = vec![test_export(
+            "node-a::nfs1",
+            "node-a",
+            "10.0.0.11",
+            base,
+            true,
+        )];
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+
+        let events = source
+            .force_find(&crate::query::request::InternalQueryRequest::force_find(
+                crate::query::request::QueryOp::Tree,
+                crate::query::request::QueryScope {
+                    path: b"/missing-subpath".to_vec(),
+                    ..Default::default()
+                },
+            ))
+            .expect("missing subpath should degrade to empty payload");
+        assert_eq!(events.len(), 1);
+    }
+
+    #[test]
     fn sentinel_trigger_rescan_bridges_into_rescan_channel() {
         let (tx, mut rx) = tokio::sync::broadcast::channel(2);
         FSMetaSource::execute_sentinel_actions(

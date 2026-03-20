@@ -19,6 +19,8 @@ use anyhow::{Context, bail};
 use capanix_app_fs_meta::RootSpec as RootEntry;
 use capanix_app_fs_meta::api::{ApiAuthConfig, BootstrapManagementConfig};
 use capanix_app_fs_meta::product::{FsMetaReleaseSpec, build_release_doc_value};
+use capanix_config::compile_scope_worker_intent_doc;
+use capanix_runtime_api::ScopeWorkerIntentDoc;
 use clap::{Args, Parser, Subcommand};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -224,29 +226,10 @@ async fn deploy(args: DeployArgs) -> anyhow::Result<serde_json::Value> {
     let product = load_product_config(&args.config)?;
     let state_dir = prepare_state_dir(args.config.parent(), ".fsmeta-state")?;
     let (auth_cfg, username, password) = build_auth_config(&product.auth, &state_dir);
-    let mut intent = build_release_doc_value(&FsMetaReleaseSpec {
-        app_id: DEFAULT_APP_ID.to_string(),
-        api_facade_resource_id: product.api.facade_resource_id.clone(),
-        auth: auth_cfg,
-        roots: Vec::new(),
-    });
     let (app_target, manifest_path) = resolve_fs_meta_runtime_inputs()?;
-    let unit = intent
-        .get_mut("units")
-        .and_then(serde_json::Value::as_array_mut)
-        .and_then(|units| units.first_mut())
-        .context("release document missing first unit")?;
-    let startup = unit
-        .get_mut("startup")
-        .and_then(serde_json::Value::as_object_mut)
-        .context("release document missing startup section")?;
-    startup.insert("path".into(), json!(app_target.display().to_string()));
-    startup.insert(
-        "manifest".into(),
-        json!(manifest_path.display().to_string()),
-    );
+    let intent = build_deploy_intent(&product, auth_cfg, &app_target, &manifest_path)?;
     let control = ControlClient::from_args(&args.control)?;
-    let result = control.apply_relation_target_value(intent).await?;
+    let result = control.apply_relation_target_intent(&intent).await?;
     Ok(json!({
         "status": "ok",
         "app_id": DEFAULT_APP_ID,
@@ -696,6 +679,121 @@ fn resolve_fs_meta_runtime_inputs() -> anyhow::Result<(PathBuf, PathBuf)> {
     Ok((binary_path, manifest_path))
 }
 
+fn build_deploy_intent(
+    product: &ProductConfig,
+    auth: ApiAuthConfig,
+    app_target: &Path,
+    manifest_path: &Path,
+) -> anyhow::Result<ScopeWorkerIntentDoc> {
+    let mut release_doc = build_release_doc_value(&FsMetaReleaseSpec {
+        app_id: DEFAULT_APP_ID.to_string(),
+        api_facade_resource_id: product.api.facade_resource_id.clone(),
+        auth,
+        roots: Vec::new(),
+    });
+    let target_generation = release_doc
+        .get("target_generation")
+        .and_then(serde_json::Value::as_u64)
+        .context("release document missing target_generation")?;
+    let unit = release_doc
+        .get_mut("units")
+        .and_then(serde_json::Value::as_array_mut)
+        .and_then(|units| units.first_mut())
+        .context("release document missing first unit")?;
+    let startup = unit
+        .get_mut("startup")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("release document missing startup section")?;
+    startup.insert("path".into(), json!(app_target.display().to_string()));
+    startup.insert(
+        "manifest".into(),
+        json!(manifest_path.display().to_string()),
+    );
+    let policy = unit
+        .get_mut("policy")
+        .and_then(serde_json::Value::as_object_mut)
+        .context("release document missing policy section")?;
+    policy.insert("generation".into(), json!(target_generation));
+
+    let intent_value = scope_unit_intent_to_scope_worker_intent_value(&release_doc)?;
+    let intent: ScopeWorkerIntentDoc =
+        serde_json::from_value(intent_value).context("decode fs-meta deploy intent failed")?;
+    compile_scope_worker_intent_doc(&intent)
+        .map_err(|err| anyhow::anyhow!("invalid fs-meta deploy intent: {err}"))?;
+    Ok(intent)
+}
+
+fn scope_unit_intent_to_scope_worker_intent_value(
+    doc: &serde_json::Value,
+) -> anyhow::Result<serde_json::Value> {
+    let units = doc
+        .get("units")
+        .and_then(serde_json::Value::as_array)
+        .context("scope-unit-intent doc missing units")?;
+    let target_id = doc
+        .get("target_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("target");
+    let target_generation = doc
+        .get("target_generation")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    let workers = units
+        .iter()
+        .map(|entry| {
+            let worker_role = entry
+                .get("worker_role")
+                .or_else(|| {
+                    entry
+                        .get("runtime")
+                        .and_then(|runtime| runtime.get("worker_role"))
+                })
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("main");
+            let worker_id = entry
+                .get("unit_id")
+                .or_else(|| entry.get("app"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("worker");
+            let startup_path = entry
+                .get("startup")
+                .and_then(|startup| startup.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("app");
+            let mut startup = serde_json::Map::new();
+            startup.insert("path".into(), serde_json::Value::String(startup_path.to_string()));
+            if let Some(manifest) = entry
+                .get("startup")
+                .and_then(|startup| startup.get("manifest"))
+                .cloned()
+            {
+                startup.insert("manifest".into(), manifest);
+            }
+            json!({
+                "worker_role": worker_role,
+                "worker_id": worker_id,
+                "scope_ids": entry.get("scope_ids").cloned().unwrap_or_else(|| json!([])),
+                "startup": serde_json::Value::Object(startup),
+                "config": entry.get("config").cloned().unwrap_or_else(|| json!({})),
+                "runtime": entry.get("runtime").cloned().unwrap_or_else(|| json!({})),
+                "policy": entry.get("policy").cloned().unwrap_or_else(|| json!({})),
+                "restart_policy": entry
+                    .get("restart_policy")
+                    .cloned()
+                    .unwrap_or_else(|| json!("Always")),
+                "version": entry.get("version").cloned().unwrap_or_else(|| json!("dev")),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "schema_version": "scope-worker-intent-v1",
+        "target_id": target_id,
+        "target_generation": target_generation,
+        "route_plans": doc.get("route_plans").cloned().unwrap_or_else(|| json!([])),
+        "workers": workers,
+    }))
+}
+
 fn ensure_fs_meta_app_runtime_path() -> anyhow::Result<PathBuf> {
     if let Some(path) = [
         std::env::var("CAPANIX_FS_META_APP_BINARY").ok(),
@@ -744,7 +842,7 @@ fn fs_meta_runtime_library_name() -> &'static str {
 
 fn workspace_root() -> anyhow::Result<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    Ok(manifest_dir.join("../../..").canonicalize()?)
+    Ok(manifest_dir.join("../..").canonicalize()?)
 }
 
 fn now_us() -> u64 {
@@ -782,11 +880,13 @@ impl ControlClient {
         })
     }
 
-    async fn apply_relation_target_value(
+    async fn apply_relation_target_intent(
         &self,
-        intent: serde_json::Value,
+        intent: &ScopeWorkerIntentDoc,
     ) -> anyhow::Result<serde_json::Value> {
-        let path = write_runtime_admin_temp_file("fsmeta-intent", &intent)?;
+        let value =
+            serde_json::to_value(intent).context("serialize scope-worker intent for submit failed")?;
+        let path = write_runtime_admin_temp_file("fsmeta-intent", &value)?;
         let output = self
             .run_cnxctl(&[
                 "app",
@@ -887,7 +987,10 @@ fn write_runtime_admin_temp_file(
 
 #[cfg(test)]
 mod tests {
-    use super::{ProductAuthConfig, build_auth_config, load_product_config};
+    use super::{
+        ProductAuthConfig, build_auth_config, build_deploy_intent, load_product_config,
+        workspace_root,
+    };
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -952,6 +1055,49 @@ mod tests {
                 .expect("bootstrap management")
                 .username,
             username
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_intent_uses_scope_worker_schema_and_shared_config_validation() {
+        let path = unique_temp_path("deploy-intent-config");
+        fs::write(
+            &path,
+            "api:\n  facade_resource_id: fs-meta-tcp-listener\nauth:\n  bootstrap_management:\n    username: admin\n",
+        )
+        .expect("write thin config");
+        let product = load_product_config(&path).expect("thin product config should parse");
+        let _ = fs::remove_file(&path);
+
+        let dir = std::env::temp_dir().join(format!(
+            "fsmeta-intent-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (auth_cfg, ..) = build_auth_config(&ProductAuthConfig::default(), &dir);
+
+        let manifest = workspace_root()
+            .expect("workspace root")
+            .join("fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml")
+            .canonicalize()
+            .expect("fixture manifest path");
+        let app_target = PathBuf::from("/tmp/capanix-app-fs-meta.so");
+        let intent = build_deploy_intent(&product, auth_cfg, &app_target, &manifest)
+            .expect("deploy intent should compile through shared config boundary");
+
+        assert_eq!(intent.schema_version, "scope-worker-intent-v1");
+        assert_eq!(intent.target_id, "fs-meta");
+        assert_eq!(intent.workers.len(), 1);
+        assert_eq!(intent.workers[0].worker_role, "main");
+        assert_eq!(intent.workers[0].startup.path, "/tmp/capanix-app-fs-meta.so");
+        assert_eq!(
+            intent.workers[0].startup.manifest.as_deref(),
+            Some(manifest.to_string_lossy().as_ref())
         );
 
         let _ = fs::remove_dir_all(&dir);

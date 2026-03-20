@@ -1,4 +1,5 @@
-version: 2.17.2
+---
+version: 3.0.0
 ---
 
 # L3 Runtime: fs-meta Workflows
@@ -324,7 +325,7 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 **Steps**
 
 1. operator runs `fsmeta deploy` with thin deploy config covering bootstrap API/auth concerns only.
-2. deploy helper generates internal release desired-state material, runtime subscriptions, execution-shape material, and startup material without exposing those details as product knobs.
+2. deploy helper consumes shared `capanix-config` config-loading, manifest-discovery, and intent-compilation semantics, then generates internal release desired-state material, runtime subscriptions, execution-shape material, and startup material without exposing those details as product knobs.
 3. deployed service starts validly with `roots=[]`.
 4. operator discovers runtime grants, previews monitoring roots, and applies online business monitoring scope through bounded product APIs.
 5. manual rescan remains an explicit repair action instead of being folded into deploy-time bootstrap config.
