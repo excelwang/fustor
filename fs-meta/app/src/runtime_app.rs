@@ -2781,15 +2781,28 @@ mod tests {
         .await
         .expect("activate scoped source generation");
 
-        let source_groups = app
-            .source
-            .status_snapshot()
-            .expect("source status")
-            .concrete_roots
-            .into_iter()
-            .filter(|root| root.active)
-            .map(|root| root.logical_root_id)
-            .collect::<std::collections::BTreeSet<_>>();
+        let source_groups = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                let groups = app
+                    .source
+                    .status_snapshot()
+                    .expect("source status")
+                    .concrete_roots
+                    .into_iter()
+                    .filter(|root| root.active)
+                    .map(|root| root.logical_root_id)
+                    .collect::<std::collections::BTreeSet<_>>();
+                if groups == std::collections::BTreeSet::from(["root-a".to_string()]) {
+                    break groups;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for source runtime scope convergence: {groups:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
         assert_eq!(
             source_groups,
             std::collections::BTreeSet::from(["root-a".to_string()])

@@ -1532,7 +1532,9 @@ impl SinkFileMeta {
             );
         }
         if pending_host_object_grants.is_some() || refresh_runtime_groups {
-            self.schedule_runtime_group_refresh();
+            let grants = self.logical_grants_snapshot()?;
+            self.reconcile_runtime_groups(&grants)?;
+            self.flush_buffered_stream_events()?;
         }
         log::debug!("sink-file-meta accepted {} control envelope(s)", validated);
         Ok(())
@@ -2781,9 +2783,29 @@ mod tests {
             .await
             .expect("grants change should flush buffered stream events");
 
-        let query_events = sink
-            .materialized_query(&default_materialized_request())
-            .expect("query after grants catch up");
+        let query_events = {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            loop {
+                let query_events = sink
+                    .materialized_query(&default_materialized_request())
+                    .expect("query after grants catch up");
+                let responses = query_events
+                    .iter()
+                    .map(decode_tree_payload)
+                    .collect::<Vec<_>>();
+                if responses
+                    .iter()
+                    .any(|response| payload_contains_path(response, b"/delayed.txt"))
+                {
+                    break query_events;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "timed out waiting for buffered stream replay after grants catch up"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        };
         let origins = query_events
             .iter()
             .map(|event| event.metadata().origin_id.0.clone())
