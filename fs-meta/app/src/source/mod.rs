@@ -704,10 +704,6 @@ impl FSMetaSource {
                     actions.push(PendingAction::UpdateHostObjectGrants(changed.clone()));
                 }
                 SourceControlSignal::ManualRescan { .. } => {
-                    eprintln!(
-                        "fs_meta_source: manual rescan control envelope received node={}",
-                        self.node_id.0
-                    );
                     let roots_snapshot = lock_or_recover(
                         &self.state_cell.roots,
                         "source.control.manual_rescan.roots",
@@ -1497,11 +1493,6 @@ impl FSMetaSource {
                 continue;
             }
             let root_key = Self::root_runtime_key(root);
-            eprintln!(
-                "fs_meta_source: queue {} rescan for primary root_key={}",
-                reason,
-                root_key
-            );
             if let Some(health) = fanout_health {
                 Self::mark_root_rescan_requested(health, &root_key, reason);
             }
@@ -1511,7 +1502,12 @@ impl FSMetaSource {
                 let mut intents =
                     lock_or_recover(intents, "source.manual_rescan_intents.queue");
                 let entry = intents.entry(root_key).or_default();
+                let should_signal = entry.requested <= entry.completed;
                 entry.requested = entry.requested.saturating_add(1);
+                if should_signal {
+                    let _ = root.rescan_tx.send(RescanReason::Manual);
+                }
+            } else {
                 let _ = root.rescan_tx.send(RescanReason::Manual);
             }
         }
@@ -2305,7 +2301,6 @@ impl FSMetaSource {
                 let control_roots = self.state_cell.roots_handle();
                 let control_fanout_health = self.state_cell.fanout_health_handle();
                 let control_manual_rescan_intents = self.state_cell.manual_rescan_intents_handle();
-                let control_node_id = self.node_id.clone();
                 let endpoint_task = ManagedEndpointTask::spawn_stream(
                     boundary.clone(),
                     route,
@@ -2316,11 +2311,6 @@ impl FSMetaSource {
                     self.shutdown.clone(),
                     move || true,
                     move |events| {
-                        eprintln!(
-                            "fs_meta_source: source.rescan control stream received node={} events={}",
-                            control_node_id.0,
-                            events.len()
-                        );
                         let roots_snapshot = lock_or_recover(
                             &control_roots,
                             "source.rescan.control_stream.roots.trigger",
@@ -2334,11 +2324,6 @@ impl FSMetaSource {
                                 "manual",
                             );
                         }
-                        eprintln!(
-                            "fs_meta_source: source.rescan control stream handled node={} events={}",
-                            control_node_id.0,
-                            events.len()
-                        );
                     },
                 );
                 lock_or_recover(
@@ -3757,7 +3742,7 @@ impl FSMetaSource {
                 audit_tick.tick().await;
             }
             let mut rescan_channel_open = root.spec.scan;
-            let mut dispatch_pending_manual = |last_manual_dispatch_target: &mut u64| {
+            let dispatch_pending_manual = |last_manual_dispatch_target: &mut u64| {
                 let requested_target = {
                     let intents = lock_or_recover(
                         &manual_rescan_intents,
@@ -3789,14 +3774,7 @@ impl FSMetaSource {
                     _ = global_shutdown.cancelled() => break,
                     _ = task_shutdown.cancelled() => break,
                     batch = scan_rx.recv(), if scan_channel_open => match batch {
-                        Some(batch) => {
-                            eprintln!(
-                                "fs_meta_source: root_stream yielding scan batch len={} root_key={}",
-                                batch.len(),
-                                root_key
-                            );
-                            yield batch;
-                        }
+                        Some(batch) => yield batch,
                         None => {
                             scan_channel_open = false;
                         }
@@ -3851,11 +3829,6 @@ impl FSMetaSource {
                                 None
                             };
                             let audit_started_at_us = now_us();
-                            eprintln!(
-                                "fs_meta_source: starting {} rescan root_key={}",
-                                reason_label,
-                                root_key
-                            );
                             Self::mark_root_audit_start(
                                 &fanout_health,
                                 &root_key,
@@ -3888,39 +3861,7 @@ impl FSMetaSource {
                             );
                             match rescan_batches {
                                 Ok(batches) => {
-                                    eprintln!(
-                                        "fs_meta_source: {} rescan produced batches={} root_key={}",
-                                        reason_label,
-                                        batches.len(),
-                                        root_key
-                                    );
-                                for (idx, batch) in batches.into_iter().enumerate() {
-                                    if matches!(reason, RescanReason::Manual) {
-                                        let data_paths = batch
-                                            .iter()
-                                            .filter_map(|event| {
-                                                rmp_serde::from_slice::<capanix_host_fs_types::FileMetaRecord>(
-                                                    event.payload_bytes(),
-                                                )
-                                                .ok()
-                                                .map(|record| {
-                                                    String::from_utf8_lossy(&record.path).into_owned()
-                                                })
-                                            })
-                                            .collect::<Vec<_>>();
-                                        eprintln!(
-                                            "fs_meta_source: manual rescan batch_index={} data_paths={:?} root_key={}",
-                                            idx,
-                                            data_paths,
-                                            root_key
-                                        );
-                                    }
-                                    eprintln!(
-                                        "fs_meta_source: rescan enqueue/yield batch_index={} len={} root_key={}",
-                                        idx,
-                                        batch.len(),
-                                        root_key
-                                        );
+                                    for batch in batches.into_iter() {
                                         if rescan_scan_tx.send(batch).await.is_err() {
                                             break;
                                         }
@@ -4793,6 +4734,75 @@ mod tests {
         assert!(matches!(
             non_primary_rx.expect("non-primary receiver").try_recv(),
             Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[test]
+    fn manual_rescan_requests_are_coalesced_while_one_is_pending() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![root("nfs1", "/mnt/nfs1")];
+        cfg.host_object_grants = vec![test_export(
+            "node-a::exp1",
+            "node-a",
+            "10.0.0.11",
+            "/mnt/nfs1",
+            true,
+        )];
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let primary_root = lock_or_recover(
+            &source.state_cell.roots,
+            "test.manual_rescan_requests_are_coalesced.roots",
+        )
+        .iter()
+        .find(|root| root.is_group_primary)
+        .cloned()
+        .expect("primary root exists");
+        let root_key = FSMetaSource::root_runtime_key(&primary_root);
+        let mut rx = primary_root.rescan_tx.subscribe();
+
+        FSMetaSource::request_rescan_on_primary_roots(
+            std::slice::from_ref(&primary_root),
+            None,
+            Some(&source.state_cell.manual_rescan_intents),
+            "manual",
+        );
+        FSMetaSource::request_rescan_on_primary_roots(
+            std::slice::from_ref(&primary_root),
+            None,
+            Some(&source.state_cell.manual_rescan_intents),
+            "manual",
+        );
+
+        assert!(matches!(
+            rx.try_recv().expect("first signal should be sent"),
+            RescanReason::Manual
+        ));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        {
+            let mut intents = lock_or_recover(
+                &source.state_cell.manual_rescan_intents,
+                "test.manual_rescan_requests_are_coalesced.intents",
+            );
+            let entry = intents.get_mut(&root_key).expect("intent exists");
+            assert_eq!(entry.requested, 2);
+            assert_eq!(entry.completed, 0);
+            entry.completed = entry.requested;
+        }
+
+        FSMetaSource::request_rescan_on_primary_roots(
+            std::slice::from_ref(&primary_root),
+            None,
+            Some(&source.state_cell.manual_rescan_intents),
+            "manual",
+        );
+        assert!(matches!(
+            rx.try_recv().expect("next signal should be re-armed after completion"),
+            RescanReason::Manual
         ));
     }
 

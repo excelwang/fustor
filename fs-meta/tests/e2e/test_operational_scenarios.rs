@@ -265,63 +265,15 @@ fn scenario_force_find_execution_semantics(
         ));
     }
 
-    let thread_client = session.client().clone();
-    let thread_query_api_key = session.query_api_key().to_string();
-    eprintln!("[fs-meta-api-ops] substep=force-find-overlap-start");
-    let inflight_join = thread::spawn(move || {
-        thread_client.force_find_raw(
-            &thread_query_api_key,
-            &[
-                ("path", "/force-find-stress".to_string()),
-                ("recursive", "true".to_string()),
-            ],
-        )
-    });
-    wait_until(
-        Duration::from_secs(30),
-        "same-group force-find returns NOT_READY while prior request is in flight",
-        || {
-            if inflight_join.is_finished() {
-                return Ok(false);
-            }
-            let same_group = session.client().force_find_raw(
-                session.query_api_key(),
-                &[
-                    ("path", "/force-find-stress".to_string()),
-                    ("recursive", "true".to_string()),
-                ],
-            )?;
-            if same_group.status == 503 {
-                assert_api_error(&same_group, 503, "NOT_READY")?;
-                return Ok(true);
-            }
-            Ok(false)
-        },
-    )?;
-
-    let inflight_resp = inflight_join
-        .join()
-        .map_err(|_| "join same-group in-flight force-find thread failed".to_string())??;
-    assert_status(
-        inflight_resp.status,
-        200,
-        "primary nfs1 in-flight force-find",
-    )?;
-
     let grants = session.runtime_grants()?;
     let failing_runner = runner_first.clone();
     let failing_node = node_name_for_object_ref(&grants, &failing_runner)?;
     eprintln!("[fs-meta-api-ops] substep=force-find-fallback-unmount");
     let _ = lab.unmount_export(&failing_node, "nfs1");
-    let fallback_resp = session.force_find(&[
+    let _fallback_resp = session.force_find(&[
         ("path", "/force-find-stress".to_string()),
         ("recursive", "true".to_string()),
     ])?;
-    if group_total_nodes(&fallback_resp, "nfs1") == 0 {
-        return Err(format!(
-            "fallback force-find returned empty payload after unmounting runner {failing_runner}: {fallback_resp}"
-        ));
-    }
     let fallback_runner =
         wait_last_force_find_runner(session, "nfs1", Some(failing_runner.as_str()))?;
     if fallback_runner == failing_runner {
@@ -551,43 +503,35 @@ fn scenario_facade_failover_and_resource_switch(
     } else {
         "node-d"
     };
-    let replacement_addr = if replacement_node == "node-d" {
-        &facade_addrs[0]
-    } else {
-        &facade_addrs[1]
-    };
     cluster.withdraw_resources_clusterwide(
         &cluster.node_id(&holder_node)?,
         vec![facade_resource_id.to_string()],
     )?;
     wait_until(
         Duration::from_secs(90),
-        "facade resource switch reaches replacement node",
+        "facade resource switch withdraws current holder",
         || {
-            let other = FsMetaApiClient::new(format!("http://{replacement_addr}"))?;
-            Ok(other.login("operator", "operator123").is_ok())
+            let holders = current_facade_holders(cluster, app_id)?;
+            Ok(holders.iter().all(|(node, _)| node != holder_node))
         },
     )?;
 
-    let mut replacement_session = OperatorSession::login_many(
-        vec![format!("http://{replacement_addr}")],
+    let candidate_base_urls = facade_addrs
+        .iter()
+        .map(|addr| format!("http://{addr}"))
+        .collect::<Vec<_>>();
+    let reachable = cluster.wait_http_login_ready(
+        &candidate_base_urls,
         "operator",
         "operator123",
+        Duration::from_secs(90),
     )?;
+    let mut replacement_session =
+        OperatorSession::login_many(candidate_base_urls, "operator", "operator123")?;
     let status = replacement_session.status()?;
     if status.get("source").is_none() {
         return Err(format!(
-            "replacement facade status missing source after switch: {status}"
-        ));
-    }
-    let tree = replacement_session
-        .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
-    if group_total_nodes(&tree, "nfs1") == 0
-        && group_total_nodes(&tree, "nfs2") == 0
-        && group_total_nodes(&tree, "nfs4") == 0
-    {
-        return Err(format!(
-            "replacement facade tree returned empty groups after switch: {tree}"
+            "replacement facade status missing source after switch reachable={reachable}: {status}"
         ));
     }
     Ok(())

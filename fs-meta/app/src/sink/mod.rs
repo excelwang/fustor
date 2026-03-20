@@ -1848,11 +1848,6 @@ impl SinkFileMeta {
         let mut pending_lag_samples = Vec::new();
         let mut control_events = 0usize;
         let mut data_events = 0usize;
-        let mut created = 0usize;
-        let mut modified = 0usize;
-        let mut deleted = 0usize;
-        let mut ignored = 0usize;
-        let mut touched_groups = BTreeSet::new();
         let mut state = self.state.write()?;
         let mut accepted = Vec::with_capacity(events.len());
 
@@ -1876,7 +1871,6 @@ impl SinkFileMeta {
             let object_ref = event.metadata().origin_id.0.clone();
             let (group_id, is_group_primary, group_state) =
                 state.ensure_group_state_mut(&object_ref)?;
-            touched_groups.insert(group_id.clone());
             group_state.clock.advance(event.metadata().timestamp_us);
 
             let payload = event.payload_bytes();
@@ -1923,15 +1917,6 @@ impl SinkFileMeta {
 
             let record: capanix_host_fs_types::FileMetaRecord = rmp_serde::from_slice(payload)
                 .map_err(|e| CnxError::InvalidInput(format!("invalid file-meta payload: {e}")))?;
-            if record.path.starts_with(b"/live-only") {
-                eprintln!(
-                    "fs_meta_sink: live-only record received group={} path={} kind={:?} audit_skipped={}",
-                    group_id,
-                    String::from_utf8_lossy(&record.path),
-                    record.event_kind,
-                    record.audit_skipped
-                );
-            }
             data_events += 1;
             if record.audit_skipped {
                 group_state
@@ -1969,12 +1954,6 @@ impl SinkFileMeta {
                 }
                 ProcessOutcome::Ignored => false,
             };
-            match outcome {
-                ProcessOutcome::UpsertCreated => created += 1,
-                ProcessOutcome::UpsertModified => modified += 1,
-                ProcessOutcome::DeleteApplied => deleted += 1,
-                ProcessOutcome::Ignored => ignored += 1,
-            }
             if write_significant {
                 group_state
                     .tree
@@ -2014,36 +1993,6 @@ impl SinkFileMeta {
             );
         }
 
-        if !touched_groups.is_empty() {
-            let state = self.state.read()?;
-            let summary = touched_groups
-                .into_iter()
-                .filter_map(|group_id| {
-                    state.groups.get(&group_id).map(|group| {
-                        format!(
-                            "{}:nodes={} live={} initial_audit_completed={}",
-                            group_id,
-                            group.tree.node_count(),
-                            query::get_health_stats(&group.tree, &group.clock).live_nodes,
-                            group.initial_audit_completed
-                        )
-                    })
-                })
-                .collect::<Vec<_>>()
-                .join("; ");
-            eprintln!(
-                "fs_meta_sink: apply_events summary total={} control={} data={} created={} modified={} deleted={} ignored={} groups=[{}]",
-                events.len(),
-                control_events,
-                data_events,
-                created,
-                modified,
-                deleted,
-                ignored,
-                summary
-            );
-        }
-
         Ok(())
     }
 
@@ -2068,19 +2017,6 @@ impl SinkFileMeta {
         for (group_id, group) in &state.groups {
             if selected_group.is_some_and(|selected| selected != group_id.as_str()) {
                 continue;
-            }
-            if request.op == QueryOp::Tree {
-                let sample_path = group
-                    .tree
-                    .iter()
-                    .map(|(path, _)| String::from_utf8_lossy(path).into_owned())
-                    .next();
-                eprintln!(
-                    "fs_meta_sink: materialized_query group={} query_path={} sample_path={:?}",
-                    group_id,
-                    String::from_utf8_lossy(&dir_path),
-                    sample_path
-                );
             }
             let payload = match request.op {
                 QueryOp::Tree => {

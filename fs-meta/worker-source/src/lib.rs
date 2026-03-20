@@ -102,13 +102,6 @@ where
                 .first()
                 .map(|event| event.metadata().origin_id.0.clone())
                 .unwrap_or_else(|| "__empty__".to_string());
-            if batch.len() > 50 {
-                eprintln!(
-                    "fs_meta_source_worker: queue stream batch len={} lane={}",
-                    batch.len(),
-                    lane
-                );
-            }
             let lane_tx = if let Some((tx, _)) = lanes.get(&lane) {
                 tx.clone()
             } else {
@@ -117,11 +110,6 @@ where
                 let lane_name = lane.clone();
                 let task = tokio::task::spawn_blocking(move || {
                     while let Some(batch) = rx.blocking_recv() {
-                        eprintln!(
-                            "fs_meta_source_worker: publish batch len={} lane={}",
-                            batch.len(),
-                            lane_name
-                        );
                         if let Err(err) = send_boundary.channel_send(
                             BoundaryContext::default(),
                             ChannelSendRequest {

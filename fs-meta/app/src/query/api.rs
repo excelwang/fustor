@@ -483,7 +483,6 @@ async fn ensure_materialized_queries_ready(state: &ApiState) -> Result<(), CnxEr
     let (Some(source), Some(sink)) = (&state.readiness_source, &state.readiness_sink) else {
         return Ok(());
     };
-    eprintln!("fs_meta_query_api: ensure_materialized_queries_ready begin");
     let source_status = source.status_snapshot()?;
     let sink_status = match &state.backend {
         QueryBackend::Route {
@@ -497,48 +496,23 @@ async fn ensure_materialized_queries_ready(state: &ApiState) -> Result<(), CnxEr
         )
         .await
         {
-            Ok(snapshot) => {
-                eprintln!(
-                    "fs_meta_query_api: readiness route sink-status ok groups={}",
-                    snapshot.groups.len()
-                );
-                Some(snapshot)
-            }
+            Ok(snapshot) => Some(snapshot),
             Err(CnxError::Timeout)
             | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ProtocolViolation(_)) => {
-                eprintln!(
-                    "fs_meta_query_api: readiness route sink-status unavailable; falling back to source-only gate"
-                );
-                None
-            }
-            Err(err) => {
-                eprintln!("fs_meta_query_api: readiness route sink-status failed err={err}");
-                return Err(err);
-            }
+            | Err(CnxError::ProtocolViolation(_)) => None,
+            Err(err) => return Err(err),
         },
-        QueryBackend::InProcess { .. } => {
-            let snapshot = sink.status_snapshot()?;
-            eprintln!(
-                "fs_meta_query_api: readiness inprocess sink-status ok groups={}",
-                snapshot.groups.len()
-            );
-            Some(snapshot)
-        }
+        QueryBackend::InProcess { .. } => Some(sink.status_snapshot()?),
     };
     match sink_status {
         Some(sink_status) => {
             if let Some(message) = materialized_query_readiness_error(&source_status, &sink_status)
             {
-                eprintln!("fs_meta_query_api: readiness not ready message={message}");
                 return Err(CnxError::NotReady(message));
             }
         }
         None => {
             if let Some(message) = materialized_query_source_gate_error(&source_status) {
-                eprintln!(
-                    "fs_meta_query_api: readiness source-only gate not ready message={message}"
-                );
                 return Err(CnxError::NotReady(message));
             }
         }
@@ -2564,7 +2538,6 @@ async fn get_stats(
     State(state): State<ApiState>,
     Query(params): Query<ApiParams>,
 ) -> impl IntoResponse {
-    eprintln!("fs_meta_query_api: get_stats handler entered");
     let policy = snapshot_policy(&state.policy);
     let params = match normalize_api_params(params) {
         Ok(params) => params,
@@ -2592,7 +2565,6 @@ async fn get_tree(
     State(state): State<ApiState>,
     Query(params): Query<ApiParams>,
 ) -> impl IntoResponse {
-    eprintln!("fs_meta_query_api: get_tree handler entered");
     let policy = snapshot_policy(&state.policy);
     let params = match normalize_api_params(params) {
         Ok(params) => params,
