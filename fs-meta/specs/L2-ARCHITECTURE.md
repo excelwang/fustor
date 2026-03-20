@@ -1,5 +1,5 @@
 ---
-version: 2.8.0
+version: 2.8.1
 ---
 
 # L2: fs-meta Domain Architecture
@@ -21,7 +21,7 @@ version: 2.8.0
    2. Outputs: `query/find` responses, domain events, and app-owned port boundaries.
    3. Role: encapsulate source/sink semantics, four worker roles (`facade-worker`, `source-worker`, `scan-worker`, `sink-worker`), thin runtime ABI participation, app-owned opaque ports, and resource-scoped HTTP facade semantics behind one app package boundary while allowing runtime to schedule multiple worker instances.
    3.1. Constraint: this boundary is a downstream app product container, not a generic reusable shared library package.
-   4. Canonical boundary path for ordinary app-facing runtime typing is `capanix-app-sdk` (authoring facade) -> `capanix-runtime-api` (runtime-owned typed surface) -> `capanix-kernel-api` (kernel-owned mirror only).
+   4. Canonical boundary path for ordinary app-facing runtime typing is `capanix-app-sdk` (default authoring facade) -> `capanix-runtime-api` (runtime-owned typed surface) -> `capanix-kernel-api` (kernel-owned mirror only).
    5. Product-facing execution vocabulary stays at `embedded | external`; realization mechanics remain internal.
 
 3. **Meta-Index Service (App Internal)**:
@@ -137,17 +137,18 @@ version: 2.8.0
 7. This split is intentionally `4`, not `3`, so heavy scan/audit work stays separate from live source/watch work.
 8. This split is intentionally `4`, not `5`, because query orchestration remains packaged with the facade until a separate query worker is justified.
 9. Product-facing worker modes are only `embedded | external`; operator-visible worker config uses `workers.facade.mode`, `workers.source.mode`, `workers.scan.mode`, and `workers.sink.mode`.
-10. Product-facing L0-L2 specs stay in worker/mode vocabulary; realization mechanics stay internal.
-11. `fs-meta/` is the product container directory only; it is not a Cargo package and exists to host the product app package, worker artifact packages, specs, docs, fixtures, and testdata.
-12. `fs-meta/app` is the main product app package for this container; it stays `publish = false`, owns package-local API/query/orchestration/business composition plus config/types, and does not define a generic reusable fs-meta library surface.
-13. Ordinary app-facing business/runtime modules default to the `capanix-app-sdk` curated re-export / raw-helper path; production business/runtime paths in the app package do not keep direct `capanix-runtime-api`, `capanix-kernel-api`, or `capanix-unit-sidecar` imports, while explicit test/dev fixtures may still depend on `capanix-runtime-api` for protocol assertions.
-14. The app package consumes `app-sdk`, product-owned `runtime-support`, `host-adapter-fs-meta`, `host-fs-types`, and `route-proto` as upstream authorities/support carriers; `product` remains the bounded product-facing CLI/tooling namespace, while `query`, `product::release_doc`, and `workers` may remain public package-local operational/test support surfaces without becoming product or platform authority.
-15. External-worker realization helpers remain confined to explicit worker runtime seams and low-level support crates; the app package may consume only the bounded typed worker transport/client surface from `runtime-support`, not raw bridge/bootstrap primitives.
-16. The upstream bridge-realization seam is low-level carrier glue only; `fs-meta/runtime-support/` owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision, while worker artifact crates own only their explicit server entry/bootstrap functions.
-17. The canonical worker transport contract preserves `Timeout` / `TransportClosed` categories and applies wall-clock total-timeout clipping before retry; transport failures are not flattened into a generic peer-error bucket.
-18. `embedded` workers share the host process; `external` workers run in dedicated worker processes.
-19. Constructor/bootstrap faults surface as typed `CnxError` / `init_error`; runtime local-execution join failures and worker/bootstrap faults are handled as app-local or local-execution-local errors or explicit degraded behavior rather than routine production `panic!` / `expect!` flow.
-20. Package-local implementation env seams remain bounded tuning knobs; `FS_META_SOURCE_SCAN_WORKERS`, `FS_META_SOURCE_AUDIT_INTERVAL_MS`, `FS_META_SOURCE_THROTTLE_INTERVAL_MS`, `FS_META_SINK_TOMBSTONE_TTL_MS`, `FS_META_SINK_TOMBSTONE_TOLERANCE_US`, and `FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS` tune implementation behavior without redefining truth, cutover, or query-surface contracts.
+10. Product-facing L0-L2 specs stay in worker/mode vocabulary; realization mechanics stay internal, but downstream architecture docs explicitly preserve the root `worker / process / unit` split.
+11. In fs-meta terms, `worker` names the product-facing role (`facade/source/scan/sink`), `process` names the hosting container selected by `embedded | external`, and `unit` remains the runtime-owned finest bind/run, activation, tick, and state-boundary identity.
+12. `fs-meta/` is the product container directory only; it is not a Cargo package and exists to host the product app package, worker artifact packages, specs, docs, fixtures, and testdata.
+13. `fs-meta/app` is the main product app package for this container; it stays `publish = false`, owns package-local API/query/orchestration/business composition plus config/types, and does not define a generic reusable fs-meta library surface.
+14. Ordinary app-facing business modules default to the `capanix-app-sdk` curated re-export / raw-helper path; narrow runtime glue, orchestration, and protocol-boundary seams MAY directly consume `capanix-runtime-api`, while production business/runtime modules in the app package do not depend on `capanix-kernel-api` or `capanix-unit-sidecar`.
+15. The app package consumes `app-sdk`, product-owned `runtime-support`, `host-adapter-fs-meta`, `host-fs-types`, and `route-proto` as upstream authorities/support carriers; `product` remains the bounded product-facing CLI/tooling namespace, while `query`, `product::release_doc`, and `workers` may remain public package-local operational/test support surfaces without becoming product or platform authority.
+16. External-worker realization helpers remain confined to explicit worker runtime seams and low-level support crates; the app package may consume only the bounded typed worker transport/client surface from `runtime-support`, not raw bridge/bootstrap primitives.
+17. The upstream bridge-realization seam is low-level carrier glue only; `fs-meta/runtime-support/` owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision, while worker artifact crates own only their explicit server entry/bootstrap functions.
+18. The canonical worker transport contract preserves `Timeout` / `TransportClosed` categories and applies wall-clock total-timeout clipping before retry; transport failures are not flattened into a generic peer-error bucket.
+19. `embedded` workers share the host process; `external` workers run in dedicated worker processes.
+20. Constructor/bootstrap faults surface as typed `CnxError` / `init_error`; runtime local-execution join failures and worker/bootstrap faults are handled as app-local or local-execution-local errors or explicit degraded behavior rather than routine production `panic!` / `expect!` flow.
+21. Package-local implementation env seams remain bounded tuning knobs; `FS_META_SOURCE_SCAN_WORKERS`, `FS_META_SOURCE_AUDIT_INTERVAL_MS`, `FS_META_SOURCE_THROTTLE_INTERVAL_MS`, `FS_META_SINK_TOMBSTONE_TTL_MS`, `FS_META_SINK_TOMBSTONE_TOLERANCE_US`, and `FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS` tune implementation behavior without redefining truth, cutover, or query-surface contracts.
 
 ## ARCHITECTURE.CLI_AND_TOOLING_BOUNDARY
 

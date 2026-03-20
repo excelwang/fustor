@@ -1,4 +1,4 @@
-version: 2.20.1
+version: 2.20.2
 ---
 
 # L1: fs-meta Domain Contracts
@@ -43,7 +43,7 @@ version: 2.20.1
 5. **THIN_RUNTIME_ABI_CONSUMPTION**: **fs-meta System** MUST consume only thin runtime ABI state (`host_object_grants`, run context, generation/lease, control events, channel hooks) at its app/runtime boundary.
    > Covers L0: VISION.THIN_RUNTIME_ABI_CONSUMPTION
    > Responsibility: keep fs-meta below runtime orchestration and above domain protocol ownership.
-   > Verification: fs-meta consumes the ordinary app-facing runtime surface through `capanix-app-sdk` authoring entrypoints and `capanix-runtime-api` typed boundaries; `capanix-kernel-api` remains only a low-level kernel-owned mirror or carrier vocabulary.
+   > Verification: fs-meta consumes the ordinary app-facing runtime surface through `capanix-app-sdk` as the default authoring surface and `capanix-runtime-api` as the typed runtime boundary mirror; `capanix-kernel-api` remains only a low-level kernel-owned mirror or carrier vocabulary.
 6. **APP_OWNS_OPAQUE_PORT_MEANING**: **fs-meta System** MUST keep query/find/source/sink rendezvous naming and protocol meaning app-owned over opaque channels.
    > Covers L0: VISION.APP_OWNS_OPAQUE_PORT_MEANING
    > Responsibility: prevent kernel/runtime/adapter layers from becoming owners of fs-meta protocol semantics.
@@ -364,7 +364,7 @@ version: 2.20.1
    > Responsibility: keep app package semantics downstream of domain/runtime authority instead of creating a parallel contract set.
    > Verification: main specs trace root/domain Convergence Vocabulary without redefining package-local authority terms.
    > Verification: main specs explicitly state fs-meta app implementation consumes fs-meta domain specs and root Convergence Vocabulary rather than redefining `Authoritative Truth`, `Observation`, `Projection`, or `Observation-Eligible`.
-   > Verification: ordinary app-facing imports and boundary-conversion seams flow through `capanix-app-sdk`; the app package does not keep a direct `capanix-runtime-api` or `capanix-kernel-api` dependency for business or infra modules.
+   > Verification: ordinary app-facing business modules default to `capanix-app-sdk`; narrow runtime glue and boundary-conversion seams MAY directly consume `capanix-runtime-api` without creating a second authoring authority, while `capanix-kernel-api` remains outside the app package business/infra surface.
    > Verification: `fs-meta/app` and other package-local authoring surfaces MUST NOT directly depend on or reference `capanix-kernel-api`, `capanix-unit-entry-macros`, or `capanix-unit-sidecar`; those remain limited to dedicated artifact/runtime crates, explicit bridge seams, or test/dev fixtures.
    > Verification: `fs-meta/app` remains the only product app package for the fs-meta container, stays `publish = false`, owns package-local business/runtime composition, and does not present a generic reusable fs-meta library API.
    > Verification: bounded `product` remains the product-facing CLI/tooling namespace, while public `query`, `product::release_doc`, and `workers` support surfaces may remain package-local operational/test support modules without becoming product or platform authority.

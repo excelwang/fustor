@@ -238,6 +238,9 @@ fn test_host_adapter_sdk_translation_boundary() {
     assert!(l1.contains("HOST_ADAPTER_SDK_TRANSLATION_BOUNDARY"));
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKFLOWS.md");
     assert!(l3.contains("host-adapter-sdk"));
+    assert!(l3.contains("post-bind dispatch"));
+    assert!(l3.contains("bound-host seam"));
+    assert!(l3.contains("也不拥有 locality resolution 或 target selection authority"));
 }
 
 // @verify_spec("CONTRACTS.KERNEL_RELATION.HOST_ADAPTER_SDK_TRANSLATION_BOUNDARY", mode="system")

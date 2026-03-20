@@ -1,11 +1,12 @@
-version: 1.0.0
+version: 1.0.1
 ---
 
 # L3 Runtime: fs-meta Observation Cutover
 
-fs-meta authoring remains centered on `capanix-app-sdk`; even
-boundary-conversion seams stay behind `app-sdk` raw helpers;
-`capanix-kernel-api` remains below that line as a low-level mirror.
+fs-meta authoring remains centered on `capanix-app-sdk`; narrow runtime-glue
+and boundary-conversion seams MAY consume `capanix-runtime-api` directly
+without becoming a second authoring authority, while `capanix-kernel-api`
+remains below that line as a low-level mirror.
 
 Product-facing execution language remains `embedded | external` worker mode over
 one `fs-meta` app product container with four worker roles. This L3 document

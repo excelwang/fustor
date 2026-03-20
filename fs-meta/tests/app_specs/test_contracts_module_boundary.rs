@@ -86,28 +86,29 @@ fn domain_contract_consumption_only() {
 fn app_sdk_authoring_path_is_primary() {
     let spec = read_app_spec("specs/L2-ARCHITECTURE.md");
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
+    let cutover = read_app_spec("specs/L3-RUNTIME/OBSERVATION_CUTOVER.md");
     let app_manifest = read_app_spec("app/Cargo.toml");
     let app_lib = read_app_spec("app/src/lib.rs");
     let source_mod = read_app_spec("src/source/mod.rs");
     let sink_mod = read_app_spec("src/sink/mod.rs");
     let query_api = read_app_spec("src/query/api.rs");
     let seam = read_app_spec("src/runtime/seam.rs");
+    let runtime_app = read_app_spec("src/runtime_app.rs");
     let state_cell = read_app_spec("src/state/cell.rs");
     assert!(spec.contains(
-        "Ordinary app-facing business/runtime modules default to the `capanix-app-sdk` curated re-export / raw-helper path"
+        "Ordinary app-facing business modules default to the `capanix-app-sdk` curated re-export / raw-helper path"
     ));
     assert!(l1.contains(
-        "the app package does not keep a direct `capanix-runtime-api` or `capanix-kernel-api` dependency"
+        "narrow runtime glue and boundary-conversion seams MAY directly consume `capanix-runtime-api`"
     ));
     assert!(l1.contains(
         "MUST NOT directly depend on or reference `capanix-kernel-api`, `capanix-unit-entry-macros`, or `capanix-unit-sidecar`"
     ));
+    assert!(cutover.contains(
+        "narrow runtime-glue\nand boundary-conversion seams MAY consume `capanix-runtime-api` directly"
+    ));
     assert!(app_manifest.contains("publish = false"));
     assert!(manifest_has_dependency(&app_manifest, "capanix-app-sdk"));
-    assert!(!manifest_has_dependency(
-        &app_manifest,
-        "capanix-runtime-api"
-    ));
     assert!(!manifest_has_dependency(
         &app_manifest,
         "capanix-kernel-api"
@@ -138,7 +139,6 @@ fn app_sdk_authoring_path_is_primary() {
     ));
     assert!(app_lib.contains("pub struct FSMetaConfig"));
     assert!(app_lib.contains("capanix_app_sdk"));
-    assert!(!app_lib.contains("use capanix_runtime_api"));
     assert!(!app_lib.contains("capanix_kernel_api"));
     assert!(!app_lib.contains("capanix_unit_sidecar"));
     assert!(!app_lib.contains("capanix_unit_entry_macros"));
@@ -155,8 +155,20 @@ fn app_sdk_authoring_path_is_primary() {
     assert!(!state_cell.contains("capanix_kernel_api"));
     assert!(seam.contains("capanix_app_sdk::raw::{ChannelIoSubset, channel_boundary_into_kernel}"));
     assert!(seam.contains("capanix_app_sdk::runtime::NodeId"));
+    assert!(seam.contains("Keep runtime-api boundary conversion out of business modules."));
+    assert!(runtime_app.contains("direct runtime-api use"));
     assert!(!seam.contains("capanix_runtime_api::channel_boundary_into_kernel"));
     assert!(!seam.contains("capanix_kernel_api"));
+}
+
+#[test]
+// @verify_spec("CONTRACTS.APP_SCOPE.WORKER_MODE_MODEL", mode="system")
+fn worker_process_unit_split_is_explicit() {
+    let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
+    assert!(l2.contains("root `worker / process / unit` split"));
+    assert!(l2.contains("`worker` names the product-facing role"));
+    assert!(l2.contains("`process` names the hosting container"));
+    assert!(l2.contains("`unit` remains the runtime-owned finest bind/run, activation, tick, and state-boundary identity"));
 }
 
 #[test]

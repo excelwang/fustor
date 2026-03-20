@@ -1,4 +1,4 @@
-version: 2.17.1
+version: 2.17.2
 ---
 
 # L3 Runtime: fs-meta Workflows
@@ -289,8 +289,8 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 **Steps**
 
 1. fs-meta 业务层通过 public host-fs facade 在绑定宿主本地发出低层元数据/目录/watch 请求。
-2. `host-adapter-sdk` 执行宿主本地 facade/ABI 适配，并保持 facade 形状稳定；它不是分布式宿主 host-operation forwarding 契约。
-3. kernel/runtime 仅承载通用 route/channel 与控制关系传播；host-facing 工作由绑定宿主上的 facade 消费。
+2. `host-adapter-sdk` 消费 runtime 已解析的 bound-host seam / post-bind dispatch 输入并执行宿主本地 facade/ABI 适配；它不是分布式宿主 host-operation forwarding 契约，也不拥有 locality resolution 或 target selection authority。
+3. kernel/runtime 仅承载通用 route/channel、post-bind dispatch、与控制关系传播；host-facing 工作由绑定宿主上的 facade 消费。
 4. fs-meta 业务层仅处理域策略与域数据融合，不处理 host-operation ABI 细节，也不拼装位置透明的远程宿主调用目录。
 5. host-object descriptors 到 groups 的映射由 fs-meta app 维护；runtime/kernel 不实现业务 fanout。
 
