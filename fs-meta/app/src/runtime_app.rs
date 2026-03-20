@@ -841,12 +841,14 @@ impl FSMetaApp {
             if let Some(current) = api_task_guard.as_ref()
                 && current.route_key == pending.route_key
                 && current.resource_ids == pending.resource_ids
+                && current.generation == pending.generation
             {
                 drop(api_task_guard);
                 let mut pending_guard = pending_facade.lock().await;
                 if pending_guard.as_ref().is_some_and(|candidate| {
                     candidate.route_key == pending.route_key
                         && candidate.resource_ids == pending.resource_ids
+                        && candidate.generation == pending.generation
                 }) {
                     pending_guard.take();
                 }
@@ -1151,6 +1153,7 @@ impl FSMetaApp {
             let mut api_task = self.api_task.lock().await;
             if let Some(current) = api_task.as_mut()
                 && current.resource_ids == candidate_resource_ids
+                && current.generation == generation
             {
                 current.generation = generation;
                 drop(api_task);
@@ -1756,9 +1759,13 @@ mod tests {
 
     impl ChannelIoSubset for NoopBoundary {}
 
+    fn facade_control_stream_route() -> String {
+        format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
+    }
+
     fn activate_envelope(unit_id: &str) -> ControlEnvelope {
         encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             unit_id: unit_id.to_string(),
             lease: None,
             generation: 1,
@@ -1783,7 +1790,7 @@ mod tests {
         generation: u64,
     ) -> ControlEnvelope {
         encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             unit_id: unit_id.to_string(),
             lease: None,
             generation,
@@ -1826,7 +1833,7 @@ mod tests {
     #[allow(dead_code)]
     fn tick_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
         encode_unit_tick_envelope(&UnitTick {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             unit_id: unit_id.to_string(),
             generation,
             at_ms: 1,
@@ -1837,7 +1844,7 @@ mod tests {
     #[allow(dead_code)]
     fn trusted_exposure_confirmed_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
         encode_unit_exposure_confirmed_envelope(&UnitExposureConfirmed {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             unit_id: unit_id.to_string(),
             generation,
             confirmed_at_us: 1,
@@ -2204,7 +2211,7 @@ mod tests {
             Err(err) => panic!("spawn active facade: {err}"),
         };
         *app.api_task.lock().await = Some(FacadeActivation {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             generation: 1,
             resource_ids: vec!["single-app-listener".to_string()],
             handle: existing,
@@ -2212,7 +2219,7 @@ mod tests {
 
         app.apply_facade_activate(
             FacadeRuntimeUnit::Facade,
-            ROUTE_KEY_FACADE_CONTROL,
+            &facade_control_stream_route(),
             2,
             &[capanix_route_proto::BoundScope {
                 scope_id: "test-root".to_string(),
@@ -2240,7 +2247,7 @@ mod tests {
             vec!["single-app-listener".to_string()]
         );
         assert!(pending.group_ids.is_empty());
-        assert_eq!(pending.route_key, ROUTE_KEY_FACADE_CONTROL);
+        assert_eq!(pending.route_key, facade_control_stream_route());
         assert!(pending.runtime_managed);
         assert!(!pending.runtime_exposure_confirmed);
         app.close().await.expect("close fs-meta app");
@@ -2303,13 +2310,13 @@ mod tests {
             Err(err) => panic!("spawn active facade: {err}"),
         };
         *app.api_task.lock().await = Some(FacadeActivation {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             generation: 1,
             resource_ids: vec!["single-app-listener".to_string()],
             handle: existing,
         });
         let readiness_pending = PendingFacadeActivation {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
             bound_scopes: vec![capanix_route_proto::BoundScope {
@@ -2410,7 +2417,7 @@ mod tests {
             Err(err) => panic!("spawn active facade: {err}"),
         };
         *app.api_task.lock().await = Some(FacadeActivation {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             generation: 1,
             resource_ids: vec!["single-app-listener".to_string()],
             handle: existing,
@@ -2418,7 +2425,7 @@ mod tests {
 
         app.apply_facade_activate(
             FacadeRuntimeUnit::Facade,
-            ROUTE_KEY_FACADE_CONTROL,
+            &facade_control_stream_route(),
             2,
             &[capanix_route_proto::BoundScope {
                 scope_id: "test-root".to_string(),
@@ -2527,7 +2534,7 @@ mod tests {
             Err(err) => panic!("spawn active facade: {err}"),
         };
         *app.api_task.lock().await = Some(FacadeActivation {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             generation: 1,
             resource_ids: vec!["single-app-listener".to_string()],
             handle: existing,
@@ -2535,7 +2542,7 @@ mod tests {
 
         app.apply_facade_activate(
             FacadeRuntimeUnit::Facade,
-            ROUTE_KEY_FACADE_CONTROL,
+            &facade_control_stream_route(),
             2,
             &[capanix_route_proto::BoundScope {
                 scope_id: "test-root".to_string(),
@@ -2634,7 +2641,7 @@ mod tests {
         .expect("init app");
 
         let pending = PendingFacadeActivation {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
             bound_scopes: vec![capanix_route_proto::BoundScope {
@@ -2693,7 +2700,7 @@ mod tests {
         .expect("init app");
 
         let pending = PendingFacadeActivation {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
             bound_scopes: vec![capanix_route_proto::BoundScope {
@@ -2814,7 +2821,7 @@ mod tests {
         );
 
         let pending = PendingFacadeActivation {
-            route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
+            route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
             bound_scopes: vec![capanix_route_proto::BoundScope {

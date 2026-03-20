@@ -1,4 +1,4 @@
-version: 2.17.1
+version: 2.17.2
 ---
 
 # L3 Runtime: fs-meta HTTP API Interfaces
@@ -189,7 +189,7 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
    2. `id` is an opaque server-issued query session id; clients do not derive meaning from it.
 8. `GroupEnvelopeStats` (used by `/stats`)
    1. required keys: `status`, `errors`; `members` key MUST be absent.
-   2. when `status=ok`: envelope MUST include `data` with `total_nodes/total_files/total_dirs/total_size/attested_count/blind_spot_count`, and `partial_failure`.
+   2. when `status=ok`: envelope MUST include `data` with `total_nodes/total_files/total_dirs/total_size/latest_file_mtime_us/attested_count/blind_spot_count`, and `partial_failure`.
    3. when `status=error`: envelope MUST include `message`; `data` key MUST be absent.
    4. before the active generation reaches materialized-query `observation_eligible`, `/stats` returns explicit `NOT_READY` / degraded status rather than silently serving partial materialized aggregates.
 

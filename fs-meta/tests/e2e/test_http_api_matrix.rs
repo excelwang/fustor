@@ -354,6 +354,7 @@ fn run_query_baseline_phase(
     let stats = session.stats(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
     let expected_stats = FsTreeOracle::stats_response(&all_mounts, "/", true, None)?;
     assert_json_eq("nfs1 stats", &stats, &expected_stats)?;
+    assert_stats_latest_file_mtime_present(&stats)?;
 
     let file_path = "/nested/child/deep.txt";
     eprintln!("[fs-meta-api-matrix] substep=query-file-tree");
@@ -413,6 +414,7 @@ fn run_query_baseline_phase(
     ])?;
     let expected_file_stats = FsTreeOracle::stats_response(&all_mounts, file_path, true, None)?;
     assert_json_eq("file-path stats", &file_stats, &expected_file_stats)?;
+    assert_stats_latest_file_mtime_present(&file_stats)?;
 
     let invalid_path_tree = session.tree(&[
         ("path", "/missing-dir".to_string()),
@@ -444,6 +446,7 @@ fn run_query_baseline_phase(
         &invalid_path_stats,
         &expected_invalid_path_stats,
     )?;
+    assert_stats_latest_file_mtime_present(&invalid_path_stats)?;
 
     let entry_one_tree = session.tree(&[
         ("path", "/".to_string()),
@@ -1244,6 +1247,38 @@ fn assert_error(response: ApiResponse, expected_status: u16, needle: &str) -> Re
             "expected response body to contain '{needle}', got {}",
             response.body
         ));
+    }
+    Ok(())
+}
+
+fn assert_stats_latest_file_mtime_present(stats: &Value) -> Result<(), String> {
+    let groups = stats
+        .get("groups")
+        .and_then(Value::as_object)
+        .ok_or_else(|| format!("stats response missing groups object: {stats}"))?;
+    if groups.is_empty() {
+        return Err(format!("stats response should expose at least one group: {stats}"));
+    }
+    for (group, envelope) in groups {
+        let Some(status) = envelope.get("status").and_then(Value::as_str) else {
+            return Err(format!("stats group missing status for {group}: {envelope}"));
+        };
+        if status != "ok" {
+            continue;
+        }
+        let latest = envelope
+            .get("data")
+            .and_then(|data| data.get("latest_file_mtime_us"))
+            .ok_or_else(|| {
+                format!(
+                    "stats group missing data.latest_file_mtime_us for {group}: {envelope}"
+                )
+            })?;
+        if !(latest.is_null() || latest.is_u64()) {
+            return Err(format!(
+                "stats group latest_file_mtime_us must be u64|null for {group}: {envelope}"
+            ));
+        }
     }
     Ok(())
 }

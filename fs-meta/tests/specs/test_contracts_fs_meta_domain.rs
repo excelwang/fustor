@@ -688,6 +688,7 @@ fn test_projection_view_contracts_are_migrated_to_main_specs() {
     assert!(l3_http.contains("\"groups\": TreeGroupEnvelope[]"));
     assert!(l3_http.contains("\"group_page\": GroupPage"));
     assert!(l3_http.contains("GroupEnvelopeStats"));
+    assert!(l3_http.contains("latest_file_mtime_us"));
 
     let projection_api = read_fs_meta_spec_file("fs-meta/app/src/query/api.rs");
     assert!(projection_api.contains(".route(\"/stats\""));
@@ -700,6 +701,7 @@ fn test_projection_view_contracts_are_migrated_to_main_specs() {
     assert!(projection_api.contains("body.insert(\"group_order\""));
     assert!(projection_api.contains("\"pit\".into()"));
     assert!(projection_api.contains("\"group_page\".into()"));
+    assert!(projection_api.contains("\"latest_file_mtime_us\": stats.latest_file_mtime_us"));
 }
 
 // @verify_spec("CONTRACTS.FAILURE_ISOLATION_BOUNDARY.INTERFACE_TASK_OR_WORKER_FAILURE_CONTAINMENT_TARGET", mode="system")

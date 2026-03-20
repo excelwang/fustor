@@ -4997,7 +4997,33 @@ mod tests {
             .await
             .expect("apply grants changed frame");
 
-        let updated = lock_or_recover(&source.state_cell.roots, "test.primary_after").clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        let updated = loop {
+            let snapshot = lock_or_recover(&source.state_cell.roots, "test.primary_after").clone();
+            let current_primary = snapshot
+                .iter()
+                .find(|root| root.is_group_primary)
+                .map(|root| root.object_ref.clone());
+            if current_primary.as_deref() == Some("node-a::exp2") {
+                break snapshot;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let object_refs = snapshot
+                    .iter()
+                    .map(|root| {
+                        format!(
+                            "{}:active={}:primary={}",
+                            root.object_ref, root.active, root.is_group_primary
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                panic!(
+                    "timed out waiting for primary failover; roots={}",
+                    object_refs.join(", ")
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        };
         let updated_primary = updated
             .iter()
             .find(|root| root.is_group_primary)
