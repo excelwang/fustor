@@ -481,6 +481,22 @@ impl FSMetaApp {
                                     "fs_meta_runtime_app: source status endpoint failed err={}",
                                     err
                                 );
+                                let snapshot = source.degraded_observability_snapshot(format!(
+                                    "source status snapshot unavailable: {err}"
+                                ));
+                                if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                    responses.push(Event::new(
+                                        EventMetadata {
+                                            origin_id: req.metadata().origin_id.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        bytes::Bytes::from(payload),
+                                    ));
+                                }
                             }
                         }
                     }

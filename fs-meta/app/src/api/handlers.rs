@@ -93,6 +93,7 @@ pub async fn status(
             Err(CnxError::Timeout)
             | Err(CnxError::TransportClosed(_))
             | Err(CnxError::ProtocolViolation(_)) => {
+                log::warn!("status falling back to local source observability after route error");
                 let runner_sets = local_source
                     .last_force_find_runner_by_group
                     .iter()
@@ -101,7 +102,13 @@ pub async fn status(
                 (local_source, runner_sets)
             }
             Err(err) => {
-                return Err(ApiError::internal(format!("source status route failed: {err}")));
+                log::warn!("status falling back to local source observability: {err}");
+                let runner_sets = local_source
+                    .last_force_find_runner_by_group
+                    .iter()
+                    .map(|(group, runner)| (group.clone(), vec![runner.clone()]))
+                    .collect::<BTreeMap<_, _>>();
+                (local_source, runner_sets)
             }
         },
         None => {

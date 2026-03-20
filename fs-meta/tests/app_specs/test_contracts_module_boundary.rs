@@ -579,6 +579,34 @@ fn operator_tooling_prefers_worker_oriented_runtime_wording() {
 }
 
 #[test]
+fn real_nfs_e2e_entrypoint_stays_aligned_with_support_preflight() {
+    let script = read_app_spec("scripts/fs-meta-api-e2e-real-nfs.sh");
+    let support = read_app_spec("tests/e2e/support/nfs_lab.rs");
+
+    for needle in [
+        "CAPANIX_REAL_NFS_E2E",
+        "/proc/fs/nfsd",
+        "rpcbind",
+        "rpc.nfsd",
+        "rpc.mountd",
+        "exportfs",
+        "mount",
+        "umount",
+        "pgrep",
+        "pkill",
+    ] {
+        assert!(
+            script.contains(needle),
+            "real NFS e2e shell entrypoint missing preflight requirement: {needle}"
+        );
+        assert!(
+            support.contains(needle),
+            "real NFS e2e Rust support missing preflight requirement: {needle}"
+        );
+    }
+}
+
+#[test]
 fn app_authoring_crate_stays_product_specific() {
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");

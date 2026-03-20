@@ -16,12 +16,17 @@ if [[ "$REAL_NFS_FLAG" != "1" ]]; then
   exit 0
 fi
 
+if [[ ! -e /proc/fs/nfsd ]]; then
+  echo "[fs-meta-api-e2e-real-nfs] skip: /proc/fs/nfsd is unavailable"
+  exit 0
+fi
+
 if ! sudo -n true >/dev/null 2>&1; then
   echo "[fs-meta-api-e2e-real-nfs] skip: requires passwordless sudo"
   exit 0
 fi
 
-for bin in rpcbind rpc.nfsd rpc.mountd exportfs mount umount; do
+for bin in rpcbind rpc.nfsd rpc.mountd exportfs mount umount pgrep pkill; do
   if ! command -v "$bin" >/dev/null 2>&1; then
     echo "[fs-meta-api-e2e-real-nfs] skip: missing $bin"
     exit 0

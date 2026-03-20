@@ -778,7 +778,9 @@ fn run_status_and_grants_checks(
     )?;
 
     eprintln!("[fs-meta-api-matrix] substep=status");
+    let metrics_before = session.bound_route_metrics()?;
     let status = session.status()?;
+    let metrics_after = session.bound_route_metrics()?;
     let source = status
         .get("source")
         .ok_or_else(|| format!("status missing source: {status}"))?;
@@ -795,6 +797,33 @@ fn run_status_and_grants_checks(
     }
     if sink.get("live_nodes").and_then(Value::as_u64).unwrap_or(0) == 0 {
         return Err(format!("expected live sink nodes in status: {status}"));
+    }
+    let sink_groups = sink
+        .get("groups")
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("status missing sink.groups array: {status}"))?;
+    if sink_groups.is_empty() {
+        return Err(format!("expected non-empty sink.groups in status: {status}"));
+    }
+    for group in sink_groups {
+        if !group.get("shadow_lag_us").is_some_and(Value::is_number) {
+            return Err(format!(
+                "status sink group missing numeric shadow_lag_us: {group}"
+            ));
+        }
+    }
+    let timeouts_before = metrics_before
+        .get("call_timeout_total")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("bound-route-metrics missing call_timeout_total: {metrics_before}"))?;
+    let timeouts_after = metrics_after
+        .get("call_timeout_total")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| format!("bound-route-metrics missing call_timeout_total: {metrics_after}"))?;
+    if timeouts_after != timeouts_before {
+        return Err(format!(
+            "status should not increase bound-route call_timeout_total: before={timeouts_before} after={timeouts_after} status={status} metrics_before={metrics_before} metrics_after={metrics_after}"
+        ));
     }
 
     eprintln!("[fs-meta-api-matrix] substep=runtime-grants");
