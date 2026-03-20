@@ -4864,7 +4864,8 @@ mod tests {
         let mut stale_signature = desired_signature.clone();
         stale_signature.watch = !desired_signature.watch;
 
-        let (out_tx, _out_rx) = mpsc::unbounded_channel::<Vec<Event>>();
+        let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<Event>>();
+        drop(out_rx);
         *lock_or_recover(&source.state_cell.stream_tx, "test.fallback.stream_tx") = Some(out_tx);
         source
             .state_cell
@@ -4928,6 +4929,8 @@ mod tests {
         assert_eq!(detail.candidate_revision, None);
         assert_eq!(detail.draining_revision, Some(1));
         assert_eq!(detail.draining_status.as_deref(), Some("retired"));
+
+        source.close().await.expect("close source");
     }
 
     #[tokio::test]

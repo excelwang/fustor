@@ -1348,9 +1348,15 @@ impl SinkFileMeta {
     }
 
     fn scheduled_stream_object_refs(&self) -> Result<Option<BTreeSet<String>>> {
-        let Some(allowed_groups) = self.scheduled_group_ids()? else {
+        let Some(bound_scopes) = self.scheduled_bound_scopes()? else {
             return Ok(None);
         };
+        let allowed_groups = bound_scopes
+            .iter()
+            .map(|scope| scope.scope_id.trim())
+            .filter(|scope_id| !scope_id.is_empty())
+            .map(|scope_id| scope_id.to_string())
+            .collect::<BTreeSet<_>>();
         if allowed_groups.is_empty() {
             return Ok(Some(BTreeSet::new()));
         }
@@ -1361,6 +1367,17 @@ impl SinkFileMeta {
             .clone();
         let grants = self.logical_grants_snapshot()?;
         let mut object_refs = BTreeSet::new();
+        for scope in &bound_scopes {
+            if !allowed_groups.contains(scope.scope_id.trim()) {
+                continue;
+            }
+            for resource_id in &scope.resource_ids {
+                let trimmed = resource_id.trim();
+                if !trimmed.is_empty() {
+                    object_refs.insert(trimmed.to_string());
+                }
+            }
+        }
         for root in roots {
             if !allowed_groups.contains(&root.id) {
                 continue;
