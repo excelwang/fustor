@@ -888,7 +888,7 @@ fn test_group_aware_sink_scheduling_contract() {
 fn test_unit_control_envelope_fencing_contract() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     assert!(l1.contains("UNIT_CONTROL_ENVELOPE_FENCING"));
-    assert!(l1.contains("unit_id") || l1.contains("worker_id"));
+    assert!(l1.contains("unit_id"));
     assert!(l1.contains("generation"));
     assert!(l1.contains("runtime.exec.*"));
     assert!(l1.contains("runtime.exec.*"));
