@@ -34,6 +34,37 @@ fn read_workspace_manifest() -> String {
     fs::read_to_string(workspace_root().join("Cargo.toml")).expect("read workspace manifest")
 }
 
+fn collect_rust_files(dir: &PathBuf, base: &PathBuf, out: &mut Vec<(String, String)>) {
+    let mut entries = fs::read_dir(dir)
+        .expect("read source directory")
+        .map(|entry| entry.expect("dir entry"))
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|entry| entry.path());
+    for entry in entries {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rust_files(&path, base, out);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(base)
+            .expect("relative path")
+            .to_string_lossy()
+            .replace('\\', "/");
+        out.push((rel, fs::read_to_string(&path).expect("read rust source")));
+    }
+}
+
+fn read_app_source_files() -> Vec<(String, String)> {
+    let app_src = fs_meta_root().join("app/src");
+    let mut out = Vec::new();
+    collect_rust_files(&app_src, &app_src, &mut out);
+    out
+}
+
 fn is_dependency_section(section: &str) -> bool {
     matches!(
         section,
@@ -169,6 +200,20 @@ fn worker_process_unit_split_is_explicit() {
     assert!(l2.contains("`worker` names the product-facing role"));
     assert!(l2.contains("`process` names the hosting container"));
     assert!(l2.contains("`unit` remains the runtime-owned finest bind/run, activation, tick, and state-boundary identity"));
+}
+
+#[test]
+fn direct_runtime_api_use_is_confined_to_runtime_glue() {
+    let files = read_app_source_files();
+    for (rel, src) in files {
+        if !src.contains("capanix_runtime_api") {
+            continue;
+        }
+        assert!(
+            rel.starts_with("runtime/") || rel == "runtime_app.rs",
+            "direct runtime-api use must stay confined to runtime glue, found in {rel}"
+        );
+    }
 }
 
 #[test]
