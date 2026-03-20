@@ -4000,8 +4000,8 @@ mod tests {
     use capanix_route_proto::{
         ExecActivate, ExecControl, ExecDeactivate, HostDescriptor, HostObjectGrant,
         HostObjectGrantState, HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged,
-        WorkerTick, encode_exec_control_envelope,
-        encode_runtime_host_object_grants_changed_envelope, encode_worker_tick_envelope,
+        UnitTick, encode_exec_control_envelope,
+        encode_runtime_host_object_grants_changed_envelope, encode_unit_tick_envelope,
     };
     use std::collections::BTreeSet;
 
@@ -4285,9 +4285,9 @@ mod tests {
     #[tokio::test]
     async fn unit_tick_control_frame_is_accepted() {
         let source = build_source(vec![]);
-        let envelope = encode_worker_tick_envelope(&WorkerTick {
+        let envelope = encode_unit_tick_envelope(&UnitTick {
             route_key: ROUTE_KEY_QUERY.to_string(),
-            worker_id: "runtime.exec.scan".to_string(),
+            unit_id: "runtime.exec.scan".to_string(),
             generation: 1,
             at_ms: 1,
         })
@@ -4302,9 +4302,9 @@ mod tests {
     #[tokio::test]
     async fn unit_tick_with_unknown_unit_id_is_rejected() {
         let source = build_source(vec![]);
-        let envelope = encode_worker_tick_envelope(&WorkerTick {
+        let envelope = encode_unit_tick_envelope(&UnitTick {
             route_key: ROUTE_KEY_QUERY.to_string(),
-            worker_id: "runtime.exec.unknown".to_string(),
+            unit_id: "runtime.exec.unknown".to_string(),
             generation: 1,
             at_ms: 1,
         })
@@ -4315,7 +4315,7 @@ mod tests {
             .await
             .expect_err("unknown unit id must be rejected");
         assert!(matches!(err, CnxError::NotSupported(_)));
-        assert!(err.to_string().contains("unsupported worker_id"));
+        assert!(err.to_string().contains("unsupported unit_id"));
     }
 
     #[tokio::test]
@@ -4323,7 +4323,7 @@ mod tests {
         let source = build_source(vec![]);
         let envelope = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
             route_key: ROUTE_KEY_QUERY.to_string(),
-            worker_id: "runtime.exec.unknown".to_string(),
+            unit_id: "runtime.exec.unknown".to_string(),
             lease: None,
             generation: 1,
             expires_at_ms: 1,
@@ -4336,7 +4336,7 @@ mod tests {
             .await
             .expect_err("unknown unit id must be rejected");
         assert!(matches!(err, CnxError::NotSupported(_)));
-        assert!(err.to_string().contains("unsupported worker_id"));
+        assert!(err.to_string().contains("unsupported unit_id"));
     }
 
     #[tokio::test]
@@ -4344,7 +4344,7 @@ mod tests {
         let source = build_source(vec![]);
         let activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
             route_key: ROUTE_KEY_QUERY.to_string(),
-            worker_id: "runtime.exec.scan".to_string(),
+            unit_id: "runtime.exec.scan".to_string(),
             lease: None,
             generation: 5,
             expires_at_ms: 1,
@@ -4359,7 +4359,7 @@ mod tests {
         let stale_deactivate =
             encode_exec_control_envelope(&ExecControl::Deactivate(ExecDeactivate {
                 route_key: ROUTE_KEY_QUERY.to_string(),
-                worker_id: "runtime.exec.scan".to_string(),
+                unit_id: "runtime.exec.scan".to_string(),
                 lease: None,
                 generation: 4,
                 reason: "test".to_string(),
@@ -4379,7 +4379,7 @@ mod tests {
         let source = build_source(vec![]);
         let activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
             route_key: ROUTE_KEY_QUERY.to_string(),
-            worker_id: "runtime.exec.scan".to_string(),
+            unit_id: "runtime.exec.scan".to_string(),
             lease: None,
             generation: 5,
             expires_at_ms: 1,
@@ -4393,7 +4393,7 @@ mod tests {
 
         let deactivate = encode_exec_control_envelope(&ExecControl::Deactivate(ExecDeactivate {
             route_key: ROUTE_KEY_QUERY.to_string(),
-            worker_id: "runtime.exec.scan".to_string(),
+            unit_id: "runtime.exec.scan".to_string(),
             lease: None,
             generation: 5,
             reason: "test".to_string(),
@@ -4406,7 +4406,7 @@ mod tests {
 
         let stale_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
             route_key: ROUTE_KEY_QUERY.to_string(),
-            worker_id: "runtime.exec.scan".to_string(),
+            unit_id: "runtime.exec.scan".to_string(),
             lease: None,
             generation: 4,
             expires_at_ms: 1,

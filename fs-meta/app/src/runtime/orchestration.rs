@@ -1,9 +1,9 @@
 use capanix_app_sdk::runtime::{ControlEnvelope, ControlFrame};
 use capanix_app_sdk::{CnxError, Result};
 use capanix_route_proto::{
-    BoundScope, ExecControl, RuntimeHostObjectGrantsChanged, TrustedExposureConfirmed,
+    BoundScope, ExecControl, RuntimeHostObjectGrantsChanged, UnitExposureConfirmed,
     decode_exec_control_envelope, decode_runtime_host_object_grants_changed_envelope,
-    decode_trusted_exposure_confirmed_envelope, decode_worker_tick_envelope,
+    decode_unit_exposure_confirmed_envelope, decode_unit_tick_envelope,
 };
 
 use crate::runtime::execution_units::{
@@ -233,9 +233,9 @@ fn facade_unit_from_id(unit_id: &str) -> Option<FacadeRuntimeUnit> {
 }
 
 fn facade_signal_from_trusted_exposure_confirmed(
-    confirmed: &TrustedExposureConfirmed,
+    confirmed: &UnitExposureConfirmed,
 ) -> Option<FacadeControlSignal> {
-    facade_unit_from_id(&confirmed.worker_id).map(|unit| FacadeControlSignal::ExposureConfirmed {
+    facade_unit_from_id(&confirmed.unit_id).map(|unit| FacadeControlSignal::ExposureConfirmed {
         unit,
         route_key: confirmed.route_key.clone(),
         generation: confirmed.generation,
@@ -251,10 +251,10 @@ pub(crate) fn source_control_signals_from_envelopes(
         if let Some(ctrl) = decode_exec_control_envelope(envelope)? {
             match ctrl {
                 ExecControl::Activate(activate) => {
-                    let Some(unit) = source_unit_from_id(&activate.worker_id) else {
+                    let Some(unit) = source_unit_from_id(&activate.unit_id) else {
                         return Err(CnxError::NotSupported(format!(
-                            "source-fs-meta: unsupported worker_id '{}' in control envelope",
-                            activate.worker_id
+                            "source-fs-meta: unsupported unit_id '{}' in control envelope",
+                            activate.unit_id
                         )));
                     };
                     signals.push(SourceControlSignal::Activate {
@@ -266,10 +266,10 @@ pub(crate) fn source_control_signals_from_envelopes(
                     });
                 }
                 ExecControl::Deactivate(deactivate) => {
-                    let Some(unit) = source_unit_from_id(&deactivate.worker_id) else {
+                    let Some(unit) = source_unit_from_id(&deactivate.unit_id) else {
                         return Err(CnxError::NotSupported(format!(
-                            "source-fs-meta: unsupported worker_id '{}' in control envelope",
-                            deactivate.worker_id
+                            "source-fs-meta: unsupported unit_id '{}' in control envelope",
+                            deactivate.unit_id
                         )));
                     };
                     signals.push(SourceControlSignal::Deactivate {
@@ -283,11 +283,11 @@ pub(crate) fn source_control_signals_from_envelopes(
             continue;
         }
 
-        if let Some(tick) = decode_worker_tick_envelope(envelope)? {
-            let Some(unit) = source_unit_from_id(&tick.worker_id) else {
+        if let Some(tick) = decode_unit_tick_envelope(envelope)? {
+            let Some(unit) = source_unit_from_id(&tick.unit_id) else {
                 return Err(CnxError::NotSupported(format!(
-                    "source-fs-meta: unsupported worker_id '{}' in control envelope",
-                    tick.worker_id
+                    "source-fs-meta: unsupported unit_id '{}' in control envelope",
+                    tick.unit_id
                 )));
             };
             signals.push(SourceControlSignal::Tick {
@@ -329,10 +329,10 @@ pub(crate) fn sink_control_signals_from_envelopes(
         if let Some(ctrl) = decode_exec_control_envelope(envelope)? {
             match ctrl {
                 ExecControl::Activate(activate) => {
-                    let Some(unit) = sink_unit_from_id(&activate.worker_id) else {
+                    let Some(unit) = sink_unit_from_id(&activate.unit_id) else {
                         return Err(CnxError::NotSupported(format!(
-                            "sink-file-meta: unsupported worker_id '{}' in control envelope",
-                            activate.worker_id
+                            "sink-file-meta: unsupported unit_id '{}' in control envelope",
+                            activate.unit_id
                         )));
                     };
                     signals.push(SinkControlSignal::Activate {
@@ -344,10 +344,10 @@ pub(crate) fn sink_control_signals_from_envelopes(
                     });
                 }
                 ExecControl::Deactivate(deactivate) => {
-                    let Some(unit) = sink_unit_from_id(&deactivate.worker_id) else {
+                    let Some(unit) = sink_unit_from_id(&deactivate.unit_id) else {
                         return Err(CnxError::NotSupported(format!(
-                            "sink-file-meta: unsupported worker_id '{}' in control envelope",
-                            deactivate.worker_id
+                            "sink-file-meta: unsupported unit_id '{}' in control envelope",
+                            deactivate.unit_id
                         )));
                     };
                     signals.push(SinkControlSignal::Deactivate {
@@ -361,11 +361,11 @@ pub(crate) fn sink_control_signals_from_envelopes(
             continue;
         }
 
-        if let Some(tick) = decode_worker_tick_envelope(envelope)? {
-            let Some(unit) = sink_unit_from_id(&tick.worker_id) else {
+        if let Some(tick) = decode_unit_tick_envelope(envelope)? {
+            let Some(unit) = sink_unit_from_id(&tick.unit_id) else {
                 return Err(CnxError::NotSupported(format!(
-                    "sink-file-meta: unsupported worker_id '{}' in control envelope",
-                    tick.worker_id
+                    "sink-file-meta: unsupported unit_id '{}' in control envelope",
+                    tick.unit_id
                 )));
             };
             signals.push(SinkControlSignal::Tick {
@@ -404,13 +404,13 @@ pub(crate) fn split_app_control_signals(
         if let Some(ctrl) = decode_exec_control_envelope(envelope)? {
             match ctrl {
                 ExecControl::Activate(activate) => {
-                    let to_source = source_unit_from_id(&activate.worker_id);
-                    let to_sink = sink_unit_from_id(&activate.worker_id);
-                    let to_facade = facade_unit_from_id(&activate.worker_id);
+                    let to_source = source_unit_from_id(&activate.unit_id);
+                    let to_sink = sink_unit_from_id(&activate.unit_id);
+                    let to_facade = facade_unit_from_id(&activate.unit_id);
                     if to_source.is_none() && to_sink.is_none() && to_facade.is_none() {
                         return Err(CnxError::NotSupported(format!(
-                            "fs-meta: unsupported worker_id '{}' in control envelope",
-                            activate.worker_id
+                            "fs-meta: unsupported unit_id '{}' in control envelope",
+                            activate.unit_id
                         )));
                     }
                     if let Some(unit) = to_source {
@@ -441,13 +441,13 @@ pub(crate) fn split_app_control_signals(
                     }
                 }
                 ExecControl::Deactivate(deactivate) => {
-                    let to_source = source_unit_from_id(&deactivate.worker_id);
-                    let to_sink = sink_unit_from_id(&deactivate.worker_id);
-                    let to_facade = facade_unit_from_id(&deactivate.worker_id);
+                    let to_source = source_unit_from_id(&deactivate.unit_id);
+                    let to_sink = sink_unit_from_id(&deactivate.unit_id);
+                    let to_facade = facade_unit_from_id(&deactivate.unit_id);
                     if to_source.is_none() && to_sink.is_none() && to_facade.is_none() {
                         return Err(CnxError::NotSupported(format!(
-                            "fs-meta: unsupported worker_id '{}' in control envelope",
-                            deactivate.worker_id
+                            "fs-meta: unsupported unit_id '{}' in control envelope",
+                            deactivate.unit_id
                         )));
                     }
                     if let Some(unit) = to_source {
@@ -478,14 +478,14 @@ pub(crate) fn split_app_control_signals(
             continue;
         }
 
-        if let Some(tick) = decode_worker_tick_envelope(envelope)? {
-            let to_source = source_unit_from_id(&tick.worker_id);
-            let to_sink = sink_unit_from_id(&tick.worker_id);
-            let to_facade = facade_unit_from_id(&tick.worker_id);
+        if let Some(tick) = decode_unit_tick_envelope(envelope)? {
+            let to_source = source_unit_from_id(&tick.unit_id);
+            let to_sink = sink_unit_from_id(&tick.unit_id);
+            let to_facade = facade_unit_from_id(&tick.unit_id);
             if to_source.is_none() && to_sink.is_none() && to_facade.is_none() {
                 return Err(CnxError::NotSupported(format!(
-                    "fs-meta: unsupported worker_id '{}' in control envelope",
-                    tick.worker_id
+                    "fs-meta: unsupported unit_id '{}' in control envelope",
+                    tick.unit_id
                 )));
             }
             if let Some(unit) = to_source {
@@ -514,7 +514,7 @@ pub(crate) fn split_app_control_signals(
             continue;
         }
 
-        if let Some(confirmed) = decode_trusted_exposure_confirmed_envelope(envelope)? {
+        if let Some(confirmed) = decode_unit_exposure_confirmed_envelope(envelope)? {
             if let Some(signal) = facade_signal_from_trusted_exposure_confirmed(&confirmed) {
                 facade.push(signal);
             }

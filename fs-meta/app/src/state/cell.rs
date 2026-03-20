@@ -70,7 +70,7 @@ fn signal_handle(scope: &str, signal: &str) -> StateCellHandle {
 }
 
 fn local_state_boundary_bridge(scope: &str) -> BoundaryContext {
-    BoundaryContext::for_worker(scope)
+    BoundaryContext::for_unit(scope)
 }
 
 fn is_statecell_not_found(err: &CnxError) -> bool {

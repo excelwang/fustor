@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use capanix_app_sdk::runtime::RouteKey;
 use capanix_host_adapter_fs_meta::{
-    ROUTE_KEY_HOST_OBJECT_PASSTHROUGH, ROUTE_TOKEN_HOST_OBJECT, RouteLookup, RouteLookupTable,
-    USE_PORT_HOST_PASSTHROUGH,
+    ROUTE_KEY_HOST_OBJECT_PASSTHROUGH, ROUTE_TOKEN_HOST_OBJECT, USE_PORT_HOST_PASSTHROUGH,
+    PostBindDispatch, PostBindDispatchTable,
 };
 
 pub const ROUTE_TOKEN_FS_META: &str = "fs-meta";
@@ -71,69 +71,69 @@ pub fn facade_source_rescan_route_key_for(node_id: &str) -> String {
     scoped_internal_route_key(ROUTE_KEY_FACADE_SOURCE_RESCAN_CONTROL, node_id)
 }
 
-pub fn default_route_bindings() -> Arc<RouteLookupTable> {
-    Arc::new(RouteLookupTable::new([
-        RouteLookup {
+pub fn default_route_bindings() -> Arc<PostBindDispatchTable> {
+    Arc::new(PostBindDispatchTable::new([
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_EVENTS.into(),
             use_port: METHOD_STREAM.into(),
             route: stream_route_key(ROUTE_KEY_EVENTS),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META.into(),
             use_port: METHOD_QUERY.into(),
             route: request_reply_route_key(ROUTE_KEY_QUERY),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META.into(),
             use_port: METHOD_FIND.into(),
             route: request_reply_route_key(ROUTE_KEY_FORCE_FIND),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SINK_QUERY.into(),
             route: request_reply_route_key(ROUTE_KEY_SINK_QUERY_INTERNAL),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SINK_QUERY_PROXY.into(),
             route: request_reply_route_key(ROUTE_KEY_SINK_QUERY_PROXY),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SINK_STATUS.into(),
             route: request_reply_route_key(ROUTE_KEY_SINK_STATUS_INTERNAL),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SOURCE_STATUS.into(),
             route: request_reply_route_key(ROUTE_KEY_SOURCE_STATUS_INTERNAL),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SOURCE_FIND.into(),
             route: request_reply_route_key(ROUTE_KEY_SOURCE_FIND_INTERNAL),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SOURCE_RESCAN.into(),
             route: request_reply_route_key(ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SOURCE_RESCAN_CONTROL.into(),
             route: stream_route_key(ROUTE_KEY_SOURCE_RESCAN_CONTROL),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SOURCE_ROOTS_CONTROL.into(),
             route: stream_route_key(ROUTE_KEY_SOURCE_ROOTS_CONTROL),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SINK_ROOTS_CONTROL.into(),
             route: stream_route_key(ROUTE_KEY_SINK_ROOTS_CONTROL),
         },
-        RouteLookup {
+        PostBindDispatch {
             route_token: ROUTE_TOKEN_HOST_OBJECT.into(),
             use_port: USE_PORT_HOST_PASSTHROUGH.into(),
             route: request_reply_route_key(ROUTE_KEY_HOST_OBJECT_PASSTHROUGH),

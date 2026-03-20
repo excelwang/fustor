@@ -897,7 +897,7 @@ fn test_unit_control_envelope_fencing_contract() {
     assert!(l3.contains("generation"));
 
     let cfg = read_fs_meta_spec_file("fs-meta/testdata/specs/fs-meta-contract-tests.config.md");
-    assert!(cfg.contains("unit_id + generation") || cfg.contains("worker_id + generation"));
+    assert!(cfg.contains("unit_id + generation"));
     assert!(cfg.contains("未知 unit 拒绝"));
     assert!(cfg.contains("过期代际信号忽略"));
     assert!(cfg.contains("runtime.exec.*"));
@@ -905,7 +905,7 @@ fn test_unit_control_envelope_fencing_contract() {
     let source = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
     assert!(source.contains("RuntimeUnitGate::new"));
     assert!(source.contains("SOURCE_RUNTIME_UNITS"));
-    assert!(source.contains("unsupported unit_id") || source.contains("unsupported worker_id"));
+    assert!(source.contains("unsupported unit_id"));
     assert!(source.contains("ignore stale activate"));
     assert!(source.contains("ignore stale deactivate"));
     assert!(source.contains("stale_deactivate_generation_is_ignored"));
@@ -914,7 +914,7 @@ fn test_unit_control_envelope_fencing_contract() {
     let sink = read_fs_meta_spec_file("fs-meta/app/src/sink/mod.rs");
     assert!(sink.contains("RuntimeUnitGate::new"));
     assert!(sink.contains("SINK_RUNTIME_UNITS"));
-    assert!(sink.contains("unsupported unit_id") || sink.contains("unsupported worker_id"));
+    assert!(sink.contains("unsupported unit_id"));
     assert!(sink.contains("ignore stale activate"));
     assert!(sink.contains("ignore stale deactivate"));
     assert!(sink.contains("stale_deactivate_generation_is_ignored"));
@@ -1473,19 +1473,19 @@ fn test_orchestration_token_parsing_boundary_contract() {
 
     let orchestration = read_fs_meta_spec_file("fs-meta/app/src/runtime/orchestration.rs");
     assert!(orchestration.contains("decode_exec_control_envelope("));
-    assert!(orchestration.contains("decode_worker_tick_envelope("));
+    assert!(orchestration.contains("decode_unit_tick_envelope("));
     assert!(orchestration.contains("decode_runtime_host_object_grants_changed_envelope("));
     assert!(orchestration.contains("source_unit_from_id("));
     assert!(orchestration.contains("sink_unit_from_id("));
 
     let source_mod = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
     assert!(!source_mod.contains("decode_exec_control_envelope("));
-    assert!(!source_mod.contains("decode_worker_tick_envelope("));
+    assert!(!source_mod.contains("decode_unit_tick_envelope("));
     assert!(!source_mod.contains("decode_runtime_host_object_grants_changed_envelope("));
 
     let sink_mod = read_fs_meta_spec_file("fs-meta/app/src/sink/mod.rs");
     assert!(!sink_mod.contains("decode_exec_control_envelope("));
-    assert!(!sink_mod.contains("decode_worker_tick_envelope("));
+    assert!(!sink_mod.contains("decode_unit_tick_envelope("));
     assert!(!sink_mod.contains("decode_runtime_host_object_grants_changed_envelope("));
 }
 

@@ -1703,10 +1703,10 @@ mod tests {
     use capanix_host_fs_types::{ControlEvent, FileMetaRecord, UnixStat};
     use capanix_route_proto::{
         ExecActivate, ExecControl, HostDescriptor, HostObjectGrant, HostObjectGrantState,
-        HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged, TrustedExposureConfirmed,
-        WorkerTick, encode_exec_control_envelope,
+        HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged, UnitExposureConfirmed,
+        UnitTick, encode_exec_control_envelope,
         encode_runtime_host_object_grants_changed_envelope,
-        encode_trusted_exposure_confirmed_envelope, encode_worker_tick_envelope,
+        encode_unit_exposure_confirmed_envelope, encode_unit_tick_envelope,
     };
     use reqwest::Client;
     use serde_json::json;
@@ -1743,7 +1743,7 @@ mod tests {
     fn activate_envelope(unit_id: &str) -> ControlEnvelope {
         encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
             route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
-            worker_id: unit_id.to_string(),
+            unit_id: unit_id.to_string(),
             lease: None,
             generation: 1,
             expires_at_ms: 60_000,
@@ -1768,7 +1768,7 @@ mod tests {
     ) -> ControlEnvelope {
         encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
             route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
-            worker_id: unit_id.to_string(),
+            unit_id: unit_id.to_string(),
             lease: None,
             generation,
             expires_at_ms: 60_000,
@@ -1809,9 +1809,9 @@ mod tests {
 
     #[allow(dead_code)]
     fn tick_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
-        encode_worker_tick_envelope(&WorkerTick {
+        encode_unit_tick_envelope(&UnitTick {
             route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
-            worker_id: unit_id.to_string(),
+            unit_id: unit_id.to_string(),
             generation,
             at_ms: 1,
         })
@@ -1820,9 +1820,9 @@ mod tests {
 
     #[allow(dead_code)]
     fn trusted_exposure_confirmed_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
-        encode_trusted_exposure_confirmed_envelope(&TrustedExposureConfirmed {
+        encode_unit_exposure_confirmed_envelope(&UnitExposureConfirmed {
             route_key: ROUTE_KEY_FACADE_CONTROL.to_string(),
-            worker_id: unit_id.to_string(),
+            unit_id: unit_id.to_string(),
             generation,
             confirmed_at_us: 1,
         })
@@ -2838,7 +2838,7 @@ mod tests {
             .expect_err("unknown unit must be rejected");
         assert!(matches!(
             err,
-            CnxError::NotSupported(msg) if msg.contains("unsupported worker_id")
+            CnxError::NotSupported(msg) if msg.contains("unsupported unit_id")
         ));
     }
 
@@ -2869,7 +2869,7 @@ mod tests {
             .expect_err("batch with unknown unit must fail atomically");
         assert!(matches!(
             err,
-            CnxError::NotSupported(msg) if msg.contains("unsupported worker_id")
+            CnxError::NotSupported(msg) if msg.contains("unsupported unit_id")
         ));
         assert_eq!(
             app.source

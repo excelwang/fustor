@@ -34,7 +34,7 @@ async fn offer_primary(app: &impl RuntimeBoundaryApp, route_key: impl Into<Strin
     for unit_id in &unit_ids {
         let ctrl = ExecControl::Activate(ExecActivate {
             route_key: route_key.clone(),
-            worker_id: unit_id.clone(),
+            unit_id: unit_id.clone(),
             lease: None,
             generation: 1,
             expires_at_ms: now_ms() + 60_000,
