@@ -47,11 +47,13 @@ use capanix_route_proto::{HostObjectGrantState, RuntimeHostObjectGrantsChanged};
 
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
-    SourceControlSignal, SourceRuntimeUnit, source_control_signals_from_envelopes,
+    SourceControlSignal, SourceRuntimeUnit, decode_logical_roots_control_payload,
+    source_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
     METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_RESCAN_CONTROL,
-    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, source_rescan_route_key_for,
+    METHOD_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
+    source_rescan_route_key_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
@@ -2355,6 +2357,73 @@ impl FSMetaSource {
             }
         }
 
+        match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL) {
+            Ok(route) => {
+                log::info!(
+                    "bound stream listening on {}.{} for deferred source {}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_ROOTS_CONTROL,
+                    self.node_id.0
+                );
+                let source = self.clone();
+                let control_node_id = self.node_id.clone();
+                let endpoint_task = ManagedEndpointTask::spawn_stream(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "source:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL
+                    ),
+                    self.shutdown.clone(),
+                    move || true,
+                    move |events| {
+                        eprintln!(
+                            "fs_meta_source: source.roots control stream received node={} events={}",
+                            control_node_id.0,
+                            events.len()
+                        );
+                        for event in events {
+                            let payload = match decode_logical_roots_control_payload(
+                                event.payload_bytes(),
+                            ) {
+                                Ok(payload) => payload,
+                                Err(err) => {
+                                    log::warn!(
+                                        "source logical-roots control decode failed on node {}: {:?}",
+                                        control_node_id.0,
+                                        err
+                                    );
+                                    continue;
+                                }
+                            };
+                            if let Err(err) = crate::runtime_app::shared_tokio_runtime()
+                                .block_on(source.update_logical_roots(payload.roots))
+                            {
+                                log::warn!(
+                                    "source logical-roots control apply failed on node {}: {:?}",
+                                    control_node_id.0,
+                                    err
+                                );
+                            }
+                        }
+                    },
+                );
+                lock_or_recover(
+                    &self.endpoint_tasks,
+                    "source.start_runtime_endpoints.roots_control_stream_tasks",
+                )
+                .push(endpoint_task);
+            }
+            Err(err) => {
+                log::error!(
+                    "failed to resolve deferred source stream route {}.{}: {:?}",
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_ROOTS_CONTROL,
+                    err
+                );
+            }
+        }
+
         {
             let route = capanix_app_sdk::runtime::RouteKey(source_rescan_route_key_for(
                 &node_id_rescan_scoped.0,
@@ -2774,7 +2843,7 @@ impl FSMetaSource {
             &self.state_cell.logical_root_fanout,
             "source.update.logical_root_fanout",
         ) = fanout;
-        self.refresh_runtime_roots(false).await?;
+        self.refresh_runtime_roots(true).await?;
         self.state_cell.record_authoritative_commit(
             "source.update_logical_roots",
             format!("roots={} host_object_grants={}", root_count, grant_count),

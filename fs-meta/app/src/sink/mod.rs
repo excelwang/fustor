@@ -42,11 +42,12 @@ use crate::query::tree::TreeGroupPayload;
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::execution_units::{SINK_RUNTIME_UNIT_ID, SINK_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
-    SinkControlSignal, SinkRuntimeUnit, sink_control_signals_from_envelopes,
+    SinkControlSignal, SinkRuntimeUnit, decode_logical_roots_control_payload,
+    sink_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
     METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
-    METHOD_STREAM,
+    METHOD_SINK_ROOTS_CONTROL, METHOD_STREAM,
     ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL,
     default_route_bindings,
 };
@@ -1154,7 +1155,7 @@ impl SinkFileMeta {
             let stream_sink_ready = stream_sink.clone();
             let stream_sink_apply = stream_sink.clone();
             let endpoint = ManagedEndpointTask::spawn_stream(
-                boundary,
+                boundary.clone(),
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
                 self.shutdown.clone(),
@@ -1168,6 +1169,58 @@ impl SinkFileMeta {
             lock_or_recover(
                 &self.endpoint_tasks,
                 "sink.start_runtime_endpoints.stream_tasks",
+            )
+            .push(endpoint);
+        }
+
+        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL) {
+            let sink = Arc::new(SinkFileMeta {
+                state: self.state.clone(),
+                root_specs: self.root_specs.clone(),
+                host_object_grants: self.host_object_grants.clone(),
+                visibility_lag: self.visibility_lag.clone(),
+                pending_stream_events: self.pending_stream_events.clone(),
+                unit_control: self.unit_control.clone(),
+                shutdown: self.shutdown.clone(),
+                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
+                runtime_refresh_running: Arc::new(AtomicBool::new(false)),
+            });
+            let endpoint = ManagedEndpointTask::spawn_stream(
+                boundary,
+                route,
+                format!(
+                    "sink:{}:{}",
+                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL
+                ),
+                self.shutdown.clone(),
+                move || true,
+                move |events| {
+                    for event in events {
+                        let payload = match decode_logical_roots_control_payload(event.payload_bytes())
+                        {
+                            Ok(payload) => payload,
+                            Err(err) => {
+                                log::warn!("sink logical-roots control decode failed: {:?}", err);
+                                continue;
+                            }
+                        };
+                        let grants = match sink.logical_grants_snapshot() {
+                            Ok(grants) => grants,
+                            Err(err) => {
+                                log::warn!("sink logical-roots control grants read failed: {:?}", err);
+                                continue;
+                            }
+                        };
+                        if let Err(err) = sink.update_logical_roots(payload.roots, &grants) {
+                            log::warn!("sink logical-roots control apply failed: {:?}", err);
+                        }
+                    }
+                },
+            );
+            lock_or_recover(
+                &self.endpoint_tasks,
+                "sink.start_runtime_endpoints.roots_control_tasks",
             )
             .push(endpoint);
         }

@@ -10,6 +10,7 @@ use crate::runtime::execution_units::{
     FACADE_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID,
     SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
+use crate::source::config::RootSpec;
 
 pub(crate) const MANUAL_RESCAN_CONTROL_FRAME_KIND: &str =
     "fs-meta.manual-rescan-control:v1";
@@ -29,6 +30,23 @@ pub(crate) fn encode_manual_rescan_envelope(requested_at_us: u64) -> Result<Cont
                 ))
             })?,
     }))
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct LogicalRootsControlPayload {
+    pub roots: Vec<RootSpec>,
+}
+
+pub(crate) fn encode_logical_roots_control_payload(roots: &[RootSpec]) -> Result<Vec<u8>> {
+    rmp_serde::to_vec_named(&LogicalRootsControlPayload {
+        roots: roots.to_vec(),
+    })
+    .map_err(|err| CnxError::Internal(format!("encode logical roots control payload failed: {err}")))
+}
+
+pub(crate) fn decode_logical_roots_control_payload(payload: &[u8]) -> Result<LogicalRootsControlPayload> {
+    rmp_serde::from_slice::<LogicalRootsControlPayload>(payload)
+        .map_err(|err| CnxError::InvalidInput(format!("decode logical roots control payload failed: {err}")))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

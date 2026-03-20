@@ -14,7 +14,11 @@ use capanix_app_sdk::runtime::{EventMetadata, NodeId};
 use capanix_app_sdk::{CnxError, raw::ChannelIoSubset};
 use capanix_host_adapter_fs_meta::HostAdapter;
 
-use crate::runtime::routes::{METHOD_SOURCE_STATUS, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings};
+use crate::runtime::orchestration::encode_logical_roots_control_payload;
+use crate::runtime::routes::{
+    METHOD_SOURCE_STATUS, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
+};
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
 use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
@@ -266,21 +270,7 @@ pub async fn roots_put(
         eprintln!("fs_meta_api: roots_put source update failed: {err}");
         err
     })?;
-    if state.sink.is_worker() {
-        refresh_policy_from_host_object_grants(&state.projection_policy, &grants);
-        return Ok(Json(RootsUpdateResponse {
-            roots_count: state
-                .source
-                .logical_roots_snapshot()
-                .map_err(|snapshot_err| {
-                    ApiError::internal(format!(
-                        "source logical roots snapshot failed: {snapshot_err}"
-                    ))
-                })?
-                .len(),
-        }));
-    }
-    let previous_sink_roots = state.sink.logical_roots_snapshot()?;
+    let previous_sink_roots = state.sink.cached_logical_roots_snapshot()?;
     if let Err(err) = state.sink.update_logical_roots(roots.clone(), &grants) {
         eprintln!("fs_meta_api: roots_put sink sync failed: {err}");
         let sink_rollback = state
@@ -304,6 +294,39 @@ pub async fn roots_put(
                 "roots update diverged after sink sync failure: sink={err}; sink_rollback={sink_rollback_err}; source_rollback={source_rollback_err}"
             ))),
         };
+    }
+    if let Some(boundary) = state.runtime_boundary.as_ref() {
+        let payload = encode_logical_roots_control_payload(&roots).map_err(|err| {
+            ApiError::internal(format!("logical roots control payload encode failed: {err}"))
+        })?;
+        for route_key in [ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SINK_ROOTS_CONTROL] {
+            boundary
+                .channel_send(
+                    BoundaryContext::default(),
+                    ChannelSendRequest {
+                        channel_key: ChannelKey(format!("{route_key}.stream")),
+                        events: vec![Event::new(
+                            EventMetadata {
+                                origin_id: state.node_id.clone(),
+                                timestamp_us: SystemTime::now()
+                                    .duration_since(UNIX_EPOCH)
+                                    .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
+                                    .unwrap_or(0),
+                                logical_ts: None,
+                                correlation_id: None,
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            bytes::Bytes::from(payload.clone()),
+                        )],
+                    },
+                )
+                .map_err(|err| {
+                    ApiError::internal(format!(
+                        "logical roots control send failed route={route_key}: {err}"
+                    ))
+                })?;
+        }
     }
     refresh_policy_from_host_object_grants(&state.projection_policy, &grants);
 

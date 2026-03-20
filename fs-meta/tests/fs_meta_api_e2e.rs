@@ -37,6 +37,72 @@ fn fs_meta_operational_scenarios_real_nfs() {
 
 #[test]
 #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_force_find_execution_semantics_real_nfs() {
+    test_operational_scenarios::run_force_find_execution_semantics().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_new_nfs_join_real_nfs() {
+    test_operational_scenarios::run_new_nfs_join().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_root_path_modify_real_nfs() {
+    test_operational_scenarios::run_root_path_modify().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_visibility_change_and_sink_selection_real_nfs() {
+    test_operational_scenarios::run_visibility_change_and_sink_selection().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_sink_failover_real_nfs() {
+    test_operational_scenarios::run_sink_failover().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_facade_failover_and_resource_switch_real_nfs() {
+    test_operational_scenarios::run_facade_failover_and_resource_switch().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_operational_nfs_retire_real_nfs() {
+    test_operational_scenarios::run_nfs_retire().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
 fn fs_meta_release_upgrade_real_nfs() {
     test_release_upgrade::run().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_release_upgrade_roots_persist_real_nfs() {
+    test_release_upgrade::run_roots_persist_across_upgrade().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_release_upgrade_tree_stats_stable_real_nfs() {
+    test_release_upgrade::run_tree_stats_stable_across_upgrade().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_release_upgrade_window_join_real_nfs() {
+    test_release_upgrade::run_upgrade_window_join().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_release_upgrade_cpu_budget_real_nfs() {
+    test_release_upgrade::run_cpu_budget().unwrap();
 }

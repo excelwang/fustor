@@ -17,21 +17,117 @@ use std::thread;
 use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UpgradeMode {
+    Smoke,
+    RootsPersistAcrossUpgrade,
+    TreeStatsStableAcrossUpgrade,
+    UpgradeWindowJoin,
+    CpuBudget,
+}
+
+impl UpgradeMode {
+    fn app_prefix(self) -> &'static str {
+        match self {
+            Self::Smoke => "fs-meta-api-upgrade-smoke",
+            Self::RootsPersistAcrossUpgrade => "fs-meta-api-upgrade-roots",
+            Self::TreeStatsStableAcrossUpgrade => "fs-meta-api-upgrade-tree-stats",
+            Self::UpgradeWindowJoin => "fs-meta-api-upgrade-window",
+            Self::CpuBudget => "fs-meta-api-upgrade-cpu",
+        }
+    }
+}
+
+struct UpgradeHarness {
+    cluster: Cluster5,
+    lab: NfsLab,
+    session: OperatorSession,
+    candidate_base_urls: Vec<String>,
+    app_id: String,
+    facade_resource_id: String,
+    roots: Vec<RootSpec>,
+    baseline_cpu: BTreeMap<String, Vec<u32>>,
+}
+
 pub fn run() -> Result<(), String> {
+    run_mode(UpgradeMode::Smoke)
+}
+
+pub fn run_roots_persist_across_upgrade() -> Result<(), String> {
+    run_mode(UpgradeMode::RootsPersistAcrossUpgrade)
+}
+
+pub fn run_tree_stats_stable_across_upgrade() -> Result<(), String> {
+    run_mode(UpgradeMode::TreeStatsStableAcrossUpgrade)
+}
+
+pub fn run_upgrade_window_join() -> Result<(), String> {
+    run_mode(UpgradeMode::UpgradeWindowJoin)
+}
+
+pub fn run_cpu_budget() -> Result<(), String> {
+    run_mode(UpgradeMode::CpuBudget)
+}
+
+fn run_mode(mode: UpgradeMode) -> Result<(), String> {
     if let Some(reason) = skip_unless_real_nfs_enabled() {
         eprintln!("[fs-meta-api-upgrade] skipped: {reason}");
         return Ok(());
     }
 
+    let mut harness = build_upgrade_harness(
+        mode.app_prefix(),
+        matches!(mode, UpgradeMode::UpgradeWindowJoin),
+        1,
+    )?;
+    match mode {
+        UpgradeMode::Smoke => upgrade_to_generation_two(&mut harness)?,
+        UpgradeMode::RootsPersistAcrossUpgrade => {
+            scenario_roots_persist_across_upgrade(&mut harness)?
+        }
+        UpgradeMode::TreeStatsStableAcrossUpgrade => {
+            scenario_tree_stats_stable_across_upgrade(&mut harness)?
+        }
+        UpgradeMode::UpgradeWindowJoin => scenario_upgrade_window_join(&mut harness)?,
+        UpgradeMode::CpuBudget => scenario_cpu_budget(&mut harness)?,
+    }
+
+    Ok(())
+}
+
+fn build_upgrade_harness(
+    app_prefix: &str,
+    preannounce_nfs4: bool,
+    facade_count: usize,
+) -> Result<UpgradeHarness, String> {
     let mut lab = NfsLab::start()?;
     seed_baseline_content(&lab)?;
     let cluster = Cluster5::start()?;
     let baseline_cpu = measure_baseline_cpu(&cluster)?;
 
-    let app_id = format!("fs-meta-api-upgrade-{}", unique_suffix());
+    let app_id = format!("{app_prefix}-{}", unique_suffix());
     let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
-    let facade_addrs = reserve_http_addrs(2)?;
+    let facade_addrs = reserve_http_addrs(facade_count)?;
     mount_and_announce(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
+    if preannounce_nfs4 {
+        lab.create_export("nfs4")?;
+        let mount_a = lab.mount_export("node-a", "nfs4")?;
+        let mount_c = lab.mount_export("node-c", "nfs4")?;
+        let mount_d = lab.mount_export("node-d", "nfs4")?;
+        for (node_name, mount_path) in [
+            ("node-a", mount_a),
+            ("node-c", mount_c),
+            ("node-d", mount_d),
+        ] {
+            cluster.announce_resources_clusterwide(vec![json!({
+                "resource_id": "nfs4",
+                "node_id": cluster.node_id(node_name)?,
+                "resource_kind": "nfs",
+                "source": lab.export_source("nfs4"),
+                "mount_hint": mount_path.display().to_string(),
+            })])?;
+        }
+    }
 
     let roots = vec![
         root_spec("nfs1", &lab.export_source("nfs1")),
@@ -40,28 +136,185 @@ pub fn run() -> Result<(), String> {
     let release_v1 =
         cluster.build_fs_meta_release(&app_id, &facade_resource_id, roots.clone(), 1, true)?;
     cluster.apply_release("node-a", release_v1)?;
-    let base_url = cluster.wait_http_login_ready(
-        &facade_addrs
-            .iter()
-            .map(|addr| format!("http://{addr}"))
-            .collect::<Vec<_>>(),
-        "operator",
-        "operator123",
-        Duration::from_secs(120),
-    )?;
+
     let candidate_base_urls = facade_addrs
         .iter()
         .map(|addr| format!("http://{addr}"))
         .collect::<Vec<_>>();
-    let _session =
-        OperatorSession::login_many(candidate_base_urls, "operator", "operator123")?;
+    let _base_url = cluster.wait_http_login_ready(
+        &candidate_base_urls,
+        "operator",
+        "operator123",
+        Duration::from_secs(120),
+    )?;
+    let session =
+        OperatorSession::login_many(candidate_base_urls.clone(), "operator", "operator123")?;
 
-    let release_v2 =
-        cluster.build_fs_meta_release(&app_id, &facade_resource_id, roots.clone(), 2, true)?;
-    cluster.apply_release("node-a", release_v2)?;
-    wait_for_generation(&cluster, 2)?;
+    Ok(UpgradeHarness {
+        cluster,
+        lab,
+        session,
+        candidate_base_urls,
+        app_id,
+        facade_resource_id,
+        roots,
+        baseline_cpu,
+    })
+}
+
+fn upgrade_to_generation_two(harness: &mut UpgradeHarness) -> Result<(), String> {
+    let release_v2 = harness.cluster.build_fs_meta_release(
+        &harness.app_id,
+        &harness.facade_resource_id,
+        harness.roots.clone(),
+        2,
+        true,
+    )?;
+    harness.cluster.apply_release("node-a", release_v2)?;
+    wait_for_generation(&harness.cluster, 2)?;
+    harness.session = OperatorSession::login_many(
+        harness.candidate_base_urls.clone(),
+        "operator",
+        "operator123",
+    )?;
+    Ok(())
+}
+
+fn wait_for_primary_tree_materialization(
+    session: &mut OperatorSession,
+    reason: &str,
+) -> Result<(), String> {
+    wait_until(Duration::from_secs(120), reason, || {
+        let tree = match session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())]) {
+            Ok(tree) => tree,
+            Err(err) => {
+                let status = session
+                    .status()
+                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                return Err(format!("tree request failed: {err}; status={status}"));
+            }
+        };
+        if group_total_nodes(&tree, "nfs1") > 0 && group_total_nodes(&tree, "nfs2") > 0 {
+            Ok(true)
+        } else {
+            let status = session
+                .status()
+                .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+            Err(format!("tree={tree}; status={status}"))
+        }
+    })
+}
+
+fn wait_for_management_stabilized(
+    session: &mut OperatorSession,
+    reason: &str,
+) -> Result<(), String> {
+    wait_until(Duration::from_secs(60), reason, || {
+        let status = match session.status() {
+            Ok(status) => status,
+            Err(_) => return Ok(false),
+        };
+        Ok(status.get("source").is_some() || status.get("facade").is_some())
+    })
+}
+
+fn current_root_ids(session: &mut OperatorSession) -> Result<Vec<String>, String> {
+    let current_roots = session.monitoring_roots()?;
+    Ok(current_roots
+        .get("roots")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default())
+}
+
+fn scenario_roots_persist_across_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
+    upgrade_to_generation_two(harness)?;
+
+    let root_ids = current_root_ids(&mut harness.session)?;
+    if root_ids != vec!["nfs1", "nfs2"] {
+        return Err(format!(
+            "roots changed unexpectedly across upgrade: {:?}",
+            harness.session.monitoring_roots()?
+        ));
+    }
 
     Ok(())
+}
+
+fn scenario_tree_stats_stable_across_upgrade(harness: &mut UpgradeHarness) -> Result<(), String> {
+    upgrade_to_generation_two(harness)?;
+    let _ = harness.cluster.wait_http_login_ready(
+        &harness.candidate_base_urls,
+        "operator",
+        "operator123",
+        Duration::from_secs(120),
+    )?;
+    harness.session = OperatorSession::login_many(
+        harness.candidate_base_urls.clone(),
+        "operator",
+        "operator123",
+    )?;
+    Ok(())
+}
+
+fn scenario_upgrade_window_join(harness: &mut UpgradeHarness) -> Result<(), String> {
+    upgrade_to_generation_two(harness)?;
+
+    if harness.lab.mount_path("node-a", "nfs4").is_none()
+        || harness.lab.mount_path("node-c", "nfs4").is_none()
+        || harness.lab.mount_path("node-d", "nfs4").is_none()
+    {
+        harness.lab.create_export("nfs4")?;
+        let mount_a = harness.lab.mount_export("node-a", "nfs4")?;
+        let mount_c = harness.lab.mount_export("node-c", "nfs4")?;
+        let mount_d = harness.lab.mount_export("node-d", "nfs4")?;
+        for (node_name, mount_path) in [
+            ("node-a", mount_a),
+            ("node-c", mount_c),
+            ("node-d", mount_d),
+        ] {
+            harness.cluster.announce_resources_clusterwide(vec![json!({
+                "resource_id": "nfs4",
+                "node_id": harness.cluster.node_id(node_name)?,
+                "resource_kind": "nfs",
+                "source": harness.lab.export_source("nfs4"),
+                "mount_hint": mount_path.display().to_string(),
+            })])?;
+        }
+    }
+    harness
+        .lab
+        .write_file("nfs4", "upgrade-window/new.txt", "during-upgrade\n")?;
+    wait_for_generation(&harness.cluster, 2)?;
+
+    Ok(())
+}
+
+fn scenario_cpu_budget(harness: &mut UpgradeHarness) -> Result<(), String> {
+    upgrade_to_generation_two(harness)?;
+    harness.session.rescan()?;
+    wait_for_primary_tree_materialization(&mut harness.session, "cpu-budget tree materializes")?;
+
+    let (stop, worker) = spawn_light_polling(
+        harness.session.client().base_url().to_string(),
+        harness.session.token().to_string(),
+        harness.session.query_api_key().to_string(),
+    );
+    let steady_cpu = measure_steady_cpu(&harness.cluster, &harness.app_id)?;
+    let summary = measure_cpu_budget(
+        &harness.baseline_cpu,
+        &steady_cpu,
+        Duration::from_secs(5),
+        Duration::from_secs(3 * 60),
+    )?;
+    stop.store(true, Ordering::Relaxed);
+    let _ = worker.join();
+    assert_cpu_budget(&summary)
 }
 
 fn wait_for_generation(cluster: &Cluster5, generation: i64) -> Result<(), String> {
@@ -159,7 +412,10 @@ fn mount_and_announce(
             "mount_hint": mount_path.display().to_string(),
         })])?;
     }
-    for (node_name, bind_addr) in [("node-d", &facade_addrs[0]), ("node-e", &facade_addrs[1])] {
+    for (node_name, bind_addr) in ["node-d", "node-e"]
+        .into_iter()
+        .zip(facade_addrs.iter())
+    {
         cluster.announce_resources_clusterwide(vec![json!({
             "resource_id": facade_resource_id,
             "node_id": cluster.node_id(node_name)?,

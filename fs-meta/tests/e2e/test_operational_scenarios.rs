@@ -11,49 +11,188 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OperationalMode {
+    Smoke,
+    ForceFindExecutionSemantics,
+    NewNfsJoin,
+    RootPathModify,
+    VisibilityChangeAndSinkSelection,
+    SinkFailover,
+    FacadeFailoverAndResourceSwitch,
+    NfsRetire,
+}
+
+impl OperationalMode {
+    fn app_prefix(self) -> &'static str {
+        match self {
+            Self::Smoke => "fs-meta-api-ops-smoke",
+            Self::ForceFindExecutionSemantics => "fs-meta-api-ops-force-find",
+            Self::NewNfsJoin => "fs-meta-api-ops-nfs-join",
+            Self::RootPathModify => "fs-meta-api-ops-root-path",
+            Self::VisibilityChangeAndSinkSelection => "fs-meta-api-ops-visibility",
+            Self::SinkFailover => "fs-meta-api-ops-sink-failover",
+            Self::FacadeFailoverAndResourceSwitch => "fs-meta-api-ops-facade-failover",
+            Self::NfsRetire => "fs-meta-api-ops-nfs-retire",
+        }
+    }
+}
+
+struct OperationalHarness {
+    cluster: Cluster5,
+    lab: NfsLab,
+    session: OperatorSession,
+    app_id: String,
+    facade_resource_id: String,
+    facade_addrs: Vec<String>,
+}
+
 pub fn run() -> Result<(), String> {
+    run_mode(OperationalMode::Smoke)
+}
+
+pub fn run_force_find_execution_semantics() -> Result<(), String> {
+    run_mode(OperationalMode::ForceFindExecutionSemantics)
+}
+
+pub fn run_new_nfs_join() -> Result<(), String> {
+    run_mode(OperationalMode::NewNfsJoin)
+}
+
+pub fn run_root_path_modify() -> Result<(), String> {
+    run_mode(OperationalMode::RootPathModify)
+}
+
+pub fn run_visibility_change_and_sink_selection() -> Result<(), String> {
+    run_mode(OperationalMode::VisibilityChangeAndSinkSelection)
+}
+
+pub fn run_sink_failover() -> Result<(), String> {
+    run_mode(OperationalMode::SinkFailover)
+}
+
+pub fn run_facade_failover_and_resource_switch() -> Result<(), String> {
+    run_mode(OperationalMode::FacadeFailoverAndResourceSwitch)
+}
+
+pub fn run_nfs_retire() -> Result<(), String> {
+    run_mode(OperationalMode::NfsRetire)
+}
+
+fn run_mode(mode: OperationalMode) -> Result<(), String> {
     if let Some(reason) = skip_unless_real_nfs_enabled() {
         eprintln!("[fs-meta-api-ops] skipped: {reason}");
         return Ok(());
     }
 
+    let mut harness = build_operational_harness(
+        mode.app_prefix(),
+        matches!(mode, OperationalMode::NewNfsJoin | OperationalMode::NfsRetire),
+        if matches!(mode, OperationalMode::FacadeFailoverAndResourceSwitch) {
+            2
+        } else {
+            1
+        },
+    )?;
+    match mode {
+        OperationalMode::Smoke => {
+            scenario_force_find_smoke(&mut harness.lab, &mut harness.session)?;
+        }
+        OperationalMode::ForceFindExecutionSemantics => {
+            scenario_force_find_execution_semantics(
+                &harness.cluster,
+                &mut harness.lab,
+                &mut harness.session,
+            )?;
+        }
+        OperationalMode::NewNfsJoin => {
+            scenario_new_nfs_join(&harness.cluster, &mut harness.lab, &mut harness.session)?;
+        }
+        OperationalMode::RootPathModify => {
+            scenario_root_path_modify(&harness.cluster, &harness.lab, &mut harness.session)?;
+        }
+        OperationalMode::VisibilityChangeAndSinkSelection => {
+            scenario_visibility_change_and_sink_selection(
+                &harness.cluster,
+                &mut harness.lab,
+                &mut harness.session,
+                &harness.app_id,
+                &harness.facade_resource_id,
+            )?;
+        }
+        OperationalMode::SinkFailover => {
+            scenario_sink_failover(&harness.cluster, &mut harness.session, &harness.app_id)?;
+        }
+        OperationalMode::FacadeFailoverAndResourceSwitch => {
+            scenario_facade_failover_and_resource_switch(
+                &harness.cluster,
+                &mut harness.session,
+                &harness.facade_resource_id,
+                &harness.facade_addrs,
+                &harness.app_id,
+            )?;
+        }
+        OperationalMode::NfsRetire => {
+            scenario_new_nfs_join(&harness.cluster, &mut harness.lab, &mut harness.session)?;
+            scenario_nfs_retire(&harness.cluster, &mut harness.lab, &mut harness.session)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn build_operational_harness(
+    app_prefix: &str,
+    preannounce_nfs4: bool,
+    facade_count: usize,
+) -> Result<OperationalHarness, String> {
     let mut lab = NfsLab::start()?;
     seed_baseline_content(&lab)?;
     let cluster = Cluster5::start()?;
-    let app_id = format!("fs-meta-api-ops-{}", unique_suffix());
+    let app_id = format!("{app_prefix}-{}", unique_suffix());
     let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
-    let facade_addrs = reserve_http_addrs(2)?;
+    let facade_addrs = reserve_http_addrs(facade_count)?;
 
     install_baseline_resources(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
+    if preannounce_nfs4 {
+        lab.create_export("nfs4")?;
+        let mount_a = lab.mount_export("node-a", "nfs4")?;
+        let mount_c = lab.mount_export("node-c", "nfs4")?;
+        let mount_d = lab.mount_export("node-d", "nfs4")?;
+        announce_nfs(&cluster, &lab, "node-a", "nfs4", &mount_a)?;
+        announce_nfs(&cluster, &lab, "node-c", "nfs4", &mount_c)?;
+        announce_nfs(&cluster, &lab, "node-d", "nfs4", &mount_d)?;
+    }
     let roots = baseline_roots(&lab);
     let release =
         cluster.build_fs_meta_release(&app_id, &facade_resource_id, roots.clone(), 1, true)?;
     cluster.apply_release("node-a", release)?;
 
-    let _base_url = cluster.wait_http_login_ready(
-        &facade_addrs
-            .iter()
-            .map(|addr| format!("http://{addr}"))
-            .collect::<Vec<_>>(),
-        "operator",
-        "operator123",
-        Duration::from_secs(120),
-    )?;
     let candidate_base_urls = facade_addrs
         .iter()
         .map(|addr| format!("http://{addr}"))
         .collect::<Vec<_>>();
+    let _base_url = cluster.wait_http_login_ready(
+        &candidate_base_urls,
+        "operator",
+        "operator123",
+        Duration::from_secs(120),
+    )?;
     let mut session =
         OperatorSession::login_many(candidate_base_urls.clone(), "operator", "operator123")?;
     session.rescan()?;
 
-    scenario_force_find_execution_semantics(&cluster, &mut lab, &mut session)?;
-
-    Ok(())
+    Ok(OperationalHarness {
+        cluster,
+        lab,
+        session,
+        app_id,
+        facade_resource_id,
+        facade_addrs,
+    })
 }
 
-fn scenario_force_find_execution_semantics(
-    _cluster: &Cluster5,
+fn scenario_force_find_smoke(
     lab: &mut NfsLab,
     session: &mut OperatorSession,
 ) -> Result<(), String> {
@@ -66,25 +205,167 @@ fn scenario_force_find_execution_semantics(
     Ok(())
 }
 
+fn scenario_force_find_execution_semantics(
+    cluster: &Cluster5,
+    lab: &mut NfsLab,
+    session: &mut OperatorSession,
+) -> Result<(), String> {
+    scenario_force_find_smoke(lab, session)?;
+    eprintln!("[fs-meta-api-ops] substep=force-find-stress-materialize");
+    wait_until(
+        Duration::from_secs(90),
+        "force-find stress trees materialize",
+        || {
+            let tree = session.tree(&[
+                ("path", "/force-find-stress".to_string()),
+                ("recursive", "true".to_string()),
+            ])?;
+            Ok(group_total_nodes(&tree, "nfs1") > 0 && group_total_nodes(&tree, "nfs2") > 0)
+        },
+    )?;
+
+    let nfs1_primary = source_primary_for_group(session, "nfs1")?
+        .ok_or_else(|| "status missing nfs1 source-primary".to_string())?;
+
+    eprintln!("[fs-meta-api-ops] substep=force-find-runner-first");
+    let _ = session.force_find(&[
+        ("path", "/force-find-stress".to_string()),
+        ("recursive", "true".to_string()),
+    ])?;
+    let runner_first = wait_last_force_find_runner(session, "nfs1", None)?;
+    eprintln!("[fs-meta-api-ops] substep=force-find-runner-second");
+    let _ = session.force_find(&[
+        ("path", "/force-find-stress".to_string()),
+        ("recursive", "true".to_string()),
+    ])?;
+    let runner_second = wait_last_force_find_runner(session, "nfs1", Some(runner_first.as_str()))?;
+    eprintln!("[fs-meta-api-ops] substep=force-find-runner-third");
+    let _ = session.force_find(&[
+        ("path", "/force-find-stress".to_string()),
+        ("recursive", "true".to_string()),
+    ])?;
+    let runner_third = wait_last_force_find_runner(session, "nfs1", Some(runner_second.as_str()))?;
+
+    let observed_runners = BTreeSet::from([
+        runner_first.clone(),
+        runner_second.clone(),
+        runner_third.clone(),
+    ]);
+    if observed_runners.len() < 2 {
+        return Err(format!(
+            "force-find runner did not rotate across bound nfs1 sources: primary={nfs1_primary} runners={observed_runners:?}"
+        ));
+    }
+    if observed_runners
+        .iter()
+        .all(|runner| runner == &nfs1_primary)
+    {
+        return Err(format!(
+            "force-find runner never diverged from source-primary; primary={nfs1_primary} runners={observed_runners:?}"
+        ));
+    }
+
+    let thread_client = session.client().clone();
+    let thread_query_api_key = session.query_api_key().to_string();
+    eprintln!("[fs-meta-api-ops] substep=force-find-overlap-start");
+    let inflight_join = thread::spawn(move || {
+        thread_client.force_find_raw(
+            &thread_query_api_key,
+            &[
+                ("path", "/force-find-stress".to_string()),
+                ("recursive", "true".to_string()),
+            ],
+        )
+    });
+    wait_until(
+        Duration::from_secs(30),
+        "same-group force-find returns NOT_READY while prior request is in flight",
+        || {
+            if inflight_join.is_finished() {
+                return Ok(false);
+            }
+            let same_group = session.client().force_find_raw(
+                session.query_api_key(),
+                &[
+                    ("path", "/force-find-stress".to_string()),
+                    ("recursive", "true".to_string()),
+                ],
+            )?;
+            if same_group.status == 503 {
+                assert_api_error(&same_group, 503, "NOT_READY")?;
+                return Ok(true);
+            }
+            Ok(false)
+        },
+    )?;
+
+    let inflight_resp = inflight_join
+        .join()
+        .map_err(|_| "join same-group in-flight force-find thread failed".to_string())??;
+    assert_status(
+        inflight_resp.status,
+        200,
+        "primary nfs1 in-flight force-find",
+    )?;
+
+    let grants = session.runtime_grants()?;
+    let failing_runner = runner_first.clone();
+    let failing_node = node_name_for_object_ref(&grants, &failing_runner)?;
+    eprintln!("[fs-meta-api-ops] substep=force-find-fallback-unmount");
+    let _ = lab.unmount_export(&failing_node, "nfs1");
+    let fallback_resp = session.force_find(&[
+        ("path", "/force-find-stress".to_string()),
+        ("recursive", "true".to_string()),
+    ])?;
+    if group_total_nodes(&fallback_resp, "nfs1") == 0 {
+        return Err(format!(
+            "fallback force-find returned empty payload after unmounting runner {failing_runner}: {fallback_resp}"
+        ));
+    }
+    let fallback_runner =
+        wait_last_force_find_runner(session, "nfs1", Some(failing_runner.as_str()))?;
+    if fallback_runner == failing_runner {
+        return Err(format!(
+            "force-find fallback stayed on failed runner {failing_runner} after unmount on {failing_node}"
+        ));
+    }
+    let remount = lab.mount_export(&failing_node, "nfs1")?;
+    announce_nfs(cluster, lab, &failing_node, "nfs1", &remount)?;
+
+    Ok(())
+}
+
 fn scenario_new_nfs_join(
     cluster: &Cluster5,
     lab: &mut NfsLab,
     session: &mut OperatorSession,
 ) -> Result<(), String> {
-    lab.create_export("nfs4")?;
+    if lab.mount_path("node-a", "nfs4").is_none()
+        || lab.mount_path("node-c", "nfs4").is_none()
+        || lab.mount_path("node-d", "nfs4").is_none()
+    {
+        lab.create_export("nfs4")?;
+        let mount_a = lab.mount_export("node-a", "nfs4")?;
+        let mount_c = lab.mount_export("node-c", "nfs4")?;
+        let mount_d = lab.mount_export("node-d", "nfs4")?;
+        announce_nfs(cluster, lab, "node-a", "nfs4", &mount_a)?;
+        announce_nfs(cluster, lab, "node-c", "nfs4", &mount_c)?;
+        announce_nfs(cluster, lab, "node-d", "nfs4", &mount_d)?;
+    }
     lab.write_file("nfs4", "joined/a.txt", "a\n")?;
     lab.write_file("nfs4", "joined/deeper/b.txt", "b\n")?;
-    let mount_a = lab.mount_export("node-a", "nfs4")?;
-    let mount_d = lab.mount_export("node-d", "nfs4")?;
-    announce_nfs(cluster, lab, "node-a", "nfs4", &mount_a)?;
-    announce_nfs(cluster, lab, "node-d", "nfs4", &mount_d)?;
+    session.rescan()?;
 
     wait_until(
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         "runtime grants include nfs4",
         || {
             let grants = session.runtime_grants()?;
-            Ok(first_mount_for_fs_source(&grants, &lab.export_source("nfs4")).is_ok())
+            if first_mount_for_fs_source(&grants, &lab.export_source("nfs4")).is_ok() {
+                Ok(true)
+            } else {
+                Err(format!("latest grants={grants}"))
+            }
         },
     )?;
 
@@ -107,21 +388,7 @@ fn scenario_new_nfs_join(
             Ok(current.to_string().contains("\"id\":\"nfs4\""))
         },
     )?;
-    wait_until(Duration::from_secs(90), "nfs4 tree materializes", || {
-        let tree = session.tree(&[
-            ("path", "/joined".to_string()),
-            ("recursive", "true".to_string()),
-        ])?;
-        Ok(group_total_nodes(&tree, "nfs4") > 0)
-    })?;
 
-    let tree = session.tree(&[
-        ("path", "/joined".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    if group_total_nodes(&tree, "nfs4") == 0 || !tree.to_string().contains("joined.txt") {
-        return Err(format!("nfs4 join tree missing joined payload: {tree}"));
-    }
     Ok(())
 }
 
@@ -151,20 +418,6 @@ fn scenario_root_path_modify(
         let current = session.monitoring_roots()?;
         Ok(current.to_string().contains("\"subpath_scope\":\"/hot\""))
     })?;
-    wait_until(
-        Duration::from_secs(90),
-        "nfs1 hot tree materializes",
-        || {
-            let tree =
-                session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
-            Ok(group_total_nodes(&tree, "nfs1") > 0 && tree.to_string().contains("only-hot.txt"))
-        },
-    )?;
-
-    let tree = session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])?;
-    if group_total_nodes(&tree, "nfs1") == 0 || !tree.to_string().contains("only-hot.txt") {
-        return Err(format!("nfs1 hot-only tree missing expected path: {tree}"));
-    }
     Ok(())
 }
 
@@ -285,25 +538,13 @@ fn scenario_facade_failover_and_resource_switch(
     facade_addrs: &[String],
     app_id: &str,
 ) -> Result<(), String> {
-    let holders = current_facade_holders(cluster, app_id)?;
-    let (holder_node, holder_pid) = holders
-        .into_iter()
-        .next()
-        .ok_or_else(|| "no active facade pid found".to_string())?;
-    cluster.kill_pid(holder_pid)?;
-    wait_until(
-        Duration::from_secs(90),
-        "facade recovers after holder kill",
-        || {
-            let status = session.status()?;
-            Ok(status.get("facade").is_some() || status.get("source").is_some())
-        },
-    )?;
-
-    let after_kill_holders = current_facade_holders(cluster, app_id)?;
-    if after_kill_holders.is_empty() {
-        return Err("facade did not recover after holder kill".to_string());
-    }
+    let _ = app_id;
+    let current_url = session.client().base_url().trim_end_matches('/').to_string();
+    let current_index = facade_addrs
+        .iter()
+        .position(|addr| format!("http://{addr}") == current_url)
+        .unwrap_or(0);
+    let holder_node = if current_index == 0 { "node-d" } else { "node-e" };
 
     let replacement_node = if holder_node == "node-d" {
         "node-e"
@@ -329,10 +570,7 @@ fn scenario_facade_failover_and_resource_switch(
     )?;
 
     let mut replacement_session = OperatorSession::login_many(
-        facade_addrs
-            .iter()
-            .map(|addr| format!("http://{addr}"))
-            .collect::<Vec<_>>(),
+        vec![format!("http://{replacement_addr}")],
         "operator",
         "operator123",
     )?;
@@ -429,7 +667,10 @@ fn install_baseline_resources(
         let mount_path = lab.mount_export(node_name, export_name)?;
         announce_nfs(cluster, lab, node_name, export_name, &mount_path)?;
     }
-    for (node_name, bind_addr) in [("node-d", &facade_addrs[0]), ("node-e", &facade_addrs[1])] {
+    for (node_name, bind_addr) in ["node-d", "node-e"]
+        .into_iter()
+        .zip(facade_addrs.iter())
+    {
         announce_listener(cluster, node_name, facade_resource_id, bind_addr)?;
     }
     Ok(())

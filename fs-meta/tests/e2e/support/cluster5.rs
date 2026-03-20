@@ -84,6 +84,20 @@ fn trace_exports_summary(command: &Value) -> String {
         .unwrap_or_default()
 }
 
+fn classify_apply_release_retry(err: &str) -> Option<&'static str> {
+    if err.contains("tx busy") {
+        Some("tx_busy")
+    } else if err.contains("relation-target replication quorum not reached") {
+        Some("quorum")
+    } else if err.contains("\"category\": \"transport\"")
+        || err.contains("\"category\":\"transport\"")
+    {
+        Some("transport")
+    } else {
+        None
+    }
+}
+
 #[derive(Clone)]
 pub struct NodeIdentity {
     pub name: String,
@@ -330,7 +344,7 @@ impl Cluster5 {
             node_name, app_id, generation
         );
         let mut result = Err("apply release not attempted".to_string());
-        for attempt in 1..=8 {
+        for attempt in 1..=12 {
             result = run_cnxctl_json(
                 &cnxctl_bin,
                 &node.socket_path,
@@ -338,17 +352,20 @@ impl Cluster5 {
             );
             match &result {
                 Ok(_) => break,
-                Err(err) if err.contains("tx busy") => {
+                Err(err) => {
+                    let Some(reason) = classify_apply_release_retry(err) else {
+                        break;
+                    };
                     eprintln!(
-                        "cluster5: apply-release retry node={} app_id={} generation={} attempt={} reason=tx_busy",
+                        "cluster5: apply-release retry node={} app_id={} generation={} attempt={} reason={}",
                         node_name,
                         app_id,
                         generation,
-                        attempt
+                        attempt,
+                        reason
                     );
-                    std::thread::sleep(Duration::from_millis(250 * attempt as u64));
+                    std::thread::sleep(Duration::from_millis(500 * attempt as u64));
                 }
-                Err(_) => break,
             }
         }
         match &result {

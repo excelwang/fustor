@@ -55,6 +55,10 @@ impl FsMetaApiClient {
         }
     }
 
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     pub fn login_raw(&self, username: &str, password: &str) -> Result<ApiResponse, String> {
         self.post_json_noauth_raw(
             "/session/login",
@@ -410,11 +414,15 @@ impl OperatorSession {
     }
 
     pub fn update_roots(&mut self, roots: &Value) -> Result<Value, String> {
-        self.with_management_reauth(|client, token| client.update_roots(token, roots))
+        let response = self.with_management_reauth(|client, token| client.update_roots(token, roots))?;
+        self.best_effort_management_fanout(|client, token| client.update_roots(token, roots));
+        Ok(response)
     }
 
     pub fn rescan(&mut self) -> Result<Value, String> {
-        self.with_management_reauth(|client, token| client.rescan(token))
+        let response = self.with_management_reauth(|client, token| client.rescan(token))?;
+        self.best_effort_management_fanout(|client, token| client.rescan(token));
+        Ok(response)
     }
 
     pub fn stats(&mut self, query: &[(&str, String)]) -> Result<Value, String> {
@@ -548,6 +556,71 @@ impl OperatorSession {
             }
         }
         ordered
+    }
+
+    fn best_effort_management_fanout<T>(
+        &mut self,
+        op: impl Fn(&FsMetaApiClient, &str) -> Result<T, String>,
+    ) {
+        let current = self.client.base_url().trim_end_matches('/').to_string();
+        for base_url in self.prioritized_base_urls() {
+            if base_url == current {
+                continue;
+            }
+            let deadline = std::time::Instant::now() + RECONNECT_RETRY_WINDOW;
+            loop {
+                let client = self.client.with_base_url(base_url.clone());
+                match op(&client, &self.management_token) {
+                    Ok(_) => break,
+                    Err(err) if is_invalid_session_error(&err) => {
+                        match login_first_available(
+                            std::slice::from_ref(&base_url),
+                            &self.username,
+                            &self.password,
+                        ) {
+                            Ok((target_client, token)) => match op(&target_client, &token) {
+                                Ok(_) => break,
+                                Err(retry_err) => {
+                                    if std::time::Instant::now() >= deadline {
+                                        eprintln!(
+                                            "fs-meta-api-client: best-effort management fanout failed base_url={} err={}",
+                                            base_url, retry_err
+                                        );
+                                        break;
+                                    }
+                                }
+                            },
+                            Err(login_err) => {
+                                if std::time::Instant::now() >= deadline {
+                                    eprintln!(
+                                        "fs-meta-api-client: best-effort management fanout failed base_url={} err={}",
+                                        base_url, login_err
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(err) if is_transport_error(&err) => {
+                        if std::time::Instant::now() >= deadline {
+                            eprintln!(
+                                "fs-meta-api-client: best-effort management fanout failed base_url={} err={}",
+                                base_url, err
+                            );
+                            break;
+                        }
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "fs-meta-api-client: best-effort management fanout failed base_url={} err={}",
+                            base_url, err
+                        );
+                        break;
+                    }
+                }
+                std::thread::sleep(RECONNECT_RETRY_INTERVAL);
+            }
+        }
     }
 }
 

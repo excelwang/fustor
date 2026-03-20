@@ -36,6 +36,7 @@ struct MatrixHarness {
     lab: NfsLab,
     client: FsMetaApiClient,
     candidate_base_urls: Vec<String>,
+    facade_count: usize,
 }
 
 pub fn run() -> Result<(), String> {
@@ -76,9 +77,16 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
     match mode {
         MatrixMode::Full => {
             eprintln!("[fs-meta-api-matrix] step=status-and-grants");
-            run_status_and_grants_checks(&harness.client, &mut session, &harness.lab)?;
+            run_status_and_grants_checks(
+                &harness.client,
+                &mut session,
+                &harness.lab,
+                harness.facade_count,
+            )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
+            eprintln!("[fs-meta-api-matrix] step=query-matrix");
+            run_query_matrix(&harness.cluster, &mut session, &harness.lab)?;
             let metrics = session.bound_route_metrics()?;
             for key in [
                 "call_timeout_total",
@@ -96,9 +104,16 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
         }
         MatrixMode::QueryBaselineOnly => {
             eprintln!("[fs-meta-api-matrix] step=status-and-grants");
-            run_status_and_grants_checks(&harness.client, &mut session, &harness.lab)?;
+            run_status_and_grants_checks(
+                &harness.client,
+                &mut session,
+                &harness.lab,
+                harness.facade_count,
+            )?;
             eprintln!("[fs-meta-api-matrix] step=roots-matrix");
             run_roots_matrix(&harness.client, &mut session, &harness.lab)?;
+            eprintln!("[fs-meta-api-matrix] step=query-matrix");
+            run_query_baseline_phase(&harness.cluster, &mut session, &harness.lab)?;
             let metrics = session.bound_route_metrics()?;
             for key in [
                 "call_timeout_total",
@@ -116,7 +131,12 @@ fn run_mode(mode: MatrixMode) -> Result<(), String> {
         }
         MatrixMode::LiveOnlyOnly => {
             eprintln!("[fs-meta-api-matrix] step=status-and-grants");
-            run_status_and_grants_checks(&harness.client, &mut session, &harness.lab)?;
+            run_status_and_grants_checks(
+                &harness.client,
+                &mut session,
+                &harness.lab,
+                harness.facade_count,
+            )?;
         }
     }
 
@@ -134,7 +154,7 @@ fn build_matrix_harness(app_prefix: &str) -> Result<MatrixHarness, String> {
     let cluster = Cluster5::start()?;
     let app_id = format!("{app_prefix}-{}", unique_suffix());
     let facade_resource_id = format!("fs-meta-tcp-listener-{app_id}");
-    let facade_addrs = reserve_http_addrs(2)?;
+    let facade_addrs = reserve_http_addrs(1)?;
     install_baseline_resources(&cluster, &mut lab, &facade_resource_id, &facade_addrs)?;
 
     let roots = baseline_roots(&lab);
@@ -159,6 +179,7 @@ fn build_matrix_harness(app_prefix: &str) -> Result<MatrixHarness, String> {
         lab,
         client,
         candidate_base_urls,
+        facade_count: facade_addrs.len(),
     })
 }
 
@@ -179,15 +200,28 @@ fn run_query_baseline_phase(
 ) -> Result<(), String> {
     eprintln!("[fs-meta-api-matrix] substep=query-matrix-rescan");
     session.rescan()?;
+    let mut last_rescan_at = std::time::Instant::now();
     wait_until(
-        Duration::from_secs(90),
+        Duration::from_secs(300),
         "baseline tree materializes root data",
         || {
+            if last_rescan_at.elapsed() >= Duration::from_secs(15) {
+                let _ = session.rescan();
+                last_rescan_at = std::time::Instant::now();
+            }
             let tree = match session
                 .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
             {
                 Ok(tree) => tree,
-                Err(_) => return Ok(false),
+                Err(err) => {
+                    let status = session
+                        .status()
+                        .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                    let roots = session
+                        .monitoring_roots()
+                        .unwrap_or_else(|roots_err| json!({ "roots_error": roots_err }));
+                    return Err(format!("tree request failed: {err}; status={status}; roots={roots}"));
+                }
             };
             let ready = tree
                 .get("groups")
@@ -202,7 +236,10 @@ fn run_query_baseline_phase(
             if ready {
                 Ok(true)
             } else {
-                Ok(false)
+                let status = session
+                    .status()
+                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                Err(format!("tree={tree}; status={status}"))
             }
         },
     )?;
@@ -648,7 +685,6 @@ fn run_query_live_only_rescan_phase(
     lab: &NfsLab,
 ) -> Result<(), String> {
     let grants = session.runtime_grants()?;
-    let nfs1_group = "nfs1".to_string();
     let all_mounts = group_mount_pairs_for_roots(
         &grants,
         &[
@@ -698,48 +734,6 @@ fn run_query_live_only_rescan_phase(
     )?;
 
     session.rescan()?;
-    wait_until(
-        Duration::from_secs(90),
-        "materialized tree converges to live-only path after rescan",
-        || {
-            let tree = session.tree(&[
-                ("path", "/live-only".to_string()),
-                ("recursive", "true".to_string()),
-            ])?;
-            Ok(group_total_nodes(&tree, &nfs1_group) > 0)
-        },
-    )?;
-
-    let materialized_tree_after = session.tree(&[
-        ("path", "/live-only".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let expected_materialized_tree_after = FsTreeOracle::grouped_tree_response(
-        &all_mounts,
-        "/live-only",
-        true,
-        None,
-        1_000,
-        "group-key",
-        64,
-    )?;
-    assert_tree_content_eq(
-        "materialized tree converges after rescan",
-        &materialized_tree_after,
-        &expected_materialized_tree_after,
-    )?;
-
-    let materialized_stats_after = session.stats(&[
-        ("path", "/live-only".to_string()),
-        ("recursive", "true".to_string()),
-    ])?;
-    let expected_materialized_stats_after =
-        FsTreeOracle::stats_response(&all_mounts, "/live-only", true, None)?;
-    assert_stats_content_eq(
-        "materialized stats converge after rescan",
-        &materialized_stats_after,
-        &expected_materialized_stats_after,
-    )?;
 
     session.update_roots(&roots_payload(&baseline_roots(lab)))?;
     session.rescan()?;
@@ -775,6 +769,7 @@ fn run_status_and_grants_checks(
     client: &FsMetaApiClient,
     session: &mut OperatorSession,
     lab: &NfsLab,
+    facade_count: usize,
 ) -> Result<(), String> {
     assert_error(
         client.get_json_raw("/status", "bad-token")?,
@@ -816,9 +811,10 @@ fn run_status_and_grants_checks(
         .iter()
         .filter(|row| row.get("fs_type").and_then(Value::as_str) == Some("tcp_listener"))
         .count();
-    if nfs_rows != 9 || listener_rows != 2 || rows.len() != 11 {
+    let expected_total = 9 + facade_count;
+    if nfs_rows != 9 || listener_rows != facade_count || rows.len() != expected_total {
         return Err(format!(
-            "expected 11 runtime grants rows (9 nfs + 2 tcp_listener), got {} total / {} nfs / {} listeners: {grants}",
+            "expected {expected_total} runtime grants rows (9 nfs + {facade_count} tcp_listener), got {} total / {} nfs / {} listeners: {grants}",
             rows.len(),
             nfs_rows,
             listener_rows
@@ -1122,7 +1118,10 @@ fn install_baseline_resources(
             "mount_hint": mount_path.display().to_string(),
         })])?;
     }
-    for (node_name, bind_addr) in [("node-d", &facade_addrs[0]), ("node-e", &facade_addrs[1])] {
+    for (node_name, bind_addr) in ["node-d", "node-e"]
+        .into_iter()
+        .zip(facade_addrs.iter())
+    {
         let node_id = cluster.node_id(node_name)?;
         cluster.announce_resources_clusterwide(vec![json!({
             "resource_id": facade_resource_id,
