@@ -1179,7 +1179,7 @@ fn base_router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-async fn run_blocking_query<F>(f: F, timeout: Duration) -> Result<Vec<Event>, CnxError>
+pub(crate) async fn run_blocking_query<F>(f: F, timeout: Duration) -> Result<Vec<Event>, CnxError>
 where
     F: FnOnce() -> Result<Vec<Event>, CnxError> + Send + 'static,
 {

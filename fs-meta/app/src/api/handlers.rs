@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     Json,
@@ -23,9 +24,10 @@ use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
 use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
 use crate::query::api::{
-    merge_sink_status_snapshots, refresh_policy_from_host_object_grants,
+    merge_sink_status_snapshots, refresh_policy_from_host_object_grants, run_blocking_query,
     route_sink_status_snapshot,
 };
+use crate::sink::SinkStatusSnapshot;
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use crate::workers::source::SourceObservabilitySnapshot;
 
@@ -61,6 +63,7 @@ pub async fn status(
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
+    let started_at = Instant::now();
 
     let local_sink = match state.sink.status_snapshot_nonblocking() {
         Ok(snapshot) => snapshot,
@@ -71,28 +74,6 @@ pub async fn status(
         Err(err) => {
             return Err(ApiError::internal(format!("sink status failed: {err}")));
         }
-    };
-    let sink_status = match state.query_runtime_boundary.clone() {
-        Some(boundary) => match route_sink_status_snapshot(
-            boundary,
-            state.node_id.clone(),
-            Duration::from_secs(30),
-        )
-        .await
-        {
-            Ok(snapshot) => merge_sink_status_snapshots(vec![local_sink, snapshot]),
-            Err(CnxError::Timeout)
-            | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ProtocolViolation(_)) => {
-                log::warn!("status falling back to local sink snapshot after route error");
-                local_sink
-            }
-            Err(err) => {
-                log::warn!("status falling back to local sink snapshot: {err}");
-                local_sink
-            }
-        },
-        None => local_sink,
     };
     let local_source = match state.source.observability_snapshot() {
         Ok(snapshot) => snapshot,
@@ -106,45 +87,26 @@ pub async fn status(
             return Err(ApiError::internal(format!("source status failed: {err}")));
         }
     };
-    let (source, runner_sets) = match state.query_runtime_boundary.clone() {
-        Some(boundary) => match route_source_observability_snapshot(
-            boundary,
+    let (sink_status, source, runner_sets, sink_outcome, source_outcome) =
+        merge_remote_status_snapshots(
+            local_sink,
+            local_source,
+            state.query_runtime_boundary.clone(),
             state.node_id.clone(),
-            Duration::from_secs(30),
+            |boundary, origin_id| async move {
+                route_sink_status_snapshot(boundary, origin_id, STATUS_ROUTE_TIMEOUT).await
+            },
+            |boundary, origin_id| async move {
+                route_source_observability_snapshot(
+                    boundary,
+                    origin_id,
+                    STATUS_ROUTE_TIMEOUT,
+                    STATUS_ROUTE_COLLECT_IDLE_GRACE,
+                )
+                .await
+            },
         )
-        .await
-        {
-            Ok((snapshot, runner_sets)) => (merge_source_observability(local_source, snapshot), runner_sets),
-            Err(CnxError::Timeout)
-            | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ProtocolViolation(_)) => {
-                log::warn!("status falling back to local source observability after route error");
-                let runner_sets = local_source
-                    .last_force_find_runner_by_group
-                    .iter()
-                    .map(|(group, runner)| (group.clone(), vec![runner.clone()]))
-                    .collect::<BTreeMap<_, _>>();
-                (local_source, runner_sets)
-            }
-            Err(err) => {
-                log::warn!("status falling back to local source observability: {err}");
-                let runner_sets = local_source
-                    .last_force_find_runner_by_group
-                    .iter()
-                    .map(|(group, runner)| (group.clone(), vec![runner.clone()]))
-                    .collect::<BTreeMap<_, _>>();
-                (local_source, runner_sets)
-            }
-        },
-        None => {
-            let runner_sets = local_source
-                .last_force_find_runner_by_group
-                .iter()
-                .map(|(group, runner)| (group.clone(), vec![runner.clone()]))
-                .collect::<BTreeMap<_, _>>();
-            (local_source, runner_sets)
-        }
-    };
+        .await;
     let live_source_nodes = source
         .grants
         .iter()
@@ -162,7 +124,11 @@ pub async fn status(
     merged_inflight.sort();
     merged_inflight.dedup();
     eprintln!(
-        "fs_meta_api_status: source runners={:?} inflight={:?}",
+        "fs_meta_api_status: sink_route={} source_route={} elapsed_ms={} sink_groups={} source_runners={:?} inflight={:?}",
+        sink_outcome.as_str(),
+        source_outcome.as_str(),
+        started_at.elapsed().as_millis(),
+        sink_status.groups.len(),
         runner_sets,
         merged_inflight
     );
@@ -204,6 +170,132 @@ pub async fn status(
             .and_then(|pending| pending.clone())
             .map(status_facade_from_pending),
     }))
+}
+
+const STATUS_ROUTE_TIMEOUT: Duration = Duration::from_secs(10);
+const STATUS_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_millis(500);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatusRouteOutcome {
+    Skipped,
+    Ok,
+    Timeout,
+    Transport,
+    Protocol,
+    Internal,
+}
+
+impl StatusRouteOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Skipped => "skipped",
+            Self::Ok => "ok",
+            Self::Timeout => "timeout",
+            Self::Transport => "transport",
+            Self::Protocol => "protocol",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+fn local_runner_sets(
+    local_source: &SourceObservabilitySnapshot,
+) -> BTreeMap<String, Vec<String>> {
+    local_source
+        .last_force_find_runner_by_group
+        .iter()
+        .map(|(group, runner)| (group.clone(), vec![runner.clone()]))
+        .collect()
+}
+
+async fn merge_remote_status_snapshots<SinkCollect, SinkFuture, SourceCollect, SourceFuture>(
+    local_sink: SinkStatusSnapshot,
+    local_source: SourceObservabilitySnapshot,
+    query_runtime_boundary: Option<std::sync::Arc<dyn ChannelIoSubset>>,
+    node_id: NodeId,
+    sink_collect: SinkCollect,
+    source_collect: SourceCollect,
+) -> (
+    SinkStatusSnapshot,
+    SourceObservabilitySnapshot,
+    BTreeMap<String, Vec<String>>,
+    StatusRouteOutcome,
+    StatusRouteOutcome,
+)
+where
+    SinkCollect:
+        Fn(std::sync::Arc<dyn ChannelIoSubset>, NodeId) -> SinkFuture + Send + Sync + 'static,
+    SinkFuture: Future<Output = Result<SinkStatusSnapshot, CnxError>> + Send,
+    SourceCollect: Fn(std::sync::Arc<dyn ChannelIoSubset>, NodeId) -> SourceFuture
+        + Send
+        + Sync
+        + 'static,
+    SourceFuture:
+        Future<Output = Result<(SourceObservabilitySnapshot, BTreeMap<String, Vec<String>>), CnxError>>
+            + Send,
+{
+    let Some(boundary) = query_runtime_boundary else {
+        return (
+            local_sink,
+            local_source.clone(),
+            local_runner_sets(&local_source),
+            StatusRouteOutcome::Skipped,
+            StatusRouteOutcome::Skipped,
+        );
+    };
+
+    let (sink_result, source_result) = tokio::join!(
+        sink_collect(boundary.clone(), node_id.clone()),
+        source_collect(boundary, node_id),
+    );
+
+    let (sink_status, sink_outcome) = match sink_result {
+        Ok(snapshot) => (
+            merge_sink_status_snapshots(vec![local_sink, snapshot]),
+            StatusRouteOutcome::Ok,
+        ),
+        Err(err) => {
+            log_status_route_fallback("sink", &err);
+            (local_sink, classify_status_route_error(&err))
+        }
+    };
+    let (source, runner_sets, source_outcome) = match source_result {
+        Ok((snapshot, runner_sets)) => (
+            merge_source_observability(local_source, snapshot),
+            runner_sets,
+            StatusRouteOutcome::Ok,
+        ),
+        Err(err) => {
+            log_status_route_fallback("source", &err);
+            let runner_sets = local_runner_sets(&local_source);
+            (local_source, runner_sets, classify_status_route_error(&err))
+        }
+    };
+
+    (sink_status, source, runner_sets, sink_outcome, source_outcome)
+}
+
+fn classify_status_route_error(err: &CnxError) -> StatusRouteOutcome {
+    match err {
+        CnxError::Timeout => StatusRouteOutcome::Timeout,
+        CnxError::TransportClosed(_) => StatusRouteOutcome::Transport,
+        CnxError::ProtocolViolation(_) => StatusRouteOutcome::Protocol,
+        _ => StatusRouteOutcome::Internal,
+    }
+}
+
+fn log_status_route_fallback(label: &str, err: &CnxError) {
+    match classify_status_route_error(err) {
+        StatusRouteOutcome::Timeout
+        | StatusRouteOutcome::Transport
+        | StatusRouteOutcome::Protocol => {
+            log::warn!("status falling back to local {label} snapshot after route error: {err}");
+        }
+        StatusRouteOutcome::Internal => {
+            log::warn!("status falling back to local {label} snapshot: {err}");
+        }
+        StatusRouteOutcome::Skipped | StatusRouteOutcome::Ok => {}
+    }
 }
 
 pub async fn runtime_grants(
@@ -570,19 +662,22 @@ async fn route_source_observability_snapshot(
     boundary: std::sync::Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
     timeout: Duration,
+    idle_after_first: Duration,
 ) -> Result<(SourceObservabilitySnapshot, BTreeMap<String, Vec<String>>), CnxError> {
     let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
-    let events: Vec<Event> = tokio::task::spawn_blocking(move || -> Result<Vec<Event>, CnxError> {
-        adapter.call_collect(
-            ROUTE_TOKEN_FS_META_INTERNAL,
-            METHOD_SOURCE_STATUS,
-            Bytes::new(),
-            timeout,
-            Duration::from_secs(5),
-        )
-    })
-    .await
-    .map_err(|err| CnxError::Internal(format!("source status route join failed: {err}")))??;
+    let events = run_blocking_query(
+        move || {
+            adapter.call_collect(
+                ROUTE_TOKEN_FS_META_INTERNAL,
+                METHOD_SOURCE_STATUS,
+                Bytes::new(),
+                timeout,
+                idle_after_first,
+            )
+        },
+        timeout,
+    )
+    .await?;
     let snapshots = events
         .into_iter()
         .map(|event| {
@@ -829,4 +924,162 @@ fn authorize_management(
         .auth
         .authorize_management_session(auth_header(headers))?;
     Ok(principal)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::source::SourceStatusSnapshot;
+    use crate::workers::source::SourceObservabilitySnapshot;
+    use capanix_app_sdk::raw::ChannelIoSubset;
+
+    struct NoopBoundary;
+
+    impl ChannelIoSubset for NoopBoundary {}
+
+    fn local_source_snapshot() -> SourceObservabilitySnapshot {
+        SourceObservabilitySnapshot {
+            lifecycle_state: "ready".to_string(),
+            host_object_grants_version: 1,
+            grants: Vec::new(),
+            logical_roots: Vec::new(),
+            status: SourceStatusSnapshot::default(),
+            source_primary_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
+            last_force_find_runner_by_group: BTreeMap::from([(
+                "nfs1".to_string(),
+                "node-a".to_string(),
+            )]),
+            force_find_inflight_groups: Vec::new(),
+        }
+    }
+
+    fn local_sink_snapshot() -> SinkStatusSnapshot {
+        SinkStatusSnapshot {
+            live_nodes: 1,
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs1".to_string(),
+                primary_object_ref: "obj-a".to_string(),
+                total_nodes: 1,
+                live_nodes: 1,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 11,
+                shadow_lag_us: 12,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn status_remote_merge_returns_local_source_when_source_times_out() {
+        let local_sink = local_sink_snapshot();
+        let local_source = local_source_snapshot();
+        let (sink, source, runner_sets, sink_outcome, source_outcome) =
+            merge_remote_status_snapshots(
+                local_sink.clone(),
+                local_source.clone(),
+                None,
+                NodeId("node-a".into()),
+                |_boundary, _origin_id| async move {
+                    unreachable!("sink collector should not run without a boundary")
+                },
+                |_boundary, _origin_id| async move {
+                    unreachable!("source collector should not run without a boundary")
+                },
+            )
+            .await;
+
+        assert_eq!(sink.live_nodes, local_sink.live_nodes);
+        assert_eq!(source.source_primary_by_group, local_source.source_primary_by_group);
+        assert_eq!(runner_sets, local_runner_sets(&local_source));
+        assert_eq!(sink_outcome, StatusRouteOutcome::Skipped);
+        assert_eq!(source_outcome, StatusRouteOutcome::Skipped);
+    }
+
+    #[tokio::test]
+    async fn status_remote_merge_keeps_local_when_source_fails_and_sink_succeeds() {
+        let local_sink = local_sink_snapshot();
+        let local_source = local_source_snapshot();
+        let remote_sink = SinkStatusSnapshot {
+            live_nodes: 3,
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "obj-b".to_string(),
+                total_nodes: 2,
+                live_nodes: 2,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 21,
+                shadow_lag_us: 22,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+        let (sink, source, runner_sets, sink_outcome, source_outcome) =
+            merge_remote_status_snapshots(
+                local_sink,
+                local_source.clone(),
+                Some(std::sync::Arc::new(NoopBoundary)),
+                NodeId("node-a".into()),
+                move |_boundary, _origin_id| {
+                    let remote_sink = remote_sink.clone();
+                    async move { Ok(remote_sink) }
+                },
+                |_boundary, _origin_id| async move { Err(CnxError::Timeout) },
+            )
+            .await;
+
+        assert_eq!(sink.groups.len(), 2);
+        assert_eq!(source.source_primary_by_group, local_source.source_primary_by_group);
+        assert_eq!(runner_sets, local_runner_sets(&local_source));
+        assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
+        assert_eq!(source_outcome, StatusRouteOutcome::Timeout);
+    }
+
+    #[tokio::test]
+    async fn status_remote_merge_runs_collectors_concurrently() {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let local_sink = local_sink_snapshot();
+        let local_source = local_source_snapshot();
+        let started_for_sink = started.clone();
+        let started_for_source = started.clone();
+
+        let (_sink, _source, _runner_sets, sink_outcome, source_outcome) =
+            merge_remote_status_snapshots(
+                local_sink,
+                local_source,
+                Some(std::sync::Arc::new(NoopBoundary)),
+                NodeId("node-a".into()),
+                move |_boundary, _origin_id| {
+                    let started = started_for_sink.clone();
+                    async move {
+                        started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok(SinkStatusSnapshot::default())
+                    }
+                },
+                move |_boundary, _origin_id| {
+                    let started = started_for_source.clone();
+                    async move {
+                        started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        Ok((local_source_snapshot(), BTreeMap::new()))
+                    }
+                },
+            )
+            .await;
+
+        assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
+        assert_eq!(source_outcome, StatusRouteOutcome::Ok);
+    }
 }
