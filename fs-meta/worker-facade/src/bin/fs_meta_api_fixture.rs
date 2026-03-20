@@ -340,7 +340,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>();
     let source_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
         route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
-        worker_id: "runtime.exec.source".to_string(),
+        unit_id: "runtime.exec.source".to_string(),
         lease: None,
         generation: 1,
         expires_at_ms: 60_000,
@@ -349,7 +349,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| format!("encode source activate envelope failed: {e}"))?;
     let scan_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
         route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
-        worker_id: "runtime.exec.scan".to_string(),
+        unit_id: "runtime.exec.scan".to_string(),
         lease: None,
         generation: 1,
         expires_at_ms: 60_000,
@@ -358,7 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| format!("encode scan activate envelope failed: {e}"))?;
     let sink_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
         route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
-        worker_id: "runtime.exec.sink".to_string(),
+        unit_id: "runtime.exec.sink".to_string(),
         lease: None,
         generation: 1,
         expires_at_ms: 60_000,
@@ -367,7 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .map_err(|e| format!("encode sink activate envelope failed: {e}"))?;
     let facade_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
         route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
-        worker_id: "runtime.exec.facade".to_string(),
+        unit_id: "runtime.exec.facade".to_string(),
         lease: None,
         generation: 1,
         expires_at_ms: 60_000,

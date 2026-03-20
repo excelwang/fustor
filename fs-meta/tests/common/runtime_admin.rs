@@ -46,6 +46,7 @@ mod tests {
                 "schema_version": "scope-worker-intent-v1",
                 "target_id": "fs-meta-test",
                 "target_generation": 7,
+                "route_plans": [],
                 "workers": [{
                     "worker_role": "main",
                     "worker_id": "fs-meta-test",
@@ -118,7 +119,7 @@ mod tests {
             serde_json::to_value(&decoded.command).expect("serialize typed command");
         assert_eq!(
             decoded_value, command,
-            "typed request encoding must not drop or reshape worker intent fields before daemon verification"
+            "typed request encoding must not drop or reshape scope-worker intent fields before daemon verification"
         );
         let expected = canonical_runtime_admin_command_value_bytes(&command)
             .expect("canonicalize raw command");

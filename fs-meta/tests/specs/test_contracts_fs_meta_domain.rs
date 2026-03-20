@@ -127,8 +127,8 @@ fn test_meta_index_domain_ownership_contract() {
 
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKFLOWS.md");
     assert!(
-        l3.contains("fs-meta app 从 `meta-index` 读取物化 observation/projection 结果")
-            || l3.contains("fs-meta app 从 `meta-index` 读取物化结果")
+        l3.contains("sink-side group execution 从 `meta-index` 读取该 group 的物化 observation/projection 结果")
+            || l3.contains("从 `meta-index` 读取该 group 的物化 observation/projection 结果")
     );
 
     let app_lib = read_fs_meta_spec_file("fs-meta/app/src/lib.rs");
@@ -694,7 +694,7 @@ fn test_projection_view_contracts_are_migrated_to_main_specs() {
     assert!(projection_api.contains(".route(\"/tree\""));
     assert!(projection_api.contains(".route(\"/on-demand-force-find\""));
     assert!(projection_api.contains(".route(\"/bound-route-metrics\""));
-    assert!(projection_api.contains("QUERY_TIMEOUT_MS_DEFAULT: u64 = 30_000"));
+    assert!(projection_api.contains("QUERY_TIMEOUT_MS_DEFAULT: u64 = 60_000"));
     assert!(projection_api.contains("FORCE_FIND_TIMEOUT_MS_DEFAULT: u64 = 60_000"));
     assert!(projection_api.contains("normalize_api_params"));
     assert!(projection_api.contains("body.insert(\"group_order\""));

@@ -508,9 +508,11 @@ fn worker_mode_failure_boundary_is_explicit() {
         architecture.contains("upstream bridge-realization seam is low-level carrier glue only")
     );
     assert!(architecture.contains(
-        "`fs-meta/runtime-support/` owns worker child-process bootstrap, log/socket ownership, retry clipping, and lifecycle supervision"
+        "`fs-meta/runtime-support/` owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision"
     ));
-    assert!(architecture.contains("preserves `Timeout` / `TransportClosed` categories"));
+    assert!(architecture.contains(
+        "The canonical worker transport contract preserves `Timeout` / `TransportClosed` categories"
+    ));
     assert!(workflow.contains(
         "product-facing failure domains are expressed only as `embedded` versus `external` workers"
     ));
@@ -526,7 +528,7 @@ fn worker_mode_failure_boundary_is_explicit() {
     assert!(!cargo.contains("crate-type = [\"cdylib\", \"rlib\"]"));
     assert!(facade_manifest.contains("crate-type = [\"cdylib\", \"rlib\"]"));
     assert!(runtime_app.contains("init_error"));
-    assert!(runtime_app.contains("fs-meta runtime task join failed"));
+    assert!(runtime_app.contains("fs-meta runtime init failed"));
     assert!(api_server.contains("create_inprocess_router"));
     assert!(!api_server.contains("remote projection client"));
     assert!(!api_server.contains("expect(\"fs-meta facade must build remote projection client\")"));
