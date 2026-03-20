@@ -62,14 +62,17 @@ version: 2.8.0
 
 1. **Materialized Query Path**:
    1. client issues `query`.
-   2. fs-meta app reads `meta-index`.
-   3. app returns fs-meta app-owned query/stats payloads built from shared Unix/FS field constraints and shared reliability/stability vocabulary; projection may further shape them into the public `/tree` or `/stats` HTTP response.
+   2. facade/query layer resolves target logical groups and fans out only to the sink-side execution partition that owns each group; worker process identity is hosting-only and is not the fan-out contract.
+   3. sink-side group execution reads its materialized subtree from `meta-index`.
+   4. facade/query layer merges the per-group sink results and returns fs-meta app-owned query/stats payloads built from shared Unix/FS field constraints and shared reliability/stability vocabulary; projection may further shape them into the public `/tree` or `/stats` HTTP response.
 
 2. **Fresh Find Path**:
    1. client issues `find`.
    2. projection/app derive candidate groups for the current scope and order them by `group_order=group-key|file-count|file-age`.
-   3. app executes live probe; when request is non-targeted (`selected_group` absent), app performs deterministic intra-group member arbitration and keeps one member snapshot per logical group.
-   4. app returns freshness observation results that projection shapes into the public multi-group paged `/on-demand-force-find` response.
+   3. facade/query layer fans out one live `force-find` execution per target logical group; when caller does not pin a group, the fan-out target set is the groups resolved for the current path scope.
+   4. inside each target logical group, app performs deterministic intra-group runner arbitration and executes the live probe on exactly one bound source-side execution partition at a time, falling back to the next runner only after failure.
+   5. source executes only the local group-scoped work it was selected for and MUST NOT forward the request to remote source execution partitions.
+   6. facade/query layer merges the per-group freshness observations and returns the public multi-group paged `/on-demand-force-find` response.
 
 3. **Projection HTTP Query Facade Path**:
    1. client issues HTTP query on `/api/fs-meta/v1/{tree|stats|on-demand-force-find}`.
@@ -143,7 +146,7 @@ version: 2.8.0
 16. The upstream bridge-realization seam is low-level carrier glue only; `fs-meta/runtime-support/` owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision, while worker artifact crates own only their explicit server entry/bootstrap functions.
 17. The canonical worker transport contract preserves `Timeout` / `TransportClosed` categories and applies wall-clock total-timeout clipping before retry; transport failures are not flattened into a generic peer-error bucket.
 18. `embedded` workers share the host process; `external` workers run in dedicated worker processes.
-19. Constructor/bootstrap faults surface as typed `CnxError` / `init_error`; runtime task join failures and worker/bootstrap faults are handled as app/task-local errors or explicit degraded behavior rather than routine production `panic!` / `expect!` flow.
+19. Constructor/bootstrap faults surface as typed `CnxError` / `init_error`; runtime local-execution join failures and worker/bootstrap faults are handled as app-local or local-execution-local errors or explicit degraded behavior rather than routine production `panic!` / `expect!` flow.
 20. Package-local implementation env seams remain bounded tuning knobs; `FS_META_SOURCE_SCAN_WORKERS`, `FS_META_SOURCE_AUDIT_INTERVAL_MS`, `FS_META_SOURCE_THROTTLE_INTERVAL_MS`, `FS_META_SINK_TOMBSTONE_TTL_MS`, `FS_META_SINK_TOMBSTONE_TOLERANCE_US`, and `FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS` tune implementation behavior without redefining truth, cutover, or query-surface contracts.
 
 ## ARCHITECTURE.CLI_AND_TOOLING_BOUNDARY

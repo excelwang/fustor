@@ -15,8 +15,8 @@ use crate::runtime::orchestration::{
 use crate::runtime::routes::{
     METHOD_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
     METHOD_SOURCE_STATUS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_PROXY,
-    ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META,
-    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
+    ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_INTERNAL,
+    default_route_bindings,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::workers::sink::{SinkFacade, SinkWorkerClientHandle};
@@ -108,42 +108,6 @@ fn attached_serving_nodes(
         }
         if nodes.insert(reply.serving_node.0.clone()) {
             out.push(reply.serving_node);
-        }
-    }
-    Ok(out)
-}
-
-fn sink_query_owner_nodes_for_request(
-    source: &SourceFacade,
-    request: &InternalQueryRequest,
-) -> Result<Vec<NodeId>> {
-    let roots = source.logical_roots_snapshot()?;
-    let grants = source.host_object_grants_snapshot()?;
-    let selected_group = request.scope.selected_group.as_deref();
-    let mut out = Vec::new();
-    let mut seen = std::collections::BTreeSet::<String>::new();
-    for root in roots {
-        if selected_group.is_some_and(|selected| selected != root.id.as_str()) {
-            continue;
-        }
-        let mut member_ids = grants
-            .iter()
-            .filter(|grant| root.selector.matches(grant))
-            .map(|grant| (grant.object_ref.clone(), grant.active))
-            .collect::<Vec<_>>();
-        member_ids.sort_by(|a, b| a.0.cmp(&b.0));
-        let primary_object_ref = member_ids
-            .iter()
-            .find_map(|(object_ref, active)| active.then(|| object_ref.clone()))
-            .or_else(|| member_ids.first().map(|(object_ref, _)| object_ref.clone()));
-        let Some(primary_object_ref) = primary_object_ref else {
-            continue;
-        };
-        let Some((node_id, _)) = primary_object_ref.split_once("::") else {
-            continue;
-        };
-        if seen.insert(node_id.to_string()) {
-            out.push(NodeId(node_id.to_string()));
         }
     }
     Ok(out)
@@ -580,6 +544,23 @@ impl FSMetaApp {
                                     "fs_meta_runtime_app: sink query proxy failed err={}",
                                     err
                                 );
+                                responses.push(Event::new(
+                                    EventMetadata {
+                                        origin_id: NodeId(
+                                            params
+                                                .scope
+                                                .selected_group
+                                                .clone()
+                                                .unwrap_or_else(|| "sink-query-proxy".to_string()),
+                                        ),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: req.metadata().correlation_id,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    },
+                                    bytes::Bytes::from(err.to_string()),
+                                ));
                             }
                         }
                     }
@@ -642,6 +623,23 @@ impl FSMetaApp {
                                     "fs_meta_runtime_app: source find proxy failed err={}",
                                     err
                                 );
+                                responses.push(Event::new(
+                                    EventMetadata {
+                                        origin_id: NodeId(
+                                            params
+                                                .scope
+                                                .selected_group
+                                                .clone()
+                                                .unwrap_or_else(|| "source-find-proxy".to_string()),
+                                        ),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: req.metadata().correlation_id,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    },
+                                    bytes::Bytes::from(err.to_string()),
+                                ));
                             }
                         }
                     }
@@ -1714,7 +1712,7 @@ mod tests {
     use serde_json::json;
     use std::fs;
     use std::net::TcpListener;
-    use std::sync::{Arc, OnceLock};
+    use std::sync::Arc;
     use std::time::Duration;
     use tempfile::tempdir;
 

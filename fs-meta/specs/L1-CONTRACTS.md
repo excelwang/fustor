@@ -39,7 +39,7 @@ version: 2.20.1
 4. **RESOURCE_BOUND_SOURCE_LOCAL_HOST_PROGRAMMING**: **fs-meta System** MUST keep resource-bound source logic programming to public host-fs facade on the bound host and MUST NOT model host operations as distributed host-operation forwarding contract.
    > Covers L0: VISION.RESOURCE_BOUND_LOCAL_HOST_PROGRAMMING
    > Responsibility: preserve local resource execution while keeping cross-node coordination in runtime/kernel control relations only.
-   > Verification: startup and adapter-boundary workflows describe source tasks consuming granted mount-root objects through public host-fs facade on the bound host; fs-meta specs do not require route-transparent remote host-operation interfaces.
+   > Verification: startup and adapter-boundary workflows describe source-side local execution consuming granted mount-root objects through public host-fs facade on the bound host; fs-meta specs do not require route-transparent remote host-operation interfaces.
 5. **THIN_RUNTIME_ABI_CONSUMPTION**: **fs-meta System** MUST consume only thin runtime ABI state (`host_object_grants`, run context, generation/lease, control events, channel hooks) at its app/runtime boundary.
    > Covers L0: VISION.THIN_RUNTIME_ABI_CONSUMPTION
    > Responsibility: keep fs-meta below runtime orchestration and above domain protocol ownership.
@@ -52,7 +52,7 @@ version: 2.20.1
    > Responsibility: keep grouping policy in fs-meta while allowing runtime to realize per-group unit bind/run realization.
    > Verification: group membership is computed from app config plus runtime-injected host object descriptors; runtime receives opaque groups and realizes per-group source/sink execution against those groups without upgrading any internal desired-state wiring into product vocabulary.
    > Verification: runtime host routing is resolved from `object_ref` and fs-meta app code does not parse node/member identifiers for host-fs calls.
-   > Verification: single mount-root init/watch failure is isolated to that object's task and does not block other group pipelines.
+   > Verification: single mount-root init/watch failure is isolated to that object's local execution partition and does not block other group pipelines.
 8. **SOURCE_PRIMARY_EXECUTOR_APP_OWNED**: **fs-meta System** MUST keep the source-primary selection rule inside fs-meta app logic while leaving bind/run admission, execution gating, and generation/fencing semantics under runtime ownership.
    > Responsibility: keep per-group audit/sentinel authority in fs-meta domain without promoting fs-meta app code into runtime-owned execution policy.
    > Verification: fs-meta selects one bound source run per group using an app-owned deterministic rule.
@@ -191,6 +191,7 @@ version: 2.20.1
 5. **GROUP_PARTITIONED_SINK_STATE**: **fs-meta System** MUST maintain sink materialization state partitioned by logical group.
    > Responsibility: prevent cross-group contamination and enable per-group lifecycle loops.
    > Verification: sink state organizes tree/clock/epoch by group only (single tree per group, no member sub-tree); same relative path from different members arbitrates into that group's single tree.
+   > Verification: worker process identity is only a hosting boundary; query fanout, sink ownership, and materialized response assembly are defined per logical group rather than by "all groups currently hosted in one worker process".
    > Verification: sink arbitration authority hierarchy is `Realtime atomic > Scan > Realtime non-atomic` for mtime dominance; equal/older compensation events do not rollback newer state.
    > Verification: sink applies compensation parent-staleness check (`parent_mtime_us`) before accepting first-seen Scan file insertions.
    > Verification: when a path changes type (`dir<->file`), sink purges cached descendants of that path before applying the new type to keep single-tree structure valid.
@@ -213,6 +214,7 @@ version: 2.20.1
    > Verification: authoritative journal cells use `state_class=authoritative`; projection or runtime scratch cells use `state_class=volatile`.
    > Verification: authoritative journal commit acceptance advances the current `authoritative_revision`; in-memory tree/view refresh advances only after projection rebuild applies that accepted truth.
    > Verification: derived materialized observation state MUST NOT outrun or replace `authoritative_revision` as the domain truth source.
+   > Verification: source workers and facade/query workers MUST NOT construct or own materialized tree state; sink remains the only materialized-tree owner.
    > Verification: source/sink authoritative mutation recording passes through one shared commit-boundary abstraction, not duplicated runtime state-carrier write call paths.
    > Verification: fs-meta manifest config MUST reject removed authority carrier fields (`unit_authority_state_carrier`, `unit_authority_state_dir`) to prevent app-level carrier coupling.
    > Verification: if runtime state-carrier authority initialization fails, fs-meta startup MUST fail closed with explicit invalid-input error.
@@ -269,6 +271,7 @@ version: 2.20.1
    > Responsibility: preserve app-owned grouping while allowing runtime to realize per-group sink bind/run realization.
    > Verification: sink generation-control/runtime contract carries per-group execution shape and runtime returns per-instance bound groups.
    > Verification: sink state partitioning keys off `group_id` plus `object_ref`, not `concrete_root_id`.
+   > Verification: worker processes may host multiple local sink execution partitions, but query fanout and materialized result ownership are still defined per logical group.
 11. **UNIT_CONTROL_ENVELOPE_FENCING**: **fs-meta System** MUST validate runtime unit control envelopes by unit contract (`unit_id`) and generation fencing (`generation`).
    > Responsibility: keep unit dispatch deterministic and reject unknown/invalid execution units.
    > Verification: source/sink reject `ExecControl` or `UnitTick` envelopes with unknown `unit_id`.
@@ -439,10 +442,10 @@ version: 2.20.1
    > Responsibility: keep worker-mode failure domains explicit so embedded host-process failures and external worker-process failures are not treated as the same operational event.
    > Verification: architecture and workflow specs describe `embedded` workers as sharing a host process and `external` workers as dedicated worker processes; public docs do not present them as equivalent isolation shapes.
 
-2. **INTERFACE_TASK_OR_WORKER_FAILURE_CONTAINMENT_TARGET**: **fs-meta System** SHOULD isolate recoverable interface failures (for example watcher/audit task panic, query worker crash, or sink worker loss) to task or worker scope when feasible, while preserving explicit degraded visibility.
+2. **INTERFACE_LOCAL_EXECUTION_OR_WORKER_FAILURE_CONTAINMENT_TARGET**: **fs-meta System** SHOULD isolate recoverable interface failures (for example watcher/audit local execution panic, query worker crash, or sink worker loss) to the narrowest local execution partition or worker scope when feasible, while preserving explicit degraded visibility.
    > Covers L0: VISION.TASK_OR_WORKER_FAILURE_CONTAINMENT
-   > Responsibility: keep recoverable interface-task and worker failures contained to the narrowest feasible scope while surfacing degraded/failure evidence.
-   > Verification: managed endpoint tasks and worker supervision keep source/sink/query failures explicit in status or degraded outputs instead of silently collapsing them into whole-app success.
+   > Responsibility: keep recoverable local-execution and worker failures contained to the narrowest feasible scope while surfacing degraded/failure evidence.
+   > Verification: managed endpoint loops and worker supervision keep source/sink/query failures explicit in status or degraded outputs instead of silently collapsing them into whole-app success.
 
 3. **FAILURE_IMPACT_BY_EXECUTION_SHAPE_DECLARED**: **fs-meta System** MUST document that in-process crash semantics can take down all boundaries in that host process, while worker-process failures are recovered through runtime lifecycle restart/rebind and rebuild paths rather than being mistaken for truth loss.
    > Covers L0: VISION.FAILURE_IMPACT_DECLARED_BY_MODE

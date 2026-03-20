@@ -1625,18 +1625,16 @@ impl FSMetaSource {
         };
 
         if let Some(sys) = boundary {
-            let roots_cloned = source.state_cell.roots_handle();
             let rescan_roots = source.state_cell.roots_handle();
             let rescan_fanout_health = source.state_cell.fanout_health_handle();
             let rescan_manual_intents = source.state_cell.manual_rescan_intents_handle();
-            let drift_cloned = drift_estimator.clone();
-            let clock_cloned = logical_clock.clone();
             let node_id_cloned = node_id.clone();
             let node_id_rescan = node_id.clone();
             let node_id_rescan_scoped = node_id.clone();
             let rescan_roots_scoped = rescan_roots.clone();
             let rescan_fanout_health_scoped = rescan_fanout_health.clone();
             let rescan_manual_intents_scoped = rescan_manual_intents.clone();
+            let source_for_find = source.clone();
             let routes = default_route_bindings();
             match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
                 Ok(route) => {
@@ -1678,76 +1676,7 @@ impl FSMetaSource {
                                         params.scope.path,
                                         params.scope.recursive
                                     );
-                                    let mut all_events = Vec::new();
-                                    let mut object_to_group = HashMap::<String, String>::new();
-                                    let roots_snapshot =
-                                        lock_or_recover(&roots_cloned, "source.endpoint.roots")
-                                            .clone();
-                                    for root in roots_snapshot.iter() {
-                                        if let Some(selected_group) = &params.scope.selected_group
-                                            && selected_group != &root.logical_root_id
-                                        {
-                                            continue;
-                                        }
-                                        object_to_group.insert(
-                                            root.object_ref.clone(),
-                                            root.logical_root_id.clone(),
-                                        );
-                                        if !root.active {
-                                            if params.scope.selected_group.as_deref()
-                                                == Some(root.logical_root_id.as_str())
-                                            {
-                                                responses.push(build_error_marker_event(
-                                                    &NodeId(root.logical_root_id.clone()),
-                                                    req.metadata().correlation_id,
-                                                    "force-find source target group is inactive",
-                                                ));
-                                            }
-                                            continue;
-                                        }
-                                        let logical_fallback =
-                                            !target_matches_any_object_monitor_prefix(
-                                                &params.scope.path,
-                                                &roots_snapshot,
-                                            );
-                                        let path_for_root = map_target_path_to_root(
-                                            &params.scope.path,
-                                            &root.monitor_path,
-                                            logical_fallback,
-                                        );
-                                        let Some(path_for_root) = path_for_root else {
-                                            continue;
-                                        };
-                                        match root.scanner.scan_targeted(
-                                            &path_for_root,
-                                            params.scope.recursive,
-                                            params.scope.max_depth,
-                                            &drift_cloned,
-                                            &clock_cloned,
-                                        ) {
-                                            Ok(mut events) => all_events.append(&mut events),
-                                            Err(e) => {
-                                                log::error!(
-                                                    "live scan failed for object {}: {:?}",
-                                                    root.object_ref,
-                                                    e
-                                                );
-                                                all_events.push(build_error_marker_event(
-                                                    &NodeId(root.object_ref.clone()),
-                                                    req.metadata().correlation_id,
-                                                    "force-find source scan failed",
-                                                ));
-                                            }
-                                        }
-                                    }
-                                    match encode_force_find_grouped_events(
-                                        &all_events,
-                                        &params.scope.path,
-                                        params.scope.recursive,
-                                        params.scope.max_depth,
-                                        params.op,
-                                        &object_to_group,
-                                    ) {
+                                    match source_for_find.force_find(&params) {
                                         Ok(grouped_events) => {
                                             eprintln!(
                                                 "fs_meta_source: route force-find response correlation={:?} groups_events={}",
@@ -1766,14 +1695,11 @@ impl FSMetaSource {
                                             }
                                         }
                                         Err(err) => {
-                                            log::error!(
-                                                "boundary endpoint failed to encode grouped force-find response: {:?}",
-                                                err
-                                            );
+                                            log::error!("boundary endpoint force-find failed: {:?}", err);
                                             responses.push(build_error_marker_event(
                                                 &node_id_cloned,
                                                 req.metadata().correlation_id,
-                                                "force-find source response encoding failed",
+                                                &err.to_string(),
                                             ));
                                         }
                                     }
@@ -2015,18 +1941,16 @@ impl FSMetaSource {
             tokio::task::block_in_place(|| handle.block_on(self.start_manual_rescan_watch()))?;
         }
 
-        let roots_cloned = self.state_cell.roots_handle();
         let rescan_roots = self.state_cell.roots_handle();
         let rescan_fanout_health = self.state_cell.fanout_health_handle();
         let rescan_manual_intents = self.state_cell.manual_rescan_intents_handle();
-        let drift_cloned = self.drift_estimator.clone();
-        let clock_cloned = self.logical_clock.clone();
         let node_id_cloned = self.node_id.clone();
         let node_id_rescan = self.node_id.clone();
         let node_id_rescan_scoped = self.node_id.clone();
         let rescan_roots_scoped = rescan_roots.clone();
         let rescan_fanout_health_scoped = rescan_fanout_health.clone();
         let rescan_manual_intents_scoped = rescan_manual_intents.clone();
+        let source_for_find = self.clone();
         let routes = default_route_bindings();
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
@@ -2069,75 +1993,7 @@ impl FSMetaSource {
                                     params.scope.path,
                                     params.scope.recursive
                                 );
-                                let mut all_events = Vec::new();
-                                let mut object_to_group = HashMap::<String, String>::new();
-                                let roots_snapshot =
-                                    lock_or_recover(&roots_cloned, "source.endpoint.roots").clone();
-                                for root in roots_snapshot.iter() {
-                                    if let Some(selected_group) = &params.scope.selected_group
-                                        && selected_group != &root.logical_root_id
-                                    {
-                                        continue;
-                                    }
-                                    object_to_group.insert(
-                                        root.object_ref.clone(),
-                                        root.logical_root_id.clone(),
-                                    );
-                                    if !root.active {
-                                        if params.scope.selected_group.as_deref()
-                                            == Some(root.logical_root_id.as_str())
-                                        {
-                                            responses.push(build_error_marker_event(
-                                                &NodeId(root.logical_root_id.clone()),
-                                                req.metadata().correlation_id,
-                                                "force-find source target group is inactive",
-                                            ));
-                                        }
-                                        continue;
-                                    }
-                                    let logical_fallback =
-                                        !target_matches_any_object_monitor_prefix(
-                                            &params.scope.path,
-                                            &roots_snapshot,
-                                        );
-                                    let path_for_root = map_target_path_to_root(
-                                        &params.scope.path,
-                                        &root.monitor_path,
-                                        logical_fallback,
-                                    );
-                                    let Some(path_for_root) = path_for_root else {
-                                        continue;
-                                    };
-                                    match root.scanner.scan_targeted(
-                                        &path_for_root,
-                                        params.scope.recursive,
-                                        params.scope.max_depth,
-                                        &drift_cloned,
-                                        &clock_cloned,
-                                    ) {
-                                        Ok(mut events) => all_events.append(&mut events),
-                                        Err(e) => {
-                                            log::error!(
-                                                "live scan failed for object {}: {:?}",
-                                                root.object_ref,
-                                                e
-                                            );
-                                            all_events.push(build_error_marker_event(
-                                                &NodeId(root.object_ref.clone()),
-                                                req.metadata().correlation_id,
-                                                "force-find source scan failed",
-                                            ));
-                                        }
-                                    }
-                                }
-                                match encode_force_find_grouped_events(
-                                    &all_events,
-                                    &params.scope.path,
-                                    params.scope.recursive,
-                                    params.scope.max_depth,
-                                    params.op,
-                                    &object_to_group,
-                                ) {
+                                match source_for_find.force_find(&params) {
                                     Ok(grouped_events) => {
                                         eprintln!(
                                             "fs_meta_source: route force-find response correlation={:?} groups_events={}",
@@ -2156,14 +2012,11 @@ impl FSMetaSource {
                                         }
                                     }
                                     Err(err) => {
-                                        log::error!(
-                                            "boundary endpoint failed to encode grouped force-find response: {:?}",
-                                            err
-                                        );
+                                        log::error!("boundary endpoint force-find failed: {:?}", err);
                                         responses.push(build_error_marker_event(
                                             &node_id_cloned,
                                             req.metadata().correlation_id,
-                                            "force-find source response encoding failed",
+                                            &err.to_string(),
                                         ));
                                     }
                                 }

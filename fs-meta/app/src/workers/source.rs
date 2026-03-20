@@ -495,6 +495,28 @@ impl SourceFacade {
         }
     }
 
+    pub fn force_find_via_node(
+        &self,
+        node_id: &NodeId,
+        params: &InternalQueryRequest,
+    ) -> Result<Vec<Event>> {
+        match self {
+            Self::Local(source) => source.force_find(params),
+            Self::Worker(client) => {
+                if client.node_id == *node_id {
+                    client.force_find(params.clone())
+                } else {
+                    let remote = SourceWorkerClientHandle::new(
+                        node_id.clone(),
+                        client.config.clone(),
+                        client.boundary.clone(),
+                    );
+                    remote.force_find(params.clone())
+                }
+            }
+        }
+    }
+
     pub fn publish_manual_rescan_signal(&self) -> Result<()> {
         match self {
             Self::Local(source) => source.publish_manual_rescan_signal(),

@@ -51,7 +51,7 @@ version: 2.17.1
 2. source 读取 `__cnx_runtime.host_object_grants`，其中每个 `mount-root` object 带 `object_ref`、`host_ref`、`host_ip`、`mount_point`、`fs_source`、`fs_type` 等 descriptors。
 3. app 仅使用 descriptors + 管理配置形成 groups，不依赖 runtime 解释路径或节点含义。
 4. app 可使用 host descriptor selectors（例如 `host_ip`、`host_name`、`site/zone`）与 object descriptors（例如 `mount_point`、`fs_source`、`fs_type`）决定分组。
-5. on runtime grants-changed control event，source 按版本号执行在线增量重收敛（新增 object 启动新 task，移除 object 有界回收旧 task），并触发定向重扫。
+5. on runtime grants-changed control event，source 按版本号执行在线增量重收敛（新增 object 启动新的本地执行分区，移除 object 有界回收旧分区），并触发定向重扫。
 6. mount-root object 生命周期独立，单 object 失败不阻塞同组其他 objects；禁止“仅更新内存映射但不生效任务变更”。
 
 ## [workflow] SourcePrimaryExecutorSelectionWorkflow
@@ -72,7 +72,10 @@ version: 2.17.1
 1. 每个 group 维护一个 app-owned in-flight mutex，确保同组同一时刻最多一个 `force-find`。
 2. `force-find` runner 采用 round-robin 在当前已调度 source instances 中选择，不要求与 source-primary executor 相同。
 3. 若被选 runner 调用失败，app 回退到下一个 bound source run。
-4. 该排他语义完全在 app 内实现，不向 runtime 引入临时 lease 语义。
+4. facade/query 先确定目标 groups；若调用方未指定 group，则 fan-out 目标集合为当前 path 命中的 groups。
+5. facade/query 对每个目标 group 启动一个独立 `force-find` 执行分支，并在 facade 侧汇总多组结果信封。
+6. source 只执行自己被选中的本地 group 范围工作，不得把该请求再转发给 remote source 执行分支。
+7. 该排他语义完全在 app 内实现，不向 runtime 引入临时 lease 语义。
 
 ## [workflow] GroupPartitionedEpochMidWorkflow
 
@@ -154,18 +157,20 @@ version: 2.17.1
 **Steps**
 
 1. caller issues `query`.
-2. fs-meta app 从 `meta-index` 读取物化 observation/projection 结果。
-3. app 按统一树响应模型返回 grouped envelopes：top-level 默认公开 `path`，只有当 query path 不是合法 UTF-8 时才额外公开 `path_b64`；每个 group 再公开 `root/entries/entry_page/stability/meta`。
-4. 当 metadata 可用时，`root` 与 `entries` 默认公开 `path`；仅当对应 raw bytes 不是合法 UTF-8 时，额外公开 authoritative bytes-safe 字段 `path_b64`。
-5. 若某 group 全部解码失败，仍返回该 group 的 `status:error` envelope，而不是伪造成功 metadata。
+2. facade/query 以 logical group 为 fan-out 单位，只向拥有该 group 的 sink-side execution partition 发起 materialized query。
+3. sink-side group execution 从 `meta-index` 读取该 group 的物化 observation/projection 结果。
+4. facade/query 汇总 per-group sink 结果，并按统一树响应模型返回 grouped envelopes：top-level 默认公开 `path`，只有当 query path 不是合法 UTF-8 时才额外公开 `path_b64`；每个 group 再公开 `root/entries/entry_page/stability/meta`。
+5. 当 metadata 可用时，`root` 与 `entries` 默认公开 `path`；仅当对应 raw bytes 不是合法 UTF-8 时，额外公开 authoritative bytes-safe 字段 `path_b64`。
+6. 若某 group 全部解码失败，仍返回该 group 的 `status:error` envelope，而不是伪造成功 metadata。
 
 ## [workflow] FindPath (Fresh)
 
 **Steps**
 
 1. caller issues `find`.
-2. fs-meta app 触发 live probe / targeted fresh scan。
-3. app 执行 delete-aware 聚合并输出与 QueryPath 完全一致的 grouped observation 模型（同 envelope、同 bytes-safe path/name 字段）。
+2. facade/query 先确定目标 groups，并对每个目标 group 启动一个 fresh-find 执行分支。
+3. 每个 group 仅在该组内选择一个 source runner 执行 live probe / targeted fresh scan；source 只执行本地 group 范围工作，不做 source-to-source forwarding。
+4. facade/query 执行 delete-aware 聚合并输出与 QueryPath 完全一致的 grouped observation 模型（同 envelope、同 bytes-safe path/name 字段）。
 
 ## [workflow] ProjectionHttpQueryFacade
 
@@ -240,7 +245,7 @@ version: 2.17.1
 1. sink 分发主路径采用“单 fs-meta app package boundary + runtime group-aware sink bind/run realization”，而不是 whole-app single-instance sharding。
 2. app 为每个 group 声明 sink 执行形状；这些声明细节仅用于内部 bind/run realization，而不是产品层术语。
 3. runtime 返回每个 sink instance 的 `bound_scopes[]`，sink 仅处理自己当前 bound_scopes 中的 groups。
-4. group 查询 fanout 单位为 group 子任务与其状态分区，不以 app 实例为 fanout 单位。
+4. worker 进程只承载本机 sink-side execution partitions；group 查询 fanout 单位为 logical group 及其状态分区，不以 app 实例或 worker 进程为 fanout 单位。
 5. source/sink unit gate 对未知 `unit_id` 与 stale generation 进行 fail-closed/fencing，确保 unit 合约前置收敛。
 
 ## [workflow] UnitControlFenceWorkflow
