@@ -412,11 +412,13 @@ fn release_generation_cutover_consumption_only() {
     let workflow = read_app_spec("specs/L3-RUNTIME/OBSERVATION_CUTOVER.md");
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     assert!(
-        l1.contains("active scan-enabled primary groups reaching initial-audit-complete materialized observation state")
+        l1.contains("rebuilding in-memory observation/projection state through scan/audit/rescan on the candidate generation")
+            && l1.contains("reaching app-owned `observation_eligible` for materialized `/tree` and `/stats`")
             && l1.contains("`/on-demand-force-find` on the freshness path")
             && workflow.contains("AuthoritativeTruthReplay")
             && workflow.contains("ProjectionCatchUp")
-            && workflow.contains("first audit has completed")
+            && workflow.contains("query `observation_status`")
+            && workflow.contains("trusted-materialized")
             && workflow.contains("`/on-demand-force-find` stays a freshness path"),
         "fs-meta app should replay authoritative truth, rebuild materialized observation, and keep force-find available before tree/stats eligibility"
     );
@@ -436,7 +438,8 @@ fn observation_eligibility_gate_ownership() {
         source.contains("apply_facade_activate")
             && source.contains("facade_gate")
             && source.contains("observation_eligible")
-            && source.contains("initial_audit_completed")
+            && source.contains("evaluate_observation_status")
+            && source.contains("candidate_group_observation_evidence")
             && source.contains("runtime_exposure_confirmed"),
         "fs-meta app should own a package-local materialized-query gate instead of relying on weak process-readiness proxies"
     );
@@ -447,7 +450,8 @@ fn observation_eligibility_gate_ownership() {
                 .contains("HTTP facade process/listener readiness is necessary but not sufficient")
             && workflow.contains("materialized `/tree` and `/stats`")
             && workflow.contains("current observation")
-            && workflow.contains("sink `initial_audit_completed` and `overflow_pending_audit`")
+            && workflow.contains("materialized observation evidence")
+            && workflow.contains("query `observation_status`")
             && workflow.contains("`/on-demand-force-find` stays a freshness path"),
         "fs-meta app workflow should treat observation_eligible as materialized-query evidence while keeping force-find on the freshness path"
     );

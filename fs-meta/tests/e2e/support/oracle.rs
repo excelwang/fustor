@@ -47,6 +47,17 @@ impl FsTreeOracle {
         body.insert("path".into(), Value::String(query_path.to_string()));
         maybe_insert_b64(&mut body, "path_b64", query_path.as_bytes());
         body.insert("status".into(), Value::String("ok".into()));
+        body.insert(
+            "read_class".into(),
+            Value::String("trusted-materialized".into()),
+        );
+        body.insert(
+            "observation_status".into(),
+            json!({
+                "state": "trusted-materialized",
+                "reasons": [],
+            }),
+        );
         body.insert("group_order".into(), Value::String(group_order.to_string()));
         body.insert(
             "pit".into(),
@@ -95,6 +106,14 @@ impl FsTreeOracle {
         body.insert("path".into(), Value::String(query_path.to_string()));
         maybe_insert_b64(&mut body, "path_b64", query_path.as_bytes());
         body.insert("status".into(), Value::String("ok".into()));
+        body.insert("read_class".into(), Value::String("fresh".into()));
+        body.insert(
+            "observation_status".into(),
+            json!({
+                "state": "fresh-only",
+                "reasons": [],
+            }),
+        );
         body.insert("group_order".into(), Value::String(group_order.to_string()));
         body.insert(
             "pit".into(),
@@ -221,7 +240,11 @@ impl FsTreeOracle {
                 "blocked_reasons": [],
             },
             "meta": {
-                "metadata_mode": "full",
+                "read_class": if force_find {
+                    "fresh"
+                } else {
+                    "trusted-materialized"
+                },
                 "metadata_available": true,
                 "withheld_reason": Value::Null,
             },
@@ -269,7 +292,7 @@ impl FsTreeOracle {
             },
             "data": build_json_tree(&nodes, query_path),
             "meta": {
-                "metadata_mode": "full",
+                "read_class": "trusted-materialized",
                 "metadata_available": true,
                 "withheld_reason": Value::Null,
                 "limit_applied": limit,
@@ -291,6 +314,9 @@ impl FsTreeOracle {
     ) -> Result<Value, String> {
         let mut payload =
             Self::tree_group_payload(mount_path, query_path, recursive, max_depth, limit)?;
+        let total_nodes = payload["meta"]["total_nodes"].clone();
+        let returned_nodes = payload["meta"]["returned_nodes"].clone();
+        let truncated = payload["meta"]["truncated"].clone();
         if let Some(group) = payload.as_object_mut() {
             group.insert("reliable".into(), Value::Bool(true));
             group.insert("unreliable_reason".into(), Value::Null);
@@ -303,6 +329,18 @@ impl FsTreeOracle {
                     "observed_quiet_for_ms": null,
                     "remaining_ms": null,
                     "blocked_reasons": [],
+                }),
+            );
+            group.insert(
+                "meta".into(),
+                json!({
+                    "read_class": "fresh",
+                    "metadata_available": true,
+                    "withheld_reason": Value::Null,
+                    "limit_applied": limit,
+                    "total_nodes": total_nodes,
+                    "returned_nodes": returned_nodes,
+                    "truncated": truncated,
                 }),
             );
         }
@@ -369,6 +407,17 @@ impl FsTreeOracle {
         let mut body = Map::new();
         body.insert("path".into(), Value::String(query_path.to_string()));
         maybe_insert_b64(&mut body, "path_b64", query_path.as_bytes());
+        body.insert(
+            "read_class".into(),
+            Value::String("trusted-materialized".into()),
+        );
+        body.insert(
+            "observation_status".into(),
+            json!({
+                "state": "trusted-materialized",
+                "reasons": [],
+            }),
+        );
         body.insert("groups".into(), Value::Object(groups));
         Ok(Value::Object(body))
     }

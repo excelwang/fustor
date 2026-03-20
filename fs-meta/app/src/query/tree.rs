@@ -4,11 +4,43 @@ use crate::query::reliability::GroupReliability;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
-pub enum MetadataMode {
+pub enum ReadClass {
+    Fresh,
+    Materialized,
     #[default]
-    Full,
-    StatusOnly,
-    StableOnly,
+    TrustedMaterialized,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ObservationState {
+    FreshOnly,
+    #[default]
+    MaterializedUntrusted,
+    TrustedMaterialized,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct ObservationStatus {
+    pub state: ObservationState,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+}
+
+impl ObservationStatus {
+    pub fn fresh_only() -> Self {
+        Self {
+            state: ObservationState::FreshOnly,
+            reasons: Vec::new(),
+        }
+    }
+
+    pub fn trusted_materialized() -> Self {
+        Self {
+            state: ObservationState::TrustedMaterialized,
+            reasons: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]

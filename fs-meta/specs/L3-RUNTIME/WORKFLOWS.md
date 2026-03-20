@@ -178,14 +178,14 @@ version: 3.0.0
 **Steps**
 
 1. caller 通过 `/api/fs-meta/v1/tree`、`/api/fs-meta/v1/stats`、`/api/fs-meta/v1/on-demand-force-find` 发起查询。
-2. projection 参数归一化：`path` 与 `path_b64` 二选一；`path_b64` 是 authoritative raw-path bytes，`path` 只是 UTF-8 convenience 输入。缺省路径为 `/`，`recursive` 缺省为 `true`；`/tree` 与 `/on-demand-force-find` 额外归一化 `group_order=group-key`、`group_page_size=64`、`entry_page_size=1000`；其中 `/tree` 还归一化 `stability_mode=none`、`metadata_mode=full`。
+2. projection 参数归一化：`path` 与 `path_b64` 二选一；`path_b64` 是 authoritative raw-path bytes，`path` 只是 UTF-8 convenience 输入。缺省路径为 `/`，`recursive` 缺省为 `true`；`/tree` 与 `/on-demand-force-find` 额外归一化 `group_order=group-key`、`group_page_size=64`、`entry_page_size=1000`；其中 `/tree` 与 `/stats` 还归一化 `read_class=trusted-materialized`。
 3. projection/query client 对 app-owned query ports 使用通用 channel attach / query request，而不是直接拼装宿主对象路由。
-4. `/tree` 与 `/on-demand-force-find` 输出 top-level `group_order`、`path`、`groups[]` 与 `group_page`；仅当 raw query path 不是合法 UTF-8 时才额外输出 `path_b64`。每个 group item 再单独携带 `group/root/entries/entry_page/stability/meta`，其中 `path_b64` 只在对应 raw bytes 不是合法 UTF-8 时出现，字符串路径字段保持默认 display 形态。
+4. `/tree` 与 `/on-demand-force-find` 输出 top-level `read_class`、`observation_status`、`group_order`、`path`、`groups[]` 与 `group_page`；仅当 raw query path 不是合法 UTF-8 时才额外输出 `path_b64`。每个 group item 再单独携带 `group/root/entries/entry_page/stability/meta`，其中 `path_b64` 只在对应 raw bytes 不是合法 UTF-8 时出现，字符串路径字段保持默认 display 形态。
 5. projection 使用请求返回事件中的 `origin_id` + policy mapping（`mount-path`/`source-locator`/`origin`）构建 group key，不依赖预置 peer 注册表。
 6. 首次 `/tree` 或 `/on-demand-force-find` 请求先按 `group_order` 生成当前 group bucket 序列，并把该次 grouped 结果冻结到一个短 TTL PIT；随后根据 `group_page_size` 取本次 bucket page。
 7. `/tree` 与 `/on-demand-force-find` 的 `group_after`/`entry_after` 都是 projection-owned opaque PIT cursors；续页必须带同一个 `pit_id`，服务端直接从 PIT 读取 page offsets，而不是重新计算 group 排序或重跑 live force-find。
 8. `group_order=file-count|file-age` 时，projection MAY 用 lightweight `stats` probe 完成 group ranking；客户端若只想要一个 top-ranked group，使用 `group_page_size=1`。
-9. `group_order` 只负责 bucket 排序；quiet-window stability、metadata withholding、以及 dual-cursor pagination 由独立参数轴控制，不隐式附着在 group ranking 上。
+9. `group_order` 只负责 bucket 排序；`read_class`、observation gating、以及 dual-cursor pagination 由独立参数轴控制，不隐式附着在 group ranking 上。
 10. transport/protocol/timeout 异常返回结构化错误体：`error/code/path`，并按错误类型映射到明确 HTTP 状态。
 11. projection 暴露 `/api/fs-meta/v1/bound-route-metrics` 读取 bound-route 传输计数（timeout/correlation/uncorrelated/pending 等）。
 12. 调用方通道生命周期与 correctness 解耦；当前实现可采用每次 route call `caller.open -> ask -> close` 的基线策略。
@@ -213,23 +213,17 @@ version: 3.0.0
 6. continuation uses `pit_id` plus `group_after`/`entry_after` offsets to read the frozen PIT page instead of rebuilding ranking or rerunning force-find.
 7. app returns grouped response with one `entry_page` per returned group plus top-level `pit`.
 
-## [workflow] QuietWindowStableTreeQuery
+## [workflow] NamedReadClassQuery
 
 **Steps**
 
-1. caller MAY request materialized tree query with `stability_mode=quiet-window`; caller MAY independently choose `group_order`, `pit_id/group_page_size/group_after`, `entry_page_size/entry_after`, and `metadata_mode`.
-2. group bucket ordering runs first; stability parameters do not alter the bucket-order algorithm.
-3. sink/projection evaluates path stability from materialized subtree evidence, not from raw query readability or `latest_file_mtime_us` ranking data.
-4. sink distinguishes two classes of incoming update:
-   1. sync-refresh update: periodic scan/audit/repair refresh that leaves the effective materialized subtree result unchanged.
-   2. write-significant update: create/delete/rename/type mutation or metadata-visible subtree delta that changes the effective materialized result.
-5. periodic refresh that discovers and accepts a query-visible `modified_time_us` or equivalent payload delta is treated as write-significant, because the effective materialized subtree result changed.
-6. write-significant updates reset the affected node and all ancestor subtree quiet-window anchors; sync-refresh updates that do not change the effective subtree result do not reset the quiet window.
-7. coverage loss or catch-up uncertainty (for example overflow pending audit, blind spots, degraded root coverage, or equivalent recovery-in-progress) prevents `stable` result and yields `unknown` or `degraded`.
-8. quiet-window outcome is computed from `max(subtree_last_write_significant_change_at, last_coverage_recovered_at)` against caller-supplied `quiet_window_ms`.
-9. `metadata_mode=full` returns paged subtree metadata (`root` + `entries` + `page`) plus stability report; `metadata_mode=status-only` returns stability report without metadata; `metadata_mode=stable-only` returns metadata only when stability state is `stable`, otherwise reports explicit metadata withholding.
-10. `group_page_size/group_after` paginate bucket selection inside one PIT and `entry_page_size/entry_after` paginate per-group metadata only; stability remains scoped to each returned subtree, not to the current page slice.
-11. `/on-demand-force-find` stays a freshness path and rejects quiet-window stability controls instead of pretending live scan equals stable materialized observation; pagination只切分 live subtree metadata，不把该结果升级为 materialized snapshot。
+1. caller selects `read_class=fresh|materialized|trusted-materialized` instead of hand-composing stability or metadata modes.
+2. group bucket ordering runs first; `read_class` does not alter the bucket-order algorithm.
+3. `fresh` delegates to the live/freshness path and reports `observation_status.state=fresh-only`; it may be useful before materialized observation catches up, but it does not claim current trusted observation.
+4. `materialized` reads the current materialized projection and returns explicit `observation_status`; degraded coverage, missing initial audit, or overflow evidence are surfaced as `materialized-untrusted` reasons instead of forcing the caller to infer trust from parameter combinations.
+5. `trusted-materialized` consumes the same package-local observation evidence as cutover `observation_eligible`; until that evidence is trusted enough, the request fails closed with explicit `NOT_READY`.
+6. `group_page_size/group_after` paginate bucket selection inside one PIT and `entry_page_size/entry_after` paginate per-group metadata only; `read_class` does not change PIT ownership or cursor meaning.
+7. `/on-demand-force-find` stays a freshness path; it is the dedicated force-find alias for `read_class=fresh` rather than a second free-form stability model.
 
 ## [workflow] DescriptorDrivenGroupingPolicy
 

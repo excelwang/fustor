@@ -76,12 +76,12 @@ version: 3.0.0
 
 3. **Projection HTTP Query Facade Path**:
    1. client issues HTTP query on `/api/fs-meta/v1/{tree|stats|on-demand-force-find}`.
-   2. projection layer normalizes request defaults (`path=/`, `recursive=true`, `group_order=group-key`, `group_page_size=64`, `entry_page_size=1000`, `stability_mode=none`, `metadata_mode=full`) and dispatches to query/find backend.
+   2. projection layer normalizes request defaults (`path=/`, `recursive=true`, `group_order=group-key`, `group_page_size=64`, `entry_page_size=1000`, `read_class=trusted-materialized`) and dispatches to materialized or freshness backend.
    3. the first materialized `/tree` or live `/on-demand-force-find` request freezes one grouped query result into a short-lived PIT session; later pages read that PIT instead of recomputing group ranking or rerunning live scans.
-   4. `group_order` remains a pure ranking axis; it orders candidate groups but does not define path stability or metadata withholding behavior.
-   5. when caller requests `stability_mode=quiet-window` on the materialized tree path, projection evaluates each returned group/path stability after bucket selection and before metadata shaping.
-   6. quiet-window evaluation uses materialized subtree observed-change evidence plus coverage recovery state; periodic sync-refresh updates that do not change the effective subtree result do not reset the quiet window.
-   7. `/tree` returns a grouped bucket envelope with top-level `pit`, `groups[]`, and `group_page`; `/on-demand-force-find` returns the same grouped-envelope family with `stability=not-evaluated` per group.
+   4. `group_order` remains a pure ranking axis; it orders candidate groups but does not define read trust or observation gating behavior.
+   5. `read_class=fresh` delegates to the freshness path, `read_class=materialized` returns current materialized observation with explicit observation status, and `read_class=trusted-materialized` is gated by package-local trusted observation evidence.
+   6. the same package-local observation evaluator feeds query `observation_status` and cutover `observation_eligible`; transport failure remains an availability concern rather than a trust state.
+   7. `/tree` returns a grouped bucket envelope with top-level `read_class`, `observation_status`, `pit`, `groups[]`, and `group_page`; `/on-demand-force-find` returns the same grouped-envelope family with `observation_status.state=fresh-only`.
    8. `/tree` and `/on-demand-force-find` both use PIT-owned cursor families: `group_after` is a top-level bucket offset cursor inside one PIT, while `entry_after` is an opaque per-group entry cursor bundle inside that same PIT.
    9. projection publishes transport diagnostics via `/api/fs-meta/v1/bound-route-metrics`.
 

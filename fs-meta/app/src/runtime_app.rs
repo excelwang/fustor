@@ -5,6 +5,12 @@ use crate::api::facade_status::{
     FacadePendingReason, SharedFacadePendingStatus, SharedFacadePendingStatusCell,
     shared_facade_pending_status_cell,
 };
+#[cfg(test)]
+use crate::query::observation::{
+    candidate_group_observation_evidence, evaluate_observation_status,
+};
+#[cfg(test)]
+use crate::query::tree::ObservationState;
 use crate::query::TreeGroupPayload;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryNode, SubtreeStats};
 use crate::runtime::endpoint::ManagedEndpointTask;
@@ -757,52 +763,12 @@ impl FSMetaApp {
         let source_status = source.status_snapshot()?;
         let sink_status = sink.status_snapshot()?;
         let candidate_groups = Self::observation_candidate_group_ids(source, sink, pending)?;
-
-        if candidate_groups.is_empty() {
-            return Ok(false);
-        }
-
-        if source_status
-            .degraded_roots
-            .iter()
-            .any(|(root_id, _)| candidate_groups.contains(root_id))
-        {
-            return Ok(false);
-        }
-
-        let scan_groups = source_status
-            .concrete_roots
-            .iter()
-            .filter(|root| {
-                root.active
-                    && root.is_group_primary
-                    && root.scan_enabled
-                    && candidate_groups.contains(&root.logical_root_id)
-            })
-            .map(|root| root.logical_root_id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        let sink_groups = sink_status
-            .groups
-            .iter()
-            .map(|group| (group.group_id.clone(), group))
-            .collect::<std::collections::BTreeMap<_, _>>();
-
-        for group_id in &candidate_groups {
-            if let Some(group) = sink_groups.get(group_id)
-                && group.overflow_pending_audit
-            {
-                return Ok(false);
-            }
-            if scan_groups.contains(group_id) {
-                let Some(group) = sink_groups.get(group_id) else {
-                    return Ok(false);
-                };
-                if !group.initial_audit_completed {
-                    return Ok(false);
-                }
-            }
-        }
-        Ok(true)
+        let status = evaluate_observation_status(&candidate_group_observation_evidence(
+            &source_status,
+            &sink_status,
+            &candidate_groups,
+        ));
+        Ok(status.state == ObservationState::TrustedMaterialized)
     }
 
     async fn try_spawn_pending_facade(&self) -> Result<bool> {

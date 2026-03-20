@@ -2055,8 +2055,7 @@ impl SinkFileMeta {
                         group.overflow_pending_audit,
                         request.scope.recursive,
                         request.scope.max_depth,
-                        tree_options.stability_mode,
-                        tree_options.quiet_window_ms,
+                        tree_options.read_class,
                         group.last_coverage_recovered_at,
                     );
                     rmp_serde::to_vec_named(&MaterializedQueryPayload::Tree(response))

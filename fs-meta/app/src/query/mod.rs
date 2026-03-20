@@ -1,5 +1,6 @@
 pub mod api;
 pub mod models;
+pub mod observation;
 pub mod path;
 pub mod reliability;
 pub mod request;
@@ -13,6 +14,6 @@ pub use request::{
     QueryOp, QueryScope, QueryTransport, TreeQueryOptions,
 };
 pub use tree::{
-    MetadataMode, PageOrder, StabilityState, TreeGroupPayload, TreePageEntry, TreePageRoot,
-    TreeStability,
+    ObservationState, ObservationStatus, PageOrder, ReadClass, StabilityState, TreeGroupPayload,
+    TreePageEntry, TreePageRoot, TreeStability,
 };

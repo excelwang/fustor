@@ -13,7 +13,7 @@ use crate::query::path::{
 use crate::query::reliability::{GroupReliability, ReliabilityAccumulator};
 use crate::query::result_ops::RawQueryResult;
 use crate::query::tree::{
-    StabilityState, TreeGroupPayload, TreePageEntry, TreePageRoot, TreeStability,
+    ReadClass, StabilityState, TreeGroupPayload, TreePageEntry, TreePageRoot, TreeStability,
 };
 use crate::sink::clock::SinkClock;
 use crate::sink::tree::{FileMetaNode, MaterializedTree};
@@ -21,6 +21,8 @@ use crate::sink::tree::{FileMetaNode, MaterializedTree};
 use capanix_host_fs_types::query::{StabilityMode, UnreliableReason};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
+
+const TRUSTED_READ_QUIET_WINDOW_MS: u64 = 5_000;
 
 pub(crate) fn query_node_from_node(path: &[u8], node: &FileMetaNode) -> QueryNode {
     QueryNode {
@@ -455,10 +457,15 @@ pub fn get_materialized_tree_payload(
     overflow_pending_audit: bool,
     recursive: bool,
     max_depth: Option<usize>,
-    stability_mode: StabilityMode,
-    quiet_window_ms: Option<u64>,
+    read_class: ReadClass,
     last_coverage_recovered_at: Option<Instant>,
 ) -> TreeGroupPayload {
+    let (stability_mode, quiet_window_ms) = match read_class {
+        ReadClass::Fresh => (StabilityMode::None, None),
+        ReadClass::Materialized | ReadClass::TrustedMaterialized => {
+            (StabilityMode::QuietWindow, Some(TRUSTED_READ_QUIET_WINDOW_MS))
+        }
+    };
     let direct_query = tree.has_path(dir_path);
     if direct_query {
         let direct = get_directory_tree(
@@ -716,8 +723,7 @@ mod tests {
             false,
             true,
             None,
-            StabilityMode::None,
-            None,
+            ReadClass::Materialized,
             None,
         );
         let mut paths = Vec::new();

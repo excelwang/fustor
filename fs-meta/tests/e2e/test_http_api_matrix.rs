@@ -616,12 +616,14 @@ fn run_query_baseline_phase(
             &[
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),
-                ("stability_mode", "quiet-window".to_string()),
-                ("quiet_window_ms", "5000".to_string()),
+                (
+                    "read_class",
+                    "trusted-materialized".to_string(),
+                ),
             ],
         )?,
         400,
-        "stability_mode must be none on /on-demand-force-find",
+        "read_class must be fresh on /on-demand-force-find",
     )?;
     assert_error(
         session.client().force_find_raw(
@@ -629,11 +631,11 @@ fn run_query_baseline_phase(
             &[
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),
-                ("quiet_window_ms", "5000".to_string()),
+                ("read_class", "materialized".to_string()),
             ],
         )?,
         400,
-        "quiet_window_ms is invalid on /on-demand-force-find",
+        "read_class must be fresh on /on-demand-force-find",
     )?;
     assert_error(
         session.client().force_find_raw(
@@ -641,11 +643,11 @@ fn run_query_baseline_phase(
             &[
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),
-                ("metadata_mode", "status-only".to_string()),
+                ("read_class", "trusted-materialized".to_string()),
             ],
         )?,
         400,
-        "metadata_mode must be full on /on-demand-force-find",
+        "read_class must be fresh on /on-demand-force-find",
     )?;
     assert_error(
         session.client().force_find_raw(

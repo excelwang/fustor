@@ -157,34 +157,37 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
 ```
 
 1. `GET /tree`
-   1. query: `path` (UTF-8 convenience path, default `/`) or `path_b64` (authoritative base64url raw-path bytes, mutually exclusive with `path`), `recursive` (default `true`), `pit_id` (optional on first page, required on continuation), `group_order` (`group-key|file-count|file-age`, default `group-key`), `group_page_size` (default `64`, range `1..=1000`), `group_after` (opaque PIT cursor, optional), `entry_page_size` (default `1000`, range `1..=10000`), `entry_after` (opaque per-group PIT cursor bundle, optional), `stability_mode` (`none|quiet-window`, default `none`), `quiet_window_ms` (required when `stability_mode=quiet-window`), `metadata_mode` (`full|status-only|stable-only`, default `full`).
-   2. response: `{ "path": string, "status": "ok", "group_order": GroupOrder, "pit": PitHandle, "groups": TreeGroupEnvelope[], "group_page": GroupPage }`, plus optional `path_b64` when the authoritative raw path is not valid UTF-8.
+   1. query: `path` (UTF-8 convenience path, default `/`) or `path_b64` (authoritative base64url raw-path bytes, mutually exclusive with `path`), `recursive` (default `true`), `pit_id` (optional on first page, required on continuation), `group_order` (`group-key|file-count|file-age`, default `group-key`), `group_page_size` (default `64`, range `1..=1000`), `group_after` (opaque PIT cursor, optional), `entry_page_size` (default `1000`, range `1..=10000`), `entry_after` (opaque per-group PIT cursor bundle, optional), `read_class` (`fresh|materialized|trusted-materialized`, default `trusted-materialized`).
+   2. response: `{ "path": string, "status": "ok", "read_class": ReadClass, "observation_status": ObservationStatus, "group_order": GroupOrder, "pit": PitHandle, "groups": TreeGroupEnvelope[], "group_page": GroupPage }`, plus optional `path_b64` when the authoritative raw path is not valid UTF-8.
 2. `GET /on-demand-force-find`
-   1. query: `path` (UTF-8 convenience path, default `/`) or `path_b64` (authoritative base64url raw-path bytes, mutually exclusive with `path`), `recursive` (default `true`), `pit_id` (optional on first page, required on continuation), `group_order` (`group-key|file-count|file-age`, default `group-key`), `group_page_size` (default `64`, range `1..=1000`), `group_after` (opaque PIT cursor, optional), `entry_page_size` (default `1000`, range `1..=10000`), `entry_after` (opaque per-group PIT cursor bundle, optional); `stability_mode` MUST stay `none`, `quiet_window_ms` is invalid, and `metadata_mode` MUST stay `full`.
-   2. response: `{ "path": string, "status": "ok", "group_order": GroupOrder, "pit": PitHandle, "groups": ForceFindGroupEnvelope[], "group_page": GroupPage }`, plus optional `path_b64` when the authoritative raw path is not valid UTF-8.
+   1. query: `path` (UTF-8 convenience path, default `/`) or `path_b64` (authoritative base64url raw-path bytes, mutually exclusive with `path`), `recursive` (default `true`), `pit_id` (optional on first page, required on continuation), `group_order` (`group-key|file-count|file-age`, default `group-key`), `group_page_size` (default `64`, range `1..=1000`), `group_after` (opaque PIT cursor, optional), `entry_page_size` (default `1000`, range `1..=10000`), `entry_after` (opaque per-group PIT cursor bundle, optional).
+   2. response: `{ "path": string, "status": "ok", "read_class": "fresh", "observation_status": ObservationStatus, "group_order": GroupOrder, "pit": PitHandle, "groups": ForceFindGroupEnvelope[], "group_page": GroupPage }`, plus optional `path_b64` when the authoritative raw path is not valid UTF-8.
 3. `GET /stats`
-   1. query: `path` (UTF-8 convenience path, default `/`) or `path_b64` (authoritative base64url raw-path bytes, mutually exclusive with `path`), `recursive` (default `true`), `group` (optional).
-   2. response: `{ "path": string, "groups": { "<group>": GroupEnvelopeStats } }`, plus optional `path_b64` when the authoritative raw path is not valid UTF-8.
+   1. query: `path` (UTF-8 convenience path, default `/`) or `path_b64` (authoritative base64url raw-path bytes, mutually exclusive with `path`), `recursive` (default `true`), `group` (optional), `read_class` (`fresh|materialized|trusted-materialized`, default `trusted-materialized`).
+   2. response: `{ "path": string, "read_class": ReadClass, "observation_status": ObservationStatus, "groups": { "<group>": GroupEnvelopeStats } }`, plus optional `path_b64` when the authoritative raw path is not valid UTF-8.
 4. `GET /bound-route-metrics`
    1. response: `{ "call_timeout_total": u64, "correlation_mismatch_total": u64, "uncorrelated_reply_total": u64, "recv_loop_iterations": u64, "pending_calls": usize }`.
 5. `GET /tree` payload details
-   1. `stability` keys: `mode`, `state`, `quiet_window_ms`, `observed_quiet_for_ms`, `remaining_ms`, `blocked_reasons`.
-   2. `stability.state` domain for materialized tree queries: `not-evaluated|stable|unstable|unknown|degraded`.
-   3. `pit` uses `{ id, expires_at_ms }`.
-   4. `group_page` uses `{ returned_groups, has_more_groups, next_cursor, next_entry_after }`.
-   5. `meta` MUST include `metadata_mode` and `metadata_available`; when metadata is withheld it MUST include `withheld_reason`.
-   6. `root` is present only when a group's `meta.metadata_available=true`; it uses `{ path, size, modified_time_us, is_dir, exists, has_children }`, plus optional `path_b64` when the authoritative raw bytes are not valid UTF-8.
-   7. `entries` is present only when a group's `meta.metadata_available=true`; each entry uses `{ path, depth, size, modified_time_us, is_dir, has_children }`, plus optional `path_b64` when the authoritative raw bytes are not valid UTF-8.
-   8. `entry_page` is present only when a group's `meta.metadata_available=true`; it uses `{ order:"path-lex", page_size, returned_entries, has_more_entries, next_cursor }`.
-   9. `group_after` and `entry_after` cursors MUST be treated as opaque by clients; any continuation using them MUST also send `pit_id`. Expired PIT returns explicit `PIT_EXPIRED`; the server does not expose materialized-revision stale cursors on the public contract.
-   10. `path_b64` is the authoritative bytes-safe path field and appears only when the underlying raw bytes are not valid UTF-8. `path` remains the default display-only UTF-8/lossy rendering for convenience.
-   11. before the active generation reaches materialized-query `observation_eligible`, `/tree` returns explicit `NOT_READY` / degraded status rather than silently serving partial materialized results.
+   1. `observation_status` keys: `state`, `reasons`.
+   2. `observation_status.state` domain for `/tree`: `fresh-only|materialized-untrusted|trusted-materialized`.
+   3. `stability` keys remain `mode`, `state`, `quiet_window_ms`, `observed_quiet_for_ms`, `remaining_ms`, `blocked_reasons`.
+   4. `stability.state` domain for tree groups remains `not-evaluated|stable|unstable|unknown|degraded`.
+   5. `pit` uses `{ id, expires_at_ms }`.
+   6. `group_page` uses `{ returned_groups, has_more_groups, next_cursor, next_entry_after }`.
+   7. `meta` MUST include `read_class` and `metadata_available`; when metadata is withheld it MUST include `withheld_reason`.
+   8. `root` is present only when a group's `meta.metadata_available=true`; it uses `{ path, size, modified_time_us, is_dir, exists, has_children }`, plus optional `path_b64` when the authoritative raw bytes are not valid UTF-8.
+   9. `entries` is present only when a group's `meta.metadata_available=true`; each entry uses `{ path, depth, size, modified_time_us, is_dir, has_children }`, plus optional `path_b64` when the authoritative raw bytes are not valid UTF-8.
+   10. `entry_page` is present only when a group's `meta.metadata_available=true`; it uses `{ order:"path-lex", page_size, returned_entries, has_more_entries, next_cursor }`.
+   11. `group_after` and `entry_after` cursors MUST be treated as opaque by clients; any continuation using them MUST also send `pit_id`. Expired PIT returns explicit `PIT_EXPIRED`; the server does not expose materialized-revision stale cursors on the public contract.
+   12. `path_b64` is the authoritative bytes-safe path field and appears only when the underlying raw bytes are not valid UTF-8. `path` remains the default display-only UTF-8/lossy rendering for convenience.
+   13. `read_class=materialized` MAY return while `observation_status.state=materialized-untrusted`; `read_class=trusted-materialized` returns explicit `NOT_READY` until the same package-local observation evidence reaches trusted state.
 6. `GET /on-demand-force-find` payload details
-   1. `stability` keys use the same object shape as `/tree`, but `state` MUST stay `not-evaluated` and `mode` MUST stay `none`.
-   2. `meta.metadata_mode` is always `full`; `meta.metadata_available` is always `true`.
-   3. each returned group item owns its own `root`, `entries`, and `entry_page`, using the same field shapes as `/tree`, including optional `path_b64` when display strings would be lossy.
-   4. `group_after` and `entry_after` cursors MUST be treated as opaque PIT cursors by clients; after the first page, force-find continuation reuses frozen PIT results instead of rerunning the live query.
-   5. `/on-demand-force-find` remains a freshness path and is not blocked by the initial-audit materialized-query gate that protects `/tree` and `/stats`.
+   1. `observation_status.state` MUST stay `fresh-only`.
+   2. `stability` keys use the same object shape as `/tree`, but `state` MUST stay `not-evaluated` and `mode` MUST stay `none`.
+   3. `meta.read_class` is always `fresh`; `meta.metadata_available` is always `true`.
+   4. each returned group item owns its own `root`, `entries`, and `entry_page`, using the same field shapes as `/tree`, including optional `path_b64` when display strings would be lossy.
+   5. `group_after` and `entry_after` cursors MUST be treated as opaque PIT cursors by clients; after the first page, force-find continuation reuses frozen PIT results instead of rerunning the live query.
+   6. `/on-demand-force-find` remains a freshness path and is not blocked by the trusted-materialized observation gate that protects `/tree` and `/stats`.
 7. `PitHandle`
    1. required keys: `id`, `expires_at_ms`.
    2. `id` is an opaque server-issued query session id; clients do not derive meaning from it.
@@ -192,7 +195,7 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
    1. required keys: `status`, `errors`; `members` key MUST be absent.
    2. when `status=ok`: envelope MUST include `data` with `total_nodes/total_files/total_dirs/total_size/latest_file_mtime_us/attested_count/blind_spot_count`, and `partial_failure`.
    3. when `status=error`: envelope MUST include `message`; `data` key MUST be absent.
-   4. before the active generation reaches materialized-query `observation_eligible`, `/stats` returns explicit `NOT_READY` / degraded status rather than silently serving partial materialized aggregates.
+   4. `read_class=materialized` MAY return while `observation_status.state=materialized-untrusted`; `read_class=trusted-materialized` returns explicit `NOT_READY` until the same package-local observation evidence reaches trusted state.
 
 ## [decision] AuthFileFormat
 
@@ -212,7 +215,7 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
 1. deploy-time product config is thin bootstrap config (`api/auth`) only.
 2. fs-meta consumes shared `capanix-config` / daemon / runtime config and intent boundaries for config loading, manifest discovery, and relation-target compilation; the product API does not redefine those platform-owned semantics.
 3. runtime grants plus monitoring-roots APIs own online business monitoring scope.
-4. query-shaping knobs stay on query-path parameters (`path/pit_id/group_order/group_page_size/group_after/entry_page_size/entry_after/recursive/stability_mode/quiet_window_ms/metadata_mode`), not in deploy bootstrap config.
+4. query-shaping knobs stay on query-path parameters (`path/pit_id/group_order/group_page_size/group_after/entry_page_size/entry_after/recursive/read_class`), not in deploy bootstrap config.
 5. internal desired-state/runtime policy fields are generated deployment details, not operator business parameters.
 
 ## [decision] ProductAccessBoundary

@@ -1,4 +1,8 @@
 use crate::query::models::SubtreeStats;
+use crate::query::observation::{
+    evaluate_observation_status, materialized_query_observation_evidence,
+    trusted_materialized_not_ready_message,
+};
 use crate::query::path::bytes_to_display_string;
 #[cfg(test)]
 use crate::query::path::normalized_path_for_query;
@@ -12,8 +16,8 @@ use crate::query::result_ops::{
     raw_query_results_by_origin_from_source_events, tree_group_payload_from_query_response,
 };
 use crate::query::tree::{
-    MetadataMode, PageOrder, StabilityState, TreeGroupPayload, TreePageEntry, TreePageRoot,
-    TreeStability,
+    ObservationState, ObservationStatus, PageOrder, ReadClass, StabilityState, TreeGroupPayload,
+    TreePageEntry, TreePageRoot, TreeStability,
 };
 use crate::sink::SinkStatusSnapshot;
 use crate::source::SourceStatusSnapshot;
@@ -43,7 +47,6 @@ use capanix_app_sdk::runtime::NodeId;
 use capanix_app_sdk::{CnxError, Event, bound_route_metrics_snapshot};
 use capanix_host_adapter_fs_meta::HostAdapter;
 use capanix_app_sdk::raw::ChannelIoSubset;
-use capanix_host_fs_types::query::StabilityMode;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
@@ -83,9 +86,7 @@ pub struct ApiParams {
     pub group_after: Option<String>,
     pub entry_page_size: Option<usize>,
     pub entry_after: Option<String>,
-    pub stability_mode: Option<StabilityMode>,
-    pub quiet_window_ms: Option<u64>,
-    pub metadata_mode: Option<MetadataMode>,
+    pub read_class: Option<ReadClass>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
@@ -248,9 +249,7 @@ struct TreePitScope {
     recursive: bool,
     max_depth: Option<usize>,
     group_order: GroupOrder,
-    stability_mode: StabilityMode,
-    quiet_window_ms: Option<u64>,
-    metadata_mode: MetadataMode,
+    read_class: ReadClass,
 }
 
 #[derive(Clone, Debug)]
@@ -270,7 +269,7 @@ enum PitScope {
 
 #[derive(Clone, Debug)]
 struct PitMetadata {
-    metadata_mode: MetadataMode,
+    read_class: ReadClass,
     metadata_available: bool,
     withheld_reason: Option<&'static str>,
 }
@@ -292,6 +291,8 @@ struct GroupPitSnapshot {
 struct PitSession {
     mode: CursorQueryMode,
     scope: PitScope,
+    read_class: ReadClass,
+    observation_status: ObservationStatus,
     groups: Vec<GroupPitSnapshot>,
     expires_at_ms: u64,
     estimated_bytes: usize,
@@ -309,82 +310,19 @@ enum QueryMode {
     ForceFind,
 }
 
+#[cfg(test)]
 fn materialized_query_readiness_error(
     source_status: &SourceStatusSnapshot,
     sink_status: &SinkStatusSnapshot,
 ) -> Option<String> {
-    let degraded_groups = source_status
-        .degraded_roots
-        .iter()
-        .map(|(root_id, _)| root_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let sink_groups = sink_status
-        .groups
-        .iter()
-        .map(|group| (group.group_id.as_str(), group))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut expected_groups = source_status
-        .concrete_roots
-        .iter()
-        .filter(|root| root.active && root.is_group_primary && root.scan_enabled)
-        .map(|root| root.logical_root_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    for root in &source_status.logical_roots {
-        if root.matched_grants > 0 && root.active_members > 0 {
-            expected_groups.insert(root.root_id.clone());
-        }
-    }
-
-    let mut pending_initial_audit = Vec::<String>::new();
-    let mut overflow_pending = Vec::<String>::new();
-    let mut degraded = Vec::<String>::new();
-
-    for group_id in &expected_groups {
-        let group_id = group_id.as_str();
-        if degraded_groups.contains(group_id) {
-            degraded.push(group_id.to_string());
-            continue;
-        }
-        let Some(group) = sink_groups.get(group_id) else {
-            pending_initial_audit.push(group_id.to_string());
-            continue;
-        };
-        if !group.initial_audit_completed {
-            pending_initial_audit.push(group_id.to_string());
-        }
-        if group.overflow_pending_audit {
-            overflow_pending.push(group_id.to_string());
-        }
-    }
-
-    if degraded.is_empty() && overflow_pending.is_empty() && pending_initial_audit.is_empty() {
+    let status = evaluate_observation_status(&materialized_query_observation_evidence(
+        source_status,
+        sink_status,
+    ));
+    if status.state == ObservationState::TrustedMaterialized {
         return None;
     }
-
-    let mut reasons = Vec::new();
-    if !pending_initial_audit.is_empty() {
-        reasons.push(format!(
-            "initial audit incomplete for groups [{}]",
-            pending_initial_audit.join(", ")
-        ));
-    }
-    if !overflow_pending.is_empty() {
-        reasons.push(format!(
-            "overflow audit pending for groups [{}]",
-            overflow_pending.join(", ")
-        ));
-    }
-    if !degraded.is_empty() {
-        reasons.push(format!(
-            "degraded coverage for groups [{}]",
-            degraded.join(", ")
-        ));
-    }
-
-    Some(format!(
-        "materialized /tree and /stats remain unavailable until initial audit catch-up completes: {}",
-        reasons.join("; ")
-    ))
+    Some(trusted_materialized_not_ready_message(&status))
 }
 
 pub(crate) fn merge_sink_status_snapshots(
@@ -532,9 +470,11 @@ pub(crate) async fn route_sink_status_snapshot(
     Ok(merge_sink_status_snapshots(snapshots))
 }
 
-async fn ensure_materialized_queries_ready(state: &ApiState) -> Result<(), CnxError> {
+async fn load_materialized_status_snapshots(
+    state: &ApiState,
+) -> Result<(SourceStatusSnapshot, SinkStatusSnapshot), CnxError> {
     let (Some(source), Some(sink)) = (&state.readiness_source, &state.readiness_sink) else {
-        return Ok(());
+        return Ok((SourceStatusSnapshot::default(), SinkStatusSnapshot::default()));
     };
     let source_status = match &state.backend {
         QueryBackend::Route {
@@ -549,14 +489,9 @@ async fn ensure_materialized_queries_ready(state: &ApiState) -> Result<(), CnxEr
         .await
         {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout)
-            | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ProtocolViolation(_)) => {
-                return Err(CnxError::NotReady(
-                    "materialized /tree and /stats remain unavailable until source-status route returns live cluster readiness evidence"
-                        .into(),
-                ));
-            }
+            Err(err @ CnxError::Timeout)
+            | Err(err @ CnxError::TransportClosed(_))
+            | Err(err @ CnxError::ProtocolViolation(_)) => return Err(err),
             Err(err) => return Err(err),
         },
         QueryBackend::InProcess { .. } => source.status_snapshot()?,
@@ -574,23 +509,24 @@ async fn ensure_materialized_queries_ready(state: &ApiState) -> Result<(), CnxEr
         .await
         {
             Ok(snapshot) => snapshot,
-            Err(CnxError::Timeout)
-            | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ProtocolViolation(_)) => {
-                return Err(CnxError::NotReady(
-                    "materialized /tree and /stats remain unavailable until sink-status route returns live cluster readiness evidence"
-                        .into(),
-                ));
-            }
+            Err(err @ CnxError::Timeout)
+            | Err(err @ CnxError::TransportClosed(_))
+            | Err(err @ CnxError::ProtocolViolation(_)) => return Err(err),
             Err(err) => return Err(err),
         },
         QueryBackend::InProcess { .. } => sink.status_snapshot()?,
     };
-    if let Some(message) = materialized_query_readiness_error(&source_status, &sink_status) {
-        return Err(CnxError::NotReady(message));
-    }
-    eprintln!("fs_meta_query_api: ensure_materialized_queries_ready ok");
-    Ok(())
+    Ok((source_status, sink_status))
+}
+
+fn materialized_observation_status(
+    source_status: &SourceStatusSnapshot,
+    sink_status: &SinkStatusSnapshot,
+) -> ObservationStatus {
+    evaluate_observation_status(&materialized_query_observation_evidence(
+        source_status,
+        sink_status,
+    ))
 }
 
 fn build_projection_maps(
@@ -732,9 +668,7 @@ struct NormalizedApiParams {
     group_after: Option<String>,
     entry_page_size: Option<usize>,
     entry_after: Option<String>,
-    stability_mode: StabilityMode,
-    quiet_window_ms: Option<u64>,
-    metadata_mode: MetadataMode,
+    read_class: Option<ReadClass>,
 }
 
 fn decode_path_param(path: Option<String>, path_b64: Option<String>) -> Result<Vec<u8>, CnxError> {
@@ -762,41 +696,19 @@ fn normalize_api_params(params: ApiParams) -> Result<NormalizedApiParams, CnxErr
         group_after: params.group_after,
         entry_page_size: params.entry_page_size,
         entry_after: params.entry_after,
-        stability_mode: params.stability_mode.unwrap_or(StabilityMode::None),
-        quiet_window_ms: params.quiet_window_ms,
-        metadata_mode: params.metadata_mode.unwrap_or(MetadataMode::Full),
+        read_class: params.read_class,
     })
 }
 
+fn tree_read_class(params: &NormalizedApiParams) -> ReadClass {
+    params.read_class.unwrap_or(ReadClass::TrustedMaterialized)
+}
+
+fn stats_read_class(params: &NormalizedApiParams) -> ReadClass {
+    params.read_class.unwrap_or(ReadClass::TrustedMaterialized)
+}
+
 fn validate_tree_query_params(params: &NormalizedApiParams) -> std::result::Result<(), CnxError> {
-    match params.stability_mode {
-        StabilityMode::None => {
-            if params.quiet_window_ms.is_some() {
-                return Err(CnxError::InvalidInput(
-                    "quiet_window_ms is only valid when stability_mode=quiet-window".into(),
-                ));
-            }
-        }
-        StabilityMode::QuietWindow => {
-            if params.quiet_window_ms.is_none() {
-                return Err(CnxError::InvalidInput(
-                    "quiet_window_ms is required when stability_mode=quiet-window".into(),
-                ));
-            }
-        }
-    }
-    if params.metadata_mode == MetadataMode::StatusOnly {
-        if params.entry_page_size.is_some() {
-            return Err(CnxError::InvalidInput(
-                "entry_page_size is invalid when metadata_mode=status-only".into(),
-            ));
-        }
-        if params.entry_after.is_some() {
-            return Err(CnxError::InvalidInput(
-                "entry_after is invalid when metadata_mode=status-only".into(),
-            ));
-        }
-    }
     if params.pit_id.is_none() && (params.group_after.is_some() || params.entry_after.is_some()) {
         return Err(CnxError::InvalidInput(
             "pit_id is required when using group_after or entry_after".into(),
@@ -806,19 +718,9 @@ fn validate_tree_query_params(params: &NormalizedApiParams) -> std::result::Resu
 }
 
 fn validate_force_find_params(params: &NormalizedApiParams) -> std::result::Result<(), CnxError> {
-    if params.stability_mode != StabilityMode::None {
+    if params.read_class.is_some_and(|read_class| read_class != ReadClass::Fresh) {
         return Err(CnxError::InvalidInput(
-            "stability_mode must be none on /on-demand-force-find".into(),
-        ));
-    }
-    if params.quiet_window_ms.is_some() {
-        return Err(CnxError::InvalidInput(
-            "quiet_window_ms is invalid on /on-demand-force-find".into(),
-        ));
-    }
-    if params.metadata_mode != MetadataMode::Full {
-        return Err(CnxError::InvalidInput(
-            "metadata_mode must be full on /on-demand-force-find".into(),
+            "read_class must be fresh on /on-demand-force-find".into(),
         ));
     }
     if params.pit_id.is_none() && (params.group_after.is_some() || params.entry_after.is_some()) {
@@ -840,9 +742,6 @@ fn normalize_group_page_size(params: &NormalizedApiParams) -> Result<usize, CnxE
 }
 
 fn normalize_entry_page_size(params: &NormalizedApiParams) -> Result<Option<usize>, CnxError> {
-    if params.metadata_mode == MetadataMode::StatusOnly {
-        return Ok(Some(0));
-    }
     let value = params.entry_page_size.unwrap_or(ENTRY_PAGE_SIZE_DEFAULT);
     if value == 0 || value > ENTRY_PAGE_SIZE_MAX {
         return Err(CnxError::InvalidInput(format!(
@@ -1014,32 +913,15 @@ fn group_page_start_index(cursor: Option<&GroupPageCursor>) -> usize {
     cursor.map(|cursor| cursor.next_group_offset).unwrap_or(0)
 }
 
-fn tree_metadata_json(
-    params: &NormalizedApiParams,
-    stability: &TreeStability,
-) -> (bool, serde_json::Value) {
-    let metadata_available = match params.metadata_mode {
-        MetadataMode::Full => true,
-        MetadataMode::StatusOnly => false,
-        MetadataMode::StableOnly => stability.state == StabilityState::Stable,
-    };
-    let meta = if metadata_available {
+fn tree_metadata_json(read_class: ReadClass) -> (bool, serde_json::Value) {
+    (
+        true,
         serde_json::json!({
-            "metadata_mode": params.metadata_mode,
+            "read_class": read_class,
             "metadata_available": true,
-        })
-    } else {
-        serde_json::json!({
-            "metadata_mode": params.metadata_mode,
-            "metadata_available": false,
-            "withheld_reason": match params.metadata_mode {
-                MetadataMode::StatusOnly => "status-only",
-                MetadataMode::StableOnly => "stability-not-stable",
-                MetadataMode::Full => "metadata-unavailable",
-            },
-        })
-    };
-    (metadata_available, meta)
+            "withheld_reason": serde_json::Value::Null,
+        }),
+    )
 }
 
 fn decode_materialized_stats_payload(bytes: &[u8]) -> Result<SubtreeStats, String> {
@@ -1083,8 +965,7 @@ fn build_materialized_tree_request(
     path: &[u8],
     recursive: bool,
     max_depth: Option<usize>,
-    stability_mode: StabilityMode,
-    quiet_window_ms: Option<u64>,
+    read_class: ReadClass,
     selected_group: Option<String>,
 ) -> InternalQueryRequest {
     InternalQueryRequest::materialized(
@@ -1096,8 +977,7 @@ fn build_materialized_tree_request(
             selected_group,
         },
         Some(TreeQueryOptions {
-            stability_mode,
-            quiet_window_ms,
+            read_class,
         }),
     )
 }
@@ -1787,9 +1667,7 @@ fn scope_matches_tree(params: &NormalizedApiParams, scope: &TreePitScope) -> boo
         && params.recursive == scope.recursive
         && params.max_depth == scope.max_depth
         && params.group_order == scope.group_order
-        && params.stability_mode == scope.stability_mode
-        && params.quiet_window_ms == scope.quiet_window_ms
-        && params.metadata_mode == scope.metadata_mode
+        && tree_read_class(params) == scope.read_class
 }
 
 fn scope_matches_force_find(params: &NormalizedApiParams, scope: &ForceFindPitScope) -> bool {
@@ -1875,7 +1753,7 @@ fn render_pit_group(
     body.insert(
         "meta".into(),
         serde_json::json!({
-            "metadata_mode": snapshot.meta.metadata_mode,
+            "read_class": snapshot.meta.read_class,
             "metadata_available": snapshot.meta.metadata_available,
             "withheld_reason": snapshot.meta.withheld_reason,
         }),
@@ -1988,6 +1866,11 @@ fn render_pit_response(
     );
     maybe_insert_b64(&mut body, "path_b64", &path);
     body.insert("status".into(), serde_json::json!("ok"));
+    body.insert("read_class".into(), serde_json::json!(session.read_class));
+    body.insert(
+        "observation_status".into(),
+        observation_status_json(&session.observation_status),
+    );
     body.insert("group_order".into(), serde_json::json!(group_order));
     body.insert(
         "pit".into(),
@@ -2014,6 +1897,7 @@ async fn build_tree_pit_session(
     policy: &ProjectionPolicy,
     params: &NormalizedApiParams,
     timeout: Duration,
+    observation_status: ObservationStatus,
 ) -> Result<PitSession, CnxError> {
     eprintln!(
         "fs_meta_query_api: build_tree_pit_session start path={} recursive={}",
@@ -2038,13 +1922,13 @@ async fn build_tree_pit_session(
         rankings.len()
     );
     let mut groups = Vec::with_capacity(rankings.len());
+    let read_class = tree_read_class(params);
     for rank in rankings {
         let tree_params = build_materialized_tree_request(
             &params.path,
             params.recursive,
             params.max_depth,
-            params.stability_mode,
-            params.quiet_window_ms,
+            read_class,
             Some(rank.group_key.clone()),
         );
         let events = match query_materialized_events(state.backend.clone(), tree_params, timeout).await {
@@ -2060,7 +1944,7 @@ async fn build_tree_pit_session(
                     unreliable_reason: response.reliability.unreliable_reason,
                     stability: response.stability,
                     meta: PitMetadata {
-                        metadata_mode: params.metadata_mode,
+                        read_class,
                         metadata_available: true,
                         withheld_reason: None,
                     },
@@ -2079,13 +1963,7 @@ async fn build_tree_pit_session(
             &params.path,
         ) {
             Ok(response) => {
-                let (metadata_available, _meta_json) =
-                    tree_metadata_json(params, &response.stability);
-                let withheld_reason = (!metadata_available).then_some(match params.metadata_mode {
-                    MetadataMode::StatusOnly => "status-only",
-                    MetadataMode::StableOnly => "stability-not-stable",
-                    MetadataMode::Full => "metadata-unavailable",
-                });
+                let (metadata_available, _meta_json) = tree_metadata_json(read_class);
                 groups.push(GroupPitSnapshot {
                     group: rank.group_key,
                     status: "ok",
@@ -2093,9 +1971,9 @@ async fn build_tree_pit_session(
                     unreliable_reason: response.reliability.unreliable_reason,
                     stability: response.stability,
                     meta: PitMetadata {
-                        metadata_mode: params.metadata_mode,
+                        read_class,
                         metadata_available,
-                        withheld_reason,
+                        withheld_reason: None,
                     },
                     root: metadata_available.then_some(response.root),
                     entries: if metadata_available {
@@ -2116,7 +1994,7 @@ async fn build_tree_pit_session(
                     ..TreeStability::not_evaluated()
                 },
                 meta: PitMetadata {
-                    metadata_mode: params.metadata_mode,
+                    read_class,
                     metadata_available: false,
                     withheld_reason: Some("group-payload-missing"),
                 },
@@ -2136,10 +2014,10 @@ async fn build_tree_pit_session(
             recursive: params.recursive,
             max_depth: params.max_depth,
             group_order: params.group_order,
-            stability_mode: params.stability_mode,
-            quiet_window_ms: params.quiet_window_ms,
-            metadata_mode: params.metadata_mode,
+            read_class,
         }),
+        read_class,
+        observation_status,
         groups,
         expires_at_ms: unix_now_ms() + PIT_TTL_MS_DEFAULT,
         estimated_bytes,
@@ -2203,7 +2081,7 @@ async fn build_force_find_pit_session(
                     unreliable_reason: None,
                     stability: TreeStability::not_evaluated(),
                     meta: PitMetadata {
-                        metadata_mode: MetadataMode::Full,
+                        read_class: ReadClass::Fresh,
                         metadata_available: false,
                         withheld_reason: Some("group-payload-missing"),
                     },
@@ -2223,7 +2101,7 @@ async fn build_force_find_pit_session(
                     unreliable_reason: payload.reliability.unreliable_reason,
                     stability: payload.stability,
                     meta: PitMetadata {
-                        metadata_mode: MetadataMode::Full,
+                        read_class: ReadClass::Fresh,
                         metadata_available: true,
                         withheld_reason: None,
                     },
@@ -2243,7 +2121,7 @@ async fn build_force_find_pit_session(
                     unreliable_reason: None,
                     stability: TreeStability::not_evaluated(),
                     meta: PitMetadata {
-                        metadata_mode: MetadataMode::Full,
+                        read_class: ReadClass::Fresh,
                         metadata_available: false,
                         withheld_reason: Some("group-payload-missing"),
                     },
@@ -2265,6 +2143,8 @@ async fn build_force_find_pit_session(
             max_depth: params.max_depth,
             group_order: params.group_order,
         }),
+        read_class: ReadClass::Fresh,
+        observation_status: ObservationStatus::fresh_only(),
         groups,
         expires_at_ms: unix_now_ms() + PIT_TTL_MS_DEFAULT,
         estimated_bytes,
@@ -2276,6 +2156,7 @@ async fn query_tree_page_response(
     policy: &ProjectionPolicy,
     params: &NormalizedApiParams,
     timeout: Duration,
+    observation_status: ObservationStatus,
 ) -> Result<serde_json::Value, CnxError> {
     let group_page_size = normalize_group_page_size(params)?;
     let entry_page_size = normalize_entry_page_size(params)?.unwrap_or(0);
@@ -2328,9 +2209,14 @@ async fn query_tree_page_response(
         );
     }
 
-    let session = Arc::new(
-        build_tree_pit_session(state, policy, params, timeout).await?,
-    );
+    let session = Arc::new(build_tree_pit_session(
+        state,
+        policy,
+        params,
+        timeout,
+        observation_status,
+    )
+    .await?);
     let pit_id = encode_pit_id("tree");
     {
         let mut guard = state
@@ -2548,6 +2434,7 @@ fn decode_stats_groups(
     events: Vec<Event>,
     policy: &ProjectionPolicy,
     selected_group: Option<&str>,
+    read_class: ReadClass,
 ) -> serde_json::Map<String, serde_json::Value> {
     #[derive(Default)]
     struct GroupStatsAccumulator {
@@ -2562,7 +2449,13 @@ fn decode_stats_groups(
             continue;
         }
         let acc = grouped.entry(group_key).or_default();
-        match decode_materialized_stats_payload(event.payload_bytes()) {
+        let stats = match read_class {
+            ReadClass::Fresh => decode_force_find_stats_payload(event.payload_bytes()),
+            ReadClass::Materialized | ReadClass::TrustedMaterialized => {
+                decode_materialized_stats_payload(event.payload_bytes())
+            }
+        };
+        match stats {
             Ok(stats) => {
                 let current = acc.ok.get_or_insert_with(SubtreeStats::default);
                 current.total_nodes += stats.total_nodes;
@@ -2644,14 +2537,40 @@ async fn collect_materialized_stats_groups(
     state: &ApiState,
     policy: &ProjectionPolicy,
     params: &NormalizedApiParams,
+    read_class: ReadClass,
 ) -> Result<serde_json::Map<String, serde_json::Value>, CnxError> {
     let mut groups = serde_json::Map::<String, serde_json::Value>::new();
-    for group_id in materialized_target_groups(state, params.group.as_deref())? {
-        let request =
-            build_materialized_stats_request(&params.path, params.recursive, Some(group_id.clone()));
-        let events =
-            query_materialized_events(state.backend.clone(), request, policy.query_timeout()).await?;
-        let targeted = decode_stats_groups(events, policy, Some(&group_id));
+    let target_groups = match read_class {
+        ReadClass::Fresh => resolve_force_find_groups(state, params)?,
+        ReadClass::Materialized | ReadClass::TrustedMaterialized => {
+            materialized_target_groups(state, params.group.as_deref())?
+        }
+    };
+    for group_id in target_groups {
+        let events = match read_class {
+            ReadClass::Fresh => {
+                let strict_conflict = params.group.as_deref() == Some(group_id.as_str());
+                query_force_find_group_stats(
+                    state,
+                    &params.path,
+                    params.recursive,
+                    policy.force_find_timeout(),
+                    &group_id,
+                    strict_conflict,
+                )
+                .await?
+            }
+            ReadClass::Materialized | ReadClass::TrustedMaterialized => {
+                let request = build_materialized_stats_request(
+                    &params.path,
+                    params.recursive,
+                    Some(group_id.clone()),
+                );
+                query_materialized_events(state.backend.clone(), request, policy.query_timeout())
+                    .await?
+            }
+        };
+        let targeted = decode_stats_groups(events, policy, Some(&group_id), read_class);
         groups.insert(
             group_id.clone(),
             targeted
@@ -2673,10 +2592,27 @@ async fn get_stats(
         Ok(params) => params,
         Err(err) => return error_response_with_context(err, None),
     };
-    if let Err(err) = ensure_materialized_queries_ready(&state).await {
-        return error_response_with_context(err, Some(&params.path));
-    }
-    let groups = match collect_materialized_stats_groups(&state, &policy, &params).await {
+    let read_class = stats_read_class(&params);
+    let observation_status = match read_class {
+        ReadClass::Fresh => ObservationStatus::fresh_only(),
+        ReadClass::Materialized | ReadClass::TrustedMaterialized => {
+            let (source_status, sink_status) = match load_materialized_status_snapshots(&state).await {
+                Ok(statuses) => statuses,
+                Err(err) => return error_response_with_context(err, Some(&params.path)),
+            };
+            let status = materialized_observation_status(&source_status, &sink_status);
+            if read_class == ReadClass::TrustedMaterialized
+                && status.state != ObservationState::TrustedMaterialized
+            {
+                return error_response_with_context(
+                    CnxError::NotReady(trusted_materialized_not_ready_message(&status)),
+                    Some(&params.path),
+                );
+            }
+            status
+        }
+    };
+    let groups = match collect_materialized_stats_groups(&state, &policy, &params, read_class).await {
         Ok(groups) => groups,
         Err(err) => return error_response_with_context(err, Some(&params.path)),
     };
@@ -2687,6 +2623,11 @@ async fn get_stats(
         serde_json::json!(path_to_string_lossy(&params.path)),
     );
     maybe_insert_b64(&mut body, "path_b64", &params.path);
+    body.insert("read_class".into(), serde_json::json!(read_class));
+    body.insert(
+        "observation_status".into(),
+        observation_status_json(&observation_status),
+    );
     body.insert("groups".into(), serde_json::json!(groups));
     Json(serde_json::Value::Object(body)).into_response()
 }
@@ -2704,10 +2645,35 @@ async fn get_tree(
     if let Err(err) = validate_tree_query_params(&params) {
         return error_response_with_context(err, Some(&path_for_error));
     }
-    if let Err(err) = ensure_materialized_queries_ready(&state).await {
-        return error_response_with_context(err, Some(&path_for_error));
+    let read_class = tree_read_class(&params);
+    if read_class == ReadClass::Fresh {
+        return match query_force_find_page_response(&state, &policy, &params, policy.force_find_timeout()).await {
+            Ok(resp) => Json(resp).into_response(),
+            Err(err) => error_response_with_context(err, Some(&path_for_error)),
+        };
     }
-    match query_tree_page_response(&state, &policy, &params, policy.query_timeout()).await {
+    let (source_status, sink_status) = match load_materialized_status_snapshots(&state).await {
+        Ok(statuses) => statuses,
+        Err(err) => return error_response_with_context(err, Some(&path_for_error)),
+    };
+    let observation_status = materialized_observation_status(&source_status, &sink_status);
+    if read_class == ReadClass::TrustedMaterialized
+        && observation_status.state != ObservationState::TrustedMaterialized
+    {
+        return error_response_with_context(
+            CnxError::NotReady(trusted_materialized_not_ready_message(&observation_status)),
+            Some(&path_for_error),
+        );
+    }
+    match query_tree_page_response(
+        &state,
+        &policy,
+        &params,
+        policy.query_timeout(),
+        observation_status,
+    )
+    .await
+    {
         Ok(resp) => Json(resp).into_response(),
         Err(err) => error_response_with_context(err, Some(&path_for_error)),
     }
@@ -2824,6 +2790,13 @@ fn path_to_string_lossy(path: &[u8]) -> String {
     bytes_to_display_string(path)
 }
 
+fn observation_status_json(status: &ObservationStatus) -> serde_json::Value {
+    serde_json::json!({
+        "state": status.state,
+        "reasons": status.reasons,
+    })
+}
+
 fn stability_json(stability: &TreeStability) -> serde_json::Value {
     serde_json::json!({
         "mode": stability.mode,
@@ -2849,7 +2822,6 @@ mod tests {
     use axum::http::Request;
     use bytes::Bytes;
     use capanix_app_sdk::runtime::{EventMetadata, NodeId};
-    use capanix_host_fs_types::query::StabilityMode;
     use capanix_host_fs_types::{FileMetaRecord, UnixStat};
     use std::fs;
     use std::path::Path;
@@ -3292,9 +3264,7 @@ mod tests {
             group_after: None,
             entry_page_size: Some(ENTRY_PAGE_SIZE_DEFAULT),
             entry_after: None,
-            stability_mode: StabilityMode::None,
-            quiet_window_ms: None,
-            metadata_mode: MetadataMode::Full,
+            read_class: None,
         };
 
         let groups = resolve_force_find_groups(&state, &params).expect("resolve groups");
@@ -3432,8 +3402,7 @@ mod tests {
             b"/a",
             false,
             Some(2),
-            StabilityMode::QuietWindow,
-            Some(5_000),
+            ReadClass::TrustedMaterialized,
             Some("sink-a".to_string()),
         );
         assert_eq!(params.op, QueryOp::Tree);
@@ -3441,8 +3410,7 @@ mod tests {
         assert!(!params.scope.recursive);
         assert_eq!(params.scope.max_depth, Some(2));
         let tree_options = params.tree_options.expect("tree options");
-        assert_eq!(tree_options.stability_mode, StabilityMode::QuietWindow);
-        assert_eq!(tree_options.quiet_window_ms, Some(5_000));
+        assert_eq!(tree_options.read_class, ReadClass::TrustedMaterialized);
         assert_eq!(params.scope.selected_group.as_deref(), Some("sink-a"));
     }
 
@@ -3460,9 +3428,7 @@ mod tests {
             group_after: None,
             entry_page_size: None,
             entry_after: None,
-            stability_mode: None,
-            quiet_window_ms: None,
-            metadata_mode: None,
+            read_class: None,
         };
         let normalized = normalize_api_params(params).expect("normalize defaults");
         assert_eq!(normalized.path, b"/".to_vec());
@@ -3475,8 +3441,7 @@ mod tests {
         assert_eq!(normalized.group_after, None);
         assert_eq!(normalized.entry_page_size, None);
         assert_eq!(normalized.entry_after, None);
-        assert_eq!(normalized.stability_mode, StabilityMode::None);
-        assert_eq!(normalized.metadata_mode, MetadataMode::Full);
+        assert_eq!(normalized.read_class, None);
     }
 
     #[test]
@@ -3493,9 +3458,7 @@ mod tests {
             group_after: Some("group-cursor-1".into()),
             entry_page_size: Some(100),
             entry_after: Some("entry-cursor-bundle-1".into()),
-            stability_mode: Some(StabilityMode::QuietWindow),
-            quiet_window_ms: Some(2_000),
-            metadata_mode: Some(MetadataMode::StableOnly),
+            read_class: Some(ReadClass::Materialized),
         };
         let normalized = normalize_api_params(params).expect("normalize explicit params");
         assert_eq!(normalized.path, b"/mnt".to_vec());
@@ -3511,9 +3474,7 @@ mod tests {
             normalized.entry_after.as_deref(),
             Some("entry-cursor-bundle-1")
         );
-        assert_eq!(normalized.stability_mode, StabilityMode::QuietWindow);
-        assert_eq!(normalized.quiet_window_ms, Some(2_000));
-        assert_eq!(normalized.metadata_mode, MetadataMode::StableOnly);
+        assert_eq!(normalized.read_class, Some(ReadClass::Materialized));
     }
 
     #[test]
@@ -3530,9 +3491,7 @@ mod tests {
             group_after: None,
             entry_page_size: None,
             entry_after: None,
-            stability_mode: None,
-            quiet_window_ms: None,
-            metadata_mode: None,
+            read_class: None,
         };
         let normalized = normalize_api_params(params).expect("normalize path_b64");
         assert_eq!(normalized.path, b"/bad/\xffname".to_vec());
@@ -3552,9 +3511,7 @@ mod tests {
             group_after: None,
             entry_page_size: None,
             entry_after: None,
-            stability_mode: None,
-            quiet_window_ms: None,
-            metadata_mode: None,
+            read_class: None,
         };
         let err = normalize_api_params(params).expect_err("reject mixed path inputs");
         assert!(err.to_string().contains("mutually exclusive"));
@@ -3633,7 +3590,7 @@ mod tests {
             mk_event("n1", ok_payload),
             mk_event("n2", b"bad-msgpack".to_vec()),
         ];
-        let groups = decode_stats_groups(events, &origin_policy(), None);
+        let groups = decode_stats_groups(events, &origin_policy(), None, ReadClass::Materialized);
         assert_eq!(groups.len(), 2);
         assert_eq!(groups["n1"]["status"], "ok");
         assert_eq!(groups["n2"]["status"], "error");
@@ -3656,6 +3613,7 @@ mod tests {
             vec![mk_stats_event(composed), mk_stats_event(decomposed)],
             &origin_policy(),
             None,
+            ReadClass::Materialized,
         );
 
         assert!(groups.contains_key(composed));
@@ -4036,7 +3994,7 @@ mod tests {
     async fn force_find_rejects_status_only_and_keeps_pagination_axis_inprocess() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
         let req = Request::builder()
-            .uri("/on-demand-force-find?path=/&group_order=group-key&metadata_mode=status-only")
+            .uri("/on-demand-force-find?path=/&group_order=group-key&read_class=trusted-materialized")
             .method("GET")
             .body(Body::empty())
             .expect("build request");
@@ -4052,7 +4010,7 @@ mod tests {
             .get("error")
             .and_then(|v| v.as_str())
             .unwrap_or_default();
-        assert!(msg.contains("metadata_mode must be full on /on-demand-force-find"));
+        assert!(msg.contains("read_class must be fresh on /on-demand-force-find"));
         assert_eq!(
             payload.get("code").and_then(|v| v.as_str()),
             Some("INVALID_INPUT")

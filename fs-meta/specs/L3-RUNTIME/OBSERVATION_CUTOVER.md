@@ -37,11 +37,11 @@ that worker model.
 **Steps**
 
 1. HTTP facade process/listener readiness is necessary but not sufficient for trusted exposure.
-2. app evaluates `observation_eligible` from initial-audit completion on active scan-enabled primary groups, materialized degraded/overflow status, and stale-writer fencing evidence.
+2. app evaluates `observation_eligible` from the same package-local materialized observation evidence that feeds query `observation_status`: initial-audit completion on active scan-enabled primary groups, materialized degraded/overflow status, and stale-writer fencing evidence.
 3. package-local status/health surfaces expose the materialized readiness evidence through source coverage and audit timing plus sink `initial_audit_completed` and `overflow_pending_audit`; these signals support cutover diagnostics but do not become a competing truth source.
 4. when facade activation remains pending because runtime exposure proof is still outstanding or listener spawn is retrying, package-local status/health surfaces also expose optional `facade.pending` diagnostics so operators can distinguish cutover waiting from generic process liveness.
-5. runtime consumes generation/bind/route proof to decide which process owns the resource-scoped one-cardinality HTTP facade, while the app uses `observation_eligible` to decide when materialized `/tree` and `/stats` may answer as current observation.
-6. when `observation_eligible` is absent or proof is incomplete, the app keeps `/tree` and `/stats` explicitly not-ready or degraded; `/on-demand-force-find` stays a freshness path and may be externally available earlier.
+5. runtime consumes generation/bind/route proof to decide which process owns the resource-scoped one-cardinality HTTP facade, while the app uses `observation_eligible` to decide when `trusted-materialized` `/tree` and `/stats` may answer as current observation.
+6. when `observation_eligible` is absent or proof is incomplete, the app keeps `trusted-materialized` `/tree` and `/stats` explicitly not-ready and surfaces weaker materialized reads as `materialized-untrusted`; `/on-demand-force-find` stays a freshness path and may be externally available earlier.
 
 ## [workflow] StaleGenerationFence
 

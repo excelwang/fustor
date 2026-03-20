@@ -1,8 +1,7 @@
-use capanix_host_fs_types::query::StabilityMode;
 use serde::{Deserialize, Serialize};
 
 use crate::query::models::SubtreeStats;
-use crate::query::tree::TreeGroupPayload;
+use crate::query::tree::{ReadClass, TreeGroupPayload};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -39,15 +38,13 @@ impl Default for QueryScope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TreeQueryOptions {
-    pub stability_mode: StabilityMode,
-    pub quiet_window_ms: Option<u64>,
+    pub read_class: ReadClass,
 }
 
 impl Default for TreeQueryOptions {
     fn default() -> Self {
         Self {
-            stability_mode: StabilityMode::None,
-            quiet_window_ms: None,
+            read_class: ReadClass::TrustedMaterialized,
         }
     }
 }
@@ -139,8 +136,7 @@ mod tests {
                 selected_group: Some(selected_group.to_string()),
             },
             Some(TreeQueryOptions {
-                stability_mode: StabilityMode::QuietWindow,
-                quiet_window_ms: Some(5_000),
+                read_class: ReadClass::TrustedMaterialized,
             }),
         );
 
@@ -152,14 +148,6 @@ mod tests {
             restored.scope.selected_group.as_deref(),
             Some(selected_group)
         );
-        assert_eq!(
-            restored
-                .scope
-                .selected_group
-                .as_deref()
-                .expect("selected group")
-                .as_bytes(),
-            selected_group.as_bytes()
-        );
+        assert_eq!(restored.tree_options.expect("tree options").read_class, ReadClass::TrustedMaterialized);
     }
 }

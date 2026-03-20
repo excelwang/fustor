@@ -73,15 +73,16 @@ version: 3.0.0
 
 2. **QUERY_PATH_OUTPUT_DISCIPLINE**: **fs-meta System** MUST keep query-path observation semantics consistent while allowing `/tree` and `/on-demand-force-find` to use path-specific response envelopes.
    > Responsibility: keep externally visible observations stable without confusing them with authoritative truth or forcing materially different paths into one fake uniform payload shape.
-   > Verification: materialized `/tree` returns a grouped envelope with top-level `path/status/group_order/groups/group_page`; each group item carries its own `group/status/reliable/unreliable_reason/stability/meta` and optional `root/entries/entry_page`.
-   > Verification: `/on-demand-force-find` remains a freshness path but also returns the same grouped-envelope family; its per-group `stability` shape stays explicit while `state` remains `not-evaluated`.
+   > Verification: `/tree` returns a grouped envelope with top-level `path/status/read_class/observation_status/group_order/groups/group_page`; each group item carries its own `group/status/reliable/unreliable_reason/stability/meta` and optional `root/entries/entry_page`.
+   > Verification: `/on-demand-force-find` remains a freshness path and is semantically equivalent to `/tree?read_class=fresh`; its per-group `stability` shape stays explicit while top-level `observation_status.state` remains `fresh-only`.
    > Verification: grouped response keys remain location-agnostic logical ids (for example `nfs1`) and MUST NOT expose absolute host mount paths.
    > Verification: returned envelopes are observation/projection outputs that may lag current authoritative truth; they do not redefine authoritative journal state by being readable.
    > Covers L0: VISION.UNIFIED_FOREST_RESPONSE, VISION.OBSERVATION_IS_NOT_TRUTH
 
 3. **EXPLICIT_QUERY_STATUS_AND_METADATA_AVAILABILITY**: **fs-meta System** MUST represent observation availability explicitly instead of silently dropping failed or withheld results.
    > Covers L0: VISION.PARTIAL_FAILURE_ISOLATION
-   > Verification: `/tree` always exposes explicit `status` and `meta.metadata_available`; withheld metadata uses explicit `withheld_reason` instead of silently dropping a returned group bucket from the response.
+   > Verification: `/tree` and `/stats` always expose explicit top-level `observation_status`; `trusted-materialized` refusal is reported as structured `NOT_READY` instead of silently downgrading to a weaker read mode.
+   > Verification: grouped tree responses keep explicit `meta.metadata_available`; withheld metadata uses explicit `withheld_reason` instead of silently dropping a returned group bucket from the response.
    > Verification: grouped query paths keep explicit per-group `ok`/`error` envelopes and `partial_failure/errors` visibility instead of silently dropping failed groups.
 
 4. **CORRELATION_ID_CONTINUITY**: **fs-meta System** MUST preserve request-response correlation metadata on query paths.
@@ -92,10 +93,10 @@ version: 3.0.0
    > Verification: clients that want one group use `group_page_size=1`; the server does not require `group=<id>` or `best=true`.
    > Verification: when `group_order=file-count`, groups are ordered by highest file count; when `group_order=file-age`, groups are ordered by newest file activity (`latest_file_mtime_us`); ties break deterministically by group key.
 
-6. **QUERY_PARAMETER_AXES_REMAIN_ORTHOGONAL**: **fs-meta System** MUST keep group ordering, PIT session ownership, bucket pagination, entry pagination, stability evaluation, and metadata-shaping parameters orthogonal.
-   > Responsibility: let callers freely combine group ordering (`group_order`), PIT session continuation (`pit_id`), group bucket pagination (`group_page_size`, `group_after`), per-group entry pagination (`entry_page_size`, `entry_after`), stability evaluation (`stability_mode`, `quiet_window_ms`), and response shaping (`metadata_mode`) without hidden semantic coupling.
-   > Verification: `group_order` affects only group ranking, `pit_id` only binds one frozen query session, `group_page_size/group_after` affect only bucket slicing, `entry_page_size/entry_after` affect only per-group entry slicing, `stability_mode/quiet_window_ms` affect only stability evaluation, and `metadata_mode` affects only whether metadata is returned.
-   > Verification: `group_order=file-age` does not implicitly mean “stable-only”, and `stability_mode=quiet-window` does not redefine group ranking.
+6. **QUERY_PARAMETER_AXES_REMAIN_ORTHOGONAL**: **fs-meta System** MUST keep group ordering, PIT session ownership, bucket pagination, entry pagination, and named read selection orthogonal.
+   > Responsibility: let callers freely combine group ordering (`group_order`), PIT session continuation (`pit_id`), group bucket pagination (`group_page_size`, `group_after`), per-group entry pagination (`entry_page_size`, `entry_after`), and named read selection (`read_class`) without hidden semantic coupling.
+   > Verification: `group_order` affects only group ranking, `pit_id` only binds one frozen query session, `group_page_size/group_after` affect only bucket slicing, `entry_page_size/entry_after` affect only per-group entry slicing, and `read_class` affects only freshness/trust semantics.
+   > Verification: `group_order=file-age` does not implicitly request `trusted-materialized`, and `read_class=trusted-materialized` does not redefine group ranking.
 
 7. **FORCE_FIND_GROUP_LOCAL_EXCLUSIVITY**: **fs-meta System** MUST keep `force-find` execution exclusive per group while allowing any bound source run in that group to perform the scan.
    > Responsibility: avoid duplicate diagnostic scans without overloading runtime with transient lease semantics.
@@ -111,24 +112,23 @@ version: 3.0.0
 
 9. **QUERY_HTTP_FACADE_DEFAULTS_AND_SHAPE**: **fs-meta System** MUST provide query HTTP facade with deterministic defaults and explicit grouped response shaping.
    > Responsibility: keep UI/CLI integration stable across `/tree` `/stats` `/on-demand-force-find`.
-   > Verification: `/tree` default query params are `path=/`, `recursive=true`, `group_order=group-key`, `group_page_size=64`, `entry_page_size=1000`, `stability_mode=none`, and `metadata_mode=full`.
+   > Verification: `/tree` default query params are `path=/`, `recursive=true`, `group_order=group-key`, `group_page_size=64`, `entry_page_size=1000`, and `read_class=trusted-materialized`; `/stats` defaults `read_class=trusted-materialized`.
    > Verification: the first `/tree` request MAY omit `pit_id`; the response returns `pit.id` and `pit.expires_at_ms`. Any continuation using `group_after` or `entry_after` MUST supply that `pit_id`.
    > Verification: `/tree` accepts `group_after` only as an opaque PIT-owned group offset cursor, and accepts `entry_after` only as an opaque PIT-owned per-group entry cursor bundle; expired PIT returns explicit `PIT_EXPIRED` instead of stale materialized-revision errors.
-   > Verification: `/tree` responses expose top-level `group_order`, `pit`, `groups`, and `group_page`; each group item exposes `stability`, and when metadata is available `root`, `entries`, and `entry_page`.
+   > Verification: `/tree` responses expose top-level `read_class`, `observation_status`, `group_order`, `pit`, `groups`, and `group_page`; each group item exposes `stability`, and when metadata is available `root`, `entries`, and `entry_page`.
    > Verification: query paths accept either `path` (UTF-8 convenience input) or `path_b64` (authoritative raw-path bytes encoded as base64url), but never both in one request.
    > Verification: `/tree`, `/on-demand-force-find`, and `/stats` expose `path_b64` only when the authoritative raw path is not valid UTF-8; group metadata entries likewise expose optional `path_b64` in those lossy cases, while `path` remains the default display form.
-   > Verification: `metadata_mode=status-only` returns stability without `root/entries/page`, and `metadata_mode=stable-only` withholds metadata until stability state is `stable`.
+   > Verification: `materialized` returns current materialized observation together with explicit `observation_status`, while `trusted-materialized` rejects the request until package-local observation evidence is trusted enough to be treated as current observation.
    > Verification: `/on-demand-force-find` defaults to `path=/`, `recursive=true`, `group_order=group-key`, `group_page_size=64`, and `entry_page_size=1000`, exposes the same grouped envelope family plus `pit`, and keeps every returned group's `stability.state` fixed to `not-evaluated`.
    > Verification: `/on-demand-force-find` uses the same PIT-only continuation model as `/tree`; live query executes once per PIT creation and later pages read frozen PIT results instead of rerunning the live scan.
    > Verification: `/stats` returns group envelopes with aggregate subtree stats and per-group `partial_failure/errors` visibility.
    > Covers L0: VISION.QUERY_HTTP_FACADE
 
-10. **QUIET_WINDOW_STABILITY_TRACKS_OBSERVED_CHANGE_NOT_REFRESH_NOISE**: **fs-meta System** MUST derive quiet-window stability from observed materialized subtree change and coverage recovery evidence, not from raw periodic sync traffic or file mtime alone.
-   > Responsibility: avoid resetting path stability on every audit/repair refresh while still reflecting real write-visible subtree change.
-   > Verification: periodic sync-refresh updates that leave the effective materialized subtree result unchanged MUST NOT reset quiet-window timing.
-   > Verification: periodic refresh that changes accepted query-visible fields such as `modified_time_us` is classified as write-significant rather than sync-refresh.
-   > Verification: write-significant subtree changes and coverage recovery reset quiet-window timing; quiet-window state is not computed from latest file mtime alone.
-   > Verification: `/on-demand-force-find` remains a freshness path and MUST NOT claim quiet-window stability semantics, even when it paginates metadata.
+10. **READ_CLASS_REPLACES_FREEFORM_STABILITY_SELECTION**: **fs-meta System** MUST replace free-form stability/mode selection with named read semantics so app developers do not hand-compose trust decisions.
+   > Responsibility: eliminate caller-owned “pick the right stable state” logic from public query surfaces.
+   > Verification: `/tree` and `/stats` accept `read_class=fresh|materialized|trusted-materialized` instead of `stability_mode` / `quiet_window_ms` / `metadata_mode`.
+   > Verification: `fresh` remains the live/freshness path, `materialized` returns current materialized observation with explicit `observation_status`, and `trusted-materialized` is the only read mode that may be treated as stable current observation.
+   > Verification: `/on-demand-force-find` remains a freshness path and does not expose a second free-form stability selector family.
 
 11. **ORIGIN_TRACE_DRIVEN_GROUP_AGGREGATION**: **fs-meta System** MUST derive query aggregation groups from per-request RPC `origin_id` traces and policy mapping, without precomputed peer registry coupling.
    > Responsibility: keep projection membership resolution request-scoped and kernel-routing driven.
@@ -393,14 +393,14 @@ version: 3.0.0
    > Verification: the upstream bridge-realization seam remains only the low-level external-worker bridge carrier; worker child-process bootstrap, log/socket ownership, retry clipping, and lifecycle supervision remain downstream product-owned runtime-support concerns rather than worker artifact or tooling responsibilities.
    > Verification: external-worker transport preserves canonical `Timeout` / `TransportClosed` categories and wall-clock total-timeout semantics instead of collapsing transport failures into a generic peer-error bucket.
 7. **RELEASE_GENERATION_CUTOVER_CONSUMPTION_ONLY**: **fs-meta System** MUST consume release-generation cutover by replaying current authoritative truth inputs (`roots`, runtime grants, authoritative journal continuation) and rebuilding observation state rather than inventing package-local rollout semantics.
-   > Verification: active scan-enabled primary groups reaching initial-audit-complete materialized observation state are the readiness anchor for trusted `/tree` and `/stats` exposure.
+   > Verification: active scan-enabled primary groups reaching trusted materialized observation state are the readiness anchor for `trusted-materialized` `/tree` and `/stats` exposure.
    > Verification: `/on-demand-force-find` stays on the freshness path while materialized observation catches up.
    > Verification: `/on-demand-force-find` on the freshness path remains available before trusted materialized observation is promoted.
 8. **AUTHORITATIVE_TRUTH_CARRIER_CONSUMPTION_ONLY**: **fs-meta System** MUST consume authoritative truth carriers and revisions from domain/runtime boundaries rather than define a package-local competing truth source.
 9. **OBSERVATION_ELIGIBILITY_GATE_OWNERSHIP**: **fs-meta System** MUST own the package-local `observation_eligible` evidence that reports when materialized `/tree` and `/stats` observations are trustworthy enough to be treated as current observation after cutover or rebuild.
-   > Verification: app cutover workflow ties `observation_eligible` to materialized `/tree` and `/stats` readiness evidence rather than to direct package-local trusted external exposure ownership in runtime or mere process readiness.
+   > Verification: app cutover workflow ties `observation_eligible` to the same package-local materialized observation evidence that feeds query `observation_status`, rather than to direct package-local trusted external exposure ownership in runtime or mere process readiness.
    > Verification: `/on-demand-force-find` remains available as a freshness path before `observation_eligible` is reached for materialized `/tree` and `/stats`.
-   > Verification: app workflow treats `observation_eligible` as materialized-query evidence while `/on-demand-force-find` stays a freshness path.
+   > Verification: app workflow treats `observation_eligible` as the trusted-materialized gate while `/on-demand-force-find` stays a freshness path.
    > Verification: status/health surfaces expose explicit source coverage, degraded state, audit timing, sink capacity signals, and optional facade-pending retry diagnostics so large-NFS monitoring can distinguish trusted exposure evidence from coarse process liveness or listener retry drift.
 10. **STALE_WRITER_FENCE_BEFORE_EXPOSURE**: **fs-meta System** MUST fence stale generations before runtime can trust a newer exposure path or allow older observations to re-expose.
 11. **NO_PRODUCT_OR_PLATFORM_OWNERSHIP**: **fs-meta System** MUST NOT own product CLI/deploy semantics or platform bind/route/grant authority.

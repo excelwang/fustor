@@ -594,7 +594,7 @@ fn test_unified_query_shape_output() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     assert!(l1.contains("QUERY_PATH_OUTPUT_DISCIPLINE"));
     assert!(l1.contains("grouped envelope"));
-    assert!(l1.contains("top-level `path/status/group_order/groups/group_page`"));
+    assert!(l1.contains("top-level `path/status/read_class/observation_status/group_order/groups/group_page`"));
     assert!(l1.contains("optional `root/entries/entry_page`"));
 }
 
@@ -1514,19 +1514,19 @@ fn test_force_find_all_can_group_by_host_descriptor_policy() {
     assert!(l3.contains("fs_type"));
 }
 
-// @verify_spec("CONTRACTS.QUERY_OUTCOME.QUIET_WINDOW_STABILITY_TRACKS_OBSERVED_CHANGE_NOT_REFRESH_NOISE", mode="system")
+// @verify_spec("CONTRACTS.QUERY_OUTCOME.READ_CLASS_REPLACES_FREEFORM_STABILITY_SELECTION", mode="system")
 #[test]
-fn test_quiet_window_stability_tracks_observed_change_not_refresh_noise() {
+fn test_named_read_class_replaces_freeform_stability_selection() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKFLOWS.md");
 
-    assert!(l1.contains("QUIET_WINDOW_STABILITY_TRACKS_OBSERVED_CHANGE_NOT_REFRESH_NOISE"));
-    assert!(l1.contains("observed materialized subtree change"));
-    assert!(l1.contains("raw periodic sync traffic or file mtime alone"));
-    assert!(l3.contains("## [workflow] QuietWindowStableTreeQuery"));
-    assert!(l3.contains("sync-refresh update"));
-    assert!(l3.contains("write-significant update"));
-    assert!(l3.contains("metadata_mode=stable-only"));
+    assert!(l1.contains("READ_CLASS_REPLACES_FREEFORM_STABILITY_SELECTION"));
+    assert!(l1.contains("read_class=fresh|materialized|trusted-materialized"));
+    assert!(l1.contains("eliminate caller-owned"));
+    assert!(l3.contains("## [workflow] NamedReadClassQuery"));
+    assert!(l3.contains("read_class=fresh|materialized|trusted-materialized"));
+    assert!(l3.contains("observation_status.state=fresh-only"));
+    assert!(l3.contains("materialized-untrusted"));
     assert!(l3.contains("`group_page_size/group_after` paginate bucket selection inside one PIT"));
     assert!(l3.contains("`/on-demand-force-find` stays a freshness path"));
 }
