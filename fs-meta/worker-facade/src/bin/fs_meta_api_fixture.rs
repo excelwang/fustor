@@ -8,7 +8,7 @@ use capanix_app_sdk::runtime::{ConfigValue, NodeId};
 use capanix_route_proto::{BoundScope, ExecActivate, ExecControl, encode_exec_control_envelope};
 use serde::Deserialize;
 
-const FACADE_CONTROL_ROUTE_KEY: &str = "fs-meta.internal.facade-control:v1";
+const FACADE_CONTROL_ROUTE_KEY: &str = "fs-meta.internal.facade-control:v1.stream";
 
 #[derive(Debug, Deserialize)]
 struct RootSelectorEnvSpec {
@@ -267,6 +267,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 (
                     "facade_resource_id".to_string(),
                     ConfigValue::String(facade_resource_id.clone()),
+                ),
+                (
+                    "local_listener_resources".to_string(),
+                    ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
+                        (
+                            "resource_id".to_string(),
+                            ConfigValue::String(facade_resource_id.clone()),
+                        ),
+                        (
+                            "bind_addr".to_string(),
+                            ConfigValue::String(bind_addr.clone()),
+                        ),
+                    ]))]),
                 ),
             ]);
             let mut auth = HashMap::from([

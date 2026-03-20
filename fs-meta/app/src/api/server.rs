@@ -78,15 +78,25 @@ pub async fn spawn(
     query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     facade_pending: SharedFacadePendingStatusCell,
 ) -> Result<ApiServerHandle> {
+    eprintln!("fs_meta_api_server: spawn begin bind_addr={}", cfg.bind_addr);
     cfg.auth
         .ensure_materialized()
         .map_err(CnxError::InvalidInput)?;
+    eprintln!(
+        "fs_meta_api_server: auth materialized bind_addr={}",
+        cfg.bind_addr
+    );
     let auth = Arc::new(AuthService::new(cfg.auth.clone()).map_err(|e| {
         CnxError::InvalidInput(format!("fs-meta api auth init failed: {}", e.message))
     })?);
+    eprintln!("fs_meta_api_server: auth service ready bind_addr={}", cfg.bind_addr);
 
     let initial_policy =
         projection_policy_from_host_object_grants(&source.cached_host_object_grants_snapshot()?);
+    eprintln!(
+        "fs_meta_api_server: initial policy ready bind_addr={}",
+        cfg.bind_addr
+    );
     let projection_policy = Arc::new(RwLock::new(initial_policy));
     let force_find_inflight = Arc::new(Mutex::new(BTreeSet::new()));
     let state = ApiState {
@@ -106,7 +116,12 @@ pub async fn spawn(
         &state.projection_policy,
         &state.source.cached_host_object_grants_snapshot()?,
     );
+    eprintln!(
+        "fs_meta_api_server: policy refreshed bind_addr={}",
+        cfg.bind_addr
+    );
     let app = router(state)?;
+    eprintln!("fs_meta_api_server: router ready bind_addr={}", cfg.bind_addr);
 
     let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();
@@ -114,6 +129,10 @@ pub async fn spawn(
     let (ready_tx, ready_rx) = sync_channel(1);
 
     let join = ApiServerJoin::Thread(std::thread::spawn(move || {
+        eprintln!(
+            "fs_meta_api_server: thread starting bind_addr={}",
+            bind_addr_for_log
+        );
         let worker_threads = std::thread::available_parallelism()
             .map(|n| n.get().clamp(4, 8))
             .unwrap_or(4);
@@ -129,6 +148,10 @@ pub async fn spawn(
                 return;
             }
         };
+        eprintln!(
+            "fs_meta_api_server: runtime ready bind_addr={}",
+            bind_addr_for_log
+        );
 
         runtime.block_on(async move {
             eprintln!("fs_meta_api_server: binding {}", bind_addr_for_log);
@@ -153,6 +176,10 @@ pub async fn spawn(
         });
     }));
 
+    eprintln!(
+        "fs_meta_api_server: waiting for bind readiness bind_addr={}",
+        cfg.bind_addr
+    );
     let ready = tokio::task::spawn_blocking(move || ready_rx.recv_timeout(Duration::from_secs(10)))
         .await
         .map_err(|err| {

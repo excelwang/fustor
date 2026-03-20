@@ -2975,11 +2975,6 @@ impl FSMetaSource {
                             if task_cancel.is_cancelled() || global_shutdown.is_cancelled() {
                                 break;
                             }
-                            eprintln!(
-                                "fs_meta_source: root task forwarding batch len={} root_key={}",
-                                batch.len(),
-                                root_key
-                            );
                             if out_tx.send(batch).is_err() {
                                 Self::update_root_task_slot_health(
                                     &fanout_health,
@@ -3462,15 +3457,7 @@ impl FSMetaSource {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     batch = out_rx.recv() => match batch {
-                        Some(events) if !events.is_empty() => {
-                            if events.len() > 50 {
-                                eprintln!(
-                                    "fs_meta_source: pub stream yielding batch len={}",
-                                    events.len()
-                                );
-                            }
-                            yield events
-                        },
+                        Some(events) if !events.is_empty() => yield events,
                         Some(_) => {},
                         None => break,
                     }

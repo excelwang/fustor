@@ -68,6 +68,7 @@ const MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_millis(50
 // and multi-runner aggregation scenarios.
 const FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(5);
 const FORCE_FIND_MIN_INFLIGHT_HOLD: Duration = Duration::from_secs(2);
+const FORCE_FIND_INFLIGHT_CONFLICT_PREFIX: &str = "force-find inflight conflict:";
 
 #[derive(Deserialize)]
 pub struct ApiParams {
@@ -2346,6 +2347,9 @@ fn error_status(err: &CnxError) -> StatusCode {
     if matches!(err, CnxError::NotReady(msg) if msg.starts_with("pit capacity exceeded")) {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
+    if matches!(err, CnxError::NotReady(msg) if msg.starts_with(FORCE_FIND_INFLIGHT_CONFLICT_PREFIX)) {
+        return StatusCode::TOO_MANY_REQUESTS;
+    }
     match err {
         CnxError::InvalidInput(_) => StatusCode::BAD_REQUEST,
         CnxError::ProtocolViolation(_) => StatusCode::BAD_GATEWAY,
@@ -2363,6 +2367,9 @@ fn error_code(err: &CnxError) -> &'static str {
     }
     if matches!(err, CnxError::NotReady(msg) if msg.starts_with("pit capacity exceeded")) {
         return "PIT_CAPACITY_EXCEEDED";
+    }
+    if matches!(err, CnxError::NotReady(msg) if msg.starts_with(FORCE_FIND_INFLIGHT_CONFLICT_PREFIX)) {
+        return "FORCE_FIND_INFLIGHT_CONFLICT";
     }
     match err {
         CnxError::InvalidInput(_) => "INVALID_INPUT",
@@ -2683,7 +2690,7 @@ fn acquire_force_find_groups(
             inflight
         );
         return Err(CnxError::NotReady(format!(
-            "force-find already running for group: {group}"
+            "{FORCE_FIND_INFLIGHT_CONFLICT_PREFIX} force-find already running for group: {group}"
         )));
     }
     for group in &groups {
@@ -3084,6 +3091,14 @@ mod tests {
     fn error_response_maps_invalid_input_to_bad_request() {
         let response = error_response(CnxError::InvalidInput("x".into()));
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn error_response_maps_force_find_inflight_conflict_to_too_many_requests() {
+        let response = error_response(CnxError::NotReady(format!(
+            "{FORCE_FIND_INFLIGHT_CONFLICT_PREFIX} force-find already running for group: nfs1"
+        )));
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     }
 
     #[test]

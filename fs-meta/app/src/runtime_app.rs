@@ -866,6 +866,10 @@ impl FSMetaApp {
             facade_pending_status.clone(),
         )
         .await?;
+        eprintln!(
+            "fs_meta_runtime_app: facade api::spawn returned generation={} route_key={}",
+            pending.generation, pending.route_key
+        );
 
         let still_pending = {
             let pending_guard = pending_facade.lock().await;
