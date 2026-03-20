@@ -151,6 +151,7 @@ impl SinkWorkerClientHandle {
             );
             let _ = client.close();
         }
+        self.update_cached_status_snapshot(SinkStatusSnapshot::default())?;
         Ok(())
     }
 
@@ -269,7 +270,8 @@ impl SinkWorkerClientHandle {
         self.with_started_retry(|client| {
             client.update_logical_roots(roots.clone(), host_object_grants.clone())
         })?;
-        self.update_cached_logical_roots(roots)
+        self.update_cached_logical_roots(roots)?;
+        self.update_cached_status_snapshot(SinkStatusSnapshot::default())
     }
 
     pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {

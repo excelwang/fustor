@@ -19,12 +19,12 @@ use crate::sink::SinkStatusSnapshot;
 use crate::source::SourceStatusSnapshot;
 use crate::source::config::GrantedMountRoot;
 use crate::runtime::routes::{
-    METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
+    METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND, METHOD_SOURCE_STATUS,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::workers::sink::SinkFacade;
-use crate::workers::source::SourceFacade;
+use crate::workers::source::{SourceFacade, SourceObservabilitySnapshot};
 use axum::{
     Json, Router,
     extract::{Query, State},
@@ -323,17 +323,24 @@ fn materialized_query_readiness_error(
         .iter()
         .map(|group| (group.group_id.as_str(), group))
         .collect::<std::collections::BTreeMap<_, _>>();
+    let mut expected_groups = source_status
+        .concrete_roots
+        .iter()
+        .filter(|root| root.active && root.is_group_primary && root.scan_enabled)
+        .map(|root| root.logical_root_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    for root in &source_status.logical_roots {
+        if root.matched_grants > 0 && root.active_members > 0 {
+            expected_groups.insert(root.root_id.clone());
+        }
+    }
 
     let mut pending_initial_audit = Vec::<String>::new();
     let mut overflow_pending = Vec::<String>::new();
     let mut degraded = Vec::<String>::new();
 
-    for root in source_status
-        .concrete_roots
-        .iter()
-        .filter(|root| root.active && root.is_group_primary && root.scan_enabled)
-    {
-        let group_id = root.logical_root_id.as_str();
+    for group_id in &expected_groups {
+        let group_id = group_id.as_str();
         if degraded_groups.contains(group_id) {
             degraded.push(group_id.to_string());
             continue;
@@ -380,32 +387,9 @@ fn materialized_query_readiness_error(
     ))
 }
 
-fn materialized_query_source_gate_error(source_status: &SourceStatusSnapshot) -> Option<String> {
-    let degraded_groups = source_status
-        .degraded_roots
-        .iter()
-        .map(|(root_id, _)| root_id.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let degraded_primary_scan_groups = source_status
-        .concrete_roots
-        .iter()
-        .filter(|root| root.active && root.is_group_primary && root.scan_enabled)
-        .filter_map(|root| {
-            degraded_groups
-                .contains(root.logical_root_id.as_str())
-                .then(|| root.logical_root_id.clone())
-        })
-        .collect::<Vec<_>>();
-    if degraded_primary_scan_groups.is_empty() {
-        return None;
-    }
-    Some(format!(
-        "materialized /tree and /stats remain unavailable while source coverage is degraded for groups [{}]",
-        degraded_primary_scan_groups.join(", ")
-    ))
-}
-
-fn merge_sink_status_snapshots(mut snapshots: Vec<SinkStatusSnapshot>) -> SinkStatusSnapshot {
+pub(crate) fn merge_sink_status_snapshots(
+    mut snapshots: Vec<SinkStatusSnapshot>,
+) -> SinkStatusSnapshot {
     if snapshots.is_empty() {
         return SinkStatusSnapshot::default();
     }
@@ -454,6 +438,70 @@ fn merge_sink_status_snapshots(mut snapshots: Vec<SinkStatusSnapshot>) -> SinkSt
     merged
 }
 
+fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> SourceStatusSnapshot {
+    if snapshots.is_empty() {
+        return SourceStatusSnapshot::default();
+    }
+    if snapshots.len() == 1 {
+        return snapshots.pop().unwrap_or_default();
+    }
+
+    let mut logical_root_map = BTreeMap::new();
+    let mut concrete_root_map = BTreeMap::new();
+    let mut degraded_root_map = BTreeMap::new();
+    for snapshot in snapshots {
+        for entry in snapshot.logical_roots {
+            logical_root_map.entry(entry.root_id.clone()).or_insert(entry);
+        }
+        for entry in snapshot.concrete_roots {
+            concrete_root_map.entry(entry.root_key.clone()).or_insert(entry);
+        }
+        for (root_key, reason) in snapshot.degraded_roots {
+            degraded_root_map.entry(root_key).or_insert(reason);
+        }
+    }
+
+    SourceStatusSnapshot {
+        logical_roots: logical_root_map.into_values().collect(),
+        concrete_roots: concrete_root_map.into_values().collect(),
+        degraded_roots: degraded_root_map.into_iter().collect(),
+    }
+}
+
+async fn route_source_status_snapshot(
+    boundary: Arc<dyn ChannelIoSubset>,
+    origin_id: NodeId,
+    timeout: Duration,
+) -> Result<SourceStatusSnapshot, CnxError> {
+    let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
+    let events = run_blocking_query(
+        move || {
+            adapter.call_collect(
+                ROUTE_TOKEN_FS_META_INTERNAL,
+                METHOD_SOURCE_STATUS,
+                Bytes::new(),
+                timeout,
+                MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
+            )
+        },
+        timeout,
+    )
+    .await?;
+    let snapshots = events
+        .into_iter()
+        .map(|event| {
+            rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes())
+                .map(|snapshot| snapshot.status)
+                .map_err(|err| {
+                    CnxError::Internal(format!(
+                        "decode source status snapshot failed: {err}"
+                    ))
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(merge_source_status_snapshots(snapshots))
+}
+
 pub(crate) async fn route_sink_status_snapshot(
     boundary: Arc<dyn ChannelIoSubset>,
     origin_id: NodeId,
@@ -488,7 +536,31 @@ async fn ensure_materialized_queries_ready(state: &ApiState) -> Result<(), CnxEr
     let (Some(source), Some(sink)) = (&state.readiness_source, &state.readiness_sink) else {
         return Ok(());
     };
-    let source_status = source.status_snapshot()?;
+    let source_status = match &state.backend {
+        QueryBackend::Route {
+            boundary,
+            origin_id,
+            ..
+        } => match route_source_status_snapshot(
+            boundary.clone(),
+            origin_id.clone(),
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(CnxError::Timeout)
+            | Err(CnxError::TransportClosed(_))
+            | Err(CnxError::ProtocolViolation(_)) => {
+                return Err(CnxError::NotReady(
+                    "materialized /tree and /stats remain unavailable until source-status route returns live cluster readiness evidence"
+                        .into(),
+                ));
+            }
+            Err(err) => return Err(err),
+        },
+        QueryBackend::InProcess { .. } => source.status_snapshot()?,
+    };
     let sink_status = match &state.backend {
         QueryBackend::Route {
             boundary,
@@ -501,26 +573,21 @@ async fn ensure_materialized_queries_ready(state: &ApiState) -> Result<(), CnxEr
         )
         .await
         {
-            Ok(snapshot) => Some(snapshot),
+            Ok(snapshot) => snapshot,
             Err(CnxError::Timeout)
             | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ProtocolViolation(_)) => None,
+            | Err(CnxError::ProtocolViolation(_)) => {
+                return Err(CnxError::NotReady(
+                    "materialized /tree and /stats remain unavailable until sink-status route returns live cluster readiness evidence"
+                        .into(),
+                ));
+            }
             Err(err) => return Err(err),
         },
-        QueryBackend::InProcess { .. } => Some(sink.status_snapshot()?),
+        QueryBackend::InProcess { .. } => sink.status_snapshot()?,
     };
-    match sink_status {
-        Some(sink_status) => {
-            if let Some(message) = materialized_query_readiness_error(&source_status, &sink_status)
-            {
-                return Err(CnxError::NotReady(message));
-            }
-        }
-        None => {
-            if let Some(message) = materialized_query_source_gate_error(&source_status) {
-                return Err(CnxError::NotReady(message));
-            }
-        }
+    if let Some(message) = materialized_query_readiness_error(&source_status, &sink_status) {
+        return Err(CnxError::NotReady(message));
     }
     eprintln!("fs_meta_query_api: ensure_materialized_queries_ready ok");
     Ok(())
@@ -3657,6 +3724,27 @@ mod tests {
 
         let err = materialized_query_readiness_error(&source_status, &sink_status)
             .expect("initial audit should gate materialized queries");
+        assert!(err.contains("initial audit incomplete"));
+        assert!(err.contains("root-a"));
+    }
+
+    #[test]
+    fn materialized_query_readiness_fail_closed_when_sink_group_missing() {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
+                root_id: "root-a".into(),
+                status: "ok".into(),
+                matched_grants: 1,
+                active_members: 1,
+                coverage_mode: "audit_only".into(),
+            }],
+            concrete_roots: Vec::new(),
+            degraded_roots: Vec::new(),
+        };
+        let sink_status = SinkStatusSnapshot::default();
+
+        let err = materialized_query_readiness_error(&source_status, &sink_status)
+            .expect("missing sink group must gate materialized queries");
         assert!(err.contains("initial audit incomplete"));
         assert!(err.contains("root-a"));
     }

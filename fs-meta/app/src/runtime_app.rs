@@ -399,7 +399,7 @@ impl FSMetaApp {
                 move |requests| {
                     let mut responses = Vec::new();
                     for req in requests {
-                        match sink.status_snapshot_nonblocking() {
+                        match sink.status_snapshot() {
                             Ok(snapshot) => {
                                 eprintln!(
                                     "fs_meta_runtime_app: sink status endpoint response groups={}",
@@ -1188,7 +1188,6 @@ impl FSMetaApp {
             if let Some(current) = api_task.as_mut()
                 && current.route_key == route_key
                 && current.resource_ids == candidate_resource_ids
-                && current.generation == generation
             {
                 current.generation = generation;
                 drop(api_task);
@@ -2299,6 +2298,104 @@ mod tests {
             2
         );
         assert!(app.pending_facade.lock().await.is_none());
+        app.close().await.expect("close fs-meta app");
+    }
+
+    #[tokio::test]
+    async fn facade_activate_same_listener_resource_advances_generation_without_pending_cutover() {
+        let tmp = tempdir().expect("create temp dir");
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root");
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let cfg = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", &root)],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-1", &root)],
+                ..in_process_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: "single-app-listener".to_string(),
+                local_listener_resources: vec![api::config::ApiListenerResource {
+                    resource_id: "single-app-listener".to_string(),
+                    bind_addr: "127.0.0.1:0".to_string(),
+                }],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        };
+        let app = FSMetaApp::with_boundaries(
+            cfg,
+            NodeId("single-app-node".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app");
+        let existing = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["single-app-listener".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_control_boundary.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["single-app-listener".to_string()],
+            handle: existing,
+        });
+
+        app.apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            &facade_control_stream_route(),
+            2,
+            &[capanix_route_proto::BoundScope {
+                scope_id: "single-app-listener".to_string(),
+                resource_ids: vec!["single-app-listener".to_string()],
+            }],
+        )
+        .await
+        .expect("apply same-resource facade activate");
+
+        assert_eq!(
+            app.api_task
+                .lock()
+                .await
+                .as_ref()
+                .expect("same-resource facade remains active")
+                .generation,
+            2
+        );
+        assert!(
+            app.pending_facade.lock().await.is_none(),
+            "same-resource generation refresh must not leave a pending cutover"
+        );
+        assert!(
+            app.facade_pending_status
+                .read()
+                .expect("read pending status")
+                .is_none(),
+            "same-resource generation refresh must clear pending diagnostics"
+        );
         app.close().await.expect("close fs-meta app");
     }
 

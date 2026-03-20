@@ -320,6 +320,32 @@ impl Cluster5 {
         request_cluster_state(&node.socket_path)
     }
 
+    pub fn node_process_status(&self, node_name: &str) -> Result<Value, String> {
+        let node = self.node(node_name)?;
+        let pid = node.child.id();
+        let exited = Command::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .map(|status| !status.success())
+            .unwrap_or(true);
+        Ok(json!({
+            "pid": pid,
+            "socket_path": node.socket_path.display().to_string(),
+            "stdout_log": node.stdout_log.display().to_string(),
+            "stderr_log": node.stderr_log.display().to_string(),
+            "alive": !exited,
+        }))
+    }
+
+    pub fn node_log_excerpt(&self, node_name: &str) -> Result<Value, String> {
+        let node = self.node(node_name)?;
+        Ok(json!({
+            "stdout": log_excerpt(&node.stdout_log),
+            "stderr": log_excerpt(&node.stderr_log),
+        }))
+    }
+
     pub fn apply_release(&self, node_name: &str, release: Value) -> Result<Value, String> {
         let node = self.node(node_name)?;
         let cnxctl_bin = try_find_cnxctl_bin().ok_or_else(|| {

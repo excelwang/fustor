@@ -1131,6 +1131,12 @@ fn baseline_cluster_diagnostics(
         let cluster_status = cluster
             .cluster_status(node_name)
             .unwrap_or_else(|err| json!({ "error": err }));
+        let process_status = cluster
+            .node_process_status(node_name)
+            .unwrap_or_else(|err| json!({ "error": err }));
+        let logs = cluster
+            .node_log_excerpt(node_name)
+            .unwrap_or_else(|err| json!({ "error": err }));
         let target_state = cluster
             .runtime_target_state(node_name)
             .unwrap_or_else(|err| json!({ "error": err }));
@@ -1138,6 +1144,8 @@ fn baseline_cluster_diagnostics(
             "node": node_name,
             "status": status_value,
             "cluster_status": cluster_status,
+            "process_status": process_status,
+            "logs": logs,
             "runtime_target_state": target_state,
         }));
     }

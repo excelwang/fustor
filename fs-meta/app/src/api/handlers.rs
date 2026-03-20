@@ -22,7 +22,10 @@ use crate::runtime::routes::{
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
 use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
-use crate::query::api::refresh_policy_from_host_object_grants;
+use crate::query::api::{
+    merge_sink_status_snapshots, refresh_policy_from_host_object_grants,
+    route_sink_status_snapshot,
+};
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use crate::workers::source::SourceObservabilitySnapshot;
 
@@ -59,7 +62,7 @@ pub async fn status(
 ) -> Result<Json<StatusResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
 
-    let sink_status = match state.sink.status_snapshot_nonblocking() {
+    let local_sink = match state.sink.status_snapshot_nonblocking() {
         Ok(snapshot) => snapshot,
         Err(err) if state.sink.is_worker() => {
             log::warn!("status falling back to default sink snapshot: {err}");
@@ -68,6 +71,28 @@ pub async fn status(
         Err(err) => {
             return Err(ApiError::internal(format!("sink status failed: {err}")));
         }
+    };
+    let sink_status = match state.query_runtime_boundary.clone() {
+        Some(boundary) => match route_sink_status_snapshot(
+            boundary,
+            state.node_id.clone(),
+            Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(snapshot) => merge_sink_status_snapshots(vec![local_sink, snapshot]),
+            Err(CnxError::Timeout)
+            | Err(CnxError::TransportClosed(_))
+            | Err(CnxError::ProtocolViolation(_)) => {
+                log::warn!("status falling back to local sink snapshot after route error");
+                local_sink
+            }
+            Err(err) => {
+                log::warn!("status falling back to local sink snapshot: {err}");
+                local_sink
+            }
+        },
+        None => local_sink,
     };
     let local_source = match state.source.observability_snapshot() {
         Ok(snapshot) => snapshot,

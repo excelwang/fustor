@@ -246,6 +246,7 @@ pub(crate) struct GroupSinkState {
     pub(crate) tombstone_policy: TombstonePolicy,
     pub(crate) primary_object_ref: String,
     pub(crate) overflow_pending_audit: bool,
+    pub(crate) audit_epoch_completed: bool,
     pub(crate) initial_audit_completed: bool,
     pub(crate) last_coverage_recovered_at: Option<Instant>,
     pub(crate) materialized_revision: u64,
@@ -261,11 +262,17 @@ impl GroupSinkState {
             tombstone_policy,
             primary_object_ref,
             overflow_pending_audit: false,
+            audit_epoch_completed: false,
             initial_audit_completed: false,
             last_coverage_recovered_at: Some(Instant::now()),
             materialized_revision: 1,
             sentinel_health: BTreeMap::new(),
         }
+    }
+
+    fn refresh_initial_audit_completed(&mut self) {
+        self.initial_audit_completed =
+            self.audit_epoch_completed && self.tree.node_count() > 0;
     }
 }
 
@@ -1920,7 +1927,7 @@ impl SinkFileMeta {
                                     ..
                                 }
                             ) {
-                                group_state.initial_audit_completed = true;
+                                group_state.audit_epoch_completed = true;
                                 if group_state.overflow_pending_audit {
                                     group_state.last_coverage_recovered_at = Some(Instant::now());
                                     group_state.materialized_revision =
@@ -1928,6 +1935,7 @@ impl SinkFileMeta {
                                 }
                                 group_state.overflow_pending_audit = false;
                             }
+                            group_state.refresh_initial_audit_completed();
                         }
                     }
                 }
@@ -1985,6 +1993,7 @@ impl SinkFileMeta {
             {
                 pending_lag_samples.push(sample);
             }
+            group_state.refresh_initial_audit_completed();
         }
         drop(state);
         self.state.record_authoritative_commit(
@@ -3004,6 +3013,51 @@ mod tests {
         assert_eq!(
             response.reliability.unreliable_reason,
             Some(UnreliableReason::WatchOverflowPendingAudit)
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_audit_completion_waits_for_materialized_root() {
+        let sink = build_single_group_sink();
+        sink.send(&[
+            mk_control_event(
+                "node-a::exp",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                1,
+            ),
+            mk_control_event(
+                "node-a::exp",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                2,
+            ),
+        ])
+        .await
+        .expect("apply empty audit epoch");
+
+        let snapshot = sink.status_snapshot().expect("sink status");
+        assert_eq!(snapshot.groups.len(), 1);
+        assert!(
+            !snapshot.groups[0].initial_audit_completed,
+            "audit epoch without a materialized root must stay not-ready"
+        );
+
+        sink.send(&[mk_source_event(
+            "node-a::exp",
+            mk_record(b"/ready.txt", "ready.txt", 3, EventKind::Update),
+        )])
+        .await
+        .expect("materialize root path");
+
+        let snapshot = sink.status_snapshot().expect("sink status after root materializes");
+        assert!(
+            snapshot.groups[0].initial_audit_completed,
+            "materialized root should unlock initial audit readiness after audit completion"
         );
     }
 }
