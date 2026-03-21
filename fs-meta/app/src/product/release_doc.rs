@@ -1,16 +1,39 @@
+use std::path::Path;
+use std::path::PathBuf;
+
 use crate::api::config::ApiAuthConfig;
 use crate::runtime::execution_units::{
-    QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
+    QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID,
+    SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
 use crate::runtime::routes::{
     ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
     ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL,
     ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
-    ROUTE_KEY_SOURCE_STATUS_INTERNAL,
-    ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+    ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL,
 };
 use crate::source::config::RootSpec;
 use capanix_app_sdk::runtime::{RouteKey, RoutePlanMode, RoutePlanSpec};
+use capanix_app_sdk::worker::WorkerMode;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsMetaReleaseWorkerModes {
+    pub facade: WorkerMode,
+    pub source: WorkerMode,
+    pub scan: WorkerMode,
+    pub sink: WorkerMode,
+}
+
+impl Default for FsMetaReleaseWorkerModes {
+    fn default() -> Self {
+        Self {
+            facade: WorkerMode::Embedded,
+            source: WorkerMode::External,
+            scan: WorkerMode::External,
+            sink: WorkerMode::External,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FsMetaReleaseSpec {
@@ -18,6 +41,8 @@ pub struct FsMetaReleaseSpec {
     pub api_facade_resource_id: String,
     pub auth: ApiAuthConfig,
     pub roots: Vec<RootSpec>,
+    pub worker_module_path: Option<PathBuf>,
+    pub worker_modes: FsMetaReleaseWorkerModes,
 }
 
 pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
@@ -38,6 +63,17 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
             "shell": bootstrap.shell,
         });
     }
+    let mut config = serde_json::json!({
+        "roots": spec.roots.iter().map(root_spec_release_json).collect::<Vec<_>>(),
+        "api": {
+            "enabled": true,
+            "facade_resource_id": spec.api_facade_resource_id,
+            "auth": auth,
+        }
+    });
+    if let Some(worker_module_path) = spec.worker_module_path.as_deref() {
+        config["workers"] = build_worker_config_json(worker_module_path, spec.worker_modes);
+    }
     serde_json::json!({
         "schema_version": "scope-unit-intent-v1",
         "target_id": spec.app_id,
@@ -49,14 +85,7 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
                 "startup": {
                     "path": "capanix-app-fs-meta"
                 },
-                "config": {
-                    "roots": spec.roots.iter().map(root_spec_release_json).collect::<Vec<_>>(),
-                    "api": {
-                        "enabled": true,
-                        "facade_resource_id": spec.api_facade_resource_id,
-                        "auth": auth,
-                    }
-                },
+                "config": config,
                 "runtime": {
                     "control_subscriptions": ["runtime.host_object_grants.changed"],
                     "app_scopes": build_app_scopes_json(spec),
@@ -99,33 +128,72 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     })
 }
 
+fn build_worker_config_json(
+    worker_module_path: &Path,
+    worker_modes: FsMetaReleaseWorkerModes,
+) -> serde_json::Value {
+    let worker_module_path = worker_module_path.display().to_string();
+    let worker_json = |mode: WorkerMode| match mode {
+        WorkerMode::Embedded => serde_json::json!({
+            "mode": "embedded"
+        }),
+        WorkerMode::External => serde_json::json!({
+            "mode": "external",
+            "startup": {
+                "path": worker_module_path
+            }
+        }),
+    };
+    serde_json::json!({
+        "facade": worker_json(worker_modes.facade),
+        "source": worker_json(worker_modes.source),
+        "scan": worker_json(worker_modes.scan),
+        "sink": worker_json(worker_modes.sink)
+    })
+}
+
 fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
     let mut plans = Vec::new();
-    plans.push(serde_json::to_value(RoutePlanSpec {
-        route_key: RouteKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
-        mode: RoutePlanMode::FanOut,
-        peers: Vec::new(),
-    }).unwrap_or_else(|_| serde_json::json!({})));
-    plans.push(serde_json::to_value(RoutePlanSpec {
-        route_key: RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)),
-        mode: RoutePlanMode::FanOut,
-        peers: Vec::new(),
-    }).unwrap_or_else(|_| serde_json::json!({})));
-    plans.push(serde_json::to_value(RoutePlanSpec {
-        route_key: RouteKey(format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)),
-        mode: RoutePlanMode::FanOut,
-        peers: Vec::new(),
-    }).unwrap_or_else(|_| serde_json::json!({})));
-    plans.push(serde_json::to_value(RoutePlanSpec {
-        route_key: RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)),
-        mode: RoutePlanMode::FanOut,
-        peers: Vec::new(),
-    }).unwrap_or_else(|_| serde_json::json!({})));
-    plans.push(serde_json::to_value(RoutePlanSpec {
-        route_key: RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)),
-        mode: RoutePlanMode::FanOut,
-        peers: Vec::new(),
-    }).unwrap_or_else(|_| serde_json::json!({})));
+    plans.push(
+        serde_json::to_value(RoutePlanSpec {
+            route_key: RouteKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
+            mode: RoutePlanMode::FanOut,
+            peers: Vec::new(),
+        })
+        .unwrap_or_else(|_| serde_json::json!({})),
+    );
+    plans.push(
+        serde_json::to_value(RoutePlanSpec {
+            route_key: RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)),
+            mode: RoutePlanMode::FanOut,
+            peers: Vec::new(),
+        })
+        .unwrap_or_else(|_| serde_json::json!({})),
+    );
+    plans.push(
+        serde_json::to_value(RoutePlanSpec {
+            route_key: RouteKey(format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)),
+            mode: RoutePlanMode::FanOut,
+            peers: Vec::new(),
+        })
+        .unwrap_or_else(|_| serde_json::json!({})),
+    );
+    plans.push(
+        serde_json::to_value(RoutePlanSpec {
+            route_key: RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL)),
+            mode: RoutePlanMode::FanOut,
+            peers: Vec::new(),
+        })
+        .unwrap_or_else(|_| serde_json::json!({})),
+    );
+    plans.push(
+        serde_json::to_value(RoutePlanSpec {
+            route_key: RouteKey(format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL)),
+            mode: RoutePlanMode::FanOut,
+            peers: Vec::new(),
+        })
+        .unwrap_or_else(|_| serde_json::json!({})),
+    );
     plans
 }
 

@@ -4,9 +4,10 @@ version: 3.0.0
 
 # L3 Runtime: fs-meta Observation Cutover
 
-fs-meta stateful authoring consumes `capanix-managed-state-sdk`; top-level
-runtime-wrapper authoring lowers through `capanix-service-sdk` above the lower
-`capanix-app-sdk` Boundary Toolkit. Narrow runtime-glue and
+fs-meta stateful authoring consumes `capanix-managed-state-sdk`
+declarations/evaluator helpers; the top-level runtime host lowers through
+`capanix-service-sdk` above the lower `capanix-app-sdk` Boundary Toolkit.
+Narrow runtime-glue and
 boundary-conversion seams MAY consume `capanix-runtime-api` directly without
 becoming a second authoring authority, while `capanix-kernel-api` remains
 below that line as a low-level mirror.
@@ -62,5 +63,6 @@ that worker model.
 1. product-facing failure domains are expressed only as `embedded` versus `external` workers.
 2. the current baseline keeps `facade-worker=embedded` and `source-worker=external`, `scan-worker=external`, `sink-worker=external`.
 3. realization details such as artifact bootstrap, loader handoff, or runtime bridge wiring remain internal and do not redefine worker roles.
-4. constructor/bootstrap faults return typed `CnxError` or `init_error` before the app claims healthy external exposure.
-5. API bootstrap, in-process projection bootstrap, and worker/bootstrap faults stay on explicit error/log paths rather than routine `expect!`/panic control flow, and runtime task join failures are reported as typed app errors.
+4. runtime-managed worker realization consumes compiled `__cnx_runtime.workers` bindings rather than raw app-owned `config.workers` parsing during app load.
+5. constructor/bootstrap faults return typed `CnxError` or `init_error` before the app claims healthy external exposure.
+6. API bootstrap, in-process projection bootstrap, and worker/bootstrap faults stay on explicit error/log paths rather than routine `expect!`/panic control flow, and runtime task join failures are reported as typed app errors.

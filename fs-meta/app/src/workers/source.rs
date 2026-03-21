@@ -2,13 +2,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use capanix_worker_runtime_support::{
-    CompositeRuntimeBoundary, TypedWorkerClient, TypedWorkerHandle, WorkerArtifactBinding,
-    WorkerBootstrapSpec, WorkerBootstrapTimeouts, encode_control_frame,
-};
 use capanix_app_sdk::raw::{BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest};
-use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RouteKey};
+use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
+use capanix_worker_runtime_support::{
+    CompositeRuntimeBoundary, TypedWorkerClient, TypedWorkerHandle, TypedWorkerInit,
+};
 use futures_util::StreamExt;
 use tokio::task::JoinHandle;
 
@@ -19,46 +18,18 @@ use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::source::{FSMetaSource, SourceStatusSnapshot};
 use crate::workers::sink::SinkFacade;
 use crate::workers::source_ipc::{
-    SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, SourceWorkerRequest, SourceWorkerResponse,
-    decode_request, decode_response, encode_request, encode_response,
-    source_worker_control_route_key_for,
+    SourceWorkerRequest, SourceWorkerResponse, decode_request, decode_response, encode_request,
+    encode_response,
 };
 
 const SOURCE_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
-const SOURCE_WORKER_INIT_RPC_TIMEOUT: Duration = Duration::from_secs(120);
-const SOURCE_WORKER_INIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(240);
-const SOURCE_WORKER_START_RPC_TIMEOUT: Duration = Duration::from_secs(180);
-const SOURCE_WORKER_START_TOTAL_TIMEOUT: Duration = Duration::from_secs(300);
 const SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 const SOURCE_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
 const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
-
-fn source_worker_timeouts() -> WorkerBootstrapTimeouts {
-    WorkerBootstrapTimeouts::new(
-        SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
-        SOURCE_WORKER_INIT_RPC_TIMEOUT,
-        SOURCE_WORKER_INIT_TOTAL_TIMEOUT,
-        SOURCE_WORKER_START_RPC_TIMEOUT,
-        SOURCE_WORKER_START_TOTAL_TIMEOUT,
-        SOURCE_WORKER_RETRY_BACKOFF,
-    )
-}
-
-fn is_source_worker_not_initialized(err: &CnxError) -> bool {
-    matches!(err, CnxError::PeerError(message) if message == "source worker not initialized")
-}
-
-fn source_worker_bootstrap_frame(request: &SourceWorkerRequest) -> Result<ControlEnvelope> {
-    Ok(encode_control_frame(
-        SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
-        encode_request(request)?,
-    ))
-}
 
 #[derive(Debug, Clone, Default)]
 struct SourceWorkerSnapshotCache {
@@ -76,7 +47,7 @@ struct SourceWorkerSnapshotCache {
 pub struct SourceWorkerClientHandle {
     node_id: NodeId,
     config: SourceConfig,
-    worker_binding: WorkerArtifactBinding,
+    worker_binding: RuntimeWorkerBinding,
     boundary: Arc<CompositeRuntimeBoundary>,
     worker: TypedWorkerHandle<SourceWorkerRpc, SourceConfig, CompositeRuntimeBoundary>,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
@@ -86,43 +57,16 @@ impl SourceWorkerClientHandle {
     pub(crate) fn new(
         node_id: NodeId,
         config: SourceConfig,
-        worker_binding: WorkerArtifactBinding,
+        worker_binding: RuntimeWorkerBinding,
         boundary: Arc<CompositeRuntimeBoundary>,
-    ) -> Self {
-        let worker_binding_for_bin = worker_binding.clone();
-        let worker_binding_for_socket = worker_binding.clone();
-        Self {
-            worker: TypedWorkerHandle::new(
+    ) -> Result<Self> {
+        Ok(Self {
+            worker: TypedWorkerHandle::for_runtime_binding(
                 node_id.clone(),
                 config.clone(),
                 boundary.clone(),
-                WorkerBootstrapSpec::new(
-                    "fs-meta-source-worker",
-                    |node_id| RouteKey(source_worker_control_route_key_for(&node_id.0)),
-                    move |_config: &SourceConfig| {
-                        worker_binding_for_bin
-                            .external_startup_path()
-                            .map(|path| path.to_path_buf())
-                    },
-                    move |_config: &SourceConfig| worker_binding_for_socket.socket_dir.clone(),
-                    source_worker_timeouts(),
-                    is_source_worker_not_initialized,
-                    |node_id, config| {
-                        Ok(vec![source_worker_bootstrap_frame(
-                            &SourceWorkerRequest::Init {
-                                node_id: node_id.0.clone(),
-                                config: config.clone(),
-                            },
-                        )?])
-                    },
-                    |_node_id, _config| {
-                        Ok(vec![
-                            source_worker_bootstrap_frame(&SourceWorkerRequest::Start)?,
-                            source_worker_bootstrap_frame(&SourceWorkerRequest::Ping)?,
-                        ])
-                    },
-                ),
-            ),
+                worker_binding.clone(),
+            )?,
             node_id,
             worker_binding,
             cache: Arc::new(Mutex::new(SourceWorkerSnapshotCache {
@@ -132,7 +76,7 @@ impl SourceWorkerClientHandle {
             })),
             config,
             boundary,
-        }
+        })
     }
 
     fn with_cache_mut<T>(&self, f: impl FnOnce(&mut SourceWorkerSnapshotCache) -> T) -> T {
@@ -179,14 +123,6 @@ impl SourceWorkerClientHandle {
         client.call_with_timeout(request, timeout)
     }
 
-    fn control_worker(
-        client: &TypedWorkerClient<SourceWorkerRpc>,
-        request: SourceWorkerRequest,
-        timeout: Duration,
-    ) -> Result<()> {
-        client.control_frames(&[source_worker_bootstrap_frame(&request)?], timeout)
-    }
-
     pub fn start(&self) -> Result<()> {
         self.worker.ensure_started()
     }
@@ -216,7 +152,7 @@ impl SourceWorkerClientHandle {
                         return Ok(());
                     }
                     Err(CnxError::PeerError(message))
-                        if message == "source worker not initialized"
+                        if message == "worker not initialized"
                             && std::time::Instant::now() < deadline =>
                     {
                         std::thread::sleep(SOURCE_WORKER_RETRY_BACKOFF);
@@ -242,10 +178,12 @@ impl SourceWorkerClientHandle {
     }
 
     pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
-        self.with_cache_mut(|cache| Ok(cache
-            .logical_roots
-            .clone()
-            .unwrap_or_else(|| self.config.roots.clone())))
+        self.with_cache_mut(|cache| {
+            Ok(cache
+                .logical_roots
+                .clone()
+                .unwrap_or_else(|| self.config.roots.clone()))
+        })
     }
 
     pub fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
@@ -269,10 +207,12 @@ impl SourceWorkerClientHandle {
     }
 
     pub fn cached_host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
-        self.with_cache_mut(|cache| Ok(cache
-            .grants
-            .clone()
-            .unwrap_or_else(|| self.config.host_object_grants.clone())))
+        self.with_cache_mut(|cache| {
+            Ok(cache
+                .grants
+                .clone()
+                .unwrap_or_else(|| self.config.host_object_grants.clone()))
+        })
     }
 
     pub fn host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
@@ -484,36 +424,53 @@ impl SourceWorkerClientHandle {
 
     pub fn publish_manual_rescan_signal(&self) -> Result<()> {
         self.with_started_retry(|client| {
-            Self::control_worker(
+            match Self::call_worker(
                 client,
                 SourceWorkerRequest::PublishManualRescanSignal,
                 SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-            )
+            )? {
+                SourceWorkerResponse::Ack => Ok(()),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for publish_manual_rescan_signal: {:?}",
+                    other
+                ))),
+            }
         })
     }
 
     pub fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
         self.start()?;
-        Self::control_worker(
+        match Self::call_worker(
             &self.client()?,
             SourceWorkerRequest::OnControlFrame { envelopes },
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )
+        )? {
+            SourceWorkerResponse::Ack => Ok(()),
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for on_control_frame: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn trigger_rescan_when_ready(&self) -> Result<()> {
         self.with_started_retry(|client| {
-            Self::control_worker(
+            match Self::call_worker(
                 client,
                 SourceWorkerRequest::TriggerRescanWhenReady,
                 SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
-            )
+            )? {
+                SourceWorkerResponse::Ack => Ok(()),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for trigger_rescan_when_ready: {:?}",
+                    other
+                ))),
+            }
         })
     }
 
     pub fn close(&self) -> Result<()> {
-        self.worker
-            .close(SourceWorkerRequest::Close, Duration::from_secs(2))?;
+        self.worker.shutdown(Duration::from_secs(2))?;
         self.with_cache_mut(|cache| {
             cache.lifecycle_state = Some("closed".to_string());
         });
@@ -772,7 +729,7 @@ impl SourceFacade {
                         client.config.clone(),
                         client.worker_binding.clone(),
                         client.boundary.clone(),
-                    );
+                    )?;
                     remote.force_find(params.clone())
                 }
             }
@@ -874,8 +831,13 @@ fn spawn_local_source_pump(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Some(boundary) = boundary {
-            let mut lanes =
-                HashMap::<String, (tokio::sync::mpsc::UnboundedSender<Vec<Event>>, JoinHandle<()>)>::new();
+            let mut lanes = HashMap::<
+                String,
+                (
+                    tokio::sync::mpsc::UnboundedSender<Vec<Event>>,
+                    JoinHandle<()>,
+                ),
+            >::new();
             tokio::pin!(stream);
             while let Some(batch) = stream.next().await {
                 let lane = batch
@@ -942,6 +904,14 @@ capanix_worker_runtime_support::define_typed_worker_rpc! {
         invalid_input: SourceWorkerResponse::InvalidInput,
         error: SourceWorkerResponse::Error,
         unavailable: "source worker unavailable",
+    }
+}
+
+impl TypedWorkerInit<SourceConfig> for SourceWorkerRpc {
+    type InitPayload = SourceConfig;
+
+    fn init_payload(_node_id: &NodeId, config: &SourceConfig) -> Result<Self::InitPayload> {
+        Ok(config.clone())
     }
 }
 

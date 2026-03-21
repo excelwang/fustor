@@ -87,7 +87,10 @@ fn run_mode(mode: OperationalMode) -> Result<(), String> {
 
     let mut harness = build_operational_harness(
         mode.app_prefix(),
-        matches!(mode, OperationalMode::NewNfsJoin | OperationalMode::NfsRetire),
+        matches!(
+            mode,
+            OperationalMode::NewNfsJoin | OperationalMode::NfsRetire
+        ),
         if matches!(mode, OperationalMode::FacadeFailoverAndResourceSwitch) {
             2
         } else {
@@ -491,12 +494,20 @@ fn scenario_facade_failover_and_resource_switch(
     app_id: &str,
 ) -> Result<(), String> {
     let _ = app_id;
-    let current_url = session.client().base_url().trim_end_matches('/').to_string();
+    let current_url = session
+        .client()
+        .base_url()
+        .trim_end_matches('/')
+        .to_string();
     let current_index = facade_addrs
         .iter()
         .position(|addr| format!("http://{addr}") == current_url)
         .unwrap_or(0);
-    let holder_node = if current_index == 0 { "node-d" } else { "node-e" };
+    let holder_node = if current_index == 0 {
+        "node-d"
+    } else {
+        "node-e"
+    };
 
     let replacement_node = if holder_node == "node-d" {
         "node-e"
@@ -611,10 +622,7 @@ fn install_baseline_resources(
         let mount_path = lab.mount_export(node_name, export_name)?;
         announce_nfs(cluster, lab, node_name, export_name, &mount_path)?;
     }
-    for (node_name, bind_addr) in ["node-d", "node-e"]
-        .into_iter()
-        .zip(facade_addrs.iter())
-    {
+    for (node_name, bind_addr) in ["node-d", "node-e"].into_iter().zip(facade_addrs.iter()) {
         announce_listener(cluster, node_name, facade_resource_id, bind_addr)?;
     }
     Ok(())

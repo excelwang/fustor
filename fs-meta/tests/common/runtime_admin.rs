@@ -59,15 +59,15 @@ mod tests {
                         "workers": {
                             "source": {
                                 "mode": "external",
-                                "binary_path": "/tmp/fs_meta_source_worker"
+                                "startup": { "path": "/tmp/libcapanix_app_fs_meta_worker_facade.so" }
                             },
                             "scan": {
                                 "mode": "external",
-                                "binary_path": "/tmp/fs_meta_source_worker"
+                                "startup": { "path": "/tmp/libcapanix_app_fs_meta_worker_facade.so" }
                             },
                             "sink": {
                                 "mode": "external",
-                                "binary_path": "/tmp/fs_meta_sink_worker"
+                                "startup": { "path": "/tmp/libcapanix_app_fs_meta_worker_facade.so" }
                             }
                         }
                     },

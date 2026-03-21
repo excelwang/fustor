@@ -266,8 +266,7 @@ fn run_stream_loop<F, G>(
         }
         eprintln!(
             "fs_meta_runtime_endpoint: stream loop recv route={} task={}",
-            stream_channel.0,
-            join_name
+            stream_channel.0, join_name
         );
         let events = match boundary.channel_recv(
             ctx.clone(),
@@ -285,9 +284,7 @@ fn run_stream_loop<F, G>(
             | Err(err @ CnxError::LinkError(_)) => {
                 eprintln!(
                     "fs_meta_runtime_endpoint: transient stream recv gap task={} route={} err={:?}",
-                    join_name,
-                    stream_channel.0,
-                    err
+                    join_name, stream_channel.0, err
                 );
                 std::thread::sleep(Duration::from_millis(50));
                 continue;
@@ -295,9 +292,7 @@ fn run_stream_loop<F, G>(
             Err(err) => {
                 eprintln!(
                     "fs_meta_runtime_endpoint: terminal stream recv failure task={} route={} err={:?}",
-                    join_name,
-                    stream_channel.0,
-                    err
+                    join_name, stream_channel.0, err
                 );
                 log::warn!(
                     "stream task {} recv failed for {}: {:?}",
@@ -316,8 +311,7 @@ fn run_stream_loop<F, G>(
         handler(events);
         eprintln!(
             "fs_meta_runtime_endpoint: stream loop handler returned route={} task={}",
-            stream_channel.0,
-            join_name
+            stream_channel.0, join_name
         );
     }
 }

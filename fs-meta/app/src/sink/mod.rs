@@ -24,6 +24,8 @@ use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::HostAdapter;
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use crate::EventKind;
 use crate::query::models::{HealthStats, QueryNode};
 use crate::query::request::{InternalQueryRequest, MaterializedQueryPayload, QueryOp};
 #[cfg(test)]
@@ -40,10 +42,9 @@ use crate::runtime::orchestration::{
     sink_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
-    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
-    METHOD_SINK_ROOTS_CONTROL, METHOD_STREAM,
-    ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL,
-    default_route_bindings,
+    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SINK_STATUS,
+    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -55,8 +56,6 @@ use crate::sink::tree::MaterializedTree;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::state::cell::AuthorityJournal;
 use crate::state::commit_boundary::CommitBoundary;
-#[cfg(test)]
-use crate::EventKind;
 use crate::{ControlEvent, FileMetaRecord};
 
 #[cfg(test)]
@@ -268,8 +267,7 @@ impl GroupSinkState {
     }
 
     fn refresh_initial_audit_completed(&mut self) {
-        self.initial_audit_completed =
-            self.audit_epoch_completed && self.tree.node_count() > 0;
+        self.initial_audit_completed = self.audit_epoch_completed && self.tree.node_count() > 0;
     }
 }
 
@@ -1175,18 +1173,24 @@ impl SinkFileMeta {
                 move || true,
                 move |events| {
                     for event in events {
-                        let payload = match decode_logical_roots_control_payload(event.payload_bytes())
-                        {
-                            Ok(payload) => payload,
-                            Err(err) => {
-                                log::warn!("sink logical-roots control decode failed: {:?}", err);
-                                continue;
-                            }
-                        };
+                        let payload =
+                            match decode_logical_roots_control_payload(event.payload_bytes()) {
+                                Ok(payload) => payload,
+                                Err(err) => {
+                                    log::warn!(
+                                        "sink logical-roots control decode failed: {:?}",
+                                        err
+                                    );
+                                    continue;
+                                }
+                            };
                         let grants = match sink.logical_grants_snapshot() {
                             Ok(grants) => grants,
                             Err(err) => {
-                                log::warn!("sink logical-roots control grants read failed: {:?}", err);
+                                log::warn!(
+                                    "sink logical-roots control grants read failed: {:?}",
+                                    err
+                                );
                                 continue;
                             }
                         };
@@ -2091,16 +2095,16 @@ impl SinkFileMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EpochType;
+    use crate::shared_types::query::UnreliableReason;
     use bytes::Bytes;
     use capanix_app_sdk::runtime::EventMetadata;
-    use crate::shared_types::query::UnreliableReason;
-    use crate::EpochType;
     use capanix_host_fs_types::UnixStat;
     use capanix_route_proto::{
         BoundScope, ExecActivate, ExecControl, ExecDeactivate, HostDescriptor, HostObjectGrant,
         HostObjectGrantState, HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged,
-        UnitTick, encode_exec_control_envelope,
-        encode_runtime_host_object_grants_changed_envelope, encode_unit_tick_envelope,
+        UnitTick, encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
+        encode_unit_tick_envelope,
     };
     fn default_materialized_request() -> InternalQueryRequest {
         InternalQueryRequest::default()
@@ -2962,7 +2966,9 @@ mod tests {
         .await
         .expect("materialize root path");
 
-        let snapshot = sink.status_snapshot().expect("sink status after root materializes");
+        let snapshot = sink
+            .status_snapshot()
+            .expect("sink status after root materializes");
         assert!(
             snapshot.groups[0].initial_audit_completed,
             "materialized root should unlock initial audit readiness after audit completion"

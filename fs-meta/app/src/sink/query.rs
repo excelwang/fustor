@@ -462,9 +462,10 @@ pub fn get_materialized_tree_payload(
 ) -> TreeGroupPayload {
     let (stability_mode, quiet_window_ms) = match read_class {
         ReadClass::Fresh => (StabilityMode::None, None),
-        ReadClass::Materialized | ReadClass::TrustedMaterialized => {
-            (StabilityMode::QuietWindow, Some(TRUSTED_READ_QUIET_WINDOW_MS))
-        }
+        ReadClass::Materialized | ReadClass::TrustedMaterialized => (
+            StabilityMode::QuietWindow,
+            Some(TRUSTED_READ_QUIET_WINDOW_MS),
+        ),
     };
     let direct_query = tree.has_path(dir_path);
     if direct_query {

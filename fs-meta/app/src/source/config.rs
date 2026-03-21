@@ -164,18 +164,6 @@ pub struct SourceConfig {
     pub max_scan_events: usize,
     pub sink_tombstone_ttl: Duration,
     pub sink_tombstone_tolerance_us: u64,
-    #[cfg(test)]
-    pub source_execution_mode: SourceExecutionMode,
-    #[cfg(test)]
-    pub source_worker_bin_path: Option<PathBuf>,
-    #[cfg(test)]
-    pub source_worker_socket_dir: Option<PathBuf>,
-    #[cfg(test)]
-    pub sink_execution_mode: SinkExecutionMode,
-    #[cfg(test)]
-    pub sink_worker_bin_path: Option<PathBuf>,
-    #[cfg(test)]
-    pub sink_worker_socket_dir: Option<PathBuf>,
     pub drift_window_size: usize,
     pub drift_graduation_threshold: u64,
     pub drift_max_jump_us: i64,
@@ -195,18 +183,6 @@ impl Default for SourceConfig {
             max_scan_events: 100_000,
             sink_tombstone_ttl: Self::sink_tombstone_ttl_from_env(),
             sink_tombstone_tolerance_us: Self::sink_tombstone_tolerance_us_from_env(),
-            #[cfg(test)]
-            source_execution_mode: SourceExecutionMode::WorkerProcess,
-            #[cfg(test)]
-            source_worker_bin_path: Self::default_source_worker_bin_path(),
-            #[cfg(test)]
-            source_worker_socket_dir: None,
-            #[cfg(test)]
-            sink_execution_mode: SinkExecutionMode::WorkerProcess,
-            #[cfg(test)]
-            sink_worker_bin_path: Self::default_sink_worker_bin_path(),
-            #[cfg(test)]
-            sink_worker_socket_dir: None,
             drift_window_size: 10_000,
             drift_graduation_threshold: 10_000,
             drift_max_jump_us: 10_000_000,
@@ -215,31 +191,6 @@ impl Default for SourceConfig {
 }
 
 impl SourceConfig {
-    #[cfg(test)]
-    fn default_worker_bin_path(bin_name: &str) -> Option<PathBuf> {
-        let mut path = std::env::current_exe().ok()?;
-        path.pop();
-        #[cfg(windows)]
-        {
-            path.push(format!("{bin_name}.exe"));
-        }
-        #[cfg(not(windows))]
-        {
-            path.push(bin_name);
-        }
-        Some(path)
-    }
-
-    #[cfg(test)]
-    fn default_source_worker_bin_path() -> Option<PathBuf> {
-        Self::default_worker_bin_path("fs_meta_source_worker")
-    }
-
-    #[cfg(test)]
-    fn default_sink_worker_bin_path() -> Option<PathBuf> {
-        Self::default_worker_bin_path("fs_meta_sink_worker")
-    }
-
     pub(crate) fn normalize_scan_workers(raw: usize) -> usize {
         raw.clamp(SOURCE_SCAN_WORKERS_MIN, SOURCE_SCAN_WORKERS_MAX)
     }
@@ -370,34 +321,6 @@ impl SourceConfig {
             grouped.insert(root.id.clone(), matches);
         }
         grouped
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum SourceExecutionMode {
-    InProcess,
-    WorkerProcess,
-}
-
-#[cfg(test)]
-impl Default for SourceExecutionMode {
-    fn default() -> Self {
-        Self::WorkerProcess
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum SinkExecutionMode {
-    InProcess,
-    WorkerProcess,
-}
-
-#[cfg(test)]
-impl Default for SinkExecutionMode {
-    fn default() -> Self {
-        Self::WorkerProcess
     }
 }
 

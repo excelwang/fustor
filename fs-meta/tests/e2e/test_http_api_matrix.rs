@@ -212,7 +212,7 @@ fn run_query_baseline_phase(
                 let _ = session.rescan();
                 last_rescan_at = std::time::Instant::now();
             }
-                let tree = match session
+            let tree = match session
                 .tree(&[("path", "/".to_string()), ("recursive", "true".to_string())])
             {
                 Ok(tree) => tree,
@@ -223,7 +223,9 @@ fn run_query_baseline_phase(
                     let roots = session
                         .monitoring_roots()
                         .unwrap_or_else(|roots_err| json!({ "roots_error": roots_err }));
-                    return Err(format!("tree request failed: {err}; status={status}; roots={roots}"));
+                    return Err(format!(
+                        "tree request failed: {err}; status={status}; roots={roots}"
+                    ));
                 }
             };
             let ready = tree
@@ -242,9 +244,13 @@ fn run_query_baseline_phase(
                 let status = session
                     .status()
                     .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
-                let diagnostics = baseline_cluster_diagnostics(cluster, session)
-                    .unwrap_or_else(|diag_err| json!({ "diagnostics_error": diag_err }).to_string());
-                Err(format!("tree={tree}; status={status}; diagnostics={diagnostics}"))
+                let diagnostics =
+                    baseline_cluster_diagnostics(cluster, session).unwrap_or_else(|diag_err| {
+                        json!({ "diagnostics_error": diag_err }).to_string()
+                    });
+                Err(format!(
+                    "tree={tree}; status={status}; diagnostics={diagnostics}"
+                ))
             }
         },
     )?;
@@ -616,10 +622,7 @@ fn run_query_baseline_phase(
             &[
                 ("path", "/".to_string()),
                 ("recursive", "true".to_string()),
-                (
-                    "read_class",
-                    "trusted-materialized".to_string(),
-                ),
+                ("read_class", "trusted-materialized".to_string()),
             ],
         )?,
         400,
@@ -819,11 +822,9 @@ fn run_status_and_grants_checks(
             if groups.is_empty() && require_sink_groups {
                 return Ok(false);
             }
-            Ok(groups.iter().all(|group| {
-                group
-                    .get("shadow_lag_us")
-                    .is_some_and(Value::is_number)
-            }))
+            Ok(groups
+                .iter()
+                .all(|group| group.get("shadow_lag_us").is_some_and(Value::is_number)))
         },
     )?;
     let metrics_before = session.bound_route_metrics()?;
@@ -848,7 +849,9 @@ fn run_status_and_grants_checks(
     }
     if let Some(sink_groups) = sink.get("groups").and_then(Value::as_array) {
         if require_sink_groups && sink_groups.is_empty() {
-            return Err(format!("expected non-empty sink.groups in status: {status}"));
+            return Err(format!(
+                "expected non-empty sink.groups in status: {status}"
+            ));
         }
         for group in sink_groups {
             if !group.get("shadow_lag_us").is_some_and(Value::is_number) {
@@ -863,11 +866,15 @@ fn run_status_and_grants_checks(
     let timeouts_before = metrics_before
         .get("call_timeout_total")
         .and_then(Value::as_u64)
-        .ok_or_else(|| format!("bound-route-metrics missing call_timeout_total: {metrics_before}"))?;
+        .ok_or_else(|| {
+            format!("bound-route-metrics missing call_timeout_total: {metrics_before}")
+        })?;
     let timeouts_after = metrics_after
         .get("call_timeout_total")
         .and_then(Value::as_u64)
-        .ok_or_else(|| format!("bound-route-metrics missing call_timeout_total: {metrics_after}"))?;
+        .ok_or_else(|| {
+            format!("bound-route-metrics missing call_timeout_total: {metrics_after}")
+        })?;
     if timeouts_after != timeouts_before {
         return Err(format!(
             "status should not increase bound-route call_timeout_total: before={timeouts_before} after={timeouts_after} status={status} metrics_before={metrics_before} metrics_after={metrics_after}"
@@ -1203,10 +1210,7 @@ fn install_baseline_resources(
             "mount_hint": mount_path.display().to_string(),
         })])?;
     }
-    for (node_name, bind_addr) in ["node-d", "node-e"]
-        .into_iter()
-        .zip(facade_addrs.iter())
-    {
+    for (node_name, bind_addr) in ["node-d", "node-e"].into_iter().zip(facade_addrs.iter()) {
         let node_id = cluster.node_id(node_name)?;
         cluster.announce_resources_clusterwide(vec![json!({
             "resource_id": facade_resource_id,
@@ -1310,11 +1314,15 @@ fn assert_stats_latest_file_mtime_present(stats: &Value) -> Result<(), String> {
         .and_then(Value::as_object)
         .ok_or_else(|| format!("stats response missing groups object: {stats}"))?;
     if groups.is_empty() {
-        return Err(format!("stats response should expose at least one group: {stats}"));
+        return Err(format!(
+            "stats response should expose at least one group: {stats}"
+        ));
     }
     for (group, envelope) in groups {
         let Some(status) = envelope.get("status").and_then(Value::as_str) else {
-            return Err(format!("stats group missing status for {group}: {envelope}"));
+            return Err(format!(
+                "stats group missing status for {group}: {envelope}"
+            ));
         };
         if status != "ok" {
             continue;
@@ -1323,9 +1331,7 @@ fn assert_stats_latest_file_mtime_present(stats: &Value) -> Result<(), String> {
             .get("data")
             .and_then(|data| data.get("latest_file_mtime_us"))
             .ok_or_else(|| {
-                format!(
-                    "stats group missing data.latest_file_mtime_us for {group}: {envelope}"
-                )
+                format!("stats group missing data.latest_file_mtime_us for {group}: {envelope}")
             })?;
         if !(latest.is_null() || latest.is_u64()) {
             return Err(format!(

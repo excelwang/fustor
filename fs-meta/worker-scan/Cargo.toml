@@ -4,15 +4,11 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 autobins = false
-description = "Internal fs-meta scan-worker artifact package"
+description = "Internal fs-meta scan-worker runtime helper package"
 
 [lib]
 path = "src/lib.rs"
 doctest = false
-
-[[bin]]
-name = "fs_meta_scan_worker"
-path = "src/main.rs"
 
 [dependencies]
 capanix-app-fs-meta-worker-source = { workspace = true }

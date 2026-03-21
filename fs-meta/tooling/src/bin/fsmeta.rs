@@ -18,9 +18,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, bail};
 use capanix_app_fs_meta::RootSpec as RootEntry;
 use capanix_app_fs_meta::api::{ApiAuthConfig, BootstrapManagementConfig};
-use capanix_app_fs_meta::product::{FsMetaReleaseSpec, build_release_doc_value};
+use capanix_app_fs_meta::product::{
+    FsMetaReleaseSpec, FsMetaReleaseWorkerModes, build_release_doc_value,
+};
 use capanix_config::compile_scope_worker_intent_doc;
-use capanix_runtime_api::ScopeWorkerIntentDoc;
+use capanix_runtime_api::{ScopeWorkerIntentDoc, WorkerMode};
 use clap::{Args, Parser, Subcommand};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -148,6 +150,8 @@ struct ProductConfig {
     api: ProductApiConfig,
     #[serde(default)]
     auth: ProductAuthConfig,
+    #[serde(default)]
+    workers: ProductWorkersConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -159,6 +163,24 @@ struct ProductApiConfig {
 struct ProductAuthConfig {
     #[serde(default)]
     bootstrap_management: Option<ProductBootstrapAdmin>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ProductWorkersConfig {
+    #[serde(default)]
+    facade: Option<ProductWorkerConfig>,
+    #[serde(default)]
+    source: Option<ProductWorkerConfig>,
+    #[serde(default)]
+    scan: Option<ProductWorkerConfig>,
+    #[serde(default)]
+    sink: Option<ProductWorkerConfig>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ProductWorkerConfig {
+    #[serde(default)]
+    mode: Option<WorkerMode>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -193,6 +215,36 @@ fn default_local_ingress_bind_addr() -> String {
 
 fn default_bootstrap_username() -> String {
     "fsmeta-admin".to_string()
+}
+
+fn configured_worker_mode(config: &Option<ProductWorkerConfig>) -> Option<WorkerMode> {
+    config.as_ref().and_then(|config| config.mode)
+}
+
+fn resolve_release_worker_modes(product: &ProductConfig) -> anyhow::Result<FsMetaReleaseWorkerModes> {
+    let facade = configured_worker_mode(&product.workers.facade).unwrap_or(WorkerMode::Embedded);
+    if facade != WorkerMode::Embedded {
+        bail!("fs-meta product config requires workers.facade.mode=embedded");
+    }
+
+    let source = configured_worker_mode(&product.workers.source);
+    let scan = configured_worker_mode(&product.workers.scan);
+    let source_and_scan = match (source, scan) {
+        (Some(source), Some(scan)) if source != scan => {
+            bail!(
+                "fs-meta product config requires workers.scan.mode to match workers.source.mode while source and scan still share one realization"
+            );
+        }
+        (Some(mode), _) | (_, Some(mode)) => mode,
+        (None, None) => WorkerMode::External,
+    };
+
+    Ok(FsMetaReleaseWorkerModes {
+        facade,
+        source: source_and_scan,
+        scan: source_and_scan,
+        sink: configured_worker_mode(&product.workers.sink).unwrap_or(WorkerMode::External),
+    })
 }
 
 #[tokio::main]
@@ -685,11 +737,14 @@ fn build_deploy_intent(
     app_target: &Path,
     manifest_path: &Path,
 ) -> anyhow::Result<ScopeWorkerIntentDoc> {
+    let worker_modes = resolve_release_worker_modes(product)?;
     let mut release_doc = build_release_doc_value(&FsMetaReleaseSpec {
         app_id: DEFAULT_APP_ID.to_string(),
         api_facade_resource_id: product.api.facade_resource_id.clone(),
         auth,
         roots: Vec::new(),
+        worker_module_path: Some(app_target.to_path_buf()),
+        worker_modes,
     });
     let target_generation = release_doc
         .get("target_generation")
@@ -761,7 +816,10 @@ fn scope_unit_intent_to_scope_worker_intent_value(
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("app");
             let mut startup = serde_json::Map::new();
-            startup.insert("path".into(), serde_json::Value::String(startup_path.to_string()));
+            startup.insert(
+                "path".into(),
+                serde_json::Value::String(startup_path.to_string()),
+            );
             if let Some(manifest) = entry
                 .get("startup")
                 .and_then(|startup| startup.get("manifest"))
@@ -884,8 +942,8 @@ impl ControlClient {
         &self,
         intent: &ScopeWorkerIntentDoc,
     ) -> anyhow::Result<serde_json::Value> {
-        let value =
-            serde_json::to_value(intent).context("serialize scope-worker intent for submit failed")?;
+        let value = serde_json::to_value(intent)
+            .context("serialize scope-worker intent for submit failed")?;
         let path = write_runtime_admin_temp_file("fsmeta-intent", &value)?;
         let output = self
             .run_cnxctl(&[
@@ -991,6 +1049,7 @@ mod tests {
         ProductAuthConfig, build_auth_config, build_deploy_intent, load_product_config,
         workspace_root,
     };
+    use capanix_runtime_api::ConfigValue;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1094,11 +1153,120 @@ mod tests {
         assert_eq!(intent.target_id, "fs-meta");
         assert_eq!(intent.workers.len(), 1);
         assert_eq!(intent.workers[0].worker_role, "main");
-        assert_eq!(intent.workers[0].startup.path, "/tmp/capanix-app-fs-meta.so");
+        assert_eq!(
+            intent.workers[0].startup.path,
+            "/tmp/capanix-app-fs-meta.so"
+        );
         assert_eq!(
             intent.workers[0].startup.manifest.as_deref(),
             Some(manifest.to_string_lossy().as_ref())
         );
+        let workers = intent.workers[0]
+            .config
+            .get("workers")
+            .expect("compiled fs-meta release config should declare workers");
+        let ConfigValue::Map(workers) = workers else {
+            panic!("workers config should be a map");
+        };
+        assert_eq!(
+            workers
+                .get("facade")
+                .and_then(|value| match value {
+                    ConfigValue::Map(row) => row.get("mode"),
+                    _ => None,
+                })
+                .and_then(|value| match value {
+                    ConfigValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+            Some("embedded")
+        );
+        for role in ["source", "scan", "sink"] {
+            let ConfigValue::Map(row) = workers
+                .get(role)
+                .expect("external worker config should exist")
+            else {
+                panic!("worker role '{role}' must encode as a map");
+            };
+            assert_eq!(
+                row.get("mode").and_then(|value| match value {
+                    ConfigValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+                Some("external")
+            );
+            let module_path = row.get("startup").and_then(|value| match value {
+                ConfigValue::Map(startup) => startup.get("path"),
+                _ => None,
+            });
+            assert_eq!(
+                module_path.and_then(|value| match value {
+                    ConfigValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+                Some("/tmp/capanix-app-fs-meta.so")
+            );
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deploy_intent_allows_generation_based_source_mode_reconfiguration() {
+        let path = unique_temp_path("deploy-intent-source-embedded");
+        fs::write(
+            &path,
+            "api:\n  facade_resource_id: fs-meta-tcp-listener\nauth:\n  bootstrap_management:\n    username: admin\nworkers:\n  source:\n    mode: embedded\n",
+        )
+        .expect("write product config");
+        let product = load_product_config(&path).expect("product config should parse");
+        let _ = fs::remove_file(&path);
+
+        let dir = std::env::temp_dir().join(format!(
+            "fsmeta-intent-source-embedded-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let (auth_cfg, ..) = build_auth_config(&ProductAuthConfig::default(), &dir);
+
+        let manifest = workspace_root()
+            .expect("workspace root")
+            .join("fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml")
+            .canonicalize()
+            .expect("fixture manifest path");
+        let app_target = PathBuf::from("/tmp/capanix-app-fs-meta.so");
+        let intent = build_deploy_intent(&product, auth_cfg, &app_target, &manifest)
+            .expect("deploy intent should compile through shared config boundary");
+
+        let workers = intent.workers[0]
+            .config
+            .get("workers")
+            .expect("compiled fs-meta release config should declare workers");
+        let ConfigValue::Map(workers) = workers else {
+            panic!("workers config should be a map");
+        };
+        for role in ["source", "scan"] {
+            let ConfigValue::Map(row) = workers
+                .get(role)
+                .expect("source/scan worker config should exist")
+            else {
+                panic!("worker role '{role}' must encode as a map");
+            };
+            assert_eq!(
+                row.get("mode").and_then(|value| match value {
+                    ConfigValue::String(value) => Some(value.as_str()),
+                    _ => None,
+                }),
+                Some("embedded")
+            );
+            assert!(
+                row.get("startup").is_none(),
+                "embedded source/scan mode must not emit startup.path"
+            );
+        }
 
         let _ = fs::remove_dir_all(&dir);
     }

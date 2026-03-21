@@ -329,7 +329,10 @@ mod tests {
     fn test_mid_removes_nested_stale_paths_without_panicking() {
         let mut tree = MaterializedTree::new();
         tree.insert(b"/stale".to_vec(), make_node(b"/stale", true, 0));
-        tree.insert(b"/stale/nested".to_vec(), make_node(b"/stale/nested", true, 0));
+        tree.insert(
+            b"/stale/nested".to_vec(),
+            make_node(b"/stale/nested", true, 0),
+        );
         tree.insert(
             b"/stale/nested/file.txt".to_vec(),
             make_node(b"/stale/nested/file.txt", false, 0),

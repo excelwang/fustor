@@ -4,18 +4,18 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use capanix_app_fs_meta::source::FSMetaSource;
+use capanix_app_fs_meta::source::config::SourceConfig;
 use capanix_app_fs_meta::workers::source::SourceWorkerRpc;
-use capanix_app_fs_meta::workers::source_ipc::{
-    SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, SourceWorkerRequest, SourceWorkerResponse,
-    source_worker_control_route_key_from_env,
-};
+use capanix_app_fs_meta::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 use capanix_app_sdk::raw::{
     BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest, StateBoundary,
 };
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
-use capanix_app_sdk::{CnxError, Event, RuntimeBoundary};
+use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary};
 use capanix_worker_runtime_support::{
-    TypedWorkerServer, TypedWorkerSession, WorkerLoopControl, WorkerSessionContext,
+    TypedWorkerBootstrapSession, TypedWorkerServer, TypedWorkerSession,
+    WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, WorkerLoopControl, WorkerSessionContext,
+    worker_control_route_key_from_env,
 };
 use futures_util::StreamExt;
 use tokio::task::JoinHandle;
@@ -37,7 +37,7 @@ where
 
 struct SourceWorkerState {
     source: Option<Arc<FSMetaSource>>,
-    pending_init: Option<(NodeId, capanix_app_fs_meta::source::config::SourceConfig)>,
+    pending_init: Option<(NodeId, SourceConfig)>,
     pump_task: Option<JoinHandle<()>>,
 }
 
@@ -136,6 +136,60 @@ where
     })
 }
 
+fn bootstrap_not_ready() -> CnxError {
+    CnxError::NotReady("worker not initialized".into())
+}
+
+fn bootstrap_init_source_runtime(
+    node_id: NodeId,
+    config: SourceConfig,
+    state: &mut SourceWorkerState,
+    runtime: &tokio::runtime::Handle,
+) {
+    let _ = block_on_runtime(runtime, stop_source_runtime(state));
+    state.pending_init = Some((node_id, config));
+}
+
+fn bootstrap_start_source_runtime(
+    state: &mut SourceWorkerState,
+    boundary: Arc<dyn ChannelIoSubset>,
+    runtime: &tokio::runtime::Handle,
+    state_boundary: Arc<dyn StateBoundary>,
+) -> Result<()> {
+    let should_restart = state
+        .pump_task
+        .as_ref()
+        .is_some_and(tokio::task::JoinHandle::is_finished);
+    if should_restart {
+        let _ = block_on_runtime(runtime, stop_source_runtime(state));
+        return Err(CnxError::NotReady("worker not initialized".to_string()));
+    }
+    if state.source.is_none() {
+        let Some((node_id, config)) = state.pending_init.clone() else {
+            return Err(bootstrap_not_ready());
+        };
+        match FSMetaSource::with_boundaries_and_state(config, node_id, None, state_boundary) {
+            Ok(inner) => {
+                state.source = Some(Arc::new(inner));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    if state.pump_task.is_none() {
+        let Some(source) = state.source.as_ref() else {
+            return Err(CnxError::Internal(
+                "source worker runtime missing during start".into(),
+            ));
+        };
+        source.start_runtime_endpoints(boundary.clone())?;
+        block_on_runtime(runtime, source.start_manual_rescan_watch())?;
+        let source = source.clone();
+        let stream = block_on_runtime(runtime, source.pub_())?;
+        state.pump_task = Some(start_source_pump_with_stream(stream, boundary, runtime));
+    }
+    Ok(())
+}
+
 fn process_worker_request(
     request: SourceWorkerRequest,
     state: &mut SourceWorkerState,
@@ -143,98 +197,16 @@ fn process_worker_request(
     runtime: &tokio::runtime::Handle,
     state_boundary: Arc<dyn StateBoundary>,
 ) -> (SourceWorkerResponse, bool) {
+    let _ = boundary;
+    let _ = state_boundary;
     match request {
-        SourceWorkerRequest::Ping => (SourceWorkerResponse::Ack, false),
-        SourceWorkerRequest::Init {
-            node_id,
-            config,
-        } => {
-            eprintln!("fs_meta_source_worker: received Init for node_id={node_id}");
-            let _ = block_on_runtime(runtime, stop_source_runtime(state));
-            state.pending_init = Some((NodeId(node_id), config));
-            eprintln!("fs_meta_source_worker: Init accepted");
-            (SourceWorkerResponse::Ack, false)
-        }
-        SourceWorkerRequest::Start => {
-            eprintln!("fs_meta_source_worker: received Start");
-            let should_restart = state
-                .pump_task
-                .as_ref()
-                .is_some_and(tokio::task::JoinHandle::is_finished);
-            if should_restart {
-                let _ = block_on_runtime(runtime, stop_source_runtime(state));
-                return (
-                    SourceWorkerResponse::Error(
-                        "source worker start requested after source runtime stopped; re-init required"
-                            .into(),
-                    ),
-                    false,
-                );
-            }
-            if state.source.is_none() {
-                let Some((node_id, config)) = state.pending_init.clone() else {
-                    return (
-                        SourceWorkerResponse::Error("source worker not initialized".into()),
-                        false,
-                    );
-                };
-                eprintln!("fs_meta_source_worker: materializing runtime on Start");
-                match FSMetaSource::with_boundaries_and_state(config, node_id, None, state_boundary)
-                {
-                    Ok(inner) => {
-                        let inner = Arc::new(inner);
-                        state.source = Some(inner);
-                        eprintln!("fs_meta_source_worker: Start runtime materialized");
-                    }
-                    Err(err) => {
-                        eprintln!("fs_meta_source_worker: Start materialization failed: {err}");
-                        return (SourceWorkerResponse::Error(err.to_string()), false);
-                    }
-                }
-            }
-            if state.pump_task.is_none() {
-                let Some(source) = state.source.as_ref() else {
-                    return (
-                        SourceWorkerResponse::Error(
-                            "source worker runtime missing during start".into(),
-                        ),
-                        false,
-                    );
-                };
-                if let Err(err) = source.start_runtime_endpoints(boundary.clone()) {
-                    eprintln!("fs_meta_source_worker: Start runtime endpoints failed: {err}");
-                    return (SourceWorkerResponse::Error(err.to_string()), false);
-                }
-                if let Err(err) = block_on_runtime(runtime, source.start_manual_rescan_watch()) {
-                    eprintln!("fs_meta_source_worker: Start manual rescan watch failed: {err}");
-                    return (SourceWorkerResponse::Error(err.to_string()), false);
-                }
-                eprintln!("fs_meta_source_worker: acquiring source stream before Ack");
-                let source = source.clone();
-                let stream = match block_on_runtime(runtime, source.pub_()) {
-                    Ok(stream) => stream,
-                    Err(err) => {
-                        eprintln!("fs_meta_source_worker: Start stream acquisition failed: {err}");
-                        return (SourceWorkerResponse::Error(err.to_string()), false);
-                    }
-                };
-                state.pump_task = Some(start_source_pump_with_stream(
-                    stream,
-                    boundary.clone(),
-                    runtime,
-                ));
-            } else {
-                eprintln!("fs_meta_source_worker: source pump already running");
-            }
-            (SourceWorkerResponse::Ack, false)
-        }
         SourceWorkerRequest::UpdateLogicalRoots { roots } => match state.source.as_ref() {
             Some(source) => match runtime.block_on(source.update_logical_roots(roots)) {
                 Ok(_) => (SourceWorkerResponse::Ack, false),
                 Err(err) => (classify_source_worker_error(err), false),
             },
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -244,7 +216,7 @@ fn process_worker_request(
                 false,
             ),
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -254,7 +226,7 @@ fn process_worker_request(
                 false,
             ),
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -266,7 +238,7 @@ fn process_worker_request(
                 false,
             ),
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -276,7 +248,7 @@ fn process_worker_request(
                 false,
             ),
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -288,7 +260,7 @@ fn process_worker_request(
                 false,
             ),
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -303,7 +275,7 @@ fn process_worker_request(
                 Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
             },
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -318,7 +290,7 @@ fn process_worker_request(
                 Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
             },
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -330,7 +302,7 @@ fn process_worker_request(
                 false,
             ),
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -347,7 +319,7 @@ fn process_worker_request(
                 )
             }
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -359,7 +331,7 @@ fn process_worker_request(
                 false,
             ),
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -383,7 +355,7 @@ fn process_worker_request(
                 }
             }
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -396,7 +368,7 @@ fn process_worker_request(
                     false,
                 ),
                 None => (
-                    SourceWorkerResponse::Error("source worker not initialized".into()),
+                    SourceWorkerResponse::Error("worker not initialized".into()),
                     false,
                 ),
             }
@@ -407,7 +379,7 @@ fn process_worker_request(
                 Err(err) => (classify_source_worker_error(err), false),
             },
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -421,26 +393,20 @@ fn process_worker_request(
                 (SourceWorkerResponse::Ack, false)
             }
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::OnControlFrame { envelopes } => match state.source.as_ref() {
-            Some(source) => {
-                match block_on_runtime(runtime, source.on_control_frame(&envelopes)) {
-                    Ok(_) => (SourceWorkerResponse::Ack, false),
-                    Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
-                }
-            }
+            Some(source) => match block_on_runtime(runtime, source.on_control_frame(&envelopes)) {
+                Ok(_) => (SourceWorkerResponse::Ack, false),
+                Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
+            },
             None => (
-                SourceWorkerResponse::Error("source worker not initialized".into()),
+                SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
-        SourceWorkerRequest::Close => {
-            let _ = block_on_runtime(runtime, stop_source_runtime(state));
-            (SourceWorkerResponse::Ack, true)
-        }
     }
 }
 
@@ -453,9 +419,9 @@ pub fn run_source_worker_server(
         pending_init: None,
         pump_task: None,
     }));
-    TypedWorkerServer::<SourceWorkerRpc, _>::new(
-        source_worker_control_route_key_from_env(),
-        SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
+    TypedWorkerServer::<SourceWorkerRpc, _, SourceConfig>::new(
+        worker_control_route_key_from_env(),
+        WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
         SourceWorkerSession { state },
     )
     .run_with_sidecar(control_socket_path, data_socket_path)
@@ -480,9 +446,9 @@ fn run_source_worker_runtime_loop_with_state(
     runtime: &tokio::runtime::Runtime,
     state: Arc<Mutex<SourceWorkerState>>,
 ) -> std::io::Result<()> {
-    TypedWorkerServer::<SourceWorkerRpc, _>::new(
-        source_worker_control_route_key_from_env(),
-        SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
+    TypedWorkerServer::<SourceWorkerRpc, _, SourceConfig>::new(
+        worker_control_route_key_from_env(),
+        WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
         SourceWorkerSession { state },
     )
     .run_loop(boundary, io_boundary, runtime)
@@ -528,9 +494,60 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
             .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
         let Some(source) = guard.source.as_ref() else {
             return Err(CnxError::NotReady(
-                "source worker runtime not initialized for runtime control frames".into(),
+                "worker runtime not initialized for runtime control frames".into(),
             ));
         };
         block_on_runtime(context.runtime_handle(), source.on_control_frame(envelopes))
+    }
+}
+
+#[async_trait::async_trait]
+impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
+    async fn on_init(
+        &mut self,
+        node_id: NodeId,
+        payload: SourceConfig,
+        context: &WorkerSessionContext,
+    ) -> capanix_app_sdk::Result<()> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
+        bootstrap_init_source_runtime(node_id, payload, &mut guard, context.runtime_handle());
+        Ok(())
+    }
+
+    async fn on_start(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
+        bootstrap_start_source_runtime(
+            &mut guard,
+            context.io_boundary(),
+            context.runtime_handle(),
+            context.state_boundary(),
+        )
+    }
+
+    async fn on_ping(&mut self, _context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
+        if guard.source.is_some() {
+            Ok(())
+        } else {
+            Err(bootstrap_not_ready())
+        }
+    }
+
+    async fn on_close(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
+        block_on_runtime(context.runtime_handle(), stop_source_runtime(&mut guard));
+        Ok(())
     }
 }

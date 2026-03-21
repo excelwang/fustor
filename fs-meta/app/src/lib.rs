@@ -1,9 +1,5 @@
 use capanix_app_sdk::runtime::ConfigValue;
-use capanix_app_sdk::worker::WorkerMode;
 use capanix_app_sdk::{CnxError, Result};
-use capanix_worker_runtime_support::{
-    WorkerArtifactBinding, WorkerArtifactDefaults, resolve_worker_artifact_binding,
-};
 
 pub mod api;
 pub mod product;
@@ -21,22 +17,13 @@ pub use runtime_app::{FSMetaApp, FSMetaRuntimeApp};
 pub use shared_types::{
     ControlCommand, ControlEvent, EpochType, EventKind, FileMetaRecord, LogicalClock, SyncTrack,
 };
-pub use source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use source::config::SourceConfig;
-
-#[derive(Clone, Debug)]
-pub struct FSMetaRuntimeWorkers {
-    pub facade: WorkerArtifactBinding,
-    pub source: WorkerArtifactBinding,
-    pub scan: WorkerArtifactBinding,
-    pub sink: WorkerArtifactBinding,
-}
+pub use source::config::{GrantedMountRoot, RootSelector, RootSpec};
 
 #[derive(Clone, Debug)]
 pub struct FSMetaConfig {
     pub source: SourceConfig,
     pub api: api::ApiConfig,
-    pub runtime_workers: FSMetaRuntimeWorkers,
 }
 
 impl Default for FSMetaConfig {
@@ -44,60 +31,6 @@ impl Default for FSMetaConfig {
         Self {
             source: SourceConfig::default(),
             api: api::ApiConfig::default(),
-            runtime_workers: FSMetaRuntimeWorkers::default(),
-        }
-    }
-}
-
-impl Default for FSMetaRuntimeWorkers {
-    fn default() -> Self {
-        let cfg = std::collections::HashMap::new();
-        Self {
-            facade: resolve_worker_artifact_binding(
-                &cfg,
-                WorkerArtifactDefaults {
-                    app_package: env!("CARGO_PKG_NAME"),
-                    role_id: "facade",
-                    default_mode: WorkerMode::Embedded,
-                    default_binary_name: None,
-                },
-            )
-            .unwrap_or(WorkerArtifactBinding {
-                role_id: "facade".to_string(),
-                mode: WorkerMode::Embedded,
-                startup_path: None,
-                socket_dir: std::env::temp_dir(),
-            }),
-            source: resolve_worker_artifact_binding(
-                &cfg,
-                WorkerArtifactDefaults {
-                    app_package: env!("CARGO_PKG_NAME"),
-                    role_id: "source",
-                    default_mode: WorkerMode::External,
-                    default_binary_name: Some("fs_meta_source_worker"),
-                },
-            )
-            .unwrap(),
-            scan: resolve_worker_artifact_binding(
-                &cfg,
-                WorkerArtifactDefaults {
-                    app_package: env!("CARGO_PKG_NAME"),
-                    role_id: "scan",
-                    default_mode: WorkerMode::External,
-                    default_binary_name: Some("fs_meta_source_worker"),
-                },
-            )
-            .unwrap(),
-            sink: resolve_worker_artifact_binding(
-                &cfg,
-                WorkerArtifactDefaults {
-                    app_package: env!("CARGO_PKG_NAME"),
-                    role_id: "sink",
-                    default_mode: WorkerMode::External,
-                    default_binary_name: Some("fs_meta_sink_worker"),
-                },
-            )
-            .unwrap(),
         }
     }
 }
@@ -402,83 +335,11 @@ impl FSMetaConfig {
                 )));
             }
         }
-
-        let facade = resolve_worker_artifact_binding(
-            cfg,
-            WorkerArtifactDefaults {
-                app_package: env!("CARGO_PKG_NAME"),
-                role_id: "facade",
-                default_mode: WorkerMode::Embedded,
-                default_binary_name: None,
-            },
-        )?;
-        if facade.mode != WorkerMode::Embedded {
+        if cfg.contains_key("workers") {
             return Err(CnxError::InvalidInput(
-                "workers.facade.mode=external is not supported; facade-worker remains embedded in the current implementation".into(),
+                "compiled fs-meta manifest config must not expose config.workers; worker bindings are config-owned and must be normalized into __cnx_runtime.workers before app load".into(),
             ));
         }
-        let source_role_cfg = get_map(cfg, "workers").and_then(|workers| get_map(workers, "source"));
-        let scan_role_cfg = get_map(cfg, "workers").and_then(|workers| get_map(workers, "scan"));
-        let explicit_worker_path = |role_cfg: Option<&std::collections::HashMap<String, ConfigValue>>| {
-            role_cfg.and_then(|row| {
-                get_map(row, "startup")
-                    .and_then(|startup| get_str(startup, "path"))
-                    .or_else(|| get_str(row, "binary_path"))
-                    .map(str::to_string)
-            })
-        };
-
-        let mut source = resolve_worker_artifact_binding(
-            cfg,
-            WorkerArtifactDefaults {
-                app_package: env!("CARGO_PKG_NAME"),
-                role_id: "source",
-                default_mode: WorkerMode::External,
-                default_binary_name: Some("fs_meta_source_worker"),
-            },
-        )?;
-        let mut scan = resolve_worker_artifact_binding(
-            cfg,
-            WorkerArtifactDefaults {
-                app_package: env!("CARGO_PKG_NAME"),
-                role_id: "scan",
-                default_mode: source.mode,
-                default_binary_name: Some("fs_meta_source_worker"),
-            },
-        )?;
-        if explicit_worker_path(source_role_cfg).is_none() && explicit_worker_path(scan_role_cfg).is_some() {
-            source.startup_path = scan.startup_path.clone();
-        }
-        if explicit_worker_path(scan_role_cfg).is_none() && explicit_worker_path(source_role_cfg).is_some() {
-            scan.startup_path = source.startup_path.clone();
-        }
-        if source.mode != scan.mode {
-            return Err(CnxError::InvalidInput(
-                "workers.source.mode and workers.scan.mode must match while source-worker and scan-worker still share one realization".into(),
-            ));
-        }
-        if let (Some(source_path), Some(scan_path)) = (&source.startup_path, &scan.startup_path)
-            && source_path != scan_path
-        {
-            return Err(CnxError::InvalidInput(
-                "workers.source.startup.path and workers.scan.startup.path must match while source-worker and scan-worker still share one realization".into(),
-            ));
-        }
-        let sink = resolve_worker_artifact_binding(
-            cfg,
-            WorkerArtifactDefaults {
-                app_package: env!("CARGO_PKG_NAME"),
-                role_id: "sink",
-                default_mode: WorkerMode::External,
-                default_binary_name: Some("fs_meta_sink_worker"),
-            },
-        )?;
-        out.runtime_workers = FSMetaRuntimeWorkers {
-            facade,
-            source,
-            scan,
-            sink,
-        };
 
         out.source
             .effective_roots()

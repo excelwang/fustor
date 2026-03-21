@@ -148,6 +148,9 @@ mod tests {
             restored.scope.selected_group.as_deref(),
             Some(selected_group)
         );
-        assert_eq!(restored.tree_options.expect("tree options").read_class, ReadClass::TrustedMaterialized);
+        assert_eq!(
+            restored.tree_options.expect("tree options").read_class,
+            ReadClass::TrustedMaterialized
+        );
     }
 }

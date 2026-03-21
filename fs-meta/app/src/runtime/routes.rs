@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use capanix_app_sdk::runtime::RouteKey;
 use capanix_host_adapter_fs::{
-    ROUTE_KEY_HOST_OBJECT_PASSTHROUGH, ROUTE_TOKEN_HOST_OBJECT, USE_PORT_HOST_PASSTHROUGH,
-    PostBindDispatch, PostBindDispatchTable,
+    PostBindDispatch, PostBindDispatchTable, ROUTE_KEY_HOST_OBJECT_PASSTHROUGH,
+    ROUTE_TOKEN_HOST_OBJECT, USE_PORT_HOST_PASSTHROUGH,
 };
 
 pub const ROUTE_TOKEN_FS_META: &str = "fs-meta";

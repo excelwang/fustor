@@ -5,8 +5,7 @@ use std::sync::Arc;
 use capanix_app_sdk::raw::{ChannelIoSubset, channel_boundary_into_kernel};
 use capanix_app_sdk::runtime::NodeId;
 use capanix_host_adapter_fs::{
-    ExchangeHostAdapter, HostFsFacade, LocalHostFs, LocalHostFsWatchProvider,
-    PostBindDispatchTable,
+    ExchangeHostAdapter, HostFsFacade, LocalHostFs, LocalHostFsWatchProvider, PostBindDispatchTable,
 };
 
 /// Narrow infra seam for adapting app-sdk ordinary boundaries into the

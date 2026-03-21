@@ -310,9 +310,13 @@ name = "capanix-app-fs-meta-worker-facade"
 version = "0.1.0"
 dependencies = [
  "capanix-app-fs-meta",
+ "capanix-app-fs-meta-worker-scan",
+ "capanix-app-fs-meta-worker-sink",
+ "capanix-app-fs-meta-worker-source",
  "capanix-app-sdk",
  "capanix-route-proto",
  "capanix-unit-entry-macros",
+ "capanix-worker-runtime-support",
  "serde",
  "serde_json",
  "tokio",
@@ -480,9 +484,6 @@ dependencies = [
 name = "capanix-managed-state-sdk"
 version = "0.1.0"
 dependencies = [
- "async-trait",
- "capanix-app-sdk",
- "capanix-service-sdk",
  "serde",
 ]
 
@@ -533,6 +534,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "capanix-app-sdk",
+ "capanix-config",
 ]
 
 [[package]]
@@ -610,6 +612,9 @@ dependencies = [
  "capanix-app-sdk",
  "capanix-kernel-api",
  "capanix-unit-sidecar",
+ "rmp-serde",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

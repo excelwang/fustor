@@ -15,18 +15,18 @@ use capanix_app_sdk::runtime::{EventMetadata, NodeId};
 use capanix_app_sdk::{CnxError, raw::ChannelIoSubset};
 use capanix_host_adapter_fs::HostAdapter;
 
+use crate::query::api::{
+    merge_sink_status_snapshots, refresh_policy_from_host_object_grants,
+    route_sink_status_snapshot, run_blocking_query,
+};
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
+use crate::runtime::orchestration::encode_manual_rescan_envelope;
+use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
 use crate::runtime::routes::{
     METHOD_SOURCE_STATUS, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_ROOTS_CONTROL,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
 };
 use crate::runtime::seam::exchange_host_adapter;
-use crate::runtime::orchestration::encode_manual_rescan_envelope;
-use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
-use crate::query::api::{
-    merge_sink_status_snapshots, refresh_policy_from_host_object_grants, run_blocking_query,
-    route_sink_status_snapshot,
-};
 use crate::sink::SinkStatusSnapshot;
 use crate::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use crate::workers::source::SourceObservabilitySnapshot;
@@ -198,9 +198,7 @@ impl StatusRouteOutcome {
     }
 }
 
-fn local_runner_sets(
-    local_source: &SourceObservabilitySnapshot,
-) -> BTreeMap<String, Vec<String>> {
+fn local_runner_sets(local_source: &SourceObservabilitySnapshot) -> BTreeMap<String, Vec<String>> {
     local_source
         .last_force_find_runner_by_group
         .iter()
@@ -226,13 +224,11 @@ where
     SinkCollect:
         Fn(std::sync::Arc<dyn ChannelIoSubset>, NodeId) -> SinkFuture + Send + Sync + 'static,
     SinkFuture: Future<Output = Result<SinkStatusSnapshot, CnxError>> + Send,
-    SourceCollect: Fn(std::sync::Arc<dyn ChannelIoSubset>, NodeId) -> SourceFuture
-        + Send
-        + Sync
-        + 'static,
-    SourceFuture:
-        Future<Output = Result<(SourceObservabilitySnapshot, BTreeMap<String, Vec<String>>), CnxError>>
-            + Send,
+    SourceCollect:
+        Fn(std::sync::Arc<dyn ChannelIoSubset>, NodeId) -> SourceFuture + Send + Sync + 'static,
+    SourceFuture: Future<
+            Output = Result<(SourceObservabilitySnapshot, BTreeMap<String, Vec<String>>), CnxError>,
+        > + Send,
 {
     let Some(boundary) = query_runtime_boundary else {
         return (
@@ -272,7 +268,13 @@ where
         }
     };
 
-    (sink_status, source, runner_sets, sink_outcome, source_outcome)
+    (
+        sink_status,
+        source,
+        runner_sets,
+        sink_outcome,
+        source_outcome,
+    )
 }
 
 fn classify_status_route_error(err: &CnxError) -> StatusRouteOutcome {
@@ -346,13 +348,10 @@ pub async fn roots_preview(
             }
         }
     }
-    let grants = state
-        .source
-        .host_object_grants_snapshot()
-        .map_err(|err| {
-            eprintln!("fs_meta_api: roots_preview grants snapshot failed: {err}");
-            ApiError::internal(format!("source grants snapshot failed: {err}"))
-        })?;
+    let grants = state.source.host_object_grants_snapshot().map_err(|err| {
+        eprintln!("fs_meta_api: roots_preview grants snapshot failed: {err}");
+        ApiError::internal(format!("source grants snapshot failed: {err}"))
+    })?;
     Ok(Json(preview_roots(&roots, &grants)?))
 }
 
@@ -390,10 +389,14 @@ pub async fn roots_put(
     // refreshes source/sink state against current runtime grants and bound
     // scopes. It does not make the API the owner of runtime bind/run
     // realization.
-    state.source.update_logical_roots(roots.clone()).await.map_err(|err| {
-        eprintln!("fs_meta_api: roots_put source update failed: {err}");
-        err
-    })?;
+    state
+        .source
+        .update_logical_roots(roots.clone())
+        .await
+        .map_err(|err| {
+            eprintln!("fs_meta_api: roots_put source update failed: {err}");
+            err
+        })?;
     let previous_sink_roots = state.sink.cached_logical_roots_snapshot()?;
     if let Err(err) = state.sink.update_logical_roots(roots.clone(), &grants) {
         eprintln!("fs_meta_api: roots_put sink sync failed: {err}");
@@ -421,7 +424,9 @@ pub async fn roots_put(
     }
     if let Some(boundary) = state.runtime_boundary.as_ref() {
         let payload = encode_logical_roots_control_payload(&roots).map_err(|err| {
-            ApiError::internal(format!("logical roots control payload encode failed: {err}"))
+            ApiError::internal(format!(
+                "logical roots control payload encode failed: {err}"
+            ))
         })?;
         for route_key in [ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SINK_ROOTS_CONTROL] {
             boundary
@@ -471,7 +476,10 @@ pub async fn rescan(
 ) -> Result<Json<RescanResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
     if let Some(boundary) = state.runtime_boundary.as_ref() {
-        eprintln!("fs_meta_api: rescan via runtime_boundary node={}", state.node_id.0);
+        eprintln!(
+            "fs_meta_api: rescan via runtime_boundary node={}",
+            state.node_id.0
+        );
         let requested_at_us = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros().min(u128::from(u64::MAX)) as u64)
@@ -482,27 +490,32 @@ pub async fn rescan(
         let payload = rmp_serde::to_vec_named(&envelope).map_err(|err| {
             ApiError::internal(format!("manual rescan envelope serialize failed: {err}"))
         })?;
-        boundary.channel_send(
-            BoundaryContext::default(),
-            ChannelSendRequest {
-                channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
-                events: vec![Event::new(
-                    EventMetadata {
-                        origin_id: state.node_id.clone(),
-                        timestamp_us: 0,
-                        logical_ts: None,
-                        correlation_id: None,
-                        ingress_auth: None,
-                        trace: None,
-                    },
-                    bytes::Bytes::from(payload),
-                )],
-            },
-        ).map_err(|err| {
-            ApiError::internal(format!("manual rescan control send failed: {err}"))
-        })?;
+        boundary
+            .channel_send(
+                BoundaryContext::default(),
+                ChannelSendRequest {
+                    channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)),
+                    events: vec![Event::new(
+                        EventMetadata {
+                            origin_id: state.node_id.clone(),
+                            timestamp_us: 0,
+                            logical_ts: None,
+                            correlation_id: None,
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        bytes::Bytes::from(payload),
+                    )],
+                },
+            )
+            .map_err(|err| {
+                ApiError::internal(format!("manual rescan control send failed: {err}"))
+            })?;
     } else {
-        eprintln!("fs_meta_api: rescan via local source node={}", state.node_id.0);
+        eprintln!(
+            "fs_meta_api: rescan via local source node={}",
+            state.node_id.0
+        );
         state.source.trigger_rescan_when_ready().await?;
     }
     Ok(Json(RescanResponse { accepted: true }))
@@ -756,9 +769,12 @@ fn merge_source_observability_snapshots(
         .collect::<BTreeSet<_>>();
 
     for snapshot in iter {
-        merged.host_object_grants_version =
-            merged.host_object_grants_version.max(snapshot.host_object_grants_version);
-        merged.source_primary_by_group.extend(snapshot.source_primary_by_group);
+        merged.host_object_grants_version = merged
+            .host_object_grants_version
+            .max(snapshot.host_object_grants_version);
+        merged
+            .source_primary_by_group
+            .extend(snapshot.source_primary_by_group);
         merged
             .last_force_find_runner_by_group
             .extend(snapshot.last_force_find_runner_by_group);
@@ -770,10 +786,14 @@ fn merge_source_observability_snapshots(
             root_map.entry(root.id.clone()).or_insert(root);
         }
         for entry in snapshot.status.logical_roots {
-            logical_root_map.entry(entry.root_id.clone()).or_insert(entry);
+            logical_root_map
+                .entry(entry.root_id.clone())
+                .or_insert(entry);
         }
         for entry in snapshot.status.concrete_roots {
-            concrete_root_map.entry(entry.root_key.clone()).or_insert(entry);
+            concrete_root_map
+                .entry(entry.root_key.clone())
+                .or_insert(entry);
         }
         for (root_key, reason) in snapshot.status.degraded_roots {
             degraded_root_map.entry(root_key).or_insert(reason);
@@ -789,9 +809,7 @@ fn merge_source_observability_snapshots(
     merged
 }
 
-fn source_runner_sets(
-    snapshots: &[SourceObservabilitySnapshot],
-) -> BTreeMap<String, Vec<String>> {
+fn source_runner_sets(snapshots: &[SourceObservabilitySnapshot]) -> BTreeMap<String, Vec<String>> {
     let mut by_group = BTreeMap::<String, BTreeSet<String>>::new();
     for snapshot in snapshots {
         for (group, runner) in &snapshot.last_force_find_runner_by_group {
@@ -995,7 +1013,10 @@ mod tests {
             .await;
 
         assert_eq!(sink.live_nodes, local_sink.live_nodes);
-        assert_eq!(source.source_primary_by_group, local_source.source_primary_by_group);
+        assert_eq!(
+            source.source_primary_by_group,
+            local_source.source_primary_by_group
+        );
         assert_eq!(runner_sets, local_runner_sets(&local_source));
         assert_eq!(sink_outcome, StatusRouteOutcome::Skipped);
         assert_eq!(source_outcome, StatusRouteOutcome::Skipped);
@@ -1039,7 +1060,10 @@ mod tests {
             .await;
 
         assert_eq!(sink.groups.len(), 2);
-        assert_eq!(source.source_primary_by_group, local_source.source_primary_by_group);
+        assert_eq!(
+            source.source_primary_by_group,
+            local_source.source_primary_by_group
+        );
         assert_eq!(runner_sets, local_runner_sets(&local_source));
         assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
         assert_eq!(source_outcome, StatusRouteOutcome::Timeout);

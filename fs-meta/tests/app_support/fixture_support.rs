@@ -211,14 +211,27 @@ fn fixture_binary_is_fresh(bin: &Path, workspace_root: &Path) -> Result<bool, St
     let app_root = workspace_root.join("fs-meta");
     let src_root = app_root.join("app").join("src");
     let facade_root = app_root.join("worker-facade").join("src");
+    let source_root = app_root.join("worker-source").join("src");
+    let sink_root = app_root.join("worker-sink").join("src");
+    let scan_root = app_root.join("worker-scan").join("src");
     let manifest = app_root.join("app").join("Cargo.toml");
     let facade_manifest = app_root.join("worker-facade").join("Cargo.toml");
+    let source_manifest = app_root.join("worker-source").join("Cargo.toml");
+    let sink_manifest = app_root.join("worker-sink").join("Cargo.toml");
+    let scan_manifest = app_root.join("worker-scan").join("Cargo.toml");
     let mut latest_src_mtime =
         latest_mtime_recursive(&src_root).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
     if let Some(mtime) = latest_mtime_recursive(&facade_root)
         && mtime > latest_src_mtime
     {
         latest_src_mtime = mtime;
+    }
+    for helper_root in [&source_root, &sink_root, &scan_root] {
+        if let Some(mtime) = latest_mtime_recursive(helper_root)
+            && mtime > latest_src_mtime
+        {
+            latest_src_mtime = mtime;
+        }
     }
     if let Ok(mtime) = std::fs::metadata(&manifest).and_then(|m| m.modified()) {
         if mtime > latest_src_mtime {
@@ -227,6 +240,13 @@ fn fixture_binary_is_fresh(bin: &Path, workspace_root: &Path) -> Result<bool, St
     }
     if let Ok(mtime) = std::fs::metadata(&facade_manifest).and_then(|m| m.modified()) {
         if mtime > latest_src_mtime {
+            latest_src_mtime = mtime;
+        }
+    }
+    for helper_manifest in [&source_manifest, &sink_manifest, &scan_manifest] {
+        if let Ok(mtime) = std::fs::metadata(helper_manifest).and_then(|m| m.modified())
+            && mtime > latest_src_mtime
+        {
             latest_src_mtime = mtime;
         }
     }

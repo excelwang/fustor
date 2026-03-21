@@ -414,7 +414,8 @@ impl OperatorSession {
     }
 
     pub fn update_roots(&mut self, roots: &Value) -> Result<Value, String> {
-        let response = self.with_management_reauth(|client, token| client.update_roots(token, roots))?;
+        let response =
+            self.with_management_reauth(|client, token| client.update_roots(token, roots))?;
         self.best_effort_management_fanout(|client, token| client.update_roots(token, roots));
         Ok(response)
     }

@@ -77,7 +77,10 @@ pub async fn spawn(
     query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     facade_pending: SharedFacadePendingStatusCell,
 ) -> Result<ApiServerHandle> {
-    eprintln!("fs_meta_api_server: spawn begin bind_addr={}", cfg.bind_addr);
+    eprintln!(
+        "fs_meta_api_server: spawn begin bind_addr={}",
+        cfg.bind_addr
+    );
     cfg.auth
         .ensure_materialized()
         .map_err(CnxError::InvalidInput)?;
@@ -88,7 +91,10 @@ pub async fn spawn(
     let auth = Arc::new(AuthService::new(cfg.auth.clone()).map_err(|e| {
         CnxError::InvalidInput(format!("fs-meta api auth init failed: {}", e.message))
     })?);
-    eprintln!("fs_meta_api_server: auth service ready bind_addr={}", cfg.bind_addr);
+    eprintln!(
+        "fs_meta_api_server: auth service ready bind_addr={}",
+        cfg.bind_addr
+    );
 
     let initial_policy =
         projection_policy_from_host_object_grants(&source.cached_host_object_grants_snapshot()?);
@@ -119,7 +125,10 @@ pub async fn spawn(
         cfg.bind_addr
     );
     let app = router(state)?;
-    eprintln!("fs_meta_api_server: router ready bind_addr={}", cfg.bind_addr);
+    eprintln!(
+        "fs_meta_api_server: router ready bind_addr={}",
+        cfg.bind_addr
+    );
 
     let shutdown = CancellationToken::new();
     let shutdown_signal = shutdown.clone();

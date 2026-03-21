@@ -6,14 +6,15 @@ use capanix_app_fs_meta::sink::SinkFileMeta;
 use capanix_app_fs_meta::source::config::SourceConfig;
 use capanix_app_fs_meta::workers::sink::SinkWorkerRpc;
 use capanix_app_fs_meta::workers::sink_ipc::{
-    SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, SinkWorkerRequest, SinkWorkerResponse,
-    recv_opts, sink_worker_control_route_key_from_env,
+    SinkWorkerInitConfig, SinkWorkerRequest, SinkWorkerResponse, recv_opts,
 };
 use capanix_app_sdk::raw::{ChannelIoSubset, StateBoundary};
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
 use capanix_app_sdk::{CnxError, Event};
 use capanix_worker_runtime_support::{
-    TypedWorkerServer, TypedWorkerSession, WorkerLoopControl, WorkerSessionContext,
+    TypedWorkerBootstrapSession, TypedWorkerServer, TypedWorkerSession,
+    WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, WorkerLoopControl, WorkerSessionContext,
+    worker_control_route_key_from_env,
 };
 
 fn block_on_runtime<F, T>(runtime: &tokio::runtime::Handle, fut: F) -> T
@@ -41,6 +42,73 @@ fn classify_sink_worker_error(err: CnxError) -> SinkWorkerResponse {
     }
 }
 
+fn bootstrap_not_ready() -> CnxError {
+    CnxError::NotReady("worker not initialized".into())
+}
+
+fn bootstrap_init_sink_runtime(
+    node_id: NodeId,
+    config: SinkWorkerInitConfig,
+    state: &mut SinkWorkerState,
+    state_boundary: Arc<dyn StateBoundary>,
+) -> Result<(), CnxError> {
+    let mut source_cfg = SourceConfig::default();
+    source_cfg.roots = config.roots;
+    source_cfg.host_object_grants = config.host_object_grants;
+    source_cfg.sink_tombstone_ttl = Duration::from_millis(config.sink_tombstone_ttl_ms.max(1));
+    source_cfg.sink_tombstone_tolerance_us = config.sink_tombstone_tolerance_us;
+    let inner =
+        SinkFileMeta::with_boundaries_and_state(node_id.clone(), None, state_boundary, source_cfg)?;
+    state.sink = Some(Arc::new(inner));
+    state.node_id = Some(node_id);
+    state.endpoints_started = false;
+    state.send_tx = None;
+    Ok(())
+}
+
+fn bootstrap_start_sink_runtime(
+    state: &mut SinkWorkerState,
+    runtime: &tokio::runtime::Handle,
+    io_boundary: Arc<dyn ChannelIoSubset>,
+) -> Result<(), CnxError> {
+    match state.sink.as_ref() {
+        Some(_) if state.endpoints_started => Ok(()),
+        Some(sink) => {
+            let Some(node_id) = state.node_id.clone() else {
+                return Err(CnxError::Internal(
+                    "sink worker missing node_id during start".into(),
+                ));
+            };
+            sink.start_runtime_endpoints(io_boundary, node_id)?;
+            if state.send_tx.is_none() {
+                let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
+                let sink_for_send = sink.clone();
+                runtime.spawn(async move {
+                    while let Some(events) = send_rx.recv().await {
+                        if let Err(err) = sink_for_send.send(&events).await {
+                            eprintln!("fs_meta_sink_worker: async Send apply failed: {err}");
+                        }
+                    }
+                });
+                state.send_tx = Some(send_tx);
+            }
+            state.endpoints_started = true;
+            Ok(())
+        }
+        None => Err(bootstrap_not_ready()),
+    }
+}
+
+async fn bootstrap_stop_sink_runtime(state: &mut SinkWorkerState) {
+    state.send_tx.take();
+    if let Some(sink) = state.sink.as_ref() {
+        let _ = sink.close().await;
+    }
+    state.sink = None;
+    state.node_id = None;
+    state.endpoints_started = false;
+}
+
 fn process_worker_request(
     request: SinkWorkerRequest,
     state: &mut SinkWorkerState,
@@ -48,86 +116,9 @@ fn process_worker_request(
     state_boundary: Arc<dyn StateBoundary>,
     io_boundary: Arc<dyn ChannelIoSubset>,
 ) -> (SinkWorkerResponse, bool) {
+    let _ = state_boundary;
+    let _ = io_boundary;
     match request {
-        SinkWorkerRequest::Ping => (SinkWorkerResponse::Ack, false),
-        SinkWorkerRequest::Init { node_id, config } => {
-            eprintln!("fs_meta_sink_worker: received Init for node_id={node_id}");
-            let mut source_cfg = SourceConfig::default();
-            source_cfg.roots = config.roots;
-            source_cfg.host_object_grants = config.host_object_grants;
-            source_cfg.sink_tombstone_ttl =
-                Duration::from_millis(config.sink_tombstone_ttl_ms.max(1));
-            source_cfg.sink_tombstone_tolerance_us = config.sink_tombstone_tolerance_us;
-            match SinkFileMeta::with_boundaries_and_state(
-                NodeId(node_id.clone()),
-                None,
-                state_boundary,
-                source_cfg,
-            ) {
-                Ok(inner) => {
-                    let inner = Arc::new(inner);
-                    state.sink = Some(inner);
-                    state.node_id = Some(NodeId(node_id));
-                    state.endpoints_started = false;
-                    state.send_tx = None;
-                    eprintln!("fs_meta_sink_worker: Init completed");
-                    (SinkWorkerResponse::Ack, false)
-                }
-                Err(err) => {
-                    eprintln!("fs_meta_sink_worker: Init failed: {err}");
-                    (SinkWorkerResponse::Error(err.to_string()), false)
-                }
-            }
-        }
-        SinkWorkerRequest::Start => match state.sink.as_ref() {
-            Some(_) if state.endpoints_started => {
-                eprintln!("fs_meta_sink_worker: Start ignored; endpoints already started");
-                (SinkWorkerResponse::Ack, false)
-            }
-            Some(sink) => {
-                let Some(node_id) = state.node_id.clone() else {
-                    return (
-                        SinkWorkerResponse::Error(
-                            "sink worker missing node_id during start".into(),
-                        ),
-                        false,
-                    );
-                };
-                eprintln!(
-                    "fs_meta_sink_worker: Start received; starting runtime endpoints before Ack"
-                );
-                match sink.start_runtime_endpoints(io_boundary, node_id) {
-                    Ok(()) => {
-                        if state.send_tx.is_none() {
-                            let (send_tx, mut send_rx) =
-                                tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
-                            let sink_for_send = sink.clone();
-                            runtime.spawn(async move {
-                                while let Some(events) = send_rx.recv().await {
-                                    if let Err(err) = sink_for_send.send(&events).await {
-                                        eprintln!(
-                                            "fs_meta_sink_worker: async Send apply failed: {err}"
-                                        );
-                                    }
-                                }
-                            });
-                            state.send_tx = Some(send_tx);
-                        }
-                        state.endpoints_started = true;
-                        eprintln!("fs_meta_sink_worker: runtime endpoints started before Ack");
-                        (SinkWorkerResponse::Ack, false)
-                    }
-                    Err(err) => {
-                        eprintln!("fs_meta_sink_worker: start runtime endpoints failed: {err}");
-                        (SinkWorkerResponse::Error(err.to_string()), false)
-                    }
-                }
-            }
-            None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
-                false,
-            ),
-        },
         SinkWorkerRequest::UpdateLogicalRoots {
             roots,
             host_object_grants,
@@ -137,7 +128,7 @@ fn process_worker_request(
                 Err(err) => (classify_sink_worker_error(err), false),
             },
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -147,7 +138,7 @@ fn process_worker_request(
                 Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
             },
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -162,7 +153,7 @@ fn process_worker_request(
                 Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
             },
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -172,7 +163,7 @@ fn process_worker_request(
                 Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
             },
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -182,7 +173,7 @@ fn process_worker_request(
                 Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
             },
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -194,7 +185,7 @@ fn process_worker_request(
                 false,
             ),
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -218,7 +209,7 @@ fn process_worker_request(
                 }
             }
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -239,11 +230,14 @@ fn process_worker_request(
                         Ok(_) => (SinkWorkerResponse::Ack, false),
                         Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
                     },
-                    None => (SinkWorkerResponse::Error("sink worker not initialized".into()), false),
+                    None => (
+                        SinkWorkerResponse::Error("worker not initialized".into()),
+                        false,
+                    ),
                 },
             },
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
@@ -255,30 +249,20 @@ fn process_worker_request(
                 }
             }
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SinkWorkerRequest::OnControlFrame { envelopes } => match state.sink.as_ref() {
-            Some(sink) => {
-                match block_on_runtime(runtime, sink.on_control_frame(&envelopes)) {
-                    Ok(_) => (SinkWorkerResponse::Ack, false),
-                    Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-                }
-            }
+            Some(sink) => match block_on_runtime(runtime, sink.on_control_frame(&envelopes)) {
+                Ok(_) => (SinkWorkerResponse::Ack, false),
+                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+            },
             None => (
-                SinkWorkerResponse::Error("sink worker not initialized".into()),
+                SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
-        SinkWorkerRequest::Close => {
-            state.send_tx.take();
-            if let Some(sink) = state.sink.as_ref() {
-                let _ = block_on_runtime(runtime, sink.close());
-            }
-            state.sink = None;
-            (SinkWorkerResponse::Ack, true)
-        }
     }
 }
 
@@ -292,9 +276,9 @@ pub fn run_sink_worker_server(
         endpoints_started: false,
         send_tx: None,
     }));
-    TypedWorkerServer::<SinkWorkerRpc, _>::new(
-        sink_worker_control_route_key_from_env(),
-        SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
+    TypedWorkerServer::<SinkWorkerRpc, _, SinkWorkerInitConfig>::new(
+        worker_control_route_key_from_env(),
+        WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
         SinkWorkerSession { state },
     )
     .run_with_sidecar(control_socket_path, data_socket_path)
@@ -340,9 +324,57 @@ impl TypedWorkerSession<SinkWorkerRpc> for SinkWorkerSession {
             .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
         let Some(sink) = guard.sink.as_ref() else {
             return Err(CnxError::NotReady(
-                "sink worker runtime not initialized for runtime control frames".into(),
+                "worker runtime not initialized for runtime control frames".into(),
             ));
         };
         block_on_runtime(context.runtime_handle(), sink.on_control_frame(envelopes))
+    }
+}
+
+#[async_trait::async_trait]
+impl TypedWorkerBootstrapSession<SinkWorkerInitConfig> for SinkWorkerSession {
+    async fn on_init(
+        &mut self,
+        node_id: NodeId,
+        payload: SinkWorkerInitConfig,
+        context: &WorkerSessionContext,
+    ) -> capanix_app_sdk::Result<()> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
+        bootstrap_init_sink_runtime(node_id, payload, &mut guard, context.state_boundary())
+    }
+
+    async fn on_start(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
+        bootstrap_start_sink_runtime(&mut guard, context.runtime_handle(), context.io_boundary())
+    }
+
+    async fn on_ping(&mut self, _context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
+        if guard.sink.is_some() {
+            Ok(())
+        } else {
+            Err(bootstrap_not_ready())
+        }
+    }
+
+    async fn on_close(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        let state = self.state.clone();
+        let mut guard = state
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
+        block_on_runtime(
+            context.runtime_handle(),
+            bootstrap_stop_sink_runtime(&mut guard),
+        );
+        Ok(())
     }
 }

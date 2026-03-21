@@ -4,15 +4,11 @@ version = "0.1.0"
 edition = "2024"
 publish = false
 autobins = false
-description = "Internal fs-meta source-worker artifact package"
+description = "Internal fs-meta source-worker runtime helper package"
 
 [lib]
 path = "src/lib.rs"
 doctest = false
-
-[[bin]]
-name = "fs_meta_source_worker"
-path = "src/main.rs"
 
 [dependencies]
 async-trait = { workspace = true }

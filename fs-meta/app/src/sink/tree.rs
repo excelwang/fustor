@@ -10,8 +10,8 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::query::path::parent_path;
 use crate::SyncTrack;
+use crate::query::path::parent_path;
 
 type NodeId = usize;
 type SharedPath = Arc<[u8]>;

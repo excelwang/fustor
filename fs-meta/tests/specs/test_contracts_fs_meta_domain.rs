@@ -301,39 +301,9 @@ async fn test_empty_roots_valid_deployed_state_without_silent_secondary_path() {
 
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     assert!(l1.contains("EMPTY_ROOTS_VALID_DEPLOYED_STATE"));
-    let cfg = FSMetaConfig::from_manifest_config(&std::collections::HashMap::from([(
-        "workers".to_string(),
-        ConfigValue::Map(std::collections::HashMap::from([
-            (
-                "facade".to_string(),
-                ConfigValue::Map(std::collections::HashMap::from([(
-                    "mode".to_string(),
-                    ConfigValue::String("embedded".to_string()),
-                )])),
-            ),
-            (
-                "source".to_string(),
-                ConfigValue::Map(std::collections::HashMap::from([(
-                    "mode".to_string(),
-                    ConfigValue::String("embedded".to_string()),
-                )])),
-            ),
-            (
-                "scan".to_string(),
-                ConfigValue::Map(std::collections::HashMap::from([(
-                    "mode".to_string(),
-                    ConfigValue::String("embedded".to_string()),
-                )])),
-            ),
-            (
-                "sink".to_string(),
-                ConfigValue::Map(std::collections::HashMap::from([(
-                    "mode".to_string(),
-                    ConfigValue::String("embedded".to_string()),
-                )])),
-            ),
-        ])),
-    )]))
+    let cfg = FSMetaConfig::from_manifest_config(
+        &std::collections::HashMap::<String, ConfigValue>::new(),
+    )
     .expect("in-process fs-meta config");
     let app = FSMetaApp::new(cfg, NodeId("node-a".into()))
         .expect("empty roots should be accepted as valid deployed state");
@@ -599,7 +569,9 @@ fn test_unified_query_shape_output() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     assert!(l1.contains("QUERY_PATH_OUTPUT_DISCIPLINE"));
     assert!(l1.contains("grouped envelope"));
-    assert!(l1.contains("top-level `path/status/read_class/observation_status/group_order/groups/group_page`"));
+    assert!(l1.contains(
+        "top-level `path/status/read_class/observation_status/group_order/groups/group_page`"
+    ));
     assert!(l1.contains("optional `root/entries/entry_page`"));
 }
 
@@ -1076,7 +1048,9 @@ fn test_product_api_namespace_stability_contract() {
             && product_api.contains(
                 "pub use crate::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};"
             )
-            && product_api.contains("pub use release_doc::{FsMetaReleaseSpec, build_release_doc_value};"),
+            && product_api.contains(
+                "pub use release_doc::{FsMetaReleaseSpec, FsMetaReleaseWorkerModes, build_release_doc_value};"
+            ),
         "fs-meta app should expose a bounded product namespace for CLI/tooling consumers"
     );
     assert_domain_fs_meta_contract_test(
@@ -1166,8 +1140,9 @@ fn test_runtime_support_transport_supervision_contracts() {
     assert!(l2.contains("MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping"));
     assert!(l3.contains("ExternalWorkerBootstrapTransport"));
     assert!(l3.contains("ExternalWorkerRetryAndErrorClassification"));
-    assert!(l3.contains("worker has acknowledged its direct control-plane startup handshake"));
-    assert!(l3.contains("`Ping` / `Init` / `Start` / `Close` / `OnControlFrame`"));
+    assert!(l3.contains("worker has accepted the platform-owned bootstrap envelope handshake"));
+    assert!(l3.contains("`Init` / `Start` / `Ping` / `Close`"));
+    assert!(l3.contains("app-owned `OnControlFrame` remains a normal typed worker RPC"));
     assert!(transport.contains("spawn_worker_process("));
     assert!(transport.contains("on_control_frame("));
     assert!(transport.contains(".arg(\"--worker-control-socket\")"));
@@ -1185,22 +1160,26 @@ fn test_runtime_support_transport_supervision_contracts() {
 fn test_scan_worker_alias_bootstrap_contract() {
     let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md");
+    let facade_lib = read_fs_meta_spec_file("fs-meta/worker-facade/src/lib.rs");
     let scan_lib = read_fs_meta_spec_file("fs-meta/worker-scan/src/lib.rs");
-    let scan_main = read_fs_meta_spec_file("fs-meta/worker-scan/src/main.rs");
     let orchestration = read_fs_meta_spec_file("fs-meta/app/src/runtime/orchestration.rs");
-    let config = read_fs_meta_spec_file("fs-meta/app/src/lib.rs");
+    let runtime_app = read_fs_meta_spec_file("fs-meta/app/src/runtime_app.rs");
 
-    assert!(l2.contains("`scan-worker` is a distinct operator-visible worker role"));
-    assert!(l2.contains("dedicated `run_scan_worker_server(...)` entry while still sharing lower-level source-runtime helpers internally"));
-    assert!(l3.contains("ScanWorkerAliasBootstrap"));
-    assert!(l3.contains("reuses lower-level source-worker runtime helpers internally via `run_source_worker_runtime_loop(...)`"));
+    assert!(l2.contains(
+        "`source-worker`, `scan-worker`, and `sink-worker` remain distinct operator-visible worker roles"
+    ));
+    assert!(l2.contains("shared `fs-meta/worker-facade/` worker module"));
+    assert!(l3.contains("SharedWorkerModuleRoleDispatch"));
+    assert!(l3.contains("the shared worker module dispatches `worker_role`"));
+    assert!(l3.contains("shared lower-level source-runtime reuse is valid only while `source-worker` and `scan-worker` share the same realization mode and worker module path constraints"));
+    assert!(facade_lib.contains("pub extern \"C\" fn capanix_run_worker_module"));
+    assert!(facade_lib.contains("\"scan\" =>"));
     assert!(scan_lib.contains("run_scan_worker_server("));
     assert!(scan_lib.contains("run_source_worker_runtime_loop("));
-    assert!(scan_main.contains("run_scan_worker_server("));
-    assert!(scan_main.contains("&control_socket_path"));
-    assert!(scan_main.contains("&data_socket_path"));
     assert!(orchestration.contains("SOURCE_SCAN_RUNTIME_UNIT_ID => Some(SourceRuntimeUnit::Scan)"));
-    assert!(config.contains("workers.source.mode and workers.scan.mode must match while source-worker and scan-worker still share one realization"));
+    assert!(runtime_app.contains(
+        "runtime worker bindings for 'source' and 'scan' must use the same mode while they still share one realization"
+    ));
 }
 
 // @verify_spec("CONTRACTS.API_BOUNDARY.ONLINE_ROOT_RECONFIG_WITHOUT_RESTART", mode="system")

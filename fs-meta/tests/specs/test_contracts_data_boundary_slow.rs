@@ -9,10 +9,10 @@ use std::time::{Duration, Instant};
 use crate::common::assert_cluster_bootstrap_governance_real_cluster;
 use bytes::Bytes;
 use capanix_app_fs_meta::query::models::QueryNode;
+use capanix_app_fs_meta::FileMetaRecord;
 use capanix_app_fs_meta::{FSMetaApp, FSMetaConfig};
 use capanix_app_sdk::runtime::{ConfigValue, EventMetadata, NodeId, RecvOpts};
 use capanix_app_sdk::Event;
-use capanix_app_fs_meta::FileMetaRecord;
 use capanix_host_fs_types::UnixStat;
 use capanix_route_proto::{
     encode_exec_control_envelope, now_ms, BoundScope, ExecActivate, ExecControl,
@@ -285,39 +285,6 @@ async fn make_app(dir: &TempDir, node_id: &str) -> FSMetaApp {
                             ),
                         ]),
                     )]),
-                ),
-            ])),
-        ),
-        (
-            "workers".to_string(),
-            ConfigValue::Map(std::collections::HashMap::from([
-                (
-                    "facade".to_string(),
-                    ConfigValue::Map(std::collections::HashMap::from([(
-                        "mode".to_string(),
-                        ConfigValue::String("embedded".to_string()),
-                    )])),
-                ),
-                (
-                    "source".to_string(),
-                    ConfigValue::Map(std::collections::HashMap::from([(
-                        "mode".to_string(),
-                        ConfigValue::String("embedded".to_string()),
-                    )])),
-                ),
-                (
-                    "scan".to_string(),
-                    ConfigValue::Map(std::collections::HashMap::from([(
-                        "mode".to_string(),
-                        ConfigValue::String("embedded".to_string()),
-                    )])),
-                ),
-                (
-                    "sink".to_string(),
-                    ConfigValue::Map(std::collections::HashMap::from([(
-                        "mode".to_string(),
-                        ConfigValue::String("embedded".to_string()),
-                    )])),
                 ),
             ])),
         ),

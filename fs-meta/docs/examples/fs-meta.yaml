@@ -3,3 +3,6 @@ api:
 auth:
   bootstrap_management:
     username: admin
+# workers:
+#   source:
+#     mode: embedded

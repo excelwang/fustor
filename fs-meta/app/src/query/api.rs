@@ -19,14 +19,14 @@ use crate::query::tree::{
     ObservationState, ObservationStatus, PageOrder, ReadClass, StabilityState, TreeGroupPayload,
     TreePageEntry, TreePageRoot, TreeStability,
 };
-use crate::sink::SinkStatusSnapshot;
-use crate::source::SourceStatusSnapshot;
-use crate::source::config::GrantedMountRoot;
 use crate::runtime::routes::{
     METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND, METHOD_SOURCE_STATUS,
     ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
 };
 use crate::runtime::seam::exchange_host_adapter;
+use crate::sink::SinkStatusSnapshot;
+use crate::source::SourceStatusSnapshot;
+use crate::source::config::GrantedMountRoot;
 use crate::workers::sink::SinkFacade;
 use crate::workers::source::{SourceFacade, SourceObservabilitySnapshot};
 use axum::{
@@ -43,10 +43,10 @@ use base64::{
 use bytes::Bytes;
 // bound_route_metrics_snapshot remains an app-sdk helper for transport
 // diagnostics; ordinary app-facing imports in this module stay on app-sdk.
+use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_app_sdk::runtime::NodeId;
 use capanix_app_sdk::{CnxError, Event, bound_route_metrics_snapshot};
 use capanix_host_adapter_fs::HostAdapter;
-use capanix_app_sdk::raw::ChannelIoSubset;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
@@ -235,8 +235,7 @@ impl Drop for ForceFindInflightGuard {
             }
             eprintln!(
                 "fs_meta_query_api: force-find inflight release groups={:?} remaining={:?}",
-                self.groups,
-                inflight
+                self.groups, inflight
             );
         }
     }
@@ -315,10 +314,10 @@ fn materialized_query_readiness_error(
     source_status: &SourceStatusSnapshot,
     sink_status: &SinkStatusSnapshot,
 ) -> Option<String> {
-    let status = evaluate_observation_status(&materialized_query_observation_evidence(
-        source_status,
-        sink_status,
-    ), ObservationTrustPolicy::materialized_query());
+    let status = evaluate_observation_status(
+        &materialized_query_observation_evidence(source_status, sink_status),
+        ObservationTrustPolicy::materialized_query(),
+    );
     if status.state == ObservationState::TrustedMaterialized {
         return None;
     }
@@ -389,10 +388,14 @@ fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> So
     let mut degraded_root_map = BTreeMap::new();
     for snapshot in snapshots {
         for entry in snapshot.logical_roots {
-            logical_root_map.entry(entry.root_id.clone()).or_insert(entry);
+            logical_root_map
+                .entry(entry.root_id.clone())
+                .or_insert(entry);
         }
         for entry in snapshot.concrete_roots {
-            concrete_root_map.entry(entry.root_key.clone()).or_insert(entry);
+            concrete_root_map
+                .entry(entry.root_key.clone())
+                .or_insert(entry);
         }
         for (root_key, reason) in snapshot.degraded_roots {
             degraded_root_map.entry(root_key).or_insert(reason);
@@ -431,9 +434,7 @@ async fn route_source_status_snapshot(
             rmp_serde::from_slice::<SourceObservabilitySnapshot>(event.payload_bytes())
                 .map(|snapshot| snapshot.status)
                 .map_err(|err| {
-                    CnxError::Internal(format!(
-                        "decode source status snapshot failed: {err}"
-                    ))
+                    CnxError::Internal(format!("decode source status snapshot failed: {err}"))
                 })
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -474,7 +475,10 @@ async fn load_materialized_status_snapshots(
     state: &ApiState,
 ) -> Result<(SourceStatusSnapshot, SinkStatusSnapshot), CnxError> {
     let (Some(source), Some(sink)) = (&state.readiness_source, &state.readiness_sink) else {
-        return Ok((SourceStatusSnapshot::default(), SinkStatusSnapshot::default()));
+        return Ok((
+            SourceStatusSnapshot::default(),
+            SinkStatusSnapshot::default(),
+        ));
     };
     let source_status = match &state.backend {
         QueryBackend::Route {
@@ -523,10 +527,10 @@ fn materialized_observation_status(
     source_status: &SourceStatusSnapshot,
     sink_status: &SinkStatusSnapshot,
 ) -> ObservationStatus {
-    evaluate_observation_status(&materialized_query_observation_evidence(
-        source_status,
-        sink_status,
-    ), ObservationTrustPolicy::materialized_query())
+    evaluate_observation_status(
+        &materialized_query_observation_evidence(source_status, sink_status),
+        ObservationTrustPolicy::materialized_query(),
+    )
 }
 
 fn build_projection_maps(
@@ -718,7 +722,10 @@ fn validate_tree_query_params(params: &NormalizedApiParams) -> std::result::Resu
 }
 
 fn validate_force_find_params(params: &NormalizedApiParams) -> std::result::Result<(), CnxError> {
-    if params.read_class.is_some_and(|read_class| read_class != ReadClass::Fresh) {
+    if params
+        .read_class
+        .is_some_and(|read_class| read_class != ReadClass::Fresh)
+    {
         return Err(CnxError::InvalidInput(
             "read_class must be fresh on /on-demand-force-find".into(),
         ));
@@ -976,9 +983,7 @@ fn build_materialized_tree_request(
             max_depth,
             selected_group,
         },
-        Some(TreeQueryOptions {
-            read_class,
-        }),
+        Some(TreeQueryOptions { read_class }),
     )
 }
 
@@ -1025,7 +1030,11 @@ pub fn create_inprocess_router(
 ) -> Router {
     eprintln!(
         "fs_meta_query_api: create router backend={}",
-        if runtime_boundary.is_some() { "route" } else { "inprocess" }
+        if runtime_boundary.is_some() {
+            "route"
+        } else {
+            "inprocess"
+        }
     );
     let state = ApiState {
         backend: runtime_boundary.map_or_else(
@@ -1089,8 +1098,12 @@ async fn query_materialized_events(
     );
     match backend {
         QueryBackend::InProcess { sink, .. } => {
-            let result = run_blocking_query(move || sink.materialized_query(&params), timeout).await;
-            eprintln!("fs_meta_query_api: query_materialized_events inprocess done ok={}", result.is_ok());
+            let result =
+                run_blocking_query(move || sink.materialized_query(&params), timeout).await;
+            eprintln!(
+                "fs_meta_query_api: query_materialized_events inprocess done ok={}",
+                result.is_ok()
+            );
             result
         }
         QueryBackend::Route {
@@ -1100,8 +1113,7 @@ async fn query_materialized_events(
             source,
         } => {
             if let Some(group_id) = params.scope.selected_group.as_deref()
-                && let Some(node_id) =
-                    materialized_owner_node_for_group(source.as_ref(), group_id)?
+                && let Some(node_id) = materialized_owner_node_for_group(source.as_ref(), group_id)?
             {
                 let node_id_for_call = node_id.clone();
                 let result = run_blocking_query(
@@ -1178,7 +1190,11 @@ async fn query_force_find_events(
             );
             result
         }
-        QueryBackend::Route { boundary, origin_id, .. } => {
+        QueryBackend::Route {
+            boundary,
+            origin_id,
+            ..
+        } => {
             let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
             let payload = rmp_serde::to_vec_named(&params).map_err(|err| {
                 CnxError::Internal(format!("encode force-find query failed: {err}"))
@@ -1309,15 +1325,17 @@ async fn collect_group_rankings(
                     Err(err) => return Err(err),
                 }
             }
-            QueryMode::ForceFind => query_force_find_group_stats(
-                state,
-                path,
-                recursive,
-                timeout,
-                &group_key,
-                explicit_group == Some(group_key.as_str()),
-            )
-            .await?,
+            QueryMode::ForceFind => {
+                query_force_find_group_stats(
+                    state,
+                    path,
+                    recursive,
+                    timeout,
+                    &group_key,
+                    explicit_group == Some(group_key.as_str()),
+                )
+                .await?
+            }
         };
         let mut best_total_files = None::<u64>;
         let mut best_latest_mtime = None::<u64>;
@@ -1336,9 +1354,8 @@ async fn collect_group_rankings(
                 best_total_files.map_or(stats.total_files, |value| value.max(stats.total_files)),
             );
             if let Some(latest_mtime) = stats.latest_file_mtime_us {
-                best_latest_mtime = Some(
-                    best_latest_mtime.map_or(latest_mtime, |value| value.max(latest_mtime)),
-                );
+                best_latest_mtime =
+                    Some(best_latest_mtime.map_or(latest_mtime, |value| value.max(latest_mtime)));
             }
         }
         let rank_metric = match group_order {
@@ -1378,7 +1395,8 @@ fn materialized_target_groups(
         .as_ref()
         .map(|source| {
             source.cached_logical_roots_snapshot().map(|roots| {
-                roots.into_iter()
+                roots
+                    .into_iter()
                     .filter(|root| root.scan)
                     .map(|root| root.id)
                     .collect::<Vec<_>>()
@@ -1476,8 +1494,11 @@ async fn query_force_find_group_stats(
             {
                 let source = source.clone();
                 let request = request.clone();
-                run_blocking_query(move || source.force_find_via_node(&node_id, &request), timeout)
-                    .await?
+                run_blocking_query(
+                    move || source.force_find_via_node(&node_id, &request),
+                    timeout,
+                )
+                .await?
             } else {
                 query_force_find_events(state.backend.clone(), request, timeout).await?
             }
@@ -1504,12 +1525,8 @@ async fn query_force_find_group_tree(
         Err(_err) if !strict_conflict => return Ok(Vec::new()),
         Err(err) => return Err(err),
     };
-    let request = build_force_find_tree_request(
-        path,
-        recursive,
-        max_depth,
-        Some(group_id.to_string()),
-    );
+    let request =
+        build_force_find_tree_request(path, recursive, max_depth, Some(group_id.to_string()));
     let events = match &state.backend {
         QueryBackend::Route { source, .. } => {
             if let Some(node_id) =
@@ -1517,8 +1534,11 @@ async fn query_force_find_group_tree(
             {
                 let source = source.clone();
                 let request = request.clone();
-                run_blocking_query(move || source.force_find_via_node(&node_id, &request), timeout)
-                    .await?
+                run_blocking_query(
+                    move || source.force_find_via_node(&node_id, &request),
+                    timeout,
+                )
+                .await?
             } else {
                 query_force_find_events(state.backend.clone(), request, timeout).await?
             }
@@ -1931,31 +1951,32 @@ async fn build_tree_pit_session(
             read_class,
             Some(rank.group_key.clone()),
         );
-        let events = match query_materialized_events(state.backend.clone(), tree_params, timeout).await {
-            Ok(events) => events,
-            Err(CnxError::Timeout)
-            | Err(CnxError::TransportClosed(_))
-            | Err(CnxError::ProtocolViolation(_)) => {
-                let response = empty_materialized_tree_group_payload(&params.path);
-                groups.push(GroupPitSnapshot {
-                    group: rank.group_key,
-                    status: "ok",
-                    reliable: response.reliability.reliable,
-                    unreliable_reason: response.reliability.unreliable_reason,
-                    stability: response.stability,
-                    meta: PitMetadata {
-                        read_class,
-                        metadata_available: true,
-                        withheld_reason: None,
-                    },
-                    root: Some(response.root),
-                    entries: response.entries,
-                    errors: Vec::new(),
-                });
-                continue;
-            }
-            Err(err) => return Err(err),
-        };
+        let events =
+            match query_materialized_events(state.backend.clone(), tree_params, timeout).await {
+                Ok(events) => events,
+                Err(CnxError::Timeout)
+                | Err(CnxError::TransportClosed(_))
+                | Err(CnxError::ProtocolViolation(_)) => {
+                    let response = empty_materialized_tree_group_payload(&params.path);
+                    groups.push(GroupPitSnapshot {
+                        group: rank.group_key,
+                        status: "ok",
+                        reliable: response.reliability.reliable,
+                        unreliable_reason: response.reliability.unreliable_reason,
+                        stability: response.stability,
+                        meta: PitMetadata {
+                            read_class,
+                            metadata_available: true,
+                            withheld_reason: None,
+                        },
+                        root: Some(response.root),
+                        entries: response.entries,
+                        errors: Vec::new(),
+                    });
+                    continue;
+                }
+                Err(err) => return Err(err),
+            };
         match decode_materialized_selected_group_response(
             &events,
             policy,
@@ -2092,7 +2113,12 @@ async fn build_force_find_pit_session(
                 continue;
             }
         };
-        match decode_force_find_selected_group_response(&events, policy, &rank.group_key, &params.path) {
+        match decode_force_find_selected_group_response(
+            &events,
+            policy,
+            &rank.group_key,
+            &params.path,
+        ) {
             Ok(payload) => {
                 groups.push(GroupPitSnapshot {
                     group: rank.group_key,
@@ -2209,14 +2235,8 @@ async fn query_tree_page_response(
         );
     }
 
-    let session = Arc::new(build_tree_pit_session(
-        state,
-        policy,
-        params,
-        timeout,
-        observation_status,
-    )
-    .await?);
+    let session =
+        Arc::new(build_tree_pit_session(state, policy, params, timeout, observation_status).await?);
     let pit_id = encode_pit_id("tree");
     {
         let mut guard = state
@@ -2346,9 +2366,7 @@ async fn query_force_find_page_response(
         );
     }
 
-    let session = Arc::new(
-        build_force_find_pit_session(state, policy, params, timeout).await?,
-    );
+    let session = Arc::new(build_force_find_pit_session(state, policy, params, timeout).await?);
     let pit_id = encode_pit_id("force-find");
     {
         let mut guard = state
@@ -2374,7 +2392,8 @@ fn error_status(err: &CnxError) -> StatusCode {
     if matches!(err, CnxError::NotReady(msg) if msg.starts_with("pit capacity exceeded")) {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
-    if matches!(err, CnxError::NotReady(msg) if msg.starts_with(FORCE_FIND_INFLIGHT_CONFLICT_PREFIX)) {
+    if matches!(err, CnxError::NotReady(msg) if msg.starts_with(FORCE_FIND_INFLIGHT_CONFLICT_PREFIX))
+    {
         return StatusCode::TOO_MANY_REQUESTS;
     }
     match err {
@@ -2395,7 +2414,8 @@ fn error_code(err: &CnxError) -> &'static str {
     if matches!(err, CnxError::NotReady(msg) if msg.starts_with("pit capacity exceeded")) {
         return "PIT_CAPACITY_EXCEEDED";
     }
-    if matches!(err, CnxError::NotReady(msg) if msg.starts_with(FORCE_FIND_INFLIGHT_CONFLICT_PREFIX)) {
+    if matches!(err, CnxError::NotReady(msg) if msg.starts_with(FORCE_FIND_INFLIGHT_CONFLICT_PREFIX))
+    {
         return "FORCE_FIND_INFLIGHT_CONFLICT";
     }
     match err {
@@ -2596,10 +2616,11 @@ async fn get_stats(
     let observation_status = match read_class {
         ReadClass::Fresh => ObservationStatus::fresh_only(),
         ReadClass::Materialized | ReadClass::TrustedMaterialized => {
-            let (source_status, sink_status) = match load_materialized_status_snapshots(&state).await {
-                Ok(statuses) => statuses,
-                Err(err) => return error_response_with_context(err, Some(&params.path)),
-            };
+            let (source_status, sink_status) =
+                match load_materialized_status_snapshots(&state).await {
+                    Ok(statuses) => statuses,
+                    Err(err) => return error_response_with_context(err, Some(&params.path)),
+                };
             let status = materialized_observation_status(&source_status, &sink_status);
             if read_class == ReadClass::TrustedMaterialized
                 && status.state != ObservationState::TrustedMaterialized
@@ -2612,7 +2633,8 @@ async fn get_stats(
             status
         }
     };
-    let groups = match collect_materialized_stats_groups(&state, &policy, &params, read_class).await {
+    let groups = match collect_materialized_stats_groups(&state, &policy, &params, read_class).await
+    {
         Ok(groups) => groups,
         Err(err) => return error_response_with_context(err, Some(&params.path)),
     };
@@ -2647,7 +2669,14 @@ async fn get_tree(
     }
     let read_class = tree_read_class(&params);
     if read_class == ReadClass::Fresh {
-        return match query_force_find_page_response(&state, &policy, &params, policy.force_find_timeout()).await {
+        return match query_force_find_page_response(
+            &state,
+            &policy,
+            &params,
+            policy.force_find_timeout(),
+        )
+        .await
+        {
             Ok(resp) => Json(resp).into_response(),
             Err(err) => error_response_with_context(err, Some(&path_for_error)),
         };
@@ -2693,8 +2722,7 @@ async fn get_force_find(
         return error_response_with_context(err, Some(&path_for_error));
     }
     let response =
-        query_force_find_page_response(&state, &policy, &params, policy.force_find_timeout())
-            .await;
+        query_force_find_page_response(&state, &policy, &params, policy.force_find_timeout()).await;
     match response {
         Ok(resp) => Json(resp).into_response(),
         Err(err) => error_response_with_context(err, Some(&path_for_error)),
@@ -2752,8 +2780,7 @@ fn acquire_force_find_groups(
     if let Some(group) = groups.iter().find(|group| inflight.contains(*group)) {
         eprintln!(
             "fs_meta_query_api: force-find inflight conflict requested={:?} active={:?}",
-            groups,
-            inflight
+            groups, inflight
         );
         return Err(CnxError::NotReady(format!(
             "{FORCE_FIND_INFLIGHT_CONFLICT_PREFIX} force-find already running for group: {group}"
@@ -2764,8 +2791,7 @@ fn acquire_force_find_groups(
     }
     eprintln!(
         "fs_meta_query_api: force-find inflight acquire groups={:?} active={:?}",
-        groups,
-        inflight
+        groups, inflight
     );
     drop(inflight);
     Ok(ForceFindInflightGuard {
@@ -2811,6 +2837,7 @@ fn stability_json(stability: &TreeStability) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::FileMetaRecord;
     use crate::sink::SinkFileMeta;
     use crate::source::FSMetaSource;
     use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
@@ -2820,7 +2847,6 @@ mod tests {
     use axum::http::Request;
     use bytes::Bytes;
     use capanix_app_sdk::runtime::{EventMetadata, NodeId};
-    use crate::FileMetaRecord;
     use capanix_host_fs_types::UnixStat;
     use std::fs;
     use std::path::Path;
@@ -2972,10 +2998,7 @@ mod tests {
         }
     }
 
-    fn source_facade_with_group(
-        group_id: &str,
-        grants: &[GrantedMountRoot],
-    ) -> Arc<SourceFacade> {
+    fn source_facade_with_group(group_id: &str, grants: &[GrantedMountRoot]) -> Arc<SourceFacade> {
         let mut root = RootSpec::new(group_id, "/unused");
         root.selector = crate::source::config::RootSelector {
             fs_type: Some("nfs".to_string()),
@@ -2993,7 +3016,10 @@ mod tests {
         )))
     }
 
-    fn source_facade_with_roots(roots: Vec<RootSpec>, grants: &[GrantedMountRoot]) -> Arc<SourceFacade> {
+    fn source_facade_with_roots(
+        roots: Vec<RootSpec>,
+        grants: &[GrantedMountRoot],
+    ) -> Arc<SourceFacade> {
         let config = SourceConfig {
             roots,
             host_object_grants: grants.to_vec(),
@@ -3202,7 +3228,10 @@ mod tests {
             },
         ];
         let source = source_facade_with_roots(
-            vec![RootSpec::new("nfs1", &root_a), RootSpec::new("nfs2", &root_b)],
+            vec![
+                RootSpec::new("nfs1", &root_a),
+                RootSpec::new("nfs2", &root_b),
+            ],
             &grants,
         );
 

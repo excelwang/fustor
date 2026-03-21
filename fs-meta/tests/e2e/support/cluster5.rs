@@ -560,10 +560,10 @@ impl Cluster5 {
         bootstrap_management: bool,
     ) -> Result<Value, String> {
         let app_path = self.fs_meta_app_runtime_path()?;
-        let source_worker_path = try_find_fs_meta_source_worker_bin()
-            .ok_or_else(|| "fs_meta_source_worker binary not found".to_string())?;
-        let sink_worker_path = try_find_fs_meta_sink_worker_bin()
-            .ok_or_else(|| "fs_meta_sink_worker binary not found".to_string())?;
+        let worker_module_path = try_find_fs_meta_worker_module()
+            .ok_or_else(|| "fs-meta shared worker module not found".to_string())?;
+        let _worker_host_path = try_find_capanix_worker_host_bin()
+            .ok_or_else(|| "capanix_worker_host binary not found".to_string())?;
         let (passwd_path, shadow_path) = self.write_fs_meta_auth_files(app_id)?;
         let query_keys_path = PathBuf::from(&passwd_path)
             .parent()
@@ -592,6 +592,8 @@ impl Cluster5 {
             api_facade_resource_id: facade_resource_id.to_string(),
             auth,
             roots,
+            worker_module_path: Some(worker_module_path),
+            worker_modes: Default::default(),
         };
         let mut value = build_release_doc_value(&spec);
         value["target_generation"] = json!(generation);
@@ -600,20 +602,6 @@ impl Cluster5 {
             .join("fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml")
             .display()
             .to_string());
-        value["units"][0]["config"]["workers"] = json!({
-            "source": {
-                "mode": "external",
-                "binary_path": source_worker_path.display().to_string(),
-            },
-            "scan": {
-                "mode": "external",
-                "binary_path": source_worker_path.display().to_string(),
-            },
-            "sink": {
-                "mode": "external",
-                "binary_path": sink_worker_path.display().to_string(),
-            }
-        });
         value["units"][0]["version"] = json!(format!("real-nfs-{generation}"));
         value["units"][0]["restart_policy"] = json!("Never");
         value["units"][0]["policy"]["generation"] = json!(generation);
@@ -1137,6 +1125,12 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
         root.join("Cargo.lock"),
         root.join("fs-meta/app/src"),
         root.join("fs-meta/worker-facade/src"),
+        root.join("fs-meta/worker-source/src"),
+        root.join("fs-meta/worker-source/Cargo.toml"),
+        root.join("fs-meta/worker-sink/src"),
+        root.join("fs-meta/worker-sink/Cargo.toml"),
+        root.join("fs-meta/worker-scan/src"),
+        root.join("fs-meta/worker-scan/Cargo.toml"),
         root.join("fs-meta/tests"),
         root.join("src"),
     ];
@@ -1175,59 +1169,41 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
     candidates.iter().find(|p| p.exists()).cloned()
 }
 
-fn try_find_fs_meta_source_worker_bin() -> Option<PathBuf> {
+fn try_find_fs_meta_worker_module() -> Option<PathBuf> {
     static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
-    BIN.get_or_init(|| resolve_fs_meta_worker_bin("source"))
-        .clone()
+    BIN.get_or_init(resolve_fs_meta_worker_module).clone()
 }
 
-fn try_find_fs_meta_sink_worker_bin() -> Option<PathBuf> {
-    static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
-    BIN.get_or_init(|| resolve_fs_meta_worker_bin("sink"))
-        .clone()
+fn resolve_fs_meta_worker_module() -> Option<PathBuf> {
+    try_find_fs_meta_app_cdylib()
 }
 
-fn resolve_fs_meta_worker_bin(kind: &str) -> Option<PathBuf> {
-    let root = repo_root();
-    let (bin_name, package_name, watch_paths) = match kind {
-        "source" => (
-            "fs_meta_source_worker",
-            "capanix-app-fs-meta-worker-source",
-            vec![
-                root.join("Cargo.lock"),
-                root.join("fs-meta/worker-source/src"),
-                root.join("fs-meta/worker-source/Cargo.toml"),
-                root.join("fs-meta/app/src/workers/source.rs"),
-                root.join("fs-meta/app/src/workers/source_ipc.rs"),
-                root.join("fs-meta/app/src/source"),
-                root.join("fs-meta/app/src"),
-                capanix_repo_root().join("Cargo.lock"),
-                capanix_repo_root().join("crates/worker-runtime-support/src"),
-                capanix_repo_root().join("crates/worker-runtime-support/Cargo.toml"),
-                capanix_repo_root().join("crates/unit-sidecar/src"),
-                capanix_repo_root().join("crates/unit-sidecar/Cargo.toml"),
-            ],
-        ),
-        "sink" => (
-            "fs_meta_sink_worker",
-            "capanix-app-fs-meta-worker-sink",
-            vec![
-                root.join("Cargo.lock"),
-                root.join("fs-meta/worker-sink/src"),
-                root.join("fs-meta/worker-sink/Cargo.toml"),
-                root.join("fs-meta/app/src/workers/sink.rs"),
-                root.join("fs-meta/app/src/workers/sink_ipc.rs"),
-                root.join("fs-meta/app/src/sink"),
-                root.join("fs-meta/app/src"),
-                capanix_repo_root().join("Cargo.lock"),
-                capanix_repo_root().join("crates/worker-runtime-support/src"),
-                capanix_repo_root().join("crates/worker-runtime-support/Cargo.toml"),
-                capanix_repo_root().join("crates/unit-sidecar/src"),
-                capanix_repo_root().join("crates/unit-sidecar/Cargo.toml"),
-            ],
-        ),
-        _ => return None,
+fn try_find_capanix_worker_host_bin() -> Option<PathBuf> {
+    static BIN: OnceLock<Option<PathBuf>> = OnceLock::new();
+    BIN.get_or_init(resolve_capanix_worker_host_bin).clone()
+}
+
+fn resolve_capanix_worker_host_bin() -> Option<PathBuf> {
+    if let Ok(path) = std::env::var("CAPANIX_WORKER_HOST_BINARY") {
+        let resolved = PathBuf::from(path);
+        if resolved.exists() {
+            return Some(resolved);
+        }
+    }
+
+    let root = capanix_repo_root();
+    let bin_name = if cfg!(windows) {
+        "capanix_worker_host.exe"
+    } else {
+        "capanix_worker_host"
     };
+    let watch_paths = vec![
+        root.join("Cargo.lock"),
+        root.join("crates/worker-host/src"),
+        root.join("crates/worker-host/Cargo.toml"),
+        root.join("crates/worker-runtime-support/src"),
+        root.join("crates/worker-runtime-support/Cargo.toml"),
+    ];
     let candidates = [
         root.join("target/debug").join(bin_name),
         root.join(".target/debug").join(bin_name),
@@ -1251,9 +1227,9 @@ fn resolve_fs_meta_worker_bin(kind: &str) -> Option<PathBuf> {
             .current_dir(&root)
             .arg("build")
             .arg("-p")
-            .arg(package_name)
+            .arg("capanix-worker-host")
             .arg("--bin")
-            .arg(bin_name)
+            .arg("capanix_worker_host")
             .status();
         let Ok(status) = status else {
             continue;

@@ -29,7 +29,7 @@ version: 3.0.0
 
 1. **KERNEL_DOMAIN_NEUTRAL_CONSUMPTION**: **fs-meta System** MUST consume only kernel thin runtime ABI plus generic route/channel-attach mechanisms, without requiring fs-meta-specific kernel primitives or kernel-owned fs-meta protocol verb interfaces.
    > Covers L0: VISION.GENERIC_KERNEL_MECHANISM_CONSUMPTION
-   > Verification: fs-meta does not treat `kernel-api` as the canonical ordinary app-facing runtime boundary; any remaining low-level primitive usage is explicit and secondary to the SDK-family path `managed-state-sdk -> service-sdk -> app-sdk -> runtime-api`.
+   > Verification: fs-meta does not treat `kernel-api` as the canonical ordinary app-facing runtime boundary; any remaining low-level primitive usage is explicit and secondary to the SDK-family path `managed-state-sdk` declarations/evaluator -> `service-sdk` runtime host -> `app-sdk` -> `runtime-api`.
 
 2. **HOST_DESCRIPTOR_GROUPING_IS_DOMAIN_POLICY**: **fs-meta System** MUST implement grouping from app-owned host descriptor selectors and object descriptors and MUST NOT require kernel/runtime hardcoded grouping semantics.
    > Covers L0: VISION.POLICY_OUTSIDE_KERNEL_FOR_GROUPING
@@ -47,7 +47,7 @@ version: 3.0.0
 5. **THIN_RUNTIME_ABI_CONSUMPTION**: **fs-meta System** MUST consume only thin runtime ABI state (`host_object_grants`, run context, generation/lease, control events, channel hooks) at its app/runtime boundary.
    > Covers L0: VISION.THIN_RUNTIME_ABI_CONSUMPTION
    > Responsibility: keep fs-meta below runtime orchestration and above domain protocol ownership.
-   > Verification: fs-meta consumes the ordinary app-facing runtime surface through the SDK family rooted in `capanix-app-sdk`: `capanix-managed-state-sdk` supplies shared stateful observation authoring plus the top-level managed-state runtime wrapper, `capanix-service-sdk` supplies the lower service-first runtime wrapper/lowering path, `capanix-app-sdk` remains the lower Boundary Toolkit, and `capanix-runtime-api` remains the typed runtime boundary mirror; `capanix-kernel-api` remains only a low-level kernel-owned mirror or carrier vocabulary.
+   > Verification: fs-meta consumes the ordinary app-facing runtime surface through the SDK family rooted in `capanix-app-sdk`: `capanix-managed-state-sdk` supplies shared stateful observation declarations/evaluator only, `capanix-service-sdk` supplies the top-level service-first runtime host/lowering path, `capanix-app-sdk` remains the lower Boundary Toolkit, and `capanix-runtime-api` remains the typed runtime boundary mirror; `capanix-kernel-api` remains only a low-level kernel-owned mirror or carrier vocabulary.
 6. **APP_OWNS_OPAQUE_PORT_MEANING**: **fs-meta System** MUST keep query/find/source/sink rendezvous naming and protocol meaning app-owned over opaque channels.
    > Covers L0: VISION.APP_OWNS_OPAQUE_PORT_MEANING
    > Responsibility: prevent kernel/runtime/adapter layers from becoming owners of fs-meta protocol semantics.
@@ -222,7 +222,7 @@ version: 3.0.0
    > Verification: source/sink authoritative mutation recording passes through one shared commit-boundary abstraction, not duplicated runtime state-carrier write call paths.
    > Verification: fs-meta manifest config MUST reject removed authority carrier fields (`unit_authority_state_carrier`, `unit_authority_state_dir`) to prevent app-level carrier coupling.
    > Verification: if runtime state-carrier authority initialization fails, fs-meta startup MUST fail closed with explicit invalid-input error.
-   > Verification: sink execution hosting is selected through worker-oriented config (`workers.sink.mode=embedded|external`); `external` hosts sink materialized tree in a dedicated sink-worker process, isolated from the main fs-meta process address space.
+   > Verification: sink execution hosting is selected through worker-oriented deploy config (`workers.sink.mode=embedded|external`) that upstream config compiles into `__cnx_runtime.workers`; `external` hosts sink materialized tree in a dedicated sink-worker process, isolated from the main fs-meta process address space.
    > Verification: under `workers.sink.mode=external`, sink worker restart/failover rebuilds materialized tree via baseline scan/audit path; in-memory tree remains projection cache, not authoritative durable state.
 7. **AUTHORITATIVE_JOURNAL_TRUTH_LEDGER**: **fs-meta System** MUST treat the bounded authoritative mutation journal as the domain truth ledger for state/effect convergence.
    > Responsibility: keep “what fs-meta currently recognizes as truth” separate from query-ready materialized views and scratch runtime state.
@@ -369,7 +369,7 @@ version: 3.0.0
    > Responsibility: keep app package semantics downstream of domain/runtime authority instead of creating a parallel contract set.
    > Verification: main specs trace root/domain Convergence Vocabulary without redefining package-local authority terms.
    > Verification: main specs explicitly state fs-meta app implementation consumes fs-meta domain specs and root Convergence Vocabulary rather than redefining `Authoritative Truth`, `Observation`, `Projection`, or `Observation-Eligible`.
-   > Verification: stateful observation-facing business modules consume `capanix-managed-state-sdk`, top-level runtime-wrapper authoring lowers through `capanix-service-sdk`, lower toolkit helpers consume `capanix-app-sdk`, worker-process client/server support consumes helper-only `capanix-worker-runtime-support`, and narrow runtime glue and boundary-conversion seams MAY directly consume `capanix-runtime-api` without creating a second authoring authority, while `capanix-kernel-api` remains outside the app package business/infra surface.
+   > Verification: stateful observation-facing business modules consume `capanix-managed-state-sdk` declarations/evaluator helpers, top-level runtime-host authoring lowers through `capanix-service-sdk`, lower toolkit helpers consume `capanix-app-sdk`, worker-process client/server support consumes helper-only `capanix-worker-runtime-support`, and narrow runtime glue and boundary-conversion seams MAY directly consume `capanix-runtime-api` without creating a second authoring authority, while `capanix-kernel-api` remains outside the app package business/infra surface.
    > Verification: `fs-meta/app` and other package-local authoring surfaces MUST NOT directly depend on or reference `capanix-kernel-api`, `capanix-unit-entry-macros`, or `capanix-unit-sidecar`; those remain limited to dedicated artifact/runtime crates, explicit bridge seams, or test/dev fixtures.
    > Verification: `fs-meta/app` remains the only product app package for the fs-meta container, stays `publish = false`, owns package-local business/runtime composition, and does not present a generic reusable fs-meta library API.
    > Verification: bounded `product` remains the product-facing CLI/tooling namespace, while public `query`, `product::release_doc`, and `workers` support surfaces may remain package-local operational/test support modules without becoming product or platform authority.
@@ -383,7 +383,7 @@ version: 3.0.0
    > Responsibility: keep product docs/config focused on worker roles and worker modes rather than realization mechanics.
    > Verification: product-facing L0-L2 specs use worker/mode vocabulary and do not present realization-mechanic terms as architecture terms.
    > Verification: app specs state the initial mode defaults as `facade-worker=embedded` and `source-worker=external`, `scan-worker=external`, `sink-worker=external`.
-   > Verification: operator-visible worker config stays worker-oriented through `workers.facade.mode`, `workers.source.mode`, `workers.scan.mode`, and `workers.sink.mode` rather than legacy realization vocabulary.
+   > Verification: operator-visible worker config stays worker-oriented through `workers.facade.mode`, `workers.source.mode`, `workers.scan.mode`, and `workers.sink.mode` rather than legacy realization vocabulary, while the app package consumes only compiled `__cnx_runtime.workers` bindings and MUST reject raw `config.workers` at app-load time.
 4. **LOCAL_HOST_RESOURCE_PROGRAMMING_ONLY**: **fs-meta System** MUST keep resource-bound source behavior on the bound host through local-host programming targets rather than inventing remote-host operation contracts.
 5. **RESOURCE_SCOPED_HTTP_FACADE_ONLY**: **fs-meta System** MUST host the resource-scoped external HTTP facade for the single fs-meta app package boundary without redefining product or platform ownership.
    > Verification: app source hosts the bounded one-cardinality HTTP facade and does not promote it into product or platform authority or a separate roaming API boundary.

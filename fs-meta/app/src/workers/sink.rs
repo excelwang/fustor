@@ -2,14 +2,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use capanix_worker_runtime_support::{
-    CompositeRuntimeBoundary, TypedWorkerClient, TypedWorkerHandle, WorkerArtifactBinding,
-    WorkerBootstrapSpec, WorkerBootstrapTimeouts, encode_control_frame,
-};
 use capanix_app_sdk::raw::ChannelIoSubset;
-use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RecvOpts, RouteKey};
+use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RecvOpts, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::HostAdapter;
+use capanix_worker_runtime_support::{
+    CompositeRuntimeBoundary, TypedWorkerClient, TypedWorkerHandle, TypedWorkerInit,
+};
 
 use crate::query::models::{HealthStats, QueryNode};
 use crate::query::path::root_file_name_bytes;
@@ -20,43 +19,14 @@ use crate::runtime::seam::exchange_host_adapter;
 use crate::sink::{SinkFileMeta, SinkStatusSnapshot, VisibilityLagSample};
 use crate::source::config::{GrantedMountRoot, SourceConfig};
 use crate::workers::sink_ipc::{
-    SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, SinkWorkerInitConfig, SinkWorkerRequest,
-    SinkWorkerResponse, decode_request, decode_response, encode_request, encode_response,
-    sink_worker_control_route_key_for,
+    SinkWorkerInitConfig, SinkWorkerRequest, SinkWorkerResponse, decode_request, decode_response,
+    encode_request, encode_response,
 };
 
-const SINK_WORKER_INIT_RPC_TIMEOUT: Duration = Duration::from_secs(60);
-const SINK_WORKER_INIT_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
-const SINK_WORKER_START_RPC_TIMEOUT: Duration = Duration::from_secs(60);
-const SINK_WORKER_START_TOTAL_TIMEOUT: Duration = Duration::from_secs(120);
-const SINK_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
 const SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
 const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
-
-fn sink_worker_timeouts() -> WorkerBootstrapTimeouts {
-    WorkerBootstrapTimeouts::new(
-        SINK_WORKER_CONTROL_RPC_TIMEOUT,
-        SINK_WORKER_START_TOTAL_TIMEOUT,
-        SINK_WORKER_INIT_RPC_TIMEOUT,
-        SINK_WORKER_INIT_TOTAL_TIMEOUT,
-        SINK_WORKER_START_RPC_TIMEOUT,
-        SINK_WORKER_START_TOTAL_TIMEOUT,
-        Duration::from_millis(100),
-    )
-}
-
-fn is_sink_worker_not_initialized(err: &CnxError) -> bool {
-    matches!(err, CnxError::PeerError(message) if message == "sink worker not initialized")
-}
-
-fn sink_worker_bootstrap_frame(request: &SinkWorkerRequest) -> Result<ControlEnvelope> {
-    Ok(encode_control_frame(
-        SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
-        encode_request(request)?,
-    ))
-}
 
 fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
     let mut selected = None::<QueryNode>;
@@ -110,7 +80,7 @@ fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<Que
 pub struct SinkWorkerClientHandle {
     node_id: NodeId,
     config: SourceConfig,
-    worker_binding: WorkerArtifactBinding,
+    worker_binding: RuntimeWorkerBinding,
     boundary: Arc<CompositeRuntimeBoundary>,
     worker: TypedWorkerHandle<SinkWorkerRpc, SourceConfig, CompositeRuntimeBoundary>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
@@ -121,60 +91,27 @@ impl SinkWorkerClientHandle {
     pub(crate) fn new(
         node_id: NodeId,
         config: SourceConfig,
-        worker_binding: WorkerArtifactBinding,
+        worker_binding: RuntimeWorkerBinding,
         boundary: Arc<CompositeRuntimeBoundary>,
-    ) -> Self {
+    ) -> Result<Self> {
         let logical_roots_cache = Arc::new(Mutex::new(config.roots.clone()));
-        let worker_binding_for_bin = worker_binding.clone();
-        let worker_binding_for_socket = worker_binding.clone();
-        Self {
-            worker: TypedWorkerHandle::new(
+        Ok(Self {
+            worker: TypedWorkerHandle::for_runtime_binding(
                 node_id.clone(),
                 config.clone(),
                 boundary.clone(),
-                WorkerBootstrapSpec::new(
-                    "fs-meta-sink-worker",
-                    |node_id| RouteKey(sink_worker_control_route_key_for(&node_id.0)),
-                    move |_config: &SourceConfig| {
-                        worker_binding_for_bin
-                            .external_startup_path()
-                            .map(|path| path.to_path_buf())
-                    },
-                    move |_config: &SourceConfig| worker_binding_for_socket.socket_dir.clone(),
-                    sink_worker_timeouts(),
-                    is_sink_worker_not_initialized,
-                    |node_id, config| {
-                        let init = SinkWorkerInitConfig {
-                            roots: config.roots.clone(),
-                            host_object_grants: config.host_object_grants.clone(),
-                            sink_tombstone_ttl_ms: config.sink_tombstone_ttl.as_millis() as u64,
-                            sink_tombstone_tolerance_us: config.sink_tombstone_tolerance_us,
-                        };
-                        Ok(vec![sink_worker_bootstrap_frame(&SinkWorkerRequest::Init {
-                            node_id: node_id.0.clone(),
-                            config: init,
-                        })?])
-                    },
-                    |_node_id, _config| {
-                        Ok(vec![
-                            sink_worker_bootstrap_frame(&SinkWorkerRequest::Start)?,
-                            sink_worker_bootstrap_frame(&SinkWorkerRequest::Ping)?,
-                        ])
-                    },
-                ),
-            ),
+                worker_binding.clone(),
+            )?,
             node_id,
             config,
             worker_binding,
             boundary,
             logical_roots_cache,
             status_cache: Arc::new(Mutex::new(SinkStatusSnapshot::default())),
-        }
+        })
     }
 
-    fn existing_client(
-        &self,
-    ) -> Result<Option<TypedWorkerClient<SinkWorkerRpc>>> {
+    fn existing_client(&self) -> Result<Option<TypedWorkerClient<SinkWorkerRpc>>> {
         self.worker.existing_client()
     }
 
@@ -229,14 +166,6 @@ impl SinkWorkerClientHandle {
         timeout: Duration,
     ) -> Result<SinkWorkerResponse> {
         client.call_with_timeout(request, timeout)
-    }
-
-    fn control_worker(
-        client: &TypedWorkerClient<SinkWorkerRpc>,
-        request: SinkWorkerRequest,
-        timeout: Duration,
-    ) -> Result<()> {
-        client.control_frames(&[sink_worker_bootstrap_frame(&request)?], timeout)
     }
 
     pub fn ensure_started(&self) -> Result<()> {
@@ -424,7 +353,10 @@ impl SinkWorkerClientHandle {
         })
     }
 
-    pub fn materialized_query_nonblocking(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
+    pub fn materialized_query_nonblocking(
+        &self,
+        request: InternalQueryRequest,
+    ) -> Result<Vec<Event>> {
         match self.existing_client()? {
             Some(client) => match Self::call_worker(
                 &client,
@@ -540,16 +472,21 @@ impl SinkWorkerClientHandle {
 
     pub fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
         self.ensure_started()?;
-        Self::control_worker(
+        match Self::call_worker(
             &self.client()?,
             SinkWorkerRequest::OnControlFrame { envelopes },
             Duration::from_secs(5),
-        )
+        )? {
+            SinkWorkerResponse::Ack => Ok(()),
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected sink worker response for on_control_frame: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn close(&self) -> Result<()> {
-        self.worker
-            .close(SinkWorkerRequest::Close, Duration::from_secs(2))
+        self.worker.shutdown(Duration::from_secs(2))
     }
 }
 
@@ -685,7 +622,10 @@ impl SinkFacade {
         }
     }
 
-    pub fn materialized_query_nonblocking(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
+    pub fn materialized_query_nonblocking(
+        &self,
+        request: &InternalQueryRequest,
+    ) -> Result<Vec<Event>> {
         match self {
             Self::Local(sink) => sink.materialized_query(request),
             Self::Worker(client) => client.materialized_query_nonblocking(request.clone()),
@@ -708,7 +648,7 @@ impl SinkFacade {
                         client.config.clone(),
                         client.worker_binding.clone(),
                         client.boundary.clone(),
-                    );
+                    )?;
                     remote.materialized_query(request.clone())
                 }
             }
@@ -794,5 +734,18 @@ capanix_worker_runtime_support::define_typed_worker_rpc! {
         invalid_input: SinkWorkerResponse::InvalidInput,
         error: SinkWorkerResponse::Error,
         unavailable: "sink worker unavailable",
+    }
+}
+
+impl TypedWorkerInit<SourceConfig> for SinkWorkerRpc {
+    type InitPayload = SinkWorkerInitConfig;
+
+    fn init_payload(_node_id: &NodeId, config: &SourceConfig) -> Result<Self::InitPayload> {
+        Ok(SinkWorkerInitConfig {
+            roots: config.roots.clone(),
+            host_object_grants: config.host_object_grants.clone(),
+            sink_tombstone_ttl_ms: config.sink_tombstone_ttl.as_millis() as u64,
+            sink_tombstone_tolerance_us: config.sink_tombstone_tolerance_us,
+        })
     }
 }

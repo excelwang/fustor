@@ -276,9 +276,7 @@ pub fn assert_cluster_bootstrap_governance_real_cluster() {
 #[allow(dead_code)]
 pub fn assert_runtime_orchestrated_multiprocess_config_apply_e2e() {
     if std::env::var("CAPANIX_RUNTIME_SCOPE_E2E").ok().as_deref() != Some("1") {
-        eprintln!(
-            "skip runtime-scope e2e: requires CAPANIX_RUNTIME_SCOPE_E2E=1"
-        );
+        eprintln!("skip runtime-scope e2e: requires CAPANIX_RUNTIME_SCOPE_E2E=1");
         return;
     }
     let mut last_err: Option<String> = None;
@@ -302,9 +300,7 @@ pub fn assert_runtime_orchestrated_multiprocess_config_apply_e2e() {
 #[allow(dead_code)]
 pub fn assert_single_entrypoint_distributed_apply_e2e() {
     if std::env::var("CAPANIX_RUNTIME_SCOPE_E2E").ok().as_deref() != Some("1") {
-        eprintln!(
-            "skip runtime-scope e2e: requires CAPANIX_RUNTIME_SCOPE_E2E=1"
-        );
+        eprintln!("skip runtime-scope e2e: requires CAPANIX_RUNTIME_SCOPE_E2E=1");
         return;
     }
     if let Err(err) = harness::scenario_single_entrypoint_distributed_apply_e2e() {

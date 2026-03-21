@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -5,18 +6,19 @@ use crate::api::facade_status::{
     FacadePendingReason, SharedFacadePendingStatus, SharedFacadePendingStatusCell,
     shared_facade_pending_status_cell,
 };
+use crate::query::TreeGroupPayload;
 #[cfg(test)]
 use crate::query::observation::{
     ObservationTrustPolicy, candidate_group_observation_evidence, evaluate_observation_status,
 };
 #[cfg(test)]
 use crate::query::tree::ObservationState;
-use crate::query::TreeGroupPayload;
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryNode, SubtreeStats};
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::{
-    FacadeControlSignal, FacadeRuntimeUnit, split_app_control_signals,
+    FacadeControlSignal, FacadeRuntimeUnit, SinkControlSignal, SourceControlSignal,
+    split_app_control_signals,
 };
 use crate::runtime::routes::{
     METHOD_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
@@ -30,14 +32,16 @@ use crate::workers::source::{SourceFacade, SourceWorkerClientHandle};
 use crate::{FSMetaConfig, api, source};
 use async_trait::async_trait;
 use capanix_app_sdk::raw::{ChannelBoundary, ChannelIoSubset, StateBoundary};
+#[cfg(test)]
+use capanix_app_sdk::runtime::ConfigValue;
 use capanix_app_sdk::runtime::{
-    ConfigValue, ControlEnvelope, EventMetadata, NodeId, RecvOpts, in_memory_state_boundary,
+    ControlEnvelope, EventMetadata, NodeId, RecvOpts, RuntimeWorkerBinding, RuntimeWorkerBindings,
+    RuntimeWorkerLauncherKind, in_memory_state_boundary,
 };
 use capanix_app_sdk::worker::WorkerMode;
 use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryApp};
-use capanix_managed_state_sdk::{
-    ManagedStateBuilder, ManagedStateDeclaration, ManagedStateProfile, RuntimeLoadedManagedState,
-};
+use capanix_managed_state_sdk::{ManagedStateDeclaration, ManagedStateProfile};
+use capanix_service_sdk::{AppBuilder, RuntimeBootstrapContext, RuntimeLoadedServiceApp};
 use capanix_worker_runtime_support::CompositeRuntimeBoundary;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -46,9 +50,9 @@ use crate::sink::SinkFileMeta;
 #[cfg(test)]
 use crate::source::config::SourceConfig;
 
-// Top-level fs-meta runtime authoring lowers through `managed-state-sdk ->
-// service-sdk -> app-sdk`; direct runtime-api use is confined to narrow infra
-// seams such as boundary conversion helpers.
+// Top-level fs-meta runtime authoring lowers through `service-sdk -> app-sdk`;
+// direct runtime-api use is confined to narrow infra seams such as boundary
+// conversion helpers and compiled worker-binding admission.
 
 struct FacadeActivation {
     route_key: String,
@@ -68,6 +72,66 @@ struct PendingFacadeActivation {
     runtime_managed: bool,
     runtime_exposure_confirmed: bool,
     resolved: api::config::ResolvedApiConfig,
+}
+
+fn default_runtime_worker_binding(
+    role_id: &str,
+    mode: WorkerMode,
+    module_path: Option<&std::path::Path>,
+) -> RuntimeWorkerBinding {
+    RuntimeWorkerBinding {
+        role_id: role_id.to_string(),
+        mode,
+        launcher_kind: match mode {
+            WorkerMode::Embedded => RuntimeWorkerLauncherKind::Embedded,
+            WorkerMode::External => RuntimeWorkerLauncherKind::WorkerHost,
+        },
+        module_path: match mode {
+            WorkerMode::Embedded => None,
+            WorkerMode::External => module_path.map(std::path::Path::to_path_buf),
+        },
+        socket_dir: None,
+    }
+}
+
+fn local_runtime_worker_binding(role_id: &str) -> RuntimeWorkerBinding {
+    default_runtime_worker_binding(role_id, WorkerMode::Embedded, None)
+}
+
+fn required_runtime_worker_binding(
+    bindings: &RuntimeWorkerBindings,
+    role_id: &str,
+) -> Result<RuntimeWorkerBinding> {
+    bindings.roles.get(role_id).cloned().ok_or_else(|| {
+        CnxError::InvalidInput(format!(
+            "compiled runtime worker bindings must declare role '{role_id}'"
+        ))
+    })
+}
+
+fn runtime_worker_client_bindings(
+    bindings: &RuntimeWorkerBindings,
+) -> Result<(RuntimeWorkerBinding, RuntimeWorkerBinding)> {
+    let facade = required_runtime_worker_binding(bindings, "facade")?;
+    if facade.mode != WorkerMode::Embedded {
+        return Err(CnxError::InvalidInput(
+            "runtime worker binding for 'facade' must remain embedded".into(),
+        ));
+    }
+    let source = required_runtime_worker_binding(bindings, "source")?;
+    let scan = required_runtime_worker_binding(bindings, "scan")?;
+    let sink = required_runtime_worker_binding(bindings, "sink")?;
+    if source.mode != scan.mode {
+        return Err(CnxError::InvalidInput(
+            "runtime worker bindings for 'source' and 'scan' must use the same mode while they still share one realization".into(),
+        ));
+    }
+    if source.module_path != scan.module_path {
+        return Err(CnxError::InvalidInput(
+            "runtime worker bindings for 'source' and 'scan' must use the same module_path while they still share one realization".into(),
+        ));
+    }
+    Ok((source, sink))
 }
 
 pub(crate) fn shared_tokio_runtime() -> &'static tokio::runtime::Runtime {
@@ -94,16 +158,12 @@ fn now_us() -> u64 {
 
 fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
     match unit {
-        FacadeRuntimeUnit::Facade => {
-            route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
-        }
+        FacadeRuntimeUnit::Facade => route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
         FacadeRuntimeUnit::Query => {
             route_key == format!("{}.req", ROUTE_KEY_QUERY)
                 || route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
         }
-        FacadeRuntimeUnit::QueryPeer => {
-            route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY)
-        }
+        FacadeRuntimeUnit::QueryPeer => route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
     }
 }
 
@@ -121,11 +181,21 @@ pub struct FSMetaApp {
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
     facade_pending_status: SharedFacadePendingStatusCell,
     facade_gate: RuntimeUnitGate,
+    control_initialized: AtomicBool,
+    control_init_lock: Mutex<()>,
 }
 
 impl FSMetaApp {
     pub fn new(config: FSMetaConfig, node_id: NodeId) -> Result<Self> {
-        Self::with_boundaries(config, node_id, None)
+        Self::with_runtime_workers_and_state(
+            config,
+            local_runtime_worker_binding("source"),
+            local_runtime_worker_binding("sink"),
+            node_id,
+            None,
+            None,
+            in_memory_state_boundary(),
+        )
     }
 
     pub fn with_boundaries(
@@ -133,11 +203,41 @@ impl FSMetaApp {
         node_id: NodeId,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
     ) -> Result<Self> {
-        Self::with_boundaries_and_state(config, node_id, boundary, None, in_memory_state_boundary())
+        Self::with_runtime_workers_and_state(
+            config,
+            local_runtime_worker_binding("source"),
+            local_runtime_worker_binding("sink"),
+            node_id,
+            boundary,
+            None,
+            in_memory_state_boundary(),
+        )
     }
 
     pub(crate) fn with_boundaries_and_state(
         config: FSMetaConfig,
+        source_worker_binding: RuntimeWorkerBinding,
+        sink_worker_binding: RuntimeWorkerBinding,
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        ordinary_boundary: Option<Arc<dyn ChannelBoundary>>,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> Result<Self> {
+        Self::with_runtime_workers_and_state(
+            config,
+            source_worker_binding,
+            sink_worker_binding,
+            node_id,
+            boundary,
+            ordinary_boundary,
+            state_boundary,
+        )
+    }
+
+    fn with_runtime_workers_and_state(
+        config: FSMetaConfig,
+        source_worker_binding: RuntimeWorkerBinding,
+        sink_worker_binding: RuntimeWorkerBinding,
         node_id: NodeId,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
         ordinary_boundary: Option<Arc<dyn ChannelBoundary>>,
@@ -145,7 +245,7 @@ impl FSMetaApp {
     ) -> Result<Self> {
         let source_cfg = config.source.clone();
         let sink_source_cfg = config.source.clone();
-        let source = match config.runtime_workers.source.mode {
+        let source = match source_worker_binding.mode {
             WorkerMode::Embedded => Arc::new(SourceFacade::local(Arc::new(
                 source::FSMetaSource::with_boundaries_and_state(
                     source_cfg,
@@ -171,9 +271,9 @@ impl FSMetaApp {
                         SourceWorkerClientHandle::new(
                             node_id.clone(),
                             config.source.clone(),
-                            config.runtime_workers.source.clone(),
+                            source_worker_binding.clone(),
                             pair,
-                        ),
+                        )?,
                     )))
                 }
                 None => {
@@ -183,7 +283,7 @@ impl FSMetaApp {
                 }
             },
         };
-        let sink = match config.runtime_workers.sink.mode {
+        let sink = match sink_worker_binding.mode {
             WorkerMode::Embedded => Arc::new(SinkFacade::local(Arc::new(
                 SinkFileMeta::with_boundaries_and_state(
                     node_id.clone(),
@@ -208,9 +308,9 @@ impl FSMetaApp {
                     Arc::new(SinkFacade::worker(Arc::new(SinkWorkerClientHandle::new(
                         node_id.clone(),
                         sink_source_cfg.clone(),
-                        config.runtime_workers.sink.clone(),
+                        sink_worker_binding.clone(),
                         pair,
-                    ))))
+                    )?)))
                 }
                 None => {
                     return Err(CnxError::InvalidInput(
@@ -241,10 +341,68 @@ impl FSMetaApp {
                     execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
                 ],
             ),
+            control_initialized: AtomicBool::new(false),
+            control_init_lock: Mutex::new(()),
         })
     }
 
-    pub async fn start(&self) -> Result<()> {
+    fn control_initialized(&self) -> bool {
+        self.control_initialized.load(Ordering::Acquire)
+    }
+
+    fn should_initialize_from_control(
+        source_signals: &[SourceControlSignal],
+        sink_signals: &[SinkControlSignal],
+        facade_signals: &[FacadeControlSignal],
+    ) -> bool {
+        source_signals.iter().any(Self::source_signal_can_initialize)
+            || sink_signals.iter().any(Self::sink_signal_can_initialize)
+            || facade_signals.iter().any(Self::facade_signal_can_initialize)
+    }
+
+    fn source_signal_can_initialize(signal: &SourceControlSignal) -> bool {
+        matches!(
+            signal,
+            SourceControlSignal::Activate { .. }
+                | SourceControlSignal::Deactivate { .. }
+                | SourceControlSignal::Tick { .. }
+        )
+    }
+
+    fn sink_signal_can_initialize(signal: &SinkControlSignal) -> bool {
+        matches!(
+            signal,
+            SinkControlSignal::Activate { .. }
+                | SinkControlSignal::Deactivate { .. }
+                | SinkControlSignal::Tick { .. }
+        )
+    }
+
+    fn facade_signal_can_initialize(signal: &FacadeControlSignal) -> bool {
+        matches!(
+            signal,
+            FacadeControlSignal::Activate { .. }
+                | FacadeControlSignal::Deactivate { .. }
+                | FacadeControlSignal::Tick { .. }
+                | FacadeControlSignal::ExposureConfirmed { .. }
+        )
+    }
+
+    fn not_ready_error() -> CnxError {
+        CnxError::NotReady(
+            "fs-meta request handling is unavailable until runtime control initializes the app"
+                .into(),
+        )
+    }
+
+    async fn initialize_from_control(&self) -> Result<()> {
+        if self.control_initialized() {
+            return Ok(());
+        }
+        let _guard = self.control_init_lock.lock().await;
+        if self.control_initialized() {
+            return Ok(());
+        }
         if !self.config.api.enabled {
             return Err(CnxError::InvalidInput(
                 "api.enabled must be true; fs-meta management API boundary is mandatory".into(),
@@ -264,8 +422,13 @@ impl FSMetaApp {
         drop(guard);
 
         self.ensure_runtime_proxy_endpoints_started().await?;
+        self.control_initialized.store(true, Ordering::Release);
 
         Ok(())
+    }
+
+    pub async fn start(&self) -> Result<()> {
+        self.initialize_from_control().await
     }
 
     pub async fn send(&self, events: &[Event]) -> Result<()> {
@@ -277,10 +440,16 @@ impl FSMetaApp {
     }
 
     async fn service_send(&self, events: &[Event]) -> Result<()> {
+        if !self.control_initialized() {
+            return Err(Self::not_ready_error());
+        }
         self.sink.send(events).await
     }
 
     async fn service_recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
+        if !self.control_initialized() {
+            return Err(Self::not_ready_error());
+        }
         self.sink.recv(opts).await
     }
 
@@ -300,80 +469,80 @@ impl FSMetaApp {
             if !query_active || !spawned_routes.insert(route.0.clone()) {
                 // Not currently selected as query ingress owner, or already running.
             } else {
-            let boundary_for_calls = self.runtime_boundary.clone().ok_or_else(|| {
-                CnxError::InvalidInput("fs-meta public query requires runtime boundary".into())
-            })?;
-            let caller_node = self.node_id.clone();
-            eprintln!(
-                "fs_meta_runtime_app: spawning public query endpoint route={}",
-                route.0
-            );
-            let endpoint = ManagedEndpointTask::spawn(
-                boundary.clone(),
-                route,
-                format!("app:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
-                tokio_util::sync::CancellationToken::new(),
-                move |requests| {
-                    let mut responses = Vec::new();
-                    for req in requests {
-                        let Ok(params) =
-                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                        else {
-                            continue;
-                        };
-                        eprintln!(
-                            "fs_meta_runtime_app: public query request selected_group={:?} recursive={} path={}",
-                            params.scope.selected_group,
-                            params.scope.recursive,
-                            String::from_utf8_lossy(&params.scope.path)
-                        );
-                        let result: Result<Vec<Event>> = (|| {
-                            let adapter = crate::runtime::seam::exchange_host_adapter(
-                                boundary_for_calls.clone(),
-                                caller_node.clone(),
-                                crate::runtime::routes::default_route_bindings(),
+                let boundary_for_calls = self.runtime_boundary.clone().ok_or_else(|| {
+                    CnxError::InvalidInput("fs-meta public query requires runtime boundary".into())
+                })?;
+                let caller_node = self.node_id.clone();
+                eprintln!(
+                    "fs_meta_runtime_app: spawning public query endpoint route={}",
+                    route.0
+                );
+                let endpoint = ManagedEndpointTask::spawn(
+                    boundary.clone(),
+                    route,
+                    format!("app:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
+                    tokio_util::sync::CancellationToken::new(),
+                    move |requests| {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            let Ok(params) =
+                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            else {
+                                continue;
+                            };
+                            eprintln!(
+                                "fs_meta_runtime_app: public query request selected_group={:?} recursive={} path={}",
+                                params.scope.selected_group,
+                                params.scope.recursive,
+                                String::from_utf8_lossy(&params.scope.path)
                             );
-                            let payload = rmp_serde::to_vec(&params).map_err(|err| {
-                                CnxError::Internal(format!(
-                                    "encode public query request failed: {err}"
-                                ))
-                            })?;
-                            capanix_host_adapter_fs::HostAdapter::call_collect(
-                                &adapter,
-                                ROUTE_TOKEN_FS_META_INTERNAL,
-                                crate::runtime::routes::METHOD_SINK_QUERY_PROXY,
-                                bytes::Bytes::from(payload),
-                                Duration::from_secs(30),
-                                Duration::from_secs(5),
-                            )
-                        })();
-                        match result {
-                            Ok(mut events) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: public query response events={}",
-                                    events.len()
+                            let result: Result<Vec<Event>> = (|| {
+                                let adapter = crate::runtime::seam::exchange_host_adapter(
+                                    boundary_for_calls.clone(),
+                                    caller_node.clone(),
+                                    crate::runtime::routes::default_route_bindings(),
                                 );
-                                for event in &mut events {
-                                    let mut meta = event.metadata().clone();
-                                    meta.correlation_id = req.metadata().correlation_id;
-                                    responses.push(Event::new(
-                                        meta,
-                                        bytes::Bytes::copy_from_slice(event.payload_bytes()),
-                                    ));
+                                let payload = rmp_serde::to_vec(&params).map_err(|err| {
+                                    CnxError::Internal(format!(
+                                        "encode public query request failed: {err}"
+                                    ))
+                                })?;
+                                capanix_host_adapter_fs::HostAdapter::call_collect(
+                                    &adapter,
+                                    ROUTE_TOKEN_FS_META_INTERNAL,
+                                    crate::runtime::routes::METHOD_SINK_QUERY_PROXY,
+                                    bytes::Bytes::from(payload),
+                                    Duration::from_secs(30),
+                                    Duration::from_secs(5),
+                                )
+                            })();
+                            match result {
+                                Ok(mut events) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: public query response events={}",
+                                        events.len()
+                                    );
+                                    for event in &mut events {
+                                        let mut meta = event.metadata().clone();
+                                        meta.correlation_id = req.metadata().correlation_id;
+                                        responses.push(Event::new(
+                                            meta,
+                                            bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                        ));
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: public query failed err={}",
+                                        err
+                                    );
                                 }
                             }
-                            Err(err) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: public query failed err={}",
-                                    err
-                                );
-                            }
                         }
-                    }
-                    responses
-                },
-            );
-            tasks.push(endpoint);
+                        responses
+                    },
+                );
+                tasks.push(endpoint);
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
@@ -385,51 +554,54 @@ impl FSMetaApp {
             if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
                 // Not currently selected as peer sink-status owner, or already running.
             } else {
-            let sink = self.sink.clone();
-            eprintln!(
-                "fs_meta_runtime_app: spawning sink status endpoint route={}",
-                route.0
-            );
-            let endpoint = ManagedEndpointTask::spawn(
-                boundary.clone(),
-                route,
-                format!("app:{}:{}", ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS),
-                tokio_util::sync::CancellationToken::new(),
-                move |requests| {
-                    let mut responses = Vec::new();
-                    for req in requests {
-                        match sink.status_snapshot() {
-                            Ok(snapshot) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: sink status endpoint response groups={}",
-                                    snapshot.groups.len()
-                                );
-                                if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
-                                    responses.push(Event::new(
-                                        EventMetadata {
-                                            origin_id: req.metadata().origin_id.clone(),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        bytes::Bytes::from(payload),
-                                    ));
+                let sink = self.sink.clone();
+                eprintln!(
+                    "fs_meta_runtime_app: spawning sink status endpoint route={}",
+                    route.0
+                );
+                let endpoint = ManagedEndpointTask::spawn(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "app:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
+                    ),
+                    tokio_util::sync::CancellationToken::new(),
+                    move |requests| {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            match sink.status_snapshot() {
+                                Ok(snapshot) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: sink status endpoint response groups={}",
+                                        snapshot.groups.len()
+                                    );
+                                    if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                        responses.push(Event::new(
+                                            EventMetadata {
+                                                origin_id: req.metadata().origin_id.clone(),
+                                                timestamp_us: now_us(),
+                                                logical_ts: None,
+                                                correlation_id: req.metadata().correlation_id,
+                                                ingress_auth: None,
+                                                trace: None,
+                                            },
+                                            bytes::Bytes::from(payload),
+                                        ));
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: sink status endpoint failed err={}",
+                                        err
+                                    );
                                 }
                             }
-                            Err(err) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: sink status endpoint failed err={}",
-                                    err
-                                );
-                            }
                         }
-                    }
-                    responses
-                },
-            );
-            tasks.push(endpoint);
+                        responses
+                    },
+                );
+                tasks.push(endpoint);
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS) {
@@ -441,68 +613,71 @@ impl FSMetaApp {
             if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
                 // Not currently selected as peer source-status owner, or already running.
             } else {
-            let source = self.source.clone();
-            eprintln!(
-                "fs_meta_runtime_app: spawning source status endpoint route={}",
-                route.0
-            );
-            let endpoint = ManagedEndpointTask::spawn(
-                boundary.clone(),
-                route,
-                format!("app:{}:{}", ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS),
-                tokio_util::sync::CancellationToken::new(),
-                move |requests| {
-                    let mut responses = Vec::new();
-                    for req in requests {
-                        match source.observability_snapshot() {
-                            Ok(snapshot) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: source status endpoint response groups={} runners={}",
-                                    snapshot.source_primary_by_group.len(),
-                                    snapshot.last_force_find_runner_by_group.len()
-                                );
-                                if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
-                                    responses.push(Event::new(
-                                        EventMetadata {
-                                            origin_id: req.metadata().origin_id.clone(),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        bytes::Bytes::from(payload),
-                                    ));
+                let source = self.source.clone();
+                eprintln!(
+                    "fs_meta_runtime_app: spawning source status endpoint route={}",
+                    route.0
+                );
+                let endpoint = ManagedEndpointTask::spawn(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "app:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS
+                    ),
+                    tokio_util::sync::CancellationToken::new(),
+                    move |requests| {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            match source.observability_snapshot() {
+                                Ok(snapshot) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: source status endpoint response groups={} runners={}",
+                                        snapshot.source_primary_by_group.len(),
+                                        snapshot.last_force_find_runner_by_group.len()
+                                    );
+                                    if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                        responses.push(Event::new(
+                                            EventMetadata {
+                                                origin_id: req.metadata().origin_id.clone(),
+                                                timestamp_us: now_us(),
+                                                logical_ts: None,
+                                                correlation_id: req.metadata().correlation_id,
+                                                ingress_auth: None,
+                                                trace: None,
+                                            },
+                                            bytes::Bytes::from(payload),
+                                        ));
+                                    }
                                 }
-                            }
-                            Err(err) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: source status endpoint failed err={}",
-                                    err
-                                );
-                                let snapshot = source.degraded_observability_snapshot(format!(
-                                    "source status snapshot unavailable: {err}"
-                                ));
-                                if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
-                                    responses.push(Event::new(
-                                        EventMetadata {
-                                            origin_id: req.metadata().origin_id.clone(),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        bytes::Bytes::from(payload),
+                                Err(err) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: source status endpoint failed err={}",
+                                        err
+                                    );
+                                    let snapshot = source.degraded_observability_snapshot(format!(
+                                        "source status snapshot unavailable: {err}"
                                     ));
+                                    if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                        responses.push(Event::new(
+                                            EventMetadata {
+                                                origin_id: req.metadata().origin_id.clone(),
+                                                timestamp_us: now_us(),
+                                                logical_ts: None,
+                                                correlation_id: req.metadata().correlation_id,
+                                                ingress_auth: None,
+                                                trace: None,
+                                            },
+                                            bytes::Bytes::from(payload),
+                                        ));
+                                    }
                                 }
                             }
                         }
-                    }
-                    responses
-                },
-            );
-            tasks.push(endpoint);
+                        responses
+                    },
+                );
+                tasks.push(endpoint);
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY) {
@@ -514,75 +689,76 @@ impl FSMetaApp {
             if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
                 // Not currently selected as peer query owner, or already running.
             } else {
-            eprintln!(
-                "fs_meta_runtime_app: spawning sink query proxy endpoint route={}",
-                route.0
-            );
-            let sink = self.sink.clone();
-            let endpoint = ManagedEndpointTask::spawn(
-                boundary.clone(),
-                route,
-                format!("app:{}:{}", ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY),
-                tokio_util::sync::CancellationToken::new(),
-                move |requests| {
-                    let mut responses = Vec::new();
-                    for req in requests {
-                        let Ok(params) =
-                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                        else {
-                            continue;
-                        };
-                        eprintln!(
-                            "fs_meta_runtime_app: sink query proxy request selected_group={:?} recursive={} path={}",
-                            params.scope.selected_group,
-                            params.scope.recursive,
-                            String::from_utf8_lossy(&params.scope.path)
-                        );
-                        let result = sink.materialized_query_nonblocking(&params);
-                        match result {
-                            Ok(mut events) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: sink query proxy response events={}",
-                                    events.len()
-                                );
-                                for event in &mut events {
-                                    let mut meta = event.metadata().clone();
-                                    meta.correlation_id = req.metadata().correlation_id;
+                eprintln!(
+                    "fs_meta_runtime_app: spawning sink query proxy endpoint route={}",
+                    route.0
+                );
+                let sink = self.sink.clone();
+                let endpoint = ManagedEndpointTask::spawn(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "app:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY
+                    ),
+                    tokio_util::sync::CancellationToken::new(),
+                    move |requests| {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            let Ok(params) =
+                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            else {
+                                continue;
+                            };
+                            eprintln!(
+                                "fs_meta_runtime_app: sink query proxy request selected_group={:?} recursive={} path={}",
+                                params.scope.selected_group,
+                                params.scope.recursive,
+                                String::from_utf8_lossy(&params.scope.path)
+                            );
+                            let result = sink.materialized_query_nonblocking(&params);
+                            match result {
+                                Ok(mut events) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: sink query proxy response events={}",
+                                        events.len()
+                                    );
+                                    for event in &mut events {
+                                        let mut meta = event.metadata().clone();
+                                        meta.correlation_id = req.metadata().correlation_id;
+                                        responses.push(Event::new(
+                                            meta,
+                                            bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                        ));
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: sink query proxy failed err={}",
+                                        err
+                                    );
                                     responses.push(Event::new(
-                                        meta,
-                                        bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                        EventMetadata {
+                                            origin_id: NodeId(
+                                                params.scope.selected_group.clone().unwrap_or_else(
+                                                    || "sink-query-proxy".to_string(),
+                                                ),
+                                            ),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        bytes::Bytes::from(err.to_string()),
                                     ));
                                 }
                             }
-                            Err(err) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: sink query proxy failed err={}",
-                                    err
-                                );
-                                responses.push(Event::new(
-                                    EventMetadata {
-                                        origin_id: NodeId(
-                                            params
-                                                .scope
-                                                .selected_group
-                                                .clone()
-                                                .unwrap_or_else(|| "sink-query-proxy".to_string()),
-                                        ),
-                                        timestamp_us: now_us(),
-                                        logical_ts: None,
-                                        correlation_id: req.metadata().correlation_id,
-                                        ingress_auth: None,
-                                        trace: None,
-                                    },
-                                    bytes::Bytes::from(err.to_string()),
-                                ));
-                            }
                         }
-                    }
-                    responses
-                },
-            );
-            tasks.push(endpoint);
+                        responses
+                    },
+                );
+                tasks.push(endpoint);
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
@@ -594,74 +770,75 @@ impl FSMetaApp {
             if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
                 // Not currently selected as peer query owner, or already running.
             } else {
-            eprintln!(
-                "fs_meta_runtime_app: spawning source find proxy endpoint route={}",
-                route.0
-            );
-            let source = self.source.clone();
-            let endpoint = ManagedEndpointTask::spawn(
-                boundary.clone(),
-                route,
-                format!("app:{}:{}", ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND),
-                tokio_util::sync::CancellationToken::new(),
-                move |requests| {
-                    let mut responses = Vec::new();
-                    for req in requests {
-                        let Ok(params) =
-                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                        else {
-                            continue;
-                        };
-                        eprintln!(
-                            "fs_meta_runtime_app: source find proxy request selected_group={:?} recursive={} path={}",
-                            params.scope.selected_group,
-                            params.scope.recursive,
-                            String::from_utf8_lossy(&params.scope.path)
-                        );
-                        match source.force_find(&params) {
-                            Ok(mut events) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: source find proxy response events={}",
-                                    events.len()
-                                );
-                                for event in &mut events {
-                                    let mut meta = event.metadata().clone();
-                                    meta.correlation_id = req.metadata().correlation_id;
+                eprintln!(
+                    "fs_meta_runtime_app: spawning source find proxy endpoint route={}",
+                    route.0
+                );
+                let source = self.source.clone();
+                let endpoint = ManagedEndpointTask::spawn(
+                    boundary.clone(),
+                    route,
+                    format!(
+                        "app:{}:{}",
+                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND
+                    ),
+                    tokio_util::sync::CancellationToken::new(),
+                    move |requests| {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            let Ok(params) =
+                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            else {
+                                continue;
+                            };
+                            eprintln!(
+                                "fs_meta_runtime_app: source find proxy request selected_group={:?} recursive={} path={}",
+                                params.scope.selected_group,
+                                params.scope.recursive,
+                                String::from_utf8_lossy(&params.scope.path)
+                            );
+                            match source.force_find(&params) {
+                                Ok(mut events) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: source find proxy response events={}",
+                                        events.len()
+                                    );
+                                    for event in &mut events {
+                                        let mut meta = event.metadata().clone();
+                                        meta.correlation_id = req.metadata().correlation_id;
+                                        responses.push(Event::new(
+                                            meta,
+                                            bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                        ));
+                                    }
+                                }
+                                Err(err) => {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: source find proxy failed err={}",
+                                        err
+                                    );
                                     responses.push(Event::new(
-                                        meta,
-                                        bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                        EventMetadata {
+                                            origin_id: NodeId(
+                                                params.scope.selected_group.clone().unwrap_or_else(
+                                                    || "source-find-proxy".to_string(),
+                                                ),
+                                            ),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        bytes::Bytes::from(err.to_string()),
                                     ));
                                 }
                             }
-                            Err(err) => {
-                                eprintln!(
-                                    "fs_meta_runtime_app: source find proxy failed err={}",
-                                    err
-                                );
-                                responses.push(Event::new(
-                                    EventMetadata {
-                                        origin_id: NodeId(
-                                            params
-                                                .scope
-                                                .selected_group
-                                                .clone()
-                                                .unwrap_or_else(|| "source-find-proxy".to_string()),
-                                        ),
-                                        timestamp_us: now_us(),
-                                        logical_ts: None,
-                                        correlation_id: req.metadata().correlation_id,
-                                        ingress_auth: None,
-                                        trace: None,
-                                    },
-                                    bytes::Bytes::from(err.to_string()),
-                                ));
-                            }
                         }
-                    }
-                    responses
-                },
-            );
-            tasks.push(endpoint);
+                        responses
+                    },
+                );
+                tasks.push(endpoint);
             }
         }
         Ok(())
@@ -758,11 +935,10 @@ impl FSMetaApp {
         let source_status = source.status_snapshot()?;
         let sink_status = sink.status_snapshot()?;
         let candidate_groups = Self::observation_candidate_group_ids(source, sink, pending)?;
-        let status = evaluate_observation_status(&candidate_group_observation_evidence(
-            &source_status,
-            &sink_status,
-            &candidate_groups,
-        ), ObservationTrustPolicy::candidate_generation());
+        let status = evaluate_observation_status(
+            &candidate_group_observation_evidence(&source_status, &sink_status, &candidate_groups),
+            ObservationTrustPolicy::candidate_generation(),
+        );
         Ok(status.state == ObservationState::TrustedMaterialized)
     }
 
@@ -903,9 +1079,7 @@ impl FSMetaApp {
         });
         eprintln!(
             "fs_meta_runtime_app: facade handle active generation={} route_key={} resources={:?}",
-            pending.generation,
-            pending.route_key,
-            pending.resource_ids
+            pending.generation, pending.route_key, pending.resource_ids
         );
         let mut pending_guard = pending_facade.lock().await;
         if pending_guard.as_ref().is_some_and(|candidate| {
@@ -1150,13 +1324,10 @@ impl FSMetaApp {
                 current.generation = generation;
                 drop(api_task);
                 let mut pending = self.pending_facade.lock().await;
-                if pending
-                    .as_ref()
-                    .is_some_and(|candidate| {
-                        candidate.route_key == route_key
-                            && candidate.resource_ids == candidate_resource_ids
-                    })
-                {
+                if pending.as_ref().is_some_and(|candidate| {
+                    candidate.route_key == route_key
+                        && candidate.resource_ids == candidate_resource_ids
+                }) {
                     pending.take();
                 }
                 Self::clear_pending_facade_status(&self.facade_pending_status);
@@ -1178,9 +1349,7 @@ impl FSMetaApp {
         if !self.try_spawn_pending_facade().await? {
             eprintln!(
                 "fs_meta_runtime_app: pending facade generation={} route_key={} awaiting_runtime_exposure={}",
-                pending.generation,
-                pending.route_key,
-                !pending.runtime_exposure_confirmed
+                pending.generation, pending.route_key, !pending.runtime_exposure_confirmed
             );
             Self::set_pending_facade_status_waiting(&self.facade_pending_status, &pending);
         }
@@ -1257,8 +1426,13 @@ impl FSMetaApp {
     }
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
-        self.ensure_runtime_proxy_endpoints_started().await?;
         let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
+        if Self::should_initialize_from_control(&source_signals, &sink_signals, &facade_signals) {
+            self.initialize_from_control().await?;
+        } else if !self.control_initialized() {
+            return Err(Self::not_ready_error());
+        }
+        self.ensure_runtime_proxy_endpoints_started().await?;
         for signal in facade_signals {
             match signal {
                 FacadeControlSignal::Activate {
@@ -1341,6 +1515,7 @@ impl FSMetaApp {
     }
 
     async fn service_close(&self) -> Result<()> {
+        self.control_initialized.store(false, Ordering::Release);
         *self.pending_facade.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
         self.shutdown_active_facade().await;
@@ -1426,7 +1601,7 @@ impl ManagedStateProfile for FSMetaApp {
 }
 
 pub struct FSMetaRuntimeApp {
-    runtime: RuntimeLoadedManagedState,
+    runtime: RuntimeLoadedServiceApp,
 }
 
 impl FSMetaRuntimeApp {
@@ -1437,6 +1612,7 @@ impl FSMetaRuntimeApp {
         }
     }
 
+    #[cfg(test)]
     fn runtime_local_host_ref(
         cfg: &std::collections::HashMap<String, ConfigValue>,
     ) -> Option<NodeId> {
@@ -1455,6 +1631,7 @@ impl FSMetaRuntimeApp {
         }
     }
 
+    #[cfg(test)]
     fn required_runtime_local_host_ref(
         cfg: &std::collections::HashMap<String, ConfigValue>,
     ) -> Result<NodeId> {
@@ -1466,6 +1643,12 @@ impl FSMetaRuntimeApp {
         })
     }
 
+    fn runtime_worker_bindings_from_bootstrap(
+        bootstrap: &RuntimeBootstrapContext,
+    ) -> Result<(RuntimeWorkerBinding, RuntimeWorkerBinding)> {
+        runtime_worker_client_bindings(&bootstrap.worker_bindings()?)
+    }
+
     fn build_from_runtime_boundaries(
         runtime_boundary: Arc<dyn RuntimeBoundary>,
         data_boundary: Option<Arc<dyn ChannelIoSubset>>,
@@ -1475,66 +1658,53 @@ impl FSMetaRuntimeApp {
             log::error!("fs-meta runtime init failed: {msg}");
             msg
         };
-        let runtime = RuntimeLoadedManagedState::from_loader(
+        let runtime = RuntimeLoadedServiceApp::from_runtime_config(
             runtime_boundary,
-            data_boundary.clone(),
-            move |runtime_boundary, data_boundary| {
-                let ordinary_boundary: Arc<dyn ChannelBoundary> = runtime_boundary.clone();
-                let state_boundary: Arc<dyn StateBoundary> = runtime_boundary.clone();
-                let manifest_cfg = ordinary_boundary.app_manifest_config().ok_or_else(|| {
-                    CnxError::InvalidInput(
-                        "roots[] is required (missing app manifest config)".to_string(),
-                    )
-                })?;
-                let node_id = Self::required_runtime_local_host_ref(&manifest_cfg)?;
-                let cfg = FSMetaConfig::from_manifest_config(&manifest_cfg)?;
+            data_boundary,
+            FSMetaConfig::from_manifest_config,
+            move |bootstrap, cfg| {
+                let ordinary_boundary: Arc<dyn ChannelBoundary> = bootstrap.runtime_boundary();
+                let (source_worker_binding, sink_worker_binding) =
+                    Self::runtime_worker_bindings_from_bootstrap(&bootstrap)?;
                 let app = Arc::new(FSMetaApp::with_boundaries_and_state(
                     cfg,
-                    node_id,
-                    data_boundary.clone(),
+                    source_worker_binding,
+                    sink_worker_binding,
+                    bootstrap.local_host_ref().clone(),
+                    bootstrap.data_boundary(),
                     Some(ordinary_boundary),
-                    state_boundary,
+                    bootstrap.state_boundary(),
                 )?);
-                let builder = ManagedStateBuilder::from_profile(app.as_ref())
-                    .register_role("facade", app.clone())
-                    .on_start({
-                        let app = app.clone();
-                        move |_context| {
-                            let app = app.clone();
-                            async move { app.start().await }
-                        }
-                    })
-                    .on_send({
+                let close_app = app.clone();
+                let built = AppBuilder::new()
+                    .register_role("facade")
+                    .request({
                         let app = app.clone();
                         move |_context, events| {
                             let app = app.clone();
                             async move { app.service_send(&events).await }
                         }
                     })
-                    .on_recv({
+                    .stream({
                         let app = app.clone();
                         move |_context, opts| {
                             let app = app.clone();
                             async move { app.service_recv(opts).await }
                         }
                     })
-                    .on_control_frame({
+                    .control({
                         let app = app.clone();
                         move |_context, envelopes| {
                             let app = app.clone();
                             async move { app.service_on_control_frame(&envelopes).await }
                         }
                     })
-                    .on_close(move |_context| {
-                        let app = app.clone();
+                    .close(move |_context| {
+                        let app = close_app.clone();
                         async move { app.service_close().await }
-                    });
-                Ok(Arc::new(builder.build(
-                    capanix_service_sdk::ServiceContext::with_optional_data(
-                        runtime_boundary,
-                        data_boundary,
-                    ),
-                )))
+                    })
+                    .build(bootstrap.service_context());
+                Ok(built)
             },
             format_error,
         );
@@ -1601,16 +1771,17 @@ impl RuntimeBoundaryApp for FSMetaRuntimeApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{ControlEvent, FileMetaRecord};
     use crate::{FSMetaConfig, api, query, source};
     use bytes::Bytes;
-    use capanix_app_sdk::runtime::EventMetadata;
-    use crate::{ControlEvent, FileMetaRecord};
+    use capanix_app_sdk::runtime::{
+        EventMetadata, RuntimeWorkerBinding, RuntimeWorkerBindings, RuntimeWorkerLauncherKind,
+    };
     use capanix_host_fs_types::UnixStat;
     use capanix_route_proto::{
         ExecActivate, ExecControl, HostDescriptor, HostObjectGrant, HostObjectGrantState,
         HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged, UnitExposureConfirmed,
-        UnitTick, encode_exec_control_envelope,
-        encode_runtime_host_object_grants_changed_envelope,
+        UnitTick, encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
         encode_unit_exposure_confirmed_envelope, encode_unit_tick_envelope,
     };
     use reqwest::Client;
@@ -1637,12 +1808,41 @@ mod tests {
         SourceConfig::default()
     }
 
-    fn in_process_runtime_workers() -> crate::FSMetaRuntimeWorkers {
-        let mut workers = crate::FSMetaRuntimeWorkers::default();
-        workers.source.mode = WorkerMode::Embedded;
-        workers.scan.mode = WorkerMode::Embedded;
-        workers.sink.mode = WorkerMode::Embedded;
-        workers
+    fn fs_meta_worker_module_path(path: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(path)
+    }
+
+    fn compiled_runtime_worker_binding(
+        role_id: &str,
+        mode: WorkerMode,
+        module_path: Option<&str>,
+    ) -> RuntimeWorkerBinding {
+        RuntimeWorkerBinding {
+            role_id: role_id.to_string(),
+            mode,
+            launcher_kind: match mode {
+                WorkerMode::Embedded => RuntimeWorkerLauncherKind::Embedded,
+                WorkerMode::External => RuntimeWorkerLauncherKind::WorkerHost,
+            },
+            module_path: module_path.map(std::path::PathBuf::from),
+            socket_dir: None,
+        }
+    }
+
+    fn compiled_runtime_worker_bindings(
+        bindings: &[(&str, WorkerMode, Option<&str>)],
+    ) -> RuntimeWorkerBindings {
+        RuntimeWorkerBindings {
+            roles: bindings
+                .iter()
+                .map(|(role_id, mode, module_path)| {
+                    (
+                        (*role_id).to_string(),
+                        compiled_runtime_worker_binding(role_id, *mode, *module_path),
+                    )
+                })
+                .collect(),
+        }
     }
 
     struct NoopBoundary;
@@ -1844,34 +2044,139 @@ mod tests {
         ]))
     }
 
-    fn worker_cfg(mode: &str) -> ConfigValue {
-        ConfigValue::Map(std::collections::HashMap::from([(
-            "mode".to_string(),
-            ConfigValue::String(mode.to_string()),
-        )]))
-    }
-
-    fn worker_cfg_with_bin(mode: &str, bin_path: &str) -> ConfigValue {
-        ConfigValue::Map(std::collections::HashMap::from([
-            ("mode".to_string(), ConfigValue::String(mode.to_string())),
-            (
-                "binary_path".to_string(),
-                ConfigValue::String(bin_path.to_string()),
-            ),
-        ]))
-    }
-
     #[tokio::test]
     async fn start_accepts_missing_roots_config_as_valid_deployed_state() {
         let _app = FSMetaApp::new(
             FSMetaConfig {
                 source: in_process_source_config(),
-                runtime_workers: in_process_runtime_workers(),
                 ..FSMetaConfig::default()
             },
             NodeId("single-app-node".into()),
         )
         .expect("empty roots should be accepted as valid deployed state");
+    }
+
+    #[tokio::test]
+    async fn request_and_stream_fail_closed_until_control_initializes_app() {
+        let app = FSMetaApp::new(
+            FSMetaConfig {
+                source: in_process_source_config(),
+                ..FSMetaConfig::default()
+            },
+            NodeId("single-app-node".into()),
+        )
+        .expect("init app");
+
+        let send_err = app.send(&[]).await.expect_err("send must fail closed");
+        assert!(matches!(send_err, CnxError::NotReady(_)));
+
+        let recv_err = app
+            .recv(RecvOpts::default())
+            .await
+            .expect_err("recv must fail closed");
+        assert!(matches!(recv_err, CnxError::NotReady(_)));
+    }
+
+    #[tokio::test]
+    async fn control_frames_initialize_app_once() {
+        let tmp = tempdir().expect("create temp dir");
+        let mount = tmp.path().join("root-a");
+        fs::create_dir_all(&mount).expect("create mount");
+        let app = FSMetaApp::new(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &mount)],
+                    ..in_process_source_config()
+                },
+                ..FSMetaConfig::default()
+            },
+            NodeId("single-app-node".into()),
+        )
+        .expect("init app");
+
+        assert!(!app.control_initialized());
+        app.on_control_frame(&[activate_envelope("runtime.exec.source")])
+        .await
+        .expect("first control should initialize app");
+        assert!(app.control_initialized());
+        app.on_control_frame(&[tick_envelope("runtime.exec.source", 1)])
+        .await
+        .expect("second control should remain idempotent");
+        assert!(app.control_initialized());
+    }
+
+    #[tokio::test]
+    async fn passthrough_control_does_not_initialize_app() {
+        let app = FSMetaApp::new(
+            FSMetaConfig {
+                source: in_process_source_config(),
+                ..FSMetaConfig::default()
+            },
+            NodeId("single-app-node".into()),
+        )
+        .expect("init app");
+
+        let err = app
+            .on_control_frame(&[ControlEnvelope::Frame(
+                capanix_app_sdk::runtime::ControlFrame {
+                    kind: "noop".into(),
+                    payload: Vec::new(),
+                },
+            )])
+            .await
+            .expect_err("passthrough control must not initialize app");
+        assert!(matches!(err, CnxError::NotReady(_)));
+        assert!(!app.control_initialized());
+    }
+
+    #[tokio::test]
+    async fn grants_changed_control_does_not_initialize_app() {
+        let tmp = tempdir().expect("create temp dir");
+        let mount = tmp.path().join("root-a");
+        fs::create_dir_all(&mount).expect("create mount");
+        let app = FSMetaApp::new(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![source::config::RootSpec::new("root-a", &mount)],
+                    ..in_process_source_config()
+                },
+                ..FSMetaConfig::default()
+            },
+            NodeId("single-app-node".into()),
+        )
+        .expect("init app");
+
+        let err = app
+            .on_control_frame(&[host_object_grants_changed_envelope(
+                1,
+                mount.to_str().expect("mount path"),
+            )])
+            .await
+            .expect_err("grant-change control must not initialize app");
+        assert!(matches!(err, CnxError::NotReady(_)));
+        assert!(!app.control_initialized());
+    }
+
+    #[tokio::test]
+    async fn manual_rescan_control_does_not_initialize_app() {
+        let app = FSMetaApp::new(
+            FSMetaConfig {
+                source: in_process_source_config(),
+                ..FSMetaConfig::default()
+            },
+            NodeId("single-app-node".into()),
+        )
+        .expect("init app");
+
+        let err = app
+            .on_control_frame(&[crate::runtime::orchestration::encode_manual_rescan_envelope(
+                now_us(),
+            )
+            .expect("encode manual rescan envelope")])
+            .await
+            .expect_err("manual rescan control must not initialize app");
+        assert!(matches!(err, CnxError::NotReady(_)));
+        assert!(!app.control_initialized());
     }
 
     #[tokio::test]
@@ -1916,7 +2221,6 @@ mod tests {
                 },
                 ..api::ApiConfig::default()
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
         match app
@@ -1975,7 +2279,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
         app.start().await.expect("start app");
@@ -2035,7 +2338,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2075,7 +2377,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2183,7 +2484,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2286,7 +2586,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2409,7 +2708,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2539,7 +2837,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2599,7 +2896,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2678,7 +2974,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
 
@@ -2776,7 +3071,6 @@ mod tests {
                 ..in_process_source_config()
             },
             api: api::ApiConfig::default(),
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
         let err = app
@@ -2798,7 +3092,6 @@ mod tests {
                 ..in_process_source_config()
             },
             api: api::ApiConfig::default(),
-            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
         assert_eq!(
@@ -2870,7 +3163,6 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
-            runtime_workers: in_process_runtime_workers(),
         };
 
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
@@ -3094,7 +3386,10 @@ mod tests {
         ]);
         let err = FSMetaConfig::from_manifest_config(&cfg)
             .expect_err("removed sink worker bin path must fail");
-        assert!(err.to_string().contains("sink_worker_bin_path has been removed"));
+        assert!(
+            err.to_string()
+                .contains("sink_worker_bin_path has been removed")
+        );
     }
 
     #[test]
@@ -3111,177 +3406,126 @@ mod tests {
         ]);
         let err = FSMetaConfig::from_manifest_config(&cfg)
             .expect_err("removed source worker bin path must fail");
-        assert!(err.to_string().contains("source_worker_bin_path has been removed"));
-    }
-
-    #[test]
-    fn defaults_sink_worker_process_mode_to_standard_worker_binary() {
-        let cfg = std::collections::HashMap::from([(
-            "roots".to_string(),
-            ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-        )]);
-        let parsed = FSMetaConfig::from_manifest_config(&cfg)
-            .expect("worker-process mode should infer sink worker binary path");
-        assert_eq!(parsed.runtime_workers.sink.mode, WorkerMode::External);
         assert!(
-            parsed
-                .runtime_workers
-                .sink
-                .startup_path
-                .as_ref()
-                .is_some_and(|path| path.ends_with("fs_meta_sink_worker")),
-            "sink worker baseline should infer the standard worker binary path"
-        );
-    }
-
-    #[test]
-    fn defaults_source_worker_process_mode_to_standard_worker_binary() {
-        let cfg = std::collections::HashMap::from([(
-            "roots".to_string(),
-            ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-        )]);
-        let parsed = FSMetaConfig::from_manifest_config(&cfg)
-            .expect("worker-process mode should infer source worker binary path");
-        assert_eq!(parsed.runtime_workers.source.mode, WorkerMode::External);
-        assert!(
-            parsed
-                .runtime_workers
-                .source
-                .startup_path
-                .as_ref()
-                .is_some_and(|path| path.ends_with("fs_meta_source_worker")),
-            "source worker baseline should infer the standard worker binary path"
+            err.to_string()
+                .contains("source_worker_bin_path has been removed")
         );
     }
 
     #[test]
     fn parses_worker_oriented_mode_config_shape() {
-        let cfg = std::collections::HashMap::from([
+        let (source, sink) = runtime_worker_client_bindings(&compiled_runtime_worker_bindings(&[
+            ("facade", WorkerMode::Embedded, None),
             (
-                "roots".to_string(),
-                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
+                "source",
+                WorkerMode::External,
+                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
             ),
             (
-                "workers".to_string(),
-                ConfigValue::Map(std::collections::HashMap::from([
-                    ("facade".to_string(), worker_cfg("embedded")),
-                    (
-                        "source".to_string(),
-                        worker_cfg_with_bin("external", "/usr/local/bin/fs_meta_source_worker"),
-                    ),
-                    ("scan".to_string(), worker_cfg("external")),
-                    ("sink".to_string(), worker_cfg("embedded")),
-                ])),
+                "scan",
+                WorkerMode::External,
+                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
             ),
-        ]);
-        let parsed =
-            FSMetaConfig::from_manifest_config(&cfg).expect("parse worker-oriented config");
-        assert_eq!(parsed.runtime_workers.source.mode, WorkerMode::External);
-        assert_eq!(parsed.runtime_workers.sink.mode, WorkerMode::Embedded);
+            ("sink", WorkerMode::Embedded, None),
+        ]))
+        .expect("parse worker-oriented config");
+        assert_eq!(source.mode, WorkerMode::External);
+        assert_eq!(sink.mode, WorkerMode::Embedded);
         assert_eq!(
-            parsed.runtime_workers.source.startup_path,
-            Some(std::path::PathBuf::from(
-                "/usr/local/bin/fs_meta_source_worker"
+            source.module_path,
+            Some(fs_meta_worker_module_path(
+                "/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so",
             ))
         );
     }
 
     #[test]
-    fn scan_worker_binary_path_can_back_shared_source_scan_realization() {
-        let cfg = std::collections::HashMap::from([
+    fn rejects_missing_compiled_source_worker_binding() {
+        let err = runtime_worker_client_bindings(&compiled_runtime_worker_bindings(&[
+            ("facade", WorkerMode::Embedded, None),
             (
-                "roots".to_string(),
-                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
+                "scan",
+                WorkerMode::External,
+                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
             ),
             (
-                "workers".to_string(),
-                ConfigValue::Map(std::collections::HashMap::from([(
-                    "scan".to_string(),
-                    worker_cfg_with_bin("external", "/usr/local/bin/fs_meta_scan_worker"),
-                )])),
+                "sink",
+                WorkerMode::External,
+                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
             ),
-        ]);
-        let parsed = FSMetaConfig::from_manifest_config(&cfg)
-            .expect("scan worker path should feed the shared source/scan realization");
-        assert_eq!(parsed.runtime_workers.source.mode, WorkerMode::External);
-        assert_eq!(
-            parsed.runtime_workers.source.startup_path,
-            Some(std::path::PathBuf::from(
-                "/usr/local/bin/fs_meta_scan_worker"
-            ))
+        ]))
+        .expect_err("missing source binding must fail closed");
+        assert!(
+            err.to_string()
+                .contains("compiled runtime worker bindings must declare role 'source'")
+        );
+    }
+
+    #[test]
+    fn rejects_missing_compiled_sink_worker_binding() {
+        let err = runtime_worker_client_bindings(&compiled_runtime_worker_bindings(&[
+            ("facade", WorkerMode::Embedded, None),
+            (
+                "source",
+                WorkerMode::External,
+                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
+            ),
+            (
+                "scan",
+                WorkerMode::External,
+                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
+            ),
+        ]))
+        .expect_err("missing sink binding must fail closed");
+        assert!(
+            err.to_string()
+                .contains("compiled runtime worker bindings must declare role 'sink'")
         );
     }
 
     #[test]
     fn rejects_external_facade_worker_mode() {
-        let cfg = std::collections::HashMap::from([
-            (
-                "roots".to_string(),
-                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-            ),
-            (
-                "workers".to_string(),
-                ConfigValue::Map(std::collections::HashMap::from([(
-                    "facade".to_string(),
-                    worker_cfg("external"),
-                )])),
-            ),
-        ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
-            .expect_err("facade-worker cannot yet move to external mode");
+        let err = runtime_worker_client_bindings(&compiled_runtime_worker_bindings(&[(
+            "facade",
+            WorkerMode::External,
+            Some("/tmp/lib.so"),
+        )]))
+        .expect_err("facade-worker cannot yet move to external mode");
         assert!(
             err.to_string()
-                .contains("workers.facade.mode=external is not supported")
+                .contains("runtime worker binding for 'facade' must remain embedded")
         );
     }
 
     #[test]
     fn rejects_mismatched_source_and_scan_worker_modes() {
-        let cfg = std::collections::HashMap::from([
-            (
-                "roots".to_string(),
-                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-            ),
-            (
-                "workers".to_string(),
-                ConfigValue::Map(std::collections::HashMap::from([
-                    ("source".to_string(), worker_cfg("embedded")),
-                    ("scan".to_string(), worker_cfg("external")),
-                ])),
-            ),
-        ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
-            .expect_err("source/scan worker mode mismatch must fail");
+        let err = runtime_worker_client_bindings(&compiled_runtime_worker_bindings(&[
+            ("source", WorkerMode::Embedded, None),
+            ("scan", WorkerMode::External, Some("/tmp/lib.so")),
+        ]))
+        .expect_err("source/scan worker mode mismatch must fail");
         assert!(err.to_string().contains(
-            "workers.source.mode and workers.scan.mode must match while source-worker and scan-worker still share one realization"
+            "runtime worker bindings for 'source' and 'scan' must use the same mode while they still share one realization"
         ));
     }
 
     #[test]
-    fn rejects_mismatched_source_and_scan_worker_binary_paths() {
-        let cfg = std::collections::HashMap::from([
+    fn rejects_mismatched_source_and_scan_worker_module_paths() {
+        let err = runtime_worker_client_bindings(&compiled_runtime_worker_bindings(&[
             (
-                "roots".to_string(),
-                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
+                "source",
+                WorkerMode::External,
+                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
             ),
             (
-                "workers".to_string(),
-                ConfigValue::Map(std::collections::HashMap::from([
-                    (
-                        "source".to_string(),
-                        worker_cfg_with_bin("external", "/usr/local/bin/fs_meta_source_worker"),
-                    ),
-                    (
-                        "scan".to_string(),
-                        worker_cfg_with_bin("external", "/usr/local/bin/fs_meta_scan_worker"),
-                    ),
-                ])),
+                "scan",
+                WorkerMode::External,
+                Some("/usr/local/lib/libfs_meta_scan_alt.so"),
             ),
-        ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
-            .expect_err("source/scan worker binary mismatch must fail");
+        ]))
+        .expect_err("source/scan worker module mismatch must fail");
         assert!(err.to_string().contains(
-            "workers.source.startup.path and workers.scan.startup.path must match while source-worker and scan-worker still share one realization"
+            "runtime worker bindings for 'source' and 'scan' must use the same module_path while they still share one realization"
         ));
     }
 

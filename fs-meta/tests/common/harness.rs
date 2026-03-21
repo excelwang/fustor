@@ -401,6 +401,12 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
         root.join("Cargo.lock"),
         root.join("fs-meta/app/src"),
         root.join("fs-meta/worker-facade/src"),
+        root.join("fs-meta/worker-source/src"),
+        root.join("fs-meta/worker-source/Cargo.toml"),
+        root.join("fs-meta/worker-sink/src"),
+        root.join("fs-meta/worker-sink/Cargo.toml"),
+        root.join("fs-meta/worker-scan/src"),
+        root.join("fs-meta/worker-scan/Cargo.toml"),
         root.join("fs-meta/tests"),
         root.join("src"),
     ];

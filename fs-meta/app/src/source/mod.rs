@@ -30,6 +30,7 @@ use capanix_app_sdk::runtime::{
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::{HostFs, HostFsFacade};
 
+use crate::LogicalClock;
 use crate::query::path::{path_buf_from_bytes, path_to_bytes};
 use crate::query::request::{
     ForceFindQueryPayload, InternalQueryRequest, LiveScanRequest, QueryOp, QueryTransport,
@@ -42,7 +43,6 @@ use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::seam::resolve_host_fs_facade;
 use capanix_route_proto::BoundScope;
 use capanix_route_proto::{HostObjectGrantState, RuntimeHostObjectGrantsChanged};
-use crate::LogicalClock;
 
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
@@ -1498,8 +1498,7 @@ impl FSMetaSource {
             if reason == "manual"
                 && let Some(intents) = manual_rescan_intents
             {
-                let mut intents =
-                    lock_or_recover(intents, "source.manual_rescan_intents.queue");
+                let mut intents = lock_or_recover(intents, "source.manual_rescan_intents.queue");
                 let entry = intents.entry(root_key).or_default();
                 let should_signal = entry.requested <= entry.completed;
                 entry.requested = entry.requested.saturating_add(1);
@@ -1694,7 +1693,10 @@ impl FSMetaSource {
                                             }
                                         }
                                         Err(err) => {
-                                            log::error!("boundary endpoint force-find failed: {:?}", err);
+                                            log::error!(
+                                                "boundary endpoint force-find failed: {:?}",
+                                                err
+                                            );
                                             responses.push(build_error_marker_event(
                                                 &node_id_cloned,
                                                 req.metadata().correlation_id,
@@ -2011,7 +2013,10 @@ impl FSMetaSource {
                                         }
                                     }
                                     Err(err) => {
-                                        log::error!("boundary endpoint force-find failed: {:?}", err);
+                                        log::error!(
+                                            "boundary endpoint force-find failed: {:?}",
+                                            err
+                                        );
                                         responses.push(build_error_marker_event(
                                             &node_id_cloned,
                                             req.metadata().correlation_id,
@@ -3077,8 +3082,7 @@ impl FSMetaSource {
             .await;
             if let Some(candidate) = entry.candidate {
                 candidate.handle.cancel.cancel();
-                let _ =
-                    tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+                let _ = tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
                 Self::clear_root_task_candidate_health(
                     &self.state_cell.fanout_health,
                     &replacement.key,
@@ -3110,8 +3114,8 @@ impl FSMetaSource {
         }
 
         if !forced_ready.is_empty() {
-            let _ = Self::wait_for_task_handles_ready(&mut forced_ready, Duration::from_secs(2))
-                .await;
+            let _ =
+                Self::wait_for_task_handles_ready(&mut forced_ready, Duration::from_secs(2)).await;
         }
 
         if !removed_absent.is_empty() && !added_ready.is_empty() {
@@ -3994,8 +3998,8 @@ mod tests {
     use capanix_route_proto::{
         ExecActivate, ExecControl, ExecDeactivate, HostDescriptor, HostObjectGrant,
         HostObjectGrantState, HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged,
-        UnitTick, encode_exec_control_envelope,
-        encode_runtime_host_object_grants_changed_envelope, encode_unit_tick_envelope,
+        UnitTick, encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
+        encode_unit_tick_envelope,
     };
     use std::collections::BTreeSet;
 
@@ -4635,7 +4639,8 @@ mod tests {
             "manual",
         );
         assert!(matches!(
-            rx.try_recv().expect("next signal should be re-armed after completion"),
+            rx.try_recv()
+                .expect("next signal should be re-armed after completion"),
             RescanReason::Manual
         ));
     }
@@ -5283,7 +5288,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_micros();
-        let base = std::env::temp_dir().join(format!("fs-meta-force-find-missing-subpath-{unique}"));
+        let base =
+            std::env::temp_dir().join(format!("fs-meta-force-find-missing-subpath-{unique}"));
         std::fs::create_dir_all(&base).expect("create base root");
 
         let mut cfg = SourceConfig::default();

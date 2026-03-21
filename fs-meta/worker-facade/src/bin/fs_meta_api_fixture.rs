@@ -292,40 +292,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             api
         }),
     );
-    cfg.insert(
-        "workers".to_string(),
-        ConfigValue::Map(HashMap::from([
-            (
-                "facade".to_string(),
-                ConfigValue::Map(HashMap::from([(
-                    "mode".to_string(),
-                    ConfigValue::String("embedded".to_string()),
-                )])),
-            ),
-            (
-                "source".to_string(),
-                ConfigValue::Map(HashMap::from([(
-                    "mode".to_string(),
-                    ConfigValue::String("embedded".to_string()),
-                )])),
-            ),
-            (
-                "scan".to_string(),
-                ConfigValue::Map(HashMap::from([(
-                    "mode".to_string(),
-                    ConfigValue::String("embedded".to_string()),
-                )])),
-            ),
-            (
-                "sink".to_string(),
-                ConfigValue::Map(HashMap::from([(
-                    "mode".to_string(),
-                    ConfigValue::String("embedded".to_string()),
-                )])),
-            ),
-        ])),
-    );
-
     let config = FSMetaConfig::from_manifest_config(&cfg)?;
 
     let app = FSMetaApp::new(config, NodeId(node_id.clone()))?;

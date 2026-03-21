@@ -64,7 +64,7 @@ cnxctl -s ./cluster-out/nodes/capanix-node-1/home/core.sock resource list --outp
 fsmeta deploy --socket ./cluster-out/nodes/capanix-node-1/home/core.sock --config fs-meta/docs/examples/fs-meta.yaml
 ```
 
-`fs-meta.yaml` 正式配置面只保留：
+`fs-meta.yaml` 正式配置面默认只需要：
 
 ```yaml
 api:
@@ -74,12 +74,21 @@ auth:
     username: admin
 ```
 
+如需通过新 generation 调整 worker realization，可额外声明：
+
+```yaml
+workers:
+  source:
+    mode: embedded
+```
+
 说明：
 
 1. `fsmeta deploy` 默认以 `roots=[]` 启动服务。
 2. `fsmeta deploy` 消费共享的 `capanix-config` 配置/manifest/intention 编译语义以及 daemon/runtime ingress，而不是重新发明第二套平台配置语义。
-3. app target、manifest、desired-state document、runtime subscriptions、source/sink execution wiring、auth 文件路径等内部细节由 CLI 自动生成。
-4. deploy 完成后会输出 `api_facade_resource_id`、一次性的 bootstrap 管理员凭据和内部 state 目录。
+3. `workers.source.mode` / `workers.scan.mode` / `workers.sink.mode` 属于产品 deploy 配置；其中 `scan` 与 `source` 在当前基线仍共享一套 realization，配置变更会编译成下一代 `__cnx_runtime.workers` bindings，通过正常 generation rollout 生效，而不是在同一运行代内热切换。
+4. app target、manifest、desired-state document、runtime subscriptions、source/sink execution wiring、auth 文件路径等内部细节由 CLI 自动生成。
+5. deploy 完成后会输出 `api_facade_resource_id`、一次性的 bootstrap 管理员凭据和内部 state 目录。
 
 ## 第 4 步：登录并勾选 monitoring roots
 

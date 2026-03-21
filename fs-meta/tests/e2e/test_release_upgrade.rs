@@ -185,15 +185,16 @@ fn wait_for_primary_tree_materialization(
     reason: &str,
 ) -> Result<(), String> {
     wait_until(Duration::from_secs(120), reason, || {
-        let tree = match session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())]) {
-            Ok(tree) => tree,
-            Err(err) => {
-                let status = session
-                    .status()
-                    .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
-                return Err(format!("tree request failed: {err}; status={status}"));
-            }
-        };
+        let tree =
+            match session.tree(&[("path", "/".to_string()), ("recursive", "true".to_string())]) {
+                Ok(tree) => tree,
+                Err(err) => {
+                    let status = session
+                        .status()
+                        .unwrap_or_else(|status_err| json!({ "status_error": status_err }));
+                    return Err(format!("tree request failed: {err}; status={status}"));
+                }
+            };
         if group_total_nodes(&tree, "nfs1") > 0 && group_total_nodes(&tree, "nfs2") > 0 {
             Ok(true)
         } else {
@@ -412,10 +413,7 @@ fn mount_and_announce(
             "mount_hint": mount_path.display().to_string(),
         })])?;
     }
-    for (node_name, bind_addr) in ["node-d", "node-e"]
-        .into_iter()
-        .zip(facade_addrs.iter())
-    {
+    for (node_name, bind_addr) in ["node-d", "node-e"].into_iter().zip(facade_addrs.iter()) {
         cluster.announce_resources_clusterwide(vec![json!({
             "resource_id": facade_resource_id,
             "node_id": cluster.node_id(node_name)?,
