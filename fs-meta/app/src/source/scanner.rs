@@ -18,9 +18,10 @@ use crossbeam_channel as cb;
 
 use capanix_app_sdk::runtime::{EventMetadata, NodeId};
 use capanix_app_sdk::{CnxError, Event};
-use capanix_host_adapter_fs_meta::{FsMetaDirEntry, FsMetaMetadata, HostFsMeta};
+use capanix_host_adapter_fs::{HostFs, HostFsDirEntry, HostFsMetadata};
+use capanix_host_fs_types::UnixStat;
 
-use capanix_host_fs_types::{ControlEvent, EpochType, FileMetaRecord, LogicalClock, UnixStat};
+use crate::{ControlEvent, EpochType, FileMetaRecord, LogicalClock};
 
 use crate::source::drift::{self, DriftEstimator};
 use crate::source::watcher;
@@ -74,7 +75,7 @@ fn deep_interval_rounds_from_env() -> u64 {
     normalize_deep_interval_rounds(raw)
 }
 
-fn directory_fingerprint(entries: &[FsMetaDirEntry]) -> u64 {
+fn directory_fingerprint(entries: &[HostFsDirEntry]) -> u64 {
     let mut parts = entries
         .iter()
         .map(|entry| {
@@ -114,7 +115,7 @@ fn should_retry_host_fs_error(kind: io::ErrorKind) -> bool {
     )
 }
 
-fn metadata_with_retry(host_fs: &dyn HostFsMeta, path: &Path) -> io::Result<FsMetaMetadata> {
+fn metadata_with_retry(host_fs: &dyn HostFs, path: &Path) -> io::Result<HostFsMetadata> {
     let mut last = None::<io::Error>;
     for attempt in 1..=HOST_FS_RETRY_ATTEMPTS {
         match host_fs.metadata(path) {
@@ -130,7 +131,7 @@ fn metadata_with_retry(host_fs: &dyn HostFsMeta, path: &Path) -> io::Result<FsMe
     Err(last.unwrap_or_else(|| io::Error::other("metadata retry exhausted")))
 }
 
-fn read_dir_with_retry(host_fs: &dyn HostFsMeta, path: &Path) -> io::Result<Vec<FsMetaDirEntry>> {
+fn read_dir_with_retry(host_fs: &dyn HostFs, path: &Path) -> io::Result<Vec<HostFsDirEntry>> {
     let mut last = None::<io::Error>;
     for attempt in 1..=HOST_FS_RETRY_ATTEMPTS {
         match host_fs.read_dir(path) {
@@ -154,7 +155,7 @@ pub struct ParallelScanner {
     batch_size: usize,
     max_scan_events: usize,
     node_id: NodeId,
-    host_fs: Arc<dyn HostFsMeta>,
+    host_fs: Arc<dyn HostFs>,
     dir_state_cache: Arc<Mutex<HashMap<PathBuf, DirAuditState>>>,
     audit_round: Arc<AtomicU64>,
     deep_scan_interval_rounds: u64,
@@ -168,7 +169,7 @@ impl ParallelScanner {
         batch_size: usize,
         max_scan_events: usize,
         node_id: NodeId,
-        host_fs: Arc<dyn HostFsMeta>,
+        host_fs: Arc<dyn HostFs>,
     ) -> Self {
         Self {
             root_path,

@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, RwLock};
 
-use capanix_app_sdk::raw::{ChannelBoundary, ChannelIoSubset};
+use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_app_sdk::runtime::NodeId;
 
 use super::facade_status::SharedFacadePendingStatusCell;
@@ -14,7 +14,6 @@ use super::auth::AuthService;
 #[derive(Clone)]
 pub struct ApiState {
     pub node_id: NodeId,
-    pub runtime_control: Option<Arc<dyn ChannelBoundary>>,
     pub runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     pub query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     pub force_find_inflight: Arc<Mutex<BTreeSet<String>>>,

@@ -18,7 +18,6 @@ members = [
     "fs-meta/worker-scan",
     "fs-meta/worker-source",
     "fs-meta/worker-sink",
-    "fs-meta/runtime-support",
 ]
 default-members = [
     ".",
@@ -28,7 +27,6 @@ default-members = [
     "fs-meta/worker-scan",
     "fs-meta/worker-source",
     "fs-meta/worker-sink",
-    "fs-meta/runtime-support",
 ]
 
 [workspace.dependencies]
@@ -38,15 +36,17 @@ capanix-app-fs-meta-worker-facade = { version = "0.1.0", path = "fs-meta/worker-
 capanix-app-fs-meta-worker-scan = { version = "0.1.0", path = "fs-meta/worker-scan" }
 capanix-app-fs-meta-worker-sink = { version = "0.1.0", path = "fs-meta/worker-sink" }
 capanix-app-fs-meta-worker-source = { version = "0.1.0", path = "fs-meta/worker-source" }
-capanix-app-fs-meta-runtime-support = { version = "0.1.0", path = "fs-meta/runtime-support" }
 capanix-app-sdk = "0.1.0"
 capanix-config = "0.1.0"
 capanix-daemon = "0.1.0"
-capanix-host-adapter-fs-meta = "0.1.0"
+capanix-host-adapter-fs = "0.1.0"
 capanix-host-fs-types = "0.1.0"
 capanix-kernel = "0.1.0"
 capanix-kernel-api = "0.1.0"
+capanix-managed-state-sdk = { version = "0.1.0", path = "../capanix/crates/managed-state-sdk" }
 capanix-route-proto = "0.1.0"
+capanix-service-sdk = { version = "0.1.0", path = "../capanix/crates/service-sdk" }
+capanix-worker-runtime-support = { version = "0.1.0", path = "../capanix/crates/worker-runtime-support" }
 capanix-specs-vocabulary = { version = "0.0.0", path = "../capanix/crates/specs-vocabulary" }
 capanix-unit-entry-macros = "0.1.0"
 capanix-unit-sidecar = "0.1.0"

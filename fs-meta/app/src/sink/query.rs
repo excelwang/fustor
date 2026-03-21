@@ -18,7 +18,7 @@ use crate::query::tree::{
 use crate::sink::clock::SinkClock;
 use crate::sink::tree::{FileMetaNode, MaterializedTree};
 
-use capanix_host_fs_types::query::{StabilityMode, UnreliableReason};
+use crate::shared_types::query::{StabilityMode, UnreliableReason};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
@@ -635,7 +635,7 @@ pub fn get_health_stats(tree: &MaterializedTree, clock: &SinkClock) -> HealthSta
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capanix_host_fs_types::SyncTrack;
+    use crate::SyncTrack;
 
     fn insert_node(tree: &mut MaterializedTree, path: &[u8], is_dir: bool, size: u64, mtime: u64) {
         tree.insert(

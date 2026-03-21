@@ -13,7 +13,7 @@ use capanix_app_sdk::Event;
 use capanix_app_sdk::raw::{BoundaryContext, ChannelKey, ChannelSendRequest};
 use capanix_app_sdk::runtime::{EventMetadata, NodeId};
 use capanix_app_sdk::{CnxError, raw::ChannelIoSubset};
-use capanix_host_adapter_fs_meta::HostAdapter;
+use capanix_host_adapter_fs::HostAdapter;
 
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
 use crate::runtime::routes::{
@@ -598,7 +598,7 @@ fn status_source_from_observability(
         status,
         source_primary_by_group,
         last_force_find_runner_by_group,
-        force_find_inflight_groups,
+        force_find_inflight_groups: _source_force_find_inflight_groups,
     } = source;
     let crate::source::SourceStatusSnapshot {
         logical_roots: status_logical_roots,

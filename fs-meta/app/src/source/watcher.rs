@@ -19,15 +19,20 @@ use tokio_util::sync::CancellationToken;
 
 use capanix_app_sdk::runtime::{EventMetadata, NodeId};
 use capanix_app_sdk::{CnxError, Event};
-use capanix_host_adapter_fs_meta::{
-    HostFsMeta, HostFsWatch, HostFsWatchDescriptor, HostFsWatchEvent, HostFsWatchMask,
+use capanix_host_adapter_fs::{
+    HostFs, HostFsWatch, HostFsWatchDescriptor, HostFsWatchEvent, HostFsWatchMask,
 };
+#[cfg(test)]
+use capanix_host_adapter_fs::{HostFsDirEntry, HostFsMetadata};
 
-use capanix_host_fs_types::{ControlEvent, FileMetaRecord, UnixStat};
+use capanix_host_fs_types::UnixStat;
 
 use crate::query::path::path_to_bytes;
 use crate::source::config::SourceConfig;
 use crate::source::drift::{self, DriftEstimator};
+use crate::{ControlEvent, FileMetaRecord, LogicalClock};
+#[cfg(test)]
+use crate::{EventKind, SyncTrack};
 
 fn lock_or_recover<'a, T>(m: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
     match m.lock() {
@@ -268,10 +273,10 @@ fn classify_event(
     event_path: PathBuf,
     root_path: &Path,
     emit_prefix: &Path,
-    host_fs: &dyn HostFsMeta,
+    host_fs: &dyn HostFs,
     node_id: &NodeId,
     drift_us: i64,
-    logical_clock: &capanix_host_fs_types::LogicalClock,
+    logical_clock: &LogicalClock,
     throttle: &mut ThrottleState,
 ) -> Vec<Event> {
     let mut results = Vec::new();
@@ -406,10 +411,10 @@ fn recursive_scan_dir(
     dir: &Path,
     root: &Path,
     emit_prefix: &Path,
-    host_fs: &dyn HostFsMeta,
+    host_fs: &dyn HostFs,
     node_id: &NodeId,
     drift_us: i64,
-    logical_clock: &capanix_host_fs_types::LogicalClock,
+    logical_clock: &LogicalClock,
     results: &mut Vec<Event>,
 ) {
     let entries = match host_fs.read_dir(dir) {
@@ -457,11 +462,11 @@ fn stat_and_emit(
     path: &Path,
     root: &Path,
     emit_prefix: &Path,
-    host_fs: &dyn HostFsMeta,
+    host_fs: &dyn HostFs,
     is_atomic: bool,
     node_id: &NodeId,
     drift_us: i64,
-    logical_clock: &capanix_host_fs_types::LogicalClock,
+    logical_clock: &LogicalClock,
 ) -> Option<Event> {
     let meta = match host_fs.metadata(path) {
         Ok(meta) => meta,
@@ -528,7 +533,7 @@ pub fn build_event(
     record: &FileMetaRecord,
     node_id: &NodeId,
     drift_us: i64,
-    logical_clock: &capanix_host_fs_types::LogicalClock,
+    logical_clock: &LogicalClock,
 ) -> Option<Event> {
     let payload = rmp_serde::to_vec_named(record).ok()?;
     Some(Event::new(
@@ -548,7 +553,7 @@ fn build_control_event(
     control: &ControlEvent,
     node_id: &NodeId,
     drift_us: i64,
-    logical_clock: &capanix_host_fs_types::LogicalClock,
+    logical_clock: &LogicalClock,
 ) -> Option<Event> {
     let payload = rmp_serde::to_vec_named(control).ok()?;
     Some(Event::new(
@@ -614,8 +619,8 @@ fn process_raw_events(
     root_path: &Path,
     emit_prefix: &Path,
     node_id: &NodeId,
-    logical_clock: &capanix_host_fs_types::LogicalClock,
-    host_fs: &dyn HostFsMeta,
+    logical_clock: &LogicalClock,
+    host_fs: &dyn HostFs,
     throttle: &mut ThrottleState,
     rescan_tx: Option<&tokio::sync::broadcast::Sender<super::RescanReason>>,
 ) -> Option<Vec<Event>> {
@@ -736,8 +741,8 @@ pub(crate) fn start_watch_loop(
     tx: mpsc::Sender<Vec<Event>>,
     shutdown: CancellationToken,
     node_id: NodeId,
-    logical_clock: Arc<capanix_host_fs_types::LogicalClock>,
-    host_fs: Arc<dyn HostFsMeta>,
+    logical_clock: Arc<LogicalClock>,
+    host_fs: Arc<dyn HostFs>,
     throttle_interval: Duration,
     rescan_tx: Option<tokio::sync::broadcast::Sender<super::RescanReason>>,
 ) -> tokio::task::JoinHandle<()> {
@@ -802,18 +807,15 @@ mod tests {
     use super::*;
     use std::collections::{HashMap, HashSet, VecDeque};
 
-    use capanix_host_adapter_fs_meta::{FsMetaDirEntry, FsMetaMetadata};
-    use capanix_host_fs_types::{EventKind, SyncTrack};
-
     #[derive(Default)]
     struct MockHostFs {
-        metadata_map: HashMap<PathBuf, FsMetaMetadata>,
+        metadata_map: HashMap<PathBuf, HostFsMetadata>,
         metadata_fail_paths: HashSet<PathBuf>,
-        read_dir_map: HashMap<PathBuf, Vec<FsMetaDirEntry>>,
+        read_dir_map: HashMap<PathBuf, Vec<HostFsDirEntry>>,
     }
 
     impl MockHostFs {
-        fn with_metadata(mut self, path: &str, metadata: FsMetaMetadata) -> Self {
+        fn with_metadata(mut self, path: &str, metadata: HostFsMetadata) -> Self {
             self.metadata_map.insert(PathBuf::from(path), metadata);
             self
         }
@@ -823,14 +825,14 @@ mod tests {
             self
         }
 
-        fn with_read_dir(mut self, path: &str, entries: Vec<FsMetaDirEntry>) -> Self {
+        fn with_read_dir(mut self, path: &str, entries: Vec<HostFsDirEntry>) -> Self {
             self.read_dir_map.insert(PathBuf::from(path), entries);
             self
         }
     }
 
-    impl HostFsMeta for MockHostFs {
-        fn metadata(&self, path: &Path) -> io::Result<FsMetaMetadata> {
+    impl HostFs for MockHostFs {
+        fn metadata(&self, path: &Path) -> io::Result<HostFsMetadata> {
             if self.metadata_fail_paths.contains(path) {
                 return Err(io::Error::other("mock metadata failure"));
             }
@@ -840,17 +842,17 @@ mod tests {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "mock metadata not found"))
         }
 
-        fn symlink_metadata(&self, path: &Path) -> io::Result<FsMetaMetadata> {
+        fn symlink_metadata(&self, path: &Path) -> io::Result<HostFsMetadata> {
             self.metadata(path)
         }
 
-        fn read_dir(&self, _path: &Path) -> io::Result<Vec<FsMetaDirEntry>> {
+        fn read_dir(&self, _path: &Path) -> io::Result<Vec<HostFsDirEntry>> {
             Ok(self.read_dir_map.get(_path).cloned().unwrap_or_default())
         }
     }
 
-    fn mock_file_metadata() -> FsMetaMetadata {
-        FsMetaMetadata {
+    fn mock_file_metadata() -> HostFsMetadata {
+        HostFsMetadata {
             is_dir: false,
             len: 123,
             modified: Some(std::time::SystemTime::now()),
@@ -860,8 +862,8 @@ mod tests {
         }
     }
 
-    fn mock_dir_metadata(ino: u64) -> FsMetaMetadata {
-        FsMetaMetadata {
+    fn mock_dir_metadata(ino: u64) -> HostFsMetadata {
+        HostFsMetadata {
             is_dir: true,
             len: 0,
             modified: Some(std::time::SystemTime::now()),
@@ -941,7 +943,7 @@ mod tests {
     fn stat_and_emit_metadata_failure_returns_none() {
         let host_fs = MockHostFs::default().with_metadata_failure("/root/fail.txt");
         let node_id = NodeId("node-a".to_string());
-        let logical_clock = capanix_host_fs_types::LogicalClock::new();
+        let logical_clock = LogicalClock::new();
         let event = stat_and_emit(
             Path::new("/root/fail.txt"),
             Path::new("/root"),
@@ -962,7 +964,7 @@ mod tests {
     fn classify_event_attrib_emits_non_atomic_update() {
         let host_fs = MockHostFs::default().with_metadata("/root/file.txt", mock_file_metadata());
         let node_id = NodeId("node-a".to_string());
-        let logical_clock = capanix_host_fs_types::LogicalClock::new();
+        let logical_clock = LogicalClock::new();
         let mut throttle = ThrottleState::new(Duration::from_millis(5));
 
         let events = classify_event(
@@ -989,7 +991,7 @@ mod tests {
     fn classify_event_attrib_metadata_failure_isolated() {
         let host_fs = MockHostFs::default().with_metadata_failure("/root/file.txt");
         let node_id = NodeId("node-a".to_string());
-        let logical_clock = capanix_host_fs_types::LogicalClock::new();
+        let logical_clock = LogicalClock::new();
         let mut throttle = ThrottleState::new(Duration::from_millis(5));
 
         let events = classify_event(
@@ -1012,7 +1014,7 @@ mod tests {
 
     #[test]
     fn classify_event_modify_then_close_write_emits_final_atomic_update_after_throttle() {
-        let initial = FsMetaMetadata {
+        let initial = HostFsMetadata {
             is_dir: false,
             len: 10,
             modified: Some(std::time::SystemTime::now()),
@@ -1020,7 +1022,7 @@ mod tests {
             dev: Some(1),
             ino: Some(2),
         };
-        let final_meta = FsMetaMetadata {
+        let final_meta = HostFsMetadata {
             is_dir: false,
             len: 20,
             modified: Some(std::time::SystemTime::now()),
@@ -1031,7 +1033,7 @@ mod tests {
         let first_host_fs = MockHostFs::default().with_metadata("/root/file.txt", initial);
         let final_host_fs = MockHostFs::default().with_metadata("/root/file.txt", final_meta);
         let node_id = NodeId("node-a".to_string());
-        let logical_clock = capanix_host_fs_types::LogicalClock::new();
+        let logical_clock = LogicalClock::new();
         let mut throttle = ThrottleState::new(Duration::from_secs(60));
 
         let first = classify_event(
@@ -1090,7 +1092,7 @@ mod tests {
     fn classify_event_moved_from_emits_delete_record() {
         let host_fs = MockHostFs::default();
         let node_id = NodeId("node-a".to_string());
-        let logical_clock = capanix_host_fs_types::LogicalClock::new();
+        let logical_clock = LogicalClock::new();
         let mut throttle = ThrottleState::new(Duration::from_millis(5));
 
         let events = classify_event(
@@ -1116,7 +1118,7 @@ mod tests {
     fn classify_event_moved_to_emits_atomic_update_record() {
         let host_fs = MockHostFs::default().with_metadata("/root/a.txt", mock_file_metadata());
         let node_id = NodeId("node-a".to_string());
-        let logical_clock = capanix_host_fs_types::LogicalClock::new();
+        let logical_clock = LogicalClock::new();
         let mut throttle = ThrottleState::new(Duration::from_millis(5));
 
         let events = classify_event(
@@ -1142,7 +1144,7 @@ mod tests {
 
     #[test]
     fn classify_event_moved_to_dir_recursively_emits_descendants() {
-        let dir_meta = FsMetaMetadata {
+        let dir_meta = HostFsMetadata {
             is_dir: true,
             len: 0,
             modified: Some(std::time::SystemTime::now()),
@@ -1160,11 +1162,11 @@ mod tests {
             .with_read_dir(
                 "/root/dir",
                 vec![
-                    FsMetaDirEntry {
+                    HostFsDirEntry {
                         path: PathBuf::from("/root/dir/a.txt"),
                         is_dir: false,
                     },
-                    FsMetaDirEntry {
+                    HostFsDirEntry {
                         path: PathBuf::from("/root/dir/sub"),
                         is_dir: true,
                     },
@@ -1172,14 +1174,14 @@ mod tests {
             )
             .with_read_dir(
                 "/root/dir/sub",
-                vec![FsMetaDirEntry {
+                vec![HostFsDirEntry {
                     path: PathBuf::from("/root/dir/sub/b.txt"),
                     is_dir: false,
                 }],
             );
 
         let node_id = NodeId("node-a".to_string());
-        let logical_clock = capanix_host_fs_types::LogicalClock::new();
+        let logical_clock = LogicalClock::new();
         let mut throttle = ThrottleState::new(Duration::from_millis(5));
 
         let events = classify_event(
@@ -1324,7 +1326,7 @@ mod tests {
             .with_metadata("/root/new_dynamic_dir/nested", mock_dir_metadata(11));
         let shutdown = CancellationToken::new();
         let node_id = NodeId("node-a".to_string());
-        let logical_clock = capanix_host_fs_types::LogicalClock::new();
+        let logical_clock = LogicalClock::new();
         let mut throttle = ThrottleState::new(Duration::from_millis(5));
 
         let created = process_raw_events(
@@ -1475,11 +1477,11 @@ mod tests {
             .with_read_dir(
                 "/root/dest_root/dest_dir",
                 vec![
-                    FsMetaDirEntry {
+                    HostFsDirEntry {
                         path: PathBuf::from("/root/dest_root/dest_dir/sub_dir"),
                         is_dir: true,
                     },
-                    FsMetaDirEntry {
+                    HostFsDirEntry {
                         path: PathBuf::from("/root/dest_root/dest_dir/file_in_src.txt"),
                         is_dir: false,
                     },
@@ -1487,14 +1489,14 @@ mod tests {
             )
             .with_read_dir(
                 "/root/dest_root/dest_dir/sub_dir",
-                vec![FsMetaDirEntry {
+                vec![HostFsDirEntry {
                     path: PathBuf::from("/root/dest_root/dest_dir/sub_dir/file_in_sub.txt"),
                     is_dir: false,
                 }],
             );
         let shutdown = CancellationToken::new();
         let node_id = NodeId("node-a".to_string());
-        let logical_clock = capanix_host_fs_types::LogicalClock::new();
+        let logical_clock = LogicalClock::new();
         let mut throttle = ThrottleState::new(Duration::from_millis(5));
 
         std::thread::sleep(Duration::from_millis(1));

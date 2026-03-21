@@ -4,7 +4,7 @@
 
 use std::time::{Duration, Instant};
 
-use capanix_host_fs_types::{EventKind, FileMetaRecord, SyncTrack};
+use crate::{EventKind, FileMetaRecord, SyncTrack};
 
 use crate::sink::clock::SinkClock;
 use crate::sink::tree::{FileMetaNode, MaterializedTree};

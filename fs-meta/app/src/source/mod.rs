@@ -16,7 +16,6 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_stream::stream;
-use async_trait::async_trait;
 
 use futures_core::Stream;
 use futures_util::StreamExt;
@@ -28,8 +27,8 @@ use capanix_app_sdk::raw::{ChannelIoSubset, StateBoundary};
 use capanix_app_sdk::runtime::{
     ControlEnvelope, EventMetadata, NodeId, RecvOpts, in_memory_state_boundary,
 };
-use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundaryApp};
-use capanix_host_adapter_fs_meta::{HostFsFacade, HostFsMeta};
+use capanix_app_sdk::{CnxError, Event, Result};
+use capanix_host_adapter_fs::{HostFs, HostFsFacade};
 
 use crate::query::path::{path_buf_from_bytes, path_to_bytes};
 use crate::query::request::{
@@ -41,9 +40,9 @@ use crate::query::result_ops::{
 };
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::seam::resolve_host_fs_facade;
-use capanix_host_fs_types::LogicalClock;
 use capanix_route_proto::BoundScope;
 use capanix_route_proto::{HostObjectGrantState, RuntimeHostObjectGrantsChanged};
+use crate::LogicalClock;
 
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
@@ -990,7 +989,7 @@ impl FSMetaSource {
                         continue;
                     }
                 };
-                let scanner_host_fs: Arc<dyn HostFsMeta> = host_fs.clone();
+                let scanner_host_fs: Arc<dyn HostFs> = host_fs.clone();
                 let scanner = Arc::new(ParallelScanner::new(
                     monitor_path.clone(),
                     emit_prefix.clone(),
@@ -3938,28 +3937,23 @@ impl FSMetaSource {
     }
 }
 
-#[async_trait]
-impl RuntimeBoundaryApp for FSMetaSource {
-    /// send: not supported (source-only app).
-    async fn send(&self, _events: &[Event]) -> Result<()> {
+impl FSMetaSource {
+    pub async fn send(&self, _events: &[Event]) -> Result<()> {
         Err(CnxError::NotSupported(
             "source-fs-meta: send not supported".into(),
         ))
     }
 
-    /// recv: returns a targeted scan of the root directory.
-    async fn recv(&self, _opts: RecvOpts) -> Result<Vec<Event>> {
+    pub async fn recv(&self, _opts: RecvOpts) -> Result<Vec<Event>> {
         self.query_scan(&crate::query::request::LiveScanRequest::default())
     }
 
-    /// on_control_frame: ingress-only boundary; decode to typed signals first.
-    async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
+    pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let signals = source_control_signals_from_envelopes(envelopes)?;
         self.apply_orchestration_signals(&signals).await
     }
 
-    /// Graceful shutdown.
-    async fn close(&self) -> Result<()> {
+    pub async fn close(&self) -> Result<()> {
         self.shutdown.cancel();
         let mut tasks = std::mem::take(&mut *lock_or_recover(
             &self.state_cell.root_tasks,

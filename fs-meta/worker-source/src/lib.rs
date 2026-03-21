@@ -3,33 +3,26 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
 use capanix_app_fs_meta::source::FSMetaSource;
-use capanix_app_fs_meta::source::config::SourceExecutionMode;
+use capanix_app_fs_meta::workers::source::SourceWorkerRpc;
 use capanix_app_fs_meta::workers::source_ipc::{
     SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, SourceWorkerRequest, SourceWorkerResponse,
-    decode_request, encode_response, source_worker_control_route_key_from_env,
+    source_worker_control_route_key_from_env,
 };
-use capanix_app_fs_meta_runtime_support::decode_control_payload;
 use capanix_app_sdk::raw::{
-    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
-    StateBoundary,
+    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest, StateBoundary,
 };
-use capanix_app_sdk::runtime::{ControlEnvelope, EventMetadata, NodeId};
-use capanix_app_sdk::{CnxError, Event, RuntimeBoundary, RuntimeBoundaryApp};
+use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
+use capanix_app_sdk::{CnxError, Event, RuntimeBoundary};
+use capanix_worker_runtime_support::{
+    TypedWorkerServer, TypedWorkerSession, WorkerLoopControl, WorkerSessionContext,
+};
 use futures_util::StreamExt;
 use tokio::task::JoinHandle;
 
 const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
 const SOURCE_WORKER_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_STOP_ABORT_TIMEOUT: Duration = Duration::from_millis(250);
-
-fn now_us() -> u64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_micros() as u64,
-        Err(_) => 0,
-    }
-}
 
 fn block_on_runtime<F, T>(runtime: &tokio::runtime::Handle, fut: F) -> T
 where
@@ -154,11 +147,10 @@ fn process_worker_request(
         SourceWorkerRequest::Ping => (SourceWorkerResponse::Ack, false),
         SourceWorkerRequest::Init {
             node_id,
-            mut config,
+            config,
         } => {
             eprintln!("fs_meta_source_worker: received Init for node_id={node_id}");
             let _ = block_on_runtime(runtime, stop_source_runtime(state));
-            config.source_execution_mode = SourceExecutionMode::InProcess;
             state.pending_init = Some((NodeId(node_id), config));
             eprintln!("fs_meta_source_worker: Init accepted");
             (SourceWorkerResponse::Ack, false)
@@ -190,7 +182,8 @@ fn process_worker_request(
                 match FSMetaSource::with_boundaries_and_state(config, node_id, None, state_boundary)
                 {
                     Ok(inner) => {
-                        state.source = Some(Arc::new(inner));
+                        let inner = Arc::new(inner);
+                        state.source = Some(inner);
                         eprintln!("fs_meta_source_worker: Start runtime materialized");
                     }
                     Err(err) => {
@@ -433,10 +426,12 @@ fn process_worker_request(
             ),
         },
         SourceWorkerRequest::OnControlFrame { envelopes } => match state.source.as_ref() {
-            Some(source) => match block_on_runtime(runtime, source.on_control_frame(&envelopes)) {
-                Ok(_) => (SourceWorkerResponse::Ack, false),
-                Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
-            },
+            Some(source) => {
+                match block_on_runtime(runtime, source.on_control_frame(&envelopes)) {
+                    Ok(_) => (SourceWorkerResponse::Ack, false),
+                    Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
+                }
+            }
             None => (
                 SourceWorkerResponse::Error("source worker not initialized".into()),
                 false,
@@ -453,97 +448,17 @@ pub fn run_source_worker_server(
     control_socket_path: &Path,
     data_socket_path: &Path,
 ) -> std::io::Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
     let state = Arc::new(Mutex::new(SourceWorkerState {
         source: None,
         pending_init: None,
         pump_task: None,
     }));
-    let runtime_handle = runtime.handle().clone();
-    let boundary_holder: Arc<Mutex<Option<(Arc<dyn StateBoundary>, Arc<dyn ChannelIoSubset>)>>> =
-        Arc::new(Mutex::new(None));
-    let control_state = state.clone();
-    let control_boundary_holder = boundary_holder.clone();
-    let control_handler = Arc::new(
-        move |envelopes: &[ControlEnvelope]| -> capanix_app_sdk::Result<()> {
-            let (state_boundary, io_boundary) = control_boundary_holder
-                .lock()
-                .map_err(|_| {
-                    CnxError::Internal("source worker boundary holder lock poisoned".into())
-                })?
-                .clone()
-                .ok_or_else(|| {
-                    CnxError::NotReady("source worker runtime boundary not ready".into())
-                })?;
-            let mut guard = control_state
-                .lock()
-                .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
-            let mut runtime_envelopes = Vec::new();
-            for envelope in envelopes {
-                if let Ok(payload) =
-                    decode_control_payload(envelope, SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND)
-                {
-                    let request = decode_request(payload)?;
-                    let (response, _) = process_worker_request(
-                        request,
-                        &mut guard,
-                        io_boundary.clone(),
-                        &runtime_handle,
-                        state_boundary.clone(),
-                    );
-                    match response {
-                        SourceWorkerResponse::Ack => {}
-                        SourceWorkerResponse::Error(message) => {
-                            return Err(CnxError::PeerError(message));
-                        }
-                        other => {
-                            return Err(CnxError::ProtocolViolation(format!(
-                                "unexpected source bootstrap response: {:?}",
-                                other
-                            )));
-                        }
-                    }
-                } else {
-                    runtime_envelopes.push(envelope.clone());
-                }
-            }
-            if !runtime_envelopes.is_empty() {
-                let Some(source) = guard.source.as_ref() else {
-                    return Err(CnxError::NotReady(
-                        "source worker runtime not initialized for runtime control frames".into(),
-                    ));
-                };
-                block_on_runtime(&runtime_handle, source.on_control_frame(&runtime_envelopes))?;
-            }
-            Ok(())
-        },
-    );
-
-    let shared_boundary = Arc::new(
-        runtime
-            .block_on(
-                capanix_unit_sidecar::UnitRuntimeIpcBoundary::bind_and_accept_with_control_handler(
-                    control_socket_path,
-                    data_socket_path,
-                    control_handler,
-                ),
-            )
-            .map_err(|err| {
-                std::io::Error::other(format!("source worker sidecar bind failed: {err}"))
-            })?,
-    );
-    let boundary: Arc<dyn RuntimeBoundary> = shared_boundary.clone();
-    let io_boundary: Arc<dyn ChannelIoSubset> = shared_boundary;
-    {
-        let mut holder = boundary_holder
-            .lock()
-            .map_err(|_| std::io::Error::other("source worker boundary holder lock poisoned"))?;
-        *holder = Some((boundary.clone(), io_boundary.clone()));
-    }
-    run_source_worker_runtime_loop_with_state(boundary, io_boundary, &runtime, state)
+    TypedWorkerServer::<SourceWorkerRpc, _>::new(
+        source_worker_control_route_key_from_env(),
+        SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
+        SourceWorkerSession { state },
+    )
+    .run_with_sidecar(control_socket_path, data_socket_path)
 }
 
 pub fn run_source_worker_runtime_loop(
@@ -565,79 +480,57 @@ fn run_source_worker_runtime_loop_with_state(
     runtime: &tokio::runtime::Runtime,
     state: Arc<Mutex<SourceWorkerState>>,
 ) -> std::io::Result<()> {
-    let ctx = BoundaryContext::default();
-    let worker_route_key = source_worker_control_route_key_from_env();
-    let request_channel = ChannelKey(worker_route_key.clone());
-    let reply_channel = ChannelKey(format!("{}:reply", worker_route_key));
+    TypedWorkerServer::<SourceWorkerRpc, _>::new(
+        source_worker_control_route_key_from_env(),
+        SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
+        SourceWorkerSession { state },
+    )
+    .run_loop(boundary, io_boundary, runtime)
+}
 
-    let state_boundary: Arc<dyn StateBoundary> = boundary.clone();
-    let mut should_break = false;
-    while !should_break {
-        let requests = match io_boundary.channel_recv(
-            ctx.clone(),
-            ChannelRecvRequest {
-                channel_key: request_channel.clone(),
-                timeout_ms: Some(250),
-            },
-        ) {
-            Ok(events) => events,
-            Err(CnxError::Timeout) => continue,
-            Err(err) => {
-                return Err(std::io::Error::other(format!(
-                    "source worker receive request failed: {err}"
-                )));
-            }
-        };
-        if requests.is_empty() {
-            continue;
-        }
+struct SourceWorkerSession {
+    state: Arc<Mutex<SourceWorkerState>>,
+}
 
-        let mut responses = Vec::with_capacity(requests.len());
-        for request_event in requests {
-            let decoded = decode_request(request_event.payload_bytes());
-            let (response, should_stop) = match decoded {
-                Ok(request) => {
-                    let mut guard = state
-                        .lock()
-                        .map_err(|_| std::io::Error::other("source worker state lock poisoned"))?;
-                    process_worker_request(
-                        request,
-                        &mut guard,
-                        io_boundary.clone(),
-                        runtime.handle(),
-                        state_boundary.clone(),
-                    )
-                }
-                Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
-            };
-            should_break |= should_stop;
-            let payload = encode_response(&response).map_err(|err| {
-                std::io::Error::other(format!("source worker encode response failed: {err}"))
-            })?;
-            responses.push(Event::new(
-                EventMetadata {
-                    origin_id: request_event.metadata().origin_id.clone(),
-                    timestamp_us: now_us(),
-                    logical_ts: None,
-                    correlation_id: request_event.metadata().correlation_id,
-                    ingress_auth: None,
-                    trace: None,
-                },
-                Bytes::from(payload),
-            ));
-        }
-
-        io_boundary
-            .channel_send(
-                ctx.clone(),
-                ChannelSendRequest {
-                    channel_key: reply_channel.clone(),
-                    events: responses,
-                },
-            )
-            .map_err(|err| {
-                std::io::Error::other(format!("source worker send response failed: {err}"))
-            })?;
+#[async_trait::async_trait]
+impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
+    async fn handle_request(
+        &mut self,
+        request: SourceWorkerRequest,
+        context: &WorkerSessionContext,
+    ) -> capanix_app_sdk::Result<WorkerLoopControl<SourceWorkerResponse>> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
+        let (response, stop) = process_worker_request(
+            request,
+            &mut guard,
+            context.io_boundary(),
+            context.runtime_handle(),
+            context.state_boundary(),
+        );
+        Ok(if stop {
+            WorkerLoopControl::Stop(response)
+        } else {
+            WorkerLoopControl::Continue(response)
+        })
     }
-    Ok(())
+
+    async fn on_runtime_control(
+        &mut self,
+        envelopes: &[ControlEnvelope],
+        context: &WorkerSessionContext,
+    ) -> capanix_app_sdk::Result<()> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
+        let Some(source) = guard.source.as_ref() else {
+            return Err(CnxError::NotReady(
+                "source worker runtime not initialized for runtime control frames".into(),
+            ));
+        };
+        block_on_runtime(context.runtime_handle(), source.on_control_frame(envelopes))
+    }
 }

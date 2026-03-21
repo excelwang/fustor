@@ -8,6 +8,7 @@ description = "Internal fs-meta scan-worker artifact package"
 
 [lib]
 path = "src/lib.rs"
+doctest = false
 
 [[bin]]
 name = "fs_meta_scan_worker"
@@ -16,5 +17,4 @@ path = "src/main.rs"
 [dependencies]
 capanix-app-fs-meta-worker-source = { workspace = true }
 capanix-app-sdk = { workspace = true }
-capanix-unit-sidecar = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }

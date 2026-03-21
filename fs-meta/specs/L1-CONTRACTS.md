@@ -29,7 +29,7 @@ version: 3.0.0
 
 1. **KERNEL_DOMAIN_NEUTRAL_CONSUMPTION**: **fs-meta System** MUST consume only kernel thin runtime ABI plus generic route/channel-attach mechanisms, without requiring fs-meta-specific kernel primitives or kernel-owned fs-meta protocol verb interfaces.
    > Covers L0: VISION.GENERIC_KERNEL_MECHANISM_CONSUMPTION
-   > Verification: fs-meta does not treat `kernel-api` as the canonical ordinary app-facing runtime boundary; any remaining low-level primitive usage is explicit and secondary to the `app-sdk -> runtime-api` path.
+   > Verification: fs-meta does not treat `kernel-api` as the canonical ordinary app-facing runtime boundary; any remaining low-level primitive usage is explicit and secondary to the SDK-family path `managed-state-sdk -> service-sdk -> app-sdk -> runtime-api`.
 
 2. **HOST_DESCRIPTOR_GROUPING_IS_DOMAIN_POLICY**: **fs-meta System** MUST implement grouping from app-owned host descriptor selectors and object descriptors and MUST NOT require kernel/runtime hardcoded grouping semantics.
    > Covers L0: VISION.POLICY_OUTSIDE_KERNEL_FOR_GROUPING
@@ -47,7 +47,7 @@ version: 3.0.0
 5. **THIN_RUNTIME_ABI_CONSUMPTION**: **fs-meta System** MUST consume only thin runtime ABI state (`host_object_grants`, run context, generation/lease, control events, channel hooks) at its app/runtime boundary.
    > Covers L0: VISION.THIN_RUNTIME_ABI_CONSUMPTION
    > Responsibility: keep fs-meta below runtime orchestration and above domain protocol ownership.
-   > Verification: fs-meta consumes the ordinary app-facing runtime surface through `capanix-app-sdk` as the default authoring surface and `capanix-runtime-api` as the typed runtime boundary mirror; `capanix-kernel-api` remains only a low-level kernel-owned mirror or carrier vocabulary.
+   > Verification: fs-meta consumes the ordinary app-facing runtime surface through the SDK family rooted in `capanix-app-sdk`: `capanix-managed-state-sdk` supplies shared stateful observation authoring plus the top-level managed-state runtime wrapper, `capanix-service-sdk` supplies the lower service-first runtime wrapper/lowering path, `capanix-app-sdk` remains the lower Boundary Toolkit, and `capanix-runtime-api` remains the typed runtime boundary mirror; `capanix-kernel-api` remains only a low-level kernel-owned mirror or carrier vocabulary.
 6. **APP_OWNS_OPAQUE_PORT_MEANING**: **fs-meta System** MUST keep query/find/source/sink rendezvous naming and protocol meaning app-owned over opaque channels.
    > Covers L0: VISION.APP_OWNS_OPAQUE_PORT_MEANING
    > Responsibility: prevent kernel/runtime/adapter layers from becoming owners of fs-meta protocol semantics.
@@ -369,7 +369,7 @@ version: 3.0.0
    > Responsibility: keep app package semantics downstream of domain/runtime authority instead of creating a parallel contract set.
    > Verification: main specs trace root/domain Convergence Vocabulary without redefining package-local authority terms.
    > Verification: main specs explicitly state fs-meta app implementation consumes fs-meta domain specs and root Convergence Vocabulary rather than redefining `Authoritative Truth`, `Observation`, `Projection`, or `Observation-Eligible`.
-   > Verification: ordinary app-facing business modules default to `capanix-app-sdk`; narrow runtime glue and boundary-conversion seams MAY directly consume `capanix-runtime-api` without creating a second authoring authority, while `capanix-kernel-api` remains outside the app package business/infra surface.
+   > Verification: stateful observation-facing business modules consume `capanix-managed-state-sdk`, top-level runtime-wrapper authoring lowers through `capanix-service-sdk`, lower toolkit helpers consume `capanix-app-sdk`, worker-process client/server support consumes helper-only `capanix-worker-runtime-support`, and narrow runtime glue and boundary-conversion seams MAY directly consume `capanix-runtime-api` without creating a second authoring authority, while `capanix-kernel-api` remains outside the app package business/infra surface.
    > Verification: `fs-meta/app` and other package-local authoring surfaces MUST NOT directly depend on or reference `capanix-kernel-api`, `capanix-unit-entry-macros`, or `capanix-unit-sidecar`; those remain limited to dedicated artifact/runtime crates, explicit bridge seams, or test/dev fixtures.
    > Verification: `fs-meta/app` remains the only product app package for the fs-meta container, stays `publish = false`, owns package-local business/runtime composition, and does not present a generic reusable fs-meta library API.
    > Verification: bounded `product` remains the product-facing CLI/tooling namespace, while public `query`, `product::release_doc`, and `workers` support surfaces may remain package-local operational/test support modules without becoming product or platform authority.
@@ -390,7 +390,7 @@ version: 3.0.0
 6. **OPAQUE_INTERNAL_PORTS_ONLY**: **fs-meta System** MUST treat internal ports and protocols as app-owned opaque semantics rather than platform-owned vocabulary.
    > Verification: app architecture and workflows keep internal ports opaque and route/channel carriers platform-owned only as transport.
    > Verification: external-worker realization helpers remain confined to explicit worker runtime seams and do not define source/sink/query/API business module contracts.
-   > Verification: the upstream bridge-realization seam remains only the low-level external-worker bridge carrier; worker child-process bootstrap, log/socket ownership, retry clipping, and lifecycle supervision remain downstream product-owned runtime-support concerns rather than worker artifact or tooling responsibilities.
+   > Verification: the upstream bridge-realization seam remains only the low-level external-worker bridge carrier; worker child-process bootstrap, log/socket ownership, retry clipping, and lifecycle supervision remain confined to helper-only `capanix-worker-runtime-support` rather than worker artifact or tooling responsibilities.
    > Verification: external-worker transport preserves canonical `Timeout` / `TransportClosed` categories and wall-clock total-timeout semantics instead of collapsing transport failures into a generic peer-error bucket.
 7. **RELEASE_GENERATION_CUTOVER_CONSUMPTION_ONLY**: **fs-meta System** MUST consume release-generation cutover by replaying current authoritative truth inputs (`roots`, runtime grants, authoritative journal continuation) and rebuilding observation state rather than inventing package-local rollout semantics.
    > Verification: active scan-enabled primary groups reaching trusted materialized observation state are the readiness anchor for `trusted-materialized` `/tree` and `/stats` exposure.

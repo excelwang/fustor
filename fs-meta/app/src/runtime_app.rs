@@ -7,7 +7,7 @@ use crate::api::facade_status::{
 };
 #[cfg(test)]
 use crate::query::observation::{
-    candidate_group_observation_evidence, evaluate_observation_status,
+    ObservationTrustPolicy, candidate_group_observation_evidence, evaluate_observation_status,
 };
 #[cfg(test)]
 use crate::query::tree::ObservationState;
@@ -29,26 +29,26 @@ use crate::workers::sink::{SinkFacade, SinkWorkerClientHandle};
 use crate::workers::source::{SourceFacade, SourceWorkerClientHandle};
 use crate::{FSMetaConfig, api, source};
 use async_trait::async_trait;
-use capanix_app_sdk::raw::{
-    BoundaryContext, ChannelAttachReply, ChannelAttachRequest, ChannelBoundary,
-    ChannelCommitRequest, ChannelCommitResult, ChannelIoSubset, ChannelKey, ChannelRecvRequest,
-    ChannelSendRequest, StateBoundary,
-};
+use capanix_app_sdk::raw::{ChannelBoundary, ChannelIoSubset, StateBoundary};
 use capanix_app_sdk::runtime::{
-    ConfigValue, ControlEnvelope, EventMetadata, KernelResultEnvelope, LogLevel, NodeId, RecvOpts,
-    StateCellReadRequest, StateCellWatchRequest, StateCellWriteRequest, in_memory_state_boundary,
+    ConfigValue, ControlEnvelope, EventMetadata, NodeId, RecvOpts, in_memory_state_boundary,
 };
+use capanix_app_sdk::worker::WorkerMode;
 use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryApp};
+use capanix_managed_state_sdk::{
+    ManagedStateBuilder, ManagedStateDeclaration, ManagedStateProfile, RuntimeLoadedManagedState,
+};
+use capanix_worker_runtime_support::CompositeRuntimeBoundary;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::sink::SinkFileMeta;
 #[cfg(test)]
 use crate::source::config::SourceConfig;
-use crate::source::config::{SinkExecutionMode, SourceExecutionMode};
 
-// Canonical fs-meta app authoring flows through `app-sdk`; direct runtime-api use
-// is confined to narrow infra seams such as boundary conversion helpers.
+// Top-level fs-meta runtime authoring lowers through `managed-state-sdk ->
+// service-sdk -> app-sdk`; direct runtime-api use is confined to narrow infra
+// seams such as boundary conversion helpers.
 
 struct FacadeActivation {
     route_key: String,
@@ -92,33 +92,6 @@ fn now_us() -> u64 {
     }
 }
 
-fn attached_serving_nodes(
-    control_boundary: Arc<dyn ChannelBoundary>,
-    route_token: &str,
-    use_port: &str,
-    timeout: Duration,
-) -> Result<Vec<NodeId>> {
-    let replies = control_boundary.channel_attach(
-        BoundaryContext::default(),
-        ChannelAttachRequest {
-            route_token: route_token.to_string(),
-            use_port: use_port.to_string(),
-            timeout_ms: Some(timeout.as_millis() as u64),
-        },
-    )?;
-    let mut nodes = std::collections::BTreeSet::<String>::new();
-    let mut out = Vec::new();
-    for reply in replies {
-        if !reply.ok {
-            continue;
-        }
-        if nodes.insert(reply.serving_node.0.clone()) {
-            out.push(reply.serving_node);
-        }
-    }
-    Ok(out)
-}
-
 fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
     match unit {
         FacadeRuntimeUnit::Facade => {
@@ -137,7 +110,6 @@ fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
 pub struct FSMetaApp {
     config: FSMetaConfig,
     node_id: NodeId,
-    runtime_control_boundary: Option<Arc<dyn ChannelBoundary>>,
     runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     source: Arc<SourceFacade>,
     sink: Arc<SinkFacade>,
@@ -173,8 +145,8 @@ impl FSMetaApp {
     ) -> Result<Self> {
         let source_cfg = config.source.clone();
         let sink_source_cfg = config.source.clone();
-        let source = match source_cfg.source_execution_mode {
-            SourceExecutionMode::InProcess => Arc::new(SourceFacade::local(Arc::new(
+        let source = match config.runtime_workers.source.mode {
+            WorkerMode::Embedded => Arc::new(SourceFacade::local(Arc::new(
                 source::FSMetaSource::with_boundaries_and_state(
                     source_cfg,
                     node_id.clone(),
@@ -182,7 +154,7 @@ impl FSMetaApp {
                     state_boundary.clone(),
                 )?,
             ))),
-            SourceExecutionMode::WorkerProcess => match boundary.clone() {
+            WorkerMode::External => match boundary.clone() {
                 Some(channel_boundary) => {
                     let control_boundary = ordinary_boundary.clone().ok_or_else(|| {
                         CnxError::InvalidInput(
@@ -190,13 +162,18 @@ impl FSMetaApp {
                                 .to_string(),
                         )
                     })?;
-                    let pair = Arc::new(RuntimeBoundaryPair {
-                        control: control_boundary,
-                        data: channel_boundary.clone(),
-                        state: state_boundary.clone(),
-                    });
+                    let pair = Arc::new(CompositeRuntimeBoundary::new(
+                        control_boundary,
+                        channel_boundary.clone(),
+                        state_boundary.clone(),
+                    ));
                     Arc::new(SourceFacade::worker(Arc::new(
-                        SourceWorkerClientHandle::new(node_id.clone(), config.source.clone(), pair),
+                        SourceWorkerClientHandle::new(
+                            node_id.clone(),
+                            config.source.clone(),
+                            config.runtime_workers.source.clone(),
+                            pair,
+                        ),
                     )))
                 }
                 None => {
@@ -206,8 +183,8 @@ impl FSMetaApp {
                 }
             },
         };
-        let sink = match sink_source_cfg.sink_execution_mode {
-            SinkExecutionMode::InProcess => Arc::new(SinkFacade::local(Arc::new(
+        let sink = match config.runtime_workers.sink.mode {
+            WorkerMode::Embedded => Arc::new(SinkFacade::local(Arc::new(
                 SinkFileMeta::with_boundaries_and_state(
                     node_id.clone(),
                     boundary.clone(),
@@ -215,7 +192,7 @@ impl FSMetaApp {
                     sink_source_cfg.clone(),
                 )?,
             ))),
-            SinkExecutionMode::WorkerProcess => match boundary.clone() {
+            WorkerMode::External => match boundary.clone() {
                 Some(channel_boundary) => {
                     let control_boundary = ordinary_boundary.clone().ok_or_else(|| {
                         CnxError::InvalidInput(
@@ -223,14 +200,15 @@ impl FSMetaApp {
                                 .to_string(),
                         )
                     })?;
-                    let pair = Arc::new(RuntimeBoundaryPair {
-                        control: control_boundary,
-                        data: channel_boundary.clone(),
-                        state: state_boundary.clone(),
-                    });
+                    let pair = Arc::new(CompositeRuntimeBoundary::new(
+                        control_boundary,
+                        channel_boundary.clone(),
+                        state_boundary.clone(),
+                    ));
                     Arc::new(SinkFacade::worker(Arc::new(SinkWorkerClientHandle::new(
                         node_id.clone(),
                         sink_source_cfg.clone(),
+                        config.runtime_workers.sink.clone(),
                         pair,
                     ))))
                 }
@@ -245,7 +223,6 @@ impl FSMetaApp {
         Ok(Self {
             config,
             node_id,
-            runtime_control_boundary: ordinary_boundary.clone(),
             runtime_boundary: boundary,
             source,
             sink,
@@ -289,6 +266,22 @@ impl FSMetaApp {
         self.ensure_runtime_proxy_endpoints_started().await?;
 
         Ok(())
+    }
+
+    pub async fn send(&self, events: &[Event]) -> Result<()> {
+        self.service_send(events).await
+    }
+
+    pub async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
+        self.service_recv(opts).await
+    }
+
+    async fn service_send(&self, events: &[Event]) -> Result<()> {
+        self.sink.send(events).await
+    }
+
+    async fn service_recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
+        self.sink.recv(opts).await
     }
 
     async fn ensure_runtime_proxy_endpoints_started(&self) -> Result<()> {
@@ -345,7 +338,7 @@ impl FSMetaApp {
                                     "encode public query request failed: {err}"
                                 ))
                             })?;
-                            capanix_host_adapter_fs_meta::HostAdapter::call_collect(
+                            capanix_host_adapter_fs::HostAdapter::call_collect(
                                 &adapter,
                                 ROUTE_TOKEN_FS_META_INTERNAL,
                                 crate::runtime::routes::METHOD_SINK_QUERY_PROXY,
@@ -689,14 +682,15 @@ impl FSMetaApp {
         ids.into_iter().collect()
     }
 
+    #[cfg(test)]
     fn runtime_scoped_facade_group_ids(
         source: &SourceFacade,
         sink: &SinkFacade,
     ) -> Result<Vec<String>> {
         let mut source_groups = source.scheduled_source_group_ids()?.unwrap_or_default();
-        let mut scan_groups = source.scheduled_scan_group_ids()?.unwrap_or_default();
+        let scan_groups = source.scheduled_scan_group_ids()?.unwrap_or_default();
         source_groups.extend(scan_groups);
-        let mut sink_groups = sink.scheduled_group_ids()?.unwrap_or_default();
+        let sink_groups = sink.scheduled_group_ids()?.unwrap_or_default();
         if !source_groups.is_empty() && !sink_groups.is_empty() {
             return Ok(source_groups.intersection(&sink_groups).cloned().collect());
         }
@@ -706,6 +700,7 @@ impl FSMetaApp {
         Ok(sink_groups.into_iter().collect())
     }
 
+    #[cfg(test)]
     fn facade_candidate_group_ids(
         source: &SourceFacade,
         sink: &SinkFacade,
@@ -767,7 +762,7 @@ impl FSMetaApp {
             &source_status,
             &sink_status,
             &candidate_groups,
-        ));
+        ), ObservationTrustPolicy::candidate_generation());
         Ok(status.state == ObservationState::TrustedMaterialized)
     }
 
@@ -777,7 +772,6 @@ impl FSMetaApp {
             self.pending_facade.clone(),
             self.facade_pending_status.clone(),
             self.node_id.clone(),
-            self.runtime_control_boundary.clone(),
             self.runtime_boundary.clone(),
             self.source.clone(),
             self.sink.clone(),
@@ -792,7 +786,6 @@ impl FSMetaApp {
         pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
         facade_pending_status: SharedFacadePendingStatusCell,
         node_id: NodeId,
-        runtime_control_boundary: Option<Arc<dyn ChannelBoundary>>,
         runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
         source: Arc<SourceFacade>,
         sink: Arc<SinkFacade>,
@@ -873,7 +866,6 @@ impl FSMetaApp {
         let handle = api::spawn(
             pending.resolved.clone(),
             node_id,
-            runtime_control_boundary,
             runtime_boundary,
             source,
             sink,
@@ -1264,154 +1256,7 @@ impl FSMetaApp {
         true
     }
 
-    pub async fn query_tree(
-        &self,
-        params: &InternalQueryRequest,
-    ) -> Result<std::collections::BTreeMap<String, TreeGroupPayload>> {
-        let events = self.sink.materialized_query(params)?;
-        let mut grouped = std::collections::BTreeMap::<String, TreeGroupPayload>::new();
-        for event in &events {
-            let payload = rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
-                .map_err(|e| CnxError::Internal(format!("decode tree response failed: {e}")))?;
-            let MaterializedQueryPayload::Tree(response) = payload else {
-                return Err(CnxError::Internal(
-                    "unexpected stats payload for query_tree".into(),
-                ));
-            };
-            grouped.insert(event.metadata().origin_id.0.clone(), response);
-        }
-        Ok(grouped)
-    }
-
-    pub async fn query_stats(&self, path: &[u8]) -> Result<SubtreeStats> {
-        let events = self.sink.subtree_stats(path)?;
-        let mut agg = SubtreeStats::default();
-        for event in &events {
-            let stats = rmp_serde::from_slice::<SubtreeStats>(event.payload_bytes())
-                .map_err(|e| CnxError::Internal(format!("decode stats response failed: {e}")))?;
-            agg.total_nodes += stats.total_nodes;
-            agg.total_files += stats.total_files;
-            agg.total_dirs += stats.total_dirs;
-            agg.total_size += stats.total_size;
-            agg.attested_count += stats.attested_count;
-            agg.blind_spot_count += stats.blind_spot_count;
-        }
-        Ok(agg)
-    }
-
-    pub fn source_status_snapshot(&self) -> Result<crate::source::SourceStatusSnapshot> {
-        self.source.status_snapshot()
-    }
-
-    pub fn sink_status_snapshot(&self) -> Result<crate::sink::SinkStatusSnapshot> {
-        self.sink.status_snapshot()
-    }
-
-    pub async fn trigger_rescan_when_ready(&self) -> Result<()> {
-        self.source.trigger_rescan_when_ready().await
-    }
-
-    pub fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
-        self.sink.query_node(path)
-    }
-}
-
-pub(crate) struct RuntimeBoundaryPair {
-    control: Arc<dyn ChannelBoundary>,
-    data: Arc<dyn ChannelIoSubset>,
-    state: Arc<dyn StateBoundary>,
-}
-
-impl ChannelBoundary for RuntimeBoundaryPair {
-    fn channel_attach(
-        &self,
-        ctx: BoundaryContext,
-        request: ChannelAttachRequest,
-    ) -> Result<Vec<ChannelAttachReply>> {
-        self.control.channel_attach(ctx, request)
-    }
-
-    fn log(&self, ctx: BoundaryContext, level: LogLevel, msg: &str) {
-        self.control.log(ctx, level, msg)
-    }
-
-    fn report_app_failure(&self, reason: &str) {
-        self.control.report_app_failure(reason);
-    }
-
-    fn app_manifest_config(&self) -> Option<std::collections::HashMap<String, ConfigValue>> {
-        self.control.app_manifest_config()
-    }
-}
-
-impl ChannelIoSubset for RuntimeBoundaryPair {
-    fn channel_send(&self, ctx: BoundaryContext, request: ChannelSendRequest) -> Result<()> {
-        self.data.channel_send(ctx, request)
-    }
-
-    fn channel_commit(
-        &self,
-        ctx: BoundaryContext,
-        request: ChannelCommitRequest,
-    ) -> Result<ChannelCommitResult> {
-        self.data.channel_commit(ctx, request)
-    }
-
-    fn channel_recv(
-        &self,
-        ctx: BoundaryContext,
-        request: ChannelRecvRequest,
-    ) -> Result<Vec<Event>> {
-        self.data.channel_recv(ctx, request)
-    }
-
-    fn channel_close(&self, ctx: BoundaryContext, channel: ChannelKey) -> Result<()> {
-        self.data.channel_close(ctx, channel)
-    }
-}
-
-impl StateBoundary for RuntimeBoundaryPair {
-    fn statecell_read(
-        &self,
-        ctx: BoundaryContext,
-        request: StateCellReadRequest,
-    ) -> Result<KernelResultEnvelope> {
-        self.state.statecell_read(ctx, request)
-    }
-
-    fn statecell_write(
-        &self,
-        ctx: BoundaryContext,
-        request: StateCellWriteRequest,
-    ) -> Result<KernelResultEnvelope> {
-        self.state.statecell_write(ctx, request)
-    }
-
-    fn statecell_watch(
-        &self,
-        ctx: BoundaryContext,
-        request: StateCellWatchRequest,
-    ) -> Result<KernelResultEnvelope> {
-        self.state.statecell_watch(ctx, request)
-    }
-}
-
-
-#[async_trait]
-impl RuntimeBoundaryApp for FSMetaApp {
-    async fn start(&self) -> Result<()> {
-        FSMetaApp::start(self).await
-    }
-
-    async fn send(&self, events: &[Event]) -> Result<()> {
-        self.sink.send(events).await
-    }
-
-    async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
-        self.sink.recv(opts).await
-    }
-
-    async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
+    async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         self.ensure_runtime_proxy_endpoints_started().await?;
         let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
         for signal in facade_signals {
@@ -1468,8 +1313,8 @@ impl RuntimeBoundaryApp for FSMetaApp {
                     } else if matches!(unit, FacadeRuntimeUnit::Facade)
                         && route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL)
                         && self
-                        .confirm_pending_facade_exposure(&route_key, generation)
-                        .await
+                            .confirm_pending_facade_exposure(&route_key, generation)
+                            .await
                     {
                         self.retry_pending_facade(&route_key, generation, false)
                             .await?;
@@ -1491,7 +1336,11 @@ impl RuntimeBoundaryApp for FSMetaApp {
         Ok(())
     }
 
-    async fn close(&self) -> Result<()> {
+    pub async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
+        self.service_on_control_frame(envelopes).await
+    }
+
+    async fn service_close(&self) -> Result<()> {
         *self.pending_facade.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
         self.shutdown_active_facade().await;
@@ -1506,11 +1355,78 @@ impl RuntimeBoundaryApp for FSMetaApp {
         }
         Ok(())
     }
+
+    pub async fn close(&self) -> Result<()> {
+        self.service_close().await
+    }
+
+    pub async fn query_tree(
+        &self,
+        params: &InternalQueryRequest,
+    ) -> Result<std::collections::BTreeMap<String, TreeGroupPayload>> {
+        let events = self.sink.materialized_query(params)?;
+        let mut grouped = std::collections::BTreeMap::<String, TreeGroupPayload>::new();
+        for event in &events {
+            let payload = rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
+                .map_err(|e| CnxError::Internal(format!("decode tree response failed: {e}")))?;
+            let MaterializedQueryPayload::Tree(response) = payload else {
+                return Err(CnxError::Internal(
+                    "unexpected stats payload for query_tree".into(),
+                ));
+            };
+            grouped.insert(event.metadata().origin_id.0.clone(), response);
+        }
+        Ok(grouped)
+    }
+
+    pub async fn query_stats(&self, path: &[u8]) -> Result<SubtreeStats> {
+        let events = self.sink.subtree_stats(path)?;
+        let mut agg = SubtreeStats::default();
+        for event in &events {
+            let stats = rmp_serde::from_slice::<SubtreeStats>(event.payload_bytes())
+                .map_err(|e| CnxError::Internal(format!("decode stats response failed: {e}")))?;
+            agg.total_nodes += stats.total_nodes;
+            agg.total_files += stats.total_files;
+            agg.total_dirs += stats.total_dirs;
+            agg.total_size += stats.total_size;
+            agg.attested_count += stats.attested_count;
+            agg.blind_spot_count += stats.blind_spot_count;
+        }
+        Ok(agg)
+    }
+
+    pub fn source_status_snapshot(&self) -> Result<crate::source::SourceStatusSnapshot> {
+        self.source.status_snapshot()
+    }
+
+    pub fn sink_status_snapshot(&self) -> Result<crate::sink::SinkStatusSnapshot> {
+        self.sink.status_snapshot()
+    }
+
+    pub async fn trigger_rescan_when_ready(&self) -> Result<()> {
+        self.source.trigger_rescan_when_ready().await
+    }
+
+    pub fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
+        self.sink.query_node(path)
+    }
+}
+
+impl ManagedStateProfile for FSMetaApp {
+    fn managed_state_declaration(&self) -> ManagedStateDeclaration {
+        ManagedStateDeclaration::new(
+            "statecell authoritative journal",
+            "materialized sink/query projection tree",
+            "authoritative_revision",
+            "observed_projection_revision",
+            "shared observation evaluator drives trusted-materialized and observation_eligible",
+            "generation high-water plus statecell stale-writer fencing",
+        )
+    }
 }
 
 pub struct FSMetaRuntimeApp {
-    inner: Option<Arc<FSMetaApp>>,
-    init_error: Option<String>,
+    runtime: RuntimeLoadedManagedState,
 }
 
 impl FSMetaRuntimeApp {
@@ -1519,16 +1435,6 @@ impl FSMetaRuntimeApp {
             CnxError::InvalidInput(msg) => msg,
             other => other.to_string(),
         }
-    }
-
-    fn inner_arc(&self) -> Result<Arc<FSMetaApp>> {
-        self.inner.clone().ok_or_else(|| {
-            CnxError::InvalidInput(
-                self.init_error
-                    .clone()
-                    .unwrap_or_else(|| "fs-meta runtime init failed".to_string()),
-            )
-        })
     }
 
     fn runtime_local_host_ref(
@@ -1561,157 +1467,133 @@ impl FSMetaRuntimeApp {
     }
 
     fn build_from_runtime_boundaries(
-        ordinary_boundary: Arc<dyn ChannelBoundary>,
-        state_boundary: Arc<dyn StateBoundary>,
+        runtime_boundary: Arc<dyn RuntimeBoundary>,
         data_boundary: Option<Arc<dyn ChannelIoSubset>>,
     ) -> Self {
-        fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
-            if let Some(msg) = payload.downcast_ref::<String>() {
-                return msg.clone();
-            }
-            if let Some(msg) = payload.downcast_ref::<&'static str>() {
-                return (*msg).to_string();
-            }
-            "unknown panic payload".to_string()
-        }
-
-        // Some embeddings still load fs-meta in-process, but that boundary is
-        // non-isolating; constructor failures must stay on `init_error`
-        // instead of crossing the ABI as a panic/abort path.
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let manifest_cfg = match ordinary_boundary.app_manifest_config() {
-                Some(cfg) => cfg,
-                None => {
-                    return Self {
-                        inner: None,
-                        init_error: Some(
-                            "roots[] is required (missing app manifest config)".to_string(),
-                        ),
-                    };
-                }
-            };
-            let node_id = match Self::required_runtime_local_host_ref(&manifest_cfg) {
-                Ok(node_id) => node_id,
-                Err(err) => {
-                    return Self {
-                        inner: None,
-                        init_error: Some(Self::init_error_message(err)),
-                    };
-                }
-            };
-            let cfg = FSMetaConfig::from_manifest_config(&manifest_cfg);
-            match cfg {
-                Ok(cfg) => match FSMetaApp::with_boundaries_and_state(
+        let format_error = |err: CnxError| {
+            let msg = Self::init_error_message(err);
+            log::error!("fs-meta runtime init failed: {msg}");
+            msg
+        };
+        let runtime = RuntimeLoadedManagedState::from_loader(
+            runtime_boundary,
+            data_boundary.clone(),
+            move |runtime_boundary, data_boundary| {
+                let ordinary_boundary: Arc<dyn ChannelBoundary> = runtime_boundary.clone();
+                let state_boundary: Arc<dyn StateBoundary> = runtime_boundary.clone();
+                let manifest_cfg = ordinary_boundary.app_manifest_config().ok_or_else(|| {
+                    CnxError::InvalidInput(
+                        "roots[] is required (missing app manifest config)".to_string(),
+                    )
+                })?;
+                let node_id = Self::required_runtime_local_host_ref(&manifest_cfg)?;
+                let cfg = FSMetaConfig::from_manifest_config(&manifest_cfg)?;
+                let app = Arc::new(FSMetaApp::with_boundaries_and_state(
                     cfg,
                     node_id,
-                    data_boundary,
+                    data_boundary.clone(),
                     Some(ordinary_boundary),
                     state_boundary,
-                ) {
-                    Ok(inner) => Self {
-                        inner: Some(Arc::new(inner)),
-                        init_error: None,
-                    },
-                    Err(err) => {
-                        let msg = Self::init_error_message(err);
-                        log::error!("fs-meta runtime init failed (build app): {msg}");
-                        Self {
-                            inner: None,
-                            init_error: Some(msg),
+                )?);
+                let builder = ManagedStateBuilder::from_profile(app.as_ref())
+                    .register_role("facade", app.clone())
+                    .on_start({
+                        let app = app.clone();
+                        move |_context| {
+                            let app = app.clone();
+                            async move { app.start().await }
                         }
-                    }
-                },
-                Err(err) => {
-                    let msg = Self::init_error_message(err);
-                    log::error!("fs-meta runtime init failed (manifest config): {msg}");
-                    Self {
-                        inner: None,
-                        init_error: Some(msg),
-                    }
-                }
-            }
-        }));
-
-        match result {
-            Ok(app) => app,
-            Err(payload) => {
-                let msg = format!(
-                    "fs-meta runtime init panicked during constructor: {}",
-                    panic_message(payload)
-                );
-                log::error!("{msg}");
-                Self {
-                    inner: None,
-                    init_error: Some(msg),
-                }
-            }
-        }
+                    })
+                    .on_send({
+                        let app = app.clone();
+                        move |_context, events| {
+                            let app = app.clone();
+                            async move { app.service_send(&events).await }
+                        }
+                    })
+                    .on_recv({
+                        let app = app.clone();
+                        move |_context, opts| {
+                            let app = app.clone();
+                            async move { app.service_recv(opts).await }
+                        }
+                    })
+                    .on_control_frame({
+                        let app = app.clone();
+                        move |_context, envelopes| {
+                            let app = app.clone();
+                            async move { app.service_on_control_frame(&envelopes).await }
+                        }
+                    })
+                    .on_close(move |_context| {
+                        let app = app.clone();
+                        async move { app.service_close().await }
+                    });
+                Ok(Arc::new(builder.build(
+                    capanix_service_sdk::ServiceContext::with_optional_data(
+                        runtime_boundary,
+                        data_boundary,
+                    ),
+                )))
+            },
+            format_error,
+        );
+        Self { runtime }
     }
 
     pub fn new_without_io(boundary: Arc<dyn RuntimeBoundary>) -> Self {
-        let ordinary_boundary: Arc<dyn ChannelBoundary> = boundary.clone();
-        let state_boundary: Arc<dyn StateBoundary> = boundary;
-        Self::build_from_runtime_boundaries(ordinary_boundary, state_boundary, None)
+        Self::build_from_runtime_boundaries(boundary, None)
     }
 
     pub fn new(
         boundary: Arc<dyn RuntimeBoundary>,
         data_boundary: Arc<dyn ChannelIoSubset>,
     ) -> Self {
-        let ordinary_boundary: Arc<dyn ChannelBoundary> = boundary.clone();
-        let state_boundary: Arc<dyn StateBoundary> = boundary;
-        Self::build_from_runtime_boundaries(ordinary_boundary, state_boundary, Some(data_boundary))
+        Self::build_from_runtime_boundaries(boundary, Some(data_boundary))
     }
 }
 
 #[async_trait]
 impl RuntimeBoundaryApp for FSMetaRuntimeApp {
     async fn start(&self) -> Result<()> {
-        let inner = self.inner_arc()?;
         if tokio::runtime::Handle::try_current().is_ok() {
-            inner.start().await
+            self.runtime.start().await
         } else {
-            shared_tokio_runtime().block_on(inner.start())
+            shared_tokio_runtime().block_on(self.runtime.start())
         }
     }
 
     async fn send(&self, events: &[Event]) -> Result<()> {
-        let inner = self.inner_arc()?;
         if tokio::runtime::Handle::try_current().is_ok() {
-            inner.send(events).await
+            self.runtime.send(events).await
         } else {
-            shared_tokio_runtime().block_on(inner.send(events))
+            shared_tokio_runtime().block_on(self.runtime.send(events))
         }
     }
 
     async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
-        let inner = self.inner_arc()?;
         if tokio::runtime::Handle::try_current().is_ok() {
-            inner.recv(opts).await
+            self.runtime.recv(opts).await
         } else {
-            shared_tokio_runtime().block_on(inner.recv(opts))
+            shared_tokio_runtime().block_on(self.runtime.recv(opts))
         }
     }
 
     async fn on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
-        let inner = self.inner_arc()?;
         if tokio::runtime::Handle::try_current().is_ok() {
-            inner.on_control_frame(envelopes).await
+            self.runtime.on_control_frame(envelopes).await
         } else {
-            shared_tokio_runtime().block_on(inner.on_control_frame(envelopes))
+            shared_tokio_runtime().block_on(self.runtime.on_control_frame(envelopes))
         }
     }
 
     async fn close(&self) -> Result<()> {
-        match self.inner_arc() {
-            Ok(inner) => {
-                if tokio::runtime::Handle::try_current().is_ok() {
-                    inner.close().await
-                } else {
-                    shared_tokio_runtime().block_on(inner.close())
-                }
-            }
-            Err(_) => Ok(()),
+        if tokio::runtime::Handle::try_current().is_ok() {
+            self.runtime.close().await.or(Ok(()))
+        } else {
+            shared_tokio_runtime()
+                .block_on(self.runtime.close())
+                .or(Ok(()))
         }
     }
 }
@@ -1722,7 +1604,8 @@ mod tests {
     use crate::{FSMetaConfig, api, query, source};
     use bytes::Bytes;
     use capanix_app_sdk::runtime::EventMetadata;
-    use capanix_host_fs_types::{ControlEvent, FileMetaRecord, UnixStat};
+    use crate::{ControlEvent, FileMetaRecord};
+    use capanix_host_fs_types::UnixStat;
     use capanix_route_proto::{
         ExecActivate, ExecControl, HostDescriptor, HostObjectGrant, HostObjectGrantState,
         HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged, UnitExposureConfirmed,
@@ -1751,11 +1634,15 @@ mod tests {
     }
 
     fn in_process_source_config() -> SourceConfig {
-        SourceConfig {
-            source_execution_mode: SourceExecutionMode::InProcess,
-            sink_execution_mode: SinkExecutionMode::InProcess,
-            ..SourceConfig::default()
-        }
+        SourceConfig::default()
+    }
+
+    fn in_process_runtime_workers() -> crate::FSMetaRuntimeWorkers {
+        let mut workers = crate::FSMetaRuntimeWorkers::default();
+        workers.source.mode = WorkerMode::Embedded;
+        workers.scan.mode = WorkerMode::Embedded;
+        workers.sink.mode = WorkerMode::Embedded;
+        workers
     }
 
     struct NoopBoundary;
@@ -1979,6 +1866,7 @@ mod tests {
         let _app = FSMetaApp::new(
             FSMetaConfig {
                 source: in_process_source_config(),
+                runtime_workers: in_process_runtime_workers(),
                 ..FSMetaConfig::default()
             },
             NodeId("single-app-node".into()),
@@ -2028,6 +1916,7 @@ mod tests {
                 },
                 ..api::ApiConfig::default()
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
         match app
@@ -2086,14 +1975,15 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
         app.start().await.expect("start app");
         match app
             .on_control_frame(&[activate_envelope_with_scopes(
                 "runtime.exec.facade",
-                "single-app-listener",
-                &["single-app-listener"],
+                "listener-a",
+                &["listener-a"],
             )])
             .await
         {
@@ -2145,6 +2035,7 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2184,6 +2075,7 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2197,7 +2089,6 @@ mod tests {
                 .resolve_for_candidate_ids(&["listener-a".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
-            app.runtime_control_boundary.clone(),
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
@@ -2292,6 +2183,7 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2305,7 +2197,6 @@ mod tests {
                 .resolve_for_candidate_ids(&["single-app-listener".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
-            app.runtime_control_boundary.clone(),
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
@@ -2395,6 +2286,7 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2408,7 +2300,6 @@ mod tests {
                 .resolve_for_candidate_ids(&["listener-a".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
-            app.runtime_control_boundary.clone(),
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
@@ -2518,6 +2409,7 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2531,7 +2423,6 @@ mod tests {
                 .resolve_for_candidate_ids(&["listener-a".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
-            app.runtime_control_boundary.clone(),
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
@@ -2648,6 +2539,7 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2707,6 +2599,7 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::with_boundaries(
             cfg,
@@ -2785,6 +2678,7 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
 
@@ -2831,7 +2725,7 @@ mod tests {
                     "single-app-node::root-a-1",
                     ControlEvent::EpochEnd {
                         epoch_id: 0,
-                        epoch_type: capanix_host_fs_types::EpochType::Audit,
+                        epoch_type: crate::EpochType::Audit,
                     },
                     11,
                 ),
@@ -2882,6 +2776,7 @@ mod tests {
                 ..in_process_source_config()
             },
             api: api::ApiConfig::default(),
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
         let err = app
@@ -2903,6 +2798,7 @@ mod tests {
                 ..in_process_source_config()
             },
             api: api::ApiConfig::default(),
+            runtime_workers: in_process_runtime_workers(),
         };
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
         assert_eq!(
@@ -2974,6 +2870,7 @@ mod tests {
                     ..api::ApiAuthConfig::default()
                 },
             },
+            runtime_workers: in_process_runtime_workers(),
         };
 
         let app = FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app");
@@ -3146,7 +3043,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_sink_execution_mode_worker_process() {
+    fn rejects_removed_sink_execution_mode_field() {
         let cfg = std::collections::HashMap::from([
             (
                 "roots".to_string(),
@@ -3155,115 +3052,82 @@ mod tests {
             (
                 "sink_execution_mode".to_string(),
                 ConfigValue::String("worker-process".to_string()),
+            ),
+        ]);
+        let err = FSMetaConfig::from_manifest_config(&cfg)
+            .expect_err("removed sink execution mode must fail");
+        assert!(err.to_string().contains(
+            "sink_execution_mode has been removed; declare generic workers.<role>.mode/startup.path/socket_dir instead"
+        ));
+    }
+
+    #[test]
+    fn rejects_removed_source_execution_mode_field() {
+        let cfg = std::collections::HashMap::from([
+            (
+                "roots".to_string(),
+                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
+            ),
+            (
+                "source_execution_mode".to_string(),
+                ConfigValue::String("worker-process".to_string()),
+            ),
+        ]);
+        let err = FSMetaConfig::from_manifest_config(&cfg)
+            .expect_err("removed source execution mode must fail");
+        assert!(err.to_string().contains(
+            "source_execution_mode has been removed; declare generic workers.<role>.mode/startup.path/socket_dir instead"
+        ));
+    }
+
+    #[test]
+    fn rejects_removed_sink_worker_bin_path_field() {
+        let cfg = std::collections::HashMap::from([
+            (
+                "roots".to_string(),
+                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
             ),
             (
                 "sink_worker_bin_path".to_string(),
                 ConfigValue::String("/usr/local/bin/fs_meta_sink_worker".to_string()),
             ),
         ]);
-        let parsed =
-            FSMetaConfig::from_manifest_config(&cfg).expect("parse worker-process sink mode");
-        assert_eq!(
-            parsed.source.sink_execution_mode,
-            SinkExecutionMode::WorkerProcess
-        );
-        assert_eq!(
-            parsed.source.sink_worker_bin_path,
-            Some(std::path::PathBuf::from(
-                "/usr/local/bin/fs_meta_sink_worker"
-            ))
-        );
+        let err = FSMetaConfig::from_manifest_config(&cfg)
+            .expect_err("removed sink worker bin path must fail");
+        assert!(err.to_string().contains("sink_worker_bin_path has been removed"));
     }
 
     #[test]
-    fn parses_source_execution_mode_worker_process() {
+    fn rejects_removed_source_worker_bin_path_field() {
         let cfg = std::collections::HashMap::from([
             (
                 "roots".to_string(),
                 ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-            ),
-            (
-                "source_execution_mode".to_string(),
-                ConfigValue::String("worker-process".to_string()),
             ),
             (
                 "source_worker_bin_path".to_string(),
                 ConfigValue::String("/usr/local/bin/fs_meta_source_worker".to_string()),
             ),
         ]);
-        let parsed =
-            FSMetaConfig::from_manifest_config(&cfg).expect("parse worker-process source mode");
-        assert_eq!(
-            parsed.source.source_execution_mode,
-            SourceExecutionMode::WorkerProcess
-        );
-        assert_eq!(
-            parsed.source.source_worker_bin_path,
-            Some(std::path::PathBuf::from(
-                "/usr/local/bin/fs_meta_source_worker"
-            ))
-        );
-    }
-
-    #[test]
-    fn rejects_unknown_sink_execution_mode() {
-        let cfg = std::collections::HashMap::from([
-            (
-                "roots".to_string(),
-                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-            ),
-            (
-                "sink_execution_mode".to_string(),
-                ConfigValue::String("sidecar".to_string()),
-            ),
-        ]);
         let err = FSMetaConfig::from_manifest_config(&cfg)
-            .expect_err("unsupported sink execution mode must fail");
-        assert!(err.to_string().contains("unsupported sink_execution_mode"));
-    }
-
-    #[test]
-    fn rejects_unknown_source_execution_mode() {
-        let cfg = std::collections::HashMap::from([
-            (
-                "roots".to_string(),
-                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-            ),
-            (
-                "source_execution_mode".to_string(),
-                ConfigValue::String("sidecar".to_string()),
-            ),
-        ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
-            .expect_err("unsupported source execution mode must fail");
-        assert!(
-            err.to_string()
-                .contains("unsupported source_execution_mode")
-        );
+            .expect_err("removed source worker bin path must fail");
+        assert!(err.to_string().contains("source_worker_bin_path has been removed"));
     }
 
     #[test]
     fn defaults_sink_worker_process_mode_to_standard_worker_binary() {
-        let cfg = std::collections::HashMap::from([
-            (
-                "roots".to_string(),
-                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-            ),
-            (
-                "sink_execution_mode".to_string(),
-                ConfigValue::String("worker-process".to_string()),
-            ),
-        ]);
+        let cfg = std::collections::HashMap::from([(
+            "roots".to_string(),
+            ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
+        )]);
         let parsed = FSMetaConfig::from_manifest_config(&cfg)
             .expect("worker-process mode should infer sink worker binary path");
-        assert_eq!(
-            parsed.source.sink_execution_mode,
-            SinkExecutionMode::WorkerProcess
-        );
+        assert_eq!(parsed.runtime_workers.sink.mode, WorkerMode::External);
         assert!(
             parsed
-                .source
-                .sink_worker_bin_path
+                .runtime_workers
+                .sink
+                .startup_path
                 .as_ref()
                 .is_some_and(|path| path.ends_with("fs_meta_sink_worker")),
             "sink worker baseline should infer the standard worker binary path"
@@ -3272,26 +3136,18 @@ mod tests {
 
     #[test]
     fn defaults_source_worker_process_mode_to_standard_worker_binary() {
-        let cfg = std::collections::HashMap::from([
-            (
-                "roots".to_string(),
-                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-            ),
-            (
-                "source_execution_mode".to_string(),
-                ConfigValue::String("worker-process".to_string()),
-            ),
-        ]);
+        let cfg = std::collections::HashMap::from([(
+            "roots".to_string(),
+            ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
+        )]);
         let parsed = FSMetaConfig::from_manifest_config(&cfg)
             .expect("worker-process mode should infer source worker binary path");
-        assert_eq!(
-            parsed.source.source_execution_mode,
-            SourceExecutionMode::WorkerProcess
-        );
+        assert_eq!(parsed.runtime_workers.source.mode, WorkerMode::External);
         assert!(
             parsed
+                .runtime_workers
                 .source
-                .source_worker_bin_path
+                .startup_path
                 .as_ref()
                 .is_some_and(|path| path.ends_with("fs_meta_source_worker")),
             "source worker baseline should infer the standard worker binary path"
@@ -3320,16 +3176,10 @@ mod tests {
         ]);
         let parsed =
             FSMetaConfig::from_manifest_config(&cfg).expect("parse worker-oriented config");
+        assert_eq!(parsed.runtime_workers.source.mode, WorkerMode::External);
+        assert_eq!(parsed.runtime_workers.sink.mode, WorkerMode::Embedded);
         assert_eq!(
-            parsed.source.source_execution_mode,
-            SourceExecutionMode::WorkerProcess
-        );
-        assert_eq!(
-            parsed.source.sink_execution_mode,
-            SinkExecutionMode::InProcess
-        );
-        assert_eq!(
-            parsed.source.source_worker_bin_path,
+            parsed.runtime_workers.source.startup_path,
             Some(std::path::PathBuf::from(
                 "/usr/local/bin/fs_meta_source_worker"
             ))
@@ -3353,12 +3203,9 @@ mod tests {
         ]);
         let parsed = FSMetaConfig::from_manifest_config(&cfg)
             .expect("scan worker path should feed the shared source/scan realization");
+        assert_eq!(parsed.runtime_workers.source.mode, WorkerMode::External);
         assert_eq!(
-            parsed.source.source_execution_mode,
-            SourceExecutionMode::WorkerProcess
-        );
-        assert_eq!(
-            parsed.source.source_worker_bin_path,
+            parsed.runtime_workers.source.startup_path,
             Some(std::path::PathBuf::from(
                 "/usr/local/bin/fs_meta_scan_worker"
             ))
@@ -3434,7 +3281,7 @@ mod tests {
         let err = FSMetaConfig::from_manifest_config(&cfg)
             .expect_err("source/scan worker binary mismatch must fail");
         assert!(err.to_string().contains(
-            "workers.source.binary_path and workers.scan.binary_path must match while source-worker and scan-worker still share one realization"
+            "workers.source.startup.path and workers.scan.startup.path must match while source-worker and scan-worker still share one realization"
         ));
     }
 

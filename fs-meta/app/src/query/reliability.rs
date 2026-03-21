@@ -1,4 +1,4 @@
-use capanix_host_fs_types::query::UnreliableReason;
+use crate::shared_types::query::UnreliableReason;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]

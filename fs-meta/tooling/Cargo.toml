@@ -24,7 +24,7 @@ anyhow = "1"
 capanix-app-fs-meta = { workspace = true }
 capanix-config = { workspace = true }
 capanix-daemon = { workspace = true, optional = true }
-capanix-host-adapter-fs-meta = { workspace = true }
+capanix-host-adapter-fs = { workspace = true }
 capanix-runtime-api = "0.1.0"
 clap = { version = "4", features = ["derive", "env"] }
 libc = "0.2"

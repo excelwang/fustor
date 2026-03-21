@@ -113,7 +113,7 @@ fn local_dev_daemon_composition_only() {
         manifest.contains("name = \"capanix-app-fs-meta-tooling\"")
             && manifest.contains("local-daemon = [\"dep:capanix-daemon\"]")
             && manifest.contains("capanix-daemon = { workspace = true, optional = true }")
-            && manifest.contains("capanix-host-adapter-fs-meta = { workspace = true }")
+            && manifest.contains("capanix-host-adapter-fs = { workspace = true }")
             && manifest.contains("required-features = [\"local-daemon\"]"),
         "fs-meta local-dev launcher should stay in the dedicated tooling package as an explicit optional feature over daemon seams"
     );

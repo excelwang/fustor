@@ -6,7 +6,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
-use capanix_host_fs_types::{ControlEvent, EpochType};
+use crate::{ControlEvent, EpochType};
 
 use crate::sink::tree::MaterializedTree;
 
@@ -217,7 +217,7 @@ pub fn missing_item_detection(
 mod tests {
     use std::time::Duration;
 
-    use capanix_host_fs_types::{ControlEvent, EpochType, SyncTrack};
+    use crate::{ControlEvent, EpochType, SyncTrack};
 
     use super::*;
     use crate::sink::tree::FileMetaNode;

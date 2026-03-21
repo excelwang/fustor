@@ -25,6 +25,11 @@ fn load_yaml(path: &str) -> Value {
     serde_yaml::from_str(&yaml).expect("parse fs-meta yaml")
 }
 
+fn read_capanix_repo_file(path: &str) -> String {
+    let root = crate::path_support::capanix_repo_root();
+    std::fs::read_to_string(root.join(path)).expect("read capanix repo file")
+}
+
 fn assert_domain_fs_meta_contract_test(contract_id: &str, fn_name: &str) {
     let domain_tests =
         read_fs_meta_spec_file("fs-meta/tests/specs/test_contracts_fs_meta_domain.rs");
@@ -251,12 +256,12 @@ fn test_source_host_fs_calls_are_abstracted_through_host_adapter_sdk() {
     let watcher = read_fs_meta_spec_file("fs-meta/app/src/source/watcher.rs");
 
     assert!(
-        scanner.contains("HostFsMeta"),
-        "scanner should consume host-adapter-fs-meta HostFsMeta trait"
+        scanner.contains("HostFs"),
+        "scanner should consume host-adapter-fs HostFs trait"
     );
     assert!(
         watcher.contains("HostFsWatch"),
-        "watcher should consume host-adapter-fs-meta HostFsWatch trait"
+        "watcher should consume host-adapter-fs HostFsWatch trait"
     );
     assert!(
         !scanner.contains("std::fs::"),
@@ -272,11 +277,11 @@ fn test_source_host_fs_calls_are_abstracted_through_host_adapter_sdk() {
     );
     assert!(source_mod.contains("HostFsFacade"));
     assert!(
-        !source_mod.contains("LocalHostFsMeta"),
+        !source_mod.contains("LocalHostFs"),
         "source runtime should not branch on local host-fs backend construction directly"
     );
     assert!(
-        !source_mod.contains("RoutedHostFsMeta::new("),
+        !source_mod.contains("RoutedHostFs::new("),
         "source runtime should not branch on routed host-fs backend construction directly"
     );
     assert!(
@@ -1151,17 +1156,17 @@ fn test_role_group_access_guard_contract() {
 fn test_runtime_support_transport_supervision_contracts() {
     let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md");
-    let transport = read_fs_meta_spec_file("fs-meta/runtime-support/src/transport.rs");
-    let typed_client = read_fs_meta_spec_file("fs-meta/runtime-support/src/typed_client.rs");
-    let errors = read_fs_meta_spec_file("fs-meta/runtime-support/src/error.rs");
+    let transport = read_capanix_repo_file("crates/worker-runtime-support/src/transport.rs");
+    let typed_client = read_capanix_repo_file("crates/worker-runtime-support/src/typed_client.rs");
+    let errors = read_capanix_repo_file("crates/worker-runtime-support/src/error.rs");
 
     assert!(l2.contains(
-        "`fs-meta/runtime-support/` is the only crate that owns worker child-process bootstrap"
+        "helper-only `capanix-worker-runtime-support` owns worker child-process bootstrap"
     ));
     assert!(l2.contains("MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping"));
     assert!(l3.contains("ExternalWorkerBootstrapTransport"));
     assert!(l3.contains("ExternalWorkerRetryAndErrorClassification"));
-    assert!(l3.contains("direct control-plane startup handshake"));
+    assert!(l3.contains("worker has acknowledged its direct control-plane startup handshake"));
     assert!(l3.contains("`Ping` / `Init` / `Start` / `Close` / `OnControlFrame`"));
     assert!(transport.contains("spawn_worker_process("));
     assert!(transport.contains("on_control_frame("));
@@ -1188,9 +1193,9 @@ fn test_scan_worker_alias_bootstrap_contract() {
     assert!(l2.contains("`scan-worker` is a distinct operator-visible worker role"));
     assert!(l2.contains("dedicated `run_scan_worker_server(...)` entry while still sharing lower-level source-runtime helpers internally"));
     assert!(l3.contains("ScanWorkerAliasBootstrap"));
-    assert!(l3.contains("reuses lower-level source-runtime helpers internally via `run_scan_worker_runtime_loop(...)`"));
+    assert!(l3.contains("reuses lower-level source-worker runtime helpers internally via `run_source_worker_runtime_loop(...)`"));
     assert!(scan_lib.contains("run_scan_worker_server("));
-    assert!(scan_lib.contains("run_scan_worker_runtime_loop(boundary, io_boundary, &runtime)"));
+    assert!(scan_lib.contains("run_source_worker_runtime_loop("));
     assert!(scan_main.contains("run_scan_worker_server("));
     assert!(scan_main.contains("&control_socket_path"));
     assert!(scan_main.contains("&data_socket_path"));

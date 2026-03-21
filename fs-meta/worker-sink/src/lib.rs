@@ -2,20 +2,19 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use bytes::Bytes;
 use capanix_app_fs_meta::sink::SinkFileMeta;
-use capanix_app_fs_meta::source::config::{SinkExecutionMode, SourceConfig};
+use capanix_app_fs_meta::source::config::SourceConfig;
+use capanix_app_fs_meta::workers::sink::SinkWorkerRpc;
 use capanix_app_fs_meta::workers::sink_ipc::{
     SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, SinkWorkerRequest, SinkWorkerResponse,
-    decode_request, encode_response, recv_opts, sink_worker_control_route_key_from_env,
+    recv_opts, sink_worker_control_route_key_from_env,
 };
-use capanix_app_fs_meta_runtime_support::decode_control_payload;
-use capanix_app_sdk::raw::{
-    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
-    StateBoundary,
+use capanix_app_sdk::raw::{ChannelIoSubset, StateBoundary};
+use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
+use capanix_app_sdk::{CnxError, Event};
+use capanix_worker_runtime_support::{
+    TypedWorkerServer, TypedWorkerSession, WorkerLoopControl, WorkerSessionContext,
 };
-use capanix_app_sdk::runtime::{ControlEnvelope, EventMetadata, NodeId};
-use capanix_app_sdk::{CnxError, Event, RuntimeBoundary, RuntimeBoundaryApp};
 
 fn block_on_runtime<F, T>(runtime: &tokio::runtime::Handle, fut: F) -> T
 where
@@ -42,13 +41,6 @@ fn classify_sink_worker_error(err: CnxError) -> SinkWorkerResponse {
     }
 }
 
-fn now_us() -> u64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => d.as_micros() as u64,
-        Err(_) => 0,
-    }
-}
-
 fn process_worker_request(
     request: SinkWorkerRequest,
     state: &mut SinkWorkerState,
@@ -66,7 +58,6 @@ fn process_worker_request(
             source_cfg.sink_tombstone_ttl =
                 Duration::from_millis(config.sink_tombstone_ttl_ms.max(1));
             source_cfg.sink_tombstone_tolerance_us = config.sink_tombstone_tolerance_us;
-            source_cfg.sink_execution_mode = SinkExecutionMode::InProcess;
             match SinkFileMeta::with_boundaries_and_state(
                 NodeId(node_id.clone()),
                 None,
@@ -74,7 +65,8 @@ fn process_worker_request(
                 source_cfg,
             ) {
                 Ok(inner) => {
-                    state.sink = Some(Arc::new(inner));
+                    let inner = Arc::new(inner);
+                    state.sink = Some(inner);
                     state.node_id = Some(NodeId(node_id));
                     state.endpoints_started = false;
                     state.send_tx = None;
@@ -231,7 +223,7 @@ fn process_worker_request(
             ),
         },
         SinkWorkerRequest::Send { events } => match state.sink.as_ref() {
-            Some(sink) => match state.send_tx.as_ref() {
+            Some(_) => match state.send_tx.as_ref() {
                 Some(send_tx) => match send_tx.send(events) {
                     Ok(()) => (SinkWorkerResponse::Ack, false),
                     Err(err) => (
@@ -242,9 +234,12 @@ fn process_worker_request(
                         false,
                     ),
                 },
-                None => match block_on_runtime(runtime, sink.send(&events)) {
-                    Ok(_) => (SinkWorkerResponse::Ack, false),
-                    Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                None => match state.sink.as_ref() {
+                    Some(sink) => match block_on_runtime(runtime, sink.send(&events)) {
+                        Ok(_) => (SinkWorkerResponse::Ack, false),
+                        Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                    },
+                    None => (SinkWorkerResponse::Error("sink worker not initialized".into()), false),
                 },
             },
             None => (
@@ -265,10 +260,12 @@ fn process_worker_request(
             ),
         },
         SinkWorkerRequest::OnControlFrame { envelopes } => match state.sink.as_ref() {
-            Some(sink) => match block_on_runtime(runtime, sink.on_control_frame(&envelopes)) {
-                Ok(_) => (SinkWorkerResponse::Ack, false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-            },
+            Some(sink) => {
+                match block_on_runtime(runtime, sink.on_control_frame(&envelopes)) {
+                    Ok(_) => (SinkWorkerResponse::Ack, false),
+                    Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                }
+            }
             None => (
                 SinkWorkerResponse::Error("sink worker not initialized".into()),
                 false,
@@ -279,6 +276,7 @@ fn process_worker_request(
             if let Some(sink) = state.sink.as_ref() {
                 let _ = block_on_runtime(runtime, sink.close());
             }
+            state.sink = None;
             (SinkWorkerResponse::Ack, true)
         }
     }
@@ -288,187 +286,63 @@ pub fn run_sink_worker_server(
     control_socket_path: &Path,
     data_socket_path: &Path,
 ) -> std::io::Result<()> {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()?;
-    eprintln!(
-        "fs_meta_sink_worker: binding control={} data={}",
-        control_socket_path.display(),
-        data_socket_path.display()
-    );
     let state = Arc::new(Mutex::new(SinkWorkerState {
         sink: None,
         node_id: None,
         endpoints_started: false,
         send_tx: None,
     }));
-    let runtime_handle = runtime.handle().clone();
-    let boundary_holder: Arc<Mutex<Option<(Arc<dyn StateBoundary>, Arc<dyn ChannelIoSubset>)>>> =
-        Arc::new(Mutex::new(None));
-    let control_state = state.clone();
-    let control_boundary_holder = boundary_holder.clone();
-    let control_handler = Arc::new(
-        move |envelopes: &[ControlEnvelope]| -> capanix_app_sdk::Result<()> {
-            let (state_boundary, io_boundary) = control_boundary_holder
-                .lock()
-                .map_err(|_| {
-                    CnxError::Internal("sink worker boundary holder lock poisoned".into())
-                })?
-                .clone()
-                .ok_or_else(|| {
-                    CnxError::NotReady("sink worker runtime boundary not ready".into())
-                })?;
-            let mut guard = control_state
-                .lock()
-                .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
-            let mut runtime_envelopes = Vec::new();
-            for envelope in envelopes {
-                if let Ok(payload) =
-                    decode_control_payload(envelope, SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND)
-                {
-                    let request = decode_request(payload)?;
-                    let (response, _) = process_worker_request(
-                        request,
-                        &mut guard,
-                        &runtime_handle,
-                        state_boundary.clone(),
-                        io_boundary.clone(),
-                    );
-                    match response {
-                        SinkWorkerResponse::Ack => {}
-                        SinkWorkerResponse::Error(message) => {
-                            return Err(CnxError::PeerError(message));
-                        }
-                        other => {
-                            return Err(CnxError::ProtocolViolation(format!(
-                                "unexpected sink bootstrap response: {:?}",
-                                other
-                            )));
-                        }
-                    }
-                } else {
-                    runtime_envelopes.push(envelope.clone());
-                }
-            }
-            if !runtime_envelopes.is_empty() {
-                let Some(sink) = guard.sink.as_ref() else {
-                    return Err(CnxError::NotReady(
-                        "sink worker runtime not initialized for runtime control frames".into(),
-                    ));
-                };
-                block_on_runtime(&runtime_handle, sink.on_control_frame(&runtime_envelopes))?;
-            }
-            Ok(())
-        },
-    );
-    let shared_boundary = Arc::new(
-        runtime
-            .block_on(
-                capanix_unit_sidecar::UnitRuntimeIpcBoundary::bind_and_accept_with_control_handler(
-                    control_socket_path,
-                    data_socket_path,
-                    control_handler,
-                ),
-            )
-            .map_err(|err| {
-                std::io::Error::other(format!("sink worker sidecar bind failed: {err}"))
-            })?,
-    );
-    eprintln!("fs_meta_sink_worker: boundary accepted control/data sockets");
-    let boundary: Arc<dyn RuntimeBoundary> = shared_boundary.clone();
-    let io_boundary: Arc<dyn ChannelIoSubset> = shared_boundary;
-    {
-        let mut holder = boundary_holder
-            .lock()
-            .map_err(|_| std::io::Error::other("sink worker boundary holder lock poisoned"))?;
-        *holder = Some((boundary.clone(), io_boundary.clone()));
-    }
-    run_sink_worker_primitive_loop(boundary, io_boundary, &runtime, state)
+    TypedWorkerServer::<SinkWorkerRpc, _>::new(
+        sink_worker_control_route_key_from_env(),
+        SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
+        SinkWorkerSession { state },
+    )
+    .run_with_sidecar(control_socket_path, data_socket_path)
 }
 
-fn run_sink_worker_primitive_loop(
-    boundary: Arc<dyn RuntimeBoundary>,
-    io_boundary: Arc<dyn ChannelIoSubset>,
-    runtime: &tokio::runtime::Runtime,
+struct SinkWorkerSession {
     state: Arc<Mutex<SinkWorkerState>>,
-) -> std::io::Result<()> {
-    let ctx = BoundaryContext::default();
-    let worker_route_key = sink_worker_control_route_key_from_env();
-    let request_channel = ChannelKey(worker_route_key.clone());
-    let reply_channel = ChannelKey(format!("{}:reply", worker_route_key));
+}
 
-    eprintln!(
-        "fs_meta_sink_worker: entering primitive loop route_key={}",
-        worker_route_key
-    );
-    let state_boundary: Arc<dyn StateBoundary> = boundary.clone();
-    let mut should_break = false;
-    while !should_break {
-        let requests = match io_boundary.channel_recv(
-            ctx.clone(),
-            ChannelRecvRequest {
-                channel_key: request_channel.clone(),
-                timeout_ms: Some(250),
-            },
-        ) {
-            Ok(events) => events,
-            Err(CnxError::Timeout) => continue,
-            Err(err) => {
-                return Err(std::io::Error::other(format!(
-                    "sink worker receive request failed: {err}"
-                )));
-            }
-        };
-        if requests.is_empty() {
-            continue;
-        }
-
-        let mut responses = Vec::with_capacity(requests.len());
-        for request_event in requests {
-            let (response, should_stop) = match decode_request(request_event.payload_bytes()) {
-                Ok(request) => {
-                    let mut guard = state
-                        .lock()
-                        .map_err(|_| std::io::Error::other("sink worker state lock poisoned"))?;
-                    process_worker_request(
-                        request,
-                        &mut guard,
-                        runtime.handle(),
-                        state_boundary.clone(),
-                        io_boundary.clone(),
-                    )
-                }
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-            };
-            should_break |= should_stop;
-            let payload = encode_response(&response).map_err(|err| {
-                std::io::Error::other(format!("sink worker encode response failed: {err}"))
-            })?;
-            responses.push(Event::new(
-                EventMetadata {
-                    origin_id: request_event.metadata().origin_id.clone(),
-                    timestamp_us: now_us(),
-                    logical_ts: None,
-                    correlation_id: request_event.metadata().correlation_id,
-                    ingress_auth: None,
-                    trace: None,
-                },
-                Bytes::from(payload),
-            ));
-        }
-
-        io_boundary
-            .channel_send(
-                ctx.clone(),
-                ChannelSendRequest {
-                    channel_key: reply_channel.clone(),
-                    events: responses,
-                },
-            )
-            .map_err(|err| {
-                std::io::Error::other(format!("sink worker send response failed: {err}"))
-            })?;
+#[async_trait::async_trait]
+impl TypedWorkerSession<SinkWorkerRpc> for SinkWorkerSession {
+    async fn handle_request(
+        &mut self,
+        request: SinkWorkerRequest,
+        context: &WorkerSessionContext,
+    ) -> capanix_app_sdk::Result<WorkerLoopControl<SinkWorkerResponse>> {
+        let mut guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
+        let (response, stop) = process_worker_request(
+            request,
+            &mut guard,
+            context.runtime_handle(),
+            context.state_boundary(),
+            context.io_boundary(),
+        );
+        Ok(if stop {
+            WorkerLoopControl::Stop(response)
+        } else {
+            WorkerLoopControl::Continue(response)
+        })
     }
-    Ok(())
+
+    async fn on_runtime_control(
+        &mut self,
+        envelopes: &[ControlEnvelope],
+        context: &WorkerSessionContext,
+    ) -> capanix_app_sdk::Result<()> {
+        let guard = self
+            .state
+            .lock()
+            .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
+        let Some(sink) = guard.sink.as_ref() else {
+            return Err(CnxError::NotReady(
+                "sink worker runtime not initialized for runtime control frames".into(),
+            ));
+        };
+        block_on_runtime(context.runtime_handle(), sink.on_control_frame(envelopes))
+    }
 }

@@ -18,9 +18,12 @@ path = "../tests/cli_specs.rs"
 
 [dependencies]
 anyhow = "1"
-capanix-host-adapter-fs-meta = { workspace = true }
+capanix-host-adapter-fs = { workspace = true }
 capanix-host-fs-types = { workspace = true }
 capanix-app-sdk = { workspace = true }
+capanix-managed-state-sdk = { workspace = true }
+capanix-service-sdk = { workspace = true }
+capanix-worker-runtime-support = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 axum = "0.7"
@@ -31,7 +34,6 @@ futures-core = { workspace = true }
 futures-util = "0.3"
 libc = "0.2"
 log = { workspace = true }
-capanix-app-fs-meta-runtime-support = { workspace = true }
 capanix-route-proto = { workspace = true }
 ring = "0.17"
 rmp-serde = { workspace = true }

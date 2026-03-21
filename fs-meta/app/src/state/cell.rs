@@ -111,9 +111,7 @@ impl SignalSnapshot {
 
 #[derive(Debug, Clone)]
 pub(crate) struct SignalEvent {
-    pub offset: u64,
     pub seq: u64,
-    pub requested_at_us: u64,
     pub requested_by: String,
 }
 
@@ -134,7 +132,6 @@ struct SignalWatchReply {
 
 #[derive(Debug, serde::Deserialize)]
 struct SignalWatchUpdate {
-    offset: u64,
     payload_b64: String,
 }
 
@@ -271,9 +268,7 @@ impl SignalCell {
                 continue;
             }
             events.push(SignalEvent {
-                offset: update.offset,
                 seq: snapshot.seq,
-                requested_at_us: snapshot.requested_at_us,
                 requested_by: snapshot.requested_by,
             });
         }

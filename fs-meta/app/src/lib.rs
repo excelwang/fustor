@@ -1,11 +1,16 @@
 use capanix_app_sdk::runtime::ConfigValue;
+use capanix_app_sdk::worker::WorkerMode;
 use capanix_app_sdk::{CnxError, Result};
+use capanix_worker_runtime_support::{
+    WorkerArtifactBinding, WorkerArtifactDefaults, resolve_worker_artifact_binding,
+};
 
 pub mod api;
 pub mod product;
 pub mod query;
 mod runtime;
 mod runtime_app;
+pub mod shared_types;
 pub mod sink;
 pub mod source;
 mod state;
@@ -13,13 +18,25 @@ pub mod workers;
 
 pub use query::GroupReliability;
 pub use runtime_app::{FSMetaApp, FSMetaRuntimeApp};
+pub use shared_types::{
+    ControlCommand, ControlEvent, EpochType, EventKind, FileMetaRecord, LogicalClock, SyncTrack,
+};
 pub use source::config::{GrantedMountRoot, RootSelector, RootSpec};
-use source::config::{SinkExecutionMode, SourceConfig, SourceExecutionMode, WorkerMode};
+use source::config::SourceConfig;
+
+#[derive(Clone, Debug)]
+pub struct FSMetaRuntimeWorkers {
+    pub facade: WorkerArtifactBinding,
+    pub source: WorkerArtifactBinding,
+    pub scan: WorkerArtifactBinding,
+    pub sink: WorkerArtifactBinding,
+}
 
 #[derive(Clone, Debug)]
 pub struct FSMetaConfig {
     pub source: SourceConfig,
     pub api: api::ApiConfig,
+    pub runtime_workers: FSMetaRuntimeWorkers,
 }
 
 impl Default for FSMetaConfig {
@@ -27,6 +44,60 @@ impl Default for FSMetaConfig {
         Self {
             source: SourceConfig::default(),
             api: api::ApiConfig::default(),
+            runtime_workers: FSMetaRuntimeWorkers::default(),
+        }
+    }
+}
+
+impl Default for FSMetaRuntimeWorkers {
+    fn default() -> Self {
+        let cfg = std::collections::HashMap::new();
+        Self {
+            facade: resolve_worker_artifact_binding(
+                &cfg,
+                WorkerArtifactDefaults {
+                    app_package: env!("CARGO_PKG_NAME"),
+                    role_id: "facade",
+                    default_mode: WorkerMode::Embedded,
+                    default_binary_name: None,
+                },
+            )
+            .unwrap_or(WorkerArtifactBinding {
+                role_id: "facade".to_string(),
+                mode: WorkerMode::Embedded,
+                startup_path: None,
+                socket_dir: std::env::temp_dir(),
+            }),
+            source: resolve_worker_artifact_binding(
+                &cfg,
+                WorkerArtifactDefaults {
+                    app_package: env!("CARGO_PKG_NAME"),
+                    role_id: "source",
+                    default_mode: WorkerMode::External,
+                    default_binary_name: Some("fs_meta_source_worker"),
+                },
+            )
+            .unwrap(),
+            scan: resolve_worker_artifact_binding(
+                &cfg,
+                WorkerArtifactDefaults {
+                    app_package: env!("CARGO_PKG_NAME"),
+                    role_id: "scan",
+                    default_mode: WorkerMode::External,
+                    default_binary_name: Some("fs_meta_source_worker"),
+                },
+            )
+            .unwrap(),
+            sink: resolve_worker_artifact_binding(
+                &cfg,
+                WorkerArtifactDefaults {
+                    app_package: env!("CARGO_PKG_NAME"),
+                    role_id: "sink",
+                    default_mode: WorkerMode::External,
+                    default_binary_name: Some("fs_meta_sink_worker"),
+                },
+            )
+            .unwrap(),
         }
     }
 }
@@ -68,50 +139,6 @@ impl FSMetaConfig {
                 Some(ConfigValue::Map(v)) => Some(v),
                 _ => None,
             }
-        }
-        fn parse_abs_path(value: &str, field_name: &str) -> Result<std::path::PathBuf> {
-            let path = std::path::PathBuf::from(value);
-            if !path.is_absolute() {
-                return Err(CnxError::InvalidInput(format!(
-                    "{field_name} must be absolute"
-                )));
-            }
-            Ok(path)
-        }
-        fn get_worker_mode(
-            workers_cfg: &std::collections::HashMap<String, ConfigValue>,
-            role: &str,
-        ) -> Result<Option<WorkerMode>> {
-            let Some(role_cfg) = get_map(workers_cfg, role) else {
-                return Ok(None);
-            };
-            let Some(raw) = get_str(role_cfg, "mode") else {
-                return Ok(None);
-            };
-            if raw.trim().is_empty() {
-                return Ok(None);
-            }
-            WorkerMode::parse(raw)
-                .ok_or_else(|| {
-                    CnxError::InvalidInput(format!("unsupported workers.{role}.mode '{raw}'"))
-                })
-                .map(Some)
-        }
-        fn get_worker_path(
-            workers_cfg: &std::collections::HashMap<String, ConfigValue>,
-            role: &str,
-            field_name: &str,
-        ) -> Result<Option<std::path::PathBuf>> {
-            let Some(role_cfg) = get_map(workers_cfg, role) else {
-                return Ok(None);
-            };
-            let Some(raw) = get_str(role_cfg, field_name) else {
-                return Ok(None);
-            };
-            if raw.trim().is_empty() {
-                return Ok(None);
-            }
-            parse_abs_path(raw, &format!("workers.{role}.{field_name}")).map(Some)
         }
         fn normalize_root_id(raw: &str) -> String {
             let mut out = String::with_capacity(raw.len());
@@ -361,109 +388,97 @@ impl FSMetaConfig {
                 "unit_authority_state_carrier/unit_authority_state_dir are removed; authority state is kernel-owned via statecell".into(),
             ));
         }
-        if let Some(v) = get_str(cfg, "sink_execution_mode")
-            && !v.trim().is_empty()
-        {
-            out.source.sink_execution_mode = SinkExecutionMode::parse(v).ok_or_else(|| {
-                CnxError::InvalidInput(format!("unsupported sink_execution_mode '{}'", v))
-            })?;
-        }
-        if let Some(v) = get_str(cfg, "source_execution_mode")
-            && !v.trim().is_empty()
-        {
-            out.source.source_execution_mode = SourceExecutionMode::parse(v).ok_or_else(|| {
-                CnxError::InvalidInput(format!("unsupported source_execution_mode '{}'", v))
-            })?;
-        }
-        if let Some(v) = get_str(cfg, "source_worker_bin_path")
-            && !v.trim().is_empty()
-        {
-            let path = parse_abs_path(v, "source_worker_bin_path")?;
-            out.source.source_worker_bin_path = Some(path);
-        }
-        if let Some(v) = get_str(cfg, "source_worker_socket_dir")
-            && !v.trim().is_empty()
-        {
-            let path = parse_abs_path(v, "source_worker_socket_dir")?;
-            out.source.source_worker_socket_dir = Some(path);
-        }
-        if let Some(v) = get_str(cfg, "sink_worker_bin_path")
-            && !v.trim().is_empty()
-        {
-            let path = parse_abs_path(v, "sink_worker_bin_path")?;
-            out.source.sink_worker_bin_path = Some(path);
-        }
-        if let Some(v) = get_str(cfg, "sink_worker_socket_dir")
-            && !v.trim().is_empty()
-        {
-            let path = parse_abs_path(v, "sink_worker_socket_dir")?;
-            out.source.sink_worker_socket_dir = Some(path);
-        }
-        if let Some(workers_cfg) = get_map(cfg, "workers") {
-            if let Some(mode) = get_worker_mode(workers_cfg, "facade")?
-                && mode != WorkerMode::Embedded
-            {
-                return Err(CnxError::InvalidInput(
-                    "workers.facade.mode=external is not supported; facade-worker remains embedded in the current implementation".into(),
-                ));
+        for removed in [
+            "sink_execution_mode",
+            "source_execution_mode",
+            "source_worker_bin_path",
+            "source_worker_socket_dir",
+            "sink_worker_bin_path",
+            "sink_worker_socket_dir",
+        ] {
+            if cfg.contains_key(removed) {
+                return Err(CnxError::InvalidInput(format!(
+                    "{removed} has been removed; declare generic workers.<role>.mode/startup.path/socket_dir instead"
+                )));
             }
+        }
 
-            let source_mode = get_worker_mode(workers_cfg, "source")?;
-            let scan_mode = get_worker_mode(workers_cfg, "scan")?;
-            if let (Some(source_mode), Some(scan_mode)) = (source_mode, scan_mode)
-                && source_mode != scan_mode
-            {
-                return Err(CnxError::InvalidInput(
-                    "workers.source.mode and workers.scan.mode must match while source-worker and scan-worker still share one realization".into(),
-                ));
-            }
-            if let Some(mode) = source_mode.or(scan_mode) {
-                out.source.source_execution_mode = mode.as_source_execution_mode();
-            }
-
-            let source_bin = get_worker_path(workers_cfg, "source", "binary_path")?;
-            let scan_bin = get_worker_path(workers_cfg, "scan", "binary_path")?;
-            if let (Some(source_bin), Some(scan_bin)) = (&source_bin, &scan_bin)
-                && source_bin != scan_bin
-            {
-                return Err(CnxError::InvalidInput(
-                    "workers.source.binary_path and workers.scan.binary_path must match while source-worker and scan-worker still share one realization".into(),
-                ));
-            }
-            if let Some(path) = source_bin.or(scan_bin) {
-                out.source.source_worker_bin_path = Some(path);
-            }
-
-            let source_socket_dir = get_worker_path(workers_cfg, "source", "socket_dir")?;
-            let scan_socket_dir = get_worker_path(workers_cfg, "scan", "socket_dir")?;
-            if let (Some(source_socket_dir), Some(scan_socket_dir)) =
-                (&source_socket_dir, &scan_socket_dir)
-                && source_socket_dir != scan_socket_dir
-            {
-                return Err(CnxError::InvalidInput(
-                    "workers.source.socket_dir and workers.scan.socket_dir must match while source-worker and scan-worker still share one realization".into(),
-                ));
-            }
-            if let Some(path) = source_socket_dir.or(scan_socket_dir) {
-                out.source.source_worker_socket_dir = Some(path);
-            }
-
-            if let Some(mode) = get_worker_mode(workers_cfg, "sink")? {
-                out.source.sink_execution_mode = mode.as_sink_execution_mode();
-            }
-            if let Some(path) = get_worker_path(workers_cfg, "sink", "binary_path")? {
-                out.source.sink_worker_bin_path = Some(path);
-            }
-            if let Some(path) = get_worker_path(workers_cfg, "sink", "socket_dir")? {
-                out.source.sink_worker_socket_dir = Some(path);
-            }
+        let facade = resolve_worker_artifact_binding(
+            cfg,
+            WorkerArtifactDefaults {
+                app_package: env!("CARGO_PKG_NAME"),
+                role_id: "facade",
+                default_mode: WorkerMode::Embedded,
+                default_binary_name: None,
+            },
+        )?;
+        if facade.mode != WorkerMode::Embedded {
+            return Err(CnxError::InvalidInput(
+                "workers.facade.mode=external is not supported; facade-worker remains embedded in the current implementation".into(),
+            ));
         }
-        out.source
-            .validate_source_execution_config()
-            .map_err(CnxError::InvalidInput)?;
-        out.source
-            .validate_sink_execution_config()
-            .map_err(CnxError::InvalidInput)?;
+        let source_role_cfg = get_map(cfg, "workers").and_then(|workers| get_map(workers, "source"));
+        let scan_role_cfg = get_map(cfg, "workers").and_then(|workers| get_map(workers, "scan"));
+        let explicit_worker_path = |role_cfg: Option<&std::collections::HashMap<String, ConfigValue>>| {
+            role_cfg.and_then(|row| {
+                get_map(row, "startup")
+                    .and_then(|startup| get_str(startup, "path"))
+                    .or_else(|| get_str(row, "binary_path"))
+                    .map(str::to_string)
+            })
+        };
+
+        let mut source = resolve_worker_artifact_binding(
+            cfg,
+            WorkerArtifactDefaults {
+                app_package: env!("CARGO_PKG_NAME"),
+                role_id: "source",
+                default_mode: WorkerMode::External,
+                default_binary_name: Some("fs_meta_source_worker"),
+            },
+        )?;
+        let mut scan = resolve_worker_artifact_binding(
+            cfg,
+            WorkerArtifactDefaults {
+                app_package: env!("CARGO_PKG_NAME"),
+                role_id: "scan",
+                default_mode: source.mode,
+                default_binary_name: Some("fs_meta_source_worker"),
+            },
+        )?;
+        if explicit_worker_path(source_role_cfg).is_none() && explicit_worker_path(scan_role_cfg).is_some() {
+            source.startup_path = scan.startup_path.clone();
+        }
+        if explicit_worker_path(scan_role_cfg).is_none() && explicit_worker_path(source_role_cfg).is_some() {
+            scan.startup_path = source.startup_path.clone();
+        }
+        if source.mode != scan.mode {
+            return Err(CnxError::InvalidInput(
+                "workers.source.mode and workers.scan.mode must match while source-worker and scan-worker still share one realization".into(),
+            ));
+        }
+        if let (Some(source_path), Some(scan_path)) = (&source.startup_path, &scan.startup_path)
+            && source_path != scan_path
+        {
+            return Err(CnxError::InvalidInput(
+                "workers.source.startup.path and workers.scan.startup.path must match while source-worker and scan-worker still share one realization".into(),
+            ));
+        }
+        let sink = resolve_worker_artifact_binding(
+            cfg,
+            WorkerArtifactDefaults {
+                app_package: env!("CARGO_PKG_NAME"),
+                role_id: "sink",
+                default_mode: WorkerMode::External,
+                default_binary_name: Some("fs_meta_sink_worker"),
+            },
+        )?;
+        out.runtime_workers = FSMetaRuntimeWorkers {
+            facade,
+            source,
+            scan,
+            sink,
+        };
 
         out.source
             .effective_roots()

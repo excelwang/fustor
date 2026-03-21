@@ -1,75 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::query::tree::{ObservationState, ObservationStatus};
 use crate::sink::SinkStatusSnapshot;
 use crate::source::SourceStatusSnapshot;
-
-#[derive(Debug, Clone, Default)]
-pub struct ObservationEvidence {
-    pub candidate_groups: BTreeSet<String>,
-    pub initial_audit_groups: BTreeSet<String>,
-    pub degraded_groups: BTreeSet<String>,
-    pub overflow_pending_groups: BTreeSet<String>,
-    pub allow_empty_candidate: bool,
-}
-
-pub fn evaluate_observation_status(evidence: &ObservationEvidence) -> ObservationStatus {
-    if evidence.candidate_groups.is_empty() {
-        return if evidence.allow_empty_candidate {
-            ObservationStatus::trusted_materialized()
-        } else {
-            ObservationStatus {
-                state: ObservationState::MaterializedUntrusted,
-                reasons: vec!["no-candidate-groups".to_string()],
-            }
-        };
-    }
-
-    let mut pending_initial_audit = Vec::<String>::new();
-    let mut overflow_pending = Vec::<String>::new();
-    let mut degraded = Vec::<String>::new();
-
-    for group_id in &evidence.candidate_groups {
-        if evidence.degraded_groups.contains(group_id) {
-            degraded.push(group_id.clone());
-        }
-        if evidence.overflow_pending_groups.contains(group_id) {
-            overflow_pending.push(group_id.clone());
-        }
-        if evidence.initial_audit_groups.contains(group_id) {
-            pending_initial_audit.push(group_id.clone());
-        }
-    }
-
-    if degraded.is_empty() && overflow_pending.is_empty() && pending_initial_audit.is_empty() {
-        return ObservationStatus::trusted_materialized();
-    }
-
-    let mut reasons = Vec::new();
-    if !pending_initial_audit.is_empty() {
-        reasons.push(format!(
-            "initial audit incomplete for groups [{}]",
-            pending_initial_audit.join(", ")
-        ));
-    }
-    if !overflow_pending.is_empty() {
-        reasons.push(format!(
-            "overflow audit pending for groups [{}]",
-            overflow_pending.join(", ")
-        ));
-    }
-    if !degraded.is_empty() {
-        reasons.push(format!(
-            "degraded coverage for groups [{}]",
-            degraded.join(", ")
-        ));
-    }
-
-    ObservationStatus {
-        state: ObservationState::MaterializedUntrusted,
-        reasons,
-    }
-}
+pub use capanix_managed_state_sdk::{
+    ObservationEvidence, ObservationTrustPolicy, evaluate_observation_status,
+    trusted_materialized_not_ready_message,
+};
 
 pub fn materialized_query_observation_evidence(
     source_status: &SourceStatusSnapshot,
@@ -119,7 +55,6 @@ pub fn materialized_query_observation_evidence(
         initial_audit_groups,
         degraded_groups,
         overflow_pending_groups,
-        allow_empty_candidate: true,
     }
 }
 
@@ -174,16 +109,5 @@ pub fn candidate_group_observation_evidence(
         initial_audit_groups,
         degraded_groups,
         overflow_pending_groups,
-        allow_empty_candidate: false,
     }
-}
-
-pub fn trusted_materialized_not_ready_message(status: &ObservationStatus) -> String {
-    if status.reasons.is_empty() {
-        return "trusted-materialized reads remain unavailable until package-local materialized observation evidence is trusted".to_string();
-    }
-    format!(
-        "trusted-materialized reads remain unavailable until package-local materialized observation evidence is trusted: {}",
-        status.reasons.join("; ")
-    )
 }

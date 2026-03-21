@@ -3,7 +3,6 @@ use std::env;
 
 use capanix_app_fs_meta::query::request::{InternalQueryRequest, QueryOp, QueryScope};
 use capanix_app_fs_meta::{FSMetaApp, FSMetaConfig};
-use capanix_app_sdk::RuntimeBoundaryApp;
 use capanix_app_sdk::runtime::{ConfigValue, NodeId};
 use capanix_route_proto::{BoundScope, ExecActivate, ExecControl, encode_exec_control_envelope};
 use serde::Deserialize;

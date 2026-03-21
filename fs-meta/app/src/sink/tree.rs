@@ -10,9 +10,8 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::time::Instant;
 
-use capanix_host_fs_types::SyncTrack;
-
 use crate::query::path::parent_path;
+use crate::SyncTrack;
 
 type NodeId = usize;
 type SharedPath = Arc<[u8]>;

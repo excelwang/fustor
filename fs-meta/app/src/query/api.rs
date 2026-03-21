@@ -1,6 +1,6 @@
 use crate::query::models::SubtreeStats;
 use crate::query::observation::{
-    evaluate_observation_status, materialized_query_observation_evidence,
+    ObservationTrustPolicy, evaluate_observation_status, materialized_query_observation_evidence,
     trusted_materialized_not_ready_message,
 };
 use crate::query::path::bytes_to_display_string;
@@ -45,7 +45,7 @@ use bytes::Bytes;
 // diagnostics; ordinary app-facing imports in this module stay on app-sdk.
 use capanix_app_sdk::runtime::NodeId;
 use capanix_app_sdk::{CnxError, Event, bound_route_metrics_snapshot};
-use capanix_host_adapter_fs_meta::HostAdapter;
+use capanix_host_adapter_fs::HostAdapter;
 use capanix_app_sdk::raw::ChannelIoSubset;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -279,7 +279,7 @@ struct GroupPitSnapshot {
     group: String,
     status: &'static str,
     reliable: bool,
-    unreliable_reason: Option<capanix_host_fs_types::query::UnreliableReason>,
+    unreliable_reason: Option<crate::shared_types::query::UnreliableReason>,
     stability: TreeStability,
     meta: PitMetadata,
     root: Option<TreePageRoot>,
@@ -318,7 +318,7 @@ fn materialized_query_readiness_error(
     let status = evaluate_observation_status(&materialized_query_observation_evidence(
         source_status,
         sink_status,
-    ));
+    ), ObservationTrustPolicy::materialized_query());
     if status.state == ObservationState::TrustedMaterialized {
         return None;
     }
@@ -526,7 +526,7 @@ fn materialized_observation_status(
     evaluate_observation_status(&materialized_query_observation_evidence(
         source_status,
         sink_status,
-    ))
+    ), ObservationTrustPolicy::materialized_query())
 }
 
 fn build_projection_maps(
@@ -1581,7 +1581,7 @@ fn decode_materialized_selected_group_response(
     if last_decode_error.is_none() {
         return Ok(TreeGroupPayload {
             reliability: GroupReliability::from_reason(Some(
-                capanix_host_fs_types::query::UnreliableReason::Unattested,
+                crate::shared_types::query::UnreliableReason::Unattested,
             )),
             stability: TreeStability::not_evaluated(),
             root: TreePageRoot {
@@ -2813,16 +2813,15 @@ mod tests {
     use super::*;
     use crate::sink::SinkFileMeta;
     use crate::source::FSMetaSource;
-    use crate::source::config::{
-        GrantedMountRoot, RootSpec, SinkExecutionMode, SourceConfig, SourceExecutionMode,
-    };
+    use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
     use crate::workers::sink::SinkFacade;
     use crate::workers::source::SourceFacade;
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use bytes::Bytes;
     use capanix_app_sdk::runtime::{EventMetadata, NodeId};
-    use capanix_host_fs_types::{FileMetaRecord, UnixStat};
+    use crate::FileMetaRecord;
+    use capanix_host_fs_types::UnixStat;
     use std::fs;
     use std::path::Path;
     use std::sync::Arc;
@@ -2918,8 +2917,6 @@ mod tests {
                 .map(|grant| RootSpec::new(grant.object_ref.clone(), grant.mount_point.clone()))
                 .collect(),
             host_object_grants: grants.to_vec(),
-            source_execution_mode: SourceExecutionMode::InProcess,
-            sink_execution_mode: SinkExecutionMode::InProcess,
             ..SourceConfig::default()
         }
     }
@@ -2988,8 +2985,6 @@ mod tests {
         let config = SourceConfig {
             roots: vec![root],
             host_object_grants: grants.to_vec(),
-            source_execution_mode: SourceExecutionMode::InProcess,
-            sink_execution_mode: SinkExecutionMode::InProcess,
             ..SourceConfig::default()
         };
         Arc::new(SourceFacade::local(Arc::new(
@@ -3002,8 +2997,6 @@ mod tests {
         let config = SourceConfig {
             roots,
             host_object_grants: grants.to_vec(),
-            source_execution_mode: SourceExecutionMode::InProcess,
-            sink_execution_mode: SinkExecutionMode::InProcess,
             ..SourceConfig::default()
         };
         Arc::new(SourceFacade::local(Arc::new(
@@ -3022,8 +3015,6 @@ mod tests {
         let config = SourceConfig {
             roots: vec![root],
             host_object_grants: grants.to_vec(),
-            source_execution_mode: SourceExecutionMode::InProcess,
-            sink_execution_mode: SinkExecutionMode::InProcess,
             ..SourceConfig::default()
         };
         Arc::new(SinkFacade::local(Arc::new(

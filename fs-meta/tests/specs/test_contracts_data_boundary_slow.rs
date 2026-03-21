@@ -11,8 +11,9 @@ use bytes::Bytes;
 use capanix_app_fs_meta::query::models::QueryNode;
 use capanix_app_fs_meta::{FSMetaApp, FSMetaConfig};
 use capanix_app_sdk::runtime::{ConfigValue, EventMetadata, NodeId, RecvOpts};
-use capanix_app_sdk::{Event, RuntimeBoundaryApp};
-use capanix_host_fs_types::{FileMetaRecord, UnixStat};
+use capanix_app_sdk::Event;
+use capanix_app_fs_meta::FileMetaRecord;
+use capanix_host_fs_types::UnixStat;
 use capanix_route_proto::{
     encode_exec_control_envelope, now_ms, BoundScope, ExecActivate, ExecControl,
 };
@@ -20,7 +21,7 @@ use tempfile::TempDir;
 
 const DATA_BOUNDARY_SCOPE_ID: &str = "data-boundary-root";
 
-async fn offer_primary(app: &impl RuntimeBoundaryApp, route_key: impl Into<String>) {
+async fn offer_primary(app: &FSMetaApp, route_key: impl Into<String>) {
     let route_key = route_key.into();
     let unit_ids = vec![
         "runtime.exec.source".to_string(),

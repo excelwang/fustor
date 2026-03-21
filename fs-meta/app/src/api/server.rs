@@ -14,7 +14,7 @@ use axum::{
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
-use capanix_app_sdk::raw::{ChannelBoundary, ChannelIoSubset};
+use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_app_sdk::runtime::NodeId;
 use capanix_app_sdk::{CnxError, Result};
 
@@ -70,7 +70,6 @@ impl ApiServerHandle {
 pub async fn spawn(
     cfg: ResolvedApiConfig,
     node_id: NodeId,
-    runtime_control: Option<Arc<dyn ChannelBoundary>>,
     runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     source: Arc<SourceFacade>,
     sink: Arc<SinkFacade>,
@@ -101,7 +100,6 @@ pub async fn spawn(
     let force_find_inflight = Arc::new(Mutex::new(BTreeSet::new()));
     let state = ApiState {
         node_id,
-        runtime_control,
         runtime_boundary,
         query_runtime_boundary,
         force_find_inflight: force_find_inflight.clone(),

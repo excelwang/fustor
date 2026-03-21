@@ -8,6 +8,7 @@ description = "Internal fs-meta facade-worker artifact/runtime package"
 
 [lib]
 crate-type = ["cdylib", "rlib"]
+doctest = false
 
 [[bin]]
 name = "fs_meta_api_fixture"

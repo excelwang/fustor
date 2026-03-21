@@ -8,15 +8,15 @@ description = "Internal fs-meta sink-worker artifact package"
 
 [lib]
 path = "src/lib.rs"
+doctest = false
 
 [[bin]]
 name = "fs_meta_sink_worker"
 path = "src/main.rs"
 
 [dependencies]
+async-trait = { workspace = true }
 capanix-app-fs-meta = { workspace = true }
-capanix-app-fs-meta-runtime-support = { workspace = true }
 capanix-app-sdk = { workspace = true }
-capanix-unit-sidecar = { workspace = true }
-bytes = { workspace = true }
+capanix-worker-runtime-support = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "time"] }

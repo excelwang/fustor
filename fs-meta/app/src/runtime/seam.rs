@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use capanix_app_sdk::raw::{ChannelIoSubset, channel_boundary_into_kernel};
 use capanix_app_sdk::runtime::NodeId;
-use capanix_host_adapter_fs_meta::{
-    ExchangeHostAdapter, HostFsFacade, LocalHostFsMeta, LocalHostFsWatchProvider,
+use capanix_host_adapter_fs::{
+    ExchangeHostAdapter, HostFsFacade, LocalHostFs, LocalHostFsWatchProvider,
     PostBindDispatchTable,
 };
 
@@ -30,7 +30,7 @@ pub(crate) fn resolve_host_fs_facade(
     Ok(HostFsFacade::new(
         root_path,
         object_ref,
-        Arc::new(LocalHostFsMeta),
+        Arc::new(LocalHostFs),
         Arc::new(LocalHostFsWatchProvider),
     ))
 }

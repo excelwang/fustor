@@ -1,14 +1,13 @@
 use std::collections::{BTreeMap, HashMap};
 
 use capanix_app_sdk::{CnxError, Event, Result};
-use capanix_host_fs_types::EventKind;
-use capanix_host_fs_types::FileMetaRecord;
-use capanix_host_fs_types::query::UnreliableReason;
 
 use crate::query::models::{QueryNode, SubtreeStats};
 use crate::query::path::{normalized_path_for_query, parent_path, relative_depth_under_root};
 use crate::query::reliability::ReliabilityAccumulator;
 use crate::query::tree::{TreeGroupPayload, TreePageEntry, TreePageRoot, TreeStability};
+use crate::shared_types::query::UnreliableReason;
+use crate::{EventKind, FileMetaRecord};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RawQueryResult {
@@ -22,7 +21,7 @@ pub(crate) fn query_response_from_records(
 ) -> RawQueryResult {
     let mut nodes: Vec<QueryNode> = records
         .into_values()
-        .filter(|record| !matches!(record.event_kind, capanix_host_fs_types::EventKind::Delete))
+        .filter(|record| !matches!(record.event_kind, EventKind::Delete))
         .map(|record| QueryNode {
             path: record.path,
             file_name: record.file_name,

@@ -2,24 +2,26 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use capanix_app_fs_meta_runtime_support::{
-    TypedWorkerClient, TypedWorkerRpc, encode_control_frame,
+use capanix_worker_runtime_support::{
+    CompositeRuntimeBoundary, TypedWorkerClient, TypedWorkerHandle, WorkerArtifactBinding,
+    WorkerBootstrapSpec, WorkerBootstrapTimeouts, encode_control_frame,
 };
 use capanix_app_sdk::raw::{BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest};
-use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
-use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryApp};
+use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RouteKey};
+use capanix_app_sdk::{CnxError, Event, Result};
 use futures_util::StreamExt;
 use tokio::task::JoinHandle;
 
 use crate::query::request::InternalQueryRequest;
 use crate::runtime::orchestration::SourceControlSignal;
 use crate::runtime::routes::ROUTE_KEY_EVENTS;
-use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig, SourceExecutionMode};
+use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::source::{FSMetaSource, SourceStatusSnapshot};
 use crate::workers::sink::SinkFacade;
 use crate::workers::source_ipc::{
     SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, SourceWorkerRequest, SourceWorkerResponse,
-    decode_response, encode_request, source_worker_control_route_key_for,
+    decode_request, decode_response, encode_request, encode_response,
+    source_worker_control_route_key_for,
 };
 
 const SOURCE_WORKER_CONTROL_RPC_TIMEOUT: Duration = Duration::from_secs(15);
@@ -35,6 +37,18 @@ const SOURCE_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
 const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
 
+fn source_worker_timeouts() -> WorkerBootstrapTimeouts {
+    WorkerBootstrapTimeouts::new(
+        SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+        SOURCE_WORKER_INIT_RPC_TIMEOUT,
+        SOURCE_WORKER_INIT_TOTAL_TIMEOUT,
+        SOURCE_WORKER_START_RPC_TIMEOUT,
+        SOURCE_WORKER_START_TOTAL_TIMEOUT,
+        SOURCE_WORKER_RETRY_BACKOFF,
+    )
+}
+
 fn is_source_worker_not_initialized(err: &CnxError) -> bool {
     matches!(err, CnxError::PeerError(message) if message == "source worker not initialized")
 }
@@ -44,12 +58,6 @@ fn source_worker_bootstrap_frame(request: &SourceWorkerRequest) -> Result<Contro
         SOURCE_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
         encode_request(request)?,
     ))
-}
-
-#[derive(Default)]
-struct SourceWorkerHandleState {
-    client: Arc<Mutex<Option<Arc<SourceWorkerClient>>>>,
-    spawn_guard: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -68,210 +76,461 @@ struct SourceWorkerSnapshotCache {
 pub struct SourceWorkerClientHandle {
     node_id: NodeId,
     config: SourceConfig,
-    boundary: Arc<crate::runtime_app::RuntimeBoundaryPair>,
-    client: Arc<Mutex<Option<Arc<SourceWorkerClient>>>>,
-    spawn_guard: Arc<Mutex<()>>,
+    worker_binding: WorkerArtifactBinding,
+    boundary: Arc<CompositeRuntimeBoundary>,
+    worker: TypedWorkerHandle<SourceWorkerRpc, SourceConfig, CompositeRuntimeBoundary>,
+    cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
 }
 
 impl SourceWorkerClientHandle {
     pub(crate) fn new(
         node_id: NodeId,
         config: SourceConfig,
-        boundary: Arc<crate::runtime_app::RuntimeBoundaryPair>,
+        worker_binding: WorkerArtifactBinding,
+        boundary: Arc<CompositeRuntimeBoundary>,
     ) -> Self {
-        let shared = Arc::new(SourceWorkerHandleState::default());
+        let worker_binding_for_bin = worker_binding.clone();
+        let worker_binding_for_socket = worker_binding.clone();
         Self {
+            worker: TypedWorkerHandle::new(
+                node_id.clone(),
+                config.clone(),
+                boundary.clone(),
+                WorkerBootstrapSpec::new(
+                    "fs-meta-source-worker",
+                    |node_id| RouteKey(source_worker_control_route_key_for(&node_id.0)),
+                    move |_config: &SourceConfig| {
+                        worker_binding_for_bin
+                            .external_startup_path()
+                            .map(|path| path.to_path_buf())
+                    },
+                    move |_config: &SourceConfig| worker_binding_for_socket.socket_dir.clone(),
+                    source_worker_timeouts(),
+                    is_source_worker_not_initialized,
+                    |node_id, config| {
+                        Ok(vec![source_worker_bootstrap_frame(
+                            &SourceWorkerRequest::Init {
+                                node_id: node_id.0.clone(),
+                                config: config.clone(),
+                            },
+                        )?])
+                    },
+                    |_node_id, _config| {
+                        Ok(vec![
+                            source_worker_bootstrap_frame(&SourceWorkerRequest::Start)?,
+                            source_worker_bootstrap_frame(&SourceWorkerRequest::Ping)?,
+                        ])
+                    },
+                ),
+            ),
             node_id,
+            worker_binding,
+            cache: Arc::new(Mutex::new(SourceWorkerSnapshotCache {
+                grants: Some(config.host_object_grants.clone()),
+                logical_roots: Some(config.roots.clone()),
+                ..SourceWorkerSnapshotCache::default()
+            })),
             config,
             boundary,
-            client: shared.client.clone(),
-            spawn_guard: shared.spawn_guard.clone(),
         }
     }
 
-    fn existing_client(&self) -> Result<Option<Arc<SourceWorkerClient>>> {
-        self.client
-            .lock()
-            .map(|guard| guard.clone())
-            .map_err(|_| CnxError::Internal("source worker handle lock poisoned".into()))
-    }
-
-    fn reset_client(&self) -> Result<()> {
-        let client = {
-            let mut guard = self
-                .client
-                .lock()
-                .map_err(|_| CnxError::Internal("source worker handle lock poisoned".into()))?;
-            guard.take()
-        };
-        if let Some(client) = client {
-            eprintln!(
-                "fs_meta_runtime_app: resetting source worker client for {}",
-                self.node_id.0
-            );
-            let _ = client.close();
-        }
-        Ok(())
-    }
-
-    fn with_retry<T>(&self, op: impl Fn(&SourceWorkerClient) -> Result<T>) -> Result<T> {
-        let deadline = std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT;
-        loop {
-            let client = self.client()?;
-            match op(client.as_ref()) {
-                Err(CnxError::TransportClosed(_)) | Err(CnxError::Timeout)
-                    if std::time::Instant::now() < deadline =>
-                {
-                    self.reset_client()?;
-                    let restarted = self.client()?;
-                    restarted.ensure_started(&self.config)?;
-                    std::thread::sleep(SOURCE_WORKER_RETRY_BACKOFF);
-                }
-                Err(err)
-                    if is_source_worker_not_initialized(&err)
-                        && std::time::Instant::now() < deadline =>
-                {
-                    client.note_not_initialized();
-                    client.ensure_started(&self.config)?;
-                    std::thread::sleep(SOURCE_WORKER_RETRY_BACKOFF);
-                }
-                other => return other,
-            }
-        }
-    }
-
-    fn with_started_retry<T>(&self, op: impl Fn(&SourceWorkerClient) -> Result<T>) -> Result<T> {
-        self.start()?;
-        self.with_retry(op)
-    }
-
-    fn client(&self) -> Result<Arc<SourceWorkerClient>> {
-        if let Some(client) = self.existing_client()? {
-            return Ok(client);
-        }
-
-        let _spawn_guard = self
-            .spawn_guard
-            .lock()
-            .map_err(|_| CnxError::Internal("source worker spawn guard lock poisoned".into()))?;
-
-        if let Some(client) = self.existing_client()? {
-            return Ok(client);
-        }
-
-        let spawned = Arc::new(SourceWorkerClient::spawn(
-            &self.node_id,
-            &self.config,
-            self.boundary.clone(),
-        )?);
-        let client = {
-            let mut guard = self
-                .client
-                .lock()
-                .map_err(|_| CnxError::Internal("source worker handle lock poisoned".into()))?;
-            if let Some(existing) = guard.as_ref() {
-                existing.clone()
-            } else {
-                *guard = Some(spawned.clone());
-                spawned
+    fn with_cache_mut<T>(&self, f: impl FnOnce(&mut SourceWorkerSnapshotCache) -> T) -> T {
+        let mut guard = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!("source worker cache lock poisoned; recovering cached snapshot state");
+                poisoned.into_inner()
             }
         };
-        Ok(client)
+        f(&mut guard)
+    }
+
+    fn degraded_observability_snapshot_from_cache(
+        &self,
+        reason: impl Into<String>,
+    ) -> SourceObservabilitySnapshot {
+        let guard = match self.cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!("source worker cache lock poisoned; recovering cached snapshot state");
+                poisoned.into_inner()
+            }
+        };
+        build_degraded_worker_observability_snapshot(&guard, reason)
+    }
+
+    fn with_started_retry<T>(
+        &self,
+        op: impl Fn(&TypedWorkerClient<SourceWorkerRpc>) -> Result<T>,
+    ) -> Result<T> {
+        self.worker.with_started_retry(op)
+    }
+
+    fn client(&self) -> Result<TypedWorkerClient<SourceWorkerRpc>> {
+        self.worker.client()
+    }
+
+    fn call_worker(
+        client: &TypedWorkerClient<SourceWorkerRpc>,
+        request: SourceWorkerRequest,
+        timeout: Duration,
+    ) -> Result<SourceWorkerResponse> {
+        client.call_with_timeout(request, timeout)
+    }
+
+    fn control_worker(
+        client: &TypedWorkerClient<SourceWorkerRpc>,
+        request: SourceWorkerRequest,
+        timeout: Duration,
+    ) -> Result<()> {
+        client.control_frames(&[source_worker_bootstrap_frame(&request)?], timeout)
     }
 
     pub fn start(&self) -> Result<()> {
-        self.with_retry(|client| client.ensure_started(&self.config))
+        self.worker.ensure_started()
     }
 
     pub fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
-        self.with_started_retry(|client| client.update_logical_roots(roots.clone()))
+        self.with_started_retry(|client| {
+            let deadline = std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
+            loop {
+                let attempt_timeout = std::cmp::min(
+                    SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+                    deadline.saturating_duration_since(std::time::Instant::now()),
+                );
+                if attempt_timeout.is_zero() {
+                    return Err(CnxError::Timeout);
+                }
+                match Self::call_worker(
+                    client,
+                    SourceWorkerRequest::UpdateLogicalRoots {
+                        roots: roots.clone(),
+                    },
+                    attempt_timeout,
+                ) {
+                    Ok(SourceWorkerResponse::Ack) => {
+                        self.with_cache_mut(|cache| {
+                            cache.logical_roots = Some(roots.clone());
+                        });
+                        return Ok(());
+                    }
+                    Err(CnxError::PeerError(message))
+                        if message == "source worker not initialized"
+                            && std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(SOURCE_WORKER_RETRY_BACKOFF);
+                    }
+                    Err(CnxError::InvalidInput(message)) => {
+                        return Err(CnxError::InvalidInput(message));
+                    }
+                    Ok(other) => {
+                        return Err(CnxError::ProtocolViolation(format!(
+                            "unexpected source worker response for update roots: {:?}",
+                            other
+                        )));
+                    }
+                    Err(CnxError::Timeout) | Err(CnxError::TransportClosed(_))
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(SOURCE_WORKER_RETRY_BACKOFF);
+                    }
+                    Err(err) => return Err(err),
+                }
+            }
+        })
     }
 
     pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
-        match self.existing_client()? {
-            Some(client) => client.cached_logical_roots_snapshot(),
-            None => Ok(self.config.roots.clone()),
-        }
+        self.with_cache_mut(|cache| Ok(cache
+            .logical_roots
+            .clone()
+            .unwrap_or_else(|| self.config.roots.clone())))
     }
 
     pub fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
-        self.client()?.logical_roots_snapshot()
-    }
-
-    pub fn cached_host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
-        match self.existing_client()? {
-            Some(client) => client.cached_host_object_grants_snapshot(),
-            None => Ok(self.config.host_object_grants.clone()),
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::LogicalRootsSnapshot,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        ) {
+            Ok(SourceWorkerResponse::LogicalRoots(roots)) => {
+                self.with_cache_mut(|cache| {
+                    cache.logical_roots = Some(roots.clone());
+                });
+                Ok(roots)
+            }
+            Ok(other) => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for logical roots: {:?}",
+                other
+            ))),
+            Err(err) => Err(err),
         }
     }
 
+    pub fn cached_host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
+        self.with_cache_mut(|cache| Ok(cache
+            .grants
+            .clone()
+            .unwrap_or_else(|| self.config.host_object_grants.clone())))
+    }
+
     pub fn host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
-        self.client()?.host_object_grants_snapshot()
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::HostObjectGrantsSnapshot,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        ) {
+            Ok(SourceWorkerResponse::HostObjectGrants(grants)) => {
+                self.with_cache_mut(|cache| {
+                    cache.grants = Some(grants.clone());
+                });
+                Ok(grants)
+            }
+            Ok(other) => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for host object grants: {:?}",
+                other
+            ))),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn host_object_grants_version_snapshot(&self) -> Result<u64> {
-        self.client()?.host_object_grants_version_snapshot()
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::HostObjectGrantsVersionSnapshot,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        ) {
+            Ok(SourceWorkerResponse::HostObjectGrantsVersion(version)) => {
+                self.with_cache_mut(|cache| {
+                    cache.host_object_grants_version = Some(version);
+                });
+                Ok(version)
+            }
+            Ok(other) => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for host object grants version: {:?}",
+                other
+            ))),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn status_snapshot(&self) -> Result<SourceStatusSnapshot> {
-        self.client()?.status_snapshot()
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::StatusSnapshot,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        ) {
+            Ok(SourceWorkerResponse::StatusSnapshot(snapshot)) => {
+                self.with_cache_mut(|cache| {
+                    cache.status = Some(snapshot.clone());
+                });
+                Ok(snapshot)
+            }
+            Ok(other) => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for status snapshot: {:?}",
+                other
+            ))),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn lifecycle_state_label(&self) -> Result<String> {
-        self.client()?.lifecycle_state_label()
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::LifecycleState,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        ) {
+            Ok(SourceWorkerResponse::LifecycleState(state)) => {
+                self.with_cache_mut(|cache| {
+                    cache.lifecycle_state = Some(state.clone());
+                });
+                Ok(state)
+            }
+            Ok(other) => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for lifecycle state: {:?}",
+                other
+            ))),
+            Err(err) => Err(err),
+        }
     }
 
     pub fn scheduled_source_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
-        self.client()?.scheduled_source_group_ids()
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::ScheduledSourceGroupIds,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )? {
+            SourceWorkerResponse::ScheduledGroupIds(groups) => {
+                Ok(groups.map(|groups| groups.into_iter().collect()))
+            }
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for scheduled source groups: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn scheduled_scan_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
-        self.client()?.scheduled_scan_group_ids()
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::ScheduledScanGroupIds,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )? {
+            SourceWorkerResponse::ScheduledGroupIds(groups) => {
+                Ok(groups.map(|groups| groups.into_iter().collect()))
+            }
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for scheduled scan groups: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn source_primary_by_group_snapshot(
         &self,
     ) -> Result<std::collections::BTreeMap<String, String>> {
-        self.client()?.source_primary_by_group_snapshot()
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::SourcePrimaryByGroupSnapshot,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )? {
+            SourceWorkerResponse::SourcePrimaryByGroup(groups) => {
+                self.with_cache_mut(|cache| {
+                    cache.source_primary_by_group = Some(groups.clone());
+                });
+                Ok(groups)
+            }
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for primary groups: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn last_force_find_runner_by_group_snapshot(
         &self,
     ) -> Result<std::collections::BTreeMap<String, String>> {
-        self.client()?.last_force_find_runner_by_group_snapshot()
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )? {
+            SourceWorkerResponse::LastForceFindRunnerByGroup(groups) => {
+                self.with_cache_mut(|cache| {
+                    cache.last_force_find_runner_by_group = Some(groups.clone());
+                });
+                Ok(groups)
+            }
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for last force-find runner: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn force_find_inflight_groups_snapshot(&self) -> Result<Vec<String>> {
-        self.client()?.force_find_inflight_groups_snapshot()
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::ForceFindInflightGroupsSnapshot,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )? {
+            SourceWorkerResponse::ForceFindInflightGroups(groups) => {
+                self.with_cache_mut(|cache| {
+                    cache.force_find_inflight_groups = Some(groups.clone());
+                });
+                Ok(groups)
+            }
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for force-find inflight groups: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn resolve_group_id_for_object_ref(&self, object_ref: &str) -> Result<Option<String>> {
-        self.client()?.resolve_group_id_for_object_ref(object_ref)
+        match Self::call_worker(
+            &self.client()?,
+            SourceWorkerRequest::ResolveGroupIdForObjectRef {
+                object_ref: object_ref.to_string(),
+            },
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )? {
+            SourceWorkerResponse::ResolveGroupIdForObjectRef(group) => Ok(group),
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for resolve group: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn force_find(&self, params: InternalQueryRequest) -> Result<Vec<Event>> {
-        self.with_started_retry(|client| client.force_find(params.clone()))
+        self.with_started_retry(|client| {
+            match Self::call_worker(
+                client,
+                SourceWorkerRequest::ForceFind {
+                    request: params.clone(),
+                },
+                SOURCE_WORKER_FORCE_FIND_TIMEOUT,
+            )? {
+                SourceWorkerResponse::Events(events) => Ok(events),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for force-find: {:?}",
+                    other
+                ))),
+            }
+        })
     }
 
     pub fn publish_manual_rescan_signal(&self) -> Result<()> {
-        self.with_started_retry(|client| client.publish_manual_rescan_signal())
+        self.with_started_retry(|client| {
+            Self::control_worker(
+                client,
+                SourceWorkerRequest::PublishManualRescanSignal,
+                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+            )
+        })
     }
 
     pub fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
         self.start()?;
-        self.client()?.on_control_frame(envelopes)
+        Self::control_worker(
+            &self.client()?,
+            SourceWorkerRequest::OnControlFrame { envelopes },
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )
     }
 
     pub fn trigger_rescan_when_ready(&self) -> Result<()> {
-        self.with_started_retry(|client| client.trigger_rescan_when_ready())
+        self.with_started_retry(|client| {
+            Self::control_worker(
+                client,
+                SourceWorkerRequest::TriggerRescanWhenReady,
+                SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
+            )
+        })
     }
 
     pub fn close(&self) -> Result<()> {
-        self.reset_client()
+        self.worker
+            .close(SourceWorkerRequest::Close, Duration::from_secs(2))?;
+        self.with_cache_mut(|cache| {
+            cache.lifecycle_state = Some("closed".to_string());
+        });
+        Ok(())
     }
 
     pub(crate) fn observability_snapshot(&self) -> Result<SourceObservabilitySnapshot> {
-        self.client()?.observability_snapshot()
+        Ok(SourceObservabilitySnapshot {
+            lifecycle_state: self.lifecycle_state_label()?,
+            host_object_grants_version: self.host_object_grants_version_snapshot()?,
+            grants: self.host_object_grants_snapshot()?,
+            logical_roots: self.logical_roots_snapshot()?,
+            status: self.status_snapshot()?,
+            source_primary_by_group: self.source_primary_by_group_snapshot()?,
+            last_force_find_runner_by_group: self.last_force_find_runner_by_group_snapshot()?,
+            force_find_inflight_groups: self.force_find_inflight_groups_snapshot()?,
+        })
     }
 
     pub(crate) fn degraded_observability_snapshot(
@@ -280,7 +539,9 @@ impl SourceWorkerClientHandle {
     ) -> SourceObservabilitySnapshot {
         let reason = reason.into();
         match self.client() {
-            Ok(client) => client.degraded_observability_snapshot(reason),
+            Ok(_) => self
+                .observability_snapshot()
+                .unwrap_or_else(|_| self.degraded_observability_snapshot_from_cache(reason)),
             Err(_) => build_degraded_worker_observability_snapshot(
                 &SourceWorkerSnapshotCache {
                     lifecycle_state: Some(SOURCE_WORKER_DEGRADED_STATE.to_string()),
@@ -509,6 +770,7 @@ impl SourceFacade {
                     let remote = SourceWorkerClientHandle::new(
                         node_id.clone(),
                         client.config.clone(),
+                        client.worker_binding.clone(),
                         client.boundary.clone(),
                     );
                     remote.force_find(params.clone())
@@ -669,592 +931,24 @@ fn spawn_local_source_pump(
     })
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SourceBootstrapState {
-    Connected,
-    Initialized,
-    Started,
-}
-
-pub struct SourceWorkerClient {
-    conn: TypedWorkerClient<SourceWorkerRpc>,
-    node_id: NodeId,
-    data_boundary: Arc<dyn ChannelIoSubset>,
-    cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
-    bootstrap_state: Mutex<SourceBootstrapState>,
-}
-
-struct SourceWorkerRpc;
-
-impl TypedWorkerRpc for SourceWorkerRpc {
-    type Request = SourceWorkerRequest;
-    type Response = SourceWorkerResponse;
-
-    fn encode_request(request: &Self::Request) -> Result<Vec<u8>> {
-        encode_request(request)
-    }
-
-    fn decode_response(payload: &[u8]) -> Result<Self::Response> {
-        decode_response(payload)
-    }
-
-    fn into_result(response: Self::Response) -> Result<Self::Response> {
-        match response {
-            SourceWorkerResponse::InvalidInput(message) => Err(CnxError::InvalidInput(message)),
-            SourceWorkerResponse::Error(message) => Err(CnxError::PeerError(message)),
-            other => Ok(other),
-        }
-    }
-
-    fn unavailable_label() -> &'static str {
-        "source worker unavailable"
-    }
-}
-
-impl SourceWorkerClient {
-    pub fn spawn<T>(node_id: &NodeId, config: &SourceConfig, boundary: Arc<T>) -> Result<Self>
-    where
-        T: RuntimeBoundary + ChannelIoSubset + 'static,
-    {
-        if config.source_execution_mode != SourceExecutionMode::WorkerProcess {
-            return Err(CnxError::InvalidInput(
-                "source worker client requires source_execution_mode=worker-process".into(),
-            ));
-        }
-        let bin_path = config
-            .source_worker_bin_path
-            .as_ref()
-            .ok_or_else(|| {
-                CnxError::InvalidInput(
-                    "source_worker_bin_path is required when source_execution_mode=worker-process"
-                        .into(),
-                )
-            })?
-            .clone();
-        let socket_dir = config
-            .source_worker_socket_dir
-            .clone()
-            .unwrap_or_else(std::env::temp_dir);
-        eprintln!(
-            "fs_meta_runtime_app: spawning source worker client for {}",
-            node_id.0
-        );
-        eprintln!(
-            "fs_meta_runtime_app: source worker control route_key={} socket_dir={} bin={}",
-            source_worker_control_route_key_for(&node_id.0),
-            socket_dir.display(),
-            bin_path.display()
-        );
-        let conn = TypedWorkerClient::spawn(
-            node_id,
-            capanix_app_sdk::runtime::RouteKey(source_worker_control_route_key_for(&node_id.0)),
-            &bin_path,
-            &socket_dir,
-            "fs-meta-source-worker",
-            boundary.clone(),
-        )?;
-        let data_boundary: Arc<dyn ChannelIoSubset> = boundary.clone();
-
-        Ok(Self {
-            conn,
-            node_id: node_id.clone(),
-            data_boundary,
-            cache: Arc::new(Mutex::new(SourceWorkerSnapshotCache {
-                grants: Some(config.host_object_grants.clone()),
-                logical_roots: Some(config.roots.clone()),
-                ..SourceWorkerSnapshotCache::default()
-            })),
-            bootstrap_state: Mutex::new(SourceBootstrapState::Connected),
-        })
-    }
-
-    fn is_started(&self) -> bool {
-        match self.bootstrap_state.lock() {
-            Ok(state) => matches!(*state, SourceBootstrapState::Started),
-            Err(poisoned) => matches!(*poisoned.into_inner(), SourceBootstrapState::Started),
-        }
-    }
-
-    fn note_not_initialized(&self) {
-        match self.bootstrap_state.lock() {
-            Ok(mut state) => {
-                if matches!(*state, SourceBootstrapState::Started) {
-                    *state = SourceBootstrapState::Initialized;
-                }
-            }
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                if matches!(*state, SourceBootstrapState::Started) {
-                    *state = SourceBootstrapState::Initialized;
-                }
-            }
-        }
-    }
-
-    fn ping(&self) -> Result<()> {
-        self.conn.control_frames(
-            &[source_worker_bootstrap_frame(&SourceWorkerRequest::Ping)?],
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )
-    }
-
-    pub fn ensure_started(&self, config: &SourceConfig) -> Result<()> {
-        let mut state = self.bootstrap_state.lock().map_err(|_| {
-            CnxError::Internal("source worker bootstrap state lock poisoned".into())
-        })?;
-
-        if matches!(*state, SourceBootstrapState::Started) {
-            return Ok(());
-        }
-
-        if matches!(*state, SourceBootstrapState::Connected) {
-            eprintln!(
-                "fs_meta_runtime_app: sending source Init for {}",
-                self.node_id.0
-            );
-            self.conn.retry_control_until(
-                || {
-                    Ok(vec![source_worker_bootstrap_frame(
-                        &SourceWorkerRequest::Init {
-                            node_id: self.node_id.0.clone(),
-                            config: config.clone(),
-                        },
-                    )?])
-                },
-                SOURCE_WORKER_INIT_RPC_TIMEOUT,
-                SOURCE_WORKER_INIT_TOTAL_TIMEOUT,
-            )?;
-            *state = SourceBootstrapState::Initialized;
-        }
-
-        if matches!(*state, SourceBootstrapState::Initialized) {
-            eprintln!(
-                "fs_meta_runtime_app: sending source Start for {}",
-                self.node_id.0
-            );
-            self.conn.retry_control_until(
-                || {
-                    Ok(vec![source_worker_bootstrap_frame(
-                        &SourceWorkerRequest::Start,
-                    )?])
-                },
-                SOURCE_WORKER_START_RPC_TIMEOUT,
-                SOURCE_WORKER_START_TOTAL_TIMEOUT,
-            )?;
-            self.ping()?;
-            *state = SourceBootstrapState::Started;
-            return Ok(());
-        }
-
-        Ok(())
-    }
-
-    fn with_cache_mut<T>(&self, f: impl FnOnce(&mut SourceWorkerSnapshotCache) -> T) -> T {
-        let mut guard = match self.cache.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                log::warn!("source worker cache lock poisoned; recovering cached snapshot state");
-                poisoned.into_inner()
-            }
-        };
-        f(&mut guard)
-    }
-
-    fn degraded_observability_snapshot(
-        &self,
-        reason: impl Into<String>,
-    ) -> SourceObservabilitySnapshot {
-        let guard = match self.cache.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                log::warn!("source worker cache lock poisoned; recovering cached snapshot state");
-                poisoned.into_inner()
-            }
-        };
-        build_degraded_worker_observability_snapshot(&guard, reason)
-    }
-
-    fn observability_snapshot(&self) -> Result<SourceObservabilitySnapshot> {
-        eprintln!(
-            "fs_meta_runtime_app: source worker observability_snapshot begin node_id={}",
-            self.node_id.0
-        );
-        let snapshot = SourceObservabilitySnapshot {
-            lifecycle_state: self.lifecycle_state_label()?,
-            host_object_grants_version: self.host_object_grants_version_snapshot()?,
-            grants: self.host_object_grants_snapshot()?,
-            logical_roots: self.logical_roots_snapshot()?,
-            status: self.status_snapshot()?,
-            source_primary_by_group: self.source_primary_by_group_snapshot()?,
-            last_force_find_runner_by_group: self.last_force_find_runner_by_group_snapshot()?,
-            force_find_inflight_groups: self.force_find_inflight_groups_snapshot()?,
-        };
-        eprintln!(
-            "fs_meta_runtime_app: source worker observability_snapshot done node_id={} grants={} roots={}",
-            self.node_id.0,
-            snapshot.grants.len(),
-            snapshot.logical_roots.len()
-        );
-        Ok(snapshot)
-    }
-
-    pub fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
-        let deadline = std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
-        loop {
-            let attempt_timeout = std::cmp::min(
-                SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-                deadline.saturating_duration_since(std::time::Instant::now()),
-            );
-            if attempt_timeout.is_zero() {
-                return Err(CnxError::Timeout);
-            }
-            match self.conn.call_with_timeout(
-                SourceWorkerRequest::UpdateLogicalRoots {
-                    roots: roots.clone(),
-                },
-                attempt_timeout,
-            ) {
-                Ok(SourceWorkerResponse::Ack) => {
-                    self.with_cache_mut(|cache| {
-                        cache.logical_roots = Some(roots.clone());
-                    });
-                    return Ok(());
-                }
-                Err(CnxError::PeerError(message))
-                    if message == "source worker not initialized"
-                        && std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(SOURCE_WORKER_RETRY_BACKOFF);
-                }
-                Err(CnxError::InvalidInput(message)) => {
-                    return Err(CnxError::InvalidInput(message));
-                }
-                Ok(other) => {
-                    return Err(CnxError::ProtocolViolation(format!(
-                        "unexpected source worker response for update roots: {:?}",
-                        other
-                    )));
-                }
-                Err(CnxError::Timeout) | Err(CnxError::TransportClosed(_))
-                    if std::time::Instant::now() < deadline =>
-                {
-                    std::thread::sleep(SOURCE_WORKER_RETRY_BACKOFF);
-                }
-                Err(err) => return Err(err),
-            }
-        }
-    }
-
-    pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
-        self.with_cache_mut(|cache| {
-            cache.logical_roots.clone().ok_or_else(|| {
-                CnxError::TransportClosed(
-                    "source worker cached logical roots unavailable before bootstrap".into(),
-                )
-            })
-        })
-    }
-
-    pub fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
-        eprintln!(
-            "fs_meta_runtime_app: source worker logical_roots_snapshot request node_id={}",
-            self.node_id.0
-        );
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::LogicalRootsSnapshot,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        ) {
-            Ok(SourceWorkerResponse::LogicalRoots(roots)) => {
-                self.with_cache_mut(|cache| {
-                    cache.logical_roots = Some(roots.clone());
-                });
-                eprintln!(
-                    "fs_meta_runtime_app: source worker logical_roots_snapshot ok node_id={} roots={}",
-                    self.node_id.0,
-                    roots.len()
-                );
-                Ok(roots)
-            }
-            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for logical roots: {:?}",
-                other
-            ))),
-            Err(err) => Err(err),
-        }
-    }
-
-    pub fn cached_host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
-        self.with_cache_mut(|cache| {
-            cache.grants.clone().ok_or_else(|| {
-                CnxError::TransportClosed(
-                    "source worker cached host-object grants unavailable before bootstrap".into(),
-                )
-            })
-        })
-    }
-
-    pub fn host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
-        eprintln!(
-            "fs_meta_runtime_app: source worker host_object_grants_snapshot request node_id={}",
-            self.node_id.0
-        );
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::HostObjectGrantsSnapshot,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        ) {
-            Ok(SourceWorkerResponse::HostObjectGrants(grants)) => {
-                self.with_cache_mut(|cache| {
-                    cache.grants = Some(grants.clone());
-                });
-                eprintln!(
-                    "fs_meta_runtime_app: source worker host_object_grants_snapshot ok node_id={} grants={}",
-                    self.node_id.0,
-                    grants.len()
-                );
-                Ok(grants)
-            }
-            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for host object grants: {:?}",
-                other
-            ))),
-            Err(err) => Err(err),
-        }
-    }
-
-    pub fn host_object_grants_version_snapshot(&self) -> Result<u64> {
-        eprintln!(
-            "fs_meta_runtime_app: source worker host_object_grants_version_snapshot request node_id={}",
-            self.node_id.0
-        );
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::HostObjectGrantsVersionSnapshot,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        ) {
-            Ok(SourceWorkerResponse::HostObjectGrantsVersion(version)) => {
-                self.with_cache_mut(|cache| {
-                    cache.host_object_grants_version = Some(version);
-                });
-                eprintln!(
-                    "fs_meta_runtime_app: source worker host_object_grants_version_snapshot ok node_id={} version={}",
-                    self.node_id.0, version
-                );
-                Ok(version)
-            }
-            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for host object grants version: {:?}",
-                other
-            ))),
-            Err(err) => Err(err),
-        }
-    }
-
-    pub fn status_snapshot(&self) -> Result<SourceStatusSnapshot> {
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::StatusSnapshot,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        ) {
-            Ok(SourceWorkerResponse::StatusSnapshot(snapshot)) => {
-                self.with_cache_mut(|cache| {
-                    cache.status = Some(snapshot.clone());
-                });
-                Ok(snapshot)
-            }
-            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for status snapshot: {:?}",
-                other
-            ))),
-            Err(err) => Err(err),
-        }
-    }
-
-    pub fn lifecycle_state_label(&self) -> Result<String> {
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::LifecycleState,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        ) {
-            Ok(SourceWorkerResponse::LifecycleState(state)) => {
-                self.with_cache_mut(|cache| {
-                    cache.lifecycle_state = Some(state.clone());
-                });
-                Ok(state)
-            }
-            Ok(other) => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for lifecycle state: {:?}",
-                other
-            ))),
-            Err(err) => Err(err),
-        }
-    }
-
-    pub fn scheduled_source_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::ScheduledSourceGroupIds,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )? {
-            SourceWorkerResponse::ScheduledGroupIds(groups) => {
-                Ok(groups.map(|groups| groups.into_iter().collect()))
-            }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for scheduled source groups: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn scheduled_scan_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::ScheduledScanGroupIds,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )? {
-            SourceWorkerResponse::ScheduledGroupIds(groups) => {
-                Ok(groups.map(|groups| groups.into_iter().collect()))
-            }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for scheduled scan groups: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn source_primary_by_group_snapshot(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, String>> {
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::SourcePrimaryByGroupSnapshot,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )? {
-            SourceWorkerResponse::SourcePrimaryByGroup(groups) => {
-                self.with_cache_mut(|cache| {
-                    cache.source_primary_by_group = Some(groups.clone());
-                });
-                Ok(groups)
-            }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for primary groups: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn last_force_find_runner_by_group_snapshot(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, String>> {
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )? {
-            SourceWorkerResponse::LastForceFindRunnerByGroup(groups) => {
-                self.with_cache_mut(|cache| {
-                    cache.last_force_find_runner_by_group = Some(groups.clone());
-                });
-                Ok(groups)
-            }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for last force-find runner: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn force_find_inflight_groups_snapshot(&self) -> Result<Vec<String>> {
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::ForceFindInflightGroupsSnapshot,
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )? {
-            SourceWorkerResponse::ForceFindInflightGroups(groups) => {
-                self.with_cache_mut(|cache| {
-                    cache.force_find_inflight_groups = Some(groups.clone());
-                });
-                Ok(groups)
-            }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for force-find inflight groups: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn resolve_group_id_for_object_ref(&self, object_ref: &str) -> Result<Option<String>> {
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::ResolveGroupIdForObjectRef {
-                object_ref: object_ref.to_string(),
-            },
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )? {
-            SourceWorkerResponse::ResolveGroupIdForObjectRef(group) => Ok(group),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for resolve group: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn force_find(&self, params: InternalQueryRequest) -> Result<Vec<Event>> {
-        match self.conn.call_with_timeout(
-            SourceWorkerRequest::ForceFind { request: params },
-            SOURCE_WORKER_FORCE_FIND_TIMEOUT,
-        )? {
-            SourceWorkerResponse::Events(events) => Ok(events),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for force-find: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
-        self.conn.control_frames(
-            &[source_worker_bootstrap_frame(
-                &SourceWorkerRequest::OnControlFrame { envelopes },
-            )?],
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )
-    }
-
-    pub fn trigger_rescan_when_ready(&self) -> Result<()> {
-        eprintln!(
-            "fs_meta_runtime_app: trigger_rescan_when_ready begin node={} timeout={:?}",
-            self.node_id.0, SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
-        );
-        let result = self.conn.control_frames(
-            &[source_worker_bootstrap_frame(
-                &SourceWorkerRequest::TriggerRescanWhenReady,
-            )?],
-            SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT,
-        );
-        eprintln!(
-            "fs_meta_runtime_app: trigger_rescan_when_ready end node={} result={:?}",
-            self.node_id.0,
-            result.as_ref().map(|_| ()).map_err(|err| err.to_string())
-        );
-        result
-    }
-
-    pub fn publish_manual_rescan_signal(&self) -> Result<()> {
-        self.conn.control_frames(
-            &[source_worker_bootstrap_frame(
-                &SourceWorkerRequest::PublishManualRescanSignal,
-            )?],
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )
-    }
-
-    pub fn close(&self) -> Result<()> {
-        self.conn.control_frames(
-            &[source_worker_bootstrap_frame(&SourceWorkerRequest::Close)?],
-            Duration::from_secs(2),
-        )?;
-        self.conn.shutdown()?;
-        self.with_cache_mut(|cache| {
-            cache.lifecycle_state = Some("closed".to_string());
-        });
-        Ok(())
+capanix_worker_runtime_support::define_typed_worker_rpc! {
+    pub struct SourceWorkerRpc {
+        request: SourceWorkerRequest,
+        response: SourceWorkerResponse,
+        encode_request: encode_request,
+        decode_request: decode_request,
+        encode_response: encode_response,
+        decode_response: decode_response,
+        invalid_input: SourceWorkerResponse::InvalidInput,
+        error: SourceWorkerResponse::Error,
+        unavailable: "source worker unavailable",
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capanix_worker_runtime_support::TypedWorkerRpc;
     use std::path::PathBuf;
 
     #[test]
@@ -1269,6 +963,7 @@ mod tests {
         }
     }
 
+    #[test]
     fn degraded_worker_observability_uses_cached_snapshot() {
         let cache = SourceWorkerSnapshotCache {
             lifecycle_state: Some("ready".to_string()),

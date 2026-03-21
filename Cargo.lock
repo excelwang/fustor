@@ -258,11 +258,13 @@ dependencies = [
  "axum",
  "base64",
  "bytes",
- "capanix-app-fs-meta-runtime-support",
  "capanix-app-sdk",
- "capanix-host-adapter-fs-meta",
+ "capanix-host-adapter-fs",
  "capanix-host-fs-types",
+ "capanix-managed-state-sdk",
  "capanix-route-proto",
+ "capanix-service-sdk",
+ "capanix-worker-runtime-support",
  "crossbeam-channel",
  "futures-core",
  "futures-util",
@@ -284,16 +286,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "capanix-app-fs-meta-runtime-support"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "capanix-app-sdk",
- "capanix-kernel-api",
- "capanix-unit-sidecar",
-]
-
-[[package]]
 name = "capanix-app-fs-meta-tooling"
 version = "0.1.0"
 dependencies = [
@@ -301,7 +293,7 @@ dependencies = [
  "capanix-app-fs-meta",
  "capanix-config",
  "capanix-daemon",
- "capanix-host-adapter-fs-meta",
+ "capanix-host-adapter-fs",
  "capanix-runtime-api",
  "clap",
  "libc",
@@ -332,7 +324,6 @@ version = "0.1.0"
 dependencies = [
  "capanix-app-fs-meta-worker-source",
  "capanix-app-sdk",
- "capanix-unit-sidecar",
  "tokio",
 ]
 
@@ -340,11 +331,10 @@ dependencies = [
 name = "capanix-app-fs-meta-worker-sink"
 version = "0.1.0"
 dependencies = [
- "bytes",
+ "async-trait",
  "capanix-app-fs-meta",
- "capanix-app-fs-meta-runtime-support",
  "capanix-app-sdk",
- "capanix-unit-sidecar",
+ "capanix-worker-runtime-support",
  "tokio",
 ]
 
@@ -352,11 +342,10 @@ dependencies = [
 name = "capanix-app-fs-meta-worker-source"
 version = "0.1.0"
 dependencies = [
- "bytes",
+ "async-trait",
  "capanix-app-fs-meta",
- "capanix-app-fs-meta-runtime-support",
  "capanix-app-sdk",
- "capanix-unit-sidecar",
+ "capanix-worker-runtime-support",
  "futures-util",
  "log",
  "tokio",
@@ -408,7 +397,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "capanix-host-adapter-fs-meta"
+name = "capanix-host-adapter-fs"
 version = "0.1.0"
 dependencies = [
  "bytes",
@@ -488,6 +477,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "capanix-managed-state-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capanix-app-sdk",
+ "capanix-service-sdk",
+ "serde",
+]
+
+[[package]]
 name = "capanix-route-proto"
 version = "0.1.0"
 dependencies = [
@@ -526,6 +525,14 @@ dependencies = [
  "capanix-route-proto",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "capanix-service-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capanix-app-sdk",
 ]
 
 [[package]]
@@ -592,6 +599,18 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "capanix-worker-runtime-support"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "capanix-app-sdk",
+ "capanix-kernel-api",
+ "capanix-unit-sidecar",
+ "tokio",
 ]
 
 [[package]]

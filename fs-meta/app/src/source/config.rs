@@ -151,80 +151,6 @@ impl RootSpec {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum WorkerMode {
-    Embedded,
-    External,
-}
-
-impl WorkerMode {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "embedded" => Some(Self::Embedded),
-            "external" => Some(Self::External),
-            _ => None,
-        }
-    }
-
-    pub fn as_source_execution_mode(self) -> SourceExecutionMode {
-        match self {
-            Self::Embedded => SourceExecutionMode::InProcess,
-            Self::External => SourceExecutionMode::WorkerProcess,
-        }
-    }
-
-    pub fn as_sink_execution_mode(self) -> SinkExecutionMode {
-        match self {
-            Self::Embedded => SinkExecutionMode::InProcess,
-            Self::External => SinkExecutionMode::WorkerProcess,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum SourceExecutionMode {
-    InProcess,
-    WorkerProcess,
-}
-
-impl Default for SourceExecutionMode {
-    fn default() -> Self {
-        Self::WorkerProcess
-    }
-}
-
-impl SourceExecutionMode {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "in-process" | "in_process" | "inprocess" => Some(Self::InProcess),
-            "worker-process" | "worker_process" | "worker" => Some(Self::WorkerProcess),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum SinkExecutionMode {
-    InProcess,
-    WorkerProcess,
-}
-
-impl Default for SinkExecutionMode {
-    fn default() -> Self {
-        Self::WorkerProcess
-    }
-}
-
-impl SinkExecutionMode {
-    pub fn parse(raw: &str) -> Option<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "in-process" | "in_process" | "inprocess" => Some(Self::InProcess),
-            "worker-process" | "worker_process" | "worker" => Some(Self::WorkerProcess),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceConfig {
     pub roots: Vec<RootSpec>,
@@ -238,11 +164,17 @@ pub struct SourceConfig {
     pub max_scan_events: usize,
     pub sink_tombstone_ttl: Duration,
     pub sink_tombstone_tolerance_us: u64,
+    #[cfg(test)]
     pub source_execution_mode: SourceExecutionMode,
+    #[cfg(test)]
     pub source_worker_bin_path: Option<PathBuf>,
+    #[cfg(test)]
     pub source_worker_socket_dir: Option<PathBuf>,
+    #[cfg(test)]
     pub sink_execution_mode: SinkExecutionMode,
+    #[cfg(test)]
     pub sink_worker_bin_path: Option<PathBuf>,
+    #[cfg(test)]
     pub sink_worker_socket_dir: Option<PathBuf>,
     pub drift_window_size: usize,
     pub drift_graduation_threshold: u64,
@@ -263,11 +195,17 @@ impl Default for SourceConfig {
             max_scan_events: 100_000,
             sink_tombstone_ttl: Self::sink_tombstone_ttl_from_env(),
             sink_tombstone_tolerance_us: Self::sink_tombstone_tolerance_us_from_env(),
+            #[cfg(test)]
             source_execution_mode: SourceExecutionMode::WorkerProcess,
+            #[cfg(test)]
             source_worker_bin_path: Self::default_source_worker_bin_path(),
+            #[cfg(test)]
             source_worker_socket_dir: None,
+            #[cfg(test)]
             sink_execution_mode: SinkExecutionMode::WorkerProcess,
+            #[cfg(test)]
             sink_worker_bin_path: Self::default_sink_worker_bin_path(),
+            #[cfg(test)]
             sink_worker_socket_dir: None,
             drift_window_size: 10_000,
             drift_graduation_threshold: 10_000,
@@ -277,6 +215,7 @@ impl Default for SourceConfig {
 }
 
 impl SourceConfig {
+    #[cfg(test)]
     fn default_worker_bin_path(bin_name: &str) -> Option<PathBuf> {
         let mut path = std::env::current_exe().ok()?;
         path.pop();
@@ -291,10 +230,12 @@ impl SourceConfig {
         Some(path)
     }
 
+    #[cfg(test)]
     fn default_source_worker_bin_path() -> Option<PathBuf> {
         Self::default_worker_bin_path("fs_meta_source_worker")
     }
 
+    #[cfg(test)]
     fn default_sink_worker_bin_path() -> Option<PathBuf> {
         Self::default_worker_bin_path("fs_meta_sink_worker")
     }
@@ -320,36 +261,6 @@ impl SourceConfig {
 
     pub(crate) fn normalize_sink_tombstone_tolerance_us(raw: u64) -> u64 {
         raw.clamp(0, SINK_TOMBSTONE_TOLERANCE_US_MAX)
-    }
-
-    pub fn validate_source_execution_config(&self) -> Result<(), String> {
-        match self.source_execution_mode {
-            SourceExecutionMode::InProcess => Ok(()),
-            SourceExecutionMode::WorkerProcess => {
-                if self.source_worker_bin_path.is_none() {
-                    return Err(
-                        "source_worker_bin_path is required when source_execution_mode=worker-process"
-                            .to_string(),
-                    );
-                }
-                Ok(())
-            }
-        }
-    }
-
-    pub fn validate_sink_execution_config(&self) -> Result<(), String> {
-        match self.sink_execution_mode {
-            SinkExecutionMode::InProcess => Ok(()),
-            SinkExecutionMode::WorkerProcess => {
-                if self.sink_worker_bin_path.is_none() {
-                    return Err(
-                        "sink_worker_bin_path is required when sink_execution_mode=worker-process"
-                            .to_string(),
-                    );
-                }
-                Ok(())
-            }
-        }
     }
 
     fn parse_env_u64(name: &str, default: u64) -> u64 {
@@ -459,6 +370,34 @@ impl SourceConfig {
             grouped.insert(root.id.clone(), matches);
         }
         grouped
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SourceExecutionMode {
+    InProcess,
+    WorkerProcess,
+}
+
+#[cfg(test)]
+impl Default for SourceExecutionMode {
+    fn default() -> Self {
+        Self::WorkerProcess
+    }
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SinkExecutionMode {
+    InProcess,
+    WorkerProcess,
+}
+
+#[cfg(test)]
+impl Default for SinkExecutionMode {
+    fn default() -> Self {
+        Self::WorkerProcess
     }
 }
 

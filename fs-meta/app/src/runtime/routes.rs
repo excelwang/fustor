@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use capanix_app_sdk::runtime::RouteKey;
-use capanix_host_adapter_fs_meta::{
+use capanix_host_adapter_fs::{
     ROUTE_KEY_HOST_OBJECT_PASSTHROUGH, ROUTE_TOKEN_HOST_OBJECT, USE_PORT_HOST_PASSTHROUGH,
     PostBindDispatch, PostBindDispatchTable,
 };
@@ -36,7 +36,6 @@ pub const ROUTE_KEY_SOURCE_RESCAN_INTERNAL: &str = "source-manual-rescan:v1";
 pub const ROUTE_KEY_SOURCE_RESCAN_CONTROL: &str = "source-manual-rescan-control:v1";
 pub const ROUTE_KEY_SOURCE_ROOTS_CONTROL: &str = "source-logical-roots-control:v1";
 pub const ROUTE_KEY_SINK_ROOTS_CONTROL: &str = "sink-logical-roots-control:v1";
-pub const ROUTE_KEY_FACADE_SOURCE_RESCAN_CONTROL: &str = "facade-source-manual-rescan:v1";
 
 fn request_reply_route_key(base: &str) -> RouteKey {
     RouteKey(format!("{base}.req"))
@@ -65,10 +64,6 @@ fn scoped_internal_route_key(base: &str, node_id: &str) -> String {
 
 pub fn source_rescan_route_key_for(node_id: &str) -> String {
     scoped_internal_route_key(ROUTE_KEY_SOURCE_RESCAN_INTERNAL, node_id)
-}
-
-pub fn facade_source_rescan_route_key_for(node_id: &str) -> String {
-    scoped_internal_route_key(ROUTE_KEY_FACADE_SOURCE_RESCAN_CONTROL, node_id)
 }
 
 pub fn default_route_bindings() -> Arc<PostBindDispatchTable> {

@@ -2,13 +2,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use capanix_app_fs_meta_runtime_support::{
-    TypedWorkerClient, TypedWorkerRpc, encode_control_frame,
+use capanix_worker_runtime_support::{
+    CompositeRuntimeBoundary, TypedWorkerClient, TypedWorkerHandle, WorkerArtifactBinding,
+    WorkerBootstrapSpec, WorkerBootstrapTimeouts, encode_control_frame,
 };
 use capanix_app_sdk::raw::ChannelIoSubset;
-use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RecvOpts};
-use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryApp};
-use capanix_host_adapter_fs_meta::HostAdapter;
+use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RecvOpts, RouteKey};
+use capanix_app_sdk::{CnxError, Event, Result};
+use capanix_host_adapter_fs::HostAdapter;
 
 use crate::query::models::{HealthStats, QueryNode};
 use crate::query::path::root_file_name_bytes;
@@ -17,10 +18,11 @@ use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from
 use crate::runtime::routes::{METHOD_FIND, ROUTE_TOKEN_FS_META, default_route_bindings};
 use crate::runtime::seam::exchange_host_adapter;
 use crate::sink::{SinkFileMeta, SinkStatusSnapshot, VisibilityLagSample};
-use crate::source::config::{GrantedMountRoot, SinkExecutionMode, SourceConfig};
+use crate::source::config::{GrantedMountRoot, SourceConfig};
 use crate::workers::sink_ipc::{
     SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, SinkWorkerInitConfig, SinkWorkerRequest,
-    SinkWorkerResponse, decode_response, encode_request, sink_worker_control_route_key_for,
+    SinkWorkerResponse, decode_request, decode_response, encode_request, encode_response,
+    sink_worker_control_route_key_for,
 };
 
 const SINK_WORKER_INIT_RPC_TIMEOUT: Duration = Duration::from_secs(60);
@@ -33,6 +35,18 @@ const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
 const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn sink_worker_timeouts() -> WorkerBootstrapTimeouts {
+    WorkerBootstrapTimeouts::new(
+        SINK_WORKER_CONTROL_RPC_TIMEOUT,
+        SINK_WORKER_START_TOTAL_TIMEOUT,
+        SINK_WORKER_INIT_RPC_TIMEOUT,
+        SINK_WORKER_INIT_TOTAL_TIMEOUT,
+        SINK_WORKER_START_RPC_TIMEOUT,
+        SINK_WORKER_START_TOTAL_TIMEOUT,
+        Duration::from_millis(100),
+    )
+}
+
 fn is_sink_worker_not_initialized(err: &CnxError) -> bool {
     matches!(err, CnxError::PeerError(message) if message == "sink worker not initialized")
 }
@@ -42,13 +56,6 @@ fn sink_worker_bootstrap_frame(request: &SinkWorkerRequest) -> Result<ControlEnv
         SINK_WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
         encode_request(request)?,
     ))
-}
-
-#[derive(Default)]
-struct SinkWorkerHandleState {
-    client: Arc<Mutex<Option<Arc<SinkWorkerClient>>>>,
-    spawn_guard: Arc<Mutex<()>>,
-    status_cache: Arc<Mutex<SinkStatusSnapshot>>,
 }
 
 fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
@@ -103,9 +110,9 @@ fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<Que
 pub struct SinkWorkerClientHandle {
     node_id: NodeId,
     config: SourceConfig,
-    boundary: Arc<crate::runtime_app::RuntimeBoundaryPair>,
-    client: Arc<Mutex<Option<Arc<SinkWorkerClient>>>>,
-    spawn_guard: Arc<Mutex<()>>,
+    worker_binding: WorkerArtifactBinding,
+    boundary: Arc<CompositeRuntimeBoundary>,
+    worker: TypedWorkerHandle<SinkWorkerRpc, SourceConfig, CompositeRuntimeBoundary>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
 }
@@ -114,45 +121,61 @@ impl SinkWorkerClientHandle {
     pub(crate) fn new(
         node_id: NodeId,
         config: SourceConfig,
-        boundary: Arc<crate::runtime_app::RuntimeBoundaryPair>,
+        worker_binding: WorkerArtifactBinding,
+        boundary: Arc<CompositeRuntimeBoundary>,
     ) -> Self {
-        let shared = Arc::new(SinkWorkerHandleState::default());
         let logical_roots_cache = Arc::new(Mutex::new(config.roots.clone()));
+        let worker_binding_for_bin = worker_binding.clone();
+        let worker_binding_for_socket = worker_binding.clone();
         Self {
+            worker: TypedWorkerHandle::new(
+                node_id.clone(),
+                config.clone(),
+                boundary.clone(),
+                WorkerBootstrapSpec::new(
+                    "fs-meta-sink-worker",
+                    |node_id| RouteKey(sink_worker_control_route_key_for(&node_id.0)),
+                    move |_config: &SourceConfig| {
+                        worker_binding_for_bin
+                            .external_startup_path()
+                            .map(|path| path.to_path_buf())
+                    },
+                    move |_config: &SourceConfig| worker_binding_for_socket.socket_dir.clone(),
+                    sink_worker_timeouts(),
+                    is_sink_worker_not_initialized,
+                    |node_id, config| {
+                        let init = SinkWorkerInitConfig {
+                            roots: config.roots.clone(),
+                            host_object_grants: config.host_object_grants.clone(),
+                            sink_tombstone_ttl_ms: config.sink_tombstone_ttl.as_millis() as u64,
+                            sink_tombstone_tolerance_us: config.sink_tombstone_tolerance_us,
+                        };
+                        Ok(vec![sink_worker_bootstrap_frame(&SinkWorkerRequest::Init {
+                            node_id: node_id.0.clone(),
+                            config: init,
+                        })?])
+                    },
+                    |_node_id, _config| {
+                        Ok(vec![
+                            sink_worker_bootstrap_frame(&SinkWorkerRequest::Start)?,
+                            sink_worker_bootstrap_frame(&SinkWorkerRequest::Ping)?,
+                        ])
+                    },
+                ),
+            ),
             node_id,
             config,
+            worker_binding,
             boundary,
-            client: shared.client.clone(),
-            spawn_guard: shared.spawn_guard.clone(),
             logical_roots_cache,
-            status_cache: shared.status_cache.clone(),
+            status_cache: Arc::new(Mutex::new(SinkStatusSnapshot::default())),
         }
     }
 
-    fn existing_client(&self) -> Result<Option<Arc<SinkWorkerClient>>> {
-        self.client
-            .lock()
-            .map(|guard| guard.clone())
-            .map_err(|_| CnxError::Internal("sink worker handle lock poisoned".into()))
-    }
-
-    fn reset_client(&self) -> Result<()> {
-        let client = {
-            let mut guard = self
-                .client
-                .lock()
-                .map_err(|_| CnxError::Internal("sink worker handle lock poisoned".into()))?;
-            guard.take()
-        };
-        if let Some(client) = client {
-            eprintln!(
-                "fs_meta_runtime_app: resetting sink worker client for {}",
-                self.node_id.0
-            );
-            let _ = client.close();
-        }
-        self.update_cached_status_snapshot(SinkStatusSnapshot::default())?;
-        Ok(())
+    fn existing_client(
+        &self,
+    ) -> Result<Option<TypedWorkerClient<SinkWorkerRpc>>> {
+        self.worker.existing_client()
     }
 
     fn cached_logical_roots(&self) -> Result<Vec<crate::source::config::RootSpec>> {
@@ -189,77 +212,35 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
-    fn with_retry<T>(&self, op: impl Fn(&SinkWorkerClient) -> Result<T>) -> Result<T> {
-        let deadline = std::time::Instant::now() + SINK_WORKER_START_TOTAL_TIMEOUT;
-        loop {
-            let client = self.client()?;
-            match op(client.as_ref()) {
-                Err(CnxError::TransportClosed(_)) | Err(CnxError::Timeout)
-                    if std::time::Instant::now() < deadline =>
-                {
-                    self.reset_client()?;
-                    let restarted = self.client()?;
-                    restarted.ensure_started(&self.node_id, &self.config)?;
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                Err(err)
-                    if is_sink_worker_not_initialized(&err)
-                        && std::time::Instant::now() < deadline =>
-                {
-                    client.note_not_initialized();
-                    client.ensure_started(&self.node_id, &self.config)?;
-                    std::thread::sleep(Duration::from_millis(100));
-                }
-                other => return other,
-            }
-        }
+    fn with_started_retry<T>(
+        &self,
+        op: impl Fn(&TypedWorkerClient<SinkWorkerRpc>) -> Result<T>,
+    ) -> Result<T> {
+        self.worker.with_started_retry(op)
     }
 
-    fn with_started_retry<T>(&self, op: impl Fn(&SinkWorkerClient) -> Result<T>) -> Result<T> {
-        self.ensure_started()?;
-        self.with_retry(op)
+    fn client(&self) -> Result<TypedWorkerClient<SinkWorkerRpc>> {
+        self.worker.client()
     }
 
-    fn client(&self) -> Result<Arc<SinkWorkerClient>> {
-        if let Some(client) = self.existing_client()? {
-            return Ok(client);
-        }
+    fn call_worker(
+        client: &TypedWorkerClient<SinkWorkerRpc>,
+        request: SinkWorkerRequest,
+        timeout: Duration,
+    ) -> Result<SinkWorkerResponse> {
+        client.call_with_timeout(request, timeout)
+    }
 
-        let _spawn_guard = self
-            .spawn_guard
-            .lock()
-            .map_err(|_| CnxError::Internal("sink worker spawn guard lock poisoned".into()))?;
-
-        if let Some(client) = self.existing_client()? {
-            return Ok(client);
-        }
-
-        let spawned = Arc::new(SinkWorkerClient::spawn(
-            &self.node_id,
-            &self.config,
-            self.boundary.clone(),
-        )?);
-        eprintln!(
-            "fs_meta_runtime_app: sink worker spawn backtrace\n{:?}",
-            std::backtrace::Backtrace::capture()
-        );
-        let client = {
-            let mut guard = self
-                .client
-                .lock()
-                .map_err(|_| CnxError::Internal("sink worker handle lock poisoned".into()))?;
-            if let Some(existing) = guard.as_ref() {
-                existing.clone()
-            } else {
-                *guard = Some(spawned.clone());
-                spawned
-            }
-        };
-        Ok(client)
+    fn control_worker(
+        client: &TypedWorkerClient<SinkWorkerRpc>,
+        request: SinkWorkerRequest,
+        timeout: Duration,
+    ) -> Result<()> {
+        client.control_frames(&[sink_worker_bootstrap_frame(&request)?], timeout)
     }
 
     pub fn ensure_started(&self) -> Result<()> {
-        self.with_retry(|client| client.ensure_started(&self.node_id, &self.config))
+        self.worker.ensure_started()
     }
 
     pub fn update_logical_roots(
@@ -268,7 +249,20 @@ impl SinkWorkerClientHandle {
         host_object_grants: Vec<GrantedMountRoot>,
     ) -> Result<()> {
         self.with_started_retry(|client| {
-            client.update_logical_roots(roots.clone(), host_object_grants.clone())
+            match Self::call_worker(
+                client,
+                SinkWorkerRequest::UpdateLogicalRoots {
+                    roots: roots.clone(),
+                    host_object_grants: host_object_grants.clone(),
+                },
+                SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+            )? {
+                SinkWorkerResponse::Ack => Ok(()),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for update roots: {:?}",
+                    other
+                ))),
+            }
         })?;
         self.update_cached_logical_roots(roots)?;
         self.update_cached_status_snapshot(SinkStatusSnapshot::default())
@@ -279,25 +273,69 @@ impl SinkWorkerClientHandle {
     }
 
     pub fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
-        let roots = self.client()?.logical_roots_snapshot()?;
+        let roots = match Self::call_worker(
+            &self.client()?,
+            SinkWorkerRequest::LogicalRootsSnapshot,
+            Duration::from_secs(5),
+        )? {
+            SinkWorkerResponse::LogicalRoots(roots) => roots,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for logical roots: {:?}",
+                    other
+                )));
+            }
+        };
         self.update_cached_logical_roots(roots.clone())?;
         Ok(roots)
     }
 
     pub fn health(&self) -> Result<HealthStats> {
-        self.client()?.health()
+        match Self::call_worker(
+            &self.client()?,
+            SinkWorkerRequest::Health,
+            Duration::from_secs(5),
+        )? {
+            SinkWorkerResponse::Health(health) => Ok(health),
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected sink worker response for health: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
-        let snapshot = self.client()?.status_snapshot()?;
+        let snapshot = match Self::call_worker(
+            &self.client()?,
+            SinkWorkerRequest::StatusSnapshot,
+            Duration::from_secs(5),
+        )? {
+            SinkWorkerResponse::StatusSnapshot(snapshot) => snapshot,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for status snapshot: {:?}",
+                    other
+                )));
+            }
+        };
         self.update_cached_status_snapshot(snapshot.clone())?;
         Ok(snapshot)
     }
 
     pub fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
         match self.existing_client()? {
-            Some(client) => match client.status_snapshot() {
+            Some(client) => match Self::call_worker(
+                &client,
+                SinkWorkerRequest::StatusSnapshot,
+                Duration::from_secs(5),
+            ) {
                 Ok(snapshot) => {
+                    let SinkWorkerResponse::StatusSnapshot(snapshot) = snapshot else {
+                        return Err(CnxError::ProtocolViolation(format!(
+                            "unexpected sink worker response for status snapshot: {:?}",
+                            snapshot
+                        )));
+                    };
                     self.update_cached_status_snapshot(snapshot.clone())?;
                     Ok(snapshot)
                 }
@@ -308,30 +346,126 @@ impl SinkWorkerClientHandle {
     }
 
     pub fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
-        self.client()?.scheduled_group_ids()
+        match Self::call_worker(
+            &self.client()?,
+            SinkWorkerRequest::ScheduledGroupIds,
+            Duration::from_secs(5),
+        )? {
+            SinkWorkerResponse::ScheduledGroupIds(groups) => {
+                Ok(groups.map(|groups| groups.into_iter().collect()))
+            }
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected sink worker response for scheduled groups: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn visibility_lag_samples_since(&self, since_us: u64) -> Result<Vec<VisibilityLagSample>> {
-        self.client()?.visibility_lag_samples_since(since_us)
+        match Self::call_worker(
+            &self.client()?,
+            SinkWorkerRequest::VisibilityLagSamplesSince { since_us },
+            Duration::from_secs(5),
+        )? {
+            SinkWorkerResponse::VisibilityLagSamples(samples) => Ok(samples),
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected sink worker response for visibility lag samples: {:?}",
+                other
+            ))),
+        }
     }
 
     pub fn query_node(&self, path: Vec<u8>) -> Result<Option<QueryNode>> {
-        self.with_started_retry(|client| client.query_node(path.clone()))
+        self.with_started_retry(|client| {
+            let request = InternalQueryRequest::materialized(
+                QueryOp::Tree,
+                QueryScope {
+                    path: path.clone(),
+                    recursive: false,
+                    max_depth: Some(0),
+                    selected_group: None,
+                },
+                None,
+            );
+            decode_exact_query_node(
+                match Self::call_worker(
+                    client,
+                    SinkWorkerRequest::MaterializedQuery { request },
+                    SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+                )? {
+                    SinkWorkerResponse::Events(events) => events,
+                    other => {
+                        return Err(CnxError::ProtocolViolation(format!(
+                            "unexpected sink worker response for materialized query: {:?}",
+                            other
+                        )));
+                    }
+                },
+                &path,
+            )
+        })
     }
 
     pub fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
-        self.with_started_retry(|client| client.materialized_query(request.clone()))
+        self.with_started_retry(|client| {
+            match Self::call_worker(
+                client,
+                SinkWorkerRequest::MaterializedQuery {
+                    request: request.clone(),
+                },
+                SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+            )? {
+                SinkWorkerResponse::Events(events) => Ok(events),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for materialized query: {:?}",
+                    other
+                ))),
+            }
+        })
     }
 
     pub fn materialized_query_nonblocking(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
         match self.existing_client()? {
-            Some(client) => client.materialized_query(request),
+            Some(client) => match Self::call_worker(
+                &client,
+                SinkWorkerRequest::MaterializedQuery { request },
+                SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+            )? {
+                SinkWorkerResponse::Events(events) => Ok(events),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for materialized query: {:?}",
+                    other
+                ))),
+            },
             None => Ok(Vec::new()),
         }
     }
 
     pub fn subtree_stats(&self, path: Vec<u8>) -> Result<Vec<Event>> {
-        self.with_started_retry(|client| client.subtree_stats(path.clone()))
+        self.with_started_retry(|client| {
+            match Self::call_worker(
+                client,
+                SinkWorkerRequest::MaterializedQuery {
+                    request: InternalQueryRequest::materialized(
+                        QueryOp::Stats,
+                        QueryScope {
+                            path: path.clone(),
+                            recursive: true,
+                            max_depth: None,
+                            selected_group: None,
+                        },
+                        None,
+                    ),
+                },
+                SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+            )? {
+                SinkWorkerResponse::Events(events) => Ok(events),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for materialized query: {:?}",
+                    other
+                ))),
+            }
+        })
     }
 
     pub fn force_find_proxy(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
@@ -368,20 +502,54 @@ impl SinkWorkerClientHandle {
     }
 
     pub fn send(&self, events: Vec<Event>) -> Result<()> {
-        self.with_started_retry(|client| client.send(events.clone()))
+        self.with_started_retry(|client| {
+            match Self::call_worker(
+                client,
+                SinkWorkerRequest::Send {
+                    events: events.clone(),
+                },
+                Duration::from_secs(5),
+            )? {
+                SinkWorkerResponse::Ack => Ok(()),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for send: {:?}",
+                    other
+                ))),
+            }
+        })
     }
 
     pub fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
-        self.with_started_retry(|client| client.recv(opts.clone()))
+        self.with_started_retry(|client| {
+            match Self::call_worker(
+                client,
+                SinkWorkerRequest::Recv {
+                    timeout_ms: opts.timeout.map(|d| d.as_millis() as u64),
+                    limit: opts.limit,
+                },
+                Duration::from_secs(5),
+            )? {
+                SinkWorkerResponse::Events(events) => Ok(events),
+                other => Err(CnxError::ProtocolViolation(format!(
+                    "unexpected sink worker response for recv: {:?}",
+                    other
+                ))),
+            }
+        })
     }
 
     pub fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
         self.ensure_started()?;
-        self.client()?.on_control_frame(envelopes)
+        Self::control_worker(
+            &self.client()?,
+            SinkWorkerRequest::OnControlFrame { envelopes },
+            Duration::from_secs(5),
+        )
     }
 
     pub fn close(&self) -> Result<()> {
-        self.reset_client()
+        self.worker
+            .close(SinkWorkerRequest::Close, Duration::from_secs(2))
     }
 }
 
@@ -538,6 +706,7 @@ impl SinkFacade {
                     let remote = SinkWorkerClientHandle::new(
                         node_id.clone(),
                         client.config.clone(),
+                        client.worker_binding.clone(),
                         client.boundary.clone(),
                     );
                     remote.materialized_query(request.clone())
@@ -614,349 +783,16 @@ impl SinkFacade {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SinkBootstrapState {
-    Connected,
-    Initialized,
-    Started,
-}
-
-pub struct SinkWorkerClient {
-    conn: TypedWorkerClient<SinkWorkerRpc>,
-    bootstrap_state: Mutex<SinkBootstrapState>,
-}
-
-struct SinkWorkerRpc;
-
-impl TypedWorkerRpc for SinkWorkerRpc {
-    type Request = SinkWorkerRequest;
-    type Response = SinkWorkerResponse;
-
-    fn encode_request(request: &Self::Request) -> Result<Vec<u8>> {
-        encode_request(request)
-    }
-
-    fn decode_response(payload: &[u8]) -> Result<Self::Response> {
-        decode_response(payload)
-    }
-
-    fn into_result(response: Self::Response) -> Result<Self::Response> {
-        match response {
-            SinkWorkerResponse::InvalidInput(message) => Err(CnxError::InvalidInput(message)),
-            SinkWorkerResponse::Error(message) => Err(CnxError::PeerError(message)),
-            other => Ok(other),
-        }
-    }
-
-    fn unavailable_label() -> &'static str {
-        "sink worker unavailable"
-    }
-}
-
-impl SinkWorkerClient {
-    pub fn spawn<T>(node_id: &NodeId, config: &SourceConfig, boundary: Arc<T>) -> Result<Self>
-    where
-        T: RuntimeBoundary + ChannelIoSubset + 'static,
-    {
-        if config.sink_execution_mode != SinkExecutionMode::WorkerProcess {
-            return Err(CnxError::InvalidInput(
-                "sink worker client requires sink_execution_mode=worker-process".into(),
-            ));
-        }
-        let bin_path = config
-            .sink_worker_bin_path
-            .as_ref()
-            .ok_or_else(|| {
-                CnxError::InvalidInput(
-                    "sink_worker_bin_path is required when sink_execution_mode=worker-process"
-                        .into(),
-                )
-            })?
-            .clone();
-        let socket_dir = config
-            .sink_worker_socket_dir
-            .clone()
-            .unwrap_or_else(std::env::temp_dir);
-        let route_key = sink_worker_control_route_key_for(&node_id.0);
-        eprintln!(
-            "fs_meta_runtime_app: spawning sink worker client for {} bin={} socket_dir={}",
-            node_id.0,
-            bin_path.display(),
-            socket_dir.display()
-        );
-        let conn = TypedWorkerClient::spawn(
-            node_id,
-            capanix_app_sdk::runtime::RouteKey(route_key.clone()),
-            &bin_path,
-            &socket_dir,
-            "fs-meta-sink-worker",
-            boundary,
-        )?;
-
-        Ok(Self {
-            conn,
-            bootstrap_state: Mutex::new(SinkBootstrapState::Connected),
-        })
-    }
-
-    fn is_started(&self) -> bool {
-        match self.bootstrap_state.lock() {
-            Ok(state) => matches!(*state, SinkBootstrapState::Started),
-            Err(poisoned) => matches!(*poisoned.into_inner(), SinkBootstrapState::Started),
-        }
-    }
-
-    fn note_not_initialized(&self) {
-        match self.bootstrap_state.lock() {
-            Ok(mut state) => {
-                if matches!(*state, SinkBootstrapState::Started) {
-                    *state = SinkBootstrapState::Initialized;
-                }
-            }
-            Err(poisoned) => {
-                let mut state = poisoned.into_inner();
-                if matches!(*state, SinkBootstrapState::Started) {
-                    *state = SinkBootstrapState::Initialized;
-                }
-            }
-        }
-    }
-
-    fn ping(&self) -> Result<()> {
-        self.conn.control_frames(
-            &[sink_worker_bootstrap_frame(&SinkWorkerRequest::Ping)?],
-            SINK_WORKER_CONTROL_RPC_TIMEOUT,
-        )
-    }
-
-    pub fn ensure_started(&self, node_id: &NodeId, config: &SourceConfig) -> Result<()> {
-        let mut state = self
-            .bootstrap_state
-            .lock()
-            .map_err(|_| CnxError::Internal("sink worker bootstrap state lock poisoned".into()))?;
-        let route_key = sink_worker_control_route_key_for(&node_id.0);
-
-        if matches!(*state, SinkBootstrapState::Started) {
-            return Ok(());
-        }
-
-        if matches!(*state, SinkBootstrapState::Connected) {
-            let init = SinkWorkerInitConfig {
-                roots: config.roots.clone(),
-                host_object_grants: config.host_object_grants.clone(),
-                sink_tombstone_ttl_ms: config.sink_tombstone_ttl.as_millis() as u64,
-                sink_tombstone_tolerance_us: config.sink_tombstone_tolerance_us,
-            };
-            eprintln!(
-                "fs-meta sink worker: sending Init route_key={} roots={} grants={}",
-                route_key,
-                init.roots.len(),
-                init.host_object_grants.len()
-            );
-            self.conn.retry_control_until(
-                || {
-                    Ok(vec![sink_worker_bootstrap_frame(
-                        &SinkWorkerRequest::Init {
-                            node_id: node_id.0.clone(),
-                            config: init.clone(),
-                        },
-                    )?])
-                },
-                SINK_WORKER_INIT_RPC_TIMEOUT,
-                SINK_WORKER_INIT_TOTAL_TIMEOUT,
-            )?;
-            *state = SinkBootstrapState::Initialized;
-        }
-
-        if matches!(*state, SinkBootstrapState::Initialized) {
-            eprintln!("fs_meta_runtime_app: sending sink Start for {}", node_id.0);
-            self.conn.retry_control_until(
-                || {
-                    Ok(vec![sink_worker_bootstrap_frame(
-                        &SinkWorkerRequest::Start,
-                    )?])
-                },
-                SINK_WORKER_START_RPC_TIMEOUT,
-                SINK_WORKER_START_TOTAL_TIMEOUT,
-            )?;
-            self.ping()?;
-            *state = SinkBootstrapState::Started;
-            return Ok(());
-        }
-
-        Ok(())
-    }
-
-    pub fn update_logical_roots(
-        &self,
-        roots: Vec<crate::source::config::RootSpec>,
-        host_object_grants: Vec<GrantedMountRoot>,
-    ) -> Result<()> {
-        match self.conn.call_with_timeout(
-            SinkWorkerRequest::UpdateLogicalRoots {
-                roots,
-                host_object_grants,
-            },
-            SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-        )? {
-            SinkWorkerResponse::Ack => Ok(()),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for update roots: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
-        match self.conn.call_with_timeout(
-            SinkWorkerRequest::LogicalRootsSnapshot,
-            Duration::from_secs(5),
-        )? {
-            SinkWorkerResponse::LogicalRoots(roots) => Ok(roots),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for logical roots: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn health(&self) -> Result<HealthStats> {
-        match self
-            .conn
-            .call_with_timeout(SinkWorkerRequest::Health, Duration::from_secs(5))?
-        {
-            SinkWorkerResponse::Health(health) => Ok(health),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for health: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
-        match self
-            .conn
-            .call_with_timeout(SinkWorkerRequest::StatusSnapshot, Duration::from_secs(5))?
-        {
-            SinkWorkerResponse::StatusSnapshot(snapshot) => Ok(snapshot),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for status snapshot: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
-        match self
-            .conn
-            .call_with_timeout(SinkWorkerRequest::ScheduledGroupIds, Duration::from_secs(5))?
-        {
-            SinkWorkerResponse::ScheduledGroupIds(groups) => {
-                Ok(groups.map(|groups| groups.into_iter().collect()))
-            }
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for scheduled groups: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn visibility_lag_samples_since(&self, since_us: u64) -> Result<Vec<VisibilityLagSample>> {
-        match self.conn.call_with_timeout(
-            SinkWorkerRequest::VisibilityLagSamplesSince { since_us },
-            Duration::from_secs(5),
-        )? {
-            SinkWorkerResponse::VisibilityLagSamples(samples) => Ok(samples),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for visibility lag samples: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn query_node(&self, path: Vec<u8>) -> Result<Option<QueryNode>> {
-        let request = InternalQueryRequest::materialized(
-            QueryOp::Tree,
-            QueryScope {
-                path: path.clone(),
-                recursive: false,
-                max_depth: Some(0),
-                selected_group: None,
-            },
-            None,
-        );
-        decode_exact_query_node(self.materialized_query(request)?, &path)
-    }
-
-    pub fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
-        match self.conn.call_with_timeout(
-            SinkWorkerRequest::MaterializedQuery { request },
-            SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-        )? {
-            SinkWorkerResponse::Events(events) => Ok(events),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for materialized query: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn subtree_stats(&self, path: Vec<u8>) -> Result<Vec<Event>> {
-        self.materialized_query(InternalQueryRequest::materialized(
-            QueryOp::Stats,
-            QueryScope {
-                path,
-                recursive: true,
-                max_depth: None,
-                selected_group: None,
-            },
-            None,
-        ))
-    }
-
-    pub fn send(&self, events: Vec<Event>) -> Result<()> {
-        match self
-            .conn
-            .call_with_timeout(SinkWorkerRequest::Send { events }, Duration::from_secs(5))?
-        {
-            SinkWorkerResponse::Ack => Ok(()),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for send: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
-        match self.conn.call_with_timeout(
-            SinkWorkerRequest::Recv {
-                timeout_ms: opts.timeout.map(|d| d.as_millis() as u64),
-                limit: opts.limit,
-            },
-            Duration::from_secs(5),
-        )? {
-            SinkWorkerResponse::Events(events) => Ok(events),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected sink worker response for recv: {:?}",
-                other
-            ))),
-        }
-    }
-
-    pub fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
-        self.conn.control_frames(
-            &[sink_worker_bootstrap_frame(
-                &SinkWorkerRequest::OnControlFrame { envelopes },
-            )?],
-            Duration::from_secs(5),
-        )
-    }
-
-    pub fn close(&self) -> Result<()> {
-        self.conn.control_frames(
-            &[sink_worker_bootstrap_frame(&SinkWorkerRequest::Close)?],
-            Duration::from_secs(2),
-        )?;
-        self.conn.shutdown()
+capanix_worker_runtime_support::define_typed_worker_rpc! {
+    pub struct SinkWorkerRpc {
+        request: SinkWorkerRequest,
+        response: SinkWorkerResponse,
+        encode_request: encode_request,
+        decode_request: decode_request,
+        encode_response: encode_response,
+        decode_response: decode_response,
+        invalid_input: SinkWorkerResponse::InvalidInput,
+        error: SinkWorkerResponse::Error,
+        unavailable: "sink worker unavailable",
     }
 }
