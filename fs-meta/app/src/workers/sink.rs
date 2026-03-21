@@ -2,12 +2,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
-use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RecvOpts, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
-use capanix_host_adapter_fs::HostAdapter;
-use capanix_worker_runtime_support::{
-    CompositeRuntimeBoundary, TypedWorkerClient, TypedWorkerHandle, TypedWorkerInit,
+use capanix_host_adapter_fs::{HostAdapter, exchange_host_adapter_from_channel_boundary};
+use capanix_runtime_host_sdk::boundary::ChannelIoSubset;
+use capanix_runtime_host_sdk::worker_runtime::{
+    RuntimeWorkerClientFactory, TypedRuntimeWorkerClient, TypedWorkerClient, TypedWorkerInit,
 };
 
 use crate::query::models::{HealthStats, QueryNode};
@@ -15,7 +15,6 @@ use crate::query::path::root_file_name_bytes;
 use crate::query::request::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
 use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from_envelopes};
 use crate::runtime::routes::{METHOD_FIND, ROUTE_TOKEN_FS_META, default_route_bindings};
-use crate::runtime::seam::exchange_host_adapter;
 use crate::sink::{SinkFileMeta, SinkStatusSnapshot, VisibilityLagSample};
 use crate::source::config::{GrantedMountRoot, SourceConfig};
 use crate::workers::sink_ipc::{
@@ -80,9 +79,9 @@ fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<Que
 pub struct SinkWorkerClientHandle {
     node_id: NodeId,
     config: SourceConfig,
+    worker_factory: RuntimeWorkerClientFactory,
     worker_binding: RuntimeWorkerBinding,
-    boundary: Arc<CompositeRuntimeBoundary>,
-    worker: TypedWorkerHandle<SinkWorkerRpc, SourceConfig, CompositeRuntimeBoundary>,
+    worker: TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
 }
@@ -92,20 +91,15 @@ impl SinkWorkerClientHandle {
         node_id: NodeId,
         config: SourceConfig,
         worker_binding: RuntimeWorkerBinding,
-        boundary: Arc<CompositeRuntimeBoundary>,
+        worker_factory: RuntimeWorkerClientFactory,
     ) -> Result<Self> {
         let logical_roots_cache = Arc::new(Mutex::new(config.roots.clone()));
         Ok(Self {
-            worker: TypedWorkerHandle::for_runtime_binding(
-                node_id.clone(),
-                config.clone(),
-                boundary.clone(),
-                worker_binding.clone(),
-            )?,
+            worker: worker_factory.connect(node_id.clone(), config.clone(), worker_binding.clone())?,
             node_id,
             config,
+            worker_factory,
             worker_binding,
-            boundary,
             logical_roots_cache,
             status_cache: Arc::new(Mutex::new(SinkStatusSnapshot::default())),
         })
@@ -406,9 +400,8 @@ impl SinkWorkerClientHandle {
             "fs-meta sink worker proxy: force_find start node={} path={:?} recursive={}",
             self.node_id.0, request.scope.path, request.scope.recursive
         );
-        let data_boundary: Arc<dyn ChannelIoSubset> = self.boundary.clone();
-        let adapter = exchange_host_adapter(
-            data_boundary,
+        let adapter = exchange_host_adapter_from_channel_boundary(
+            self.worker_factory.io_boundary(),
             self.node_id.clone(),
             default_route_bindings(),
         );
@@ -647,7 +640,7 @@ impl SinkFacade {
                         node_id.clone(),
                         client.config.clone(),
                         client.worker_binding.clone(),
-                        client.boundary.clone(),
+                        client.worker_factory.clone(),
                     )?;
                     remote.materialized_query(request.clone())
                 }
@@ -723,7 +716,7 @@ impl SinkFacade {
     }
 }
 
-capanix_worker_runtime_support::define_typed_worker_rpc! {
+capanix_runtime_host_sdk::define_typed_worker_rpc! {
     pub struct SinkWorkerRpc {
         request: SinkWorkerRequest,
         response: SinkWorkerResponse,

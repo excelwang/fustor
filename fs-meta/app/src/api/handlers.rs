@@ -10,10 +10,12 @@ use axum::{
 };
 use bytes::Bytes;
 use capanix_app_sdk::Event;
-use capanix_app_sdk::raw::{BoundaryContext, ChannelKey, ChannelSendRequest};
 use capanix_app_sdk::runtime::{EventMetadata, NodeId};
-use capanix_app_sdk::{CnxError, raw::ChannelIoSubset};
+use capanix_app_sdk::CnxError;
 use capanix_host_adapter_fs::HostAdapter;
+use capanix_runtime_host_sdk::boundary::{
+    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest,
+};
 
 use crate::query::api::{
     merge_sink_status_snapshots, refresh_policy_from_host_object_grants,
@@ -949,7 +951,7 @@ mod tests {
     use super::*;
     use crate::source::SourceStatusSnapshot;
     use crate::workers::source::SourceObservabilitySnapshot;
-    use capanix_app_sdk::raw::ChannelIoSubset;
+    use capanix_runtime_host_sdk::boundary::ChannelIoSubset;
 
     struct NoopBoundary;
 

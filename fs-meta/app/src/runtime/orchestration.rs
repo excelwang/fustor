@@ -1,6 +1,6 @@
 use capanix_app_sdk::runtime::{ControlEnvelope, ControlFrame};
 use capanix_app_sdk::{CnxError, Result};
-use capanix_route_proto::{
+use capanix_runtime_host_sdk::control::{
     BoundScope, ExecControl, RuntimeHostObjectGrantsChanged, UnitExposureConfirmed,
     decode_exec_control_envelope, decode_runtime_host_object_grants_changed_envelope,
     decode_unit_exposure_confirmed_envelope, decode_unit_tick_envelope,

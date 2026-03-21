@@ -13,20 +13,19 @@
 ## ENGINEERING_GOVERNANCE.CRATE_OWNERSHIP
 
 1. `fs-meta/` 是产品容器目录，不是 Cargo package，不拥有代码级业务 authority。
-2. `fs-meta/app/` 是唯一的产品 app package；它保持 `publish = false`，拥有 package-local config/types 以及 API、query、orchestration 和 business composition。
-3. `capanix-worker-runtime-support` is the helper-only upstream crate that owns worker child-process bootstrap, control/data socket/log path materialization, direct control-plane startup/management, retry clipping, and low-level external-worker transport supervision for fs-meta worker-process clients.
-4. `fs-meta/worker-facade/` 拥有 embedded `facade-worker` artifact entry、fixture binary surface，以及 shared external worker module export `capanix_run_worker_module(...)`；它不拥有 business/query semantics。
-5. `fs-meta/worker-source/`、`fs-meta/worker-sink/`、`fs-meta/worker-scan/` 是 role-local helper crates，分别拥有 `run_source_worker_server(...)`、`run_sink_worker_server(...)`、`run_scan_worker_server(...)` 和对应 request handling；它们不是独立 external worker executable artifacts。
-8. `fs-meta/tooling/` 拥有 operator CLI binaries 和 optional local-dev daemon composition；它不拥有 worker bootstrap 或 runtime planning semantics。
+2. `fs-meta/lib/` 是唯一的开发者-facing fs-meta authoring package；它保持 `publish = false`，暴露 product-specific config/types、API/query/source/sink 语义与 bounded authoring surface，而不要求开发者直接依赖 runtime/deploy seams。
+3. `fs-meta/app/` 是内部 `fs-meta-runtime` package；它拥有 ordinary `create_unit` entry、shared external worker module entry `capanix_run_worker_module(...)`、runtime host glue、worker bootstrap glue 和 fixture binary `fs_meta_api_fixture`。
+4. `fs-meta/deploy/` 是内部 `fs-meta-deploy` package；它拥有 release/deploy 文档生成与产品拓扑编译，不拥有业务 handler 语义。
+5. Helper-only upstream worker bootstrap/transport support remains owned beneath `capanix-runtime-host-sdk`; fs-meta packages consume that support through bounded runtime-host helper surfaces rather than importing the low-level helper crate directly.
+8. `fs-meta/tooling/` 拥有 operator CLI binaries 和 optional local-dev daemon composition；它依赖 bounded `fs-meta` / `fs-meta-deploy` surfaces，但不拥有 worker bootstrap 或 runtime planning semantics。
 
 ## ENGINEERING_GOVERNANCE.DEPENDENCY_RULES
 
-1. `fs-meta/app/` does not depend on `capanix-kernel-api`, worker artifact crates, low-level external-worker bridge crate or embedded-entry macro crate; it may consume only the bounded typed transport/client surface exposed by `capanix-worker-runtime-support`.
-2. `fs-meta/tooling/` 可以依赖 bounded `product` types 和 optional daemon/bootstrap seams，但不得依赖 worker runtime internals 或重写 worker bootstrap。
-3. `capanix-worker-runtime-support` 作为 helper-only realization layer 可以依赖 low-level external-worker bridge crate，并负责保留 canonical `Timeout` / `TransportClosed` 分类与 wall-clock timeout clipping；fs-meta 本地 crate 不重定义这些 transport/bootstrap 语义。
-4. `fs-meta/worker-facade/` 可以依赖 `fs-meta/app`、role-local helper crates、embedded-entry macro crate 与 `capanix-worker-runtime-support` 来承载 embedded facade realization与 shared worker-module dispatch；realization wiring 保持 artifact-local。
-5. `fs-meta/worker-source/` 与 `fs-meta/worker-sink/` 可以依赖 `fs-meta/app`、`capanix-app-sdk` 与 `capanix-worker-runtime-support` 承载 external worker servers；app business modules 不得反向依赖这些 helper crates。
-6. `fs-meta/worker-scan/` 可以依赖 `worker-source` 的 lower-level runtime helpers；若 scan runtime semantics 发生分歧，应先更新 formal specs，再改依赖关系。
+1. `fs-meta/lib/` 不直接依赖 `capanix-kernel-api`、`capanix-runtime-api`、`capanix-config`、`capanix-unit-entry-macros` 或 low-level external-worker bridge crates；`fs-meta/app/` 和 `fs-meta/deploy/` 也遵守同样的限制，这些能力必须通过 `capanix-service-sdk` / `capanix-runtime-host-sdk` / `capanix-deploy-sdk` 这样的高层 surfaces 进入 fs-meta。
+2. `fs-meta/app/` 作为 `fs-meta-runtime` package 通过 `capanix-runtime-host-sdk` 提供的 entry、runtime control/grant、route/state/channel、worker-hosting helper 来导出 product artifact entries，同时通过 `capanix-service-sdk` 保持 primitive-first authoring，而不得回收产品 deploy authority。
+3. `fs-meta/deploy/` 通过 `capanix-deploy-sdk` 消费 release/deploy 编译能力，而不是直接依赖 `capanix-config` 和 `capanix-runtime-api`。
+4. `fs-meta/tooling/` 可以依赖 bounded `fs-meta` / `fs-meta-deploy` types 和 optional daemon/bootstrap seams，但不得依赖 worker runtime internals 或重写 worker bootstrap。
+5. Helper-only upstream worker bootstrap support仍负责 canonical `Timeout` / `TransportClosed` 分类与 wall-clock timeout clipping；fs-meta 本地 crate 通过 `capanix-runtime-host-sdk` 等更高层 helper 消费它，而不重定义这些 transport/bootstrap 语义。
 
 ## ENGINEERING_GOVERNANCE.VALIDATION_WORKFLOW
 

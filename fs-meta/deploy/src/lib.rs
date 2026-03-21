@@ -1,36 +1,43 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-use crate::api::config::ApiAuthConfig;
-use crate::runtime::execution_units::{
+pub use fs_meta::api::types::RootEntry;
+pub use fs_meta::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};
+use fs_meta::RootSpec;
+use fs_meta_runtime::runtime::execution_units::{
     QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID,
     SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
-use crate::runtime::routes::{
+use fs_meta_runtime::runtime::routes::{
     ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
     ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL,
     ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL,
 };
-use crate::source::config::RootSpec;
 use capanix_app_sdk::runtime::{RouteKey, RoutePlanMode, RoutePlanSpec};
-use capanix_app_sdk::worker::WorkerMode;
+use capanix_app_sdk::{CnxError, Result};
+use capanix_deploy_sdk::compile_relation_target_intent_value;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FsMetaReleaseWorkerMode {
+    Embedded,
+    External,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FsMetaReleaseWorkerModes {
-    pub facade: WorkerMode,
-    pub source: WorkerMode,
-    pub scan: WorkerMode,
-    pub sink: WorkerMode,
+    pub facade: FsMetaReleaseWorkerMode,
+    pub source: FsMetaReleaseWorkerMode,
+    pub sink: FsMetaReleaseWorkerMode,
 }
 
 impl Default for FsMetaReleaseWorkerModes {
     fn default() -> Self {
         Self {
-            facade: WorkerMode::Embedded,
-            source: WorkerMode::External,
-            scan: WorkerMode::External,
-            sink: WorkerMode::External,
+            facade: FsMetaReleaseWorkerMode::Embedded,
+            source: FsMetaReleaseWorkerMode::External,
+            sink: FsMetaReleaseWorkerMode::External,
         }
     }
 }
@@ -83,7 +90,7 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
             {
                 "unit_id": spec.app_id,
                 "startup": {
-                    "path": "capanix-app-fs-meta"
+                    "path": "fs-meta-runtime"
                 },
                 "config": config,
                 "runtime": {
@@ -128,16 +135,25 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     })
 }
 
+pub fn compile_release_doc_to_relation_target_intent(
+    release_doc: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let intent_value = scope_unit_intent_to_scope_worker_intent_value(release_doc)?;
+    compile_relation_target_intent_value(intent_value).map_err(|err| {
+        CnxError::InvalidInput(format!("invalid fs-meta deploy intent: {err}"))
+    })
+}
+
 fn build_worker_config_json(
     worker_module_path: &Path,
     worker_modes: FsMetaReleaseWorkerModes,
 ) -> serde_json::Value {
     let worker_module_path = worker_module_path.display().to_string();
-    let worker_json = |mode: WorkerMode| match mode {
-        WorkerMode::Embedded => serde_json::json!({
+    let worker_json = |mode: FsMetaReleaseWorkerMode| match mode {
+        FsMetaReleaseWorkerMode::Embedded => serde_json::json!({
             "mode": "embedded"
         }),
-        WorkerMode::External => serde_json::json!({
+        FsMetaReleaseWorkerMode::External => serde_json::json!({
             "mode": "external",
             "startup": {
                 "path": worker_module_path
@@ -147,9 +163,80 @@ fn build_worker_config_json(
     serde_json::json!({
         "facade": worker_json(worker_modes.facade),
         "source": worker_json(worker_modes.source),
-        "scan": worker_json(worker_modes.scan),
         "sink": worker_json(worker_modes.sink)
     })
+}
+
+fn scope_unit_intent_to_scope_worker_intent_value(
+    doc: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let units = doc
+        .get("units")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| CnxError::InvalidInput("scope-unit-intent doc missing units".into()))?;
+    let target_id = doc
+        .get("target_id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("target");
+    let target_generation = doc
+        .get("target_generation")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    let workers = units
+        .iter()
+        .map(|entry| {
+            let worker_role = entry
+                .get("worker_role")
+                .or_else(|| {
+                    entry
+                        .get("runtime")
+                        .and_then(|runtime| runtime.get("worker_role"))
+                })
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("main");
+            let worker_id = entry
+                .get("unit_id")
+                .or_else(|| entry.get("app"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("worker");
+            let startup_path = entry
+                .get("startup")
+                .and_then(|startup| startup.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("app");
+            let mut startup = serde_json::Map::new();
+            startup.insert("path".into(), serde_json::json!(startup_path));
+            if let Some(manifest) = entry
+                .get("startup")
+                .and_then(|startup| startup.get("manifest"))
+                .and_then(serde_json::Value::as_str)
+            {
+                startup.insert("manifest".into(), serde_json::json!(manifest));
+            }
+            let mode = entry
+                .get("config")
+                .and_then(|config| config.get("workers"))
+                .and_then(|workers| workers.get(worker_role))
+                .and_then(|worker| worker.get("mode"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("external");
+            serde_json::json!({
+                "worker_id": worker_id,
+                "worker_role": worker_role,
+                "target_id": target_id,
+                "target_generation": target_generation,
+                "startup": serde_json::Value::Object(startup),
+                "mode": mode,
+                "config": entry.get("config").cloned().unwrap_or(serde_json::Value::Null),
+            })
+        })
+        .collect::<Vec<_>>();
+    Ok(serde_json::json!({
+        "schema_version": "scope-worker-intent-v1",
+        "target_id": target_id,
+        "target_generation": target_generation,
+        "workers": workers,
+    }))
 }
 
 fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {

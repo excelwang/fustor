@@ -130,19 +130,18 @@ fn app_sdk_authoring_path_is_primary() {
         "Ordinary app-facing business modules use the SDK family rooted in `capanix-app-sdk`"
     ));
     assert!(l1.contains(
-        "narrow runtime glue and boundary-conversion seams MAY directly consume `capanix-runtime-api`"
+        "deploy compilation consumes `capanix-deploy-sdk`"
     ));
     assert!(l1.contains(
         "`capanix-managed-state-sdk` supplies shared stateful observation declarations/evaluator only"
     ));
     assert!(l1.contains("`capanix-service-sdk`"));
-    assert!(l1.contains("service-first runtime host/lowering path"));
-    assert!(l1.contains(
-        "MUST NOT directly depend on or reference `capanix-kernel-api`, `capanix-unit-entry-macros`, or `capanix-unit-sidecar`"
-    ));
-    assert!(cutover.contains(
-        "runtime-glue and\nboundary-conversion seams MAY consume `capanix-runtime-api` directly"
-    ));
+    assert!(l1.contains("`capanix-runtime-host-sdk`"));
+    assert!(l1.contains("service-first authoring primitives"));
+    assert!(l1.contains("top-level runtime host/lowering path"));
+    assert!(l1.contains("MUST NOT directly depend on or reference `capanix-kernel-api`"));
+    assert!(cutover.contains("capanix-service-sdk"));
+    assert!(cutover.contains("capanix-runtime-host-sdk"));
     assert!(app_manifest.contains("publish = false"));
     assert!(manifest_has_dependency(&app_manifest, "capanix-app-sdk"));
     assert!(manifest_has_dependency(
@@ -152,6 +151,10 @@ fn app_sdk_authoring_path_is_primary() {
     assert!(manifest_has_dependency(
         &app_manifest,
         "capanix-service-sdk"
+    ));
+    assert!(manifest_has_dependency(
+        &app_manifest,
+        "capanix-runtime-host-sdk"
     ));
     assert!(!manifest_has_dependency(
         &app_manifest,
@@ -167,25 +170,23 @@ fn app_sdk_authoring_path_is_primary() {
     ));
     assert!(!manifest_has_dependency(
         &app_manifest,
-        "capanix-app-fs-meta-worker-source"
+        "fs-meta-worker-source"
     ));
     assert!(!manifest_has_dependency(
         &app_manifest,
-        "capanix-app-fs-meta-worker-sink"
+        "fs-meta-worker-sink"
     ));
     assert!(!manifest_has_dependency(
         &app_manifest,
-        "capanix-app-fs-meta-worker-scan"
-    ));
-    assert!(!manifest_has_dependency(
-        &app_manifest,
-        "capanix-app-fs-meta-worker-facade"
+        "fs-meta-worker-facade"
     ));
     assert!(app_lib.contains("pub struct FSMetaConfig"));
     assert!(app_lib.contains("capanix_app_sdk"));
     assert!(!app_lib.contains("capanix_kernel_api"));
     assert!(!app_lib.contains("capanix_unit_sidecar"));
-    assert!(!app_lib.contains("capanix_unit_entry_macros"));
+    assert!(app_lib.contains("capanix_runtime_host_sdk::entry::capanix_unit_entry"));
+    assert!(app_lib.contains("capanix_unit_entry!(FSMetaRuntimeApp);"));
+    assert!(combined_source_text().contains("pub extern \"C\" fn capanix_run_worker_module"));
     assert!(!app_lib.contains("SourceWorkerClient"));
     assert!(!app_lib.contains("SinkWorkerClient"));
     assert!(!app_lib.contains("UnitRuntimeIpcBoundary::bind_and_accept"));
@@ -197,12 +198,12 @@ fn app_sdk_authoring_path_is_primary() {
     assert!(!query_api.contains("capanix_kernel_api"));
     assert!(!state_cell.contains("use capanix_runtime_api"));
     assert!(!state_cell.contains("capanix_kernel_api"));
-    assert!(seam.contains("capanix_app_sdk::raw::{ChannelIoSubset, channel_boundary_into_kernel}"));
+    assert!(seam.contains("exchange_host_adapter_from_channel_boundary"));
     assert!(seam.contains("capanix_app_sdk::runtime::NodeId"));
     assert!(seam.contains("Keep runtime-api boundary conversion out of business modules."));
     assert!(runtime_app.contains("direct runtime-api use"));
     assert!(runtime_app.contains("capanix_managed_state_sdk"));
-    assert!(runtime_app.contains("service-sdk -> app-sdk"));
+    assert!(runtime_app.contains("service-sdk -> runtime-host-sdk -> app-sdk"));
     assert!(runtime_app.contains("impl ManagedStateProfile for FSMetaApp"));
     assert!(runtime_app.contains("RuntimeLoadedServiceApp::from_runtime_config"));
     assert!(runtime_app.contains("AppBuilder::new()"));
@@ -232,12 +233,12 @@ fn app_sdk_authoring_path_is_primary() {
 
 #[test]
 // @verify_spec("CONTRACTS.APP_SCOPE.WORKER_MODE_MODEL", mode="system")
-fn worker_process_unit_split_is_explicit() {
+fn worker_unit_split_is_explicit() {
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
-    assert!(l2.contains("root `worker / process / unit` split"));
+    assert!(l2.contains("runtime-facing architecture keeps only the `worker / unit` split"));
     assert!(l2.contains("`worker` names the product-facing role"));
-    assert!(l2.contains("`process` names the hosting container"));
-    assert!(l2.contains("`unit` remains the runtime-owned finest bind/run, activation, tick, and state-boundary identity"));
+    assert!(l2.contains("`runtime.exec.scan` remains a source-side unit"));
+    assert!(l2.contains("`unit` stays the runtime-owned finest bind/run, activation, tick, and state-boundary identity"));
 }
 
 #[test]
@@ -259,13 +260,16 @@ fn direct_runtime_api_use_is_confined_to_runtime_glue() {
 fn public_operational_support_surfaces_are_explicitly_non_authoritative() {
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
-    let lib = read_app_spec("src/lib.rs");
-    assert!(l1.contains("bounded `product` remains the product-facing CLI/tooling namespace"));
-    assert!(l2.contains("`product` remains the bounded product-facing CLI/tooling namespace"));
-    assert!(l2.contains("`query`, `product::release_doc`, and `workers`"));
-    assert!(lib.contains("pub mod product;"));
-    assert!(lib.contains("pub mod query;"));
-    assert!(lib.contains("pub mod workers;"));
+    let authoring_lib = read_app_spec("lib/src/lib.rs");
+    let runtime_lib = read_app_spec("app/src/lib.rs");
+    let deploy_lib = read_app_spec("deploy/src/lib.rs");
+    assert!(l1.contains("bounded `fs-meta-deploy` remains the product-facing CLI/tooling namespace"));
+    assert!(l2.contains("`fs-meta/deploy` is the internal product deployment compiler package"));
+    assert!(authoring_lib.contains("pub use fs_meta_runtime::"));
+    assert!(!authoring_lib.contains("pub mod product;"));
+    assert!(runtime_lib.contains("pub mod query;"));
+    assert!(runtime_lib.contains("pub mod workers;"));
+    assert!(deploy_lib.contains("pub fn build_release_doc_value"));
 }
 
 #[test]
@@ -278,7 +282,6 @@ fn worker_model_is_product_facing() {
     for spec in [&l1, &l2] {
         assert!(spec.contains("facade-worker"));
         assert!(spec.contains("source-worker"));
-        assert!(spec.contains("scan-worker"));
         assert!(spec.contains("sink-worker"));
         assert!(spec.contains("embedded"));
         assert!(spec.contains("external"));
@@ -286,17 +289,16 @@ fn worker_model_is_product_facing() {
     assert!(l0.contains("WORKER_ROLE_MODEL"));
     assert!(l0.contains("WORKER_MODE_MODEL"));
     assert!(l0.contains("facade/query ingress"));
-    assert!(l0.contains("shared-process versus dedicated-process isolation choices"));
+    assert!(l0.contains("bounded per-worker hosting choices"));
     assert!(!l0.contains("facade-worker"));
     assert!(!l0.contains("source-worker"));
-    assert!(!l0.contains("scan-worker"));
+    assert!(!l0.contains("four worker roles"));
     assert!(!l0.contains("sink-worker"));
     assert!(!l0.contains("`embedded | external`"));
-    assert!(l1.contains("split as `4`, not `3`"));
-    assert!(l1.contains("split as `4`, not `5`"));
+    assert!(l1.contains("composed of three worker roles"));
+    assert!(l1.contains("split as `3`, not `2`"));
     assert!(l1.contains("workers.facade.mode"));
     assert!(l2.contains("workers.facade.mode"));
-    assert!(l2.contains("workers.scan.mode"));
     assert!(l2.contains("Current baseline defaults: `facade-worker=embedded`"));
 }
 
@@ -311,16 +313,13 @@ fn worker_responsibility_split_is_explicit() {
 
     assert!(l2.contains("`facade-worker` owns HTTP/API ingress, auth, PIT lifecycle, response shaping, and current query orchestration"));
     assert!(l2.contains(
-        "`source-worker` owns live watch, live force-find, and source-side host/grant interaction"
-    ));
-    assert!(l2.contains(
-        "`scan-worker` owns initial full scan, periodic audit, and overflow/recovery rescans"
+        "`source-worker` owns live watch, live force-find, initial full scan, periodic audit, overflow/recovery rescans, and source-side host/grant interaction"
     ));
     assert!(l2.contains("`sink-worker` owns materialized tree/index maintenance plus `/tree` and `/stats` materialized-query backend duties"));
-    assert!(l2.contains("This split is intentionally `4`, not `3`"));
-    assert!(l2.contains("This split is intentionally `4`, not `5`"));
+    assert!(l2.contains("This split is intentionally `3`, not `2`"));
+    assert!(l2.contains("This split is intentionally `3`, not `4`"));
 
-    assert!(api_server.contains("create_inprocess_router"));
+    assert!(api_server.contains("create_local_router"));
     assert!(query_api.contains("pit"));
     assert!(source_mod.contains("WatchManager"));
     assert!(source_mod.contains("force_find"));
@@ -363,42 +362,32 @@ fn realization_bridge_confined_to_worker_module() {
     let app_cargo = read_app_spec("Cargo.toml");
     let app_manifest = read_app_spec("app/Cargo.toml");
     let tooling_manifest = read_app_spec("tooling/Cargo.toml");
-    let facade_manifest = read_app_spec("worker-facade/Cargo.toml");
-    let facade_lib = read_app_spec("worker-facade/src/lib.rs");
-    let source_manifest = read_app_spec("worker-source/Cargo.toml");
-    let scan_manifest = read_app_spec("worker-scan/Cargo.toml");
-    let sink_manifest = read_app_spec("worker-sink/Cargo.toml");
     let app_lib = read_app_spec("app/src/lib.rs");
+    let module_entry = read_app_spec("src/workers/module_entry.rs");
     let source_worker = read_app_spec("src/workers/source.rs");
     let sink_worker = read_app_spec("src/workers/sink.rs");
+    let source_server = read_app_spec("src/workers/source_server.rs");
+    let sink_server = read_app_spec("src/workers/sink_server.rs");
     let lib = read_app_spec("src/lib.rs");
     assert!(!combined.contains("capanix_app_sidecar::ipc_codec"));
     assert!(!app_cargo.contains("name = \"fsmeta\""));
-    assert!(!app_cargo.contains("name = \"capanixd-fs-meta\""));
-    assert!(!app_cargo.contains("name = \"fs_meta_api_fixture\""));
+    assert!(!app_cargo.contains("name = \"fsmeta-locald\""));
     assert!(!app_cargo.contains("name = \"fs_meta_source_worker\""));
     assert!(!app_cargo.contains("name = \"fs_meta_scan_worker\""));
     assert!(!app_cargo.contains("name = \"fs_meta_sink_worker\""));
     assert!(!app_manifest.contains("capanix-unit-sidecar"));
     assert!(!app_manifest.contains("capanix-unit-entry-macros"));
+    assert!(app_manifest.contains("crate-type = [\"rlib\", \"cdylib\"]"));
+    assert!(app_manifest.contains("name = \"fs_meta_api_fixture\""));
     assert!(!app_lib.contains("capanix_unit_sidecar"));
-    assert!(!app_lib.contains("capanix_unit_entry_macros"));
-    assert!(tooling_manifest.contains("name = \"capanix-app-fs-meta-tooling\""));
+    assert!(app_lib.contains("capanix_runtime_host_sdk::entry::capanix_unit_entry"));
+    assert!(tooling_manifest.contains("name = \"fs-meta-tooling\""));
     assert!(tooling_manifest.contains("name = \"fsmeta\""));
-    assert!(tooling_manifest.contains("name = \"capanixd-fs-meta\""));
-    assert!(facade_manifest.contains("name = \"capanix-app-fs-meta-worker-facade\""));
-    assert!(facade_manifest.contains("crate-type = [\"cdylib\", \"rlib\"]"));
-    assert!(facade_manifest.contains("name = \"fs_meta_api_fixture\""));
-    assert!(facade_lib.contains("pub extern \"C\" fn capanix_run_worker_module"));
-    assert!(facade_lib.contains("\"source\" =>"));
-    assert!(facade_lib.contains("\"scan\" =>"));
-    assert!(facade_lib.contains("\"sink\" =>"));
-    assert!(source_manifest.contains("name = \"capanix-app-fs-meta-worker-source\""));
-    assert!(!source_manifest.contains("[[bin]]"));
-    assert!(scan_manifest.contains("name = \"capanix-app-fs-meta-worker-scan\""));
-    assert!(!scan_manifest.contains("[[bin]]"));
-    assert!(sink_manifest.contains("name = \"capanix-app-fs-meta-worker-sink\""));
-    assert!(!sink_manifest.contains("[[bin]]"));
+    assert!(tooling_manifest.contains("name = \"fsmeta-locald\""));
+    assert!(combined_source_text().contains("pub extern \"C\" fn capanix_run_worker_module"));
+    assert!(module_entry.contains("\"source\" => run_source_worker_server"));
+    assert!(module_entry.contains("\"sink\" => run_sink_worker_server"));
+    assert!(!module_entry.contains("\"scan\" =>"));
     assert!(!source_worker.contains("BoundRouteClient"));
     assert!(!source_worker.contains("::open("));
     assert!(!source_worker.contains("Command::new("));
@@ -409,9 +398,9 @@ fn realization_bridge_confined_to_worker_module() {
     assert!(!source_worker.contains("fn init_with_retry("));
     assert!(!source_worker.contains("fn call_with_timeout("));
     assert!(!source_worker.contains("TypedWorkerClient::spawn("));
-    assert!(source_worker.contains("TypedWorkerHandle<SourceWorkerRpc"));
+    assert!(source_worker.contains("TypedRuntimeWorkerClient<SourceWorkerRpc"));
     assert!(source_worker.contains("TypedWorkerInit<SourceConfig>"));
-    assert!(source_worker.contains("TypedWorkerHandle::for_runtime_binding("));
+    assert!(source_worker.contains("RuntimeWorkerClientFactory"));
     assert!(source_worker.contains(".shutdown(Duration::from_secs(2))"));
     assert!(!sink_worker.contains("BoundRouteClient"));
     assert!(!sink_worker.contains("::open("));
@@ -423,12 +412,14 @@ fn realization_bridge_confined_to_worker_module() {
     assert!(!sink_worker.contains("fn init_with_retry("));
     assert!(!sink_worker.contains("fn call_with_timeout("));
     assert!(!sink_worker.contains("TypedWorkerClient::spawn("));
-    assert!(sink_worker.contains("TypedWorkerHandle<SinkWorkerRpc"));
+    assert!(sink_worker.contains("TypedRuntimeWorkerClient<SinkWorkerRpc"));
     assert!(sink_worker.contains("TypedWorkerInit<SourceConfig>"));
-    assert!(sink_worker.contains("TypedWorkerHandle::for_runtime_binding("));
+    assert!(sink_worker.contains("RuntimeWorkerClientFactory"));
     assert!(sink_worker.contains(".shutdown(Duration::from_secs(2))"));
     assert!(!lib.contains("mod sink_worker_sidecar_bridge;"));
     assert!(!lib.contains("mod source_worker_sidecar_bridge;"));
+    assert!(source_server.contains("run_worker_sidecar_server::<SourceWorkerRpc"));
+    assert!(sink_server.contains("run_worker_sidecar_server::<SinkWorkerRpc"));
 }
 
 #[test]
@@ -491,13 +482,12 @@ fn observation_eligibility_gate_ownership() {
             && source.contains("evaluate_observation_status")
             && source.contains("candidate_group_observation_evidence")
             && source.contains("runtime_exposure_confirmed"),
-        "fs-meta app should own a package-local materialized-query gate instead of relying on weak process-readiness proxies"
+        "fs-meta app should own a package-local materialized-query gate instead of relying on weak hosting-readiness proxies"
     );
     assert!(
         (contracts.contains("trusted external exposure ownership in runtime")
             || contracts.contains("runtime-owned trusted external exposure"))
-            && workflow
-                .contains("HTTP facade process/listener readiness is necessary but not sufficient")
+            && workflow.contains("HTTP facade listener readiness is necessary but not sufficient")
             && workflow.contains("materialized `/tree` and `/stats`")
             && workflow.contains("current observation")
             && workflow.contains("materialized observation evidence")
@@ -537,7 +527,6 @@ fn stale_writer_fence_before_exposure() {
 // @verify_spec("CONTRACTS.APP_SCOPE.WORKER_MODE_FAILURE_BOUNDARY_IS_EXPLICIT", mode="system")
 fn worker_mode_failure_boundary_is_explicit() {
     let cargo = read_app_spec("Cargo.toml");
-    let facade_manifest = read_app_spec("worker-facade/Cargo.toml");
     let l0 = read_app_spec("specs/L0-VISION.md");
     let contracts = read_app_spec("specs/L1-CONTRACTS.md");
     let architecture = read_app_spec("specs/L2-ARCHITECTURE.md");
@@ -545,16 +534,16 @@ fn worker_mode_failure_boundary_is_explicit() {
     let runtime_app = read_app_spec("src/runtime_app.rs");
     let api_server = read_app_spec("src/api/server.rs");
     let app_lib = read_app_spec("src/lib.rs");
-    assert!(l0.contains("shared-process versus dedicated-process execution boundaries"));
+    assert!(l0.contains("`embedded` versus `external` worker hosting boundaries"));
     assert!(!l0.contains("init_error"));
     assert!(!l0.contains("facade-worker"));
-    assert!(contracts.contains("`embedded` workers share a host process"));
-    assert!(contracts.contains("`external` workers run in dedicated worker processes"));
+    assert!(contracts.contains("`embedded` workers stay inside the shared host boundary"));
+    assert!(contracts.contains("`external` workers run through isolated external worker hosting"));
     assert!(contracts.contains(
         "upstream bridge-realization seam remains only the low-level external-worker bridge carrier"
     ));
     assert!(contracts.contains(
-        "worker child-process bootstrap, log/socket ownership, retry clipping, and lifecycle supervision remain confined to helper-only `capanix-worker-runtime-support`"
+        "worker bootstrap, log/socket ownership, retry clipping, and lifecycle supervision remain confined to helper-only upstream support beneath `capanix-runtime-host-sdk`"
     ));
     assert!(contracts.contains("canonical `Timeout` / `TransportClosed` categories"));
     assert!(architecture.contains("Product-facing worker modes are only `embedded | external`"));
@@ -562,7 +551,7 @@ fn worker_mode_failure_boundary_is_explicit() {
         architecture.contains("upstream bridge-realization seam is low-level carrier glue only")
     );
     assert!(architecture.contains(
-        "helper-only `capanix-worker-runtime-support` owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision"
+        "helper-only upstream worker support beneath `capanix-runtime-host-sdk` owns worker bootstrap"
     ));
     assert!(architecture.contains(
         "The canonical worker transport contract MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping"
@@ -572,22 +561,19 @@ fn worker_mode_failure_boundary_is_explicit() {
     ));
     assert!(workflow.contains("`facade-worker=embedded`"));
     assert!(workflow.contains("`source-worker=external`"));
-    assert!(workflow.contains("`scan-worker=external`"));
     assert!(workflow.contains("`sink-worker=external`"));
     assert!(!app_lib.contains("pub struct FSMetaRuntimeWorkers"));
     assert!(!app_lib.contains("resolve_worker_artifact_binding("));
     assert!(app_lib.contains("compiled fs-meta manifest config must not expose config.workers"));
     assert!(contracts.contains("workers.source.mode"));
-    assert!(contracts.contains("workers.scan.mode"));
     assert!(contracts.contains("workers.sink.mode"));
     assert!(contracts.contains("consumes only compiled `__cnx_runtime.workers` bindings"));
     assert!(architecture.contains("consumes only compiled `__cnx_runtime.workers` bindings emitted by the fs-meta release compiler"));
     assert!(workflow.contains("__cnx_runtime.workers"));
-    assert!(!cargo.contains("crate-type = [\"cdylib\", \"rlib\"]"));
-    assert!(facade_manifest.contains("crate-type = [\"cdylib\", \"rlib\"]"));
+    assert!(cargo.contains("crate-type = [\"rlib\", \"cdylib\"]"));
     assert!(runtime_app.contains("init_error"));
     assert!(runtime_app.contains("fs-meta runtime init failed"));
-    assert!(api_server.contains("create_inprocess_router"));
+    assert!(api_server.contains("create_local_router"));
     assert!(!api_server.contains("remote projection client"));
     assert!(!api_server.contains("expect(\"fs-meta facade must build remote projection client\")"));
 }
@@ -668,17 +654,17 @@ fn real_nfs_e2e_entrypoint_stays_aligned_with_support_preflight() {
 fn app_authoring_crate_stays_product_specific() {
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
-    let app_manifest = read_app_spec("app/Cargo.toml");
-    let app_lib = read_app_spec("app/src/lib.rs");
+    let authoring_manifest = read_app_spec("lib/Cargo.toml");
+    let authoring_lib = read_app_spec("lib/src/lib.rs");
 
-    assert!(l1.contains("`fs-meta/app` remains the only product app package"));
-    assert!(l1.contains("does not present a generic reusable fs-meta library API"));
-    assert!(l2.contains("`fs-meta/app` is the main product app package"));
-    assert!(l2.contains("does not define a generic reusable fs-meta library surface"));
-    assert!(app_manifest.contains("name = \"capanix-app-fs-meta\""));
-    assert!(app_manifest.contains("publish = false"));
-    assert!(app_manifest.contains("description = \"fs-meta application package\""));
-    assert!(app_lib.contains("pub struct FSMetaConfig"));
+    assert!(l1.contains("`fs-meta/lib` is the only developer-facing fs-meta authoring package"));
+    assert!(l1.contains("`fs-meta-runtime` and `fs-meta-deploy`"));
+    assert!(l2.contains("`fs-meta/lib` is the main product authoring package"));
+    assert!(l2.contains("`fs-meta/app` is the internal `fs-meta-runtime` package"));
+    assert!(authoring_manifest.contains("name = \"fs-meta\""));
+    assert!(authoring_manifest.contains("publish = false"));
+    assert!(authoring_manifest.contains("description = \"fs-meta authoring package\""));
+    assert!(authoring_lib.contains("pub use fs_meta_runtime::{"));
 }
 
 #[test]
@@ -686,11 +672,8 @@ fn embedded_worker_build_path_stays_internal() {
     let l0 = read_app_spec("specs/L0-VISION.md");
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
-    let runtime_manifest = read_app_spec("Cargo.toml");
-    let runtime_lib = read_app_spec("src/lib.rs");
-    let facade_manifest = read_app_spec("worker-facade/Cargo.toml");
-    let facade_lib = read_app_spec("worker-facade/src/lib.rs");
     let app_manifest = read_app_spec("app/Cargo.toml");
+    let app_lib = read_app_spec("app/src/lib.rs");
     let tooling = read_app_spec("tooling/src/bin/fsmeta.rs");
     let harness = read_app_spec("tests/common/harness.rs");
     let cluster = read_app_spec("tests/e2e/support/cluster5.rs");
@@ -701,25 +684,21 @@ fn embedded_worker_build_path_stays_internal() {
         assert!(!lowered.contains("proc macro"));
         assert!(!lowered.contains("create_unit"));
     }
-    assert!(!runtime_manifest.contains("capanix-unit-entry-macros"));
-    assert!(!runtime_lib.contains("capanix_unit_entry!(FSMetaRuntimeApp);"));
-    assert!(facade_manifest.contains("crate-type = [\"cdylib\", \"rlib\"]"));
-    assert!(facade_manifest.contains("capanix-unit-entry-macros"));
-    assert!(facade_lib.contains("Embedded facade-worker entry wiring stays artifact-local"));
-    assert!(facade_lib.contains("pub use capanix_app_fs_meta::FSMetaRuntimeApp;"));
-    assert!(facade_lib.contains("capanix_unit_entry!(FSMetaRuntimeApp);"));
     assert!(!app_manifest.contains("capanix-unit-entry-macros"));
-    assert!(tooling.contains("capanix-app-fs-meta-worker-facade"));
-    assert!(harness.contains("capanix-app-fs-meta-worker-facade"));
-    assert!(cluster.contains("capanix-app-fs-meta-worker-facade"));
+    assert!(app_manifest.contains("crate-type = [\"rlib\", \"cdylib\"]"));
+    assert!(app_lib.contains("capanix_unit_entry!(FSMetaRuntimeApp);"));
+    assert!(combined_source_text().contains("pub extern \"C\" fn capanix_run_worker_module"));
+    assert!(tooling.contains("fs-meta-runtime"));
+    assert!(harness.contains("fs-meta-runtime"));
+    assert!(cluster.contains("fs-meta-runtime"));
 }
 
 #[test]
 fn source_and_sink_worker_server_bootstrap_live_in_artifact_crates() {
     let runtime_source = read_app_spec("src/workers/source.rs");
     let runtime_sink = read_app_spec("src/workers/sink.rs");
-    let worker_source = read_app_spec("worker-source/src/lib.rs");
-    let worker_sink = read_app_spec("worker-sink/src/lib.rs");
+    let worker_source = read_app_spec("src/workers/source_server.rs");
+    let worker_sink = read_app_spec("src/workers/sink_server.rs");
 
     assert!(!runtime_source.contains("pub fn run_source_worker_server"));
     assert!(!runtime_sink.contains("pub fn run_sink_worker_server"));
@@ -727,13 +706,13 @@ fn source_and_sink_worker_server_bootstrap_live_in_artifact_crates() {
     assert!(!runtime_sink.contains("UnitRuntimeIpcBoundary::bind_and_accept"));
 
     assert!(worker_source.contains("pub fn run_source_worker_server"));
-    assert!(worker_source.contains("TypedWorkerServer::<SourceWorkerRpc, _, SourceConfig>::new("));
+    assert!(worker_source.contains("run_worker_sidecar_server::<SourceWorkerRpc"));
     assert!(worker_source.contains("TypedWorkerBootstrapSession<SourceConfig>"));
-    assert!(worker_source.contains(".run_with_sidecar("));
+    assert!(!worker_source.contains("run_scan_worker_server("));
     assert!(worker_sink.contains("pub fn run_sink_worker_server"));
-    assert!(worker_sink.contains("TypedWorkerServer::<SinkWorkerRpc, _, SinkWorkerInitConfig>::new("));
+    assert!(worker_sink.contains("run_worker_sidecar_server::<SinkWorkerRpc"));
     assert!(worker_sink.contains("TypedWorkerBootstrapSession<SinkWorkerInitConfig>"));
-    assert!(worker_sink.contains(".run_with_sidecar("));
+    assert!(worker_sink.contains("SinkWorkerSession"));
 }
 
 #[test]
@@ -743,32 +722,26 @@ fn crate_ownership_and_dependency_rules_are_explicit() {
     let root_manifest = read_workspace_manifest();
     let app_manifest = read_app_spec("app/Cargo.toml");
     let tooling_manifest = read_app_spec("tooling/Cargo.toml");
-    let worker_facade_manifest = read_app_spec("worker-facade/Cargo.toml");
-    let worker_source_manifest = read_app_spec("worker-source/Cargo.toml");
-    let worker_sink_manifest = read_app_spec("worker-sink/Cargo.toml");
-    let scan_manifest = read_app_spec("worker-scan/Cargo.toml");
 
     assert!(governance.contains("## ENGINEERING_GOVERNANCE.CRATE_OWNERSHIP"));
     assert!(governance.contains(
-        "`capanix-worker-runtime-support` is the helper-only upstream crate that owns worker child-process bootstrap"
+        "Helper-only upstream worker bootstrap/transport support remains owned beneath `capanix-runtime-host-sdk`"
     ));
     assert!(
-        governance
-            .contains("shared external worker module export `capanix_run_worker_module(...)`")
+        governance.contains("shared external worker module entry `capanix_run_worker_module(...)`")
     );
     assert!(governance.contains("## ENGINEERING_GOVERNANCE.DEPENDENCY_RULES"));
-    assert!(governance.contains("`fs-meta/app/` does not depend on `capanix-kernel-api`, worker artifact crates, low-level external-worker bridge crate or embedded-entry macro crate"));
+    assert!(governance.contains("`fs-meta/lib/` 不直接依赖 `capanix-kernel-api`"));
     assert!(l2.contains("## ARCHITECTURE.WORKER_ROLE_TO_ARTIFACT_MAP"));
-    assert!(l2.contains("`source-worker`, `scan-worker`, and `sink-worker` remain distinct operator-visible worker roles"));
-    assert!(l2.contains("shared `fs-meta/worker-facade/` worker module"));
+    assert!(l2.contains(
+        "`source-worker` and `sink-worker` remain the two operator-visible external worker roles"
+    ));
+    assert!(l2.contains("shared `fs-meta/app` worker module"));
 
     assert!(root_manifest.contains("capanix-worker-runtime-support"));
-    assert!(app_manifest.contains("capanix-worker-runtime-support"));
+    assert!(!app_manifest.contains("capanix-worker-runtime-support"));
+    assert!(!app_manifest.contains("capanix-unit-entry-macros"));
     assert!(!tooling_manifest.contains("capanix-worker-runtime-support"));
-    assert!(worker_facade_manifest.contains("capanix-worker-runtime-support"));
-    assert!(worker_source_manifest.contains("capanix-worker-runtime-support"));
-    assert!(worker_sink_manifest.contains("capanix-worker-runtime-support"));
-    assert!(scan_manifest.contains("capanix-app-fs-meta-worker-source"));
 }
 
 #[test]

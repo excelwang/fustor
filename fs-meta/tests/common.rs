@@ -38,8 +38,8 @@ pub fn assert_l1_contract(contract: &str) {
             harness::scenario_end_to_end_bootstrap,
         ),
         "CONTRACTS.SYSTEM_INTEGRATION.IN_PROCESS_KERNEL_HOSTING" => run_cached_scenario(
-            "scenario_in_process_kernel_hosting",
-            harness::scenario_in_process_kernel_hosting,
+            "scenario_local_kernel_hosting",
+            harness::scenario_local_kernel_hosting,
         ),
         "CONTRACTS.SYSTEM_INTEGRATION.DECOUPLED_CLI_UPGRADES" => run_cached_scenario(
             "scenario_decoupled_client_queries_no_restart",
@@ -274,14 +274,14 @@ pub fn assert_cluster_bootstrap_governance_real_cluster() {
 }
 
 #[allow(dead_code)]
-pub fn assert_runtime_orchestrated_multiprocess_config_apply_e2e() {
+pub fn assert_runtime_orchestrated_worker_hosting_config_apply_e2e() {
     if std::env::var("CAPANIX_RUNTIME_SCOPE_E2E").ok().as_deref() != Some("1") {
         eprintln!("skip runtime-scope e2e: requires CAPANIX_RUNTIME_SCOPE_E2E=1");
         return;
     }
     let mut last_err: Option<String> = None;
     for attempt in 0..2 {
-        match harness::scenario_runtime_orchestrated_multiprocess_config_apply_e2e() {
+        match harness::scenario_runtime_orchestrated_worker_hosting_config_apply_e2e() {
             Ok(()) => return,
             Err(err) => {
                 last_err = Some(err);

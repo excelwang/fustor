@@ -249,113 +249,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
-name = "capanix-app-fs-meta"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "async-stream",
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "capanix-app-sdk",
- "capanix-host-adapter-fs",
- "capanix-host-fs-types",
- "capanix-managed-state-sdk",
- "capanix-route-proto",
- "capanix-service-sdk",
- "capanix-worker-runtime-support",
- "crossbeam-channel",
- "futures-core",
- "futures-util",
- "libc",
- "log",
- "reqwest",
- "ring",
- "rmp-serde",
- "serde",
- "serde_bytes",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tempfile",
- "tokio",
- "tokio-util",
- "tower",
- "tower-http 0.5.2",
-]
-
-[[package]]
-name = "capanix-app-fs-meta-tooling"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "capanix-app-fs-meta",
- "capanix-config",
- "capanix-daemon",
- "capanix-host-adapter-fs",
- "capanix-runtime-api",
- "clap",
- "libc",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokio",
- "uuid",
-]
-
-[[package]]
-name = "capanix-app-fs-meta-worker-facade"
-version = "0.1.0"
-dependencies = [
- "capanix-app-fs-meta",
- "capanix-app-fs-meta-worker-scan",
- "capanix-app-fs-meta-worker-sink",
- "capanix-app-fs-meta-worker-source",
- "capanix-app-sdk",
- "capanix-route-proto",
- "capanix-unit-entry-macros",
- "capanix-worker-runtime-support",
- "serde",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "capanix-app-fs-meta-worker-scan"
-version = "0.1.0"
-dependencies = [
- "capanix-app-fs-meta-worker-source",
- "capanix-app-sdk",
- "tokio",
-]
-
-[[package]]
-name = "capanix-app-fs-meta-worker-sink"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "capanix-app-fs-meta",
- "capanix-app-sdk",
- "capanix-worker-runtime-support",
- "tokio",
-]
-
-[[package]]
-name = "capanix-app-fs-meta-worker-source"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "capanix-app-fs-meta",
- "capanix-app-sdk",
- "capanix-worker-runtime-support",
- "futures-util",
- "log",
- "tokio",
-]
-
-[[package]]
 name = "capanix-app-sdk"
 version = "0.1.0"
 dependencies = [
@@ -401,10 +294,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "capanix-deploy-sdk"
+version = "0.1.0"
+dependencies = [
+ "capanix-app-sdk",
+ "capanix-config",
+ "capanix-runtime-api",
+ "serde_json",
+]
+
+[[package]]
 name = "capanix-host-adapter-fs"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "capanix-app-sdk",
  "capanix-host-adapter-sdk",
  "capanix-host-fs-types",
  "capanix-kernel-api",
@@ -529,12 +433,23 @@ dependencies = [
 ]
 
 [[package]]
-name = "capanix-service-sdk"
+name = "capanix-runtime-host-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "capanix-app-sdk",
  "capanix-config",
+ "capanix-service-sdk",
+ "capanix-unit-entry-macros",
+ "capanix-worker-runtime-support",
+]
+
+[[package]]
+name = "capanix-service-sdk"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "capanix-app-sdk",
 ]
 
 [[package]]
@@ -870,19 +785,101 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs-meta"
+version = "0.1.0"
+dependencies = [
+ "fs-meta-deploy",
+ "fs-meta-runtime",
+ "reqwest",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tower",
+]
+
+[[package]]
+name = "fs-meta-deploy"
+version = "0.1.0"
+dependencies = [
+ "capanix-app-sdk",
+ "capanix-deploy-sdk",
+ "fs-meta",
+ "fs-meta-runtime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "fs-meta-runtime"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "base64",
+ "bytes",
+ "capanix-app-sdk",
+ "capanix-host-adapter-fs",
+ "capanix-host-fs-types",
+ "capanix-managed-state-sdk",
+ "capanix-runtime-host-sdk",
+ "capanix-service-sdk",
+ "crossbeam-channel",
+ "futures-core",
+ "futures-util",
+ "libc",
+ "log",
+ "reqwest",
+ "ring",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "tokio-util",
+ "tower",
+ "tower-http 0.5.2",
+]
+
+[[package]]
+name = "fs-meta-tooling"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "capanix-daemon",
+ "capanix-host-adapter-fs",
+ "clap",
+ "fs-meta",
+ "fs-meta-deploy",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tokio-util",
+ "uuid",
+]
+
+[[package]]
 name = "fustor-specs-root"
 version = "0.0.0"
 dependencies = [
  "anyhow",
  "base64",
  "bytes",
- "capanix-app-fs-meta",
  "capanix-app-sdk",
  "capanix-host-fs-types",
  "capanix-kernel-api",
  "capanix-route-proto",
  "capanix-runtime-api",
  "capanix-specs-vocabulary",
+ "fs-meta",
+ "fs-meta-deploy",
  "libc",
  "reqwest",
  "ring",

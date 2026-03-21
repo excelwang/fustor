@@ -1,8 +1,8 @@
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, RwLock};
 
-use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_app_sdk::runtime::NodeId;
+use capanix_runtime_host_sdk::boundary::ChannelIoSubset;
 
 use super::facade_status::SharedFacadePendingStatusCell;
 use crate::query::api::ProjectionPolicy;

@@ -16,12 +16,13 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
-use capanix_app_sdk::raw::{ChannelIoSubset, StateBoundary};
 use capanix_app_sdk::runtime::{
     ControlEnvelope, EventMetadata, NodeId, RecvOpts, in_memory_state_boundary,
 };
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::HostAdapter;
+use capanix_runtime_host_sdk::boundary::{ChannelIoSubset, StateBoundary};
+use capanix_runtime_host_sdk::control::{BoundScope, HostObjectGrantState};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -1283,7 +1284,7 @@ impl SinkFileMeta {
         unit: SinkRuntimeUnit,
         route_key: &str,
         generation: u64,
-        bound_scopes: &[capanix_route_proto::BoundScope],
+        bound_scopes: &[BoundScope],
     ) -> Result<()> {
         let unit_id = unit.unit_id();
         let accepted =
@@ -1299,7 +1300,7 @@ impl SinkFileMeta {
         Ok(())
     }
 
-    fn scheduled_bound_scopes(&self) -> Result<Option<Vec<capanix_route_proto::BoundScope>>> {
+    fn scheduled_bound_scopes(&self) -> Result<Option<Vec<BoundScope>>> {
         if !self.unit_control.has_runtime_state() {
             return Ok(None);
         }
@@ -1490,7 +1491,7 @@ impl SinkFileMeta {
                             interfaces: row.interfaces.clone(),
                             active: matches!(
                                 row.grant_state,
-                                capanix_route_proto::HostObjectGrantState::Active
+                                HostObjectGrantState::Active
                             ),
                         })
                         .collect::<Vec<_>>();
@@ -1553,7 +1554,7 @@ impl SinkFileMeta {
         let grant_count = host_object_grants.len();
         let bound_scopes = roots
             .iter()
-            .map(|root| capanix_route_proto::BoundScope {
+            .map(|root| BoundScope {
                 scope_id: root.id.clone(),
                 resource_ids: Vec::new(),
             })
@@ -2100,12 +2101,13 @@ mod tests {
     use bytes::Bytes;
     use capanix_app_sdk::runtime::EventMetadata;
     use capanix_host_fs_types::UnixStat;
-    use capanix_route_proto::{
+    use capanix_runtime_host_sdk::control::{
         BoundScope, ExecActivate, ExecControl, ExecDeactivate, HostDescriptor, HostObjectGrant,
         HostObjectGrantState, HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged,
-        UnitTick, encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
+        encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
         encode_unit_tick_envelope,
     };
+    use capanix_app_sdk::route_proto::UnitTick;
     fn default_materialized_request() -> InternalQueryRequest {
         InternalQueryRequest::default()
     }

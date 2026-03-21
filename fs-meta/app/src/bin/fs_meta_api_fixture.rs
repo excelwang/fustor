@@ -1,10 +1,12 @@
 use std::collections::HashMap;
 use std::env;
 
-use capanix_app_fs_meta::query::request::{InternalQueryRequest, QueryOp, QueryScope};
-use capanix_app_fs_meta::{FSMetaApp, FSMetaConfig};
+use fs_meta_runtime::query::request::{InternalQueryRequest, QueryOp, QueryScope};
+use fs_meta_runtime::{FSMetaApp, FSMetaConfig};
 use capanix_app_sdk::runtime::{ConfigValue, NodeId};
-use capanix_route_proto::{BoundScope, ExecActivate, ExecControl, encode_exec_control_envelope};
+use capanix_runtime_host_sdk::control::{
+    BoundScope, ExecActivate, ExecControl, encode_exec_control_envelope,
+};
 use serde::Deserialize;
 
 const FACADE_CONTROL_ROUTE_KEY: &str = "fs-meta.internal.facade-control:v1.stream";
@@ -246,13 +248,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "resource_kind".to_string(),
                         ConfigValue::String("tcp_listener".to_string()),
                     ),
+                    ("bind_addr".to_string(), ConfigValue::String(bind_addr.clone())),
                     (
                         "source".to_string(),
                         ConfigValue::String("fs-meta-fixture".to_string()),
-                    ),
-                    (
-                        "bind_addr".to_string(),
-                        ConfigValue::String(bind_addr.clone()),
                     ),
                 ]))]),
             ),
@@ -293,7 +292,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }),
     );
     let config = FSMetaConfig::from_manifest_config(&cfg)?;
-
     let app = FSMetaApp::new(config, NodeId(node_id.clone()))?;
     app.start().await?;
     let worker_scopes = roots_env

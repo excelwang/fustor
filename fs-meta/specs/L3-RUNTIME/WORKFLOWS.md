@@ -21,7 +21,7 @@ version: 3.0.0
 11. unit 作用域 authoritative commit journal 统一通过 runtime-owned `statecell_*` state-carrier boundary 提交；app 仅声明 `state_class`（`authoritative`/`volatile`），不声明底层 carrier 介质。
 12. sink 在每个 logical group 内维持单树仲裁/构建状态，对外查询响应不暴露 member 子层。
 13. `workers.sink.mode=external` 时，sink materialized tree 由独立 sink-worker 进程承载；主 fs-meta 进程通过 kernel data route 转发 sink 读写与控制帧，worker 仅消费相同的 runtime ABI、route-resolved opaque channels 与内部 sink protocol，worker 重启后走扫描/审计重建。
-14. worker-mode reconfiguration is generation-based: operator changes to `workers.source.mode`, `workers.scan.mode`, or `workers.sink.mode` are compiled into a new generation’s `__cnx_runtime.workers` bindings and take effect only through normal generation rollout, not through same-generation hot switching inside one running host.
+14. worker-mode reconfiguration is generation-based: operator changes to `workers.source.mode` or `workers.sink.mode` are compiled into a new generation’s `__cnx_runtime.workers` bindings and take effect only through normal generation rollout, not through same-generation hot switching inside one running host.
 
 ## [workflow] UnifiedAuditScanWorkflow
 
@@ -149,7 +149,7 @@ version: 3.0.0
 
 1. fs-meta 对外 HTTP API 继续附着在由 facade resource 驱动的 one-cardinality domain facade 上，而不是单独声明 `runtime.exec.api` execution identity。
 2. runtime 只需保持整个 fs-meta app 对外入口在 facade resource scope 内的单活 bind/run 落位；不额外为 projection/API 维护 roaming bind/run 语义。
-3. active app 实例保留 API manifest/监听职责；non-active 节点不暴露 fs-meta HTTP API，并执行 stale-process 回收。
+3. active app 实例保留 API manifest/监听职责；non-active 节点不暴露 fs-meta HTTP API，并执行 stale worker-host 回收。
 4. 对 stateful cutover，只有完成 authoritative replay、projection rebuild，并达到 semantic-eligible / app-owned `observation_eligible` 的 active generation 才承担“可信 observation”暴露；未追平 generation 只能保留旧 active 或显式降级结果。
 5. app failover 时，新 active 实例重新拉起同一 HTTP facade；对外 URL 模型保持不变。
 6. 内部 query/find、sink worker 与 host object 协调继续优先走 route/channel/opaque-channel/facade 边界，而不是多节点 HTTP 漫游或宿主 host-operation 转发。

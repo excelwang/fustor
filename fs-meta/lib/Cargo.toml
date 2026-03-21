@@ -1,0 +1,29 @@
+[package]
+name = "fs-meta"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "fs-meta authoring package"
+
+[lib]
+path = "src/lib.rs"
+
+[[test]]
+name = "app_specs"
+path = "../tests/app_specs.rs"
+
+[[test]]
+name = "cli_specs"
+path = "../tests/cli_specs.rs"
+
+[dependencies]
+fs-meta-runtime = { workspace = true }
+
+[dev-dependencies]
+fs-meta-deploy = { workspace = true }
+fs-meta-runtime = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tempfile = { workspace = true }
+tower = { version = "0.5", features = ["util"] }

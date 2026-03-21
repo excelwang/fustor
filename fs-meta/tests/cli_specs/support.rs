@@ -58,7 +58,7 @@ pub fn launcher_source_text() -> String {
             .parent()
             .map(PathBuf::from)
             .expect("fs-meta container root")
-            .join("tooling/src/bin/capanixd-fs-meta.rs"),
+            .join("tooling/src/bin/fsmeta-locald.rs"),
     )
     .expect("read fs-meta daemon launcher source")
 }

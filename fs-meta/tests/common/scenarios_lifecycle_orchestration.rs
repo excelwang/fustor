@@ -119,7 +119,7 @@ fn release_clear(c: &ClusterContext, app_id: &str) -> Result<Value, String> {
     )
 }
 
-fn managed_pid_for_instance(status: &Value, instance_id: &str) -> Option<u64> {
+fn managed_host_pid_for_instance(status: &Value, instance_id: &str) -> Option<u64> {
     let rows = status
         .get("daemon")
         .and_then(|v| v.get("managed_processes"))
@@ -129,7 +129,10 @@ fn managed_pid_for_instance(status: &Value, instance_id: &str) -> Option<u64> {
         .and_then(|row| row.get("pid").and_then(Value::as_u64))
 }
 
-fn managed_pids_for_instance(status: &Value, instance_id: &str) -> std::collections::BTreeSet<u64> {
+fn managed_host_pids_for_instance(
+    status: &Value,
+    instance_id: &str,
+) -> std::collections::BTreeSet<u64> {
     status
         .get("daemon")
         .and_then(|v| v.get("managed_processes"))
@@ -326,8 +329,8 @@ pub(crate) fn scenario_tx_spawn_abort_deterministic() -> Result<(), String> {
                 || {
                     let status_a = c.layered_status_a_local()?;
                     let status_b = c.layered_status_b_local()?;
-                    let mut current = managed_pids_for_instance(&status_a, &app_id);
-                    current.extend(managed_pids_for_instance(&status_b, &app_id));
+                    let mut current = managed_host_pids_for_instance(&status_a, &app_id);
+                    current.extend(managed_host_pids_for_instance(&status_b, &app_id));
                     if current.is_empty() {
                         stable_polls = 0;
                         return Ok(false);
@@ -361,8 +364,8 @@ pub(crate) fn scenario_tx_spawn_abort_deterministic() -> Result<(), String> {
                 || {
                     let status_a = c.layered_status_a_local()?;
                     let status_b = c.layered_status_b_local()?;
-                    let mut current = managed_pids_for_instance(&status_a, &app_id);
-                    current.extend(managed_pids_for_instance(&status_b, &app_id));
+                    let mut current = managed_host_pids_for_instance(&status_a, &app_id);
+                    current.extend(managed_host_pids_for_instance(&status_b, &app_id));
                     last_projection = format!(
                         "current_pids={current:?} initial_pids={initial_pids:?} status_a={} status_b={}",
                         status_a,
@@ -440,8 +443,8 @@ pub(crate) fn scenario_tx_recovery_after_abort() -> Result<(), String> {
                         .and_then(|d| d.get("declared_units_count"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    let pid_a = managed_pid_for_instance(&status_a, &app_id);
-                    let pid_b = managed_pid_for_instance(&status_b, &app_id);
+                    let pid_a = managed_host_pid_for_instance(&status_a, &app_id);
+                    let pid_b = managed_host_pid_for_instance(&status_b, &app_id);
                     Ok(declared_a > 0
                         && declared_a == declared_b
                         && (pid_a.is_some() || pid_b.is_some()))

@@ -1,20 +1,17 @@
 [package]
-name = "capanix-app-fs-meta"
+name = "fs-meta-runtime"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "fs-meta application package"
+description = "fs-meta runtime-entry and worker hosting package"
 
 [lib]
 path = "src/lib.rs"
+crate-type = ["rlib", "cdylib"]
 
-[[test]]
-name = "app_specs"
-path = "../tests/app_specs.rs"
-
-[[test]]
-name = "cli_specs"
-path = "../tests/cli_specs.rs"
+[[bin]]
+name = "fs_meta_api_fixture"
+path = "src/bin/fs_meta_api_fixture.rs"
 
 [dependencies]
 anyhow = "1"
@@ -22,8 +19,8 @@ capanix-host-adapter-fs = { workspace = true }
 capanix-host-fs-types = { workspace = true }
 capanix-app-sdk = { workspace = true }
 capanix-managed-state-sdk = { workspace = true }
+capanix-runtime-host-sdk = { workspace = true }
 capanix-service-sdk = { workspace = true }
-capanix-worker-runtime-support = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }
 axum = "0.7"
@@ -34,7 +31,6 @@ futures-core = { workspace = true }
 futures-util = "0.3"
 libc = "0.2"
 log = { workspace = true }
-capanix-route-proto = { workspace = true }
 ring = "0.17"
 rmp-serde = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

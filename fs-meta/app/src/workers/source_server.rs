@@ -3,22 +3,22 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use capanix_app_fs_meta::source::FSMetaSource;
-use capanix_app_fs_meta::source::config::SourceConfig;
-use capanix_app_fs_meta::workers::source::SourceWorkerRpc;
-use capanix_app_fs_meta::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
-use capanix_app_sdk::raw::{
+use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
+use capanix_app_sdk::{CnxError, Event, Result};
+use capanix_runtime_host_sdk::boundary::{
     BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest, StateBoundary,
 };
-use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
-use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary};
-use capanix_worker_runtime_support::{
-    TypedWorkerBootstrapSession, TypedWorkerServer, TypedWorkerSession,
-    WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, WorkerLoopControl, WorkerSessionContext,
-    worker_control_route_key_from_env,
+use capanix_runtime_host_sdk::worker_runtime::{
+    TypedWorkerBootstrapSession, TypedWorkerSession, WorkerLoopControl, WorkerSessionContext,
+    run_worker_sidecar_server,
 };
 use futures_util::StreamExt;
 use tokio::task::JoinHandle;
+
+use crate::source::FSMetaSource;
+use crate::source::config::SourceConfig;
+use crate::workers::source::SourceWorkerRpc;
+use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 
 const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
 const SOURCE_WORKER_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -307,17 +307,12 @@ fn process_worker_request(
             ),
         },
         SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot => match state.source.as_ref() {
-            Some(source) => {
-                let snapshot = source.last_force_find_runner_by_group_snapshot();
-                eprintln!(
-                    "fs_meta_source_worker: LastForceFindRunnerByGroupSnapshot {:?}",
-                    snapshot
-                );
-                (
-                    SourceWorkerResponse::LastForceFindRunnerByGroup(snapshot),
-                    false,
-                )
-            }
+            Some(source) => (
+                SourceWorkerResponse::LastForceFindRunnerByGroup(
+                    source.last_force_find_runner_by_group_snapshot(),
+                ),
+                false,
+            ),
             None => (
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -336,24 +331,10 @@ fn process_worker_request(
             ),
         },
         SourceWorkerRequest::ForceFind { request } => match state.source.as_ref() {
-            Some(source) => {
-                eprintln!(
-                    "fs_meta_source_worker: ForceFind selected_group={:?} recursive={} path={}",
-                    request.scope.selected_group,
-                    request.scope.recursive,
-                    String::from_utf8_lossy(&request.scope.path)
-                );
-                match source.force_find(&request) {
-                    Ok(events) => {
-                        eprintln!(
-                            "fs_meta_source_worker: ForceFind response events={}",
-                            events.len()
-                        );
-                        (SourceWorkerResponse::Events(events), false)
-                    }
-                    Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
-                }
-            }
+            Some(source) => match source.force_find(&request) {
+                Ok(events) => (SourceWorkerResponse::Events(events), false),
+                Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
+            },
             None => (
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -385,7 +366,6 @@ fn process_worker_request(
         },
         SourceWorkerRequest::TriggerRescanWhenReady => match state.source.as_ref() {
             Some(source) => {
-                eprintln!("fs_meta_source_worker: received TriggerRescanWhenReady");
                 let source = source.clone();
                 runtime.spawn(async move {
                     source.trigger_rescan_when_ready().await;
@@ -419,39 +399,11 @@ pub fn run_source_worker_server(
         pending_init: None,
         pump_task: None,
     }));
-    TypedWorkerServer::<SourceWorkerRpc, _, SourceConfig>::new(
-        worker_control_route_key_from_env(),
-        WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
+    run_worker_sidecar_server::<SourceWorkerRpc, _, SourceConfig>(
+        control_socket_path,
+        data_socket_path,
         SourceWorkerSession { state },
     )
-    .run_with_sidecar(control_socket_path, data_socket_path)
-}
-
-pub fn run_source_worker_runtime_loop(
-    boundary: Arc<dyn RuntimeBoundary>,
-    io_boundary: Arc<dyn ChannelIoSubset>,
-    runtime: &tokio::runtime::Runtime,
-) -> std::io::Result<()> {
-    let state = Arc::new(Mutex::new(SourceWorkerState {
-        source: None,
-        pending_init: None,
-        pump_task: None,
-    }));
-    run_source_worker_runtime_loop_with_state(boundary, io_boundary, runtime, state)
-}
-
-fn run_source_worker_runtime_loop_with_state(
-    boundary: Arc<dyn RuntimeBoundary>,
-    io_boundary: Arc<dyn ChannelIoSubset>,
-    runtime: &tokio::runtime::Runtime,
-    state: Arc<Mutex<SourceWorkerState>>,
-) -> std::io::Result<()> {
-    TypedWorkerServer::<SourceWorkerRpc, _, SourceConfig>::new(
-        worker_control_route_key_from_env(),
-        WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
-        SourceWorkerSession { state },
-    )
-    .run_loop(boundary, io_boundary, runtime)
 }
 
 struct SourceWorkerSession {

@@ -2,19 +2,19 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use capanix_app_fs_meta::sink::SinkFileMeta;
-use capanix_app_fs_meta::source::config::SourceConfig;
-use capanix_app_fs_meta::workers::sink::SinkWorkerRpc;
-use capanix_app_fs_meta::workers::sink_ipc::{
-    SinkWorkerInitConfig, SinkWorkerRequest, SinkWorkerResponse, recv_opts,
-};
-use capanix_app_sdk::raw::{ChannelIoSubset, StateBoundary};
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
 use capanix_app_sdk::{CnxError, Event};
-use capanix_worker_runtime_support::{
-    TypedWorkerBootstrapSession, TypedWorkerServer, TypedWorkerSession,
-    WORKER_BOOTSTRAP_CONTROL_FRAME_KIND, WorkerLoopControl, WorkerSessionContext,
-    worker_control_route_key_from_env,
+use capanix_runtime_host_sdk::boundary::{ChannelIoSubset, StateBoundary};
+use capanix_runtime_host_sdk::worker_runtime::{
+    TypedWorkerBootstrapSession, TypedWorkerSession, WorkerLoopControl, WorkerSessionContext,
+    run_worker_sidecar_server,
+};
+
+use crate::sink::SinkFileMeta;
+use crate::source::config::SourceConfig;
+use crate::workers::sink::SinkWorkerRpc;
+use crate::workers::sink_ipc::{
+    SinkWorkerInitConfig, SinkWorkerRequest, SinkWorkerResponse, recv_opts,
 };
 
 fn block_on_runtime<F, T>(runtime: &tokio::runtime::Handle, fut: F) -> T
@@ -190,24 +190,10 @@ fn process_worker_request(
             ),
         },
         SinkWorkerRequest::MaterializedQuery { request } => match state.sink.as_ref() {
-            Some(sink) => {
-                eprintln!(
-                    "fs_meta_sink_worker: MaterializedQuery selected_group={:?} recursive={} path={}",
-                    request.scope.selected_group,
-                    request.scope.recursive,
-                    String::from_utf8_lossy(&request.scope.path)
-                );
-                match sink.materialized_query(&request) {
-                    Ok(events) => {
-                        eprintln!(
-                            "fs_meta_sink_worker: MaterializedQuery response events={}",
-                            events.len()
-                        );
-                        (SinkWorkerResponse::Events(events), false)
-                    }
-                    Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-                }
-            }
+            Some(sink) => match sink.materialized_query(&request) {
+                Ok(events) => (SinkWorkerResponse::Events(events), false),
+                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+            },
             None => (
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -242,12 +228,10 @@ fn process_worker_request(
             ),
         },
         SinkWorkerRequest::Recv { timeout_ms, limit } => match state.sink.as_ref() {
-            Some(sink) => {
-                match block_on_runtime(runtime, sink.recv(recv_opts(timeout_ms, limit))) {
-                    Ok(events) => (SinkWorkerResponse::Events(events), false),
-                    Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-                }
-            }
+            Some(sink) => match block_on_runtime(runtime, sink.recv(recv_opts(timeout_ms, limit))) {
+                Ok(events) => (SinkWorkerResponse::Events(events), false),
+                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+            },
             None => (
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -276,12 +260,11 @@ pub fn run_sink_worker_server(
         endpoints_started: false,
         send_tx: None,
     }));
-    TypedWorkerServer::<SinkWorkerRpc, _, SinkWorkerInitConfig>::new(
-        worker_control_route_key_from_env(),
-        WORKER_BOOTSTRAP_CONTROL_FRAME_KIND,
+    run_worker_sidecar_server::<SinkWorkerRpc, _, SinkWorkerInitConfig>(
+        control_socket_path,
+        data_socket_path,
         SinkWorkerSession { state },
     )
-    .run_with_sidecar(control_socket_path, data_socket_path)
 }
 
 struct SinkWorkerSession {
@@ -367,8 +350,8 @@ impl TypedWorkerBootstrapSession<SinkWorkerInitConfig> for SinkWorkerSession {
     }
 
     async fn on_close(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
-        let state = self.state.clone();
-        let mut guard = state
+        let mut guard = self
+            .state
             .lock()
             .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
         block_on_runtime(

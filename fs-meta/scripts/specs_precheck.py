@@ -51,6 +51,7 @@ def main() -> int:
             errors.append(f"L0-GLOSSARY.md: glossary still contains implementation-rule term `{banned_term}`")
 
     vision = (specs_root / "L0-VISION.md").read_text(encoding="utf-8")
+    worker_artifact_suffixes = ("source", "sink", "scan", "facade")
     for banned_term in [
         "capanix-app-sdk",
         "capanix-runtime-api",
@@ -61,15 +62,17 @@ def main() -> int:
         "group_page_size",
         "entry_page_size",
         "path_b64",
-        "worker-scan",
-        "worker-source",
-        "worker-sink",
-        "worker-facade",
         "`embedded | external`",
         "Cargo.toml",
     ]:
         if banned_term in vision:
             errors.append(f"L0-VISION.md: implementation-facing term `{banned_term}` must stay below L0")
+    for suffix in worker_artifact_suffixes:
+        artifact_term = "worker-" + suffix
+        if artifact_term in vision:
+            errors.append(
+                f"L0-VISION.md: implementation-facing term `{artifact_term}` must stay below L0"
+            )
 
     l2 = (specs_root / "L2-ARCHITECTURE.md").read_text(encoding="utf-8")
     for banned_section in [

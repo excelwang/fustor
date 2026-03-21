@@ -5,7 +5,7 @@ use crate::support::cluster5::Cluster5;
 use crate::support::cpu_budget::{assert_cpu_budget, measure_cpu_budget};
 use crate::support::nfs_lab::NfsLab;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
-use capanix_app_fs_meta::{RootSelector, RootSpec};
+use fs_meta::{RootSelector, RootSpec};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -348,7 +348,7 @@ fn measure_steady_cpu(
         let mut pids = vec![cluster.daemon_pid(node_name)?];
         pids.extend(
             cluster
-                .managed_pids_for_instance(node_name, app_id)?
+                .managed_host_pids_for_instance(node_name, app_id)?
                 .into_iter(),
         );
         by_node.insert(node_name.to_string(), pids);

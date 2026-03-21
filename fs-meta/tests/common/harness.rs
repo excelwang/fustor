@@ -37,10 +37,12 @@ const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
     "tx_execute",
 ];
 
-fn configure_test_child_process(cmd: &mut Command) {
-    cmd.process_group(0);
+fn configure_test_child_runtime(cmd: &mut Command) {
     unsafe {
         cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -361,15 +363,15 @@ fn resolve_test_app_cdylib() -> Option<PathBuf> {
 fn fs_meta_app_lib_filename() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "libcapanix_app_fs_meta_worker_facade.dylib"
+        "libfs_meta_runtime.dylib"
     }
     #[cfg(target_os = "windows")]
     {
-        "capanix_app_fs_meta_worker_facade.dll"
+        "fs_meta_runtime.dll"
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        "libcapanix_app_fs_meta_worker_facade.so"
+        "libfs_meta_runtime.so"
     }
 }
 
@@ -400,13 +402,8 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
     let watch_paths = vec![
         root.join("Cargo.lock"),
         root.join("fs-meta/app/src"),
-        root.join("fs-meta/worker-facade/src"),
-        root.join("fs-meta/worker-source/src"),
-        root.join("fs-meta/worker-source/Cargo.toml"),
-        root.join("fs-meta/worker-sink/src"),
-        root.join("fs-meta/worker-sink/Cargo.toml"),
-        root.join("fs-meta/worker-scan/src"),
-        root.join("fs-meta/worker-scan/Cargo.toml"),
+        root.join("fs-meta/app/src"),
+        root.join("fs-meta/app/Cargo.toml"),
         root.join("fs-meta/tests"),
         root.join("src"),
     ];
@@ -431,7 +428,7 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
             .current_dir(&root)
             .arg("build")
             .arg("-p")
-            .arg("capanix-app-fs-meta-worker-facade")
+            .arg("fs-meta-runtime")
             .arg("--lib")
             .status();
         let Ok(status) = status else {
@@ -599,7 +596,7 @@ impl RunningNode {
             cmd.env_remove("CAPANIX_ADMIN_SK_B64");
             cmd.env_remove("DATANIX_ADMIN_SK_B64");
         }
-        configure_test_child_process(&mut cmd);
+        configure_test_child_runtime(&mut cmd);
         let child = cmd.spawn().map_err(|e| format!("spawn capanixd: {e}"))?;
         Ok(Self {
             node_id: node.node_id.clone(),

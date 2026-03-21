@@ -4,7 +4,7 @@ use crate::support::api_client::{ApiResponse, FsMetaApiClient, OperatorSession};
 use crate::support::cluster5::Cluster5;
 use crate::support::nfs_lab::NfsLab;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
-use capanix_app_fs_meta::{RootSelector, RootSpec};
+use fs_meta::{RootSelector, RootSpec};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};

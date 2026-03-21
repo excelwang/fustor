@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Duration;
 
-use capanix_app_sdk::raw::{
+use capanix_runtime_host_sdk::boundary::{
     BoundaryContext, ChannelIoSubset, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
 };
 use capanix_app_sdk::runtime::RouteKey;

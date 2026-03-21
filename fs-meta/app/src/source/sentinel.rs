@@ -99,7 +99,7 @@ impl Default for SentinelConfig {
     }
 }
 
-/// Sentinel monitor: processes health signals and emits self-healing actions.
+/// Sentinel monitor: handles health signals and emits self-healing actions.
 ///
 /// Thread-safe — the inner state is behind a Mutex so multiple concrete root
 /// tasks can report signals concurrently.
@@ -116,8 +116,8 @@ impl Sentinel {
         }
     }
 
-    /// Process a health signal and return any resulting actions.
-    pub(crate) fn process(&self, signal: HealthSignal) -> Vec<SentinelAction> {
+    /// Handle a health signal and return any resulting actions.
+    pub(crate) fn handle_signal(&self, signal: HealthSignal) -> Vec<SentinelAction> {
         let mut state = self.state.lock().unwrap_or_else(|p| {
             log::warn!("sentinel: mutex poisoned; recovering");
             p.into_inner()
@@ -285,7 +285,7 @@ mod tests {
     #[test]
     fn overflow_below_threshold_no_action() {
         let s = sentinel();
-        let actions = s.process(HealthSignal::WatchOverflow {
+        let actions = s.handle_signal(HealthSignal::WatchOverflow {
             root_key: "r1".into(),
         });
         assert!(actions.is_empty());
@@ -295,11 +295,11 @@ mod tests {
     fn overflow_at_threshold_triggers_rescan_and_degraded() {
         let s = sentinel();
         for _ in 0..2 {
-            s.process(HealthSignal::WatchOverflow {
+            s.handle_signal(HealthSignal::WatchOverflow {
                 root_key: "r1".into(),
             });
         }
-        let actions = s.process(HealthSignal::WatchOverflow {
+        let actions = s.handle_signal(HealthSignal::WatchOverflow {
             root_key: "r1".into(),
         });
         assert!(actions.contains(&SentinelAction::TriggerRescan {
@@ -313,7 +313,7 @@ mod tests {
     #[test]
     fn audit_drift_triggers_degraded() {
         let s = sentinel();
-        let actions = s.process(HealthSignal::AuditDrift {
+        let actions = s.handle_signal(HealthSignal::AuditDrift {
             root_key: "r1".into(),
             corrections: 50,
         });
@@ -325,11 +325,11 @@ mod tests {
     #[test]
     fn clean_audit_after_drift_recovers() {
         let s = sentinel();
-        s.process(HealthSignal::AuditDrift {
+        s.handle_signal(HealthSignal::AuditDrift {
             root_key: "r1".into(),
             corrections: 50,
         });
-        let actions = s.process(HealthSignal::AuditDrift {
+        let actions = s.handle_signal(HealthSignal::AuditDrift {
             root_key: "r1".into(),
             corrections: 0,
         });
@@ -341,12 +341,12 @@ mod tests {
     #[test]
     fn pipeline_error_threshold() {
         let s = sentinel();
-        let a1 = s.process(HealthSignal::PipelineError {
+        let a1 = s.handle_signal(HealthSignal::PipelineError {
             root_key: "r1".into(),
             error: "io error".into(),
         });
         assert!(a1.is_empty());
-        let a2 = s.process(HealthSignal::PipelineError {
+        let a2 = s.handle_signal(HealthSignal::PipelineError {
             root_key: "r1".into(),
             error: "io error".into(),
         });
@@ -364,15 +364,15 @@ mod tests {
     #[test]
     fn pipeline_recovery_clears_degraded() {
         let s = sentinel();
-        s.process(HealthSignal::PipelineError {
+        s.handle_signal(HealthSignal::PipelineError {
             root_key: "r1".into(),
             error: "e".into(),
         });
-        s.process(HealthSignal::PipelineError {
+        s.handle_signal(HealthSignal::PipelineError {
             root_key: "r1".into(),
             error: "e".into(),
         });
-        let actions = s.process(HealthSignal::PipelineRecovered {
+        let actions = s.handle_signal(HealthSignal::PipelineRecovered {
             root_key: "r1".into(),
         });
         assert!(actions.contains(&SentinelAction::ReportRecovered {
@@ -384,7 +384,7 @@ mod tests {
     #[test]
     fn degraded_roots_reports_correctly() {
         let s = sentinel();
-        s.process(HealthSignal::WatchInitFailed {
+        s.handle_signal(HealthSignal::WatchInitFailed {
             root_key: "r1".into(),
             error: "no inotify".into(),
         });

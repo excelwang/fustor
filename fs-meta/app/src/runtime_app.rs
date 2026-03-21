@@ -31,7 +31,6 @@ use crate::workers::sink::{SinkFacade, SinkWorkerClientHandle};
 use crate::workers::source::{SourceFacade, SourceWorkerClientHandle};
 use crate::{FSMetaConfig, api, source};
 use async_trait::async_trait;
-use capanix_app_sdk::raw::{ChannelBoundary, ChannelIoSubset, StateBoundary};
 #[cfg(test)]
 use capanix_app_sdk::runtime::ConfigValue;
 use capanix_app_sdk::runtime::{
@@ -41,8 +40,11 @@ use capanix_app_sdk::runtime::{
 use capanix_app_sdk::worker::WorkerMode;
 use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryApp};
 use capanix_managed_state_sdk::{ManagedStateDeclaration, ManagedStateProfile};
-use capanix_service_sdk::{AppBuilder, RuntimeBootstrapContext, RuntimeLoadedServiceApp};
-use capanix_worker_runtime_support::CompositeRuntimeBoundary;
+use capanix_runtime_host_sdk::boundary::{ChannelBoundary, ChannelIoSubset, StateBoundary};
+use capanix_runtime_host_sdk::control::BoundScope;
+use capanix_runtime_host_sdk::{RuntimeBootstrapContext, RuntimeLoadedServiceApp};
+use capanix_runtime_host_sdk::worker_runtime::RuntimeWorkerClientFactory;
+use capanix_service_sdk::AppBuilder;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
@@ -50,9 +52,10 @@ use crate::sink::SinkFileMeta;
 #[cfg(test)]
 use crate::source::config::SourceConfig;
 
-// Top-level fs-meta runtime authoring lowers through `service-sdk -> app-sdk`;
-// direct runtime-api use is confined to narrow infra seams such as boundary
-// conversion helpers and compiled worker-binding admission.
+// Top-level fs-meta runtime authoring lowers through
+// `service-sdk -> runtime-host-sdk -> app-sdk`; direct runtime-api use is
+// confined to narrow infra seams such as boundary conversion helpers and
+// compiled worker-binding admission.
 
 struct FacadeActivation {
     route_key: String,
@@ -67,7 +70,7 @@ struct PendingFacadeActivation {
     route_key: String,
     generation: u64,
     resource_ids: Vec<String>,
-    bound_scopes: Vec<capanix_route_proto::BoundScope>,
+    bound_scopes: Vec<BoundScope>,
     group_ids: Vec<String>,
     runtime_managed: bool,
     runtime_exposure_confirmed: bool,
@@ -119,18 +122,7 @@ fn runtime_worker_client_bindings(
         ));
     }
     let source = required_runtime_worker_binding(bindings, "source")?;
-    let scan = required_runtime_worker_binding(bindings, "scan")?;
     let sink = required_runtime_worker_binding(bindings, "sink")?;
-    if source.mode != scan.mode {
-        return Err(CnxError::InvalidInput(
-            "runtime worker bindings for 'source' and 'scan' must use the same mode while they still share one realization".into(),
-        ));
-    }
-    if source.module_path != scan.module_path {
-        return Err(CnxError::InvalidInput(
-            "runtime worker bindings for 'source' and 'scan' must use the same module_path while they still share one realization".into(),
-        ));
-    }
     Ok((source, sink))
 }
 
@@ -262,17 +254,17 @@ impl FSMetaApp {
                                 .to_string(),
                         )
                     })?;
-                    let pair = Arc::new(CompositeRuntimeBoundary::new(
+                    let worker_factory = RuntimeWorkerClientFactory::new(
                         control_boundary,
                         channel_boundary.clone(),
                         state_boundary.clone(),
-                    ));
+                    );
                     Arc::new(SourceFacade::worker(Arc::new(
                         SourceWorkerClientHandle::new(
                             node_id.clone(),
                             config.source.clone(),
                             source_worker_binding.clone(),
-                            pair,
+                            worker_factory,
                         )?,
                     )))
                 }
@@ -300,16 +292,16 @@ impl FSMetaApp {
                                 .to_string(),
                         )
                     })?;
-                    let pair = Arc::new(CompositeRuntimeBoundary::new(
+                    let worker_factory = RuntimeWorkerClientFactory::new(
                         control_boundary,
                         channel_boundary.clone(),
                         state_boundary.clone(),
-                    ));
+                    );
                     Arc::new(SinkFacade::worker(Arc::new(SinkWorkerClientHandle::new(
                         node_id.clone(),
                         sink_source_cfg.clone(),
                         sink_worker_binding.clone(),
-                        pair,
+                        worker_factory,
                     )?)))
                 }
                 None => {
@@ -355,9 +347,13 @@ impl FSMetaApp {
         sink_signals: &[SinkControlSignal],
         facade_signals: &[FacadeControlSignal],
     ) -> bool {
-        source_signals.iter().any(Self::source_signal_can_initialize)
+        source_signals
+            .iter()
+            .any(Self::source_signal_can_initialize)
             || sink_signals.iter().any(Self::sink_signal_can_initialize)
-            || facade_signals.iter().any(Self::facade_signal_can_initialize)
+            || facade_signals
+                .iter()
+                .any(Self::facade_signal_can_initialize)
     }
 
     fn source_signal_can_initialize(signal: &SourceControlSignal) -> bool {
@@ -845,7 +841,7 @@ impl FSMetaApp {
     }
 
     fn facade_candidate_resource_ids(
-        bound_scopes: &[capanix_route_proto::BoundScope],
+        bound_scopes: &[BoundScope],
     ) -> Vec<String> {
         let mut ids = std::collections::BTreeSet::new();
         for scope in bound_scopes {
@@ -881,7 +877,7 @@ impl FSMetaApp {
     fn facade_candidate_group_ids(
         source: &SourceFacade,
         sink: &SinkFacade,
-        bound_scopes: &[capanix_route_proto::BoundScope],
+        bound_scopes: &[BoundScope],
     ) -> Result<Vec<String>> {
         let logical_root_ids = source
             .logical_roots_snapshot()?
@@ -1030,7 +1026,7 @@ impl FSMetaApp {
             }
         }
         // Cold start has no prior facade to retain, so runtime confirmation is
-        // sufficient to bring up the process. Replacement also proceeds once
+        // sufficient to bring up the hosting boundary. Replacement also proceeds once
         // runtime confirms external exposure; materialized `/tree` and `/stats`
         // readiness is enforced at the query surface so `/on-demand-force-find`
         // can become available earlier.
@@ -1271,7 +1267,7 @@ impl FSMetaApp {
         unit: FacadeRuntimeUnit,
         route_key: &str,
         generation: u64,
-        bound_scopes: &[capanix_route_proto::BoundScope],
+        bound_scopes: &[BoundScope],
     ) -> Result<()> {
         eprintln!(
             "fs_meta_runtime_app: apply_facade_activate unit={} route_key={} generation={} scopes={}",
@@ -1777,11 +1773,12 @@ mod tests {
     use capanix_app_sdk::runtime::{
         EventMetadata, RuntimeWorkerBinding, RuntimeWorkerBindings, RuntimeWorkerLauncherKind,
     };
+    use capanix_app_sdk::route_proto::UnitTick;
     use capanix_host_fs_types::UnixStat;
-    use capanix_route_proto::{
+    use capanix_runtime_host_sdk::control::{
         ExecActivate, ExecControl, HostDescriptor, HostObjectGrant, HostObjectGrantState,
         HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged, UnitExposureConfirmed,
-        UnitTick, encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
+        encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
         encode_unit_exposure_confirmed_envelope, encode_unit_tick_envelope,
     };
     use reqwest::Client;
@@ -1804,7 +1801,7 @@ mod tests {
         (passwd, shadow)
     }
 
-    fn in_process_source_config() -> SourceConfig {
+    fn local_source_config() -> SourceConfig {
         SourceConfig::default()
     }
 
@@ -1885,7 +1882,7 @@ mod tests {
             lease: None,
             generation,
             expires_at_ms: 60_000,
-            bound_scopes: vec![capanix_route_proto::BoundScope {
+            bound_scopes: vec![BoundScope {
                 scope_id: scope_id.to_string(),
                 resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
             }],
@@ -2048,7 +2045,7 @@ mod tests {
     async fn start_accepts_missing_roots_config_as_valid_deployed_state() {
         let _app = FSMetaApp::new(
             FSMetaConfig {
-                source: in_process_source_config(),
+                source: local_source_config(),
                 ..FSMetaConfig::default()
             },
             NodeId("single-app-node".into()),
@@ -2060,7 +2057,7 @@ mod tests {
     async fn request_and_stream_fail_closed_until_control_initializes_app() {
         let app = FSMetaApp::new(
             FSMetaConfig {
-                source: in_process_source_config(),
+                source: local_source_config(),
                 ..FSMetaConfig::default()
             },
             NodeId("single-app-node".into()),
@@ -2086,7 +2083,7 @@ mod tests {
             FSMetaConfig {
                 source: SourceConfig {
                     roots: vec![source::config::RootSpec::new("root-a", &mount)],
-                    ..in_process_source_config()
+                    ..local_source_config()
                 },
                 ..FSMetaConfig::default()
             },
@@ -2096,12 +2093,12 @@ mod tests {
 
         assert!(!app.control_initialized());
         app.on_control_frame(&[activate_envelope("runtime.exec.source")])
-        .await
-        .expect("first control should initialize app");
+            .await
+            .expect("first control should initialize app");
         assert!(app.control_initialized());
         app.on_control_frame(&[tick_envelope("runtime.exec.source", 1)])
-        .await
-        .expect("second control should remain idempotent");
+            .await
+            .expect("second control should remain idempotent");
         assert!(app.control_initialized());
     }
 
@@ -2109,7 +2106,7 @@ mod tests {
     async fn passthrough_control_does_not_initialize_app() {
         let app = FSMetaApp::new(
             FSMetaConfig {
-                source: in_process_source_config(),
+                source: local_source_config(),
                 ..FSMetaConfig::default()
             },
             NodeId("single-app-node".into()),
@@ -2138,7 +2135,7 @@ mod tests {
             FSMetaConfig {
                 source: SourceConfig {
                     roots: vec![source::config::RootSpec::new("root-a", &mount)],
-                    ..in_process_source_config()
+                    ..local_source_config()
                 },
                 ..FSMetaConfig::default()
             },
@@ -2161,7 +2158,7 @@ mod tests {
     async fn manual_rescan_control_does_not_initialize_app() {
         let app = FSMetaApp::new(
             FSMetaConfig {
-                source: in_process_source_config(),
+                source: local_source_config(),
                 ..FSMetaConfig::default()
             },
             NodeId("single-app-node".into()),
@@ -2169,10 +2166,10 @@ mod tests {
         .expect("init app");
 
         let err = app
-            .on_control_frame(&[crate::runtime::orchestration::encode_manual_rescan_envelope(
-                now_us(),
-            )
-            .expect("encode manual rescan envelope")])
+            .on_control_frame(&[
+                crate::runtime::orchestration::encode_manual_rescan_envelope(now_us())
+                    .expect("encode manual rescan envelope"),
+            ])
             .await
             .expect_err("manual rescan control must not initialize app");
         assert!(matches!(err, CnxError::NotReady(_)));
@@ -2206,7 +2203,7 @@ mod tests {
         let cfg = FSMetaConfig {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 facade_resource_id: "single-app-listener".to_string(),
@@ -2264,7 +2261,7 @@ mod tests {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("root-a", &root_a)],
                 host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root_a)],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -2323,7 +2320,7 @@ mod tests {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("root-a", &root_a)],
                 host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root_a)],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -2362,7 +2359,7 @@ mod tests {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", &root)],
                 host_object_grants: vec![granted_mount_root("single-app-node::root-1", &root)],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -2417,7 +2414,7 @@ mod tests {
             route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
-            bound_scopes: vec![capanix_route_proto::BoundScope {
+            bound_scopes: vec![BoundScope {
                 scope_id: "single-app-listener".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -2469,7 +2466,7 @@ mod tests {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", &root)],
                 host_object_grants: vec![granted_mount_root("single-app-node::root-1", &root)],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -2525,7 +2522,7 @@ mod tests {
             FacadeRuntimeUnit::Facade,
             &facade_control_stream_route(),
             2,
-            &[capanix_route_proto::BoundScope {
+            &[BoundScope {
                 scope_id: "single-app-listener".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -2565,7 +2562,7 @@ mod tests {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
                 host_object_grants: vec![granted_mount_root("single-app-node::root-1", tmp.path())],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -2627,7 +2624,7 @@ mod tests {
             FacadeRuntimeUnit::Facade,
             &facade_control_stream_route(),
             2,
-            &[capanix_route_proto::BoundScope {
+            &[BoundScope {
                 scope_id: "test-root".to_string(),
                 resource_ids: vec!["listener-b".to_string()],
             }],
@@ -2687,7 +2684,7 @@ mod tests {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
                 host_object_grants: vec![granted_mount_root("single-app-node::root-1", tmp.path())],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -2749,7 +2746,7 @@ mod tests {
             FacadeRuntimeUnit::Facade,
             &facade_control_stream_route(),
             2,
-            &[capanix_route_proto::BoundScope {
+            &[BoundScope {
                 scope_id: "test-root".to_string(),
                 resource_ids: vec!["listener-b".to_string()],
             }],
@@ -2822,7 +2819,7 @@ mod tests {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("root-a", &root_a)],
                 host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root_a)],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -2849,7 +2846,7 @@ mod tests {
             route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
-            bound_scopes: vec![capanix_route_proto::BoundScope {
+            bound_scopes: vec![BoundScope {
                 scope_id: "single-app-listener".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -2881,7 +2878,7 @@ mod tests {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("root-a", &root_a)],
                 host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root_a)],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -2908,7 +2905,7 @@ mod tests {
             route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
-            bound_scopes: vec![capanix_route_proto::BoundScope {
+            bound_scopes: vec![BoundScope {
                 scope_id: "single-app-listener".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -2959,7 +2956,7 @@ mod tests {
                     granted_mount_root("single-app-node::root-a-1", &root_a),
                     granted_mount_root("single-app-node::root-b-1", &root_b),
                 ],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -3042,7 +3039,7 @@ mod tests {
             route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
-            bound_scopes: vec![capanix_route_proto::BoundScope {
+            bound_scopes: vec![BoundScope {
                 scope_id: "root-a".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -3068,7 +3065,7 @@ mod tests {
         let cfg = FSMetaConfig {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig::default(),
         };
@@ -3089,7 +3086,7 @@ mod tests {
         let cfg = FSMetaConfig {
             source: SourceConfig {
                 roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig::default(),
         };
@@ -3148,7 +3145,7 @@ mod tests {
                 scan_workers: 1,
                 batch_size: 128,
                 max_scan_events: 4096,
-                ..in_process_source_config()
+                ..local_source_config()
             },
             api: api::ApiConfig {
                 enabled: true,
@@ -3343,7 +3340,7 @@ mod tests {
             ),
             (
                 "sink_execution_mode".to_string(),
-                ConfigValue::String("worker-process".to_string()),
+                ConfigValue::String("external".to_string()),
             ),
         ]);
         let err = FSMetaConfig::from_manifest_config(&cfg)
@@ -3362,7 +3359,7 @@ mod tests {
             ),
             (
                 "source_execution_mode".to_string(),
-                ConfigValue::String("worker-process".to_string()),
+                ConfigValue::String("external".to_string()),
             ),
         ]);
         let err = FSMetaConfig::from_manifest_config(&cfg)
@@ -3419,12 +3416,7 @@ mod tests {
             (
                 "source",
                 WorkerMode::External,
-                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
-            ),
-            (
-                "scan",
-                WorkerMode::External,
-                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
+                Some("/usr/local/lib/libfs_meta_runtime.so"),
             ),
             ("sink", WorkerMode::Embedded, None),
         ]))
@@ -3434,7 +3426,7 @@ mod tests {
         assert_eq!(
             source.module_path,
             Some(fs_meta_worker_module_path(
-                "/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so",
+                "/usr/local/lib/libfs_meta_runtime.so",
             ))
         );
     }
@@ -3444,14 +3436,9 @@ mod tests {
         let err = runtime_worker_client_bindings(&compiled_runtime_worker_bindings(&[
             ("facade", WorkerMode::Embedded, None),
             (
-                "scan",
-                WorkerMode::External,
-                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
-            ),
-            (
                 "sink",
                 WorkerMode::External,
-                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
+                Some("/usr/local/lib/libfs_meta_runtime.so"),
             ),
         ]))
         .expect_err("missing source binding must fail closed");
@@ -3468,12 +3455,7 @@ mod tests {
             (
                 "source",
                 WorkerMode::External,
-                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
-            ),
-            (
-                "scan",
-                WorkerMode::External,
-                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
+                Some("/usr/local/lib/libfs_meta_runtime.so"),
             ),
         ]))
         .expect_err("missing sink binding must fail closed");
@@ -3498,35 +3480,24 @@ mod tests {
     }
 
     #[test]
-    fn rejects_mismatched_source_and_scan_worker_modes() {
-        let err = runtime_worker_client_bindings(&compiled_runtime_worker_bindings(&[
-            ("source", WorkerMode::Embedded, None),
-            ("scan", WorkerMode::External, Some("/tmp/lib.so")),
-        ]))
-        .expect_err("source/scan worker mode mismatch must fail");
-        assert!(err.to_string().contains(
-            "runtime worker bindings for 'source' and 'scan' must use the same mode while they still share one realization"
-        ));
-    }
-
-    #[test]
-    fn rejects_mismatched_source_and_scan_worker_module_paths() {
+    fn rejects_missing_compiled_facade_worker_binding() {
         let err = runtime_worker_client_bindings(&compiled_runtime_worker_bindings(&[
             (
                 "source",
                 WorkerMode::External,
-                Some("/usr/local/lib/libcapanix_app_fs_meta_worker_facade.so"),
+                Some("/usr/local/lib/libfs_meta_runtime.so"),
             ),
             (
-                "scan",
+                "sink",
                 WorkerMode::External,
-                Some("/usr/local/lib/libfs_meta_scan_alt.so"),
+                Some("/usr/local/lib/libfs_meta_runtime.so"),
             ),
         ]))
-        .expect_err("source/scan worker module mismatch must fail");
-        assert!(err.to_string().contains(
-            "runtime worker bindings for 'source' and 'scan' must use the same module_path while they still share one realization"
-        ));
+        .expect_err("missing facade binding must fail closed");
+        assert!(
+            err.to_string()
+                .contains("compiled runtime worker bindings must declare role 'facade'")
+        );
     }
 
     #[test]

@@ -2,11 +2,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use capanix_app_sdk::raw::{BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest};
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
-use capanix_worker_runtime_support::{
-    CompositeRuntimeBoundary, TypedWorkerClient, TypedWorkerHandle, TypedWorkerInit,
+use capanix_runtime_host_sdk::boundary::{
+    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest,
+};
+use capanix_runtime_host_sdk::worker_runtime::{
+    RuntimeWorkerClientFactory, TypedRuntimeWorkerClient, TypedWorkerClient, TypedWorkerInit,
 };
 use futures_util::StreamExt;
 use tokio::task::JoinHandle;
@@ -47,9 +49,9 @@ struct SourceWorkerSnapshotCache {
 pub struct SourceWorkerClientHandle {
     node_id: NodeId,
     config: SourceConfig,
+    worker_factory: RuntimeWorkerClientFactory,
     worker_binding: RuntimeWorkerBinding,
-    boundary: Arc<CompositeRuntimeBoundary>,
-    worker: TypedWorkerHandle<SourceWorkerRpc, SourceConfig, CompositeRuntimeBoundary>,
+    worker: TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
 }
 
@@ -58,16 +60,12 @@ impl SourceWorkerClientHandle {
         node_id: NodeId,
         config: SourceConfig,
         worker_binding: RuntimeWorkerBinding,
-        boundary: Arc<CompositeRuntimeBoundary>,
+        worker_factory: RuntimeWorkerClientFactory,
     ) -> Result<Self> {
         Ok(Self {
-            worker: TypedWorkerHandle::for_runtime_binding(
-                node_id.clone(),
-                config.clone(),
-                boundary.clone(),
-                worker_binding.clone(),
-            )?,
+            worker: worker_factory.connect(node_id.clone(), config.clone(), worker_binding.clone())?,
             node_id,
+            worker_factory,
             worker_binding,
             cache: Arc::new(Mutex::new(SourceWorkerSnapshotCache {
                 grants: Some(config.host_object_grants.clone()),
@@ -75,7 +73,6 @@ impl SourceWorkerClientHandle {
                 ..SourceWorkerSnapshotCache::default()
             })),
             config,
-            boundary,
         })
     }
 
@@ -728,7 +725,7 @@ impl SourceFacade {
                         node_id.clone(),
                         client.config.clone(),
                         client.worker_binding.clone(),
-                        client.boundary.clone(),
+                        client.worker_factory.clone(),
                     )?;
                     remote.force_find(params.clone())
                 }
@@ -893,7 +890,7 @@ fn spawn_local_source_pump(
     })
 }
 
-capanix_worker_runtime_support::define_typed_worker_rpc! {
+capanix_runtime_host_sdk::define_typed_worker_rpc! {
     pub struct SourceWorkerRpc {
         request: SourceWorkerRequest,
         response: SourceWorkerResponse,
@@ -918,7 +915,7 @@ impl TypedWorkerInit<SourceConfig> for SourceWorkerRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capanix_worker_runtime_support::TypedWorkerRpc;
+    use capanix_runtime_host_sdk::worker_runtime::TypedWorkerRpc;
     use std::path::PathBuf;
 
     #[test]

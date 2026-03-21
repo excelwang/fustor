@@ -23,12 +23,15 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
-use capanix_app_sdk::raw::{ChannelIoSubset, StateBoundary};
 use capanix_app_sdk::runtime::{
     ControlEnvelope, EventMetadata, NodeId, RecvOpts, in_memory_state_boundary,
 };
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::{HostFs, HostFsFacade};
+use capanix_runtime_host_sdk::boundary::{ChannelIoSubset, StateBoundary};
+use capanix_runtime_host_sdk::control::{
+    BoundScope, HostObjectGrantState, RuntimeHostObjectGrantsChanged,
+};
 
 use crate::LogicalClock;
 use crate::query::path::{path_buf_from_bytes, path_to_bytes};
@@ -41,8 +44,6 @@ use crate::query::result_ops::{
 };
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::seam::resolve_host_fs_facade;
-use capanix_route_proto::BoundScope;
-use capanix_route_proto::{HostObjectGrantState, RuntimeHostObjectGrantsChanged};
 
 use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS};
 use crate::runtime::orchestration::{
@@ -2817,7 +2818,7 @@ impl FSMetaSource {
                         );
                         if Self::root_current_is_group_primary(&roots_handle, &root_key) {
                             // Group-primary owns audit/sentinel periodic loop authority.
-                            let actions = sentinel.process(HealthSignal::PipelineRecovered {
+                            let actions = sentinel.handle_signal(HealthSignal::PipelineRecovered {
                                 root_key: root_key.clone(),
                             });
                             Self::execute_sentinel_actions(
@@ -2863,7 +2864,7 @@ impl FSMetaSource {
                         Self::set_object_last_error(&fanout_health, &root_key, err.to_string());
                         if Self::root_current_is_group_primary(&roots_handle, &root_key) {
                             // Group-primary owns audit/sentinel periodic loop authority.
-                            let actions = sentinel.process(HealthSignal::PipelineError {
+                            let actions = sentinel.handle_signal(HealthSignal::PipelineError {
                                 root_key: root_key.clone(),
                                 error: format!("{err}"),
                             });
@@ -3424,7 +3425,7 @@ impl FSMetaSource {
                     }
                 },
                 Err(err) => {
-                    let actions = sentinel.process(HealthSignal::WatchInitFailed {
+                    let actions = sentinel.handle_signal(HealthSignal::WatchInitFailed {
                         root_key: root_key.clone(),
                         error: err.to_string(),
                     });
@@ -3644,7 +3645,7 @@ impl FSMetaSource {
                             }
                             if matches!(reason, RescanReason::Overflow) {
                                 Self::mark_root_overflow_observed(&fanout_health, &root_key);
-                                let actions = sentinel.process(HealthSignal::WatchOverflow {
+                                let actions = sentinel.handle_signal(HealthSignal::WatchOverflow {
                                     root_key: root_key.clone(),
                                 });
                                 Self::execute_sentinel_actions(
@@ -3995,12 +3996,13 @@ impl FSMetaSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capanix_route_proto::{
+    use capanix_runtime_host_sdk::control::{
         ExecActivate, ExecControl, ExecDeactivate, HostDescriptor, HostObjectGrant,
         HostObjectGrantState, HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged,
-        UnitTick, encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
+        encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
         encode_unit_tick_envelope,
     };
+    use capanix_app_sdk::route_proto::UnitTick;
     use std::collections::BTreeSet;
 
     fn root(id: &str, path: &str) -> RootSpec {

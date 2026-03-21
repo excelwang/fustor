@@ -27,7 +27,7 @@
    - 命名基线收敛到 `runtime.exec.*`（例如 `runtime.exec.scan`）。
 2. `apps[*].policy`: 仅保留 release generation 输入。
    - `apps[*].policy.generation` 为必填且 `>= 1`（策略声明硬切，无隐式旧版代际模式）。
-3. `apps[*].manifest`: port/use/serve 发现入口（fixture: `fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml`）。
+3. `apps[*].manifest`: port/use/serve 发现入口（fixture: `fs-meta/fixtures/manifests/fs-meta.yaml`）。
 4. `apps[*].policy` 下的执行启用列表字段对 fs-meta 主声明为必填非空数组；不允许隐式回退。
 5. fs-meta source/sink 对 runtime unit 控制帧执行 `unit_id + generation` 合约校验：未知 unit 拒绝、过期代际信号忽略。
 6. source/sink realization 由 runtime 按 `eligibility + cardinality` 执行，但 runtime 不内建 fs-meta 组语义或 primary 规则。

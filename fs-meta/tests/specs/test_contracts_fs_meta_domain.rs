@@ -3,7 +3,7 @@
 //! ASSERTION ROUTE: Provide traceable verification anchors for domain-level cross-module contracts.
 
 use crate::common::{
-    assert_l1_contract, assert_runtime_orchestrated_multiprocess_config_apply_e2e,
+    assert_l1_contract, assert_runtime_orchestrated_worker_hosting_config_apply_e2e,
     assert_single_entrypoint_distributed_apply_e2e,
 };
 use capanix_app_sdk::runtime::{ConfigValue, NodeId};
@@ -116,7 +116,7 @@ fn test_role_boundary_enforcement() {
     assert!(
         l2.contains("encapsulate source/sink semantics") && l2.contains("HTTP facade semantics")
     );
-    assert!(manifest.contains("description = \"fs-meta application package\""));
+    assert!(manifest.contains("description = \"fs-meta runtime-entry and worker hosting package\""));
     assert!(!manifest.contains("description = \"fs-meta shared library\""));
 }
 
@@ -297,14 +297,14 @@ fn test_source_host_fs_calls_are_abstracted_through_host_adapter_sdk() {
 // @verify_spec("CONTRACTS.API_BOUNDARY.EMPTY_ROOTS_VALID_DEPLOYED_STATE", mode="system")
 #[tokio::test]
 async fn test_empty_roots_valid_deployed_state_without_silent_secondary_path() {
-    use capanix_app_fs_meta::{FSMetaApp, FSMetaConfig};
+    use fs_meta::{FSMetaApp, FSMetaConfig};
 
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     assert!(l1.contains("EMPTY_ROOTS_VALID_DEPLOYED_STATE"));
     let cfg = FSMetaConfig::from_manifest_config(
         &std::collections::HashMap::<String, ConfigValue>::new(),
     )
-    .expect("in-process fs-meta config");
+    .expect("local fs-meta config");
     let app = FSMetaApp::new(cfg, NodeId("node-a".into()))
         .expect("empty roots should be accepted as valid deployed state");
     drop(app);
@@ -546,7 +546,7 @@ fn test_source_error_isolation_and_attrib_watch_contracts_are_migrated_to_main_s
 #[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn test_non_linux_strict_fail_for_realtime_startup() {
-    use capanix_app_fs_meta::{FSMetaApp, FSMetaConfig};
+    use fs_meta::{FSMetaApp, FSMetaConfig};
     let cfg_map = HashMap::from([(
         "roots".to_string(),
         ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([(
@@ -706,10 +706,10 @@ fn test_interface_endpoints_use_managed_task_lifecycle_and_bounded_shutdown() {
 
 // @verify_spec("CONTRACTS.FAILURE_ISOLATION_BOUNDARY.FAILURE_IMPACT_BY_EXECUTION_SHAPE_DECLARED", mode="system")
 #[test]
-fn test_process_level_failure_impact_declared_contract() {
+fn test_execution_shape_failure_impact_declared_contract() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     assert!(l1.contains("FAILURE_IMPACT_BY_EXECUTION_SHAPE_DECLARED"));
-    assert!(l1.contains("in-process crash semantics"));
+    assert!(l1.contains("embedded crash semantics"));
     assert!(l1.contains("runtime lifecycle restart/rebind and rebuild paths"));
 
     let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
@@ -1040,17 +1040,19 @@ fn test_manual_rescan_operation_contract() {
 fn test_product_api_namespace_stability_contract() {
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/API_HTTP.md");
-    let product_api = read_fs_meta_spec_file("fs-meta/app/src/product/mod.rs");
+    let product_api = read_fs_meta_spec_file("fs-meta/deploy/src/lib.rs");
     assert!(l1.contains("PRODUCT_API_NAMESPACE_STABILITY"));
     assert!(l3.contains("Legacy product-management paths"));
     assert!(
-        product_api.contains("pub use crate::api::types::RootEntry;")
+        product_api.contains("pub use fs_meta::api::types::RootEntry;")
             && product_api.contains(
-                "pub use crate::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};"
+                "pub use fs_meta::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};"
             )
-            && product_api.contains(
-                "pub use release_doc::{FsMetaReleaseSpec, FsMetaReleaseWorkerModes, build_release_doc_value};"
-            ),
+            && product_api.contains("FsMetaReleaseSpec")
+            && product_api.contains("FsMetaReleaseWorkerMode")
+            && product_api.contains("FsMetaReleaseWorkerModes")
+            && product_api.contains("build_release_doc_value")
+            && product_api.contains("compile_release_doc_to_relation_target_intent"),
         "fs-meta app should expose a bounded product namespace for CLI/tooling consumers"
     );
     assert_domain_fs_meta_contract_test(
@@ -1135,7 +1137,7 @@ fn test_runtime_support_transport_supervision_contracts() {
     let errors = read_capanix_repo_file("crates/worker-runtime-support/src/error.rs");
 
     assert!(l2.contains(
-        "helper-only `capanix-worker-runtime-support` owns worker child-process bootstrap"
+        "helper-only upstream worker support beneath `capanix-runtime-host-sdk` owns worker bootstrap"
     ));
     assert!(l2.contains("MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping"));
     assert!(l3.contains("ExternalWorkerBootstrapTransport"));
@@ -1157,29 +1159,33 @@ fn test_runtime_support_transport_supervision_contracts() {
 
 // @verify_spec("CONTRACTS.APP_SCOPE.WORKER_ROLE_MODEL", mode="system")
 #[test]
-fn test_scan_worker_alias_bootstrap_contract() {
+fn test_source_side_scan_unit_bootstrap_contract() {
     let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md");
-    let facade_lib = read_fs_meta_spec_file("fs-meta/worker-facade/src/lib.rs");
-    let scan_lib = read_fs_meta_spec_file("fs-meta/worker-scan/src/lib.rs");
+    let app_lib = read_fs_meta_spec_file("fs-meta/app/src/lib.rs");
+    let source_server = read_fs_meta_spec_file("fs-meta/app/src/workers/source_server.rs");
     let orchestration = read_fs_meta_spec_file("fs-meta/app/src/runtime/orchestration.rs");
     let runtime_app = read_fs_meta_spec_file("fs-meta/app/src/runtime_app.rs");
 
     assert!(l2.contains(
-        "`source-worker`, `scan-worker`, and `sink-worker` remain distinct operator-visible worker roles"
+        "`source-worker` and `sink-worker` remain the two operator-visible external worker roles"
     ));
-    assert!(l2.contains("shared `fs-meta/worker-facade/` worker module"));
+    assert!(l2.contains("shared `fs-meta/app` worker module"));
     assert!(l3.contains("SharedWorkerModuleRoleDispatch"));
     assert!(l3.contains("the shared worker module dispatches `worker_role`"));
-    assert!(l3.contains("shared lower-level source-runtime reuse is valid only while `source-worker` and `scan-worker` share the same realization mode and worker module path constraints"));
-    assert!(facade_lib.contains("pub extern \"C\" fn capanix_run_worker_module"));
-    assert!(facade_lib.contains("\"scan\" =>"));
-    assert!(scan_lib.contains("run_scan_worker_server("));
-    assert!(scan_lib.contains("run_source_worker_runtime_loop("));
-    assert!(orchestration.contains("SOURCE_SCAN_RUNTIME_UNIT_ID => Some(SourceRuntimeUnit::Scan)"));
-    assert!(runtime_app.contains(
-        "runtime worker bindings for 'source' and 'scan' must use the same mode while they still share one realization"
+    assert!(l3.contains(
+        "`runtime.exec.scan` remains a source-side unit and reuses the `source-worker` server/runtime surface"
     ));
+    assert!(
+        app_lib.contains("capanix_unit_entry!(FSMetaRuntimeApp);")
+            || read_fs_meta_spec_file("fs-meta/app/src/workers/module_entry.rs")
+                .contains("pub extern \"C\" fn capanix_run_worker_module")
+    );
+    assert!(app_lib.contains("capanix_unit_entry!(FSMetaRuntimeApp);"));
+    assert!(source_server.contains("pub fn run_source_worker_server("));
+    assert!(!source_server.contains("pub fn run_scan_worker_server("));
+    assert!(orchestration.contains("SOURCE_SCAN_RUNTIME_UNIT_ID => Some(SourceRuntimeUnit::Scan)"));
+    assert!(runtime_app.contains("scheduled_scan_group_ids"));
 }
 
 // @verify_spec("CONTRACTS.API_BOUNDARY.ONLINE_ROOT_RECONFIG_WITHOUT_RESTART", mode="system")
@@ -1238,7 +1244,7 @@ fn test_binary_app_startup_path() {
         return;
     }
     assert_l1_contract("CONTRACTS.EVOLUTION_AND_OPERATIONS.BINARY_APP_STARTUP_PATH");
-    assert_runtime_orchestrated_multiprocess_config_apply_e2e();
+    assert_runtime_orchestrated_worker_hosting_config_apply_e2e();
 }
 
 // @verify_spec("CONTRACTS.EVOLUTION_AND_OPERATIONS.INDEPENDENT_UPGRADE_CONTINUITY", mode="system")
@@ -1249,9 +1255,9 @@ fn test_independent_upgrade_continuity() {
     let cfg_b =
         load_yaml("fs-meta/testdata/specs/fs-meta-contract-tests.cluster.node-b.config.yaml");
     let app_decl = load_yaml("fs-meta/testdata/specs/fs-meta.release-v2.yaml");
-    let app_count_a = app_count(&cfg_a, "capanix-app-fs-meta");
-    let app_count_b = app_count(&cfg_b, "capanix-app-fs-meta");
-    let app_count_decl = app_count(&app_decl, "capanix-app-fs-meta");
+    let app_count_a = app_count(&cfg_a, "fs-meta");
+    let app_count_b = app_count(&cfg_b, "fs-meta");
+    let app_count_decl = app_count(&app_decl, "fs-meta");
     assert_eq!(app_count_a, 0);
     assert_eq!(app_count_b, 0);
     assert_eq!(app_count_decl, 1);
@@ -1339,9 +1345,9 @@ fn test_single_entrypoint_desired_state_contract_fixture() {
     let cfg_b =
         load_yaml("fs-meta/testdata/specs/fs-meta-contract-tests.cluster.node-b.config.yaml");
     let app_decl = load_yaml("fs-meta/testdata/specs/fs-meta.release-v2.yaml");
-    let app_count_a = app_count(&cfg_a, "capanix-app-fs-meta");
-    let app_count_b = app_count(&cfg_b, "capanix-app-fs-meta");
-    let app_count_decl = app_count(&app_decl, "capanix-app-fs-meta");
+    let app_count_a = app_count(&cfg_a, "fs-meta");
+    let app_count_b = app_count(&cfg_b, "fs-meta");
+    let app_count_decl = app_count(&app_decl, "fs-meta");
 
     assert_eq!(
         app_count_a, 0,
@@ -1401,7 +1407,7 @@ fn test_force_find_group_local_exclusivity_contract() {
 #[test]
 fn test_release_yaml_uses_explicit_multi_roots_config() {
     let doc = load_yaml("fs-meta/testdata/specs/fs-meta.release-v2.yaml");
-    let app = find_app(&doc, "capanix-app-fs-meta");
+    let app = find_app(&doc, "fs-meta");
     let config = app
         .get(Value::String("config".to_string()))
         .and_then(Value::as_mapping)
@@ -1524,20 +1530,24 @@ fn test_named_read_class_replaces_freeform_stability_selection() {
 // @verify_spec("CONTRACTS.API_BOUNDARY.QUERY_PATH_PARAMETERS_OWN_PAYLOAD_SHAPE", mode="system")
 // @verify_spec("CONTRACTS.API_BOUNDARY.API_NON_OWNERSHIP_OF_QUERY_FIND_CHANNEL_PATH", mode="system")
 #[test]
-fn projection_http_runtime_coverage_moved_to_inprocess_projection_api_unit_tests() {
+fn projection_http_runtime_coverage_moved_to_local_projection_api_unit_tests() {
     let projection_api = read_fs_meta_spec_file("fs-meta/app/src/query/api.rs");
-    assert!(projection_api.contains("force_find_group_order_file_count_top_bucket_inprocess"));
-    assert!(projection_api.contains("force_find_group_order_file_age_top_bucket_inprocess"));
-    assert!(projection_api
-        .contains("force_find_group_order_file_age_keeps_empty_groups_eligible_inprocess"));
+    assert!(projection_api.contains("force_find_group_order_file_count_top_bucket_local"));
+    assert!(projection_api.contains("force_find_group_order_file_age_top_bucket_local"));
     assert!(
-        projection_api.contains("force_find_defaults_to_group_key_multi_group_response_inprocess")
+        projection_api
+            .contains("force_find_group_order_file_age_keeps_empty_groups_eligible_local")
     );
-    assert!(projection_api.contains("force_find_defaults_when_query_params_omitted_inprocess"));
-    assert!(projection_api.contains("projection_rpc_metrics_endpoint_shape_inprocess"));
-    assert!(projection_api
-        .contains("force_find_rejects_status_only_and_keeps_pagination_axis_inprocess"));
-    assert!(projection_api.contains("namespace_projection_endpoints_removed_inprocess"));
+    assert!(
+        projection_api.contains("force_find_defaults_to_group_key_multi_group_response_local")
+    );
+    assert!(projection_api.contains("force_find_defaults_when_query_params_omitted_local"));
+    assert!(projection_api.contains("projection_rpc_metrics_endpoint_shape_local"));
+    assert!(
+        projection_api
+            .contains("force_find_rejects_status_only_and_keeps_pagination_axis_local")
+    );
+    assert!(projection_api.contains("namespace_projection_endpoints_removed_local"));
 }
 
 #[test]
@@ -1547,23 +1557,30 @@ fn test_single_formal_specs_tree_layout() {
     assert!(!root.join("specs/cli").exists());
     assert!(!root.join("specs/PRODUCT_DEPLOYMENT.md").exists());
     assert!(!root.join("specs/fs-meta-contract-tests.config.md").exists());
-    assert!(!root
-        .join("specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
-        .exists());
-    assert!(!root
-        .join("specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
-        .exists());
+    assert!(
+        !root
+            .join("specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
+            .exists()
+    );
+    assert!(
+        !root
+            .join("specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
+            .exists()
+    );
     assert!(!root.join("specs/fs-meta.release-v2.yaml").exists());
     assert!(root.join("docs/PRODUCT_DEPLOYMENT.md").exists());
     assert!(root.join("docs/examples/fs-meta.yaml").exists());
-    assert!(root
-        .join("testdata/specs/fs-meta-contract-tests.config.md")
-        .exists());
-    assert!(root
-        .join("testdata/specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
-        .exists());
-    assert!(root
-        .join("testdata/specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
-        .exists());
+    assert!(
+        root.join("testdata/specs/fs-meta-contract-tests.config.md")
+            .exists()
+    );
+    assert!(
+        root.join("testdata/specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
+            .exists()
+    );
+    assert!(
+        root.join("testdata/specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
+            .exists()
+    );
     assert!(root.join("testdata/specs/fs-meta.release-v2.yaml").exists());
 }

@@ -12,38 +12,34 @@ path = "src/lib.rs"
 resolver = "2"
 members = [
     ".",
+    "fs-meta/lib",
     "fs-meta/app",
+    "fs-meta/deploy",
     "fs-meta/tooling",
-    "fs-meta/worker-facade",
-    "fs-meta/worker-scan",
-    "fs-meta/worker-source",
-    "fs-meta/worker-sink",
 ]
 default-members = [
     ".",
+    "fs-meta/lib",
     "fs-meta/app",
+    "fs-meta/deploy",
     "fs-meta/tooling",
-    "fs-meta/worker-facade",
-    "fs-meta/worker-scan",
-    "fs-meta/worker-source",
-    "fs-meta/worker-sink",
 ]
 
 [workspace.dependencies]
-capanix-app-fs-meta = { version = "0.1.0", path = "fs-meta/app" }
-capanix-app-fs-meta-tooling = { version = "0.1.0", path = "fs-meta/tooling" }
-capanix-app-fs-meta-worker-facade = { version = "0.1.0", path = "fs-meta/worker-facade" }
-capanix-app-fs-meta-worker-scan = { version = "0.1.0", path = "fs-meta/worker-scan" }
-capanix-app-fs-meta-worker-sink = { version = "0.1.0", path = "fs-meta/worker-sink" }
-capanix-app-fs-meta-worker-source = { version = "0.1.0", path = "fs-meta/worker-source" }
+fs-meta = { version = "0.1.0", path = "fs-meta/lib" }
+fs-meta-runtime = { version = "0.1.0", path = "fs-meta/app" }
+fs-meta-deploy = { version = "0.1.0", path = "fs-meta/deploy" }
+fs-meta-tooling = { version = "0.1.0", path = "fs-meta/tooling" }
 capanix-app-sdk = "0.1.0"
 capanix-config = "0.1.0"
 capanix-daemon = "0.1.0"
+capanix-deploy-sdk = { version = "0.1.0", path = "../capanix/crates/deploy-sdk" }
 capanix-host-adapter-fs = "0.1.0"
 capanix-host-fs-types = "0.1.0"
 capanix-kernel = "0.1.0"
 capanix-kernel-api = "0.1.0"
 capanix-managed-state-sdk = { version = "0.1.0", path = "../capanix/crates/managed-state-sdk" }
+capanix-runtime-host-sdk = { version = "0.1.0", path = "../capanix/crates/runtime-host-sdk" }
 capanix-route-proto = "0.1.0"
 capanix-service-sdk = { version = "0.1.0", path = "../capanix/crates/service-sdk" }
 capanix-worker-runtime-support = { version = "0.1.0", path = "../capanix/crates/worker-runtime-support" }
@@ -70,7 +66,8 @@ capanix-specs-vocabulary = { workspace = true }
 anyhow = "1"
 base64 = "0.22"
 bytes = { workspace = true }
-capanix-app-fs-meta = { workspace = true }
+fs-meta = { workspace = true }
+fs-meta-deploy = { workspace = true }
 capanix-app-sdk = { workspace = true }
 capanix-host-fs-types = { workspace = true }
 capanix-kernel-api = { workspace = true }

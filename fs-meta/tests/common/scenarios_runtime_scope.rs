@@ -107,14 +107,14 @@ fn append_mount_root_resources(
     }));
 }
 
-pub(crate) fn scenario_runtime_orchestrated_multiprocess_config_apply_e2e() -> Result<(), String> {
+pub(crate) fn scenario_runtime_orchestrated_worker_hosting_config_apply_e2e() -> Result<(), String> {
     with_cluster(
         FULL_NODE_DELEGATION_SCOPES,
         FULL_NODE_DELEGATION_SCOPES,
         |c| {
             let Some(fs_meta_app) = try_find_fs_meta_app_cdylib() else {
                 return Err(
-                    "fs-meta app runtime path not found; set CAPANIX_FS_META_APP_BINARY or build capanix-app-fs-meta-worker-facade"
+                    "fs-meta app runtime path not found; set CAPANIX_FS_META_APP_BINARY or build fs-meta-runtime"
                         .to_string(),
                 );
             };
@@ -253,14 +253,13 @@ pub(crate) fn scenario_runtime_orchestrated_multiprocess_config_apply_e2e() -> R
                     {
                         "id": instance_id,
                         "app": fs_meta_app.to_string_lossy().to_string(),
-                        "manifest": "fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml",
+                        "manifest": "fs-meta/fixtures/manifests/fs-meta.yaml",
                         "version": "0.0.2",
                         "restart_policy": "Never",
                         "config": {
                             "workers": {
                                 "facade": { "mode": "embedded" },
                                 "source": { "mode": "embedded" },
-                                "scan": { "mode": "embedded" },
                                 "sink": { "mode": "embedded" }
                             },
                             "roots": [
@@ -520,7 +519,7 @@ pub(crate) fn scenario_single_entrypoint_distributed_apply_e2e() -> Result<(), S
         |c| {
             let Some(fs_meta_app) = try_find_fs_meta_app_cdylib() else {
                 return Err(
-                    "fs-meta app runtime path not found; set CAPANIX_FS_META_APP_BINARY or build capanix-app-fs-meta-worker-facade"
+                    "fs-meta app runtime path not found; set CAPANIX_FS_META_APP_BINARY or build fs-meta-runtime"
                         .to_string(),
                 );
             };
@@ -645,14 +644,13 @@ pub(crate) fn scenario_single_entrypoint_distributed_apply_e2e() -> Result<(), S
                     {
                         "id": instance_id,
                         "app": fs_meta_app.to_string_lossy().to_string(),
-                        "manifest": "fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml",
+                        "manifest": "fs-meta/fixtures/manifests/fs-meta.yaml",
                         "version": "0.0.2",
                         "restart_policy": "Never",
                         "config": {
                             "workers": {
                                 "facade": { "mode": "embedded" },
                                 "source": { "mode": "embedded" },
-                                "scan": { "mode": "embedded" },
                                 "sink": { "mode": "embedded" }
                             },
                             "roots": [

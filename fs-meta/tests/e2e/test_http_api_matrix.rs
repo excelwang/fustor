@@ -7,7 +7,7 @@ use crate::support::oracle::FsTreeOracle;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
 use base64::Engine;
-use capanix_app_fs_meta::{RootSelector, RootSpec};
+use fs_meta::{RootSelector, RootSpec};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;

@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 
 use crate::common::assert_cluster_bootstrap_governance_real_cluster;
 use bytes::Bytes;
-use capanix_app_fs_meta::query::models::QueryNode;
-use capanix_app_fs_meta::FileMetaRecord;
-use capanix_app_fs_meta::{FSMetaApp, FSMetaConfig};
+use fs_meta::query::models::QueryNode;
+use fs_meta::FileMetaRecord;
+use fs_meta::{FSMetaApp, FSMetaConfig};
 use capanix_app_sdk::runtime::{ConfigValue, EventMetadata, NodeId, RecvOpts};
 use capanix_app_sdk::Event;
 use capanix_host_fs_types::UnixStat;

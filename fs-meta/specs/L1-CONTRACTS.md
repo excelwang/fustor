@@ -47,7 +47,7 @@ version: 3.0.0
 5. **THIN_RUNTIME_ABI_CONSUMPTION**: **fs-meta System** MUST consume only thin runtime ABI state (`host_object_grants`, run context, generation/lease, control events, channel hooks) at its app/runtime boundary.
    > Covers L0: VISION.THIN_RUNTIME_ABI_CONSUMPTION
    > Responsibility: keep fs-meta below runtime orchestration and above domain protocol ownership.
-   > Verification: fs-meta consumes the ordinary app-facing runtime surface through the SDK family rooted in `capanix-app-sdk`: `capanix-managed-state-sdk` supplies shared stateful observation declarations/evaluator only, `capanix-service-sdk` supplies the top-level service-first runtime host/lowering path, `capanix-app-sdk` remains the lower Boundary Toolkit, and `capanix-runtime-api` remains the typed runtime boundary mirror; `capanix-kernel-api` remains only a low-level kernel-owned mirror or carrier vocabulary.
+   > Verification: fs-meta consumes the ordinary app-facing runtime surface through the SDK family rooted in `capanix-app-sdk`: `capanix-managed-state-sdk` supplies shared stateful observation declarations/evaluator only, `capanix-service-sdk` supplies service-first authoring primitives, `capanix-runtime-host-sdk` supplies the top-level runtime host/lowering path, `capanix-app-sdk` remains the lower Boundary Toolkit, and `capanix-runtime-api` remains the typed runtime boundary mirror; `capanix-kernel-api` remains only a low-level kernel-owned mirror or carrier vocabulary.
 6. **APP_OWNS_OPAQUE_PORT_MEANING**: **fs-meta System** MUST keep query/find/source/sink rendezvous naming and protocol meaning app-owned over opaque channels.
    > Covers L0: VISION.APP_OWNS_OPAQUE_PORT_MEANING
    > Responsibility: prevent kernel/runtime/adapter layers from becoming owners of fs-meta protocol semantics.
@@ -195,7 +195,7 @@ version: 3.0.0
 5. **GROUP_PARTITIONED_SINK_STATE**: **fs-meta System** MUST maintain sink materialization state partitioned by logical group.
    > Responsibility: prevent cross-group contamination and enable per-group lifecycle loops.
    > Verification: sink state organizes tree/clock/epoch by group only (single tree per group, no member sub-tree); same relative path from different members arbitrates into that group's single tree.
-   > Verification: worker process identity is only a hosting boundary; query fanout, sink ownership, and materialized response assembly are defined per logical group rather than by "all groups currently hosted in one worker process".
+   > Verification: worker hosting identity is only a hosting boundary; query fanout, sink ownership, and materialized response assembly are defined per logical group rather than by "all groups currently hosted behind one worker host".
    > Verification: sink arbitration authority hierarchy is `Realtime atomic > Scan > Realtime non-atomic` for mtime dominance; equal/older compensation events do not rollback newer state.
    > Verification: sink applies compensation parent-staleness check (`parent_mtime_us`) before accepting first-seen Scan file insertions.
    > Verification: when a path changes type (`dir<->file`), sink purges cached descendants of that path before applying the new type to keep single-tree structure valid.
@@ -207,9 +207,9 @@ version: 3.0.0
    > Verification: sink shadow clock tracks `EventMetadata.timestamp_us` high-water mark for NFS-domain freshness calculations; `logical_ts` is transport-preserved ordering metadata and is not used as sink arbitration time axis.
    > Covers L0: VISION.SINK_SINGLE_TREE_ARBITRATION
 6. **IN_MEMORY_MATERIALIZED_INDEX_BASELINE**: **fs-meta System** MUST keep sink materialized tree as in-memory observation/projection state in current baseline architecture.
-   > Responsibility: preserve the current low-latency projection baseline while keeping authoritative truth distinct from derived observation state across both in-process and worker-process execution shapes.
+   > Responsibility: preserve the current low-latency projection baseline while keeping authoritative truth distinct from derived observation state across both embedded and external-worker execution shapes.
    > Cross-ref: root `L1-CONTRACTS` `AUTHORITATIVE_TRUTH_OBSERVATION_SEPARATION`, `STATEFUL_APP_OBSERVATION_PLANE_OPT_IN`, `STATEFUL_APP_OBSERVATION_PLANE_MINIMUM_DECLARATIONS`, and `OPTIONAL_STATE_CARRIER_RUNTIME_HOSTING`.
-   > Verification: sink materialized tree lifecycle is process-bound (no durable snapshot dependency required for startup).
+   > Verification: sink materialized tree lifecycle is hosting-bound and rebuildable (no durable snapshot dependency required for startup).
    > Verification: sink state access passes through explicit in-memory carrier boundary (`SinkStateCell`) rather than scattering raw lock ownership across business handlers.
    > Verification: source mutable runtime state access passes through explicit in-memory carrier boundary (`SourceStateCell`) to keep source state hosting orthogonal to business handlers.
    > Verification: source/sink carrier boundaries keep a bounded authoritative mutation journal separate from projection state so future StateCell backend changes can replace hosting without rewriting business handlers.
@@ -222,14 +222,14 @@ version: 3.0.0
    > Verification: source/sink authoritative mutation recording passes through one shared commit-boundary abstraction, not duplicated runtime state-carrier write call paths.
    > Verification: fs-meta manifest config MUST reject removed authority carrier fields (`unit_authority_state_carrier`, `unit_authority_state_dir`) to prevent app-level carrier coupling.
    > Verification: if runtime state-carrier authority initialization fails, fs-meta startup MUST fail closed with explicit invalid-input error.
-   > Verification: sink execution hosting is selected through worker-oriented deploy config (`workers.sink.mode=embedded|external`) that upstream config compiles into `__cnx_runtime.workers`; `external` hosts sink materialized tree in a dedicated sink-worker process, isolated from the main fs-meta process address space.
+   > Verification: sink execution hosting is selected through worker-oriented deploy config (`workers.sink.mode=embedded|external`) that upstream config compiles into `__cnx_runtime.workers`; `external` hosts sink materialized tree in isolated sink-worker hosting separated from the embedded fs-meta app host.
    > Verification: under `workers.sink.mode=external`, sink worker restart/failover rebuilds materialized tree via baseline scan/audit path; in-memory tree remains projection cache, not authoritative durable state.
 7. **AUTHORITATIVE_JOURNAL_TRUTH_LEDGER**: **fs-meta System** MUST treat the bounded authoritative mutation journal as the domain truth ledger for state/effect convergence.
    > Responsibility: keep “what fs-meta currently recognizes as truth” separate from query-ready materialized views and scratch runtime state.
    > Cross-ref: root `L1-CONTRACTS` `AUTHORITATIVE_TRUTH_OBSERVATION_SEPARATION` and `STATEFUL_APP_OBSERVATION_PLANE_MINIMUM_DECLARATIONS`.
    > Verification: authoritative mutation commits pass through one shared commit boundary and one journal abstraction, rather than being inferred from query results or duplicated across source/sink business handlers.
    > Verification: the journal is the only boundary that mints or advances `authoritative_revision`; query/materialized-tree readability and projection refresh do not become competing revision authorities.
-   > Verification: restart, failover, and worker-process rebuild paths replay or rebuild from authoritative journal inputs plus scan/audit progression; successful query observation alone is never the authority source.
+   > Verification: restart, failover, and external-worker rebuild paths replay or rebuild from authoritative journal inputs plus scan/audit progression; successful query observation alone is never the authority source.
    > Covers L0: VISION.AUTHORITATIVE_TRUTH_LEDGER
 8. **BUSINESS_MODULE_ORCHESTRATION_TOKEN_FREE**: **fs-meta System** MUST keep orchestration tokens and runtime-unit identifiers out of source/sink business logic modules.
    > Responsibility: preserve local-style business coding model and keep orchestration concerns in dedicated ingress/gate adapters.
@@ -276,7 +276,7 @@ version: 3.0.0
    > Responsibility: preserve app-owned grouping while allowing runtime to realize per-group sink bind/run realization.
    > Verification: sink generation-control/runtime contract carries per-group execution shape and runtime returns per-instance bound groups.
    > Verification: sink state partitioning keys off `group_id` plus `object_ref`, not `concrete_root_id`.
-   > Verification: worker processes may host multiple local sink execution partitions, but query fanout and materialized result ownership are still defined per logical group.
+   > Verification: sink-worker hosting may cover multiple local sink execution partitions, but query fanout and materialized result ownership are still defined per logical group.
 11. **UNIT_CONTROL_ENVELOPE_FENCING**: **fs-meta System** MUST validate runtime unit control envelopes by unit contract (`unit_id`) and generation fencing (`generation`).
    > Responsibility: keep unit dispatch deterministic and reject unknown/invalid execution units.
    > Verification: source/sink reject `ExecControl` or `UnitTick` envelopes with unknown `unit_id`.
@@ -321,7 +321,7 @@ version: 3.0.0
 5. **ONLINE_ROOT_RECONFIG_WITHOUT_RESTART**: **fs-meta System** MUST support online logical-root reconfiguration through API without app restart while keeping roots/group definitions app-owned and bind/run realization runtime-owned.
    > Responsibility: keep fs-meta root lifecycle mutable at runtime while preserving fanout correctness and current owner boundaries.
    > Verification: API root/group update applies validation (including rejecting legacy `roots[].source_locator`), updates app-owned authoritative roots/group definitions against current host object grants, consumes current runtime-returned bound scopes only for resulting source/sink refresh and compensatory rescan, and does not promote API/app code into bind/run semantic ownership.
-   > Verification: after an app-defined group is added or removed, projection `tree` / `force-find` group result sets converge to the new defined groups without requiring process restart or runtime auto-discovery of groups.
+   > Verification: after an app-defined group is added or removed, projection `tree` / `force-find` group result sets converge to the new defined groups without requiring host restart or runtime auto-discovery of groups.
 
 6. **MANUAL_RESCAN_OPERATION**: **fs-meta System** MUST provide explicit manual rescan operation to repair index drift and watch-loss conditions.
    > Covers L0: VISION.ONLINE_SCOPE_MUTATION_AND_REPAIR
@@ -369,28 +369,28 @@ version: 3.0.0
    > Responsibility: keep app package semantics downstream of domain/runtime authority instead of creating a parallel contract set.
    > Verification: main specs trace root/domain Convergence Vocabulary without redefining package-local authority terms.
    > Verification: main specs explicitly state fs-meta app implementation consumes fs-meta domain specs and root Convergence Vocabulary rather than redefining `Authoritative Truth`, `Observation`, `Projection`, or `Observation-Eligible`.
-   > Verification: stateful observation-facing business modules consume `capanix-managed-state-sdk` declarations/evaluator helpers, top-level runtime-host authoring lowers through `capanix-service-sdk`, lower toolkit helpers consume `capanix-app-sdk`, worker-process client/server support consumes helper-only `capanix-worker-runtime-support`, and narrow runtime glue and boundary-conversion seams MAY directly consume `capanix-runtime-api` without creating a second authoring authority, while `capanix-kernel-api` remains outside the app package business/infra surface.
-   > Verification: `fs-meta/app` and other package-local authoring surfaces MUST NOT directly depend on or reference `capanix-kernel-api`, `capanix-unit-entry-macros`, or `capanix-unit-sidecar`; those remain limited to dedicated artifact/runtime crates, explicit bridge seams, or test/dev fixtures.
-   > Verification: `fs-meta/app` remains the only product app package for the fs-meta container, stays `publish = false`, owns package-local business/runtime composition, and does not present a generic reusable fs-meta library API.
-   > Verification: bounded `product` remains the product-facing CLI/tooling namespace, while public `query`, `product::release_doc`, and `workers` support surfaces may remain package-local operational/test support modules without becoming product or platform authority.
+   > Verification: stateful observation-facing business modules consume `capanix-managed-state-sdk` declarations/evaluator helpers, `capanix-service-sdk` service-first authoring primitives, `capanix-runtime-host-sdk` runtime control/grant, route/state/channel, entry, and worker-hosting helpers, lower toolkit helpers consume `capanix-app-sdk`, deploy compilation consumes `capanix-deploy-sdk`, and helper-only `capanix-worker-runtime-support` remains beneath those public surfaces rather than being imported directly by fs-meta packages.
+   > Verification: `fs-meta/lib` is the only developer-facing fs-meta authoring package and MUST NOT directly depend on or reference `capanix-kernel-api`, `capanix-runtime-api`, `capanix-config`, `capanix-unit-entry-macros`, `capanix-worker-runtime-support`, or `capanix-unit-sidecar`; `fs-meta/app` and `fs-meta/deploy` consume those capabilities only through higher-level `capanix-service-sdk` / `capanix-runtime-host-sdk` / `capanix-deploy-sdk` surfaces.
+   > Verification: `fs-meta/lib` stays `publish = false`, exposes bounded product-specific authoring types, and keeps runtime-entry / release-compiler seams in sibling internal packages `fs-meta-runtime` and `fs-meta-deploy`.
+   > Verification: bounded `fs-meta-deploy` remains the product-facing CLI/tooling namespace, while public `query` and `workers` support surfaces may remain package-local operational/test support modules without becoming product or platform authority.
    > Verification: package-local implementation tuning seams (`FS_META_SOURCE_SCAN_WORKERS`, `FS_META_SOURCE_AUDIT_INTERVAL_MS`, `FS_META_SOURCE_THROTTLE_INTERVAL_MS`, `FS_META_SINK_TOMBSTONE_TTL_MS`, `FS_META_SINK_TOMBSTONE_TOLERANCE_US`, `FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS`) are documented as bounded implementation knobs and do not redefine domain truth, cutover, or query-surface contracts.
-2. **WORKER_ROLE_MODEL**: **fs-meta System** MUST present one app product container composed of four worker roles: `facade-worker`, `source-worker`, `scan-worker`, and `sink-worker`.
-   > Responsibility: keep the downstream product model stable before internal crate splitting or realization changes.
-   > Verification: app specs explicitly name the four worker roles and state that `query` remains inside `facade-worker` for now.
-   > Verification: app specs justify the split as `4`, not `3`, by keeping heavy scan/audit work separate from live source/watch work.
-   > Verification: app specs justify the split as `4`, not `5`, by keeping query orchestration inside `facade-worker` until traffic or ownership pressure proves a fifth worker is needed.
+2. **WORKER_ROLE_MODEL**: **fs-meta System** MUST present one app product container composed of three worker roles: `facade-worker`, `source-worker`, and `sink-worker`.
+   > Responsibility: keep the downstream product model stable while making scan/audit source-side unit work rather than a fourth worker role.
+   > Verification: app specs explicitly name the three worker roles and state that `query` remains inside `facade-worker` for now.
+   > Verification: app specs state that initial full scan, periodic audit, and overflow/recovery rescans remain `source-worker` responsibilities carried by the source-side unit set rather than by a fourth worker role.
+   > Verification: app specs justify the split as `3`, not `2`, by keeping sink/materialized ownership separate from source-side observation and keeping query orchestration inside `facade-worker`.
 3. **WORKER_MODE_MODEL**: **fs-meta System** MUST use `embedded | external` as the only product-facing worker-mode vocabulary.
    > Responsibility: keep product docs/config focused on worker roles and worker modes rather than realization mechanics.
    > Verification: product-facing L0-L2 specs use worker/mode vocabulary and do not present realization-mechanic terms as architecture terms.
-   > Verification: app specs state the initial mode defaults as `facade-worker=embedded` and `source-worker=external`, `scan-worker=external`, `sink-worker=external`.
-   > Verification: operator-visible worker config stays worker-oriented through `workers.facade.mode`, `workers.source.mode`, `workers.scan.mode`, and `workers.sink.mode` rather than legacy realization vocabulary, while the app package consumes only compiled `__cnx_runtime.workers` bindings and MUST reject raw `config.workers` at app-load time.
+   > Verification: app specs state the initial mode defaults as `facade-worker=embedded`, `source-worker=external`, and `sink-worker=external`.
+   > Verification: operator-visible worker config stays worker-oriented through `workers.facade.mode`, `workers.source.mode`, and `workers.sink.mode` rather than legacy realization vocabulary, while the app package consumes only compiled `__cnx_runtime.workers` bindings and MUST reject raw `config.workers` at app-load time.
 4. **LOCAL_HOST_RESOURCE_PROGRAMMING_ONLY**: **fs-meta System** MUST keep resource-bound source behavior on the bound host through local-host programming targets rather than inventing remote-host operation contracts.
 5. **RESOURCE_SCOPED_HTTP_FACADE_ONLY**: **fs-meta System** MUST host the resource-scoped external HTTP facade for the single fs-meta app package boundary without redefining product or platform ownership.
    > Verification: app source hosts the bounded one-cardinality HTTP facade and does not promote it into product or platform authority or a separate roaming API boundary.
 6. **OPAQUE_INTERNAL_PORTS_ONLY**: **fs-meta System** MUST treat internal ports and protocols as app-owned opaque semantics rather than platform-owned vocabulary.
    > Verification: app architecture and workflows keep internal ports opaque and route/channel carriers platform-owned only as transport.
    > Verification: external-worker realization helpers remain confined to explicit worker runtime seams and do not define source/sink/query/API business module contracts.
-   > Verification: the upstream bridge-realization seam remains only the low-level external-worker bridge carrier; worker child-process bootstrap, log/socket ownership, retry clipping, and lifecycle supervision remain confined to helper-only `capanix-worker-runtime-support` rather than worker artifact or tooling responsibilities.
+   > Verification: the upstream bridge-realization seam remains only the low-level external-worker bridge carrier; worker bootstrap, log/socket ownership, retry clipping, and lifecycle supervision remain confined to helper-only upstream support beneath `capanix-runtime-host-sdk` rather than worker artifact or tooling responsibilities.
    > Verification: external-worker transport preserves canonical `Timeout` / `TransportClosed` categories and wall-clock total-timeout semantics instead of collapsing transport failures into a generic peer-error bucket.
 7. **RELEASE_GENERATION_CUTOVER_CONSUMPTION_ONLY**: **fs-meta System** MUST consume release-generation cutover by replaying current authoritative truth inputs (`roots`, runtime grants, authoritative journal continuation) and rebuilding observation state rather than inventing package-local rollout semantics.
    > Verification: active scan-enabled primary groups reaching trusted materialized observation state are the readiness anchor for `trusted-materialized` `/tree` and `/stats` exposure.
@@ -398,14 +398,14 @@ version: 3.0.0
    > Verification: `/on-demand-force-find` on the freshness path remains available before trusted materialized observation is promoted.
 8. **AUTHORITATIVE_TRUTH_CARRIER_CONSUMPTION_ONLY**: **fs-meta System** MUST consume authoritative truth carriers and revisions from domain/runtime boundaries rather than define a package-local competing truth source.
 9. **OBSERVATION_ELIGIBILITY_GATE_OWNERSHIP**: **fs-meta System** MUST own the package-local `observation_eligible` evidence that reports when materialized `/tree` and `/stats` observations are trustworthy enough to be treated as current observation after cutover or rebuild.
-   > Verification: app cutover workflow ties `observation_eligible` to the same package-local materialized observation evidence that feeds query `observation_status`, rather than to direct package-local trusted external exposure ownership in runtime or mere process readiness.
+   > Verification: app cutover workflow ties `observation_eligible` to the same package-local materialized observation evidence that feeds query `observation_status`, rather than to direct package-local trusted external exposure ownership in runtime or mere hosting readiness.
    > Verification: `/on-demand-force-find` remains available as a freshness path before `observation_eligible` is reached for materialized `/tree` and `/stats`.
    > Verification: app workflow treats `observation_eligible` as the trusted-materialized gate while `/on-demand-force-find` stays a freshness path.
-   > Verification: status/health surfaces expose explicit source coverage, degraded state, audit timing, sink capacity signals, and optional facade-pending retry diagnostics so large-NFS monitoring can distinguish trusted exposure evidence from coarse process liveness or listener retry drift.
+   > Verification: status/health surfaces expose explicit source coverage, degraded state, audit timing, sink capacity signals, and optional facade-pending retry diagnostics so large-NFS monitoring can distinguish trusted exposure evidence from coarse host-boundary liveness or listener retry drift.
 10. **STALE_WRITER_FENCE_BEFORE_EXPOSURE**: **fs-meta System** MUST fence stale generations before runtime can trust a newer exposure path or allow older observations to re-expose.
 11. **NO_PRODUCT_OR_PLATFORM_OWNERSHIP**: **fs-meta System** MUST NOT own product CLI/deploy semantics or platform bind/route/grant authority.
-12. **WORKER_MODE_FAILURE_BOUNDARY_IS_EXPLICIT**: **fs-meta System** MUST describe failure isolation in worker-mode terms: `embedded` workers share a host process, `external` workers run in dedicated worker processes, and construction/bootstrap/runtime-task failures MUST surface through typed `CnxError` / `init_error` paths instead of routine production `panic!` / `expect!`.
-   > Verification: product-facing L0-L2 specs describe the baseline defaults as `facade-worker=embedded` and `source-worker=external`, `scan-worker=external`, `sink-worker=external`.
+12. **WORKER_MODE_FAILURE_BOUNDARY_IS_EXPLICIT**: **fs-meta System** MUST describe failure isolation in worker-mode terms: `embedded` workers stay inside the shared host boundary, `external` workers run through isolated external worker hosting, and construction/bootstrap/runtime-task failures MUST surface through typed `CnxError` / `init_error` paths instead of routine production `panic!` / `expect!`.
+   > Verification: product-facing L0-L2 specs describe the baseline defaults as `facade-worker=embedded`, `source-worker=external`, and `sink-worker=external`.
    > Verification: app workflow and source continue to preserve `init_error` / join-failure handling and keep API/bootstrap construction failures on explicit typed error/log paths instead of routine `expect(...)`.
    > Verification: external-worker init retry is clipped by wall-clock total timeout even when one RPC attempt has a larger per-call timeout budget.
 
@@ -422,7 +422,7 @@ version: 3.0.0
 5. **DOMAIN_BOUNDARY_CONSUMPTION_ONLY**: **fs-meta System** MUST keep CLI request composition built from fs-meta domain declarations, external `cnxctl` deploy/control commands, and shared kernel-owned auth vocabulary without redefining them.
 6. **NO_RUNTIME_OR_PLATFORM_OWNERSHIP**: **fs-meta System** MUST keep runtime policy, bind/run realization, route convergence, route target selection, and primitive semantics out of the CLI package.
 7. **NO_OBSERVATION_PLANE_OWNERSHIP**: **fs-meta System** MUST keep `state/effect observation plane` meaning such as `observation_eligible` out of the CLI package.
-8. **LOCAL_DEV_DAEMON_COMPOSITION_ONLY**: An optional tooling-only local-dev launcher MAY ship the product-scoped `capanixd-fs-meta` binary as an explicit feature, but that launcher MUST remain tooling-only composition over `capanix-daemon` bootstrap seams and MUST NOT redefine daemon ingress, runtime planning, or kernel authority.
+8. **LOCAL_DEV_DAEMON_COMPOSITION_ONLY**: An optional tooling-only local-dev launcher MAY ship the product-scoped `fsmeta-locald` binary as an explicit feature, but that launcher MUST remain tooling-only composition over `capanix-daemon` bootstrap seams and MUST NOT redefine daemon ingress, runtime planning, or kernel authority.
 
 ---
 
@@ -442,17 +442,17 @@ version: 3.0.0
 
 ## CONTRACTS.FAILURE_ISOLATION_BOUNDARY
 
-1. **EXECUTION_FAILURE_DOMAINS_ARE_EXPLICIT**: **fs-meta System** MUST explicitly distinguish non-isolating in-process loadable boundaries from worker-process execution boundaries, and MUST NOT present them as one equivalent fault domain.
+1. **EXECUTION_FAILURE_DOMAINS_ARE_EXPLICIT**: **fs-meta System** MUST explicitly distinguish non-isolating `embedded` execution from isolated `external` worker execution, and MUST NOT present them as one equivalent fault domain.
    > Covers L0: VISION.EXPLICIT_EXECUTION_FAILURE_DOMAINS
-   > Responsibility: keep worker-mode failure domains explicit so embedded host-process failures and external worker-process failures are not treated as the same operational event.
-   > Verification: architecture and workflow specs describe `embedded` workers as sharing a host process and `external` workers as dedicated worker processes; public docs do not present them as equivalent isolation shapes.
+   > Responsibility: keep worker-mode failure domains explicit so embedded host-boundary failures and external worker failures are not treated as the same operational event.
+   > Verification: architecture and workflow specs describe `embedded` workers as sharing the host boundary and `external` workers as isolated external worker hosting; public docs do not present them as equivalent isolation shapes.
 
 2. **INTERFACE_LOCAL_EXECUTION_OR_WORKER_FAILURE_CONTAINMENT_TARGET**: **fs-meta System** SHOULD isolate recoverable interface failures (for example watcher/audit local execution panic, query worker crash, or sink worker loss) to the narrowest local execution partition or worker scope when feasible, while preserving explicit degraded visibility.
    > Covers L0: VISION.TASK_OR_WORKER_FAILURE_CONTAINMENT
    > Responsibility: keep recoverable local-execution and worker failures contained to the narrowest feasible scope while surfacing degraded/failure evidence.
    > Verification: managed endpoint loops and worker supervision keep source/sink/query failures explicit in status or degraded outputs instead of silently collapsing them into whole-app success.
 
-3. **FAILURE_IMPACT_BY_EXECUTION_SHAPE_DECLARED**: **fs-meta System** MUST document that in-process crash semantics can take down all boundaries in that host process, while worker-process failures are recovered through runtime lifecycle restart/rebind and rebuild paths rather than being mistaken for truth loss.
+3. **FAILURE_IMPACT_BY_EXECUTION_SHAPE_DECLARED**: **fs-meta System** MUST document that embedded crash semantics can take down all boundaries in the shared host boundary, while external worker failures are recovered through runtime lifecycle restart/rebind and rebuild paths rather than being mistaken for truth loss.
    > Covers L0: VISION.FAILURE_IMPACT_DECLARED_BY_MODE
    > Responsibility: declare user-visible failure impact by worker mode so recovery expectations stay stable across product docs, tooling, and runtime behavior.
-   > Verification: specs and runtime behavior state that embedded crash semantics can terminate the shared host process, while external worker failures recover through restart/rebind/rebuild rather than being interpreted as authoritative truth loss.
+   > Verification: specs and runtime behavior state that embedded crash semantics can terminate the shared host boundary, while external worker failures recover through restart/rebind/rebuild rather than being interpreted as authoritative truth loss.

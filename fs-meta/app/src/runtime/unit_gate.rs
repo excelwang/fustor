@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use capanix_app_sdk::{CnxError, Result};
-use capanix_route_proto::BoundScope;
+use capanix_runtime_host_sdk::control::BoundScope;
 
 #[derive(Debug, Clone, Default)]
 struct RouteControlState {

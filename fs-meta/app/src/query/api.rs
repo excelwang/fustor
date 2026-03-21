@@ -43,10 +43,10 @@ use base64::{
 use bytes::Bytes;
 // bound_route_metrics_snapshot remains an app-sdk helper for transport
 // diagnostics; ordinary app-facing imports in this module stay on app-sdk.
-use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_app_sdk::runtime::NodeId;
 use capanix_app_sdk::{CnxError, Event, bound_route_metrics_snapshot};
 use capanix_host_adapter_fs::HostAdapter;
+use capanix_runtime_host_sdk::boundary::ChannelIoSubset;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, RwLock};
@@ -199,7 +199,7 @@ impl ProjectionPolicy {
 
 #[derive(Clone)]
 enum QueryBackend {
-    InProcess {
+    Local {
         sink: Arc<SinkFacade>,
         source: Arc<SourceFacade>,
     },
@@ -498,7 +498,7 @@ async fn load_materialized_status_snapshots(
             | Err(err @ CnxError::ProtocolViolation(_)) => return Err(err),
             Err(err) => return Err(err),
         },
-        QueryBackend::InProcess { .. } => source.status_snapshot()?,
+        QueryBackend::Local { .. } => source.status_snapshot()?,
     };
     let sink_status = match &state.backend {
         QueryBackend::Route {
@@ -518,7 +518,7 @@ async fn load_materialized_status_snapshots(
             | Err(err @ CnxError::ProtocolViolation(_)) => return Err(err),
             Err(err) => return Err(err),
         },
-        QueryBackend::InProcess { .. } => sink.status_snapshot()?,
+        QueryBackend::Local { .. } => sink.status_snapshot()?,
     };
     Ok((source_status, sink_status))
 }
@@ -1020,7 +1020,7 @@ fn build_force_find_tree_request(
     )
 }
 
-pub fn create_inprocess_router(
+pub fn create_local_router(
     sink: Arc<SinkFacade>,
     source: Arc<SourceFacade>,
     runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
@@ -1033,12 +1033,12 @@ pub fn create_inprocess_router(
         if runtime_boundary.is_some() {
             "route"
         } else {
-            "inprocess"
+            "local"
         }
     );
     let state = ApiState {
         backend: runtime_boundary.map_or_else(
-            || QueryBackend::InProcess {
+            || QueryBackend::Local {
                 sink: sink.clone(),
                 source: source.clone(),
             },
@@ -1097,11 +1097,11 @@ async fn query_materialized_events(
         String::from_utf8_lossy(&params.scope.path)
     );
     match backend {
-        QueryBackend::InProcess { sink, .. } => {
+        QueryBackend::Local { sink, .. } => {
             let result =
                 run_blocking_query(move || sink.materialized_query(&params), timeout).await;
             eprintln!(
-                "fs_meta_query_api: query_materialized_events inprocess done ok={}",
+                "fs_meta_query_api: query_materialized_events local done ok={}",
                 result.is_ok()
             );
             result
@@ -1182,10 +1182,10 @@ async fn query_force_find_events(
         String::from_utf8_lossy(&params.scope.path)
     );
     match backend {
-        QueryBackend::InProcess { source, .. } => {
+        QueryBackend::Local { source, .. } => {
             let result = run_blocking_query(move || source.force_find(&params), timeout).await;
             eprintln!(
-                "fs_meta_query_api: query_force_find_events inprocess done ok={}",
+                "fs_meta_query_api: query_force_find_events local done ok={}",
                 result.is_ok()
             );
             result
@@ -2763,7 +2763,7 @@ fn resolve_force_find_groups(
     }
 
     match &state.backend {
-        QueryBackend::InProcess { source, .. } | QueryBackend::Route { source, .. } => {
+        QueryBackend::Local { source, .. } | QueryBackend::Route { source, .. } => {
             fallback_force_find_groups(source)
         }
     }
@@ -2906,7 +2906,7 @@ mod tests {
 
             Self {
                 _tempdir: tempdir,
-                app: create_inprocess_router(
+                app: create_local_router(
                     sink,
                     source,
                     None,
@@ -3051,7 +3051,7 @@ mod tests {
 
     fn test_api_state_for_source(source: Arc<SourceFacade>, sink: Arc<SinkFacade>) -> ApiState {
         ApiState {
-            backend: QueryBackend::InProcess { sink, source },
+            backend: QueryBackend::Local { sink, source },
             policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
             pit_store: Arc::new(Mutex::new(QueryPitStore::default())),
             force_find_inflight: Arc::new(Mutex::new(BTreeSet::new())),
@@ -3800,7 +3800,7 @@ mod tests {
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.GROUP_ORDER_MULTI_GROUP_BUCKET_SELECTION", mode="system")
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.DUAL_QUERY_PATH_AVAILABILITY", mode="system")
     #[tokio::test]
-    async fn force_find_group_order_file_count_top_bucket_inprocess() {
+    async fn force_find_group_order_file_count_top_bucket_local() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
         let req = Request::builder()
             .uri("/on-demand-force-find?path=/&group_order=file-count&group_page_size=1")
@@ -3834,7 +3834,7 @@ mod tests {
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.GROUP_ORDER_MULTI_GROUP_BUCKET_SELECTION", mode="system")
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.DUAL_QUERY_PATH_AVAILABILITY", mode="system")
     #[tokio::test]
-    async fn force_find_group_order_file_age_top_bucket_inprocess() {
+    async fn force_find_group_order_file_age_top_bucket_local() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
         let req = Request::builder()
             .uri("/on-demand-force-find?path=/&group_order=file-age&group_page_size=1")
@@ -3867,7 +3867,7 @@ mod tests {
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.GROUP_ORDER_MULTI_GROUP_BUCKET_SELECTION", mode="system")
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.DUAL_QUERY_PATH_AVAILABILITY", mode="system")
     #[tokio::test]
-    async fn force_find_group_order_file_age_keeps_empty_groups_eligible_inprocess() {
+    async fn force_find_group_order_file_age_keeps_empty_groups_eligible_local() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::FileAgeNoFiles);
         let req = Request::builder()
             .uri("/on-demand-force-find?path=/&group_order=file-age&group_page_size=1")
@@ -3900,7 +3900,7 @@ mod tests {
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.DUAL_QUERY_PATH_AVAILABILITY", mode="system")
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.NO_CROSS_GROUP_ENTRY_MERGE", mode="system")
     #[tokio::test]
-    async fn force_find_defaults_to_group_key_multi_group_response_inprocess() {
+    async fn force_find_defaults_to_group_key_multi_group_response_local() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
         let req = Request::builder()
             .uri("/on-demand-force-find?path=/")
@@ -3931,7 +3931,7 @@ mod tests {
 
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.DUAL_QUERY_PATH_AVAILABILITY", mode="system")
     #[tokio::test]
-    async fn force_find_explicit_group_returns_only_that_group_inprocess() {
+    async fn force_find_explicit_group_returns_only_that_group_local() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
         let req = Request::builder()
             .uri("/on-demand-force-find?path=/&group=sink-b")
@@ -3954,7 +3954,7 @@ mod tests {
 
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.QUERY_HTTP_FACADE_DEFAULTS_AND_SHAPE", mode="system")
     #[tokio::test]
-    async fn force_find_defaults_when_query_params_omitted_inprocess() {
+    async fn force_find_defaults_when_query_params_omitted_local() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
         let req = Request::builder()
             .uri("/on-demand-force-find")
@@ -3986,7 +3986,7 @@ mod tests {
 
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.QUERY_BOUND_ROUTE_METRICS_DIAGNOSTICS_BOUNDARY", mode="system")
     #[tokio::test]
-    async fn projection_rpc_metrics_endpoint_shape_inprocess() {
+    async fn projection_rpc_metrics_endpoint_shape_local() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
         let req = Request::builder()
             .uri("/bound-route-metrics")
@@ -4011,7 +4011,7 @@ mod tests {
     // @verify_spec("CONTRACTS.QUERY_OUTCOME.QUERY_PARAMETER_AXES_REMAIN_ORTHOGONAL", mode="system")
     // @verify_spec("CONTRACTS.API_BOUNDARY.QUERY_PATH_PARAMETERS_OWN_PAYLOAD_SHAPE", mode="system")
     #[tokio::test]
-    async fn force_find_rejects_status_only_and_keeps_pagination_axis_inprocess() {
+    async fn force_find_rejects_status_only_and_keeps_pagination_axis_local() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
         let req = Request::builder()
             .uri("/on-demand-force-find?path=/&group_order=group-key&read_class=trusted-materialized")
@@ -4040,7 +4040,7 @@ mod tests {
 
     // @verify_spec("CONTRACTS.API_BOUNDARY.API_NON_OWNERSHIP_OF_QUERY_FIND_CHANNEL_PATH", mode="system")
     #[tokio::test]
-    async fn namespace_projection_endpoints_removed_inprocess() {
+    async fn namespace_projection_endpoints_removed_local() {
         let fixture = ForceFindFixture::new(ForceFindFixtureScenario::Standard);
 
         let req_tree = Request::builder()

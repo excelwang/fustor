@@ -16,13 +16,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
-use capanix_app_fs_meta::RootSpec as RootEntry;
-use capanix_app_fs_meta::api::{ApiAuthConfig, BootstrapManagementConfig};
-use capanix_app_fs_meta::product::{
-    FsMetaReleaseSpec, FsMetaReleaseWorkerModes, build_release_doc_value,
+use fs_meta::RootSpec as RootEntry;
+use fs_meta::api::{ApiAuthConfig, BootstrapManagementConfig};
+use fs_meta_deploy::{
+    FsMetaReleaseSpec, FsMetaReleaseWorkerMode, FsMetaReleaseWorkerModes, build_release_doc_value,
+    compile_release_doc_to_relation_target_intent,
 };
-use capanix_config::compile_scope_worker_intent_doc;
-use capanix_runtime_api::{ScopeWorkerIntentDoc, WorkerMode};
 use clap::{Args, Parser, Subcommand};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
@@ -166,21 +165,21 @@ struct ProductAuthConfig {
 }
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProductWorkersConfig {
     #[serde(default)]
     facade: Option<ProductWorkerConfig>,
     #[serde(default)]
     source: Option<ProductWorkerConfig>,
     #[serde(default)]
-    scan: Option<ProductWorkerConfig>,
-    #[serde(default)]
     sink: Option<ProductWorkerConfig>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ProductWorkerConfig {
     #[serde(default)]
-    mode: Option<WorkerMode>,
+    mode: Option<FsMetaReleaseWorkerMode>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -217,33 +216,25 @@ fn default_bootstrap_username() -> String {
     "fsmeta-admin".to_string()
 }
 
-fn configured_worker_mode(config: &Option<ProductWorkerConfig>) -> Option<WorkerMode> {
+fn configured_worker_mode(config: &Option<ProductWorkerConfig>) -> Option<FsMetaReleaseWorkerMode> {
     config.as_ref().and_then(|config| config.mode)
 }
 
-fn resolve_release_worker_modes(product: &ProductConfig) -> anyhow::Result<FsMetaReleaseWorkerModes> {
-    let facade = configured_worker_mode(&product.workers.facade).unwrap_or(WorkerMode::Embedded);
-    if facade != WorkerMode::Embedded {
+fn resolve_release_worker_modes(
+    product: &ProductConfig,
+) -> anyhow::Result<FsMetaReleaseWorkerModes> {
+    let facade = configured_worker_mode(&product.workers.facade)
+        .unwrap_or(FsMetaReleaseWorkerMode::Embedded);
+    if facade != FsMetaReleaseWorkerMode::Embedded {
         bail!("fs-meta product config requires workers.facade.mode=embedded");
     }
 
-    let source = configured_worker_mode(&product.workers.source);
-    let scan = configured_worker_mode(&product.workers.scan);
-    let source_and_scan = match (source, scan) {
-        (Some(source), Some(scan)) if source != scan => {
-            bail!(
-                "fs-meta product config requires workers.scan.mode to match workers.source.mode while source and scan still share one realization"
-            );
-        }
-        (Some(mode), _) | (_, Some(mode)) => mode,
-        (None, None) => WorkerMode::External,
-    };
-
     Ok(FsMetaReleaseWorkerModes {
         facade,
-        source: source_and_scan,
-        scan: source_and_scan,
-        sink: configured_worker_mode(&product.workers.sink).unwrap_or(WorkerMode::External),
+        source: configured_worker_mode(&product.workers.source)
+            .unwrap_or(FsMetaReleaseWorkerMode::External),
+        sink: configured_worker_mode(&product.workers.sink)
+            .unwrap_or(FsMetaReleaseWorkerMode::External),
     })
 }
 
@@ -310,7 +301,7 @@ async fn local_start(args: LocalStartArgs) -> anyhow::Result<serde_json::Value> 
     let state_path = args.workdir.join("runtime.json");
     if state_path.exists() {
         let state = load_local_state(&state_path)?;
-        if process_is_running(state.pid) {
+        if pid_is_running(state.pid) {
             bail!(
                 "local runtime already running for workdir {}",
                 args.workdir.display()
@@ -408,11 +399,11 @@ async fn local_stop(args: LocalWorkdirArgs) -> anyhow::Result<serde_json::Value>
     let state_path = args.workdir.join("runtime.json");
     let state = load_local_state(&state_path)?;
     let mut stopped = false;
-    if process_is_running(state.pid) {
+    if pid_is_running(state.pid) {
         let status = Command::new("kill")
             .arg(state.pid.to_string())
             .status()
-            .context("process kill failed")?;
+            .context("runtime stop failed")?;
         if !status.success() {
             bail!("kill {} failed with status {}", state.pid, status);
         }
@@ -429,7 +420,7 @@ async fn local_stop(args: LocalWorkdirArgs) -> anyhow::Result<serde_json::Value>
 
 async fn local_status(args: LocalWorkdirArgs) -> anyhow::Result<serde_json::Value> {
     let state = load_local_state(&args.workdir.join("runtime.json"))?;
-    let running = process_is_running(state.pid);
+    let running = pid_is_running(state.pid);
     let service_status = if running {
         let client = reqwest::Client::new();
         match login_api(
@@ -667,7 +658,7 @@ fn ensure_fixture_binary() -> anyhow::Result<PathBuf> {
         .current_dir(&root)
         .arg("build")
         .arg("-p")
-        .arg("capanix-app-fs-meta-worker-facade")
+        .arg("fs-meta-runtime")
         .arg("--bin")
         .arg("fs_meta_api_fixture")
         .status()?;
@@ -702,7 +693,7 @@ async fn wait_for_local_ready(
     }
 }
 
-fn process_is_running(pid: u32) -> bool {
+fn pid_is_running(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
 }
 
@@ -724,7 +715,7 @@ fn prepare_state_dir(base: Option<&Path>, leaf: &str) -> anyhow::Result<PathBuf>
 fn resolve_fs_meta_runtime_inputs() -> anyhow::Result<(PathBuf, PathBuf)> {
     let root = workspace_root()?;
     let manifest_path = root
-        .join("fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml")
+        .join("fs-meta/fixtures/manifests/fs-meta.yaml")
         .canonicalize()
         .context("resolve fs-meta manifest path failed")?;
     let binary_path = ensure_fs_meta_app_runtime_path()?;
@@ -736,7 +727,7 @@ fn build_deploy_intent(
     auth: ApiAuthConfig,
     app_target: &Path,
     manifest_path: &Path,
-) -> anyhow::Result<ScopeWorkerIntentDoc> {
+) -> anyhow::Result<serde_json::Value> {
     let worker_modes = resolve_release_worker_modes(product)?;
     let mut release_doc = build_release_doc_value(&FsMetaReleaseSpec {
         app_id: DEFAULT_APP_ID.to_string(),
@@ -769,87 +760,8 @@ fn build_deploy_intent(
         .and_then(serde_json::Value::as_object_mut)
         .context("release document missing policy section")?;
     policy.insert("generation".into(), json!(target_generation));
-
-    let intent_value = scope_unit_intent_to_scope_worker_intent_value(&release_doc)?;
-    let intent: ScopeWorkerIntentDoc =
-        serde_json::from_value(intent_value).context("decode fs-meta deploy intent failed")?;
-    compile_scope_worker_intent_doc(&intent)
-        .map_err(|err| anyhow::anyhow!("invalid fs-meta deploy intent: {err}"))?;
-    Ok(intent)
-}
-
-fn scope_unit_intent_to_scope_worker_intent_value(
-    doc: &serde_json::Value,
-) -> anyhow::Result<serde_json::Value> {
-    let units = doc
-        .get("units")
-        .and_then(serde_json::Value::as_array)
-        .context("scope-unit-intent doc missing units")?;
-    let target_id = doc
-        .get("target_id")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("target");
-    let target_generation = doc
-        .get("target_generation")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(1);
-    let workers = units
-        .iter()
-        .map(|entry| {
-            let worker_role = entry
-                .get("worker_role")
-                .or_else(|| {
-                    entry
-                        .get("runtime")
-                        .and_then(|runtime| runtime.get("worker_role"))
-                })
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("main");
-            let worker_id = entry
-                .get("unit_id")
-                .or_else(|| entry.get("app"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("worker");
-            let startup_path = entry
-                .get("startup")
-                .and_then(|startup| startup.get("path"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("app");
-            let mut startup = serde_json::Map::new();
-            startup.insert(
-                "path".into(),
-                serde_json::Value::String(startup_path.to_string()),
-            );
-            if let Some(manifest) = entry
-                .get("startup")
-                .and_then(|startup| startup.get("manifest"))
-                .cloned()
-            {
-                startup.insert("manifest".into(), manifest);
-            }
-            json!({
-                "worker_role": worker_role,
-                "worker_id": worker_id,
-                "scope_ids": entry.get("scope_ids").cloned().unwrap_or_else(|| json!([])),
-                "startup": serde_json::Value::Object(startup),
-                "config": entry.get("config").cloned().unwrap_or_else(|| json!({})),
-                "runtime": entry.get("runtime").cloned().unwrap_or_else(|| json!({})),
-                "policy": entry.get("policy").cloned().unwrap_or_else(|| json!({})),
-                "restart_policy": entry
-                    .get("restart_policy")
-                    .cloned()
-                    .unwrap_or_else(|| json!("Always")),
-                "version": entry.get("version").cloned().unwrap_or_else(|| json!("dev")),
-            })
-        })
-        .collect::<Vec<_>>();
-    Ok(json!({
-        "schema_version": "scope-worker-intent-v1",
-        "target_id": target_id,
-        "target_generation": target_generation,
-        "route_plans": doc.get("route_plans").cloned().unwrap_or_else(|| json!([])),
-        "workers": workers,
-    }))
+    compile_release_doc_to_relation_target_intent(&release_doc)
+        .map_err(|err| anyhow::anyhow!("invalid fs-meta deploy intent: {err}"))
 }
 
 fn ensure_fs_meta_app_runtime_path() -> anyhow::Result<PathBuf> {
@@ -874,11 +786,11 @@ fn ensure_fs_meta_app_runtime_path() -> anyhow::Result<PathBuf> {
         .current_dir(&root)
         .arg("build")
         .arg("-p")
-        .arg("capanix-app-fs-meta-worker-facade")
+        .arg("fs-meta-runtime")
         .arg("--lib")
         .status()?;
     if !status.success() {
-        bail!("cargo build for capanix-app-fs-meta-worker-facade failed");
+        bail!("cargo build for fs-meta-runtime failed");
     }
     Ok(bin.canonicalize()?)
 }
@@ -886,15 +798,15 @@ fn ensure_fs_meta_app_runtime_path() -> anyhow::Result<PathBuf> {
 fn fs_meta_runtime_library_name() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        return "libcapanix_app_fs_meta_worker_facade.dylib";
+        return "libfs_meta_runtime.dylib";
     }
     #[cfg(target_os = "windows")]
     {
-        return "capanix_app_fs_meta_worker_facade.dll";
+        return "fs_meta_runtime.dll";
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
-        "libcapanix_app_fs_meta_worker_facade.so"
+        "libfs_meta_runtime.so"
     }
 }
 
@@ -940,11 +852,9 @@ impl ControlClient {
 
     async fn apply_relation_target_intent(
         &self,
-        intent: &ScopeWorkerIntentDoc,
+        intent: &serde_json::Value,
     ) -> anyhow::Result<serde_json::Value> {
-        let value = serde_json::to_value(intent)
-            .context("serialize scope-worker intent for submit failed")?;
-        let path = write_runtime_admin_temp_file("fsmeta-intent", &value)?;
+        let path = write_runtime_admin_temp_file("fsmeta-intent", intent)?;
         let output = self
             .run_cnxctl(&[
                 "app",
@@ -1049,7 +959,7 @@ mod tests {
         ProductAuthConfig, build_auth_config, build_deploy_intent, load_product_config,
         workspace_root,
     };
-    use capanix_runtime_api::ConfigValue;
+    use serde_json::json;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1142,69 +1052,56 @@ mod tests {
 
         let manifest = workspace_root()
             .expect("workspace root")
-            .join("fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml")
+            .join("fs-meta/fixtures/manifests/fs-meta.yaml")
             .canonicalize()
             .expect("fixture manifest path");
-        let app_target = PathBuf::from("/tmp/capanix-app-fs-meta.so");
+        let app_target = PathBuf::from("/tmp/fs-meta-runtime.so");
         let intent = build_deploy_intent(&product, auth_cfg, &app_target, &manifest)
             .expect("deploy intent should compile through shared config boundary");
 
-        assert_eq!(intent.schema_version, "scope-worker-intent-v1");
-        assert_eq!(intent.target_id, "fs-meta");
-        assert_eq!(intent.workers.len(), 1);
-        assert_eq!(intent.workers[0].worker_role, "main");
+        assert_eq!(intent["schema_version"], json!("scope-worker-intent-v1"));
+        assert_eq!(intent["target_id"], json!("fs-meta"));
+        let workers_array = intent["workers"]
+            .as_array()
+            .expect("worker intent should encode workers");
+        assert_eq!(workers_array.len(), 1);
+        let worker = &workers_array[0];
+        assert_eq!(worker["worker_role"], json!("main"));
         assert_eq!(
-            intent.workers[0].startup.path,
-            "/tmp/capanix-app-fs-meta.so"
+            worker["startup"]["path"],
+            json!("/tmp/fs-meta-runtime.so")
         );
         assert_eq!(
-            intent.workers[0].startup.manifest.as_deref(),
-            Some(manifest.to_string_lossy().as_ref())
+            worker["startup"]["manifest"],
+            json!(manifest.to_string_lossy().as_ref())
         );
-        let workers = intent.workers[0]
-            .config
-            .get("workers")
+        let workers = worker["config"]["workers"]
+            .as_object()
             .expect("compiled fs-meta release config should declare workers");
-        let ConfigValue::Map(workers) = workers else {
-            panic!("workers config should be a map");
-        };
         assert_eq!(
             workers
                 .get("facade")
-                .and_then(|value| match value {
-                    ConfigValue::Map(row) => row.get("mode"),
-                    _ => None,
-                })
-                .and_then(|value| match value {
-                    ConfigValue::String(value) => Some(value.as_str()),
-                    _ => None,
-                }),
+                .and_then(|row| row.get("mode"))
+                .and_then(serde_json::Value::as_str),
             Some("embedded")
         );
-        for role in ["source", "scan", "sink"] {
-            let ConfigValue::Map(row) = workers
+        for role in ["source", "sink"] {
+            let row = workers
                 .get(role)
                 .expect("external worker config should exist")
-            else {
-                panic!("worker role '{role}' must encode as a map");
-            };
+                .as_object()
+                .expect("worker config should encode as an object");
             assert_eq!(
-                row.get("mode").and_then(|value| match value {
-                    ConfigValue::String(value) => Some(value.as_str()),
-                    _ => None,
-                }),
+                row.get("mode").and_then(serde_json::Value::as_str),
                 Some("external")
             );
-            let module_path = row.get("startup").and_then(|value| match value {
-                ConfigValue::Map(startup) => startup.get("path"),
-                _ => None,
-            });
+            let module_path = row
+                .get("startup")
+                .and_then(serde_json::Value::as_object)
+                .and_then(|startup| startup.get("path"));
             assert_eq!(
-                module_path.and_then(|value| match value {
-                    ConfigValue::String(value) => Some(value.as_str()),
-                    _ => None,
-                }),
-                Some("/tmp/capanix-app-fs-meta.so")
+                module_path.and_then(serde_json::Value::as_str),
+                Some("/tmp/fs-meta-runtime.so")
             );
         }
 
@@ -1234,40 +1131,50 @@ mod tests {
 
         let manifest = workspace_root()
             .expect("workspace root")
-            .join("fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml")
+            .join("fs-meta/fixtures/manifests/fs-meta.yaml")
             .canonicalize()
             .expect("fixture manifest path");
-        let app_target = PathBuf::from("/tmp/capanix-app-fs-meta.so");
+        let app_target = PathBuf::from("/tmp/fs-meta-runtime.so");
         let intent = build_deploy_intent(&product, auth_cfg, &app_target, &manifest)
             .expect("deploy intent should compile through shared config boundary");
-
-        let workers = intent.workers[0]
-            .config
-            .get("workers")
+        let workers = intent["workers"][0]["config"]["workers"]
+            .as_object()
             .expect("compiled fs-meta release config should declare workers");
-        let ConfigValue::Map(workers) = workers else {
-            panic!("workers config should be a map");
-        };
-        for role in ["source", "scan"] {
-            let ConfigValue::Map(row) = workers
+        for role in ["source"] {
+            let row = workers
                 .get(role)
-                .expect("source/scan worker config should exist")
-            else {
-                panic!("worker role '{role}' must encode as a map");
-            };
+                .expect("source worker config should exist")
+                .as_object()
+                .expect("worker config should encode as an object");
             assert_eq!(
-                row.get("mode").and_then(|value| match value {
-                    ConfigValue::String(value) => Some(value.as_str()),
-                    _ => None,
-                }),
+                row.get("mode").and_then(serde_json::Value::as_str),
                 Some("embedded")
             );
             assert!(
                 row.get("startup").is_none(),
-                "embedded source/scan mode must not emit startup.path"
+                "embedded source mode must not emit startup.path"
             );
         }
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn product_config_rejects_removed_fourth_worker_surface() {
+        let path = unique_temp_path("reject-legacy-scan-role");
+        fs::write(
+            &path,
+            "api:\n  facade_resource_id: fs-meta-tcp-listener\nworkers:\n  scan:\n    mode: external\n",
+        )
+        .expect("write invalid config");
+
+        let err = load_product_config(&path).expect_err("workers.scan must be rejected");
+        let _ = fs::remove_file(&path);
+        let err_text = format!("{err:#}");
+
+        assert!(
+            err_text.contains("parse config") && err_text.contains("unknown field `scan`"),
+            "unexpected parse error: {err_text}"
+        );
     }
 }

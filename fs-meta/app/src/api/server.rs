@@ -14,12 +14,12 @@ use axum::{
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::CorsLayer;
 
-use capanix_app_sdk::raw::ChannelIoSubset;
 use capanix_app_sdk::runtime::NodeId;
 use capanix_app_sdk::{CnxError, Result};
+use capanix_runtime_host_sdk::boundary::ChannelIoSubset;
 
 use crate::query::api::{
-    create_inprocess_router, projection_policy_from_host_object_grants,
+    create_local_router, projection_policy_from_host_object_grants,
     refresh_policy_from_host_object_grants,
 };
 use crate::workers::sink::SinkFacade;
@@ -231,7 +231,7 @@ fn router(state: ApiState) -> Result<Router> {
             Method::OPTIONS,
         ])
         .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE]);
-    let projection_router = create_inprocess_router(
+    let projection_router = create_local_router(
         state.query_sink.clone(),
         state.source.clone(),
         state.query_runtime_boundary.clone(),

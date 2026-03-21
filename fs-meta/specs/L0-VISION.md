@@ -70,8 +70,8 @@ version: 3.0.0
 > Traceability: fs-meta app implementation must consume fs-meta domain specs and root Convergence Vocabulary. `Authoritative Truth`, `Observation`, `Projection`, and `Observation-Eligible` retain their upstream meanings unless this main spec explicitly narrows them.
 
 1. **DOMAIN_CONTRACT_CONSUMPTION_ONLY**: User wants package-local fs-meta app implementation limited to consuming domain and platform contracts rather than redefining them.
-2. **WORKER_ROLE_MODEL**: User wants the product-facing app package to present one `fs-meta` app product container whose execution responsibilities cover facade/query ingress, live source observation, scan/audit, and sink/materialized-index maintenance; `query` remains with the ingress/query responsibility until a later split is justified.
-3. **WORKER_MODE_MODEL**: User wants product-facing execution described only by shared-process versus dedicated-process isolation choices, without exposing realization-mechanic terminology as architecture vocabulary.
+2. **WORKER_ROLE_MODEL**: User wants the product-facing app package to present one `fs-meta` app product container whose execution responsibilities are split across `facade`, `source`, and `sink`; `query` remains with facade ingress/orchestration, and scan/audit remain source-side unit responsibilities rather than a fourth worker role.
+3. **WORKER_MODE_MODEL**: User wants product-facing execution described only by bounded per-worker hosting choices, without exposing realization-mechanic terminology as architecture vocabulary.
 4. **LOCAL_HOST_RESOURCE_PROGRAMMING_ONLY**: User wants resource-bound source and other app-internal behavior implemented through bound-host local-host programming targets without redefining platform semantics.
 5. **RESOURCE_SCOPED_HTTP_FACADE_ONLY**: User wants the package-local app implementation to host one bounded external HTTP facade for the single fs-meta app boundary.
 6. **OPAQUE_INTERNAL_PORTS_ONLY**: User wants the app package to keep internal coordination on app-owned opaque protocols rather than redefining platform vocabulary.
@@ -80,7 +80,7 @@ version: 3.0.0
 9. **OBSERVATION_ELIGIBILITY_GATE_OWNERSHIP**: User wants the app package to own the local readiness evidence that determines when rebuilt materialized results are trustworthy enough for current external use.
 10. **STALE_WRITER_FENCE_BEFORE_EXPOSURE**: User wants stale generations fenced before runtime can promote a newer generation or allow older observations to re-expose.
 11. **NO_PRODUCT_OR_PLATFORM_OWNERSHIP**: User wants product, deploy, and platform authority kept outside the package-local app implementation.
-12. **WORKER_MODE_FAILURE_BOUNDARY_IS_EXPLICIT**: User wants failure isolation described in terms of shared-process versus dedicated-process execution boundaries, and constructor/bootstrap/join failures to surface as typed app errors rather than unexpected crashes.
+12. **WORKER_MODE_FAILURE_BOUNDARY_IS_EXPLICIT**: User wants failure isolation described in terms of `embedded` versus `external` worker hosting boundaries, and constructor/bootstrap/join failures to surface as typed app errors rather than unexpected crashes.
 
 ### VISION.CLI_SCOPE
 
@@ -101,9 +101,9 @@ version: 3.0.0
 
 ### VISION.FAILURE_ISOLATION_BOUNDARY
 
-1. **EXPLICIT_EXECUTION_FAILURE_DOMAINS**: User wants shared-process 与 dedicated-process execution boundary 的故障域被明确区分，而不是被表述成同一种失败语义。
+1. **EXPLICIT_EXECUTION_FAILURE_DOMAINS**: User wants `embedded` 与 `external` worker hosting boundary 的故障域被明确区分，而不是被表述成同一种失败语义。
 2. **TASK_OR_WORKER_FAILURE_CONTAINMENT**: User wants 可恢复的 interface task 或 execution-role 故障尽量局限在 task/role 范围内，并保持 degraded/failure evidence 可见。
-3. **FAILURE_IMPACT_DECLARED_BY_MODE**: User wants 文档与系统行为明确说明不同执行形态的失败影响：shared-process 故障可能影响同宿主进程内全部工作，而 dedicated-process 故障通过 restart/rebind/rebuild 恢复，而不是被误当成 truth 丢失。
+3. **FAILURE_IMPACT_DECLARED_BY_MODE**: User wants 文档与系统行为明确说明不同执行形态的失败影响：`embedded` 故障可能影响共享宿主边界内全部工作，而 `external` 故障通过 restart/rebind/rebuild 恢复，而不是被误当成 truth 丢失。
 
 ## Out-of-Scope
 

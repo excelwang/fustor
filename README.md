@@ -8,8 +8,8 @@ package and repository-level tests.
 
 ## Layout
 
-- `fs-meta`: classic Rust application package containing the fs-meta library,
-  CLI, worker binaries, package tests, fixtures, and product specs
+- `fs-meta`: product container directory holding the `fs-meta`, `fs-meta-runtime`,
+  `fs-meta-deploy`, and `fs-meta-tooling` packages plus fixtures and specs
 - `fs-meta/fixtures`: module fixtures, manifests, and test apps
 - `fs-meta/specs`: product and contract specs
 - `fs-meta/tests`: domain-level specs and end-to-end tests
@@ -18,8 +18,8 @@ package and repository-level tests.
 
 ```bash
 cargo check
-cargo test -p capanix-app-fs-meta --test specs -- --nocapture
-cargo test -p fsmeta --test specs -- --nocapture
+cargo test -p fs-meta --test app_specs -- --nocapture
+cargo test -p fs-meta-tooling -- --nocapture
 ```
 
 ## Dependency Overrides

@@ -5,8 +5,8 @@ version: 3.0.0
 # L2: fs-meta Domain Architecture
 
 > Focus: fs-meta domain externally behaves as one app product container; internal
-> execution is organized as `facade-worker`, `source-worker`, `scan-worker`,
-> and `sink-worker`, with product-facing worker mode vocabulary limited to
+> execution is organized as `facade-worker`, `source-worker`, and
+> `sink-worker`, with product-facing worker mode vocabulary limited to
 > `embedded | external`.
 
 ## ARCHITECTURE.COMPONENTS
@@ -19,16 +19,16 @@ version: 3.0.0
 2. **Single fs-meta App Boundary**:
    1. Inputs: filesystem change observations, domain queries, runtime control frames, runtime host object grants.
    2. Outputs: `query/find` responses, domain events, and app-owned port boundaries.
-   3. Role: encapsulate source/sink semantics, four worker roles (`facade-worker`, `source-worker`, `scan-worker`, `sink-worker`), thin runtime ABI participation, app-owned opaque ports, and resource-scoped HTTP facade semantics behind one app package boundary while allowing runtime to schedule multiple worker instances.
+   3. Role: encapsulate source/sink semantics, three worker roles (`facade-worker`, `source-worker`, `sink-worker`), thin runtime ABI participation, app-owned opaque ports, and resource-scoped HTTP facade semantics behind one app package boundary while allowing runtime to schedule multiple worker instances.
    3.1. Constraint: this boundary is a downstream app product container, not a generic reusable shared library package.
-   4. Canonical boundary path for stateful fs-meta authoring is `capanix-managed-state-sdk` (shared observation declarations/evaluator) -> `capanix-service-sdk` (service-first runtime host/lowering) -> `capanix-app-sdk` (Boundary Toolkit) -> `capanix-runtime-api` (runtime-owned typed surface) -> `capanix-kernel-api` (kernel-owned mirror only).
+   4. Canonical boundary path for stateful fs-meta authoring is `capanix-managed-state-sdk` (shared observation declarations/evaluator) -> `capanix-service-sdk` (service-first authoring) -> `capanix-runtime-host-sdk` (runtime host/control/worker helper layer) -> `capanix-app-sdk` (Boundary Toolkit) -> `capanix-runtime-api` (runtime-owned typed surface) -> `capanix-kernel-api` (kernel-owned mirror only).
    5. Product-facing execution vocabulary stays at `embedded | external`; realization mechanics remain internal.
 
 3. **Meta-Index Service (App Internal)**:
    1. Inputs: realtime watch stream, initial full scan batches, audit pass results, sentinel feedback.
    2. Outputs: materialized metadata index + repair actions.
    3. Role: own fs-meta index lifecycle; not kernel-owned state.
-   4. Baseline: materialized index is in-memory observation/projection state (process-bound), not durable checkpoint state and not the domain truth ledger itself.
+   4. Baseline: materialized index is in-memory observation/projection state (hosting-bound), not durable checkpoint state and not the domain truth ledger itself.
    5. Sink arbitration/build baseline: single-tree per logical group, no member-level output boundary.
    6. State split baseline: source/sink keep authoritative journal inputs separate from projection/materialized state (in-memory tree/runtime maps).
    7. Authority state baseline: fs-meta authority journal remains the domain authoritative truth ledger; projection/materialized state remains rebuildable observation state.
@@ -62,7 +62,7 @@ version: 3.0.0
 
 1. **Materialized Query Path**:
    1. client issues `query`.
-   2. facade/query layer resolves target logical groups and fans out only to the sink-side execution partition that owns each group; worker process identity is hosting-only and is not the fan-out contract.
+   2. facade/query layer resolves target logical groups and fans out only to the sink-side execution partition that owns each group; worker hosting identity is hosting-only and is not the fan-out contract.
    3. sink-side group execution reads its materialized subtree from `meta-index`.
    4. facade/query layer merges the per-group sink results and returns fs-meta app-owned query/stats payloads built from shared Unix/FS field constraints and shared reliability/stability vocabulary; projection may further shape them into the public `/tree` or `/stats` HTTP response.
 
@@ -128,36 +128,37 @@ version: 3.0.0
 
 ## ARCHITECTURE.APP_PACKAGE
 
-1. One `fs-meta` app product container hosts four worker roles: `facade-worker`, `source-worker`, `scan-worker`, and `sink-worker`.
+1. One `fs-meta` app product container hosts three worker roles: `facade-worker`, `source-worker`, and `sink-worker`.
 2. `facade-worker` owns HTTP/API ingress, auth, PIT lifecycle, response shaping, and current query orchestration; `query` remains inside `facade-worker` for now.
-3. `source-worker` owns live watch, live force-find, and source-side host/grant interaction.
-4. `scan-worker` owns initial full scan, periodic audit, and overflow/recovery rescans.
-5. `sink-worker` owns materialized tree/index maintenance plus `/tree` and `/stats` materialized-query backend duties.
-6. Current baseline defaults: `facade-worker=embedded`; `source-worker=external`; `scan-worker=external`; `sink-worker=external`.
-7. This split is intentionally `4`, not `3`, so heavy scan/audit work stays separate from live source/watch work.
-8. This split is intentionally `4`, not `5`, because query orchestration remains packaged with the facade until a separate query worker is justified.
-9. Product-facing worker modes are only `embedded | external`; operator-visible worker config uses `workers.facade.mode`, `workers.source.mode`, `workers.scan.mode`, and `workers.sink.mode`, while app/runtime composition consumes only compiled `__cnx_runtime.workers` bindings emitted by the fs-meta release compiler.
-10. Product-facing L0-L2 specs stay in worker/mode vocabulary; realization mechanics stay internal, but downstream architecture docs explicitly preserve the root `worker / process / unit` split.
-11. In fs-meta terms, `worker` names the product-facing role (`facade/source/scan/sink`), `process` names the hosting container selected by `embedded | external`, and `unit` remains the runtime-owned finest bind/run, activation, tick, and state-boundary identity.
-12. `fs-meta/` is the product container directory only; it is not a Cargo package and exists to host the product app package, worker artifact packages, specs, docs, fixtures, and testdata.
-13. `fs-meta/app` is the main product app package for this container; it stays `publish = false`, owns package-local API/query/orchestration/business composition plus config/types, and does not define a generic reusable fs-meta library surface.
-14. Ordinary app-facing business modules use the SDK family rooted in `capanix-app-sdk`: shared observation authoring consumes `capanix-managed-state-sdk` declarations/evaluator helpers, top-level runtime-host authoring lowers through `capanix-service-sdk`, lower toolkit helpers consume `capanix-app-sdk`, worker-process client/server support consumes the helper-only `capanix-worker-runtime-support`, and narrow runtime glue, orchestration, and protocol-boundary seams MAY directly consume `capanix-runtime-api`, while production business/runtime modules in the app package do not depend on `capanix-kernel-api` or `capanix-unit-sidecar`.
-15. The service-sdk runtime host is primitive-first only: fs-meta initialization is triggered only by runtime orchestration controls (`activate`, `deactivate`, `tick`, and trusted-exposure confirmation) and must fail closed for `request/stream` before that control arrives; grant-change, manual-rescan, or passthrough controls do not implicitly bootstrap the app, and fs-meta does not rely on a fifth public start-hook seam from the platform.
-16. The app package consumes `managed-state-sdk`, `service-sdk`, `app-sdk`, helper-only `worker-runtime-support`, `host-adapter-fs`, `host-fs-types`, and `route-proto` as upstream authorities/support carriers; `managed-state-sdk` remains declaration/evaluator-only, `service-sdk` remains the runtime host/lowering owner, `product` remains the bounded product-facing CLI/tooling namespace, while `query`, `product::release_doc`, and `workers` may remain public package-local operational/test support surfaces without becoming product or platform authority.
-17. External-worker realization helpers remain confined to explicit worker runtime seams and helper-only upstream support crates; the app package may consume only the bounded typed worker handle/transport surface from `capanix-worker-runtime-support`, not raw bridge/bootstrap primitives.
-18. The upstream bridge-realization seam is low-level carrier glue only; helper-only `capanix-worker-runtime-support` owns worker child-process bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision, while fs-meta worker artifact crates own only their explicit bootstrap-session/server entry functions and request handling logic.
-19. The canonical worker transport contract MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping before retry; transport failures are not flattened into a generic peer-error bucket.
-20. `embedded` workers share the host process; `external` workers run in dedicated worker processes.
-21. Constructor/bootstrap faults surface as typed `CnxError` / `init_error`; runtime local-execution join failures and worker/bootstrap faults are handled as app-local or local-execution-local errors or explicit degraded behavior rather than routine production `panic!` / `expect!` flow.
-22. Package-local implementation env seams remain bounded tuning knobs; `FS_META_SOURCE_SCAN_WORKERS`, `FS_META_SOURCE_AUDIT_INTERVAL_MS`, `FS_META_SOURCE_THROTTLE_INTERVAL_MS`, `FS_META_SINK_TOMBSTONE_TTL_MS`, `FS_META_SINK_TOMBSTONE_TOLERANCE_US`, and `FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS` tune implementation behavior without redefining truth, cutover, or query-surface contracts.
+3. `source-worker` owns live watch, live force-find, initial full scan, periodic audit, overflow/recovery rescans, and source-side host/grant interaction.
+4. `sink-worker` owns materialized tree/index maintenance plus `/tree` and `/stats` materialized-query backend duties.
+5. Current baseline defaults: `facade-worker=embedded`; `source-worker=external`; `sink-worker=external`.
+6. This split is intentionally `3`, not `2`, so sink/materialized ownership stays separate from source-side observation while query orchestration remains packaged with the facade.
+7. This split is intentionally `3`, not `4`, because scan stays a source-side unit responsibility rather than a standalone worker role.
+8. Product-facing worker modes are only `embedded | external`; operator-visible worker config uses `workers.facade.mode`, `workers.source.mode`, and `workers.sink.mode`, while app/runtime composition consumes only compiled `__cnx_runtime.workers` bindings emitted by the fs-meta release compiler.
+9. Product-facing L0-L2 specs stay in worker/mode vocabulary; runtime-facing architecture keeps only the `worker / unit` split, and hosting realization remains deployment-only.
+10. In fs-meta terms, `worker` names the product-facing role (`facade/source/sink`), `runtime.exec.scan` remains a source-side unit, and `unit` stays the runtime-owned finest bind/run, activation, tick, and state-boundary identity.
+11. `fs-meta/` is the product container directory only; it is not a Cargo package and exists to host the product app package, specs, docs, fixtures, and testdata.
+12. `fs-meta/lib` is the main product authoring package for this container; it stays `publish = false`, exposes the bounded fs-meta authoring surface, and keeps developer-facing fs-meta types independent from runtime-entry and release-compiler seams.
+13. `fs-meta/app` is the internal `fs-meta-runtime` package. It owns ordinary/shared worker-module entry, runtime host lowering, worker bootstrap glue, and fixture/runtime seams while remaining `publish = false`.
+14. `fs-meta/deploy` is the internal product deployment compiler package. It owns release-doc generation and relation-target intent compilation for facade/source/sink worker bindings without owning query/source/sink business handlers.
+15. Ordinary app-facing business modules use the SDK family rooted in `capanix-app-sdk`: shared observation authoring consumes `capanix-managed-state-sdk` declarations/evaluator helpers, service-first authoring consumes `capanix-service-sdk`, top-level runtime-host authoring plus runtime control/grant, route/state/channel, entry, and worker-hosting helpers lower through `capanix-runtime-host-sdk`, lower toolkit helpers consume `capanix-app-sdk`, deploy compilation consumes `capanix-deploy-sdk`, and helper-only `capanix-worker-runtime-support` remains beneath those public surfaces rather than being imported directly by fs-meta packages.
+16. The runtime-host-sdk runtime host is primitive-first only: fs-meta initialization is triggered only by runtime orchestration controls (`activate`, `deactivate`, `tick`, and trusted-exposure confirmation) and must fail closed for `request/stream` before that control arrives; grant-change, manual-rescan, or passthrough controls do not implicitly bootstrap the app, and fs-meta does not rely on a fifth public start-hook seam from the platform.
+17. `fs-meta/lib` keeps the developer-facing surface bounded to fs-meta authoring types; `fs-meta/app` consumes `managed-state-sdk`, `service-sdk`, `runtime-host-sdk`, `app-sdk`, `host-adapter-fs`, and `host-fs-types` as upstream authorities/support carriers; `fs-meta/deploy` remains the bounded product-facing release/deploy namespace above `capanix-deploy-sdk`.
+18. External-worker realization helpers remain confined to explicit worker runtime seams and higher-level runtime-host-sdk worker-hosting views; helper-only upstream support crates remain internal implementation layers, not direct fs-meta package dependencies.
+19. The upstream bridge-realization seam is low-level carrier glue only; helper-only upstream worker support beneath `capanix-runtime-host-sdk` owns worker bootstrap, control/data socket ownership, direct control-plane startup/management, retry clipping, and lifecycle supervision, while `fs-meta/app` owns its explicit bootstrap-session/server entry functions and request handling logic.
+20. The canonical worker transport contract MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping before retry; transport failures are not flattened into a generic peer-error bucket.
+21. `embedded` workers stay inside the shared host boundary; `external` workers use isolated external worker hosting.
+22. Constructor/bootstrap faults surface as typed `CnxError` / `init_error`; runtime local-execution join failures and worker/bootstrap faults are handled as app-local or local-execution-local errors or explicit degraded behavior rather than routine production `panic!` / `expect!` flow.
+23. Package-local implementation env seams remain bounded tuning knobs; `FS_META_SOURCE_SCAN_WORKERS`, `FS_META_SOURCE_AUDIT_INTERVAL_MS`, `FS_META_SOURCE_THROTTLE_INTERVAL_MS`, `FS_META_SINK_TOMBSTONE_TTL_MS`, `FS_META_SINK_TOMBSTONE_TOLERANCE_US`, and `FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS` tune implementation behavior without redefining truth, cutover, or query-surface contracts.
 
 ## ARCHITECTURE.CLI_AND_TOOLING_BOUNDARY
 
 1. CLI command layer parses deploy/undeploy/local/grants/roots command workflows and targets the bounded fs-meta product boundary; login/rescan remain bounded HTTP/API workflows consumed inside operator sessions, tests, and support clients rather than top-level `fsmeta` subcommands.
-2. Request composition layer uses fs-meta bounded `product` types, bounded HTTP facade endpoints, external `cnxctl` deploy/control commands, and shared kernel-owned auth vocabulary without importing app package-local runtime/orchestration internals.
+2. Request composition layer uses fs-meta bounded deploy/authoring types, bounded HTTP facade endpoints, external `cnxctl` deploy/control commands, and shared kernel-owned auth vocabulary without importing runtime/orchestration internals from `fs-meta/app`.
 3. Upgrade workflow submits a new release generation through the same deploy boundary instead of exposing manual internal release-doc editing.
-4. Local-dev helpers, including the workspace package `capanix-app-fs-meta-tooling` and the product-scoped `capanixd-fs-meta` launcher, remain tooling only, are feature-gated away from the default CLI install, and do not create new platform authority or alter daemon ownership.
-5. The optional `capanixd-fs-meta` launcher composes `capanix_daemon::run_with_host_passthrough_bootstrap(...)` with `capanix_host_adapter_fs::spawn_host_passthrough_endpoint`; it does not bind sockets, construct runtime control services, or start runtime directly.
+4. Local-dev helpers, including the workspace package `fs-meta-tooling` and the product-scoped `fsmeta-locald` launcher, remain tooling only, are feature-gated away from the default CLI install, and do not create new platform authority or alter daemon ownership.
+5. The optional `fsmeta-locald` launcher composes `capanix_daemon::run_with_host_passthrough_bootstrap(...)` with `capanix_host_adapter_fs::spawn_host_passthrough_endpoint`; it does not bind sockets, construct runtime control services, or start runtime directly.
 6. CLI remains a request client only: it does not own bind/run realization, route convergence, route target selection, or `state/effect observation plane` meaning such as `observation_eligible`.
 
 ## ARCHITECTURE.GOVERNANCE_REFERENCE
@@ -167,8 +168,8 @@ version: 3.0.0
 
 ## ARCHITECTURE.WORKER_ROLE_TO_ARTIFACT_MAP
 
-1. `facade-worker` maps to the `fs-meta/worker-facade/` artifact crate and remains the only embedded worker in the current baseline.
-2. `source-worker`, `scan-worker`, and `sink-worker` remain distinct operator-visible worker roles, but their external realization is hosted by the platform generic `capanix-worker-host` loading the shared `fs-meta/worker-facade/` worker module.
-3. `fs-meta/worker-source/`, `fs-meta/worker-sink/`, and `fs-meta/worker-scan/` remain role-local helper crates that own `run_*_worker_server(...)` entry functions and request handling logic; they are not standalone executable artifact identities.
-4. `scan-worker` may continue to reuse lower-level source-runtime helpers internally while it shares the same external worker module path and supervision surface as `source-worker`.
-5. Any future change from the shared worker module to a role-specific module or artifact split MUST update this section first, then the dependent manifests and tests.
+1. `facade-worker` remains the only embedded worker in the current baseline and is exported directly from the internal `fs-meta-runtime` package under `fs-meta/app/`.
+2. `source-worker` and `sink-worker` remain the two operator-visible external worker roles, and their external realization is hosted by the platform generic `capanix-worker-host` loading the shared `fs-meta/app` worker module from `fs-meta-runtime`.
+3. `fs-meta/app/src/workers/source_server.rs` and `fs-meta/app/src/workers/sink_server.rs` own the role-local external worker request handling and bootstrap-session logic; they are runtime-package modules, not standalone artifact identities.
+4. `runtime.exec.scan` remains a source-side unit and reuses the source-server/runtime surface under `source-worker` rather than defining a standalone worker role.
+5. Any future change from the shared worker module to a role-specific module split, or any future promotion of scan into its own worker role, MUST update this section first, then the dependent manifests and tests.

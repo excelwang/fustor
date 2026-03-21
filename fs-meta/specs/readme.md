@@ -11,7 +11,7 @@
 5. [L3-RUNTIME/API_HTTP.md](./L3-RUNTIME/API_HTTP.md)：当前 fs-meta 管理 API。
 6. [L3-RUNTIME/WORKFLOWS.md](./L3-RUNTIME/WORKFLOWS.md)：部署、登录、grants、roots、rescan 工作流。
 7. [L3-RUNTIME/OBSERVATION_CUTOVER.md](./L3-RUNTIME/OBSERVATION_CUTOVER.md)：cutover / observation eligibility / stale fencing 运行时流程。
-8. [L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md](./L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md)：external worker bootstrap / transport supervision / scan alias realization。
+8. [L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md](./L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md)：worker bootstrap / transport supervision / source-side scan unit realization。
 
 ## 非规格材料位置
 

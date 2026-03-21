@@ -1,7 +1,7 @@
-use anyhow::{bail, Context};
+use anyhow::{Context, bail};
 use capanix_runtime_api::{
-    canonical_runtime_admin_command_bytes, RuntimeAdminCommand, RuntimeAdminEnvelope,
-    RuntimeAdminRequest,
+    RuntimeAdminCommand, RuntimeAdminEnvelope, RuntimeAdminRequest,
+    canonical_runtime_admin_command_bytes,
 };
 use serde_json::Value;
 
@@ -52,22 +52,18 @@ mod tests {
                     "worker_id": "fs-meta-test",
                     "scope_ids": [],
                     "startup": {
-                        "path": "/tmp/capanix-app-fs-meta.so",
-                        "manifest": "/tmp/capanix-app-fs-meta.yaml"
+                        "path": "/tmp/fs-meta-runtime.so",
+                        "manifest": "/tmp/fs-meta.yaml"
                     },
                     "config": {
                         "workers": {
                             "source": {
                                 "mode": "external",
-                                "startup": { "path": "/tmp/libcapanix_app_fs_meta_worker_facade.so" }
-                            },
-                            "scan": {
-                                "mode": "external",
-                                "startup": { "path": "/tmp/libcapanix_app_fs_meta_worker_facade.so" }
+                                "startup": { "path": "/tmp/libfs_meta_runtime.so" }
                             },
                             "sink": {
                                 "mode": "external",
-                                "startup": { "path": "/tmp/libcapanix_app_fs_meta_worker_facade.so" }
+                                "startup": { "path": "/tmp/libfs_meta_runtime.so" }
                             }
                         }
                     },

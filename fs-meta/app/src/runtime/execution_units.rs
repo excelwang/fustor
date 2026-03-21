@@ -1,20 +1,20 @@
 /// Runtime unit id for source execution scheduling domain.
-pub(crate) const SOURCE_RUNTIME_UNIT_ID: &str = "runtime.exec.source";
+pub const SOURCE_RUNTIME_UNIT_ID: &str = "runtime.exec.source";
 
 /// Runtime unit id for source scan execution scheduling domain.
-pub(crate) const SOURCE_SCAN_RUNTIME_UNIT_ID: &str = "runtime.exec.scan";
+pub const SOURCE_SCAN_RUNTIME_UNIT_ID: &str = "runtime.exec.scan";
 
 /// Runtime unit id for sink execution scheduling domain.
-pub(crate) const SINK_RUNTIME_UNIT_ID: &str = "runtime.exec.sink";
+pub const SINK_RUNTIME_UNIT_ID: &str = "runtime.exec.sink";
 
 /// Runtime unit id for app-level HTTP facade execution.
 pub(crate) const FACADE_RUNTIME_UNIT_ID: &str = "runtime.exec.facade";
 
 /// Runtime unit id for app-level internal query execution.
-pub(crate) const QUERY_RUNTIME_UNIT_ID: &str = "runtime.exec.query";
+pub const QUERY_RUNTIME_UNIT_ID: &str = "runtime.exec.query";
 
 /// Runtime unit id for per-root-scope peer query fanout execution.
-pub(crate) const QUERY_PEER_RUNTIME_UNIT_ID: &str = "runtime.exec.query-peer";
+pub const QUERY_PEER_RUNTIME_UNIT_ID: &str = "runtime.exec.query-peer";
 
 /// Source-side accepted runtime unit ids.
 pub(crate) const SOURCE_RUNTIME_UNITS: &[&str] =

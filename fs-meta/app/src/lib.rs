@@ -1,10 +1,10 @@
 use capanix_app_sdk::runtime::ConfigValue;
 use capanix_app_sdk::{CnxError, Result};
+use capanix_runtime_host_sdk::entry::capanix_unit_entry;
 
 pub mod api;
-pub mod product;
 pub mod query;
-mod runtime;
+pub mod runtime;
 mod runtime_app;
 pub mod shared_types;
 pub mod sink;
@@ -19,6 +19,8 @@ pub use shared_types::{
 };
 use source::config::SourceConfig;
 pub use source::config::{GrantedMountRoot, RootSelector, RootSpec};
+
+capanix_unit_entry!(FSMetaRuntimeApp);
 
 #[derive(Clone, Debug)]
 pub struct FSMetaConfig {

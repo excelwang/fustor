@@ -4,12 +4,12 @@ use std::sync::{Arc, Mutex};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 use capanix_app_sdk::CnxError;
-use capanix_app_sdk::raw::{BoundaryContext, StateBoundary};
 #[cfg(test)]
 use capanix_app_sdk::runtime::in_memory_state_boundary;
 use capanix_app_sdk::runtime::{
     StateCellHandle, StateCellReadRequest, StateCellWatchRequest, StateCellWriteRequest, StateClass,
 };
+use capanix_runtime_host_sdk::boundary::{BoundaryContext, StateBoundary};
 
 const AUTHORITY_JOURNAL_MAX_ENTRIES: usize = 4_096;
 const AUTHORITY_SCHEMA_REV: u64 = 1;

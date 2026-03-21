@@ -284,17 +284,17 @@ pub(crate) fn scenario_logical_single_kernel_semantics() -> Result<(), String> {
                     last_cfg_a = cfg_a.clone();
                     last_cfg_b = cfg_b.clone();
 
-                    let active_processes_a = status_a
+                    let active_runtime_hosts_a = status_a
                         .get("metrics")
                         .and_then(|v| v.get("active_processes"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    let active_processes_b = status_b
+                    let active_runtime_hosts_b = status_b
                         .get("metrics")
                         .and_then(|v| v.get("active_processes"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    if active_processes_a + active_processes_b == 0 {
+                    if active_runtime_hosts_a + active_runtime_hosts_b == 0 {
                         return Ok(false);
                     }
 
@@ -346,7 +346,7 @@ pub(crate) fn scenario_logical_single_kernel_semantics() -> Result<(), String> {
     )
 }
 
-pub(crate) fn scenario_in_process_kernel_hosting() -> Result<(), String> {
+pub(crate) fn scenario_local_kernel_hosting() -> Result<(), String> {
     with_cluster(
         FULL_NODE_DELEGATION_SCOPES,
         FULL_NODE_DELEGATION_SCOPES,

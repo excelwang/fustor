@@ -11,11 +11,11 @@ use super::runtime_admin::{
     encode_runtime_admin_request_value,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use capanix_app_fs_meta::{
+use fs_meta::{
     api::config::{ApiAuthConfig, BootstrapAdminConfig},
-    product::{build_release_doc_value, FsMetaReleaseSpec},
     RootSpec,
 };
+use fs_meta_deploy::{FsMetaReleaseSpec, build_release_doc_value};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
@@ -51,10 +51,12 @@ const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
 ];
 const NODE_NAMES: &[&str] = &["node-a", "node-b", "node-c", "node-d", "node-e"];
 
-fn configure_test_child_process(cmd: &mut Command) {
-    cmd.process_group(0);
+fn configure_test_child_runtime(cmd: &mut Command) {
     unsafe {
         cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -186,7 +188,7 @@ impl Cluster5 {
 
     pub fn fs_meta_app_runtime_path(&self) -> Result<PathBuf, String> {
         try_find_fs_meta_app_cdylib().ok_or_else(|| {
-            "fs-meta app runtime path not found; set CAPANIX_FS_META_APP_BINARY or build capanix-app-fs-meta-worker-facade"
+            "fs-meta app runtime path not found; set CAPANIX_FS_META_APP_BINARY or build fs-meta-runtime"
                 .to_string()
         })
     }
@@ -599,7 +601,7 @@ impl Cluster5 {
         value["target_generation"] = json!(generation);
         value["units"][0]["startup"]["path"] = json!(app_path.to_string_lossy().to_string());
         value["units"][0]["startup"]["manifest"] = json!(repo_root()
-            .join("fs-meta/fixtures/manifests/capanix-app-fs-meta.yaml")
+            .join("fs-meta/fixtures/manifests/fs-meta.yaml")
             .display()
             .to_string());
         value["units"][0]["version"] = json!(format!("real-nfs-{generation}"));
@@ -635,7 +637,7 @@ impl Cluster5 {
         }
     }
 
-    pub fn managed_pids_for_instance(
+    pub fn managed_host_pids_for_instance(
         &self,
         node_name: &str,
         instance_id: &str,
@@ -663,7 +665,7 @@ impl Cluster5 {
         unit_id: &str,
     ) -> Result<BTreeSet<u32>, String> {
         let status = self.status(node_name)?;
-        let managed = self.managed_pids_for_instance(node_name, instance_id)?;
+        let managed = self.managed_host_pids_for_instance(node_name, instance_id)?;
         let routes = status
             .get("daemon")
             .and_then(|v| v.get("activation"))
@@ -730,7 +732,7 @@ impl Cluster5 {
             .unwrap_or_else(|| json!({})))
     }
 
-    pub fn node_active_processes(&self, node_name: &str) -> Result<u64, String> {
+    pub fn node_active_runtime_hosts(&self, node_name: &str) -> Result<u64, String> {
         let status = self.status(node_name)?;
         Ok(status
             .get("node")
@@ -1089,15 +1091,15 @@ fn resolve_capanixd_bin() -> Option<PathBuf> {
 fn fs_meta_app_lib_filename() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "libcapanix_app_fs_meta_worker_facade.dylib"
+        "libfs_meta_runtime.dylib"
     }
     #[cfg(target_os = "windows")]
     {
-        "capanix_app_fs_meta_worker_facade.dll"
+        "fs_meta_runtime.dll"
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
-        "libcapanix_app_fs_meta_worker_facade.so"
+        "libfs_meta_runtime.so"
     }
 }
 
@@ -1124,13 +1126,8 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
     let watch_paths = vec![
         root.join("Cargo.lock"),
         root.join("fs-meta/app/src"),
-        root.join("fs-meta/worker-facade/src"),
-        root.join("fs-meta/worker-source/src"),
-        root.join("fs-meta/worker-source/Cargo.toml"),
-        root.join("fs-meta/worker-sink/src"),
-        root.join("fs-meta/worker-sink/Cargo.toml"),
-        root.join("fs-meta/worker-scan/src"),
-        root.join("fs-meta/worker-scan/Cargo.toml"),
+        root.join("fs-meta/app/src"),
+        root.join("fs-meta/app/Cargo.toml"),
         root.join("fs-meta/tests"),
         root.join("src"),
     ];
@@ -1153,7 +1150,7 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
             .current_dir(&root)
             .arg("build")
             .arg("-p")
-            .arg("capanix-app-fs-meta-worker-facade")
+            .arg("fs-meta-runtime")
             .arg("--lib")
             .status();
         let Ok(status) = status else {
@@ -1393,7 +1390,7 @@ impl RunningNode {
             cmd.env_remove("CAPANIX_ADMIN_SK_B64");
             cmd.env_remove("DATANIX_ADMIN_SK_B64");
         }
-        configure_test_child_process(&mut cmd);
+        configure_test_child_runtime(&mut cmd);
         let child = cmd.spawn().map_err(|e| format!("spawn capanixd: {e}"))?;
         Ok(Self {
             name: node.name.clone(),

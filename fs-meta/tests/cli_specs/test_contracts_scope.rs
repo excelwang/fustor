@@ -26,16 +26,17 @@ fn domain_boundary_consumption_only() {
     let manifest = package_manifest_text();
     assert!(
         source.contains("build_release_doc_value")
-            && source.contains("ScopeWorkerIntentDoc")
-            && source.contains("compile_scope_worker_intent_doc")
+            && source.contains("compile_release_doc_to_relation_target_intent")
             && source.contains("ControlClient")
             && source.contains("apply_relation_target_intent")
             && source.contains("clear_relation_target")
             && source.contains("run_cnxctl")
             && source.contains("resolve_cnxctl_bin")
-            && source.contains("\"scope-worker-intent-v1\"")
-            && manifest.contains("capanix-config = { workspace = true }")
-            && manifest.contains("capanix-runtime-api = \"0.1.0\"")
+            && source.contains("build_deploy_intent")
+            && !source.contains("ScopeWorkerIntentDoc")
+            && !source.contains("compile_scope_worker_intent_doc")
+            && !manifest.contains("capanix-config = { workspace = true }")
+            && !manifest.contains("capanix-runtime-api = \"0.1.0\"")
             && !source.contains("CtlCommand::RelationTargetApply")
             && !source.contains("CtlCommand::RelationTargetClear")
     );
@@ -110,7 +111,7 @@ fn local_dev_daemon_composition_only() {
     let l2 = include_str!("../../specs/L2-ARCHITECTURE.md");
 
     assert!(
-        manifest.contains("name = \"capanix-app-fs-meta-tooling\"")
+        manifest.contains("name = \"fs-meta-tooling\"")
             && manifest.contains("local-daemon = [\"dep:capanix-daemon\"]")
             && manifest.contains("capanix-daemon = { workspace = true, optional = true }")
             && manifest.contains("capanix-host-adapter-fs = { workspace = true }")
@@ -118,7 +119,7 @@ fn local_dev_daemon_composition_only() {
         "fs-meta local-dev launcher should stay in the dedicated tooling package as an explicit optional feature over daemon seams"
     );
     assert!(
-        l2.contains("workspace package `capanix-app-fs-meta-tooling`")
+        l2.contains("workspace package `fs-meta-tooling`")
             && l2.contains("feature-gated away from the default CLI install")
             && l2.contains("run_with_host_passthrough_bootstrap")
             && l2.contains("spawn_host_passthrough_endpoint")

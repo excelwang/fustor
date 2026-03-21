@@ -86,7 +86,7 @@ workers:
 
 1. `fsmeta deploy` 默认以 `roots=[]` 启动服务。
 2. `fsmeta deploy` 消费共享的 `capanix-config` 配置/manifest/intention 编译语义以及 daemon/runtime ingress，而不是重新发明第二套平台配置语义。
-3. `workers.source.mode` / `workers.scan.mode` / `workers.sink.mode` 属于产品 deploy 配置；其中 `scan` 与 `source` 在当前基线仍共享一套 realization，配置变更会编译成下一代 `__cnx_runtime.workers` bindings，通过正常 generation rollout 生效，而不是在同一运行代内热切换。
+3. `workers.source.mode` / `workers.sink.mode` 属于产品 deploy 配置；`scan` 在当前基线是 `source-worker` 内的 source-side unit，而不是独立 worker role。配置变更会编译成下一代 `__cnx_runtime.workers` bindings，通过正常 generation rollout 生效，而不是在同一运行代内热切换。
 4. app target、manifest、desired-state document、runtime subscriptions、source/sink execution wiring、auth 文件路径等内部细节由 CLI 自动生成。
 5. deploy 完成后会输出 `api_facade_resource_id`、一次性的 bootstrap 管理员凭据和内部 state 目录。
 
