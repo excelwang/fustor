@@ -325,6 +325,7 @@ dependencies = [
 name = "capanix-host-adapter-sdk"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "capanix-kernel-api",
  "rmp-serde",
@@ -407,6 +408,7 @@ name = "capanix-runtime"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64",
  "capanix-config",
  "capanix-kernel-api",

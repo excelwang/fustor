@@ -853,12 +853,20 @@ fn spawn_local_source_pump(
                     let lane_name = lane.clone();
                     let task = tokio::task::spawn_blocking(move || {
                         while let Some(batch) = rx.blocking_recv() {
-                            if let Err(err) = send_boundary.channel_send(
-                                BoundaryContext::default(),
-                                ChannelSendRequest {
-                                    channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                                    events: batch,
-                                },
+                            if let Err(err) = crate::runtime_app::block_on_shared_runtime(
+                                send_boundary.channel_send(
+                                    BoundaryContext::default(),
+                                    ChannelSendRequest {
+                                        channel_key: ChannelKey(format!(
+                                            "{}.stream",
+                                            ROUTE_KEY_EVENTS
+                                        )),
+                                        events: batch,
+                                        timeout_ms: Some(
+                                            Duration::from_secs(5).as_millis() as u64
+                                        ),
+                                    },
+                                ),
                             ) {
                                 log::error!(
                                     "fs-meta app pump failed to publish source batch on stream route lane={}: {:?}",

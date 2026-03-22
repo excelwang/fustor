@@ -755,12 +755,14 @@ impl SinkFileMeta {
                                 }
                             };
 
-                            match proxy_adapter.call_collect(
-                                ROUTE_TOKEN_FS_META_INTERNAL,
-                                METHOD_SOURCE_FIND,
-                                Bytes::copy_from_slice(req.payload_bytes()),
-                                Duration::from_secs(60),
-                                Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
+                            match crate::runtime_app::block_on_shared_runtime(
+                                proxy_adapter.call_collect(
+                                    ROUTE_TOKEN_FS_META_INTERNAL,
+                                    METHOD_SOURCE_FIND,
+                                    Bytes::copy_from_slice(req.payload_bytes()),
+                                    Duration::from_secs(60),
+                                    Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
+                                ),
                             ) {
                                 Ok(source_events) => {
                                     eprintln!(
@@ -1078,12 +1080,14 @@ impl SinkFileMeta {
                             }
                         };
 
-                        match proxy_adapter.call_collect(
-                            ROUTE_TOKEN_FS_META_INTERNAL,
-                            METHOD_SOURCE_FIND,
-                            Bytes::copy_from_slice(req.payload_bytes()),
-                            Duration::from_secs(60),
-                            Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
+                        match crate::runtime_app::block_on_shared_runtime(
+                            proxy_adapter.call_collect(
+                                ROUTE_TOKEN_FS_META_INTERNAL,
+                                METHOD_SOURCE_FIND,
+                                Bytes::copy_from_slice(req.payload_bytes()),
+                                Duration::from_secs(60),
+                                Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
+                            ),
                         ) {
                             Ok(source_events) => {
                                 for event in source_events {

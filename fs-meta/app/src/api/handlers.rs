@@ -19,7 +19,7 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
 
 use crate::query::api::{
     merge_sink_status_snapshots, refresh_policy_from_host_object_grants,
-    route_sink_status_snapshot, run_blocking_query,
+    route_sink_status_snapshot,
 };
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
@@ -450,8 +450,10 @@ pub async fn roots_put(
                             },
                             bytes::Bytes::from(payload.clone()),
                         )],
+                        timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
                     },
                 )
+                .await
                 .map_err(|err| {
                     ApiError::internal(format!(
                         "logical roots control send failed route={route_key}: {err}"
@@ -508,8 +510,10 @@ pub async fn rescan(
                         },
                         bytes::Bytes::from(payload),
                     )],
+                    timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
                 },
             )
+            .await
             .map_err(|err| {
                 ApiError::internal(format!("manual rescan control send failed: {err}"))
             })?;
@@ -680,19 +684,15 @@ async fn route_source_observability_snapshot(
     idle_after_first: Duration,
 ) -> Result<(SourceObservabilitySnapshot, BTreeMap<String, Vec<String>>), CnxError> {
     let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
-    let events = run_blocking_query(
-        move || {
-            adapter.call_collect(
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SOURCE_STATUS,
-                Bytes::new(),
-                timeout,
-                idle_after_first,
-            )
-        },
-        timeout,
-    )
-    .await?;
+    let events = adapter
+        .call_collect(
+            ROUTE_TOKEN_FS_META_INTERNAL,
+            METHOD_SOURCE_STATUS,
+            Bytes::new(),
+            timeout,
+            idle_after_first,
+        )
+        .await?;
     let snapshots = events
         .into_iter()
         .map(|event| {

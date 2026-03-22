@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -23,7 +24,7 @@ impl TestRuntimeApp {
 
 #[async_trait]
 impl RuntimeBoundaryApp for TestRuntimeApp {
-    async fn send(&self, _events: &[Event]) -> Result<()> {
+    async fn send(&self, _events: &[Event], _timeout: Duration) -> Result<()> {
         Ok(())
     }
 

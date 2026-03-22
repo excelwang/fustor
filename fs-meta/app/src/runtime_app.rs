@@ -142,6 +142,17 @@ pub(crate) fn shared_tokio_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+pub(crate) fn block_on_shared_runtime<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::block_in_place(|| shared_tokio_runtime().block_on(fut))
+    } else {
+        shared_tokio_runtime().block_on(fut)
+    }
+}
+
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_micros() as u64,
@@ -513,13 +524,15 @@ impl FSMetaApp {
                                         "encode public query request failed: {err}"
                                     ))
                                 })?;
-                                capanix_host_adapter_fs::HostAdapter::call_collect(
-                                    &adapter,
-                                    ROUTE_TOKEN_FS_META_INTERNAL,
-                                    crate::runtime::routes::METHOD_SINK_QUERY_PROXY,
-                                    bytes::Bytes::from(payload),
-                                    Duration::from_secs(30),
-                                    Duration::from_secs(5),
+                                crate::runtime_app::block_on_shared_runtime(
+                                    capanix_host_adapter_fs::HostAdapter::call_collect(
+                                        &adapter,
+                                        ROUTE_TOKEN_FS_META_INTERNAL,
+                                        crate::runtime::routes::METHOD_SINK_QUERY_PROXY,
+                                        bytes::Bytes::from(payload),
+                                        Duration::from_secs(30),
+                                        Duration::from_secs(5),
+                                    ),
                                 )
                             })();
                             match result {
@@ -1738,11 +1751,11 @@ impl RuntimeBoundaryApp for FSMetaRuntimeApp {
         }
     }
 
-    async fn send(&self, events: &[Event]) -> Result<()> {
+    async fn send(&self, events: &[Event], timeout: Duration) -> Result<()> {
         if tokio::runtime::Handle::try_current().is_ok() {
-            self.runtime.send(events).await
+            self.runtime.send(events, timeout).await
         } else {
-            shared_tokio_runtime().block_on(self.runtime.send(events))
+            shared_tokio_runtime().block_on(self.runtime.send(events, timeout))
         }
     }
 

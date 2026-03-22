@@ -85,7 +85,9 @@ fn start_source_pump_with_stream<S>(
 where
     S: futures_util::Stream<Item = Vec<Event>> + Send + 'static,
 {
-    runtime.spawn(async move {
+    let runtime_for_spawn = runtime.clone();
+    let send_runtime = runtime.clone();
+    runtime_for_spawn.spawn(async move {
         let mut lanes =
             HashMap::<String, (tokio::sync::mpsc::UnboundedSender<Vec<Event>>, JoinHandle<()>)>::new();
 
@@ -101,14 +103,19 @@ where
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
                 let send_boundary = boundary.clone();
                 let lane_name = lane.clone();
+                let send_runtime = send_runtime.clone();
                 let task = tokio::task::spawn_blocking(move || {
                     while let Some(batch) = rx.blocking_recv() {
-                        if let Err(err) = send_boundary.channel_send(
-                            BoundaryContext::default(),
-                            ChannelSendRequest {
-                                channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                                events: batch,
-                            },
+                        if let Err(err) = block_on_runtime(
+                            &send_runtime,
+                            send_boundary.channel_send(
+                                BoundaryContext::default(),
+                                ChannelSendRequest {
+                                    channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                                    events: batch,
+                                    timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
+                                },
+                            ),
                         ) {
                             log::error!(
                                 "source worker pump failed to publish source batch on stream route lane={}: {:?}",

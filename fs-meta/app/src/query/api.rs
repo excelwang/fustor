@@ -415,19 +415,15 @@ async fn route_source_status_snapshot(
     timeout: Duration,
 ) -> Result<SourceStatusSnapshot, CnxError> {
     let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
-    let events = run_blocking_query(
-        move || {
-            adapter.call_collect(
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SOURCE_STATUS,
-                Bytes::new(),
-                timeout,
-                MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
-            )
-        },
-        timeout,
-    )
-    .await?;
+    let events = adapter
+        .call_collect(
+            ROUTE_TOKEN_FS_META_INTERNAL,
+            METHOD_SOURCE_STATUS,
+            Bytes::new(),
+            timeout,
+            MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
+        )
+        .await?;
     let snapshots = events
         .into_iter()
         .map(|event| {
@@ -447,19 +443,15 @@ pub(crate) async fn route_sink_status_snapshot(
     timeout: Duration,
 ) -> Result<SinkStatusSnapshot, CnxError> {
     let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
-    let events = run_blocking_query(
-        move || {
-            adapter.call_collect(
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SINK_STATUS,
-                Bytes::new(),
-                timeout,
-                MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
-            )
-        },
-        timeout,
-    )
-    .await?;
+    let events = adapter
+        .call_collect(
+            ROUTE_TOKEN_FS_META_INTERNAL,
+            METHOD_SINK_STATUS,
+            Bytes::new(),
+            timeout,
+            MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
+        )
+        .await?;
     let snapshots = events
         .into_iter()
         .map(|event| {
@@ -1133,19 +1125,15 @@ async fn query_materialized_events(
                 CnxError::Internal(format!("encode materialized query failed: {err}"))
             })?;
             eprintln!("fs_meta_query_api: query_materialized_events route call_collect begin");
-            let events = run_blocking_query(
-                move || {
-                    adapter.call_collect(
-                        ROUTE_TOKEN_FS_META_INTERNAL,
-                        METHOD_SINK_QUERY_PROXY,
-                        Bytes::from(payload),
-                        timeout,
-                        MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
-                    )
-                },
-                timeout,
-            )
-            .await
+            let events = adapter
+                .call_collect(
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SINK_QUERY_PROXY,
+                    Bytes::from(payload),
+                    timeout,
+                    MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
+                )
+                .await
             .map_err(|err| {
                 eprintln!(
                     "fs_meta_query_api: query_materialized_events route call_collect failed err={}",
@@ -1200,19 +1188,15 @@ async fn query_force_find_events(
                 CnxError::Internal(format!("encode force-find query failed: {err}"))
             })?;
             eprintln!("fs_meta_query_api: query_force_find_events route call_collect begin");
-            let events = run_blocking_query(
-                move || {
-                    adapter.call_collect(
-                        ROUTE_TOKEN_FS_META_INTERNAL,
-                        METHOD_SOURCE_FIND,
-                        Bytes::from(payload),
-                        timeout,
-                        FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE,
-                    )
-                },
-                timeout,
-            )
-            .await
+            let events = adapter
+                .call_collect(
+                    ROUTE_TOKEN_FS_META_INTERNAL,
+                    METHOD_SOURCE_FIND,
+                    Bytes::from(payload),
+                    timeout,
+                    FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE,
+                )
+                .await
             .map_err(|err| {
                 eprintln!(
                     "fs_meta_query_api: query_force_find_events route call_collect failed err={}",

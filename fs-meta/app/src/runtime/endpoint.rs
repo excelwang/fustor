@@ -224,13 +224,14 @@ fn run_endpoint_loop<F>(
         if responses.is_empty() {
             continue;
         }
-        if let Err(err) = boundary.channel_send(
+        if let Err(err) = crate::runtime_app::block_on_shared_runtime(boundary.channel_send(
             ctx.clone(),
             ChannelSendRequest {
                 channel_key: reply_channel.clone(),
                 events: responses,
+                timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
             },
-        ) {
+        )) {
             log::warn!(
                 "endpoint task {} send failed for {}: {:?}",
                 join_name,

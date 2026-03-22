@@ -27,6 +27,13 @@ const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
 const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn block_on_shared_runtime<F, T>(fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    crate::runtime_app::block_on_shared_runtime(fut)
+}
+
 fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
     let mut selected = None::<QueryNode>;
     for event in &events {
@@ -412,13 +419,13 @@ impl SinkWorkerClientHandle {
         let payload = rmp_serde::to_vec(&request).map_err(|err| {
             CnxError::Internal(format!("sink worker force-find encode failed: {err}"))
         })?;
-        let result = adapter.call_collect(
+        let result = block_on_shared_runtime(adapter.call_collect(
             ROUTE_TOKEN_FS_META,
             METHOD_FIND,
             Bytes::from(payload),
             SINK_WORKER_FORCE_FIND_TIMEOUT,
             SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE,
-        );
+        ));
         eprintln!(
             "fs-meta sink worker proxy: force_find end node={} result={:?}",
             self.node_id.0,
