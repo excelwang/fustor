@@ -16,9 +16,7 @@ pub struct RawQueryResult {
     pub unreliable_reason: Option<UnreliableReason>,
 }
 
-pub fn query_response_from_records(
-    records: HashMap<Vec<u8>, FileMetaRecord>,
-) -> RawQueryResult {
+pub fn query_response_from_records(records: HashMap<Vec<u8>, FileMetaRecord>) -> RawQueryResult {
     let mut nodes: Vec<QueryNode> = records
         .into_values()
         .filter(|record| !matches!(record.event_kind, EventKind::Delete))

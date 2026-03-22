@@ -1,7 +1,7 @@
+use fs_meta::api::config::ApiConfig as ProductApiConfig;
 pub use fs_meta::api::config::{
     ApiAuthConfig, ApiListenerResource, BootstrapAdminConfig, BootstrapManagementConfig,
 };
-use fs_meta::api::config::ApiConfig as ProductApiConfig;
 
 #[derive(Debug, Clone)]
 pub struct ApiConfig {

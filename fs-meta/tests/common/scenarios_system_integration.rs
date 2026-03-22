@@ -110,12 +110,14 @@ fn release_apply_single_with_retry(c: &ClusterContext, mut entry: Value) -> Resu
             .unwrap_or(1);
         let command = json!({
             "command": "relation_target_apply",
-            "intent": {
-                "schema_version": "scope-unit-intent-v1",
+            "declaration": {
+                "schema_version": "scope-worker-declaration-v1",
                 "target_id": target_id,
                 "target_generation": target_generation,
-                "units": [{
-                    "unit_id": entry.get("id").and_then(Value::as_str).unwrap_or("unit"),
+                "workers": [{
+                    "worker_role": entry.get("id").and_then(Value::as_str).and_then(|id| id.rsplit('.').next()).unwrap_or("main"),
+                    "worker_id": entry.get("id").and_then(Value::as_str).unwrap_or("unit"),
+                    "mode": "embedded",
                     "scope_ids": [],
                     "startup": {
                         "path": entry.get("app").and_then(Value::as_str).unwrap_or_default(),

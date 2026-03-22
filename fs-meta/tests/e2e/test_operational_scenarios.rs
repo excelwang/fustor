@@ -1,6 +1,6 @@
 #![cfg(target_os = "linux")]
 
-use crate::support::api_client::{ApiResponse, FsMetaApiClient, OperatorSession};
+use crate::support::api_client::OperatorSession;
 use crate::support::cluster5::Cluster5;
 use crate::support::nfs_lab::NfsLab;
 use crate::support::{reserve_http_addrs, skip_unless_real_nfs_enabled, wait_until};
@@ -509,11 +509,6 @@ fn scenario_facade_failover_and_resource_switch(
         "node-e"
     };
 
-    let replacement_node = if holder_node == "node-d" {
-        "node-e"
-    } else {
-        "node-d"
-    };
     cluster.withdraw_resources_clusterwide(
         &cluster.node_id(&holder_node)?,
         vec![facade_resource_id.to_string()],
@@ -719,21 +714,6 @@ fn source_primary_for_group(
     Ok(None)
 }
 
-fn force_find_inflight_groups(session: &mut OperatorSession) -> Result<BTreeSet<String>, String> {
-    let mut groups = BTreeSet::new();
-    for status in session.status_all()? {
-        if let Some(items) = status
-            .get("source")
-            .and_then(|source| source.get("debug"))
-            .and_then(|debug| debug.get("force_find_inflight_groups"))
-            .and_then(Value::as_array)
-        {
-            groups.extend(items.iter().filter_map(Value::as_str).map(str::to_string));
-        }
-    }
-    Ok(groups)
-}
-
 fn wait_last_force_find_runner(
     session: &mut OperatorSession,
     group_id: &str,
@@ -826,33 +806,6 @@ fn seed_force_find_stress_content(
                 "force-find-stress\n",
             )?;
         }
-    }
-    Ok(())
-}
-
-fn assert_status(actual: u16, expected: u16, context: &str) -> Result<(), String> {
-    if actual != expected {
-        return Err(format!("{context} expected http {expected}, got {actual}"));
-    }
-    Ok(())
-}
-
-fn assert_api_error(
-    response: &ApiResponse,
-    expected_status: u16,
-    expected_code: &str,
-) -> Result<(), String> {
-    assert_status(response.status, expected_status, "api error response")?;
-    let code = response
-        .body
-        .get("code")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    if code != expected_code {
-        return Err(format!(
-            "expected error code {expected_code}, got {code}; body={}",
-            response.body
-        ));
     }
     Ok(())
 }

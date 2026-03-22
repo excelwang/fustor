@@ -37,6 +37,10 @@ const FULL_NODE_DELEGATION_SCOPES: &[&str] = &[
     "tx_execute",
 ];
 
+fn cargo_build_silent(command: &mut Command) -> Option<std::process::Output> {
+    command.output().ok()
+}
+
 fn configure_test_child_runtime(cmd: &mut Command) {
     unsafe {
         cmd.pre_exec(|| {
@@ -239,18 +243,18 @@ fn resolve_capanixd_bin() -> Option<PathBuf> {
     }
 
     for cargo_bin in cargo_bins {
-        let status = Command::new(&cargo_bin)
-            .current_dir(&root)
-            .arg("build")
-            .arg("-p")
-            .arg("capanix-daemon")
-            .arg("--bin")
-            .arg("capanixd")
-            .status();
-        let Ok(status) = status else {
+        let Some(output) = cargo_build_silent(
+            Command::new(&cargo_bin)
+                .current_dir(&root)
+                .arg("build")
+                .arg("-p")
+                .arg("capanix-daemon")
+                .arg("--bin")
+                .arg("capanixd"),
+        ) else {
             continue;
         };
-        if !status.success() {
+        if !output.status.success() {
             continue;
         }
         if let Some(found) = candidates.iter().find(|p| p.exists()) {
@@ -343,17 +347,17 @@ fn resolve_test_app_cdylib() -> Option<PathBuf> {
         }
     }
 
-    let Ok(status) = Command::new("cargo")
-        .current_dir(&root)
-        .arg("build")
-        .arg("--manifest-path")
-        .arg(fixture_manifest)
-        .arg("--lib")
-        .status()
-    else {
+    let Some(output) = cargo_build_silent(
+        Command::new("cargo")
+            .current_dir(&root)
+            .arg("build")
+            .arg("--manifest-path")
+            .arg(fixture_manifest)
+            .arg("--lib"),
+    ) else {
         return None;
     };
-    if !status.success() {
+    if !output.status.success() {
         return None;
     }
 
@@ -424,17 +428,17 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
     }
 
     for cargo_bin in cargo_bins {
-        let status = Command::new(&cargo_bin)
-            .current_dir(&root)
-            .arg("build")
-            .arg("-p")
-            .arg("fs-meta-runtime")
-            .arg("--lib")
-            .status();
-        let Ok(status) = status else {
+        let Some(output) = cargo_build_silent(
+            Command::new(&cargo_bin)
+                .current_dir(&root)
+                .arg("build")
+                .arg("-p")
+                .arg("fs-meta-runtime")
+                .arg("--lib"),
+        ) else {
             continue;
         };
-        if !status.success() {
+        if !output.status.success() {
             continue;
         }
         if let Some(found) = candidates.iter().find(|p| p.exists()) {
@@ -1032,8 +1036,34 @@ fn normalize_runtime_admin_command(command: Value) -> Option<Value> {
     if command_obj.get("command").and_then(Value::as_str) != Some("relation_target_apply") {
         return None;
     }
-    let intent = command_obj.get_mut("intent")?.as_object_mut()?;
-    let units = intent.get_mut("units")?.as_array_mut()?;
+    let declaration = if let Some(value) = command_obj.get_mut("declaration") {
+        value.as_object_mut()?
+    } else {
+        command_obj.get_mut("intent")?.as_object_mut()?
+    };
+    if let Some(workers) = declaration.get_mut("workers").and_then(Value::as_array_mut) {
+        for worker in workers {
+            let Some(worker_obj) = worker.as_object_mut() else {
+                continue;
+            };
+            let Some(startup) = worker_obj.get_mut("startup").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            let Some(manifest) = startup.get_mut("manifest") else {
+                continue;
+            };
+            let Some(raw) = manifest.as_str() else {
+                continue;
+            };
+            let path = PathBuf::from(raw);
+            if path.is_absolute() {
+                continue;
+            }
+            *manifest = Value::String(repo_root().join(path).display().to_string());
+        }
+        return Some(Value::Object(command_obj));
+    }
+    let units = declaration.get_mut("units")?.as_array_mut()?;
     for unit in units {
         let Some(unit_obj) = unit.as_object_mut() else {
             continue;

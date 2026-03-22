@@ -206,19 +206,6 @@ fn wait_for_primary_tree_materialization(
     })
 }
 
-fn wait_for_management_stabilized(
-    session: &mut OperatorSession,
-    reason: &str,
-) -> Result<(), String> {
-    wait_until(Duration::from_secs(60), reason, || {
-        let status = match session.status() {
-            Ok(status) => status,
-            Err(_) => return Ok(false),
-        };
-        Ok(status.get("source").is_some() || status.get("facade").is_some())
-    })
-}
-
 fn current_root_ids(session: &mut OperatorSession) -> Result<Vec<String>, String> {
     let current_roots = session.monitoring_roots()?;
     Ok(current_roots
@@ -440,16 +427,6 @@ fn root_spec(id: &str, fs_source: &str) -> RootSpec {
         scan: true,
         audit_interval_ms: None,
     }
-}
-
-fn root_payload(id: &str, fs_source: &str, subpath_scope: &str) -> Value {
-    json!({
-        "id": id,
-        "selector": { "fs_source": fs_source },
-        "subpath_scope": subpath_scope,
-        "watch": true,
-        "scan": true,
-    })
 }
 
 fn group_total_nodes(payload: &Value, group_key: &str) -> u64 {

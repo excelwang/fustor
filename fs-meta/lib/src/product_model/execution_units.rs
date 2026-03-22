@@ -17,8 +17,7 @@ pub const QUERY_RUNTIME_UNIT_ID: &str = "runtime.exec.query";
 pub const QUERY_PEER_RUNTIME_UNIT_ID: &str = "runtime.exec.query-peer";
 
 /// Source-side accepted runtime unit ids.
-pub const SOURCE_RUNTIME_UNITS: &[&str] =
-    &[SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID];
+pub const SOURCE_RUNTIME_UNITS: &[&str] = &[SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID];
 
 /// Sink-side accepted runtime unit ids.
 pub const SINK_RUNTIME_UNITS: &[&str] = &[SINK_RUNTIME_UNIT_ID];

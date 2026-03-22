@@ -42,8 +42,8 @@ mod tests {
     fn runtime_admin_request_roundtrip_preserves_worker_intent_payload_shape() {
         let command = json!({
             "command": "relation_target_apply",
-            "intent": {
-                "schema_version": "scope-worker-intent-v1",
+            "declaration": {
+                "schema_version": "scope-worker-declaration-v1",
                 "target_id": "fs-meta-test",
                 "target_generation": 7,
                 "route_plans": [],

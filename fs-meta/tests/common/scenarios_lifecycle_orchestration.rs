@@ -84,12 +84,14 @@ fn release_apply_one_cardinality_with_generation(
         app_id,
         json!({
             "command": "relation_target_apply",
-            "intent": {
-                "schema_version": "scope-unit-intent-v1",
+            "declaration": {
+                "schema_version": "scope-worker-declaration-v1",
                 "target_id": app_id,
                 "target_generation": generation,
-                "units": [{
-                    "unit_id": app_id,
+                "workers": [{
+                    "worker_role": "main",
+                    "worker_id": app_id,
+                    "mode": "embedded",
                     "scope_ids": [],
                     "startup": {
                         "path": app_path,

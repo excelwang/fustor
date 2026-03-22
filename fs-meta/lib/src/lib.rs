@@ -201,7 +201,10 @@ impl FSMetaConfig {
             out.source.sink_tombstone_tolerance_us =
                 source::config::SourceConfig::normalize_sink_tombstone_tolerance_us(value as u64);
         }
-        out.source.roots = out.source.effective_roots().map_err(CnxError::InvalidInput)?;
+        out.source.roots = out
+            .source
+            .effective_roots()
+            .map_err(CnxError::InvalidInput)?;
         let api_map = get_map(cfg, "api")
             .ok_or_else(|| CnxError::InvalidInput("api config is required".into()))?;
         out.api.enabled = get_bool(api_map, "enabled", true);

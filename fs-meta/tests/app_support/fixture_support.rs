@@ -182,17 +182,20 @@ fn ensure_fixture_binary() -> Result<PathBuf, String> {
     }
 
     let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = Command::new(cargo_bin)
+    let output = Command::new(cargo_bin)
         .current_dir(&root)
         .arg("build")
         .arg("-p")
         .arg("fs-meta-runtime")
         .arg("--bin")
         .arg("fs_meta_api_fixture")
-        .status()
+        .output()
         .map_err(|e| format!("spawn cargo build for fixture failed: {e}"))?;
-    if !status.success() {
-        return Err("cargo build for fixture failed".to_string());
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        return Err(format!("cargo build for fixture failed: {detail}"));
     }
 
     if !bin.exists() {

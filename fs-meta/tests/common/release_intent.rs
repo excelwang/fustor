@@ -58,6 +58,7 @@ pub(crate) fn release_v2_doc_to_scope_unit_intent_value(doc: &Value) -> Result<V
             json!({
                 "worker_role": worker_role,
                 "worker_id": worker_id,
+                "mode": "embedded",
                 "scope_ids": [],
                 "startup": Value::Object(startup),
                 "config": entry.get("config").cloned().unwrap_or_else(|| json!({})),
@@ -69,7 +70,7 @@ pub(crate) fn release_v2_doc_to_scope_unit_intent_value(doc: &Value) -> Result<V
         })
         .collect::<Vec<_>>();
     Ok(json!({
-        "schema_version": "scope-worker-intent-v1",
+        "schema_version": "scope-worker-declaration-v1",
         "target_id": target_id,
         "target_generation": target_generation,
         "workers": workers

@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
-use capanix_app_sdk::runtime::ConfigValue;
 use capanix_app_sdk::Result;
+use capanix_app_sdk::runtime::ConfigValue;
 use fs_meta::FSMetaConfig as ProductFSMetaConfig;
 
 use crate::api::config::{ApiConfig, ApiListenerResource};
@@ -22,7 +22,10 @@ pub struct FSMetaConfig {
 
 impl Default for FSMetaConfig {
     fn default() -> Self {
-        Self::from_product_config(ProductFSMetaConfig::default(), FSMetaRuntimeInputs::default())
+        Self::from_product_config(
+            ProductFSMetaConfig::default(),
+            FSMetaRuntimeInputs::default(),
+        )
     }
 }
 
@@ -34,10 +37,7 @@ impl From<ProductFSMetaConfig> for FSMetaConfig {
 
 impl FSMetaRuntimeInputs {
     pub fn from_runtime_manifest_config(cfg: &HashMap<String, ConfigValue>) -> Self {
-        fn get_str<'a>(
-            row: &'a HashMap<String, ConfigValue>,
-            key: &str,
-        ) -> Option<&'a str> {
+        fn get_str<'a>(row: &'a HashMap<String, ConfigValue>, key: &str) -> Option<&'a str> {
             match row.get(key) {
                 Some(ConfigValue::String(s)) => Some(s.as_str()),
                 _ => None,
@@ -197,10 +197,7 @@ impl FSMetaRuntimeInputs {
 }
 
 impl FSMetaConfig {
-    pub fn from_product_config(
-        product: ProductFSMetaConfig,
-        runtime: FSMetaRuntimeInputs,
-    ) -> Self {
+    pub fn from_product_config(product: ProductFSMetaConfig, runtime: FSMetaRuntimeInputs) -> Self {
         Self {
             source: SourceConfig::from_product_config(product.source, runtime.host_object_grants),
             api: ApiConfig::from_product_config(product.api, runtime.local_listener_resources),

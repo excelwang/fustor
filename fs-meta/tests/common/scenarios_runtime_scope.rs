@@ -338,7 +338,7 @@ pub(crate) fn scenario_runtime_orchestrated_worker_hosting_config_apply_e2e() ->
             let apply_add = c
                 .ctl_ok_a_local(json!({
                     "command": "relation_target_apply",
-                    "intent": intent,
+                    "declaration": intent,
                 }))
                 .map_err(|e| format!("runtime-e2e relation_target_apply failed: {e}"))?;
             if apply_add.get("ok").and_then(Value::as_bool) != Some(true) {
@@ -729,7 +729,7 @@ pub(crate) fn scenario_single_entrypoint_distributed_apply_e2e() -> Result<(), S
             let apply = c
                 .ctl_ok_a_local(json!({
                     "command": "relation_target_apply",
-                    "intent": intent,
+                    "declaration": intent,
                 }))
                 .map_err(|e| format!("distributed-e2e relation_target_apply failed: {e}"))?;
             if apply.get("ok").and_then(Value::as_bool) != Some(true) {

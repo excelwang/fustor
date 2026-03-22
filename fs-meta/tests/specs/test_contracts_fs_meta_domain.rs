@@ -1138,8 +1138,7 @@ fn test_role_group_access_guard_contract() {
 fn test_runtime_support_transport_supervision_contracts() {
     let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md");
-    let worker_l1 =
-        read_capanix_repo_file("crates/worker-runtime-support/specs/L1-CONTRACTS.md");
+    let worker_l1 = read_capanix_repo_file("crates/worker-runtime-support/specs/L1-CONTRACTS.md");
     let worker_l2 =
         read_capanix_repo_file("crates/worker-runtime-support/specs/L2-ARCHITECTURE.md");
 

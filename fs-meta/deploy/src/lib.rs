@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use capanix_app_sdk::runtime::{RouteKey, RoutePlanMode, RoutePlanSpec};
 use capanix_app_sdk::{CnxError, Result};
 use capanix_deploy_sdk::compile_relation_target_intent_value;
+use fs_meta::RootSpec;
+pub use fs_meta::api::types::RootEntry;
+pub use fs_meta::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};
 use fs_meta::product_model::execution_units::{
     QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID,
     SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
@@ -14,9 +17,6 @@ use fs_meta::product_model::routes::{
     ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL,
 };
-use fs_meta::RootSpec;
-pub use fs_meta::api::types::RootEntry;
-pub use fs_meta::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -231,7 +231,7 @@ fn scope_unit_intent_to_scope_worker_intent_value(
         })
         .collect::<Vec<_>>();
     Ok(serde_json::json!({
-        "schema_version": "scope-worker-intent-v1",
+        "schema_version": "scope-worker-declaration-v1",
         "target_id": target_id,
         "target_generation": target_generation,
         "workers": workers,

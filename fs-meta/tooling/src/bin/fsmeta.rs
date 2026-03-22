@@ -654,16 +654,19 @@ fn ensure_fixture_binary() -> anyhow::Result<PathBuf> {
         return Ok(bin);
     }
     let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = Command::new(cargo_bin)
+    let output = Command::new(cargo_bin)
         .current_dir(&root)
         .arg("build")
         .arg("-p")
         .arg("fs-meta-runtime")
         .arg("--bin")
         .arg("fs_meta_api_fixture")
-        .status()?;
-    if !status.success() {
-        bail!("cargo build for fs_meta_api_fixture failed");
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        bail!("cargo build for fs_meta_api_fixture failed: {detail}");
     }
     Ok(bin)
 }
@@ -782,15 +785,18 @@ fn ensure_fs_meta_app_runtime_path() -> anyhow::Result<PathBuf> {
         return Ok(bin.canonicalize()?);
     }
     let cargo_bin = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
-    let status = Command::new(cargo_bin)
+    let output = Command::new(cargo_bin)
         .current_dir(&root)
         .arg("build")
         .arg("-p")
         .arg("fs-meta-runtime")
         .arg("--lib")
-        .status()?;
-    if !status.success() {
-        bail!("cargo build for fs-meta-runtime failed");
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if !stderr.is_empty() { stderr } else { stdout };
+        bail!("cargo build for fs-meta-runtime failed: {detail}");
     }
     Ok(bin.canonicalize()?)
 }
@@ -1059,7 +1065,10 @@ mod tests {
         let intent = build_deploy_intent(&product, auth_cfg, &app_target, &manifest)
             .expect("deploy intent should compile through shared config boundary");
 
-        assert_eq!(intent["schema_version"], json!("scope-worker-intent-v1"));
+        assert_eq!(
+            intent["schema_version"],
+            json!("scope-worker-declaration-v1")
+        );
         assert_eq!(intent["target_id"], json!("fs-meta"));
         let workers_array = intent["workers"]
             .as_array()

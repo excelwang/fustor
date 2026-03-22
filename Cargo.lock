@@ -259,6 +259,7 @@ dependencies = [
  "futures-core",
  "serde",
  "serde_json",
+ "tokio",
  "tokio-util",
  "tracing",
 ]
@@ -329,6 +330,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "serde_bytes",
+ "tokio",
  "tokio-util",
  "tracing",
 ]
@@ -508,6 +510,7 @@ dependencies = [
  "bytes",
  "capanix-runtime-api",
  "futures-core",
+ "libc",
  "prost",
  "prost-build",
  "protoc-bin-vendored",
@@ -527,6 +530,7 @@ dependencies = [
  "capanix-app-sdk",
  "capanix-kernel-api",
  "capanix-unit-sidecar",
+ "libc",
  "rmp-serde",
  "serde",
  "serde_json",

@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-pub use fs_meta::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 use fs_meta::source::config::SourceConfig as ProductSourceConfig;
+pub use fs_meta::source::config::{GrantedMountRoot, RootSelector, RootSpec};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceConfig {

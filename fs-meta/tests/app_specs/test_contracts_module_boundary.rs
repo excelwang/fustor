@@ -153,9 +153,9 @@ fn app_sdk_authoring_path_is_primary() {
         cutover.contains("helper-crate")
             && cutover.contains("wrapper API names remain engineering-governance or")
     );
-    assert!(!cutover.contains(
-        "boundary-conversion seams MAY consume `capanix-runtime-api` directly"
-    ));
+    assert!(
+        !cutover.contains("boundary-conversion seams MAY consume `capanix-runtime-api` directly")
+    );
     assert!(app_manifest.contains("publish = false"));
     assert!(manifest_has_dependency(&app_manifest, "capanix-app-sdk"));
     assert!(manifest_has_dependency(
@@ -586,9 +586,11 @@ fn worker_mode_failure_boundary_is_explicit() {
     assert!(!l0.contains("facade-worker"));
     assert!(contracts.contains("`embedded` workers stay inside the shared host boundary"));
     assert!(contracts.contains("`external` workers run through isolated external worker hosting"));
-    assert!(contracts.contains(
-        "bridge-realization seam remains below the business-module contract boundary"
-    ));
+    assert!(
+        contracts.contains(
+            "bridge-realization seam remains below the business-module contract boundary"
+        )
+    );
     assert!(contracts.contains(
         "worker bootstrap, retry clipping, lifecycle supervision, and canonical transport/error classification remain runtime-helper implementation"
     ));
@@ -697,6 +699,24 @@ fn real_nfs_e2e_entrypoint_stays_aligned_with_support_preflight() {
 }
 
 #[test]
+fn e2e_apply_release_harness_stays_blackbox() {
+    let cluster = read_app_spec("tests/e2e/support/cluster5.rs");
+    let start = cluster
+        .find("pub fn apply_release(")
+        .expect("cluster5 apply_release");
+    let end = cluster[start..]
+        .find("pub fn clear_release(")
+        .map(|offset| start + offset)
+        .expect("cluster5 clear_release after apply_release");
+    let apply_release = &cluster[start..end];
+
+    assert!(apply_release.contains("run_cnxctl_json("));
+    assert!(!apply_release.contains("runtime_target_state("));
+    assert!(!apply_release.contains("already_applied_while_cli_pending"));
+    assert!(!apply_release.contains("already_applied_despite_cli_error"));
+}
+
+#[test]
 fn app_authoring_crate_stays_product_specific() {
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
@@ -707,24 +727,34 @@ fn app_authoring_crate_stays_product_specific() {
     let runtime_lib = read_app_spec("app/src/lib.rs");
     let runtime_config = read_app_spec("app/src/config.rs");
 
-    assert!(l1.contains("developer-facing authoring surface stays bounded to fs-meta domain/types"));
+    assert!(
+        l1.contains("developer-facing authoring surface stays bounded to fs-meta domain/types")
+    );
     assert!(l2.contains(
         "product boundary separates bounded authoring/domain, runtime artifact, deploy compilation, and operator tooling surfaces"
     ));
     assert!(l2.contains("runtime artifact surface owns worker entry"));
-    assert!(governance.contains("`fs-meta/lib/` 是唯一的开发者-facing fs-meta authoring/domain package"));
+    assert!(
+        governance
+            .contains("`fs-meta/lib/` 是唯一的开发者-facing fs-meta authoring/domain package")
+    );
     assert!(governance.contains("`fs-meta/app/` 是内部 `fs-meta-runtime` package"));
     assert!(governance.contains("`fs-meta/deploy/` 是内部 `fs-meta-deploy` package"));
     assert!(authoring_manifest.contains("name = \"fs-meta\""));
     assert!(authoring_manifest.contains("publish = false"));
-    assert!(authoring_manifest.contains("description = \"fs-meta authoring and domain surface package\""));
+    assert!(
+        authoring_manifest
+            .contains("description = \"fs-meta authoring and domain surface package\"")
+    );
     assert!(authoring_lib.contains("pub mod api;"));
     assert!(authoring_lib.contains("pub mod product_model;"));
     assert!(authoring_lib.contains("pub struct FSMetaConfig"));
     assert!(!authoring_lib.contains("pub use fs_meta_runtime::{"));
     assert!(!authoring_lib.contains("__cnx_runtime"));
     assert!(!authoring_lib.contains("announced_resources"));
-    assert!(runtime_manifest.contains("description = \"fs-meta deployable runtime artifact package\""));
+    assert!(
+        runtime_manifest.contains("description = \"fs-meta deployable runtime artifact package\"")
+    );
     assert!(runtime_lib.contains("pub mod api;"));
     assert!(runtime_lib.contains("pub mod query;"));
     assert!(runtime_lib.contains("pub mod sink;"));

@@ -3,22 +3,22 @@
 
 use super::api_client::FsMetaApiClient;
 use super::control_protocol::{
-    canonical_ctl_command_value_bytes, AnnouncedResourceExport, ControlEnvelope, CtlRequest,
-    CtlResponse,
+    AnnouncedResourceExport, ControlEnvelope, CtlRequest, CtlResponse,
+    canonical_ctl_command_value_bytes,
 };
 use super::runtime_admin::{
     canonical_runtime_admin_command_value_bytes, decode_runtime_admin_or_kernel_response_value,
     encode_runtime_admin_request_value,
 };
-use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use fs_meta::{
-    api::config::{ApiAuthConfig, BootstrapAdminConfig},
     RootSpec,
+    api::config::{ApiAuthConfig, BootstrapAdminConfig},
 };
-use fs_meta_deploy::{build_release_doc_value, FsMetaReleaseSpec};
+use fs_meta_deploy::{FsMetaReleaseSpec, build_release_doc_value};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -98,6 +98,31 @@ fn classify_apply_release_retry(err: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+fn is_generation_conflict_apply_error(err: &str) -> bool {
+    err.contains("generation conflict") && err.contains("bump target generation to override")
+}
+
+fn release_target_id(release: &Value) -> String {
+    release
+        .get("target_id")
+        .or_else(|| release.get("app_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>")
+        .to_string()
+}
+
+fn release_target_generation(release: &Value) -> Option<i64> {
+    release
+        .get("target_generation")
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            release
+                .get("target_generation")
+                .and_then(Value::as_u64)
+                .and_then(|value| i64::try_from(value).ok())
+        })
 }
 
 #[derive(Clone)]
@@ -353,24 +378,20 @@ impl Cluster5 {
         let cnxctl_bin = try_find_cnxctl_bin().ok_or_else(|| {
             "cnxctl binary not found; build capanix-cli or set CNXCTL_BIN".to_string()
         })?;
-        let app_id = release
-            .get("app_id")
-            .or_else(|| release.get("app_id"))
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown>")
-            .to_string();
-        let generation = release
-            .get("target_generation")
-            .and_then(Value::as_i64)
-            .map(|v| v.to_string())
+        let target_id = release_target_id(&release);
+        let target_generation = release_target_generation(&release);
+        let generation = target_generation
+            .map(|value| value.to_string())
             .unwrap_or_else(|| "<unknown>".to_string());
         let file = write_temp_json("relation-target-apply", &release)?;
         let file_arg = file.to_string_lossy().to_string();
         let started = Instant::now();
         eprintln!(
-            "cluster5: apply-release begin node={} app_id={} generation={}",
-            node_name, app_id, generation
+            "cluster5: apply-release begin node={} target_id={} generation={}",
+            node_name, target_id, generation
         );
+        // Keep relation-target apply black-box: success/failure must come from cnxctl,
+        // not from peeking into runtime_target_state while the CLI is still pending.
         let mut result = Err("apply release not attempted".to_string());
         for attempt in 1..=12 {
             result = run_cnxctl_json(
@@ -381,16 +402,15 @@ impl Cluster5 {
             match &result {
                 Ok(_) => break,
                 Err(err) => {
+                    if is_generation_conflict_apply_error(err) {
+                        break;
+                    }
                     let Some(reason) = classify_apply_release_retry(err) else {
                         break;
                     };
                     eprintln!(
-                        "cluster5: apply-release retry node={} app_id={} generation={} attempt={} reason={}",
-                        node_name,
-                        app_id,
-                        generation,
-                        attempt,
-                        reason
+                        "cluster5: apply-release retry node={} target_id={} generation={} attempt={} reason={}",
+                        node_name, target_id, generation, attempt, reason
                     );
                     std::thread::sleep(Duration::from_millis(500 * attempt as u64));
                 }
@@ -398,16 +418,16 @@ impl Cluster5 {
         }
         match &result {
             Ok(_) => eprintln!(
-                "cluster5: apply-release ok node={} app_id={} generation={} elapsed_ms={}",
+                "cluster5: apply-release ok node={} target_id={} generation={} elapsed_ms={}",
                 node_name,
-                app_id,
+                target_id,
                 generation,
                 started.elapsed().as_millis()
             ),
             Err(err) => eprintln!(
-                "cluster5: apply-release err node={} app_id={} generation={} elapsed_ms={} error={}",
+                "cluster5: apply-release err node={} target_id={} generation={} elapsed_ms={} error={}",
                 node_name,
-                app_id,
+                target_id,
                 generation,
                 started.elapsed().as_millis(),
                 err
@@ -600,10 +620,12 @@ impl Cluster5 {
         let mut value = build_release_doc_value(&spec);
         value["target_generation"] = json!(generation);
         value["units"][0]["startup"]["path"] = json!(app_path.to_string_lossy().to_string());
-        value["units"][0]["startup"]["manifest"] = json!(repo_root()
-            .join("fs-meta/fixtures/manifests/fs-meta.yaml")
-            .display()
-            .to_string());
+        value["units"][0]["startup"]["manifest"] = json!(
+            repo_root()
+                .join("fs-meta/fixtures/manifests/fs-meta.yaml")
+                .display()
+                .to_string()
+        );
         value["units"][0]["version"] = json!(format!("real-nfs-{generation}"));
         value["units"][0]["restart_policy"] = json!("Never");
         value["units"][0]["policy"]["generation"] = json!(generation);
@@ -801,6 +823,7 @@ fn scope_unit_intent_to_scope_worker_intent(doc: &Value) -> Result<Value, String
             json!({
                 "worker_role": worker_role,
                 "worker_id": worker_id,
+                "mode": "embedded",
                 "scope_ids": entry.get("scope_ids").cloned().unwrap_or_else(|| json!([])),
                 "startup": Value::Object(startup),
                 "config": entry.get("config").cloned().unwrap_or_else(|| json!({})),
@@ -815,7 +838,7 @@ fn scope_unit_intent_to_scope_worker_intent(doc: &Value) -> Result<Value, String
         })
         .collect::<Vec<_>>();
     Ok(json!({
-        "schema_version": "scope-worker-intent-v1",
+        "schema_version": "scope-worker-declaration-v1",
         "target_id": target_id,
         "target_generation": target_generation,
         "route_plans": doc.get("route_plans").cloned().unwrap_or_else(|| json!([])),
@@ -837,6 +860,10 @@ fn cluster_lock() -> MutexGuard<'static, ()> {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     }
+}
+
+fn cargo_build_silent(command: &mut Command) -> Option<std::process::Output> {
+    command.output().ok()
 }
 
 fn tmp_dir(prefix: &str) -> PathBuf {
@@ -968,18 +995,18 @@ fn try_find_cnxctl_bin() -> Option<PathBuf> {
     .into_iter()
     .flatten()
     {
-        let status = Command::new(&cargo_bin)
-            .current_dir(&root)
-            .arg("build")
-            .arg("-p")
-            .arg("capanix-cli")
-            .arg("--bin")
-            .arg("cnxctl")
-            .status();
-        let Ok(status) = status else {
+        let Some(output) = cargo_build_silent(
+            Command::new(&cargo_bin)
+                .current_dir(&root)
+                .arg("build")
+                .arg("-p")
+                .arg("capanix-cli")
+                .arg("--bin")
+                .arg("cnxctl"),
+        ) else {
             continue;
         };
-        if !status.success() {
+        if !output.status.success() {
             continue;
         }
         if let Some(found) = candidates.iter().find(|p| p.exists()) {
@@ -1014,6 +1041,10 @@ fn run_cnxctl_json<const N: usize>(
         .output()
         .map_err(|e| format!("spawn cnxctl failed: {e}"))?;
 
+    decode_cnxctl_json_output(output)
+}
+
+fn decode_cnxctl_json_output(output: std::process::Output) -> Result<Value, String> {
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
 
@@ -1067,18 +1098,18 @@ fn resolve_capanixd_bin() -> Option<PathBuf> {
     .into_iter()
     .flatten()
     {
-        let status = Command::new(&cargo_bin)
-            .current_dir(&root)
-            .arg("build")
-            .arg("-p")
-            .arg("capanix-daemon")
-            .arg("--bin")
-            .arg("capanixd")
-            .status();
-        let Ok(status) = status else {
+        let Some(output) = cargo_build_silent(
+            Command::new(&cargo_bin)
+                .current_dir(&root)
+                .arg("build")
+                .arg("-p")
+                .arg("capanix-daemon")
+                .arg("--bin")
+                .arg("capanixd"),
+        ) else {
             continue;
         };
-        if !status.success() {
+        if !output.status.success() {
             continue;
         }
         if let Some(found) = candidates.iter().find(|p| p.exists()) {
@@ -1146,17 +1177,17 @@ fn resolve_fs_meta_app_cdylib() -> Option<PathBuf> {
     .into_iter()
     .flatten()
     {
-        let status = Command::new(&cargo_bin)
-            .current_dir(&root)
-            .arg("build")
-            .arg("-p")
-            .arg("fs-meta-runtime")
-            .arg("--lib")
-            .status();
-        let Ok(status) = status else {
+        let Some(output) = cargo_build_silent(
+            Command::new(&cargo_bin)
+                .current_dir(&root)
+                .arg("build")
+                .arg("-p")
+                .arg("fs-meta-runtime")
+                .arg("--lib"),
+        ) else {
             continue;
         };
-        if !status.success() {
+        if !output.status.success() {
             continue;
         }
         if let Some(found) = candidates.iter().find(|p| p.exists()) {
@@ -1220,18 +1251,18 @@ fn resolve_capanix_worker_host_bin() -> Option<PathBuf> {
     .into_iter()
     .flatten()
     {
-        let status = Command::new(&cargo_bin)
-            .current_dir(&root)
-            .arg("build")
-            .arg("-p")
-            .arg("capanix-worker-host")
-            .arg("--bin")
-            .arg("capanix_worker_host")
-            .status();
-        let Ok(status) = status else {
+        let Some(output) = cargo_build_silent(
+            Command::new(&cargo_bin)
+                .current_dir(&root)
+                .arg("build")
+                .arg("-p")
+                .arg("capanix-worker-host")
+                .arg("--bin")
+                .arg("capanix_worker_host"),
+        ) else {
             continue;
         };
-        if !status.success() {
+        if !output.status.success() {
             continue;
         }
         if let Some(found) = candidates.iter().find(|p| p.exists()) {
