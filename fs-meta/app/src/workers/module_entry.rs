@@ -1,7 +1,7 @@
 use std::ffi::c_char;
 use std::io;
 
-use capanix_runtime_host_sdk::worker_runtime::run_worker_module_entry;
+use capanix_runtime_entry_sdk::worker_runtime::run_worker_module_entry;
 
 use crate::workers::sink_server::run_sink_worker_server;
 use crate::workers::source_server::run_source_worker_server;

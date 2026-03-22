@@ -16,7 +16,7 @@ use tower_http::cors::CorsLayer;
 
 use capanix_app_sdk::runtime::NodeId;
 use capanix_app_sdk::{CnxError, Result};
-use capanix_runtime_host_sdk::boundary::ChannelIoSubset;
+use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
 
 use crate::query::api::{
     create_local_router, projection_policy_from_host_object_grants,

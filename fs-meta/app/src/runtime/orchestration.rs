@@ -1,9 +1,9 @@
 use capanix_app_sdk::runtime::{ControlEnvelope, ControlFrame};
 use capanix_app_sdk::{CnxError, Result};
-use capanix_runtime_host_sdk::control::{
-    BoundScope, ExecControl, RuntimeHostObjectGrantsChanged, UnitExposureConfirmed,
-    decode_exec_control_envelope, decode_runtime_host_object_grants_changed_envelope,
-    decode_unit_exposure_confirmed_envelope, decode_unit_tick_envelope,
+use capanix_runtime_entry_sdk::control::{
+    RuntimeBoundScope, RuntimeExecControl, RuntimeHostGrantChange, RuntimeUnitExposure,
+    decode_runtime_exec_control, decode_runtime_host_grant_change, decode_runtime_unit_exposure,
+    decode_runtime_unit_tick,
 };
 
 use crate::runtime::execution_units::{
@@ -109,7 +109,7 @@ pub(crate) enum SourceControlSignal {
         unit: SourceRuntimeUnit,
         route_key: String,
         generation: u64,
-        bound_scopes: Vec<BoundScope>,
+        bound_scopes: Vec<RuntimeBoundScope>,
         envelope: ControlEnvelope,
     },
     Deactivate {
@@ -124,8 +124,8 @@ pub(crate) enum SourceControlSignal {
         generation: u64,
         envelope: ControlEnvelope,
     },
-    RuntimeHostObjectGrantsChanged {
-        changed: RuntimeHostObjectGrantsChanged,
+    RuntimeHostGrantChange {
+        changed: RuntimeHostGrantChange,
         envelope: ControlEnvelope,
     },
     ManualRescan {
@@ -140,7 +140,7 @@ impl SourceControlSignal {
             Self::Activate { envelope, .. }
             | Self::Deactivate { envelope, .. }
             | Self::Tick { envelope, .. }
-            | Self::RuntimeHostObjectGrantsChanged { envelope, .. }
+            | Self::RuntimeHostGrantChange { envelope, .. }
             | Self::ManualRescan { envelope, .. } => envelope.clone(),
             Self::Passthrough(envelope) => envelope.clone(),
         }
@@ -153,7 +153,7 @@ pub(crate) enum SinkControlSignal {
         unit: SinkRuntimeUnit,
         route_key: String,
         generation: u64,
-        bound_scopes: Vec<BoundScope>,
+        bound_scopes: Vec<RuntimeBoundScope>,
         envelope: ControlEnvelope,
     },
     Deactivate {
@@ -168,8 +168,8 @@ pub(crate) enum SinkControlSignal {
         generation: u64,
         envelope: ControlEnvelope,
     },
-    RuntimeHostObjectGrantsChanged {
-        changed: RuntimeHostObjectGrantsChanged,
+    RuntimeHostGrantChange {
+        changed: RuntimeHostGrantChange,
         envelope: ControlEnvelope,
     },
     Passthrough(ControlEnvelope),
@@ -181,7 +181,7 @@ impl SinkControlSignal {
             Self::Activate { envelope, .. }
             | Self::Deactivate { envelope, .. }
             | Self::Tick { envelope, .. }
-            | Self::RuntimeHostObjectGrantsChanged { envelope, .. } => envelope.clone(),
+            | Self::RuntimeHostGrantChange { envelope, .. } => envelope.clone(),
             Self::Passthrough(envelope) => envelope.clone(),
         }
     }
@@ -193,7 +193,7 @@ pub(crate) enum FacadeControlSignal {
         unit: FacadeRuntimeUnit,
         route_key: String,
         generation: u64,
-        bound_scopes: Vec<BoundScope>,
+        bound_scopes: Vec<RuntimeBoundScope>,
     },
     Deactivate {
         unit: FacadeRuntimeUnit,
@@ -211,8 +211,8 @@ pub(crate) enum FacadeControlSignal {
         generation: u64,
         confirmed_at_us: u64,
     },
-    RuntimeHostObjectGrantsChanged {
-        _changed: RuntimeHostObjectGrantsChanged,
+    RuntimeHostGrantChange {
+        _changed: RuntimeHostGrantChange,
     },
     Passthrough,
 }
@@ -242,7 +242,7 @@ fn facade_unit_from_id(unit_id: &str) -> Option<FacadeRuntimeUnit> {
 }
 
 fn facade_signal_from_trusted_exposure_confirmed(
-    confirmed: &UnitExposureConfirmed,
+    confirmed: &RuntimeUnitExposure,
 ) -> Option<FacadeControlSignal> {
     facade_unit_from_id(&confirmed.unit_id).map(|unit| FacadeControlSignal::ExposureConfirmed {
         unit,
@@ -257,9 +257,9 @@ pub(crate) fn source_control_signals_from_envelopes(
 ) -> Result<Vec<SourceControlSignal>> {
     let mut signals = Vec::new();
     for envelope in envelopes {
-        if let Some(ctrl) = decode_exec_control_envelope(envelope)? {
+        if let Some(ctrl) = decode_runtime_exec_control(envelope)? {
             match ctrl {
-                ExecControl::Activate(activate) => {
+                RuntimeExecControl::Activate(activate) => {
                     let Some(unit) = source_unit_from_id(&activate.unit_id) else {
                         return Err(CnxError::NotSupported(format!(
                             "source-fs-meta: unsupported unit_id '{}' in control envelope",
@@ -274,7 +274,7 @@ pub(crate) fn source_control_signals_from_envelopes(
                         envelope: envelope.clone(),
                     });
                 }
-                ExecControl::Deactivate(deactivate) => {
+                RuntimeExecControl::Deactivate(deactivate) => {
                     let Some(unit) = source_unit_from_id(&deactivate.unit_id) else {
                         return Err(CnxError::NotSupported(format!(
                             "source-fs-meta: unsupported unit_id '{}' in control envelope",
@@ -292,7 +292,7 @@ pub(crate) fn source_control_signals_from_envelopes(
             continue;
         }
 
-        if let Some(tick) = decode_unit_tick_envelope(envelope)? {
+        if let Some(tick) = decode_runtime_unit_tick(envelope)? {
             let Some(unit) = source_unit_from_id(&tick.unit_id) else {
                 return Err(CnxError::NotSupported(format!(
                     "source-fs-meta: unsupported unit_id '{}' in control envelope",
@@ -308,8 +308,8 @@ pub(crate) fn source_control_signals_from_envelopes(
             continue;
         }
 
-        if let Some(changed) = decode_runtime_host_object_grants_changed_envelope(envelope)? {
-            signals.push(SourceControlSignal::RuntimeHostObjectGrantsChanged {
+        if let Some(changed) = decode_runtime_host_grant_change(envelope)? {
+            signals.push(SourceControlSignal::RuntimeHostGrantChange {
                 changed,
                 envelope: envelope.clone(),
             });
@@ -335,9 +335,9 @@ pub(crate) fn sink_control_signals_from_envelopes(
 ) -> Result<Vec<SinkControlSignal>> {
     let mut signals = Vec::new();
     for envelope in envelopes {
-        if let Some(ctrl) = decode_exec_control_envelope(envelope)? {
+        if let Some(ctrl) = decode_runtime_exec_control(envelope)? {
             match ctrl {
-                ExecControl::Activate(activate) => {
+                RuntimeExecControl::Activate(activate) => {
                     let Some(unit) = sink_unit_from_id(&activate.unit_id) else {
                         return Err(CnxError::NotSupported(format!(
                             "sink-file-meta: unsupported unit_id '{}' in control envelope",
@@ -352,7 +352,7 @@ pub(crate) fn sink_control_signals_from_envelopes(
                         envelope: envelope.clone(),
                     });
                 }
-                ExecControl::Deactivate(deactivate) => {
+                RuntimeExecControl::Deactivate(deactivate) => {
                     let Some(unit) = sink_unit_from_id(&deactivate.unit_id) else {
                         return Err(CnxError::NotSupported(format!(
                             "sink-file-meta: unsupported unit_id '{}' in control envelope",
@@ -370,7 +370,7 @@ pub(crate) fn sink_control_signals_from_envelopes(
             continue;
         }
 
-        if let Some(tick) = decode_unit_tick_envelope(envelope)? {
+        if let Some(tick) = decode_runtime_unit_tick(envelope)? {
             let Some(unit) = sink_unit_from_id(&tick.unit_id) else {
                 return Err(CnxError::NotSupported(format!(
                     "sink-file-meta: unsupported unit_id '{}' in control envelope",
@@ -386,8 +386,8 @@ pub(crate) fn sink_control_signals_from_envelopes(
             continue;
         }
 
-        if let Some(changed) = decode_runtime_host_object_grants_changed_envelope(envelope)? {
-            signals.push(SinkControlSignal::RuntimeHostObjectGrantsChanged {
+        if let Some(changed) = decode_runtime_host_grant_change(envelope)? {
+            signals.push(SinkControlSignal::RuntimeHostGrantChange {
                 changed,
                 envelope: envelope.clone(),
             });
@@ -410,9 +410,9 @@ pub(crate) fn split_app_control_signals(
     let mut sink = Vec::new();
     let mut facade = Vec::new();
     for envelope in envelopes {
-        if let Some(ctrl) = decode_exec_control_envelope(envelope)? {
+        if let Some(ctrl) = decode_runtime_exec_control(envelope)? {
             match ctrl {
-                ExecControl::Activate(activate) => {
+                RuntimeExecControl::Activate(activate) => {
                     let to_source = source_unit_from_id(&activate.unit_id);
                     let to_sink = sink_unit_from_id(&activate.unit_id);
                     let to_facade = facade_unit_from_id(&activate.unit_id);
@@ -449,7 +449,7 @@ pub(crate) fn split_app_control_signals(
                         });
                     }
                 }
-                ExecControl::Deactivate(deactivate) => {
+                RuntimeExecControl::Deactivate(deactivate) => {
                     let to_source = source_unit_from_id(&deactivate.unit_id);
                     let to_sink = sink_unit_from_id(&deactivate.unit_id);
                     let to_facade = facade_unit_from_id(&deactivate.unit_id);
@@ -487,7 +487,7 @@ pub(crate) fn split_app_control_signals(
             continue;
         }
 
-        if let Some(tick) = decode_unit_tick_envelope(envelope)? {
+        if let Some(tick) = decode_runtime_unit_tick(envelope)? {
             let to_source = source_unit_from_id(&tick.unit_id);
             let to_sink = sink_unit_from_id(&tick.unit_id);
             let to_facade = facade_unit_from_id(&tick.unit_id);
@@ -523,23 +523,23 @@ pub(crate) fn split_app_control_signals(
             continue;
         }
 
-        if let Some(confirmed) = decode_unit_exposure_confirmed_envelope(envelope)? {
+        if let Some(confirmed) = decode_runtime_unit_exposure(envelope)? {
             if let Some(signal) = facade_signal_from_trusted_exposure_confirmed(&confirmed) {
                 facade.push(signal);
             }
             continue;
         }
 
-        if let Some(changed) = decode_runtime_host_object_grants_changed_envelope(envelope)? {
-            source.push(SourceControlSignal::RuntimeHostObjectGrantsChanged {
+        if let Some(changed) = decode_runtime_host_grant_change(envelope)? {
+            source.push(SourceControlSignal::RuntimeHostGrantChange {
                 changed: changed.clone(),
                 envelope: envelope.clone(),
             });
-            sink.push(SinkControlSignal::RuntimeHostObjectGrantsChanged {
+            sink.push(SinkControlSignal::RuntimeHostGrantChange {
                 changed: changed.clone(),
                 envelope: envelope.clone(),
             });
-            facade.push(FacadeControlSignal::RuntimeHostObjectGrantsChanged { _changed: changed });
+            facade.push(FacadeControlSignal::RuntimeHostGrantChange { _changed: changed });
             continue;
         }
 

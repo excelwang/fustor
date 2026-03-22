@@ -5,8 +5,8 @@ use bytes::Bytes;
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RecvOpts, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::{HostAdapter, exchange_host_adapter_from_channel_boundary};
-use capanix_runtime_host_sdk::boundary::ChannelIoSubset;
-use capanix_runtime_host_sdk::worker_runtime::{
+use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
+use capanix_runtime_entry_sdk::worker_runtime::{
     RuntimeWorkerClientFactory, TypedRuntimeWorkerClient, TypedWorkerClient, TypedWorkerInit,
 };
 
@@ -95,7 +95,11 @@ impl SinkWorkerClientHandle {
     ) -> Result<Self> {
         let logical_roots_cache = Arc::new(Mutex::new(config.roots.clone()));
         Ok(Self {
-            worker: worker_factory.connect(node_id.clone(), config.clone(), worker_binding.clone())?,
+            worker: worker_factory.connect(
+                node_id.clone(),
+                config.clone(),
+                worker_binding.clone(),
+            )?,
             node_id,
             config,
             worker_factory,
@@ -716,7 +720,7 @@ impl SinkFacade {
     }
 }
 
-capanix_runtime_host_sdk::define_typed_worker_rpc! {
+capanix_runtime_entry_sdk::worker_runtime::define_typed_worker_rpc! {
     pub struct SinkWorkerRpc {
         request: SinkWorkerRequest,
         response: SinkWorkerResponse,

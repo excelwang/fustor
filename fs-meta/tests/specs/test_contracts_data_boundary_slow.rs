@@ -8,15 +8,16 @@ use std::time::{Duration, Instant};
 
 use crate::common::assert_cluster_bootstrap_governance_real_cluster;
 use bytes::Bytes;
-use fs_meta::query::models::QueryNode;
-use fs_meta::FileMetaRecord;
-use fs_meta::{FSMetaApp, FSMetaConfig};
 use capanix_app_sdk::runtime::{ConfigValue, EventMetadata, NodeId, RecvOpts};
 use capanix_app_sdk::Event;
 use capanix_host_fs_types::UnixStat;
-use capanix_route_proto::{
-    encode_exec_control_envelope, now_ms, BoundScope, ExecActivate, ExecControl,
+use capanix_route_proto::now_ms;
+use capanix_runtime_entry_sdk::control::{
+    encode_runtime_exec_control, RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl,
 };
+use fs_meta::query::models::QueryNode;
+use fs_meta::FileMetaRecord;
+use fs_meta_runtime::{FSMetaApp, FSMetaConfig};
 use tempfile::TempDir;
 
 const DATA_BOUNDARY_SCOPE_ID: &str = "data-boundary-root";
@@ -28,12 +29,12 @@ async fn offer_primary(app: &FSMetaApp, route_key: impl Into<String>) {
         "runtime.exec.scan".to_string(),
         "runtime.exec.sink".to_string(),
     ];
-    let bound_scopes = vec![BoundScope {
+    let bound_scopes = vec![RuntimeBoundScope {
         scope_id: DATA_BOUNDARY_SCOPE_ID.to_string(),
         resource_ids: vec!["data-boundary-root".to_string()],
     }];
     for unit_id in &unit_ids {
-        let ctrl = ExecControl::Activate(ExecActivate {
+        let ctrl = RuntimeExecControl::Activate(RuntimeExecActivate {
             route_key: route_key.clone(),
             unit_id: unit_id.clone(),
             lease: None,
@@ -41,7 +42,7 @@ async fn offer_primary(app: &FSMetaApp, route_key: impl Into<String>) {
             expires_at_ms: now_ms() + 60_000,
             bound_scopes: bound_scopes.clone(),
         });
-        let env = encode_exec_control_envelope(&ctrl).expect("encode exec activation");
+        let env = encode_runtime_exec_control(&ctrl).expect("encode exec activation");
         app.on_control_frame(&[env])
             .await
             .expect("apply exec activation via control");
@@ -289,7 +290,8 @@ async fn make_app(dir: &TempDir, node_id: &str) -> FSMetaApp {
             ])),
         ),
     ]);
-    let mut cfg = FSMetaConfig::from_manifest_config(&cfg_map).expect("parse fs-meta config");
+    let mut cfg =
+        FSMetaConfig::from_runtime_manifest_config(&cfg_map).expect("parse fs-meta config");
     cfg.source.batch_size = 64;
     cfg.source.scan_workers = 2;
     cfg.source.lru_capacity = 1024;

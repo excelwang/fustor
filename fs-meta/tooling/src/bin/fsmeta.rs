@@ -16,13 +16,13 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
+use clap::{Args, Parser, Subcommand};
 use fs_meta::RootSpec as RootEntry;
 use fs_meta::api::{ApiAuthConfig, BootstrapManagementConfig};
 use fs_meta_deploy::{
     FsMetaReleaseSpec, FsMetaReleaseWorkerMode, FsMetaReleaseWorkerModes, build_release_doc_value,
     compile_release_doc_to_relation_target_intent,
 };
-use clap::{Args, Parser, Subcommand};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -1067,10 +1067,7 @@ mod tests {
         assert_eq!(workers_array.len(), 1);
         let worker = &workers_array[0];
         assert_eq!(worker["worker_role"], json!("main"));
-        assert_eq!(
-            worker["startup"]["path"],
-            json!("/tmp/fs-meta-runtime.so")
-        );
+        assert_eq!(worker["startup"]["path"], json!("/tmp/fs-meta-runtime.so"));
         assert_eq!(
             worker["startup"]["manifest"],
             json!(manifest.to_string_lossy().as_ref())

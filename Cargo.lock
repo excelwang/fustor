@@ -433,7 +433,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "capanix-runtime-host-sdk"
+name = "capanix-runtime-entry-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
@@ -788,9 +788,16 @@ dependencies = [
 name = "fs-meta"
 version = "0.1.0"
 dependencies = [
+ "capanix-app-sdk",
+ "capanix-host-adapter-fs",
+ "capanix-host-fs-types",
+ "capanix-managed-state-sdk",
  "fs-meta-deploy",
  "fs-meta-runtime",
  "reqwest",
+ "rmp-serde",
+ "serde",
+ "serde_bytes",
  "serde_json",
  "serde_yaml",
  "tempfile",
@@ -804,7 +811,6 @@ dependencies = [
  "capanix-app-sdk",
  "capanix-deploy-sdk",
  "fs-meta",
- "fs-meta-runtime",
  "serde",
  "serde_json",
 ]
@@ -823,9 +829,10 @@ dependencies = [
  "capanix-host-adapter-fs",
  "capanix-host-fs-types",
  "capanix-managed-state-sdk",
- "capanix-runtime-host-sdk",
+ "capanix-runtime-entry-sdk",
  "capanix-service-sdk",
  "crossbeam-channel",
+ "fs-meta",
  "futures-core",
  "futures-util",
  "libc",
@@ -877,9 +884,11 @@ dependencies = [
  "capanix-kernel-api",
  "capanix-route-proto",
  "capanix-runtime-api",
+ "capanix-runtime-entry-sdk",
  "capanix-specs-vocabulary",
  "fs-meta",
  "fs-meta-deploy",
+ "fs-meta-runtime",
  "libc",
  "reqwest",
  "ring",

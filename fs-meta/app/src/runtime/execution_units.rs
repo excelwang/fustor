@@ -1,24 +1,5 @@
-/// Runtime unit id for source execution scheduling domain.
-pub const SOURCE_RUNTIME_UNIT_ID: &str = "runtime.exec.source";
-
-/// Runtime unit id for source scan execution scheduling domain.
-pub const SOURCE_SCAN_RUNTIME_UNIT_ID: &str = "runtime.exec.scan";
-
-/// Runtime unit id for sink execution scheduling domain.
-pub const SINK_RUNTIME_UNIT_ID: &str = "runtime.exec.sink";
-
-/// Runtime unit id for app-level HTTP facade execution.
-pub(crate) const FACADE_RUNTIME_UNIT_ID: &str = "runtime.exec.facade";
-
-/// Runtime unit id for app-level internal query execution.
-pub const QUERY_RUNTIME_UNIT_ID: &str = "runtime.exec.query";
-
-/// Runtime unit id for per-root-scope peer query fanout execution.
-pub const QUERY_PEER_RUNTIME_UNIT_ID: &str = "runtime.exec.query-peer";
-
-/// Source-side accepted runtime unit ids.
-pub(crate) const SOURCE_RUNTIME_UNITS: &[&str] =
-    &[SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID];
-
-/// Sink-side accepted runtime unit ids.
-pub(crate) const SINK_RUNTIME_UNITS: &[&str] = &[SINK_RUNTIME_UNIT_ID];
+pub use fs_meta::product_model::execution_units::{
+    FACADE_RUNTIME_UNIT_ID, QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID,
+    SINK_RUNTIME_UNITS, SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNITS, SOURCE_RUNTIME_UNIT_ID,
+    SOURCE_SCAN_RUNTIME_UNIT_ID,
+};

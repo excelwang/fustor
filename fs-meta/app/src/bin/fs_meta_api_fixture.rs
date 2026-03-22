@@ -1,12 +1,12 @@
 use std::collections::HashMap;
 use std::env;
 
+use capanix_app_sdk::runtime::{ConfigValue, NodeId};
+use capanix_runtime_entry_sdk::control::{
+    RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
+};
 use fs_meta_runtime::query::request::{InternalQueryRequest, QueryOp, QueryScope};
 use fs_meta_runtime::{FSMetaApp, FSMetaConfig};
-use capanix_app_sdk::runtime::{ConfigValue, NodeId};
-use capanix_runtime_host_sdk::control::{
-    BoundScope, ExecActivate, ExecControl, encode_exec_control_envelope,
-};
 use serde::Deserialize;
 
 const FACADE_CONTROL_ROUTE_KEY: &str = "fs-meta.internal.facade-control:v1.stream";
@@ -248,7 +248,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "resource_kind".to_string(),
                         ConfigValue::String("tcp_listener".to_string()),
                     ),
-                    ("bind_addr".to_string(), ConfigValue::String(bind_addr.clone())),
+                    (
+                        "bind_addr".to_string(),
+                        ConfigValue::String(bind_addr.clone()),
+                    ),
                     (
                         "source".to_string(),
                         ConfigValue::String("fs-meta-fixture".to_string()),
@@ -266,19 +269,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "facade_resource_id".to_string(),
                     ConfigValue::String(facade_resource_id.clone()),
                 ),
-                (
-                    "local_listener_resources".to_string(),
-                    ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([
-                        (
-                            "resource_id".to_string(),
-                            ConfigValue::String(facade_resource_id.clone()),
-                        ),
-                        (
-                            "bind_addr".to_string(),
-                            ConfigValue::String(bind_addr.clone()),
-                        ),
-                    ]))]),
-                ),
             ]);
             let mut auth = HashMap::from([
                 ("passwd_path".to_string(), ConfigValue::String(passwd_path)),
@@ -291,55 +281,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             api
         }),
     );
-    let config = FSMetaConfig::from_manifest_config(&cfg)?;
+    let config = FSMetaConfig::from_runtime_manifest_config(&cfg)?;
     let app = FSMetaApp::new(config, NodeId(node_id.clone()))?;
     app.start().await?;
     let worker_scopes = roots_env
         .iter()
-        .map(|root| BoundScope {
+        .map(|root| RuntimeBoundScope {
             scope_id: root.id.clone(),
             resource_ids: Vec::new(),
         })
         .collect::<Vec<_>>();
-    let source_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-        route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
-        unit_id: "runtime.exec.source".to_string(),
-        lease: None,
-        generation: 1,
-        expires_at_ms: 60_000,
-        bound_scopes: worker_scopes.clone(),
-    }))
-    .map_err(|e| format!("encode source activate envelope failed: {e}"))?;
-    let scan_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-        route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
-        unit_id: "runtime.exec.scan".to_string(),
-        lease: None,
-        generation: 1,
-        expires_at_ms: 60_000,
-        bound_scopes: worker_scopes.clone(),
-    }))
-    .map_err(|e| format!("encode scan activate envelope failed: {e}"))?;
-    let sink_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-        route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
-        unit_id: "runtime.exec.sink".to_string(),
-        lease: None,
-        generation: 1,
-        expires_at_ms: 60_000,
-        bound_scopes: worker_scopes.clone(),
-    }))
-    .map_err(|e| format!("encode sink activate envelope failed: {e}"))?;
-    let facade_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-        route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
-        unit_id: "runtime.exec.facade".to_string(),
-        lease: None,
-        generation: 1,
-        expires_at_ms: 60_000,
-        bound_scopes: vec![BoundScope {
-            scope_id: facade_resource_id.clone(),
-            resource_ids: vec![facade_resource_id.clone()],
-        }],
-    }))
-    .map_err(|e| format!("encode facade activate envelope failed: {e}"))?;
+    let source_activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            unit_id: "runtime.exec.source".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 60_000,
+            bound_scopes: worker_scopes.clone(),
+        }))
+        .map_err(|e| format!("encode source activate envelope failed: {e}"))?;
+    let scan_activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            unit_id: "runtime.exec.scan".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 60_000,
+            bound_scopes: worker_scopes.clone(),
+        }))
+        .map_err(|e| format!("encode scan activate envelope failed: {e}"))?;
+    let sink_activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            unit_id: "runtime.exec.sink".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 60_000,
+            bound_scopes: worker_scopes.clone(),
+        }))
+        .map_err(|e| format!("encode sink activate envelope failed: {e}"))?;
+    let facade_activate =
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key: FACADE_CONTROL_ROUTE_KEY.to_string(),
+            unit_id: "runtime.exec.facade".to_string(),
+            lease: None,
+            generation: 1,
+            expires_at_ms: 60_000,
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: facade_resource_id.clone(),
+                resource_ids: vec![facade_resource_id.clone()],
+            }],
+        }))
+        .map_err(|e| format!("encode facade activate envelope failed: {e}"))?;
     app.on_control_frame(&[
         source_activate,
         scan_activate,

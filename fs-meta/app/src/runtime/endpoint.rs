@@ -2,11 +2,11 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Duration;
 
-use capanix_runtime_host_sdk::boundary::{
-    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
-};
 use capanix_app_sdk::runtime::RouteKey;
 use capanix_app_sdk::{CnxError, Event};
+use capanix_runtime_entry_sdk::advanced::boundary::{
+    BoundaryContext, ChannelIoSubset, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
+};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 

@@ -4,10 +4,10 @@ use std::time::Duration;
 
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RuntimeWorkerBinding};
 use capanix_app_sdk::{CnxError, Event, Result};
-use capanix_runtime_host_sdk::boundary::{
+use capanix_runtime_entry_sdk::advanced::boundary::{
     BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest,
 };
-use capanix_runtime_host_sdk::worker_runtime::{
+use capanix_runtime_entry_sdk::worker_runtime::{
     RuntimeWorkerClientFactory, TypedRuntimeWorkerClient, TypedWorkerClient, TypedWorkerInit,
 };
 use futures_util::StreamExt;
@@ -63,7 +63,11 @@ impl SourceWorkerClientHandle {
         worker_factory: RuntimeWorkerClientFactory,
     ) -> Result<Self> {
         Ok(Self {
-            worker: worker_factory.connect(node_id.clone(), config.clone(), worker_binding.clone())?,
+            worker: worker_factory.connect(
+                node_id.clone(),
+                config.clone(),
+                worker_binding.clone(),
+            )?,
             node_id,
             worker_factory,
             worker_binding,
@@ -890,7 +894,7 @@ fn spawn_local_source_pump(
     })
 }
 
-capanix_runtime_host_sdk::define_typed_worker_rpc! {
+capanix_runtime_entry_sdk::worker_runtime::define_typed_worker_rpc! {
     pub struct SourceWorkerRpc {
         request: SourceWorkerRequest,
         response: SourceWorkerResponse,
@@ -915,7 +919,7 @@ impl TypedWorkerInit<SourceConfig> for SourceWorkerRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capanix_runtime_host_sdk::worker_runtime::TypedWorkerRpc;
+    use capanix_runtime_entry_sdk::worker_runtime::TypedWorkerRpc;
     use std::path::PathBuf;
 
     #[test]

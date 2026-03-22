@@ -1,7 +1,7 @@
-use anyhow::{Context, bail};
+use anyhow::{bail, Context};
 use capanix_runtime_api::{
-    RuntimeAdminCommand, RuntimeAdminEnvelope, RuntimeAdminRequest,
-    canonical_runtime_admin_command_bytes,
+    canonical_runtime_admin_command_bytes, RuntimeAdminCommand, RuntimeAdminEnvelope,
+    RuntimeAdminRequest,
 };
 use serde_json::Value;
 

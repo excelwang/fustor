@@ -21,8 +21,8 @@ use capanix_app_sdk::runtime::{
 };
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::HostAdapter;
-use capanix_runtime_host_sdk::boundary::{ChannelIoSubset, StateBoundary};
-use capanix_runtime_host_sdk::control::{BoundScope, HostObjectGrantState};
+use capanix_runtime_entry_sdk::advanced::boundary::{ChannelIoSubset, StateBoundary};
+use capanix_runtime_entry_sdk::control::{RuntimeBoundScope, RuntimeHostGrantState};
 use tokio_util::sync::CancellationToken;
 
 #[cfg(test)]
@@ -1284,7 +1284,7 @@ impl SinkFileMeta {
         unit: SinkRuntimeUnit,
         route_key: &str,
         generation: u64,
-        bound_scopes: &[BoundScope],
+        bound_scopes: &[RuntimeBoundScope],
     ) -> Result<()> {
         let unit_id = unit.unit_id();
         let accepted =
@@ -1300,7 +1300,7 @@ impl SinkFileMeta {
         Ok(())
     }
 
-    fn scheduled_bound_scopes(&self) -> Result<Option<Vec<BoundScope>>> {
+    fn scheduled_bound_scopes(&self) -> Result<Option<Vec<RuntimeBoundScope>>> {
         if !self.unit_control.has_runtime_state() {
             return Ok(None);
         }
@@ -1471,7 +1471,7 @@ impl SinkFileMeta {
                     self.accept_tick_signal(*unit, route_key, *generation)?;
                     validated += 1;
                 }
-                SinkControlSignal::RuntimeHostObjectGrantsChanged { changed, .. } => {
+                SinkControlSignal::RuntimeHostGrantChange { changed, .. } => {
                     let host_object_grants = changed
                         .grants
                         .iter()
@@ -1489,10 +1489,7 @@ impl SinkFileMeta {
                             fs_type: row.object.fs_type.clone(),
                             mount_options: row.object.mount_options.clone(),
                             interfaces: row.interfaces.clone(),
-                            active: matches!(
-                                row.grant_state,
-                                HostObjectGrantState::Active
-                            ),
+                            active: matches!(row.grant_state, RuntimeHostGrantState::Active),
                         })
                         .collect::<Vec<_>>();
                     pending_host_object_grants = Some(host_object_grants);
@@ -1554,7 +1551,7 @@ impl SinkFileMeta {
         let grant_count = host_object_grants.len();
         let bound_scopes = roots
             .iter()
-            .map(|root| BoundScope {
+            .map(|root| RuntimeBoundScope {
                 scope_id: root.id.clone(),
                 resource_ids: Vec::new(),
             })
@@ -2101,13 +2098,12 @@ mod tests {
     use bytes::Bytes;
     use capanix_app_sdk::runtime::EventMetadata;
     use capanix_host_fs_types::UnixStat;
-    use capanix_runtime_host_sdk::control::{
-        BoundScope, ExecActivate, ExecControl, ExecDeactivate, HostDescriptor, HostObjectGrant,
-        HostObjectGrantState, HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged,
-        encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
-        encode_unit_tick_envelope,
+    use capanix_runtime_entry_sdk::control::{
+        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
+        RuntimeHostDescriptor, RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState,
+        RuntimeHostObjectType, RuntimeObjectDescriptor, RuntimeUnitTick,
+        encode_runtime_exec_control, encode_runtime_host_grant_change, encode_runtime_unit_tick,
     };
-    use capanix_app_sdk::route_proto::UnitTick;
     fn default_materialized_request() -> InternalQueryRequest {
         InternalQueryRequest::default()
     }
@@ -2217,15 +2213,15 @@ mod tests {
         SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg).expect("build sink")
     }
 
-    fn bound_scope(scope_id: &str) -> BoundScope {
-        BoundScope {
+    fn bound_scope(scope_id: &str) -> RuntimeBoundScope {
+        RuntimeBoundScope {
             scope_id: scope_id.to_string(),
             resource_ids: Vec::new(),
         }
     }
 
-    fn bound_scope_with_resources(scope_id: &str, resource_ids: &[&str]) -> BoundScope {
-        BoundScope {
+    fn bound_scope_with_resources(scope_id: &str, resource_ids: &[&str]) -> RuntimeBoundScope {
+        RuntimeBoundScope {
             scope_id: scope_id.to_string(),
             resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
         }
@@ -2235,15 +2231,15 @@ mod tests {
         version: u64,
         grants: &[GrantedMountRoot],
     ) -> ControlEnvelope {
-        encode_runtime_host_object_grants_changed_envelope(&RuntimeHostObjectGrantsChanged {
+        encode_runtime_host_grant_change(&RuntimeHostGrantChange {
             version,
             grants: grants
                 .iter()
-                .map(|grant| HostObjectGrant {
+                .map(|grant| RuntimeHostGrant {
                     object_ref: grant.object_ref.clone(),
-                    object_type: HostObjectType::MountRoot,
+                    object_type: RuntimeHostObjectType::MountRoot,
                     interfaces: grant.interfaces.clone(),
-                    host: HostDescriptor {
+                    host: RuntimeHostDescriptor {
                         host_ref: grant.host_ref.clone(),
                         host_ip: grant.host_ip.clone(),
                         host_name: grant.host_name.clone(),
@@ -2251,16 +2247,16 @@ mod tests {
                         zone: grant.zone.clone(),
                         host_labels: grant.host_labels.clone(),
                     },
-                    object: ObjectDescriptor {
+                    object: RuntimeObjectDescriptor {
                         mount_point: grant.mount_point.display().to_string(),
                         fs_source: grant.fs_source.clone(),
                         fs_type: grant.fs_type.clone(),
                         mount_options: grant.mount_options.clone(),
                     },
                     grant_state: if grant.active {
-                        HostObjectGrantState::Active
+                        RuntimeHostGrantState::Active
                     } else {
-                        HostObjectGrantState::Revoked
+                        RuntimeHostGrantState::Revoked
                     },
                 })
                 .collect(),
@@ -2271,7 +2267,7 @@ mod tests {
     #[tokio::test]
     async fn unit_tick_control_frame_is_accepted() {
         let sink = build_single_group_sink();
-        let envelope = encode_unit_tick_envelope(&UnitTick {
+        let envelope = encode_runtime_unit_tick(&RuntimeUnitTick {
             route_key: ROUTE_KEY_QUERY.to_string(),
             unit_id: "runtime.exec.sink".to_string(),
             generation: 1,
@@ -2287,7 +2283,7 @@ mod tests {
     #[tokio::test]
     async fn unit_tick_with_unknown_unit_id_is_rejected() {
         let sink = build_single_group_sink();
-        let envelope = encode_unit_tick_envelope(&UnitTick {
+        let envelope = encode_runtime_unit_tick(&RuntimeUnitTick {
             route_key: ROUTE_KEY_QUERY.to_string(),
             unit_id: "runtime.exec.unknown".to_string(),
             generation: 1,
@@ -2306,15 +2302,16 @@ mod tests {
     #[tokio::test]
     async fn exec_activate_with_unknown_unit_id_is_rejected() {
         let sink = build_single_group_sink();
-        let envelope = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.unknown".to_string(),
-            lease: None,
-            generation: 1,
-            expires_at_ms: 1,
-            bound_scopes: Vec::new(),
-        }))
-        .expect("encode exec activate");
+        let envelope =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.unknown".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode exec activate");
 
         let err = sink
             .on_control_frame(&[envelope])
@@ -2327,21 +2324,22 @@ mod tests {
     #[tokio::test]
     async fn stale_deactivate_generation_is_ignored() {
         let sink = build_single_group_sink();
-        let activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 5,
-            expires_at_ms: 1,
-            bound_scopes: Vec::new(),
-        }))
-        .expect("encode activate");
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 5,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode activate");
         sink.on_control_frame(&[activate])
             .await
             .expect("activate should pass");
 
         let stale_deactivate =
-            encode_exec_control_envelope(&ExecControl::Deactivate(ExecDeactivate {
+            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
                 route_key: ROUTE_KEY_QUERY.to_string(),
                 unit_id: "runtime.exec.sink".to_string(),
                 lease: None,
@@ -2360,40 +2358,43 @@ mod tests {
     #[tokio::test]
     async fn stale_activate_generation_is_ignored() {
         let sink = build_single_group_sink();
-        let activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 5,
-            expires_at_ms: 1,
-            bound_scopes: Vec::new(),
-        }))
-        .expect("encode activate");
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 5,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode activate");
         sink.on_control_frame(&[activate])
             .await
             .expect("activate should pass");
 
-        let deactivate = encode_exec_control_envelope(&ExecControl::Deactivate(ExecDeactivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 5,
-            reason: "test".to_string(),
-        }))
-        .expect("encode deactivate");
+        let deactivate =
+            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 5,
+                reason: "test".to_string(),
+            }))
+            .expect("encode deactivate");
         sink.on_control_frame(&[deactivate])
             .await
             .expect("deactivate should pass");
 
-        let stale_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 4,
-            expires_at_ms: 1,
-            bound_scopes: Vec::new(),
-        }))
-        .expect("encode stale activate");
+        let stale_activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 4,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode stale activate");
         sink.on_control_frame(&[stale_activate])
             .await
             .expect("stale activate should be ignored");
@@ -2547,15 +2548,16 @@ mod tests {
         let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
             .expect("init sink");
 
-        let activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 1,
-            expires_at_ms: 1,
-            bound_scopes: vec![bound_scope("root-a")],
-        }))
-        .expect("encode activate");
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope("root-a")],
+            }))
+            .expect("encode activate");
 
         sink.on_control_frame(&[activate])
             .await
@@ -2593,28 +2595,30 @@ mod tests {
         let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
             .expect("init sink");
 
-        let activate_root_a = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 1,
-            expires_at_ms: 1,
-            bound_scopes: vec![bound_scope("root-a")],
-        }))
-        .expect("encode activate root-a");
+        let activate_root_a =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope("root-a")],
+            }))
+            .expect("encode activate root-a");
         sink.on_control_frame(&[activate_root_a])
             .await
             .expect("activate root-a should pass");
 
-        let activate_both = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 2,
-            expires_at_ms: 2,
-            bound_scopes: vec![bound_scope("root-a"), bound_scope("root-b")],
-        }))
-        .expect("encode activate both");
+        let activate_both =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 2,
+                bound_scopes: vec![bound_scope("root-a"), bound_scope("root-b")],
+            }))
+            .expect("encode activate both");
         sink.on_control_frame(&[activate_both])
             .await
             .expect("activate both should pass");
@@ -2654,18 +2658,19 @@ mod tests {
         let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
             .expect("init sink");
 
-        let activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 1,
-            expires_at_ms: 1,
-            bound_scopes: vec![
-                bound_scope_with_resources("root-a", &["node-a::exp-a"]),
-                bound_scope_with_resources("root-b", &["node-b::exp-b"]),
-            ],
-        }))
-        .expect("encode activate");
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("root-a", &["node-a::exp-a"]),
+                    bound_scope_with_resources("root-b", &["node-b::exp-b"]),
+                ],
+            }))
+            .expect("encode activate");
         sink.on_control_frame(&[activate])
             .await
             .expect("activate should pass");
@@ -2784,15 +2789,16 @@ mod tests {
         let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
             .expect("init sink");
 
-        let activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.sink".to_string(),
-            lease: None,
-            generation: 1,
-            expires_at_ms: 1,
-            bound_scopes: vec![bound_scope("root-a")],
-        }))
-        .expect("encode activate root-a");
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![bound_scope("root-a")],
+            }))
+            .expect("encode activate root-a");
         sink.on_control_frame(&[activate])
             .await
             .expect("activate root-a should pass");

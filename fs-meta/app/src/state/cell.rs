@@ -9,7 +9,7 @@ use capanix_app_sdk::runtime::in_memory_state_boundary;
 use capanix_app_sdk::runtime::{
     StateCellHandle, StateCellReadRequest, StateCellWatchRequest, StateCellWriteRequest, StateClass,
 };
-use capanix_runtime_host_sdk::boundary::{BoundaryContext, StateBoundary};
+use capanix_runtime_entry_sdk::advanced::boundary::{BoundaryContext, StateBoundary};
 
 const AUTHORITY_JOURNAL_MAX_ENTRIES: usize = 4_096;
 const AUTHORITY_SCHEMA_REV: u64 = 1;

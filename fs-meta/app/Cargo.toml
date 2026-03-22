@@ -3,7 +3,7 @@ name = "fs-meta-runtime"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "fs-meta runtime-entry and worker hosting package"
+description = "fs-meta deployable runtime artifact package"
 
 [lib]
 path = "src/lib.rs"
@@ -15,11 +15,12 @@ path = "src/bin/fs_meta_api_fixture.rs"
 
 [dependencies]
 anyhow = "1"
+fs-meta = { workspace = true }
 capanix-host-adapter-fs = { workspace = true }
 capanix-host-fs-types = { workspace = true }
 capanix-app-sdk = { workspace = true }
 capanix-managed-state-sdk = { workspace = true }
-capanix-runtime-host-sdk = { workspace = true }
+capanix-runtime-entry-sdk = { workspace = true }
 capanix-service-sdk = { workspace = true }
 async-stream = { workspace = true }
 async-trait = { workspace = true }

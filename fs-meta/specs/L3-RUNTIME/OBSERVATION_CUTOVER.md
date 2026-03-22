@@ -6,12 +6,11 @@ version: 3.0.0
 
 fs-meta stateful authoring consumes `capanix-managed-state-sdk`
 declarations/evaluator helpers; service-first authoring lowers through
-`capanix-service-sdk`, while the top-level runtime host lowers through
-`capanix-runtime-host-sdk` above the lower `capanix-app-sdk` Boundary Toolkit.
-Narrow runtime-glue and
-boundary-conversion seams MAY consume `capanix-runtime-api` directly without
-becoming a second authoring authority, while `capanix-kernel-api` remains
-below that line as a low-level mirror.
+`capanix-service-sdk`, while the top-level runtime-entry/bootstrap path lowers through
+`capanix-runtime-entry-sdk` above the lower `capanix-app-sdk` Boundary Toolkit.
+Rare lower boundary/state bridge usage remains an explicit advanced escape hatch
+beneath that layer rather than a direct sanctioned app-facing path, while
+`capanix-kernel-api` remains below that line as a low-level mirror.
 
 Product-facing execution language remains `embedded | external` worker mode over
 one `fs-meta` app product container with three worker roles. This L3 document
@@ -42,7 +41,7 @@ that worker model.
 
 1. HTTP facade listener readiness is necessary but not sufficient for trusted exposure.
 2. app evaluates `observation_eligible` from the same managed-state-sdk observation evaluator and package-local materialized observation evidence that feeds query `observation_status`: initial-audit completion on active scan-enabled primary groups, materialized degraded/overflow status, and stale-writer fencing evidence.
-3. the worker-facing runtime wrapper lowers those app-owned start/send/recv/control/close hooks through `ManagedStateApp` over `ServiceApp`, rather than making the fs-meta business app itself the direct `RuntimeBoundaryApp` authoring surface.
+3. the worker-facing runtime wrapper now lowers runtime loading through `RuntimeLoadedServiceApp::from_runtime_config(...)` plus `AppBuilder` wiring, while `capanix-managed-state-sdk` remains limited to declaration/evaluator helpers rather than owning a separate wrapper host.
 4. package-local status/health surfaces expose the materialized readiness evidence through source coverage and audit timing plus sink `initial_audit_completed` and `overflow_pending_audit`; these signals support cutover diagnostics but do not become a competing truth source.
 5. when facade activation remains pending because runtime exposure proof is still outstanding or listener spawn is retrying, package-local status/health surfaces also expose optional `facade.pending` diagnostics so operators can distinguish cutover waiting from generic host-boundary liveness.
 6. runtime consumes generation/bind/route proof to decide which active facade unit owns the resource-scoped one-cardinality HTTP facade, while the app uses `observation_eligible` to decide when `trusted-materialized` `/tree` and `/stats` may answer as current observation.

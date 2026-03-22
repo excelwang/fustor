@@ -15,7 +15,7 @@ use fs_meta::{
     api::config::{ApiAuthConfig, BootstrapAdminConfig},
     RootSpec,
 };
-use fs_meta_deploy::{FsMetaReleaseSpec, build_release_doc_value};
+use fs_meta_deploy::{build_release_doc_value, FsMetaReleaseSpec};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};

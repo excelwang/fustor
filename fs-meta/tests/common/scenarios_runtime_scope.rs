@@ -107,7 +107,8 @@ fn append_mount_root_resources(
     }));
 }
 
-pub(crate) fn scenario_runtime_orchestrated_worker_hosting_config_apply_e2e() -> Result<(), String> {
+pub(crate) fn scenario_runtime_orchestrated_worker_hosting_config_apply_e2e() -> Result<(), String>
+{
     with_cluster(
         FULL_NODE_DELEGATION_SCOPES,
         FULL_NODE_DELEGATION_SCOPES,

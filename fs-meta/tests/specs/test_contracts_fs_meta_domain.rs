@@ -116,7 +116,7 @@ fn test_role_boundary_enforcement() {
     assert!(
         l2.contains("encapsulate source/sink semantics") && l2.contains("HTTP facade semantics")
     );
-    assert!(manifest.contains("description = \"fs-meta runtime-entry and worker hosting package\""));
+    assert!(manifest.contains("description = \"fs-meta deployable runtime artifact package\""));
     assert!(!manifest.contains("description = \"fs-meta shared library\""));
 }
 
@@ -162,7 +162,7 @@ fn test_kernel_domain_neutral_consumption_contract() {
     );
 
     let runtime_seam = read_fs_meta_spec_file("fs-meta/app/src/runtime/seam.rs");
-    let runtime_routes = read_fs_meta_spec_file("fs-meta/app/src/runtime/routes.rs");
+    let runtime_routes = read_fs_meta_spec_file("fs-meta/lib/src/product_model/routes.rs");
     assert!(runtime_seam.contains("ChannelIoSubset"));
     assert!(runtime_seam.contains("ExchangeHostAdapter"));
     assert!(runtime_routes.contains("ROUTE_TOKEN_FS_META"));
@@ -297,13 +297,18 @@ fn test_source_host_fs_calls_are_abstracted_through_host_adapter_sdk() {
 // @verify_spec("CONTRACTS.API_BOUNDARY.EMPTY_ROOTS_VALID_DEPLOYED_STATE", mode="system")
 #[tokio::test]
 async fn test_empty_roots_valid_deployed_state_without_silent_secondary_path() {
-    use fs_meta::{FSMetaApp, FSMetaConfig};
+    use fs_meta::FSMetaConfig;
+    use fs_meta_runtime::FSMetaApp;
 
     let l1 = read_fs_meta_spec_file("fs-meta/specs/L1-CONTRACTS.md");
     assert!(l1.contains("EMPTY_ROOTS_VALID_DEPLOYED_STATE"));
-    let cfg = FSMetaConfig::from_manifest_config(
-        &std::collections::HashMap::<String, ConfigValue>::new(),
-    )
+    let cfg = FSMetaConfig::from_product_manifest_config(&std::collections::HashMap::from([(
+        "api".to_string(),
+        ConfigValue::Map(std::collections::HashMap::from([(
+            "auth".to_string(),
+            ConfigValue::Map(std::collections::HashMap::new()),
+        )])),
+    )]))
     .expect("local fs-meta config");
     let app = FSMetaApp::new(cfg, NodeId("node-a".into()))
         .expect("empty roots should be accepted as valid deployed state");
@@ -546,7 +551,8 @@ fn test_source_error_isolation_and_attrib_watch_contracts_are_migrated_to_main_s
 #[cfg(not(target_os = "linux"))]
 #[tokio::test]
 async fn test_non_linux_strict_fail_for_realtime_startup() {
-    use fs_meta::{FSMetaApp, FSMetaConfig};
+    use fs_meta::FSMetaConfig;
+    use fs_meta_runtime::FSMetaApp;
     let cfg_map = HashMap::from([(
         "roots".to_string(),
         ConfigValue::Array(vec![ConfigValue::Map(HashMap::from([(
@@ -554,7 +560,7 @@ async fn test_non_linux_strict_fail_for_realtime_startup() {
             ConfigValue::String("/tmp".to_string()),
         )]))]),
     )]);
-    let cfg = FSMetaConfig::from_manifest_config(&cfg_map).expect("valid root config");
+    let cfg = FSMetaConfig::from_product_manifest_config(&cfg_map).expect("valid root config");
     let app = FSMetaApp::new(cfg, NodeId("node-a".into())).expect("init fs-meta app");
     let err = app
         .start()
@@ -906,7 +912,7 @@ fn test_unit_control_envelope_fencing_contract() {
     assert!(gate.contains("struct RuntimeUnitGate"));
     assert!(gate.contains("unsupported unit_id"));
 
-    let units = read_fs_meta_spec_file("fs-meta/app/src/runtime/execution_units.rs");
+    let units = read_fs_meta_spec_file("fs-meta/lib/src/product_model/execution_units.rs");
     assert!(units.contains("SOURCE_RUNTIME_UNITS"));
     assert!(units.contains("SINK_RUNTIME_UNITS"));
     assert!(!units.contains("runtime.exec.unsupported"));
@@ -939,7 +945,7 @@ fn test_query_limit_param_owns_payload_bound_contract() {
     assert!(l3_workflows.contains("query-shaping 参数"));
     assert!(l3_workflows.contains("`path` 与 `path_b64` 二选一"));
 
-    let api_types = read_fs_meta_spec_file("fs-meta/app/src/api/types.rs");
+    let api_types = read_fs_meta_spec_file("fs-meta/lib/src/api/types.rs");
     let api_handlers = read_fs_meta_spec_file("fs-meta/app/src/api/handlers.rs");
     assert!(
         !api_types.contains("limit"),
@@ -1132,12 +1138,13 @@ fn test_role_group_access_guard_contract() {
 fn test_runtime_support_transport_supervision_contracts() {
     let l2 = read_fs_meta_spec_file("fs-meta/specs/L2-ARCHITECTURE.md");
     let l3 = read_fs_meta_spec_file("fs-meta/specs/L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md");
-    let transport = read_capanix_repo_file("crates/worker-runtime-support/src/transport.rs");
-    let typed_client = read_capanix_repo_file("crates/worker-runtime-support/src/typed_client.rs");
-    let errors = read_capanix_repo_file("crates/worker-runtime-support/src/error.rs");
+    let worker_l1 =
+        read_capanix_repo_file("crates/worker-runtime-support/specs/L1-CONTRACTS.md");
+    let worker_l2 =
+        read_capanix_repo_file("crates/worker-runtime-support/specs/L2-ARCHITECTURE.md");
 
     assert!(l2.contains(
-        "helper-only upstream worker support beneath `capanix-runtime-host-sdk` owns worker bootstrap"
+        "helper-only upstream worker support beneath `capanix-runtime-entry-sdk` owns worker bootstrap"
     ));
     assert!(l2.contains("MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping"));
     assert!(l3.contains("ExternalWorkerBootstrapTransport"));
@@ -1145,16 +1152,17 @@ fn test_runtime_support_transport_supervision_contracts() {
     assert!(l3.contains("worker has accepted the platform-owned bootstrap envelope handshake"));
     assert!(l3.contains("`Init` / `Start` / `Ping` / `Close`"));
     assert!(l3.contains("app-owned `OnControlFrame` remains a normal typed worker RPC"));
-    assert!(transport.contains("spawn_worker_process("));
-    assert!(transport.contains("on_control_frame("));
-    assert!(transport.contains(".arg(\"--worker-control-socket\")"));
-    assert!(transport.contains(".arg(\"--worker-data-socket\")"));
-    assert!(transport.contains("control_socket_path"));
-    assert!(transport.contains("data_socket_path"));
-    assert!(typed_client.contains("effective_rpc_timeout(deadline, rpc_timeout)"));
-    assert!(typed_client.contains("control_frames(&envelopes, attempt_timeout)"));
-    assert!(errors.contains("CnxError::Timeout => CnxError::Timeout"));
-    assert!(errors.contains("CnxError::TransportClosed"));
+    assert!(l3.contains("transport failures remain transport-classified `CnxError`"));
+    assert!(l3.contains("absolute wall-clock deadline from `total_timeout`"));
+    assert!(!l3.contains("absolute worker control/data socket paths"));
+    assert!(!l3.contains("--worker-control-socket"));
+    assert!(!l3.contains("--worker-data-socket"));
+    assert!(!l3.contains("dedicated bridge thread"));
+    assert!(worker_l1.contains("MANAGED_WORKER_BOOTSTRAP_REUSE"));
+    assert!(worker_l1.contains("worker-host path/install resolution stays internal"));
+    assert!(worker_l1.contains("RUNTIME_WORKER_CLIENT_FACTORY_REUSE"));
+    assert!(worker_l2.contains("helper-only worker transport/bootstrap support"));
+    assert!(worker_l2.contains("hidden dispatch bridge"));
 }
 
 // @verify_spec("CONTRACTS.APP_SCOPE.WORKER_ROLE_MODEL", mode="system")
@@ -1186,6 +1194,12 @@ fn test_source_side_scan_unit_bootstrap_contract() {
     assert!(!source_server.contains("pub fn run_scan_worker_server("));
     assert!(orchestration.contains("SOURCE_SCAN_RUNTIME_UNIT_ID => Some(SourceRuntimeUnit::Scan)"));
     assert!(runtime_app.contains("scheduled_scan_group_ids"));
+    assert!(orchestration.contains("decode_runtime_exec_control("));
+    assert!(orchestration.contains("decode_runtime_unit_tick("));
+    assert!(orchestration.contains("decode_runtime_host_grant_change("));
+    assert!(!orchestration.contains("decode_exec_control_envelope("));
+    assert!(!orchestration.contains("decode_unit_tick_envelope("));
+    assert!(!orchestration.contains("decode_runtime_host_object_grants_changed_envelope("));
 }
 
 // @verify_spec("CONTRACTS.API_BOUNDARY.ONLINE_ROOT_RECONFIG_WITHOUT_RESTART", mode="system")
@@ -1467,21 +1481,21 @@ fn test_orchestration_token_parsing_boundary_contract() {
     assert!(l1.contains("ORCHESTRATION_TOKEN_PARSING_BOUNDARY"));
 
     let orchestration = read_fs_meta_spec_file("fs-meta/app/src/runtime/orchestration.rs");
-    assert!(orchestration.contains("decode_exec_control_envelope("));
-    assert!(orchestration.contains("decode_unit_tick_envelope("));
-    assert!(orchestration.contains("decode_runtime_host_object_grants_changed_envelope("));
+    assert!(orchestration.contains("decode_runtime_exec_control("));
+    assert!(orchestration.contains("decode_runtime_unit_tick("));
+    assert!(orchestration.contains("decode_runtime_host_grant_change("));
     assert!(orchestration.contains("source_unit_from_id("));
     assert!(orchestration.contains("sink_unit_from_id("));
 
     let source_mod = read_fs_meta_spec_file("fs-meta/app/src/source/mod.rs");
-    assert!(!source_mod.contains("decode_exec_control_envelope("));
-    assert!(!source_mod.contains("decode_unit_tick_envelope("));
-    assert!(!source_mod.contains("decode_runtime_host_object_grants_changed_envelope("));
+    assert!(!source_mod.contains("decode_runtime_exec_control("));
+    assert!(!source_mod.contains("decode_runtime_unit_tick("));
+    assert!(!source_mod.contains("decode_runtime_host_grant_change("));
 
     let sink_mod = read_fs_meta_spec_file("fs-meta/app/src/sink/mod.rs");
-    assert!(!sink_mod.contains("decode_exec_control_envelope("));
-    assert!(!sink_mod.contains("decode_unit_tick_envelope("));
-    assert!(!sink_mod.contains("decode_runtime_host_object_grants_changed_envelope("));
+    assert!(!sink_mod.contains("decode_runtime_exec_control("));
+    assert!(!sink_mod.contains("decode_runtime_unit_tick("));
+    assert!(!sink_mod.contains("decode_runtime_host_grant_change("));
 }
 
 // @verify_spec("CONTRACTS.KERNEL_RELATION.HOST_DESCRIPTOR_GROUPING_IS_DOMAIN_POLICY", mode="system")
@@ -1534,18 +1548,13 @@ fn projection_http_runtime_coverage_moved_to_local_projection_api_unit_tests() {
     let projection_api = read_fs_meta_spec_file("fs-meta/app/src/query/api.rs");
     assert!(projection_api.contains("force_find_group_order_file_count_top_bucket_local"));
     assert!(projection_api.contains("force_find_group_order_file_age_top_bucket_local"));
-    assert!(
-        projection_api
-            .contains("force_find_group_order_file_age_keeps_empty_groups_eligible_local")
-    );
-    assert!(
-        projection_api.contains("force_find_defaults_to_group_key_multi_group_response_local")
-    );
+    assert!(projection_api
+        .contains("force_find_group_order_file_age_keeps_empty_groups_eligible_local"));
+    assert!(projection_api.contains("force_find_defaults_to_group_key_multi_group_response_local"));
     assert!(projection_api.contains("force_find_defaults_when_query_params_omitted_local"));
     assert!(projection_api.contains("projection_rpc_metrics_endpoint_shape_local"));
     assert!(
-        projection_api
-            .contains("force_find_rejects_status_only_and_keeps_pagination_axis_local")
+        projection_api.contains("force_find_rejects_status_only_and_keeps_pagination_axis_local")
     );
     assert!(projection_api.contains("namespace_projection_endpoints_removed_local"));
 }
@@ -1557,30 +1566,23 @@ fn test_single_formal_specs_tree_layout() {
     assert!(!root.join("specs/cli").exists());
     assert!(!root.join("specs/PRODUCT_DEPLOYMENT.md").exists());
     assert!(!root.join("specs/fs-meta-contract-tests.config.md").exists());
-    assert!(
-        !root
-            .join("specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
-            .exists()
-    );
-    assert!(
-        !root
-            .join("specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
-            .exists()
-    );
+    assert!(!root
+        .join("specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
+        .exists());
+    assert!(!root
+        .join("specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
+        .exists());
     assert!(!root.join("specs/fs-meta.release-v2.yaml").exists());
     assert!(root.join("docs/PRODUCT_DEPLOYMENT.md").exists());
     assert!(root.join("docs/examples/fs-meta.yaml").exists());
-    assert!(
-        root.join("testdata/specs/fs-meta-contract-tests.config.md")
-            .exists()
-    );
-    assert!(
-        root.join("testdata/specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
-            .exists()
-    );
-    assert!(
-        root.join("testdata/specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
-            .exists()
-    );
+    assert!(root
+        .join("testdata/specs/fs-meta-contract-tests.config.md")
+        .exists());
+    assert!(root
+        .join("testdata/specs/fs-meta-contract-tests.cluster.node-a.config.yaml")
+        .exists());
+    assert!(root
+        .join("testdata/specs/fs-meta-contract-tests.cluster.node-b.config.yaml")
+        .exists());
     assert!(root.join("testdata/specs/fs-meta.release-v2.yaml").exists());
 }

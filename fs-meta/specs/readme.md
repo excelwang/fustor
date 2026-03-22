@@ -18,10 +18,9 @@
 1. 产品部署文档：`../docs/PRODUCT_DEPLOYMENT.md`
 2. 用户示例配置：`../docs/examples/`
 3. 工程治理与规格校验规则：`../docs/ENGINEERING_GOVERNANCE.md`
-4. 上游 capanix 规格对齐审计：`../docs/UPSTREAM_SPEC_ALIGNMENT.md`
-5. contract-test / regression yaml 与 release 示例：`../testdata/specs/`
-6. 可运行 fixture apps / manifests / runtime artifacts：`../fixtures/`
-7. 规格校验脚本：`../scripts/validate_specs.sh`
+4. contract-test / regression yaml 与 release 示例：`../testdata/specs/`
+5. 可运行 fixture apps / manifests / runtime artifacts：`../fixtures/`
+6. 规格校验脚本：`../scripts/validate_specs.sh`
 
 ## 作用域
 

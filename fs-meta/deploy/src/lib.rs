@@ -1,22 +1,22 @@
 use std::path::Path;
 use std::path::PathBuf;
 
-pub use fs_meta::api::types::RootEntry;
-pub use fs_meta::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};
-use fs_meta::RootSpec;
-use fs_meta_runtime::runtime::execution_units::{
+use capanix_app_sdk::runtime::{RouteKey, RoutePlanMode, RoutePlanSpec};
+use capanix_app_sdk::{CnxError, Result};
+use capanix_deploy_sdk::compile_relation_target_intent_value;
+use fs_meta::product_model::execution_units::{
     QUERY_PEER_RUNTIME_UNIT_ID, QUERY_RUNTIME_UNIT_ID, SINK_RUNTIME_UNIT_ID,
     SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
 };
-use fs_meta_runtime::runtime::routes::{
+use fs_meta::product_model::routes::{
     ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
     ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL,
     ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
     ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL,
 };
-use capanix_app_sdk::runtime::{RouteKey, RoutePlanMode, RoutePlanSpec};
-use capanix_app_sdk::{CnxError, Result};
-use capanix_deploy_sdk::compile_relation_target_intent_value;
+use fs_meta::RootSpec;
+pub use fs_meta::api::types::RootEntry;
+pub use fs_meta::api::{ApiAuthConfig, BootstrapAdminConfig, BootstrapManagementConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -139,9 +139,8 @@ pub fn compile_release_doc_to_relation_target_intent(
     release_doc: &serde_json::Value,
 ) -> Result<serde_json::Value> {
     let intent_value = scope_unit_intent_to_scope_worker_intent_value(release_doc)?;
-    compile_relation_target_intent_value(intent_value).map_err(|err| {
-        CnxError::InvalidInput(format!("invalid fs-meta deploy intent: {err}"))
-    })
+    compile_relation_target_intent_value(intent_value)
+        .map_err(|err| CnxError::InvalidInput(format!("invalid fs-meta deploy intent: {err}")))
 }
 
 fn build_worker_config_json(

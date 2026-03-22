@@ -39,7 +39,7 @@ capanix-host-fs-types = "0.1.0"
 capanix-kernel = "0.1.0"
 capanix-kernel-api = "0.1.0"
 capanix-managed-state-sdk = { version = "0.1.0", path = "../capanix/crates/managed-state-sdk" }
-capanix-runtime-host-sdk = { version = "0.1.0", path = "../capanix/crates/runtime-host-sdk" }
+capanix-runtime-entry-sdk = { version = "0.1.0", path = "../capanix/crates/runtime-entry-sdk" }
 capanix-route-proto = "0.1.0"
 capanix-service-sdk = { version = "0.1.0", path = "../capanix/crates/service-sdk" }
 capanix-worker-runtime-support = { version = "0.1.0", path = "../capanix/crates/worker-runtime-support" }
@@ -68,11 +68,13 @@ base64 = "0.22"
 bytes = { workspace = true }
 fs-meta = { workspace = true }
 fs-meta-deploy = { workspace = true }
+fs-meta-runtime = { workspace = true }
 capanix-app-sdk = { workspace = true }
 capanix-host-fs-types = { workspace = true }
 capanix-kernel-api = { workspace = true }
 capanix-route-proto = { workspace = true }
 capanix-runtime-api = "0.1.0"
+capanix-runtime-entry-sdk = { workspace = true }
 libc = "0.2"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 ring = "0.17"

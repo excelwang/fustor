@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
 use capanix_app_sdk::{CnxError, Event, Result};
-use capanix_runtime_host_sdk::boundary::{
+use capanix_runtime_entry_sdk::advanced::boundary::{
     BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest, StateBoundary,
 };
-use capanix_runtime_host_sdk::worker_runtime::{
+use capanix_runtime_entry_sdk::worker_runtime::{
     TypedWorkerBootstrapSession, TypedWorkerSession, WorkerLoopControl, WorkerSessionContext,
     run_worker_sidecar_server,
 };

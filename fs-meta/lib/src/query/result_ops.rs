@@ -10,13 +10,13 @@ use crate::shared_types::query::UnreliableReason;
 use crate::{EventKind, FileMetaRecord};
 
 #[derive(Debug, Clone)]
-pub(crate) struct RawQueryResult {
+pub struct RawQueryResult {
     pub nodes: Vec<QueryNode>,
     pub reliable: bool,
     pub unreliable_reason: Option<UnreliableReason>,
 }
 
-pub(crate) fn query_response_from_records(
+pub fn query_response_from_records(
     records: HashMap<Vec<u8>, FileMetaRecord>,
 ) -> RawQueryResult {
     let mut nodes: Vec<QueryNode> = records
@@ -41,7 +41,7 @@ pub(crate) fn query_response_from_records(
     }
 }
 
-pub(crate) fn raw_query_results_by_origin_from_source_events(
+pub fn raw_query_results_by_origin_from_source_events(
     events: &[Event],
     query_path: &[u8],
 ) -> Result<BTreeMap<String, RawQueryResult>> {
@@ -87,7 +87,7 @@ pub(crate) fn raw_query_results_by_origin_from_source_events(
         .collect())
 }
 
-pub(crate) fn subtree_stats_from_query_response(response: &RawQueryResult) -> SubtreeStats {
+pub fn subtree_stats_from_query_response(response: &RawQueryResult) -> SubtreeStats {
     let mut stats = SubtreeStats::default();
     for node in &response.nodes {
         stats.total_nodes += 1;
@@ -112,7 +112,7 @@ pub(crate) fn subtree_stats_from_query_response(response: &RawQueryResult) -> Su
     stats
 }
 
-pub(crate) fn merge_query_responses(responses: Vec<RawQueryResult>) -> RawQueryResult {
+pub fn merge_query_responses(responses: Vec<RawQueryResult>) -> RawQueryResult {
     let mut by_path: HashMap<Vec<u8>, QueryNode> = HashMap::new();
     let mut reliability = ReliabilityAccumulator::new();
 
@@ -136,7 +136,7 @@ pub(crate) fn merge_query_responses(responses: Vec<RawQueryResult>) -> RawQueryR
     }
 }
 
-pub(crate) fn tree_group_payload_from_query_response(
+pub fn tree_group_payload_from_query_response(
     response: &RawQueryResult,
     query_path: &[u8],
     recursive: bool,

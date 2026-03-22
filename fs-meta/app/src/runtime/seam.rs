@@ -4,10 +4,10 @@ use std::sync::Arc;
 
 use capanix_app_sdk::runtime::NodeId;
 use capanix_host_adapter_fs::{
-    ExchangeHostAdapter, HostFsFacade, PostBindDispatchTable, exchange_host_adapter_from_channel_boundary,
-    local_host_fs_facade,
+    ExchangeHostAdapter, HostFsFacade, PostBindDispatchTable,
+    exchange_host_adapter_from_channel_boundary, local_host_fs_facade,
 };
-use capanix_runtime_host_sdk::boundary::ChannelIoSubset;
+use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
 
 /// Narrow infra seam for adapting app-sdk ordinary boundaries into the
 /// kernel-facing carrier shapes still required by host-adapter internals.

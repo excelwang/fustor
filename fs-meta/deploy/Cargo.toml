@@ -10,7 +10,6 @@ path = "src/lib.rs"
 
 [dependencies]
 fs-meta = { workspace = true }
-fs-meta-runtime = { workspace = true }
 capanix-app-sdk = { workspace = true }
 capanix-deploy-sdk = { workspace = true }
 serde = { workspace = true, features = ["derive"] }

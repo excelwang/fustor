@@ -4,8 +4,8 @@ use std::time::Duration;
 
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
 use capanix_app_sdk::{CnxError, Event};
-use capanix_runtime_host_sdk::boundary::{ChannelIoSubset, StateBoundary};
-use capanix_runtime_host_sdk::worker_runtime::{
+use capanix_runtime_entry_sdk::advanced::boundary::{ChannelIoSubset, StateBoundary};
+use capanix_runtime_entry_sdk::worker_runtime::{
     TypedWorkerBootstrapSession, TypedWorkerSession, WorkerLoopControl, WorkerSessionContext,
     run_worker_sidecar_server,
 };
@@ -228,10 +228,12 @@ fn process_worker_request(
             ),
         },
         SinkWorkerRequest::Recv { timeout_ms, limit } => match state.sink.as_ref() {
-            Some(sink) => match block_on_runtime(runtime, sink.recv(recv_opts(timeout_ms, limit))) {
-                Ok(events) => (SinkWorkerResponse::Events(events), false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-            },
+            Some(sink) => {
+                match block_on_runtime(runtime, sink.recv(recv_opts(timeout_ms, limit))) {
+                    Ok(events) => (SinkWorkerResponse::Events(events), false),
+                    Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                }
+            }
             None => (
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,

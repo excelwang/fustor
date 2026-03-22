@@ -28,9 +28,9 @@ use capanix_app_sdk::runtime::{
 };
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::{HostFs, HostFsFacade};
-use capanix_runtime_host_sdk::boundary::{ChannelIoSubset, StateBoundary};
-use capanix_runtime_host_sdk::control::{
-    BoundScope, HostObjectGrantState, RuntimeHostObjectGrantsChanged,
+use capanix_runtime_entry_sdk::advanced::boundary::{ChannelIoSubset, StateBoundary};
+use capanix_runtime_entry_sdk::control::{
+    RuntimeBoundScope, RuntimeHostGrantChange, RuntimeHostGrantState,
 };
 
 use crate::LogicalClock;
@@ -598,7 +598,7 @@ impl FSMetaSource {
         unit: SourceRuntimeUnit,
         route_key: &str,
         generation: u64,
-        bound_scopes: &[BoundScope],
+        bound_scopes: &[RuntimeBoundScope],
     ) -> Result<()> {
         let unit_id = unit.unit_id();
         let accepted =
@@ -659,7 +659,7 @@ impl FSMetaSource {
         signals: &[SourceControlSignal],
     ) -> Result<()> {
         enum PendingAction {
-            UpdateHostObjectGrants(RuntimeHostObjectGrantsChanged),
+            UpdateHostObjectGrants(RuntimeHostGrantChange),
         }
         let mut actions = Vec::new();
         let mut refresh_runtime_topology = false;
@@ -700,7 +700,7 @@ impl FSMetaSource {
                     // business data path independent.
                     self.accept_tick_signal(*unit, route_key, *generation)?;
                 }
-                SourceControlSignal::RuntimeHostObjectGrantsChanged { changed, .. } => {
+                SourceControlSignal::RuntimeHostGrantChange { changed, .. } => {
                     actions.push(PendingAction::UpdateHostObjectGrants(changed.clone()));
                 }
                 SourceControlSignal::ManualRescan { .. } => {
@@ -757,7 +757,7 @@ impl FSMetaSource {
                             fs_type: row.object.fs_type,
                             mount_options: row.object.mount_options,
                             interfaces: row.interfaces,
-                            active: matches!(row.grant_state, HostObjectGrantState::Active),
+                            active: matches!(row.grant_state, RuntimeHostGrantState::Active),
                         })
                         .collect::<Vec<_>>();
                     if changed.version > current.saturating_add(1) {
@@ -2662,7 +2662,7 @@ impl FSMetaSource {
         let grant_count = host_object_grants.len();
         let bound_scopes = root_specs
             .iter()
-            .map(|root| BoundScope {
+            .map(|root| RuntimeBoundScope {
                 scope_id: root.id.clone(),
                 resource_ids: Vec::new(),
             })
@@ -3996,13 +3996,12 @@ impl FSMetaSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use capanix_runtime_host_sdk::control::{
-        ExecActivate, ExecControl, ExecDeactivate, HostDescriptor, HostObjectGrant,
-        HostObjectGrantState, HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged,
-        encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
-        encode_unit_tick_envelope,
+    use capanix_runtime_entry_sdk::control::{
+        RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate, RuntimeHostDescriptor,
+        RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType,
+        RuntimeObjectDescriptor, RuntimeUnitTick, encode_runtime_exec_control,
+        encode_runtime_host_grant_change, encode_runtime_unit_tick,
     };
-    use capanix_app_sdk::route_proto::UnitTick;
     use std::collections::BTreeSet;
 
     fn root(id: &str, path: &str) -> RootSpec {
@@ -4040,12 +4039,12 @@ mod tests {
         host_ip: &str,
         mount_point: &str,
         active: bool,
-    ) -> HostObjectGrant {
-        HostObjectGrant {
+    ) -> RuntimeHostGrant {
+        RuntimeHostGrant {
             object_ref: object_ref.to_string(),
-            object_type: HostObjectType::MountRoot,
+            object_type: RuntimeHostObjectType::MountRoot,
             interfaces: vec!["posix-fs".to_string(), "inotify".to_string()],
-            host: HostDescriptor {
+            host: RuntimeHostDescriptor {
                 host_ref: host_ref.to_string(),
                 host_ip: host_ip.to_string(),
                 host_name: Some(host_ref.to_string()),
@@ -4053,16 +4052,16 @@ mod tests {
                 zone: None,
                 host_labels: Default::default(),
             },
-            object: ObjectDescriptor {
+            object: RuntimeObjectDescriptor {
                 mount_point: mount_point.to_string(),
                 fs_source: mount_point.to_string(),
                 fs_type: "nfs".to_string(),
                 mount_options: Vec::new(),
             },
             grant_state: if active {
-                HostObjectGrantState::Active
+                RuntimeHostGrantState::Active
             } else {
-                HostObjectGrantState::Revoked
+                RuntimeHostGrantState::Revoked
             },
         }
     }
@@ -4135,16 +4134,15 @@ mod tests {
             true,
         )]);
 
-        let envelope =
-            encode_runtime_host_object_grants_changed_envelope(&RuntimeHostObjectGrantsChanged {
-                version: 2,
-                grants: vec![
-                    route_export("node-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
-                    route_export("node-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
-                    route_export("node-z", "node-z", "10.0.0.13", "relative/path", true),
-                ],
-            })
-            .expect("encode runtime host object grants changed");
+        let envelope = encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+            version: 2,
+            grants: vec![
+                route_export("node-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+                route_export("node-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+                route_export("node-z", "node-z", "10.0.0.13", "relative/path", true),
+            ],
+        })
+        .expect("encode runtime host object grants changed");
 
         source
             .on_control_frame(&[envelope])
@@ -4202,18 +4200,17 @@ mod tests {
             after_update
         );
 
-        let envelope =
-            encode_runtime_host_object_grants_changed_envelope(&RuntimeHostObjectGrantsChanged {
-                version: 1,
-                grants: vec![route_export(
-                    "node-a",
-                    "node-a",
-                    "10.0.0.11",
-                    "/mnt/nfs1",
-                    true,
-                )],
-            })
-            .expect("encode runtime host object grants changed");
+        let envelope = encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+            version: 1,
+            grants: vec![route_export(
+                "node-a",
+                "node-a",
+                "10.0.0.11",
+                "/mnt/nfs1",
+                true,
+            )],
+        })
+        .expect("encode runtime host object grants changed");
         source
             .on_control_frame(&[envelope])
             .await
@@ -4237,35 +4234,33 @@ mod tests {
             true,
         )]);
 
-        let first =
-            encode_runtime_host_object_grants_changed_envelope(&RuntimeHostObjectGrantsChanged {
-                version: 1,
-                grants: vec![route_export(
-                    "node-a",
-                    "node-a",
-                    "10.0.0.11",
-                    "/mnt/nfs1",
-                    true,
-                )],
-            })
-            .expect("encode first frame");
+        let first = encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+            version: 1,
+            grants: vec![route_export(
+                "node-a",
+                "node-a",
+                "10.0.0.11",
+                "/mnt/nfs1",
+                true,
+            )],
+        })
+        .expect("encode first frame");
         source
             .on_control_frame(&[first])
             .await
             .expect("apply first frame");
 
-        let stale =
-            encode_runtime_host_object_grants_changed_envelope(&RuntimeHostObjectGrantsChanged {
-                version: 1,
-                grants: vec![route_export(
-                    "node-b",
-                    "node-b",
-                    "10.0.0.12",
-                    "/mnt/nfs2",
-                    true,
-                )],
-            })
-            .expect("encode stale frame");
+        let stale = encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+            version: 1,
+            grants: vec![route_export(
+                "node-b",
+                "node-b",
+                "10.0.0.12",
+                "/mnt/nfs2",
+                true,
+            )],
+        })
+        .expect("encode stale frame");
         source
             .on_control_frame(&[stale])
             .await
@@ -4285,7 +4280,7 @@ mod tests {
     #[tokio::test]
     async fn unit_tick_control_frame_is_accepted() {
         let source = build_source(vec![]);
-        let envelope = encode_unit_tick_envelope(&UnitTick {
+        let envelope = encode_runtime_unit_tick(&RuntimeUnitTick {
             route_key: ROUTE_KEY_QUERY.to_string(),
             unit_id: "runtime.exec.scan".to_string(),
             generation: 1,
@@ -4302,7 +4297,7 @@ mod tests {
     #[tokio::test]
     async fn unit_tick_with_unknown_unit_id_is_rejected() {
         let source = build_source(vec![]);
-        let envelope = encode_unit_tick_envelope(&UnitTick {
+        let envelope = encode_runtime_unit_tick(&RuntimeUnitTick {
             route_key: ROUTE_KEY_QUERY.to_string(),
             unit_id: "runtime.exec.unknown".to_string(),
             generation: 1,
@@ -4321,15 +4316,16 @@ mod tests {
     #[tokio::test]
     async fn exec_activate_with_unknown_unit_id_is_rejected() {
         let source = build_source(vec![]);
-        let envelope = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.unknown".to_string(),
-            lease: None,
-            generation: 1,
-            expires_at_ms: 1,
-            bound_scopes: Vec::new(),
-        }))
-        .expect("encode exec activate");
+        let envelope =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.unknown".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode exec activate");
 
         let err = source
             .on_control_frame(&[envelope])
@@ -4342,22 +4338,23 @@ mod tests {
     #[tokio::test]
     async fn stale_deactivate_generation_is_ignored() {
         let source = build_source(vec![]);
-        let activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.scan".to_string(),
-            lease: None,
-            generation: 5,
-            expires_at_ms: 1,
-            bound_scopes: Vec::new(),
-        }))
-        .expect("encode activate");
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.scan".to_string(),
+                lease: None,
+                generation: 5,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode activate");
         source
             .on_control_frame(&[activate])
             .await
             .expect("activate should pass");
 
         let stale_deactivate =
-            encode_exec_control_envelope(&ExecControl::Deactivate(ExecDeactivate {
+            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
                 route_key: ROUTE_KEY_QUERY.to_string(),
                 unit_id: "runtime.exec.scan".to_string(),
                 lease: None,
@@ -4377,42 +4374,45 @@ mod tests {
     #[tokio::test]
     async fn stale_activate_generation_is_ignored() {
         let source = build_source(vec![]);
-        let activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.scan".to_string(),
-            lease: None,
-            generation: 5,
-            expires_at_ms: 1,
-            bound_scopes: Vec::new(),
-        }))
-        .expect("encode activate");
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.scan".to_string(),
+                lease: None,
+                generation: 5,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode activate");
         source
             .on_control_frame(&[activate])
             .await
             .expect("activate should pass");
 
-        let deactivate = encode_exec_control_envelope(&ExecControl::Deactivate(ExecDeactivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.scan".to_string(),
-            lease: None,
-            generation: 5,
-            reason: "test".to_string(),
-        }))
-        .expect("encode deactivate");
+        let deactivate =
+            encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.scan".to_string(),
+                lease: None,
+                generation: 5,
+                reason: "test".to_string(),
+            }))
+            .expect("encode deactivate");
         source
             .on_control_frame(&[deactivate])
             .await
             .expect("deactivate should pass");
 
-        let stale_activate = encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
-            route_key: ROUTE_KEY_QUERY.to_string(),
-            unit_id: "runtime.exec.scan".to_string(),
-            lease: None,
-            generation: 4,
-            expires_at_ms: 1,
-            bound_scopes: Vec::new(),
-        }))
-        .expect("encode stale activate");
+        let stale_activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.scan".to_string(),
+                lease: None,
+                generation: 4,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode stale activate");
         source
             .on_control_frame(&[stale_activate])
             .await
@@ -4974,27 +4974,26 @@ mod tests {
             .clone();
         assert_eq!(initial_primary, "node-a::exp1");
 
-        let envelope =
-            encode_runtime_host_object_grants_changed_envelope(&RuntimeHostObjectGrantsChanged {
-                version: 1,
-                grants: vec![
-                    route_export(
-                        "node-a::exp1",
-                        "node-a",
-                        "10.0.0.11",
-                        &root_dir.display().to_string(),
-                        false,
-                    ),
-                    route_export(
-                        "node-a::exp2",
-                        "node-a",
-                        "10.0.0.12",
-                        &root_dir.display().to_string(),
-                        true,
-                    ),
-                ],
-            })
-            .expect("encode grants changed");
+        let envelope = encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+            version: 1,
+            grants: vec![
+                route_export(
+                    "node-a::exp1",
+                    "node-a",
+                    "10.0.0.11",
+                    &root_dir.display().to_string(),
+                    false,
+                ),
+                route_export(
+                    "node-a::exp2",
+                    "node-a",
+                    "10.0.0.12",
+                    &root_dir.display().to_string(),
+                    true,
+                ),
+            ],
+        })
+        .expect("encode grants changed");
 
         source
             .on_control_frame(&[envelope])

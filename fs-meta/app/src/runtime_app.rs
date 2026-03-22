@@ -40,10 +40,12 @@ use capanix_app_sdk::runtime::{
 use capanix_app_sdk::worker::WorkerMode;
 use capanix_app_sdk::{CnxError, Event, Result, RuntimeBoundary, RuntimeBoundaryApp};
 use capanix_managed_state_sdk::{ManagedStateDeclaration, ManagedStateProfile};
-use capanix_runtime_host_sdk::boundary::{ChannelBoundary, ChannelIoSubset, StateBoundary};
-use capanix_runtime_host_sdk::control::BoundScope;
-use capanix_runtime_host_sdk::{RuntimeBootstrapContext, RuntimeLoadedServiceApp};
-use capanix_runtime_host_sdk::worker_runtime::RuntimeWorkerClientFactory;
+use capanix_runtime_entry_sdk::advanced::boundary::{
+    ChannelBoundary, ChannelIoSubset, StateBoundary, boundary_handles,
+};
+use capanix_runtime_entry_sdk::control::RuntimeBoundScope;
+use capanix_runtime_entry_sdk::worker_runtime::RuntimeWorkerClientFactory;
+use capanix_runtime_entry_sdk::{RuntimeBootstrapContext, RuntimeLoadedServiceApp};
 use capanix_service_sdk::AppBuilder;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -52,10 +54,9 @@ use crate::sink::SinkFileMeta;
 #[cfg(test)]
 use crate::source::config::SourceConfig;
 
-// Top-level fs-meta runtime authoring lowers through
-// `service-sdk -> runtime-host-sdk -> app-sdk`; direct runtime-api use is
-// confined to narrow infra seams such as boundary conversion helpers and
-// compiled worker-binding admission.
+// Top-level fs-meta runtime-entry/bootstrap glue lowers through
+// `service-sdk -> runtime-entry-sdk -> app-sdk`; lower runtime mirror/control
+// carriers stay behind the sanctioned helper layer.
 
 struct FacadeActivation {
     route_key: String,
@@ -70,7 +71,7 @@ struct PendingFacadeActivation {
     route_key: String,
     generation: u64,
     resource_ids: Vec<String>,
-    bound_scopes: Vec<BoundScope>,
+    bound_scopes: Vec<RuntimeBoundScope>,
     group_ids: Vec<String>,
     runtime_managed: bool,
     runtime_exposure_confirmed: bool,
@@ -178,9 +179,12 @@ pub struct FSMetaApp {
 }
 
 impl FSMetaApp {
-    pub fn new(config: FSMetaConfig, node_id: NodeId) -> Result<Self> {
+    pub fn new<C>(config: C, node_id: NodeId) -> Result<Self>
+    where
+        C: Into<FSMetaConfig>,
+    {
         Self::with_runtime_workers_and_state(
-            config,
+            config.into(),
             local_runtime_worker_binding("source"),
             local_runtime_worker_binding("sink"),
             node_id,
@@ -190,13 +194,16 @@ impl FSMetaApp {
         )
     }
 
-    pub fn with_boundaries(
-        config: FSMetaConfig,
+    pub fn with_boundaries<C>(
+        config: C,
         node_id: NodeId,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        C: Into<FSMetaConfig>,
+    {
         Self::with_runtime_workers_and_state(
-            config,
+            config.into(),
             local_runtime_worker_binding("source"),
             local_runtime_worker_binding("sink"),
             node_id,
@@ -206,17 +213,20 @@ impl FSMetaApp {
         )
     }
 
-    pub(crate) fn with_boundaries_and_state(
-        config: FSMetaConfig,
+    pub(crate) fn with_boundaries_and_state<C>(
+        config: C,
         source_worker_binding: RuntimeWorkerBinding,
         sink_worker_binding: RuntimeWorkerBinding,
         node_id: NodeId,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
         ordinary_boundary: Option<Arc<dyn ChannelBoundary>>,
         state_boundary: Arc<dyn StateBoundary>,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        C: Into<FSMetaConfig>,
+    {
         Self::with_runtime_workers_and_state(
-            config,
+            config.into(),
             source_worker_binding,
             sink_worker_binding,
             node_id,
@@ -840,9 +850,7 @@ impl FSMetaApp {
         Ok(())
     }
 
-    fn facade_candidate_resource_ids(
-        bound_scopes: &[BoundScope],
-    ) -> Vec<String> {
+    fn facade_candidate_resource_ids(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
         let mut ids = std::collections::BTreeSet::new();
         for scope in bound_scopes {
             for resource_id in &scope.resource_ids {
@@ -877,7 +885,7 @@ impl FSMetaApp {
     fn facade_candidate_group_ids(
         source: &SourceFacade,
         sink: &SinkFacade,
-        bound_scopes: &[BoundScope],
+        bound_scopes: &[RuntimeBoundScope],
     ) -> Result<Vec<String>> {
         let logical_root_ids = source
             .logical_roots_snapshot()?
@@ -1267,7 +1275,7 @@ impl FSMetaApp {
         unit: FacadeRuntimeUnit,
         route_key: &str,
         generation: u64,
-        bound_scopes: &[BoundScope],
+        bound_scopes: &[RuntimeBoundScope],
     ) -> Result<()> {
         eprintln!(
             "fs_meta_runtime_app: apply_facade_activate unit={} route_key={} generation={} scopes={}",
@@ -1490,7 +1498,7 @@ impl FSMetaApp {
                             .await?;
                     }
                 }
-                FacadeControlSignal::RuntimeHostObjectGrantsChanged { .. }
+                FacadeControlSignal::RuntimeHostGrantChange { .. }
                 | FacadeControlSignal::Passthrough => {}
             }
         }
@@ -1657,9 +1665,10 @@ impl FSMetaRuntimeApp {
         let runtime = RuntimeLoadedServiceApp::from_runtime_config(
             runtime_boundary,
             data_boundary,
-            FSMetaConfig::from_manifest_config,
+            FSMetaConfig::from_runtime_manifest_config,
             move |bootstrap, cfg| {
-                let ordinary_boundary: Arc<dyn ChannelBoundary> = bootstrap.runtime_boundary();
+                let boundary_handles = boundary_handles(&bootstrap);
+                let ordinary_boundary = boundary_handles.ordinary_boundary();
                 let (source_worker_binding, sink_worker_binding) =
                     Self::runtime_worker_bindings_from_bootstrap(&bootstrap)?;
                 let app = Arc::new(FSMetaApp::with_boundaries_and_state(
@@ -1667,9 +1676,9 @@ impl FSMetaRuntimeApp {
                     source_worker_binding,
                     sink_worker_binding,
                     bootstrap.local_host_ref().clone(),
-                    bootstrap.data_boundary(),
+                    boundary_handles.data_boundary(),
                     Some(ordinary_boundary),
-                    bootstrap.state_boundary(),
+                    boundary_handles.state_boundary(),
                 )?);
                 let close_app = app.clone();
                 let built = AppBuilder::new()
@@ -1768,18 +1777,17 @@ impl RuntimeBoundaryApp for FSMetaRuntimeApp {
 mod tests {
     use super::*;
     use crate::{ControlEvent, FileMetaRecord};
-    use crate::{FSMetaConfig, api, query, source};
+    use crate::{FSMetaConfig, FSMetaProductConfig, api, query, source};
     use bytes::Bytes;
     use capanix_app_sdk::runtime::{
         EventMetadata, RuntimeWorkerBinding, RuntimeWorkerBindings, RuntimeWorkerLauncherKind,
     };
-    use capanix_app_sdk::route_proto::UnitTick;
     use capanix_host_fs_types::UnixStat;
-    use capanix_runtime_host_sdk::control::{
-        ExecActivate, ExecControl, HostDescriptor, HostObjectGrant, HostObjectGrantState,
-        HostObjectType, ObjectDescriptor, RuntimeHostObjectGrantsChanged, UnitExposureConfirmed,
-        encode_exec_control_envelope, encode_runtime_host_object_grants_changed_envelope,
-        encode_unit_exposure_confirmed_envelope, encode_unit_tick_envelope,
+    use capanix_runtime_entry_sdk::control::{
+        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeHostDescriptor,
+        RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType,
+        RuntimeObjectDescriptor, RuntimeUnitExposure, RuntimeUnitTick, encode_runtime_exec_control,
+        encode_runtime_host_grant_change, encode_runtime_unit_exposure, encode_runtime_unit_tick,
     };
     use reqwest::Client;
     use serde_json::json;
@@ -1851,7 +1859,7 @@ mod tests {
     }
 
     fn activate_envelope(unit_id: &str) -> ControlEnvelope {
-        encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
             route_key: facade_control_stream_route(),
             unit_id: unit_id.to_string(),
             lease: None,
@@ -1876,13 +1884,13 @@ mod tests {
         resource_ids: &[&str],
         generation: u64,
     ) -> ControlEnvelope {
-        encode_exec_control_envelope(&ExecControl::Activate(ExecActivate {
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
             route_key: facade_control_stream_route(),
             unit_id: unit_id.to_string(),
             lease: None,
             generation,
             expires_at_ms: 60_000,
-            bound_scopes: vec![BoundScope {
+            bound_scopes: vec![RuntimeBoundScope {
                 scope_id: scope_id.to_string(),
                 resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
             }],
@@ -1891,13 +1899,13 @@ mod tests {
     }
 
     fn host_object_grants_changed_envelope(version: u64, mount_point: &str) -> ControlEnvelope {
-        encode_runtime_host_object_grants_changed_envelope(&RuntimeHostObjectGrantsChanged {
+        encode_runtime_host_grant_change(&RuntimeHostGrantChange {
             version,
-            grants: vec![HostObjectGrant {
+            grants: vec![RuntimeHostGrant {
                 object_ref: "single-app-node::root-1".to_string(),
-                object_type: HostObjectType::MountRoot,
+                object_type: RuntimeHostObjectType::MountRoot,
                 interfaces: vec!["posix-fs".to_string(), "inotify".to_string()],
-                host: HostDescriptor {
+                host: RuntimeHostDescriptor {
                     host_ref: "single-app-node".to_string(),
                     host_ip: "127.0.0.1".to_string(),
                     host_name: Some("single-app-node".to_string()),
@@ -1905,13 +1913,13 @@ mod tests {
                     zone: None,
                     host_labels: Default::default(),
                 },
-                object: ObjectDescriptor {
+                object: RuntimeObjectDescriptor {
                     mount_point: mount_point.to_string(),
                     fs_source: mount_point.to_string(),
                     fs_type: "nfs".to_string(),
                     mount_options: Vec::new(),
                 },
-                grant_state: HostObjectGrantState::Active,
+                grant_state: RuntimeHostGrantState::Active,
             }],
         })
         .expect("encode runtime host object grants changed envelope")
@@ -1919,7 +1927,7 @@ mod tests {
 
     #[allow(dead_code)]
     fn tick_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
-        encode_unit_tick_envelope(&UnitTick {
+        encode_runtime_unit_tick(&RuntimeUnitTick {
             route_key: facade_control_stream_route(),
             unit_id: unit_id.to_string(),
             generation,
@@ -1930,7 +1938,7 @@ mod tests {
 
     #[allow(dead_code)]
     fn trusted_exposure_confirmed_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
-        encode_unit_exposure_confirmed_envelope(&UnitExposureConfirmed {
+        encode_runtime_unit_exposure(&RuntimeUnitExposure {
             route_key: facade_control_stream_route(),
             unit_id: unit_id.to_string(),
             generation,
@@ -2039,6 +2047,13 @@ mod tests {
             ("id".to_string(), ConfigValue::String(id.to_string())),
             ("selector".to_string(), selector_mount_point(path)),
         ]))
+    }
+
+    fn minimal_api_config() -> ConfigValue {
+        ConfigValue::Map(std::collections::HashMap::from([(
+            "auth".to_string(),
+            ConfigValue::Map(std::collections::HashMap::new()),
+        )]))
     }
 
     #[tokio::test]
@@ -2183,12 +2198,13 @@ mod tests {
                 "roots".to_string(),
                 ConfigValue::Array(vec![root_entry("/tmp")]),
             ),
+            ("api".to_string(), minimal_api_config()),
             (
                 "unit_authority_state_dir".to_string(),
                 ConfigValue::String("/var/lib/capanix/fs-meta/statecell".to_string()),
             ),
         ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
             .expect_err("removed unit authority fields must fail-closed");
         assert!(
             err.to_string()
@@ -2384,7 +2400,7 @@ mod tests {
         let existing = match api::spawn(
             app.config
                 .api
-                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .resolve_for_candidate_ids(&["single-app-listener".to_string()])
                 .expect("resolve facade config"),
             app.node_id.clone(),
             app.runtime_boundary.clone(),
@@ -2414,7 +2430,7 @@ mod tests {
             route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
-            bound_scopes: vec![BoundScope {
+            bound_scopes: vec![RuntimeBoundScope {
                 scope_id: "single-app-listener".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -2522,7 +2538,7 @@ mod tests {
             FacadeRuntimeUnit::Facade,
             &facade_control_stream_route(),
             2,
-            &[BoundScope {
+            &[RuntimeBoundScope {
                 scope_id: "single-app-listener".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -2624,7 +2640,7 @@ mod tests {
             FacadeRuntimeUnit::Facade,
             &facade_control_stream_route(),
             2,
-            &[BoundScope {
+            &[RuntimeBoundScope {
                 scope_id: "test-root".to_string(),
                 resource_ids: vec!["listener-b".to_string()],
             }],
@@ -2746,7 +2762,7 @@ mod tests {
             FacadeRuntimeUnit::Facade,
             &facade_control_stream_route(),
             2,
-            &[BoundScope {
+            &[RuntimeBoundScope {
                 scope_id: "test-root".to_string(),
                 resource_ids: vec!["listener-b".to_string()],
             }],
@@ -2846,7 +2862,7 @@ mod tests {
             route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
-            bound_scopes: vec![BoundScope {
+            bound_scopes: vec![RuntimeBoundScope {
                 scope_id: "single-app-listener".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -2905,7 +2921,7 @@ mod tests {
             route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
-            bound_scopes: vec![BoundScope {
+            bound_scopes: vec![RuntimeBoundScope {
                 scope_id: "single-app-listener".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -3039,7 +3055,7 @@ mod tests {
             route_key: facade_control_stream_route(),
             generation: 2,
             resource_ids: vec!["single-app-listener".to_string()],
-            bound_scopes: vec![BoundScope {
+            bound_scopes: vec![RuntimeBoundScope {
                 scope_id: "root-a".to_string(),
                 resource_ids: vec!["single-app-listener".to_string()],
             }],
@@ -3200,22 +3216,26 @@ mod tests {
 
     #[test]
     fn parses_manifest_config_multi_roots() {
-        let cfg = std::collections::HashMap::from([(
-            "roots".to_string(),
-            ConfigValue::Array(vec![
-                {
-                    let mut row = match root_entry_with_id("nfs1-a", "/mnt/nfs1") {
-                        ConfigValue::Map(map) => map,
-                        _ => unreachable!(),
-                    };
-                    row.insert("watch".to_string(), ConfigValue::Bool(true));
-                    row.insert("scan".to_string(), ConfigValue::Bool(true));
-                    ConfigValue::Map(row)
-                },
-                root_entry_with_id("nfs2-b", "/mnt/nfs2"),
-            ]),
-        )]);
-        let parsed = FSMetaConfig::from_manifest_config(&cfg).expect("parse roots config");
+        let cfg = std::collections::HashMap::from([
+            (
+                "roots".to_string(),
+                ConfigValue::Array(vec![
+                    {
+                        let mut row = match root_entry_with_id("nfs1-a", "/mnt/nfs1") {
+                            ConfigValue::Map(map) => map,
+                            _ => unreachable!(),
+                        };
+                        row.insert("watch".to_string(), ConfigValue::Bool(true));
+                        row.insert("scan".to_string(), ConfigValue::Bool(true));
+                        ConfigValue::Map(row)
+                    },
+                    root_entry_with_id("nfs2-b", "/mnt/nfs2"),
+                ]),
+            ),
+            ("api".to_string(), minimal_api_config()),
+        ]);
+        let parsed =
+            FSMetaProductConfig::from_product_manifest_config(&cfg).expect("parse roots config");
         assert_eq!(parsed.source.roots.len(), 2);
         assert_eq!(parsed.source.roots[0].id, "nfs1-a");
     }
@@ -3271,6 +3291,7 @@ mod tests {
                 "roots".to_string(),
                 ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
             ),
+            ("api".to_string(), minimal_api_config()),
             ("scan_workers".to_string(), ConfigValue::Int(999)),
             ("audit_interval_ms".to_string(), ConfigValue::Int(1)),
             ("throttle_interval_ms".to_string(), ConfigValue::Int(1)),
@@ -3280,7 +3301,8 @@ mod tests {
                 ConfigValue::Int(i64::MAX),
             ),
         ]);
-        let parsed = FSMetaConfig::from_manifest_config(&cfg).expect("parse source tuning fields");
+        let parsed = FSMetaProductConfig::from_product_manifest_config(&cfg)
+            .expect("parse source tuning fields");
         assert_eq!(parsed.source.scan_workers, 16);
         assert_eq!(parsed.source.audit_interval, Duration::from_millis(5_000));
         assert_eq!(parsed.source.throttle_interval, Duration::from_millis(50));
@@ -3298,12 +3320,13 @@ mod tests {
                 "roots".to_string(),
                 ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
             ),
+            ("api".to_string(), minimal_api_config()),
             (
                 "unit_authority_state_dir".to_string(),
                 ConfigValue::String("relative/statecell".to_string()),
             ),
         ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
             .expect_err("removed unit_authority_state_dir must fail");
         assert!(
             err.to_string()
@@ -3318,12 +3341,13 @@ mod tests {
                 "roots".to_string(),
                 ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
             ),
+            ("api".to_string(), minimal_api_config()),
             (
                 "unit_authority_state_carrier".to_string(),
                 ConfigValue::String("external".to_string()),
             ),
         ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
             .expect_err("removed unit_authority_state_carrier must fail");
         assert!(
             err.to_string()
@@ -3338,12 +3362,13 @@ mod tests {
                 "roots".to_string(),
                 ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
             ),
+            ("api".to_string(), minimal_api_config()),
             (
                 "sink_execution_mode".to_string(),
                 ConfigValue::String("external".to_string()),
             ),
         ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
             .expect_err("removed sink execution mode must fail");
         assert!(err.to_string().contains(
             "sink_execution_mode has been removed; declare generic workers.<role>.mode/startup.path/socket_dir instead"
@@ -3357,12 +3382,13 @@ mod tests {
                 "roots".to_string(),
                 ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
             ),
+            ("api".to_string(), minimal_api_config()),
             (
                 "source_execution_mode".to_string(),
                 ConfigValue::String("external".to_string()),
             ),
         ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
             .expect_err("removed source execution mode must fail");
         assert!(err.to_string().contains(
             "source_execution_mode has been removed; declare generic workers.<role>.mode/startup.path/socket_dir instead"
@@ -3376,12 +3402,13 @@ mod tests {
                 "roots".to_string(),
                 ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
             ),
+            ("api".to_string(), minimal_api_config()),
             (
                 "sink_worker_bin_path".to_string(),
                 ConfigValue::String("/usr/local/bin/fs_meta_sink_worker".to_string()),
             ),
         ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
             .expect_err("removed sink worker bin path must fail");
         assert!(
             err.to_string()
@@ -3396,12 +3423,13 @@ mod tests {
                 "roots".to_string(),
                 ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
             ),
+            ("api".to_string(), minimal_api_config()),
             (
                 "source_worker_bin_path".to_string(),
                 ConfigValue::String("/usr/local/bin/fs_meta_source_worker".to_string()),
             ),
         ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg)
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
             .expect_err("removed source worker bin path must fail");
         assert!(
             err.to_string()
@@ -3516,17 +3544,22 @@ mod tests {
                 ConfigValue::Map(row)
             }]),
         )]);
-        let err = FSMetaConfig::from_manifest_config(&cfg).expect_err("must reject source_locator");
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
+            .expect_err("must reject source_locator");
         assert!(err.to_string().contains("source_locator is forbidden"));
     }
 
     #[test]
     fn derives_root_id_from_selector_mount_point_when_missing() {
-        let cfg = std::collections::HashMap::from([(
-            "roots".to_string(),
-            ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
-        )]);
-        let parsed = FSMetaConfig::from_manifest_config(&cfg).expect("parse roots config");
+        let cfg = std::collections::HashMap::from([
+            (
+                "roots".to_string(),
+                ConfigValue::Array(vec![root_entry("/mnt/nfs1")]),
+            ),
+            ("api".to_string(), minimal_api_config()),
+        ]);
+        let parsed =
+            FSMetaProductConfig::from_product_manifest_config(&cfg).expect("parse roots config");
         assert_eq!(parsed.source.roots[0].id, "mnt-nfs1");
     }
 
@@ -3536,14 +3569,15 @@ mod tests {
             "root_path".to_string(),
             ConfigValue::String("/mnt/nfs1".to_string()),
         )]);
-        let err = FSMetaConfig::from_manifest_config(&cfg).expect_err("must reject root_path");
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
+            .expect_err("must reject root_path");
         assert!(err.to_string().contains("root_path is forbidden"));
     }
 
     #[test]
     fn allows_missing_roots_field_as_empty_deployed_state() {
-        let cfg = std::collections::HashMap::new();
-        let parsed = FSMetaConfig::from_manifest_config(&cfg)
+        let cfg = std::collections::HashMap::from([("api".to_string(), minimal_api_config())]);
+        let parsed = FSMetaProductConfig::from_product_manifest_config(&cfg)
             .expect("missing roots should parse as empty deployed state");
         assert!(parsed.source.roots.is_empty());
     }
@@ -3624,7 +3658,7 @@ mod tests {
             );
             cfg
         };
-        let parsed = FSMetaConfig::from_manifest_config(&cfg).expect("parse api config");
+        let parsed = FSMetaConfig::from_runtime_manifest_config(&cfg).expect("parse api config");
         assert!(parsed.api.enabled);
         assert_eq!(parsed.api.facade_resource_id, "fs-meta-tcp-listener");
         assert_eq!(parsed.api.local_listener_resources.len(), 1);
@@ -3659,7 +3693,15 @@ mod tests {
                 )])),
             ),
         ]);
-        let err = FSMetaConfig::from_manifest_config(&cfg).expect_err("api must be mandatory");
+        let mut cfg = cfg;
+        if let Some(ConfigValue::Map(api)) = cfg.get_mut("api") {
+            api.insert(
+                "auth".to_string(),
+                ConfigValue::Map(std::collections::HashMap::new()),
+            );
+        }
+        let err = FSMetaProductConfig::from_product_manifest_config(&cfg)
+            .expect_err("api must be mandatory");
         assert!(
             err.to_string()
                 .contains("api.enabled must be true; fs-meta management API boundary is mandatory")

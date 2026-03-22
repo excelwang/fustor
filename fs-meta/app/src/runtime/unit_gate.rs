@@ -2,13 +2,13 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Mutex;
 
 use capanix_app_sdk::{CnxError, Result};
-use capanix_runtime_host_sdk::control::BoundScope;
+use capanix_runtime_entry_sdk::control::RuntimeBoundScope;
 
 #[derive(Debug, Clone, Default)]
 struct RouteControlState {
     generation: u64,
     active: bool,
-    bound_scopes: Vec<BoundScope>,
+    bound_scopes: Vec<RuntimeBoundScope>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -27,7 +27,7 @@ impl UnitControlGate {
         unit_id: &str,
         route_key: &str,
         generation: u64,
-        bound_scopes: &[BoundScope],
+        bound_scopes: &[RuntimeBoundScope],
     ) -> bool {
         let entry = self.units.entry(unit_id.to_string()).or_default();
         let route = entry.routes.entry(route_key.to_string()).or_default();
@@ -62,7 +62,7 @@ impl UnitControlGate {
         }
     }
 
-    fn sync_active_scopes(&mut self, unit_id: &str, bound_scopes: &[BoundScope]) {
+    fn sync_active_scopes(&mut self, unit_id: &str, bound_scopes: &[RuntimeBoundScope]) {
         let Some(state) = self.units.get_mut(unit_id) else {
             return;
         };
@@ -129,7 +129,7 @@ impl RuntimeUnitGate {
         unit_id: &str,
         route_key: &str,
         generation: u64,
-        bound_scopes: &[BoundScope],
+        bound_scopes: &[RuntimeBoundScope],
     ) -> Result<bool> {
         self.validate_runtime_unit(unit_id)?;
         let mut gate = self
@@ -170,7 +170,7 @@ impl RuntimeUnitGate {
     pub(crate) fn sync_active_scopes(
         &self,
         unit_id: &str,
-        bound_scopes: &[BoundScope],
+        bound_scopes: &[RuntimeBoundScope],
     ) -> Result<()> {
         self.validate_runtime_unit(unit_id)?;
         let mut gate = self
@@ -188,7 +188,10 @@ impl RuntimeUnitGate {
             .unwrap_or(false)
     }
 
-    pub(crate) fn unit_state(&self, unit_id: &str) -> Result<Option<(bool, Vec<BoundScope>)>> {
+    pub(crate) fn unit_state(
+        &self,
+        unit_id: &str,
+    ) -> Result<Option<(bool, Vec<RuntimeBoundScope>)>> {
         self.validate_runtime_unit(unit_id)?;
         let gate = self
             .gate
@@ -207,7 +210,7 @@ impl RuntimeUnitGate {
             let active = !merged.is_empty();
             let bound_scopes = merged
                 .into_iter()
-                .map(|(scope_id, resource_ids)| BoundScope {
+                .map(|(scope_id, resource_ids)| RuntimeBoundScope {
                     scope_id,
                     resource_ids: resource_ids.into_iter().collect(),
                 })
@@ -238,8 +241,8 @@ impl RuntimeUnitGate {
 mod tests {
     use super::*;
 
-    fn bound_scope(scope_id: &str, resource_id: &str) -> BoundScope {
-        BoundScope {
+    fn bound_scope(scope_id: &str, resource_id: &str) -> RuntimeBoundScope {
+        RuntimeBoundScope {
             scope_id: scope_id.to_string(),
             resource_ids: vec![resource_id.to_string()],
         }

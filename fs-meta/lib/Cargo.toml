@@ -3,7 +3,7 @@ name = "fs-meta"
 version = "0.1.0"
 edition = "2024"
 publish = false
-description = "fs-meta authoring package"
+description = "fs-meta authoring and domain surface package"
 
 [lib]
 path = "src/lib.rs"
@@ -17,7 +17,14 @@ name = "cli_specs"
 path = "../tests/cli_specs.rs"
 
 [dependencies]
-fs-meta-runtime = { workspace = true }
+capanix-app-sdk = { workspace = true }
+capanix-host-adapter-fs = { workspace = true }
+capanix-host-fs-types = { workspace = true }
+capanix-managed-state-sdk = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_bytes = { workspace = true }
+serde_json = "1"
 
 [dev-dependencies]
 fs-meta-deploy = { workspace = true }
