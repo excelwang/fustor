@@ -490,7 +490,7 @@ async fn load_materialized_status_snapshots(
             | Err(err @ CnxError::ProtocolViolation(_)) => return Err(err),
             Err(err) => return Err(err),
         },
-        QueryBackend::Local { .. } => source.status_snapshot()?,
+        QueryBackend::Local { .. } => source.status_snapshot().await?,
     };
     let sink_status = match &state.backend {
         QueryBackend::Route {
@@ -510,7 +510,7 @@ async fn load_materialized_status_snapshots(
             | Err(err @ CnxError::ProtocolViolation(_)) => return Err(err),
             Err(err) => return Err(err),
         },
-        QueryBackend::Local { .. } => sink.status_snapshot()?,
+        QueryBackend::Local { .. } => sink.status_snapshot().await?,
     };
     Ok((source_status, sink_status))
 }
@@ -1060,21 +1060,13 @@ fn base_router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-pub(crate) async fn run_blocking_query<F>(f: F, timeout: Duration) -> Result<Vec<Event>, CnxError>
+pub(crate) async fn run_timed_query<Fut>(fut: Fut, timeout: Duration) -> Result<Vec<Event>, CnxError>
 where
-    F: FnOnce() -> Result<Vec<Event>, CnxError> + Send + 'static,
+    Fut: std::future::Future<Output = Result<Vec<Event>, CnxError>>,
 {
-    let handle = tokio::task::spawn_blocking(f);
-    let abort_handle = handle.abort_handle();
-    match tokio::time::timeout(timeout, handle).await {
-        Ok(joined) => {
-            joined.map_err(|e| CnxError::Internal(format!("blocking query task failed: {e}")))?
-        }
-        Err(_) => {
-            abort_handle.abort();
-            Err(CnxError::Timeout)
-        }
-    }
+    tokio::time::timeout(timeout, fut)
+        .await
+        .map_err(|_| CnxError::Timeout)?
 }
 
 async fn query_materialized_events(
@@ -1090,8 +1082,7 @@ async fn query_materialized_events(
     );
     match backend {
         QueryBackend::Local { sink, .. } => {
-            let result =
-                run_blocking_query(move || sink.materialized_query(&params), timeout).await;
+            let result = run_timed_query(sink.materialized_query(&params), timeout).await;
             eprintln!(
                 "fs_meta_query_api: query_materialized_events local done ok={}",
                 result.is_ok()
@@ -1105,14 +1096,12 @@ async fn query_materialized_events(
             source,
         } => {
             if let Some(group_id) = params.scope.selected_group.as_deref()
-                && let Some(node_id) = materialized_owner_node_for_group(source.as_ref(), group_id)?
+                && let Some(node_id) =
+                    materialized_owner_node_for_group(source.as_ref(), group_id).await?
             {
-                let node_id_for_call = node_id.clone();
-                let result = run_blocking_query(
-                    move || sink.materialized_query_via_node(&node_id_for_call, &params),
-                    timeout,
-                )
-                .await;
+                let result =
+                    run_timed_query(sink.materialized_query_via_node(&node_id, &params), timeout)
+                        .await;
                 eprintln!(
                     "fs_meta_query_api: query_materialized_events direct-node node={} ok={}",
                     node_id.0,
@@ -1171,7 +1160,7 @@ async fn query_force_find_events(
     );
     match backend {
         QueryBackend::Local { source, .. } => {
-            let result = run_blocking_query(move || source.force_find(&params), timeout).await;
+            let result = run_timed_query(source.force_find(&params), timeout).await;
             eprintln!(
                 "fs_meta_query_api: query_force_find_events local done ok={}",
                 result.is_ok()
@@ -1399,22 +1388,23 @@ fn node_id_from_object_ref(object_ref: &str) -> Option<NodeId> {
         .map(|(node_id, _)| NodeId(node_id.to_string()))
 }
 
-fn materialized_owner_node_for_group(
+async fn materialized_owner_node_for_group(
     source: &SourceFacade,
     group_id: &str,
 ) -> Result<Option<NodeId>, CnxError> {
     Ok(source
-        .source_primary_by_group_snapshot()?
+        .source_primary_by_group_snapshot()
+        .await?
         .get(group_id)
         .and_then(|object_ref| node_id_from_object_ref(object_ref)))
 }
 
-fn force_find_candidate_object_refs_for_group(
+async fn force_find_candidate_object_refs_for_group(
     source: &SourceFacade,
     group_id: &str,
 ) -> Result<Vec<String>, CnxError> {
-    let roots = source.logical_roots_snapshot()?;
-    let grants = source.host_object_grants_snapshot()?;
+    let roots = source.logical_roots_snapshot().await?;
+    let grants = source.host_object_grants_snapshot().await?;
     let Some(root) = roots.into_iter().find(|root| root.id == group_id) else {
         return Ok(Vec::new());
     };
@@ -1428,14 +1418,14 @@ fn force_find_candidate_object_refs_for_group(
     Ok(candidates)
 }
 
-fn select_force_find_runner_node_for_group(
+async fn select_force_find_runner_node_for_group(
     state: &ApiState,
     source: &SourceFacade,
     group_id: &str,
 ) -> Result<Option<NodeId>, CnxError> {
-    let candidates = force_find_candidate_object_refs_for_group(source, group_id)?;
+    let candidates = force_find_candidate_object_refs_for_group(source, group_id).await?;
     if candidates.is_empty() {
-        return Ok(materialized_owner_node_for_group(source, group_id)?);
+        return materialized_owner_node_for_group(source, group_id).await;
     }
     let len = candidates.len();
     let idx = {
@@ -1474,15 +1464,9 @@ async fn query_force_find_group_stats(
     let events = match &state.backend {
         QueryBackend::Route { source, .. } => {
             if let Some(node_id) =
-                select_force_find_runner_node_for_group(state, source.as_ref(), group_id)?
+                select_force_find_runner_node_for_group(state, source.as_ref(), group_id).await?
             {
-                let source = source.clone();
-                let request = request.clone();
-                run_blocking_query(
-                    move || source.force_find_via_node(&node_id, &request),
-                    timeout,
-                )
-                .await?
+                run_timed_query(source.force_find_via_node(&node_id, &request), timeout).await?
             } else {
                 query_force_find_events(state.backend.clone(), request, timeout).await?
             }
@@ -1514,15 +1498,9 @@ async fn query_force_find_group_tree(
     let events = match &state.backend {
         QueryBackend::Route { source, .. } => {
             if let Some(node_id) =
-                select_force_find_runner_node_for_group(state, source.as_ref(), group_id)?
+                select_force_find_runner_node_for_group(state, source.as_ref(), group_id).await?
             {
-                let source = source.clone();
-                let request = request.clone();
-                run_blocking_query(
-                    move || source.force_find_via_node(&node_id, &request),
-                    timeout,
-                )
-                .await?
+                run_timed_query(source.force_find_via_node(&node_id, &request), timeout).await?
             } else {
                 query_force_find_events(state.backend.clone(), request, timeout).await?
             }
@@ -2035,7 +2013,7 @@ async fn build_force_find_pit_session(
     params: &NormalizedApiParams,
     timeout: Duration,
 ) -> Result<PitSession, CnxError> {
-    let target_groups = resolve_force_find_groups(state, params)?;
+    let target_groups = resolve_force_find_groups(state, params).await?;
     let rankings = if params.group_order == GroupOrder::GroupKey {
         let mut ordered = target_groups.clone();
         ordered.sort();
@@ -2545,7 +2523,7 @@ async fn collect_materialized_stats_groups(
 ) -> Result<serde_json::Map<String, serde_json::Value>, CnxError> {
     let mut groups = serde_json::Map::<String, serde_json::Value>::new();
     let target_groups = match read_class {
-        ReadClass::Fresh => resolve_force_find_groups(state, params)?,
+        ReadClass::Fresh => resolve_force_find_groups(state, params).await?,
         ReadClass::Materialized | ReadClass::TrustedMaterialized => {
             materialized_target_groups(state, params.group.as_deref())?
         }
@@ -2713,7 +2691,7 @@ async fn get_force_find(
     }
 }
 
-fn resolve_force_find_groups(
+async fn resolve_force_find_groups(
     state: &ApiState,
     params: &NormalizedApiParams,
 ) -> Result<Vec<String>, CnxError> {
@@ -2721,14 +2699,16 @@ fn resolve_force_find_groups(
         return Ok(vec![group.clone()]);
     }
 
-    fn fallback_force_find_groups(source: &Arc<SourceFacade>) -> Result<Vec<String>, CnxError> {
+    async fn fallback_force_find_groups(
+        source: &Arc<SourceFacade>,
+    ) -> Result<Vec<String>, CnxError> {
         let scan_enabled_groups = source
             .cached_logical_roots_snapshot()?
             .into_iter()
             .filter(|root| root.scan)
             .map(|root| root.id)
             .collect::<BTreeSet<_>>();
-        if let Ok(snapshot) = source.observability_snapshot() {
+        if let Ok(snapshot) = source.observability_snapshot().await {
             let mut groups = snapshot
                 .source_primary_by_group
                 .into_keys()
@@ -2748,7 +2728,7 @@ fn resolve_force_find_groups(
 
     match &state.backend {
         QueryBackend::Local { source, .. } | QueryBackend::Route { source, .. } => {
-            fallback_force_find_groups(source)
+            fallback_force_find_groups(source).await
         }
     }
 }
@@ -3156,13 +3136,28 @@ mod tests {
         let sink = sink_facade_with_group(&grants);
         let state = test_api_state_for_source(source.clone(), sink);
 
-        let first = select_force_find_runner_node_for_group(&state, source.as_ref(), "nfs1")
+        let first = crate::runtime_app::shared_tokio_runtime()
+            .block_on(select_force_find_runner_node_for_group(
+                &state,
+                source.as_ref(),
+                "nfs1",
+            ))
             .expect("first selection")
             .expect("first node");
-        let second = select_force_find_runner_node_for_group(&state, source.as_ref(), "nfs1")
+        let second = crate::runtime_app::shared_tokio_runtime()
+            .block_on(select_force_find_runner_node_for_group(
+                &state,
+                source.as_ref(),
+                "nfs1",
+            ))
             .expect("second selection")
             .expect("second node");
-        let third = select_force_find_runner_node_for_group(&state, source.as_ref(), "nfs1")
+        let third = crate::runtime_app::shared_tokio_runtime()
+            .block_on(select_force_find_runner_node_for_group(
+                &state,
+                source.as_ref(),
+                "nfs1",
+            ))
             .expect("third selection")
             .expect("third node");
 
@@ -3219,10 +3214,12 @@ mod tests {
             &grants,
         );
 
-        let nfs1 = materialized_owner_node_for_group(source.as_ref(), "nfs1")
+        let nfs1 = crate::runtime_app::shared_tokio_runtime()
+            .block_on(materialized_owner_node_for_group(source.as_ref(), "nfs1"))
             .expect("resolve nfs1 owner")
             .expect("nfs1 owner");
-        let nfs2 = materialized_owner_node_for_group(source.as_ref(), "nfs2")
+        let nfs2 = crate::runtime_app::shared_tokio_runtime()
+            .block_on(materialized_owner_node_for_group(source.as_ref(), "nfs2"))
             .expect("resolve nfs2 owner")
             .expect("nfs2 owner");
 
@@ -3271,7 +3268,9 @@ mod tests {
             read_class: None,
         };
 
-        let groups = resolve_force_find_groups(&state, &params).expect("resolve groups");
+        let groups = crate::runtime_app::shared_tokio_runtime()
+            .block_on(resolve_force_find_groups(&state, &params))
+            .expect("resolve groups");
 
         assert_eq!(groups, vec!["nfs1".to_string(), "nfs2".to_string()]);
     }

@@ -24,21 +24,27 @@ pub(crate) struct ManagedEndpointTask {
 }
 
 impl ManagedEndpointTask {
-    fn spawn_join(runner: impl FnOnce() + Send + 'static) -> EndpointJoin {
+    fn spawn_join<Fut>(runner: Fut) -> EndpointJoin
+    where
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         if tokio::runtime::Handle::try_current().is_ok() {
-            EndpointJoin::Tokio(tokio::task::spawn_blocking(runner))
+            EndpointJoin::Tokio(tokio::spawn(runner))
         } else {
-            EndpointJoin::Thread(std::thread::spawn(runner))
+            EndpointJoin::Thread(std::thread::spawn(move || {
+                crate::runtime_app::shared_tokio_runtime().block_on(runner)
+            }))
         }
     }
 
-    fn spawn_join_with_ready(
-        runner: impl FnOnce() + Send + 'static,
-    ) -> (EndpointJoin, Receiver<()>) {
+    fn spawn_join_with_ready<Fut>(runner: Fut) -> (EndpointJoin, Receiver<()>)
+    where
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let (ready_tx, ready_rx) = sync_channel(1);
-        let join = Self::spawn_join(move || {
+        let join = Self::spawn_join(async move {
             let _ = ready_tx.send(());
-            runner();
+            runner.await;
         });
         (join, ready_rx)
     }
@@ -53,7 +59,7 @@ impl ManagedEndpointTask {
         }
     }
 
-    pub(crate) fn spawn<F>(
+    pub(crate) fn spawn<F, Fut>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
         name: impl Into<String>,
@@ -61,14 +67,14 @@ impl ManagedEndpointTask {
         handler: F,
     ) -> Self
     where
-        F: Fn(Vec<Event>) -> Vec<Event> + Send + Sync + 'static,
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
     {
         let name_owned = name.into();
         let join_name = name_owned.clone();
         let shutdown_for_task = shutdown.clone();
         let handler = Arc::new(handler);
-        let runner =
-            move || run_endpoint_loop(boundary, route, join_name, shutdown_for_task, handler);
+        let runner = run_endpoint_loop(boundary, route, join_name, shutdown_for_task, handler);
         let (join, ready_rx) = Self::spawn_join_with_ready(runner);
         Self::wait_until_ready(&name_owned, ready_rx);
 
@@ -79,7 +85,7 @@ impl ManagedEndpointTask {
         }
     }
 
-    pub(crate) fn spawn_stream<F, G>(
+    pub(crate) fn spawn_stream<F, Fut, G>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
         name: impl Into<String>,
@@ -88,7 +94,8 @@ impl ManagedEndpointTask {
         handler: F,
     ) -> Self
     where
-        F: Fn(Vec<Event>) + Send + Sync + 'static,
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
         G: Fn() -> bool + Send + Sync + 'static,
     {
         let name_owned = name.into();
@@ -96,16 +103,14 @@ impl ManagedEndpointTask {
         let shutdown_for_task = shutdown.clone();
         let should_recv = Arc::new(should_recv);
         let handler = Arc::new(handler);
-        let runner = move || {
-            run_stream_loop(
-                boundary,
-                route,
-                join_name,
-                shutdown_for_task,
-                should_recv,
-                handler,
-            )
-        };
+        let runner = run_stream_loop(
+            boundary,
+            route,
+            join_name,
+            shutdown_for_task,
+            should_recv,
+            handler,
+        );
         let (join, ready_rx) = Self::spawn_join_with_ready(runner);
         Self::wait_until_ready(&name_owned, ready_rx);
 
@@ -166,14 +171,15 @@ impl ManagedEndpointTask {
     }
 }
 
-fn run_endpoint_loop<F>(
+async fn run_endpoint_loop<F, Fut>(
     boundary: Arc<dyn ChannelIoSubset>,
     route: RouteKey,
     join_name: String,
     shutdown_for_task: CancellationToken,
     handler: Arc<F>,
 ) where
-    F: Fn(Vec<Event>) -> Vec<Event> + Send + Sync + 'static,
+    F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
 {
     let ctx = BoundaryContext::default();
     let request_channel = ChannelKey(route.0.clone());
@@ -189,7 +195,9 @@ fn run_endpoint_loop<F>(
                 channel_key: request_channel.clone(),
                 timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
             },
-        ) {
+        )
+        .await
+        {
             Ok(events) => events,
             Err(err) => {
                 log::warn!(
@@ -207,7 +215,7 @@ fn run_endpoint_loop<F>(
         }
 
         let correlation_id = shared_correlation_id(&requests);
-        let mut responses = handler(requests);
+        let mut responses = handler(requests).await;
         if let Some(cid) = correlation_id {
             responses = responses
                 .into_iter()
@@ -224,14 +232,17 @@ fn run_endpoint_loop<F>(
         if responses.is_empty() {
             continue;
         }
-        if let Err(err) = crate::runtime_app::block_on_shared_runtime(boundary.channel_send(
+        if let Err(err) = boundary
+            .channel_send(
             ctx.clone(),
             ChannelSendRequest {
                 channel_key: reply_channel.clone(),
                 events: responses,
                 timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
             },
-        )) {
+        )
+        .await
+        {
             log::warn!(
                 "endpoint task {} send failed for {}: {:?}",
                 join_name,
@@ -243,7 +254,7 @@ fn run_endpoint_loop<F>(
     }
 }
 
-fn run_stream_loop<F, G>(
+async fn run_stream_loop<F, Fut, G>(
     boundary: Arc<dyn ChannelIoSubset>,
     route: RouteKey,
     join_name: String,
@@ -251,7 +262,8 @@ fn run_stream_loop<F, G>(
     should_recv: Arc<G>,
     handler: Arc<F>,
 ) where
-    F: Fn(Vec<Event>) + Send + Sync + 'static,
+    F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
     G: Fn() -> bool + Send + Sync + 'static,
 {
     let ctx = BoundaryContext::default();
@@ -262,7 +274,7 @@ fn run_stream_loop<F, G>(
             break;
         }
         if !should_recv() {
-            std::thread::sleep(Duration::from_millis(50));
+            tokio::time::sleep(Duration::from_millis(50)).await;
             continue;
         }
         eprintln!(
@@ -275,7 +287,9 @@ fn run_stream_loop<F, G>(
                 channel_key: stream_channel.clone(),
                 timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
             },
-        ) {
+        )
+        .await
+        {
             Ok(events) => events,
             Err(CnxError::Timeout) => continue,
             Err(err @ CnxError::NotSupported(_))
@@ -287,7 +301,7 @@ fn run_stream_loop<F, G>(
                     "fs_meta_runtime_endpoint: transient stream recv gap task={} route={} err={:?}",
                     join_name, stream_channel.0, err
                 );
-                std::thread::sleep(Duration::from_millis(50));
+                tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
             Err(err) => {
@@ -309,7 +323,7 @@ fn run_stream_loop<F, G>(
             continue;
         }
 
-        handler(events);
+        handler(events).await;
         eprintln!(
             "fs_meta_runtime_endpoint: stream loop handler returned route={} task={}",
             stream_channel.0, join_name
@@ -343,8 +357,9 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
     impl ChannelIoSubset for RecordingBoundary {
-        fn channel_recv(
+        async fn channel_recv(
             &self,
             _ctx: BoundaryContext,
             request: ChannelRecvRequest,
@@ -365,14 +380,14 @@ mod tests {
     #[test]
     fn stream_loop_uses_exact_route_key_without_double_suffix() {
         let boundary = Arc::new(RecordingBoundary::new());
-        run_stream_loop(
+        crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
             boundary.clone(),
             RouteKey("fs-meta.events:v1.stream".into()),
             "test-stream".into(),
             CancellationToken::new(),
             Arc::new(|| true),
-            Arc::new(|_events: Vec<Event>| {}),
-        );
+            Arc::new(|_events: Vec<Event>| std::future::ready(())),
+        ));
 
         let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
         assert_eq!(recv_keys, vec!["fs-meta.events:v1.stream".to_string()]);
@@ -381,14 +396,14 @@ mod tests {
     #[test]
     fn stream_loop_retries_transient_recv_errors() {
         let boundary = Arc::new(RecordingBoundary::fail_once());
-        run_stream_loop(
+        crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
             boundary.clone(),
             RouteKey("fs-meta.events:v1.stream".into()),
             "test-stream".into(),
             CancellationToken::new(),
             Arc::new(|| true),
-            Arc::new(|_events: Vec<Event>| {}),
-        );
+            Arc::new(|_events: Vec<Event>| std::future::ready(())),
+        ));
 
         let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
         assert_eq!(

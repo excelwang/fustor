@@ -27,13 +27,6 @@ const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
 const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
-fn block_on_shared_runtime<F, T>(fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    crate::runtime_app::block_on_shared_runtime(fut)
-}
-
 fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
     let mut selected = None::<QueryNode>;
     for event in &events {
@@ -116,8 +109,8 @@ impl SinkWorkerClientHandle {
         })
     }
 
-    fn existing_client(&self) -> Result<Option<TypedWorkerClient<SinkWorkerRpc>>> {
-        self.worker.existing_client()
+    async fn existing_client(&self) -> Result<Option<TypedWorkerClient<SinkWorkerRpc>>> {
+        self.worker.existing_client().await
     }
 
     fn cached_logical_roots(&self) -> Result<Vec<crate::source::config::RootSpec>> {
@@ -154,50 +147,58 @@ impl SinkWorkerClientHandle {
         Ok(())
     }
 
-    fn with_started_retry<T>(
-        &self,
-        op: impl Fn(&TypedWorkerClient<SinkWorkerRpc>) -> Result<T>,
-    ) -> Result<T> {
-        self.worker.with_started_retry(op)
+    async fn with_started_retry<T, F, Fut>(&self, op: F) -> Result<T>
+    where
+        F: Fn(TypedWorkerClient<SinkWorkerRpc>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        self.worker.with_started_retry(op).await
     }
 
-    fn client(&self) -> Result<TypedWorkerClient<SinkWorkerRpc>> {
-        self.worker.client()
+    async fn client(&self) -> Result<TypedWorkerClient<SinkWorkerRpc>> {
+        self.worker.client().await
     }
 
-    fn call_worker(
+    async fn call_worker(
         client: &TypedWorkerClient<SinkWorkerRpc>,
         request: SinkWorkerRequest,
         timeout: Duration,
     ) -> Result<SinkWorkerResponse> {
-        client.call_with_timeout(request, timeout)
+        client.call_with_timeout(request, timeout).await
     }
 
-    pub fn ensure_started(&self) -> Result<()> {
-        self.worker.ensure_started()
+    pub async fn ensure_started(&self) -> Result<()> {
+        self.worker.ensure_started().await
     }
 
-    pub fn update_logical_roots(
+    pub async fn update_logical_roots(
         &self,
         roots: Vec<crate::source::config::RootSpec>,
         host_object_grants: Vec<GrantedMountRoot>,
     ) -> Result<()> {
         self.with_started_retry(|client| {
+            let roots = roots.clone();
+            let host_object_grants = host_object_grants.clone();
+            async move {
             match Self::call_worker(
-                client,
+                &client,
                 SinkWorkerRequest::UpdateLogicalRoots {
                     roots: roots.clone(),
                     host_object_grants: host_object_grants.clone(),
                 },
                 SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-            )? {
+            )
+            .await?
+            {
                 SinkWorkerResponse::Ack => Ok(()),
                 other => Err(CnxError::ProtocolViolation(format!(
                     "unexpected sink worker response for update roots: {:?}",
                     other
                 ))),
             }
-        })?;
+            }
+        })
+        .await?;
         self.update_cached_logical_roots(roots)?;
         self.update_cached_status_snapshot(SinkStatusSnapshot::default())
     }
@@ -206,12 +207,14 @@ impl SinkWorkerClientHandle {
         self.cached_logical_roots()
     }
 
-    pub fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
+    pub async fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
         let roots = match Self::call_worker(
-            &self.client()?,
+            &self.client().await?,
             SinkWorkerRequest::LogicalRootsSnapshot,
             Duration::from_secs(5),
-        )? {
+        )
+        .await?
+        {
             SinkWorkerResponse::LogicalRoots(roots) => roots,
             other => {
                 return Err(CnxError::ProtocolViolation(format!(
@@ -224,12 +227,14 @@ impl SinkWorkerClientHandle {
         Ok(roots)
     }
 
-    pub fn health(&self) -> Result<HealthStats> {
+    pub async fn health(&self) -> Result<HealthStats> {
         match Self::call_worker(
-            &self.client()?,
+            &self.client().await?,
             SinkWorkerRequest::Health,
             Duration::from_secs(5),
-        )? {
+        )
+        .await?
+        {
             SinkWorkerResponse::Health(health) => Ok(health),
             other => Err(CnxError::ProtocolViolation(format!(
                 "unexpected sink worker response for health: {:?}",
@@ -238,12 +243,14 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    pub fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+    pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
         let snapshot = match Self::call_worker(
-            &self.client()?,
+            &self.client().await?,
             SinkWorkerRequest::StatusSnapshot,
             Duration::from_secs(5),
-        )? {
+        )
+        .await?
+        {
             SinkWorkerResponse::StatusSnapshot(snapshot) => snapshot,
             other => {
                 return Err(CnxError::ProtocolViolation(format!(
@@ -256,13 +263,15 @@ impl SinkWorkerClientHandle {
         Ok(snapshot)
     }
 
-    pub fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
-        match self.existing_client()? {
+    pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+        match self.existing_client().await? {
             Some(client) => match Self::call_worker(
                 &client,
                 SinkWorkerRequest::StatusSnapshot,
                 Duration::from_secs(5),
-            ) {
+            )
+            .await
+            {
                 Ok(snapshot) => {
                     let SinkWorkerResponse::StatusSnapshot(snapshot) = snapshot else {
                         return Err(CnxError::ProtocolViolation(format!(
@@ -279,12 +288,14 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    pub fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
+    pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
         match Self::call_worker(
-            &self.client()?,
+            &self.client().await?,
             SinkWorkerRequest::ScheduledGroupIds,
             Duration::from_secs(5),
-        )? {
+        )
+        .await?
+        {
             SinkWorkerResponse::ScheduledGroupIds(groups) => {
                 Ok(groups.map(|groups| groups.into_iter().collect()))
             }
@@ -295,12 +306,17 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    pub fn visibility_lag_samples_since(&self, since_us: u64) -> Result<Vec<VisibilityLagSample>> {
+    pub async fn visibility_lag_samples_since(
+        &self,
+        since_us: u64,
+    ) -> Result<Vec<VisibilityLagSample>> {
         match Self::call_worker(
-            &self.client()?,
+            &self.client().await?,
             SinkWorkerRequest::VisibilityLagSamplesSince { since_us },
             Duration::from_secs(5),
-        )? {
+        )
+        .await?
+        {
             SinkWorkerResponse::VisibilityLagSamples(samples) => Ok(samples),
             other => Err(CnxError::ProtocolViolation(format!(
                 "unexpected sink worker response for visibility lag samples: {:?}",
@@ -309,8 +325,10 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    pub fn query_node(&self, path: Vec<u8>) -> Result<Option<QueryNode>> {
+    pub async fn query_node(&self, path: Vec<u8>) -> Result<Option<QueryNode>> {
         self.with_started_retry(|client| {
+            let path = path.clone();
+            async move {
             let request = InternalQueryRequest::materialized(
                 QueryOp::Tree,
                 QueryScope {
@@ -323,10 +341,12 @@ impl SinkWorkerClientHandle {
             );
             decode_exact_query_node(
                 match Self::call_worker(
-                    client,
+                    &client,
                     SinkWorkerRequest::MaterializedQuery { request },
                     SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-                )? {
+                )
+                .await?
+                {
                     SinkWorkerResponse::Events(events) => events,
                     other => {
                         return Err(CnxError::ProtocolViolation(format!(
@@ -337,37 +357,47 @@ impl SinkWorkerClientHandle {
                 },
                 &path,
             )
+            }
         })
+        .await
     }
 
-    pub fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
+    pub async fn materialized_query(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
         self.with_started_retry(|client| {
+            let request = request.clone();
+            async move {
             match Self::call_worker(
-                client,
+                &client,
                 SinkWorkerRequest::MaterializedQuery {
                     request: request.clone(),
                 },
                 SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-            )? {
+            )
+            .await?
+            {
                 SinkWorkerResponse::Events(events) => Ok(events),
                 other => Err(CnxError::ProtocolViolation(format!(
                     "unexpected sink worker response for materialized query: {:?}",
                     other
                 ))),
             }
+            }
         })
+        .await
     }
 
-    pub fn materialized_query_nonblocking(
+    pub async fn materialized_query_nonblocking(
         &self,
         request: InternalQueryRequest,
     ) -> Result<Vec<Event>> {
-        match self.existing_client()? {
+        match self.existing_client().await? {
             Some(client) => match Self::call_worker(
                 &client,
                 SinkWorkerRequest::MaterializedQuery { request },
                 SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-            )? {
+            )
+            .await?
+            {
                 SinkWorkerResponse::Events(events) => Ok(events),
                 other => Err(CnxError::ProtocolViolation(format!(
                     "unexpected sink worker response for materialized query: {:?}",
@@ -378,10 +408,12 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    pub fn subtree_stats(&self, path: Vec<u8>) -> Result<Vec<Event>> {
+    pub async fn subtree_stats(&self, path: Vec<u8>) -> Result<Vec<Event>> {
         self.with_started_retry(|client| {
+            let path = path.clone();
+            async move {
             match Self::call_worker(
-                client,
+                &client,
                 SinkWorkerRequest::MaterializedQuery {
                     request: InternalQueryRequest::materialized(
                         QueryOp::Stats,
@@ -395,18 +427,22 @@ impl SinkWorkerClientHandle {
                     ),
                 },
                 SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-            )? {
+            )
+            .await?
+            {
                 SinkWorkerResponse::Events(events) => Ok(events),
                 other => Err(CnxError::ProtocolViolation(format!(
                     "unexpected sink worker response for materialized query: {:?}",
                     other
                 ))),
             }
+            }
         })
+        .await
     }
 
-    pub fn force_find_proxy(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
-        self.ensure_started()?;
+    pub async fn force_find_proxy(&self, request: InternalQueryRequest) -> Result<Vec<Event>> {
+        self.ensure_started().await?;
         eprintln!(
             "fs-meta sink worker proxy: force_find start node={} path={:?} recursive={}",
             self.node_id.0, request.scope.path, request.scope.recursive
@@ -419,13 +455,15 @@ impl SinkWorkerClientHandle {
         let payload = rmp_serde::to_vec(&request).map_err(|err| {
             CnxError::Internal(format!("sink worker force-find encode failed: {err}"))
         })?;
-        let result = block_on_shared_runtime(adapter.call_collect(
-            ROUTE_TOKEN_FS_META,
-            METHOD_FIND,
-            Bytes::from(payload),
-            SINK_WORKER_FORCE_FIND_TIMEOUT,
-            SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE,
-        ));
+        let result = adapter
+            .call_collect(
+                ROUTE_TOKEN_FS_META,
+                METHOD_FIND,
+                Bytes::from(payload),
+                SINK_WORKER_FORCE_FIND_TIMEOUT,
+                SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE,
+            )
+            .await;
         eprintln!(
             "fs-meta sink worker proxy: force_find end node={} result={:?}",
             self.node_id.0,
@@ -437,34 +475,44 @@ impl SinkWorkerClientHandle {
         result
     }
 
-    pub fn send(&self, events: Vec<Event>) -> Result<()> {
+    pub async fn send(&self, events: Vec<Event>) -> Result<()> {
         self.with_started_retry(|client| {
+            let events = events.clone();
+            async move {
             match Self::call_worker(
-                client,
+                &client,
                 SinkWorkerRequest::Send {
                     events: events.clone(),
                 },
                 Duration::from_secs(5),
-            )? {
+            )
+            .await?
+            {
                 SinkWorkerResponse::Ack => Ok(()),
                 other => Err(CnxError::ProtocolViolation(format!(
                     "unexpected sink worker response for send: {:?}",
                     other
                 ))),
             }
+            }
         })
+        .await
     }
 
-    pub fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
-        self.with_started_retry(|client| {
+    pub async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
+        let timeout_ms = opts.timeout.map(|d| d.as_millis() as u64);
+        let limit = opts.limit;
+        self.with_started_retry(|client| async move {
             match Self::call_worker(
-                client,
+                &client,
                 SinkWorkerRequest::Recv {
-                    timeout_ms: opts.timeout.map(|d| d.as_millis() as u64),
-                    limit: opts.limit,
+                    timeout_ms,
+                    limit,
                 },
                 Duration::from_secs(5),
-            )? {
+            )
+            .await?
+            {
                 SinkWorkerResponse::Events(events) => Ok(events),
                 other => Err(CnxError::ProtocolViolation(format!(
                     "unexpected sink worker response for recv: {:?}",
@@ -472,15 +520,18 @@ impl SinkWorkerClientHandle {
                 ))),
             }
         })
+        .await
     }
 
-    pub fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
-        self.ensure_started()?;
+    pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
+        self.ensure_started().await?;
         match Self::call_worker(
-            &self.client()?,
+            &self.client().await?,
             SinkWorkerRequest::OnControlFrame { envelopes },
             Duration::from_secs(5),
-        )? {
+        )
+        .await?
+        {
             SinkWorkerResponse::Ack => Ok(()),
             other => Err(CnxError::ProtocolViolation(format!(
                 "unexpected sink worker response for on_control_frame: {:?}",
@@ -489,8 +540,8 @@ impl SinkWorkerClientHandle {
         }
     }
 
-    pub fn close(&self) -> Result<()> {
-        self.worker.shutdown(Duration::from_secs(2))
+    pub async fn close(&self) -> Result<()> {
+        self.worker.shutdown(Duration::from_secs(2)).await
     }
 }
 
@@ -513,10 +564,10 @@ impl SinkFacade {
         matches!(self, Self::Worker(_))
     }
 
-    pub fn ensure_started(&self) -> Result<()> {
+    pub async fn ensure_started(&self) -> Result<()> {
         match self {
             Self::Local(_) => Ok(()),
-            Self::Worker(client) => client.ensure_started(),
+            Self::Worker(client) => client.ensure_started().await,
         }
     }
 
@@ -531,14 +582,18 @@ impl SinkFacade {
         }
     }
 
-    pub fn update_logical_roots(
+    pub async fn update_logical_roots(
         &self,
         roots: Vec<crate::source::config::RootSpec>,
         host_object_grants: &[GrantedMountRoot],
     ) -> Result<()> {
         match self {
             Self::Local(sink) => sink.update_logical_roots(roots, host_object_grants),
-            Self::Worker(client) => client.update_logical_roots(roots, host_object_grants.to_vec()),
+            Self::Worker(client) => {
+                client
+                    .update_logical_roots(roots, host_object_grants.to_vec())
+                    .await
+            }
         }
     }
 
@@ -549,58 +604,59 @@ impl SinkFacade {
         }
     }
 
-    pub fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
+    pub async fn logical_roots_snapshot(&self) -> Result<Vec<crate::source::config::RootSpec>> {
         match self {
             Self::Local(sink) => sink.logical_roots_snapshot(),
-            Self::Worker(client) => client.logical_roots_snapshot(),
+            Self::Worker(client) => client.logical_roots_snapshot().await,
         }
     }
 
-    pub fn health(&self) -> Result<HealthStats> {
+    pub async fn health(&self) -> Result<HealthStats> {
         match self {
             Self::Local(sink) => sink.health(),
-            Self::Worker(client) => client.health(),
+            Self::Worker(client) => client.health().await,
         }
     }
 
-    pub fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
+    pub async fn status_snapshot(&self) -> Result<SinkStatusSnapshot> {
         match self {
             Self::Local(sink) => sink.status_snapshot(),
-            Self::Worker(client) => client.status_snapshot(),
+            Self::Worker(client) => client.status_snapshot().await,
         }
     }
 
-    pub fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+    pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
         match self {
             Self::Local(sink) => sink.status_snapshot(),
-            Self::Worker(client) => client.status_snapshot_nonblocking(),
+            Self::Worker(client) => client.status_snapshot_nonblocking().await,
         }
     }
 
-    pub fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
+    pub async fn scheduled_group_ids(&self) -> Result<Option<std::collections::BTreeSet<String>>> {
         match self {
             Self::Local(sink) => sink.scheduled_group_ids_snapshot(),
-            Self::Worker(client) => client.scheduled_group_ids(),
+            Self::Worker(client) => client.scheduled_group_ids().await,
         }
     }
 
-    pub fn shadow_time_us(&self) -> Result<u64> {
+    pub async fn shadow_time_us(&self) -> Result<u64> {
         match self {
             Self::Local(sink) => sink.shadow_time_us(),
-            Self::Worker(client) => client.health().map(|stats| stats.shadow_time_us),
+            Self::Worker(client) => client.health().await.map(|stats| stats.shadow_time_us),
         }
     }
 
-    pub fn visibility_lag_samples_since(&self, since_us: u64) -> Vec<VisibilityLagSample> {
+    pub async fn visibility_lag_samples_since(&self, since_us: u64) -> Vec<VisibilityLagSample> {
         match self {
             Self::Local(sink) => sink.visibility_lag_samples_since(since_us),
             Self::Worker(client) => client
                 .visibility_lag_samples_since(since_us)
+                .await
                 .unwrap_or_default(),
         }
     }
 
-    pub fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
+    pub async fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
         match self {
             Self::Local(sink) => {
                 let request = InternalQueryRequest::materialized(
@@ -615,28 +671,28 @@ impl SinkFacade {
                 );
                 decode_exact_query_node(sink.materialized_query(&request)?, path)
             }
-            Self::Worker(client) => client.query_node(path.to_vec()),
+            Self::Worker(client) => client.query_node(path.to_vec()).await,
         }
     }
 
-    pub fn materialized_query(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
+    pub async fn materialized_query(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
         match self {
             Self::Local(sink) => sink.materialized_query(request),
-            Self::Worker(client) => client.materialized_query(request.clone()),
+            Self::Worker(client) => client.materialized_query(request.clone()).await,
         }
     }
 
-    pub fn materialized_query_nonblocking(
+    pub async fn materialized_query_nonblocking(
         &self,
         request: &InternalQueryRequest,
     ) -> Result<Vec<Event>> {
         match self {
             Self::Local(sink) => sink.materialized_query(request),
-            Self::Worker(client) => client.materialized_query_nonblocking(request.clone()),
+            Self::Worker(client) => client.materialized_query_nonblocking(request.clone()).await,
         }
     }
 
-    pub fn materialized_query_via_node(
+    pub async fn materialized_query_via_node(
         &self,
         node_id: &NodeId,
         request: &InternalQueryRequest,
@@ -645,7 +701,7 @@ impl SinkFacade {
             Self::Local(sink) => sink.materialized_query(request),
             Self::Worker(client) => {
                 if client.node_id == *node_id {
-                    client.materialized_query(request.clone())
+                    client.materialized_query(request.clone()).await
                 } else {
                     let remote = SinkWorkerClientHandle::new(
                         node_id.clone(),
@@ -653,13 +709,13 @@ impl SinkFacade {
                         client.worker_binding.clone(),
                         client.worker_factory.clone(),
                     )?;
-                    remote.materialized_query(request.clone())
+                    remote.materialized_query(request.clone()).await
                 }
             }
         }
     }
 
-    pub fn subtree_stats(&self, path: &[u8]) -> Result<Vec<Event>> {
+    pub async fn subtree_stats(&self, path: &[u8]) -> Result<Vec<Event>> {
         match self {
             Self::Local(sink) => sink.materialized_query(&InternalQueryRequest::materialized(
                 QueryOp::Stats,
@@ -671,30 +727,30 @@ impl SinkFacade {
                 },
                 None,
             )),
-            Self::Worker(client) => client.subtree_stats(path.to_vec()),
+            Self::Worker(client) => client.subtree_stats(path.to_vec()).await,
         }
     }
 
-    pub fn force_find_proxy(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
+    pub async fn force_find_proxy(&self, request: &InternalQueryRequest) -> Result<Vec<Event>> {
         match self {
             Self::Local(_) => Err(CnxError::InvalidInput(
                 "force-find proxy requires sink worker execution mode".into(),
             )),
-            Self::Worker(client) => client.force_find_proxy(request.clone()),
+            Self::Worker(client) => client.force_find_proxy(request.clone()).await,
         }
     }
 
     pub async fn send(&self, events: &[Event]) -> Result<()> {
         match self {
             Self::Local(sink) => sink.send(events).await,
-            Self::Worker(client) => client.send(events.to_vec()),
+            Self::Worker(client) => client.send(events.to_vec()).await,
         }
     }
 
     pub async fn recv(&self, opts: RecvOpts) -> Result<Vec<Event>> {
         match self {
             Self::Local(sink) => sink.recv(opts).await,
-            Self::Worker(client) => client.recv(opts),
+            Self::Worker(client) => client.recv(opts).await,
         }
     }
 
@@ -714,7 +770,7 @@ impl SinkFacade {
                     .iter()
                     .map(SinkControlSignal::envelope)
                     .collect::<Vec<_>>();
-                client.on_control_frame(envelopes)
+                client.on_control_frame(envelopes).await
             }
         }
     }
@@ -722,7 +778,7 @@ impl SinkFacade {
     pub async fn close(&self) -> Result<()> {
         match self {
             Self::Local(sink) => sink.close().await,
-            Self::Worker(client) => client.close(),
+            Self::Worker(client) => client.close().await,
         }
     }
 }

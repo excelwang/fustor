@@ -521,46 +521,54 @@ impl SinkFileMeta {
                     format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
                     sink.shutdown.clone(),
                     move |requests| {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            if let Ok(params) =
-                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                            {
-                                eprintln!(
-                                    "fs_meta_sink: query endpoint request selected_group={:?} recursive={} path={}",
-                                    params.scope.selected_group,
-                                    params.scope.recursive,
-                                    String::from_utf8_lossy(&params.scope.path)
-                                );
-                                let sink_impl = SinkFileMeta {
-                                    state: query_state.clone(),
-                                    root_specs: query_root_specs.clone(),
-                                    host_object_grants: query_host_object_grants.clone(),
-                                    visibility_lag: query_visibility_lag.clone(),
-                                    pending_stream_events: query_pending_stream_events.clone(),
-                                    unit_control: query_unit_control.clone(),
-                                    shutdown: CancellationToken::new(),
-                                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                                };
-                                let mut events =
-                                    sink_impl.materialized_query(&params).unwrap_or_default();
-                                eprintln!(
-                                    "fs_meta_sink: query endpoint response events={}",
-                                    events.len()
-                                );
-                                for event in &mut events {
-                                    let mut meta = event.metadata().clone();
-                                    meta.correlation_id = req.metadata().correlation_id;
-                                    responses.push(Event::new(
-                                        meta,
-                                        Bytes::copy_from_slice(event.payload_bytes()),
-                                    ));
+                        let query_state = query_state.clone();
+                        let query_root_specs = query_root_specs.clone();
+                        let query_host_object_grants = query_host_object_grants.clone();
+                        let query_visibility_lag = query_visibility_lag.clone();
+                        let query_pending_stream_events = query_pending_stream_events.clone();
+                        let query_unit_control = query_unit_control.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                if let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) {
+                                    eprintln!(
+                                        "fs_meta_sink: query endpoint request selected_group={:?} recursive={} path={}",
+                                        params.scope.selected_group,
+                                        params.scope.recursive,
+                                        String::from_utf8_lossy(&params.scope.path)
+                                    );
+                                    let sink_impl = SinkFileMeta {
+                                        state: query_state.clone(),
+                                        root_specs: query_root_specs.clone(),
+                                        host_object_grants: query_host_object_grants.clone(),
+                                        visibility_lag: query_visibility_lag.clone(),
+                                        pending_stream_events: query_pending_stream_events.clone(),
+                                        unit_control: query_unit_control.clone(),
+                                        shutdown: CancellationToken::new(),
+                                        endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                    };
+                                    let mut events =
+                                        sink_impl.materialized_query(&params).unwrap_or_default();
+                                    eprintln!(
+                                        "fs_meta_sink: query endpoint response events={}",
+                                        events.len()
+                                    );
+                                    for event in &mut events {
+                                        let mut meta = event.metadata().clone();
+                                        meta.correlation_id = req.metadata().correlation_id;
+                                        responses.push(Event::new(
+                                            meta,
+                                            Bytes::copy_from_slice(event.payload_bytes()),
+                                        ));
+                                    }
+                                } else {
+                                    log::warn!("bound route failed to parse InternalQueryRequest");
                                 }
-                            } else {
-                                log::warn!("bound route failed to parse InternalQueryRequest");
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
@@ -595,47 +603,58 @@ impl SinkFileMeta {
                     ),
                     sink.shutdown.clone(),
                     move |requests| {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            if let Ok(params) =
-                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                            {
-                                eprintln!(
-                                    "fs_meta_sink: internal query endpoint request selected_group={:?} recursive={} path={}",
-                                    params.scope.selected_group,
-                                    params.scope.recursive,
-                                    String::from_utf8_lossy(&params.scope.path)
-                                );
-                                let sink_impl = SinkFileMeta {
-                                    state: internal_query_state.clone(),
-                                    root_specs: internal_query_root_specs.clone(),
-                                    host_object_grants: internal_query_host_object_grants.clone(),
-                                    visibility_lag: internal_query_visibility_lag.clone(),
-                                    pending_stream_events: internal_query_pending_stream_events
-                                        .clone(),
-                                    unit_control: internal_query_unit_control.clone(),
-                                    shutdown: CancellationToken::new(),
-                                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                                };
-                                let mut events =
-                                    sink_impl.materialized_query(&params).unwrap_or_default();
-                                eprintln!(
-                                    "fs_meta_sink: internal query endpoint response events={}",
-                                    events.len()
-                                );
-                                for event in &mut events {
-                                    let mut meta = event.metadata().clone();
-                                    meta.correlation_id = req.metadata().correlation_id;
-                                    responses.push(Event::new(
-                                        meta,
-                                        Bytes::copy_from_slice(event.payload_bytes()),
-                                    ));
+                        let internal_query_state = internal_query_state.clone();
+                        let internal_query_root_specs = internal_query_root_specs.clone();
+                        let internal_query_host_object_grants =
+                            internal_query_host_object_grants.clone();
+                        let internal_query_visibility_lag = internal_query_visibility_lag.clone();
+                        let internal_query_pending_stream_events =
+                            internal_query_pending_stream_events.clone();
+                        let internal_query_unit_control = internal_query_unit_control.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                if let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) {
+                                    eprintln!(
+                                        "fs_meta_sink: internal query endpoint request selected_group={:?} recursive={} path={}",
+                                        params.scope.selected_group,
+                                        params.scope.recursive,
+                                        String::from_utf8_lossy(&params.scope.path)
+                                    );
+                                    let sink_impl = SinkFileMeta {
+                                        state: internal_query_state.clone(),
+                                        root_specs: internal_query_root_specs.clone(),
+                                        host_object_grants: internal_query_host_object_grants
+                                            .clone(),
+                                        visibility_lag: internal_query_visibility_lag.clone(),
+                                        pending_stream_events: internal_query_pending_stream_events
+                                            .clone(),
+                                        unit_control: internal_query_unit_control.clone(),
+                                        shutdown: CancellationToken::new(),
+                                        endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                    };
+                                    let mut events =
+                                        sink_impl.materialized_query(&params).unwrap_or_default();
+                                    eprintln!(
+                                        "fs_meta_sink: internal query endpoint response events={}",
+                                        events.len()
+                                    );
+                                    for event in &mut events {
+                                        let mut meta = event.metadata().clone();
+                                        meta.correlation_id = req.metadata().correlation_id;
+                                        responses.push(Event::new(
+                                            meta,
+                                            Bytes::copy_from_slice(event.payload_bytes()),
+                                        ));
+                                    }
+                                } else {
+                                    log::warn!("bound route failed to parse InternalQueryRequest");
                                 }
-                            } else {
-                                log::warn!("bound route failed to parse InternalQueryRequest");
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
@@ -670,36 +689,46 @@ impl SinkFileMeta {
                     ),
                     sink.shutdown.clone(),
                     move |requests| {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            let sink_impl = SinkFileMeta {
-                                state: internal_status_state.clone(),
-                                root_specs: internal_status_root_specs.clone(),
-                                host_object_grants: internal_status_host_object_grants.clone(),
-                                visibility_lag: internal_status_visibility_lag.clone(),
-                                pending_stream_events: internal_status_pending_stream_events
-                                    .clone(),
-                                unit_control: internal_status_unit_control.clone(),
-                                shutdown: CancellationToken::new(),
-                                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                            };
-                            if let Ok(snapshot) = sink_impl.status_snapshot()
-                                && let Ok(payload) = rmp_serde::to_vec_named(&snapshot)
-                            {
-                                responses.push(Event::new(
-                                    EventMetadata {
-                                        origin_id: req.metadata().origin_id.clone(),
-                                        timestamp_us: now_us(),
-                                        logical_ts: None,
-                                        correlation_id: req.metadata().correlation_id,
-                                        ingress_auth: None,
-                                        trace: None,
-                                    },
-                                    Bytes::from(payload),
-                                ));
+                        let internal_status_state = internal_status_state.clone();
+                        let internal_status_root_specs = internal_status_root_specs.clone();
+                        let internal_status_host_object_grants =
+                            internal_status_host_object_grants.clone();
+                        let internal_status_visibility_lag = internal_status_visibility_lag.clone();
+                        let internal_status_pending_stream_events =
+                            internal_status_pending_stream_events.clone();
+                        let internal_status_unit_control = internal_status_unit_control.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                let sink_impl = SinkFileMeta {
+                                    state: internal_status_state.clone(),
+                                    root_specs: internal_status_root_specs.clone(),
+                                    host_object_grants: internal_status_host_object_grants.clone(),
+                                    visibility_lag: internal_status_visibility_lag.clone(),
+                                    pending_stream_events: internal_status_pending_stream_events
+                                        .clone(),
+                                    unit_control: internal_status_unit_control.clone(),
+                                    shutdown: CancellationToken::new(),
+                                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                };
+                                if let Ok(snapshot) = sink_impl.status_snapshot()
+                                    && let Ok(payload) = rmp_serde::to_vec_named(&snapshot)
+                                {
+                                    responses.push(Event::new(
+                                        EventMetadata {
+                                            origin_id: req.metadata().origin_id.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        Bytes::from(payload),
+                                    ));
+                                }
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
@@ -734,66 +763,76 @@ impl SinkFileMeta {
                     format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_FIND),
                     sink.shutdown.clone(),
                     move |requests| {
-                        let mut responses = Vec::new();
+                        let node_id_proxy = node_id_proxy.clone();
+                        let proxy_adapter = proxy_adapter.clone();
+                        async move {
+                            let mut responses = Vec::new();
 
-                        for req in requests {
-                            let _params = match rmp_serde::from_slice::<InternalQueryRequest>(
-                                req.payload_bytes(),
-                            ) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    log::warn!(
-                                        "find proxy failed to parse InternalQueryRequest: {:?}",
-                                        e
-                                    );
-                                    responses.push(build_error_marker_event(
-                                        &node_id_proxy,
-                                        req.metadata().correlation_id,
-                                        "find proxy invalid request payload",
-                                    ));
-                                    continue;
-                                }
-                            };
+                            for req in requests {
+                                let _params = match rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) {
+                                    Ok(p) => p,
+                                    Err(e) => {
+                                        log::warn!(
+                                            "find proxy failed to parse InternalQueryRequest: {:?}",
+                                            e
+                                        );
+                                        responses.push(build_error_marker_event(
+                                            &node_id_proxy,
+                                            req.metadata().correlation_id,
+                                            "find proxy invalid request payload",
+                                        ));
+                                        continue;
+                                    }
+                                };
 
-                            match crate::runtime_app::block_on_shared_runtime(
-                                proxy_adapter.call_collect(
-                                    ROUTE_TOKEN_FS_META_INTERNAL,
-                                    METHOD_SOURCE_FIND,
-                                    Bytes::copy_from_slice(req.payload_bytes()),
-                                    Duration::from_secs(60),
-                                    Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
-                                ),
-                            ) {
-                                Ok(source_events) => {
-                                    eprintln!(
-                                        "fs_meta_sink: public find proxy ok node={} events={}",
-                                        node_id_proxy.0,
-                                        source_events.len()
-                                    );
-                                    for event in source_events {
-                                        let mut meta = event.metadata().clone();
-                                        meta.correlation_id = req.metadata().correlation_id;
-                                        responses.push(Event::new(
-                                            meta,
-                                            Bytes::copy_from_slice(event.payload_bytes()),
+                                match proxy_adapter
+                                    .call_collect(
+                                        ROUTE_TOKEN_FS_META_INTERNAL,
+                                        METHOD_SOURCE_FIND,
+                                        Bytes::copy_from_slice(req.payload_bytes()),
+                                        Duration::from_secs(60),
+                                        Duration::from_millis(
+                                            FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS,
+                                        ),
+                                    )
+                                    .await
+                                {
+                                    Ok(source_events) => {
+                                        eprintln!(
+                                            "fs_meta_sink: public find proxy ok node={} events={}",
+                                            node_id_proxy.0,
+                                            source_events.len()
+                                        );
+                                        for event in source_events {
+                                            let mut meta = event.metadata().clone();
+                                            meta.correlation_id = req.metadata().correlation_id;
+                                            responses.push(Event::new(
+                                                meta,
+                                                Bytes::copy_from_slice(event.payload_bytes()),
+                                            ));
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!(
+                                            "fs_meta_sink: public find proxy err node={} err={}",
+                                            node_id_proxy.0, e
+                                        );
+                                        log::error!(
+                                            "find proxy upstream route call failed: {:?}",
+                                            e
+                                        );
+                                        responses.push(build_error_marker_event(
+                                            &node_id_proxy,
+                                            req.metadata().correlation_id,
+                                            "find proxy upstream request failed",
                                         ));
                                     }
                                 }
-                                Err(e) => {
-                                    eprintln!(
-                                        "fs_meta_sink: public find proxy err node={} err={}",
-                                        node_id_proxy.0, e
-                                    );
-                                    log::error!("find proxy upstream route call failed: {:?}", e);
-                                    responses.push(build_error_marker_event(
-                                        &node_id_proxy,
-                                        req.metadata().correlation_id,
-                                        "find proxy upstream request failed",
-                                    ));
-                                }
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
@@ -831,8 +870,11 @@ impl SinkFileMeta {
                     sink.shutdown.clone(),
                     move || stream_sink_ready.has_scheduled_stream_targets(),
                     move |events| {
-                        if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
-                            log::error!("sink stream ingest failed: {:?}", err);
+                        let stream_sink_apply = stream_sink_apply.clone();
+                        async move {
+                            if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
+                                log::error!("sink stream ingest failed: {:?}", err);
+                            }
                         }
                     },
                 );
@@ -883,36 +925,44 @@ impl SinkFileMeta {
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
                 self.shutdown.clone(),
                 move |requests| {
-                    let mut responses = Vec::new();
-                    for req in requests {
-                        if let Ok(params) =
-                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                        {
-                            let sink_impl = SinkFileMeta {
-                                state: query_state.clone(),
-                                root_specs: query_root_specs.clone(),
-                                host_object_grants: query_host_object_grants.clone(),
-                                visibility_lag: query_visibility_lag.clone(),
-                                pending_stream_events: query_pending_stream_events.clone(),
-                                unit_control: query_unit_control.clone(),
-                                shutdown: CancellationToken::new(),
-                                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                            };
-                            let mut events =
-                                sink_impl.materialized_query(&params).unwrap_or_default();
-                            for event in &mut events {
-                                let mut meta = event.metadata().clone();
-                                meta.correlation_id = req.metadata().correlation_id;
-                                responses.push(Event::new(
-                                    meta,
-                                    Bytes::copy_from_slice(event.payload_bytes()),
-                                ));
+                    let query_state = query_state.clone();
+                    let query_root_specs = query_root_specs.clone();
+                    let query_host_object_grants = query_host_object_grants.clone();
+                    let query_visibility_lag = query_visibility_lag.clone();
+                    let query_pending_stream_events = query_pending_stream_events.clone();
+                    let query_unit_control = query_unit_control.clone();
+                    async move {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            if let Ok(params) =
+                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            {
+                                let sink_impl = SinkFileMeta {
+                                    state: query_state.clone(),
+                                    root_specs: query_root_specs.clone(),
+                                    host_object_grants: query_host_object_grants.clone(),
+                                    visibility_lag: query_visibility_lag.clone(),
+                                    pending_stream_events: query_pending_stream_events.clone(),
+                                    unit_control: query_unit_control.clone(),
+                                    shutdown: CancellationToken::new(),
+                                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                };
+                                let mut events =
+                                    sink_impl.materialized_query(&params).unwrap_or_default();
+                                for event in &mut events {
+                                    let mut meta = event.metadata().clone();
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    responses.push(Event::new(
+                                        meta,
+                                        Bytes::copy_from_slice(event.payload_bytes()),
+                                    ));
+                                }
+                            } else {
+                                log::warn!("bound route failed to parse InternalQueryRequest");
                             }
-                        } else {
-                            log::warn!("bound route failed to parse InternalQueryRequest");
                         }
+                        responses
                     }
-                    responses
                 },
             );
             lock_or_recover(
@@ -944,36 +994,47 @@ impl SinkFileMeta {
                 ),
                 self.shutdown.clone(),
                 move |requests| {
-                    let mut responses = Vec::new();
-                    for req in requests {
-                        if let Ok(params) =
-                            rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                        {
-                            let sink_impl = SinkFileMeta {
-                                state: internal_query_state.clone(),
-                                root_specs: internal_query_root_specs.clone(),
-                                host_object_grants: internal_query_host_object_grants.clone(),
-                                visibility_lag: internal_query_visibility_lag.clone(),
-                                pending_stream_events: internal_query_pending_stream_events.clone(),
-                                unit_control: internal_query_unit_control.clone(),
-                                shutdown: CancellationToken::new(),
-                                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                            };
-                            let mut events =
-                                sink_impl.materialized_query(&params).unwrap_or_default();
-                            for event in &mut events {
-                                let mut meta = event.metadata().clone();
-                                meta.correlation_id = req.metadata().correlation_id;
-                                responses.push(Event::new(
-                                    meta,
-                                    Bytes::copy_from_slice(event.payload_bytes()),
-                                ));
+                    let internal_query_state = internal_query_state.clone();
+                    let internal_query_root_specs = internal_query_root_specs.clone();
+                    let internal_query_host_object_grants =
+                        internal_query_host_object_grants.clone();
+                    let internal_query_visibility_lag = internal_query_visibility_lag.clone();
+                    let internal_query_pending_stream_events =
+                        internal_query_pending_stream_events.clone();
+                    let internal_query_unit_control = internal_query_unit_control.clone();
+                    async move {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            if let Ok(params) =
+                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
+                            {
+                                let sink_impl = SinkFileMeta {
+                                    state: internal_query_state.clone(),
+                                    root_specs: internal_query_root_specs.clone(),
+                                    host_object_grants: internal_query_host_object_grants.clone(),
+                                    visibility_lag: internal_query_visibility_lag.clone(),
+                                    pending_stream_events: internal_query_pending_stream_events
+                                        .clone(),
+                                    unit_control: internal_query_unit_control.clone(),
+                                    shutdown: CancellationToken::new(),
+                                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                                };
+                                let mut events =
+                                    sink_impl.materialized_query(&params).unwrap_or_default();
+                                for event in &mut events {
+                                    let mut meta = event.metadata().clone();
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    responses.push(Event::new(
+                                        meta,
+                                        Bytes::copy_from_slice(event.payload_bytes()),
+                                    ));
+                                }
+                            } else {
+                                log::warn!("bound route failed to parse InternalQueryRequest");
                             }
-                        } else {
-                            log::warn!("bound route failed to parse InternalQueryRequest");
                         }
+                        responses
                     }
-                    responses
                 },
             );
             lock_or_recover(
@@ -1005,35 +1066,46 @@ impl SinkFileMeta {
                 ),
                 self.shutdown.clone(),
                 move |requests| {
-                    let mut responses = Vec::new();
-                    for req in requests {
-                        let sink_impl = SinkFileMeta {
-                            state: internal_status_state.clone(),
-                            root_specs: internal_status_root_specs.clone(),
-                            host_object_grants: internal_status_host_object_grants.clone(),
-                            visibility_lag: internal_status_visibility_lag.clone(),
-                            pending_stream_events: internal_status_pending_stream_events.clone(),
-                            unit_control: internal_status_unit_control.clone(),
-                            shutdown: CancellationToken::new(),
-                            endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                        };
-                        if let Ok(snapshot) = sink_impl.status_snapshot()
-                            && let Ok(payload) = rmp_serde::to_vec_named(&snapshot)
-                        {
-                            responses.push(Event::new(
-                                EventMetadata {
-                                    origin_id: req.metadata().origin_id.clone(),
-                                    timestamp_us: now_us(),
-                                    logical_ts: None,
-                                    correlation_id: req.metadata().correlation_id,
-                                    ingress_auth: None,
-                                    trace: None,
-                                },
-                                Bytes::from(payload),
-                            ));
+                    let internal_status_state = internal_status_state.clone();
+                    let internal_status_root_specs = internal_status_root_specs.clone();
+                    let internal_status_host_object_grants =
+                        internal_status_host_object_grants.clone();
+                    let internal_status_visibility_lag = internal_status_visibility_lag.clone();
+                    let internal_status_pending_stream_events =
+                        internal_status_pending_stream_events.clone();
+                    let internal_status_unit_control = internal_status_unit_control.clone();
+                    async move {
+                        let mut responses = Vec::new();
+                        for req in requests {
+                            let sink_impl = SinkFileMeta {
+                                state: internal_status_state.clone(),
+                                root_specs: internal_status_root_specs.clone(),
+                                host_object_grants: internal_status_host_object_grants.clone(),
+                                visibility_lag: internal_status_visibility_lag.clone(),
+                                pending_stream_events: internal_status_pending_stream_events
+                                    .clone(),
+                                unit_control: internal_status_unit_control.clone(),
+                                shutdown: CancellationToken::new(),
+                                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
+                            };
+                            if let Ok(snapshot) = sink_impl.status_snapshot()
+                                && let Ok(payload) = rmp_serde::to_vec_named(&snapshot)
+                            {
+                                responses.push(Event::new(
+                                    EventMetadata {
+                                        origin_id: req.metadata().origin_id.clone(),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: req.metadata().correlation_id,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    },
+                                    Bytes::from(payload),
+                                ));
+                            }
                         }
+                        responses
                     }
-                    responses
                 },
             );
             lock_or_recover(
@@ -1059,57 +1131,62 @@ impl SinkFileMeta {
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_FIND),
                 self.shutdown.clone(),
                 move |requests| {
-                    let mut responses = Vec::new();
+                    let node_id_proxy = node_id_proxy.clone();
+                    let proxy_adapter = proxy_adapter.clone();
+                    async move {
+                        let mut responses = Vec::new();
 
-                    for req in requests {
-                        let _params = match rmp_serde::from_slice::<InternalQueryRequest>(
-                            req.payload_bytes(),
-                        ) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                log::warn!(
-                                    "find proxy failed to parse InternalQueryRequest: {:?}",
-                                    e
-                                );
-                                responses.push(build_error_marker_event(
-                                    &node_id_proxy,
-                                    req.metadata().correlation_id,
-                                    "find proxy invalid request payload",
-                                ));
-                                continue;
-                            }
-                        };
+                        for req in requests {
+                            let _params = match rmp_serde::from_slice::<InternalQueryRequest>(
+                                req.payload_bytes(),
+                            ) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    log::warn!(
+                                        "find proxy failed to parse InternalQueryRequest: {:?}",
+                                        e
+                                    );
+                                    responses.push(build_error_marker_event(
+                                        &node_id_proxy,
+                                        req.metadata().correlation_id,
+                                        "find proxy invalid request payload",
+                                    ));
+                                    continue;
+                                }
+                            };
 
-                        match crate::runtime_app::block_on_shared_runtime(
-                            proxy_adapter.call_collect(
-                                ROUTE_TOKEN_FS_META_INTERNAL,
-                                METHOD_SOURCE_FIND,
-                                Bytes::copy_from_slice(req.payload_bytes()),
-                                Duration::from_secs(60),
-                                Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
-                            ),
-                        ) {
-                            Ok(source_events) => {
-                                for event in source_events {
-                                    let mut meta = event.metadata().clone();
-                                    meta.correlation_id = req.metadata().correlation_id;
-                                    responses.push(Event::new(
-                                        meta,
-                                        Bytes::copy_from_slice(event.payload_bytes()),
+                            match proxy_adapter
+                                .call_collect(
+                                    ROUTE_TOKEN_FS_META_INTERNAL,
+                                    METHOD_SOURCE_FIND,
+                                    Bytes::copy_from_slice(req.payload_bytes()),
+                                    Duration::from_secs(60),
+                                    Duration::from_millis(FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS),
+                                )
+                                .await
+                            {
+                                Ok(source_events) => {
+                                    for event in source_events {
+                                        let mut meta = event.metadata().clone();
+                                        meta.correlation_id = req.metadata().correlation_id;
+                                        responses.push(Event::new(
+                                            meta,
+                                            Bytes::copy_from_slice(event.payload_bytes()),
+                                        ));
+                                    }
+                                }
+                                Err(e) => {
+                                    log::error!("find proxy upstream route call failed: {:?}", e);
+                                    responses.push(build_error_marker_event(
+                                        &node_id_proxy,
+                                        req.metadata().correlation_id,
+                                        "find proxy upstream request failed",
                                     ));
                                 }
                             }
-                            Err(e) => {
-                                log::error!("find proxy upstream route call failed: {:?}", e);
-                                responses.push(build_error_marker_event(
-                                    &node_id_proxy,
-                                    req.metadata().correlation_id,
-                                    "find proxy upstream request failed",
-                                ));
-                            }
                         }
+                        responses
                     }
-                    responses
                 },
             );
             lock_or_recover(
@@ -1144,8 +1221,11 @@ impl SinkFileMeta {
                 self.shutdown.clone(),
                 move || stream_sink_ready.has_scheduled_stream_targets(),
                 move |events| {
-                    if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
-                        log::error!("sink stream ingest failed: {:?}", err);
+                    let stream_sink_apply = stream_sink_apply.clone();
+                    async move {
+                        if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
+                            log::error!("sink stream ingest failed: {:?}", err);
+                        }
                     }
                 },
             );
@@ -1177,30 +1257,33 @@ impl SinkFileMeta {
                 self.shutdown.clone(),
                 move || true,
                 move |events| {
-                    for event in events {
-                        let payload =
-                            match decode_logical_roots_control_payload(event.payload_bytes()) {
-                                Ok(payload) => payload,
+                    let sink = sink.clone();
+                    async move {
+                        for event in events {
+                            let payload =
+                                match decode_logical_roots_control_payload(event.payload_bytes()) {
+                                    Ok(payload) => payload,
+                                    Err(err) => {
+                                        log::warn!(
+                                            "sink logical-roots control decode failed: {:?}",
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                };
+                            let grants = match sink.logical_grants_snapshot() {
+                                Ok(grants) => grants,
                                 Err(err) => {
                                     log::warn!(
-                                        "sink logical-roots control decode failed: {:?}",
+                                        "sink logical-roots control grants read failed: {:?}",
                                         err
                                     );
                                     continue;
                                 }
                             };
-                        let grants = match sink.logical_grants_snapshot() {
-                            Ok(grants) => grants,
-                            Err(err) => {
-                                log::warn!(
-                                    "sink logical-roots control grants read failed: {:?}",
-                                    err
-                                );
-                                continue;
+                            if let Err(err) = sink.update_logical_roots(payload.roots, &grants) {
+                                log::warn!("sink logical-roots control apply failed: {:?}", err);
                             }
-                        };
-                        if let Err(err) = sink.update_logical_roots(payload.roots, &grants) {
-                            log::warn!("sink logical-roots control apply failed: {:?}", err);
                         }
                     }
                 },
@@ -1268,8 +1351,11 @@ impl SinkFileMeta {
                 self.shutdown.clone(),
                 move || stream_sink_ready.has_scheduled_stream_targets(),
                 move |events| {
-                    if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
-                        log::error!("sink stream ingest failed: {:?}", err);
+                    let stream_sink_apply = stream_sink_apply.clone();
+                    async move {
+                        if let Err(err) = stream_sink_apply.ingest_stream_events(&events) {
+                            log::error!("sink stream ingest failed: {:?}", err);
+                        }
                     }
                 },
             );

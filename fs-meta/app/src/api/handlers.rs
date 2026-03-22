@@ -67,7 +67,7 @@ pub async fn status(
     let _ = authorize_management(&state, &headers)?;
     let started_at = Instant::now();
 
-    let local_sink = match state.sink.status_snapshot_nonblocking() {
+    let local_sink = match state.sink.status_snapshot_nonblocking().await {
         Ok(snapshot) => snapshot,
         Err(err) if state.sink.is_worker() => {
             log::warn!("status falling back to default sink snapshot: {err}");
@@ -77,13 +77,14 @@ pub async fn status(
             return Err(ApiError::internal(format!("sink status failed: {err}")));
         }
     };
-    let local_source = match state.source.observability_snapshot() {
+    let local_source = match state.source.observability_snapshot().await {
         Ok(snapshot) => snapshot,
         Err(err) if state.source.is_worker() => {
             log::warn!("status falling back to degraded source snapshot: {err}");
             state
                 .source
                 .degraded_observability_snapshot(format!("source worker unavailable: {err}"))
+                .await
         }
         Err(err) => {
             return Err(ApiError::internal(format!("source status failed: {err}")));
@@ -311,6 +312,7 @@ pub async fn runtime_grants(
         grants: state
             .source
             .host_object_grants_snapshot()
+            .await
             .map_err(|err| ApiError::internal(format!("source grants snapshot failed: {err}")))?,
     }))
 }
@@ -323,6 +325,7 @@ pub async fn roots_get(
     let roots = state
         .source
         .logical_roots_snapshot()
+        .await
         .map_err(|err| ApiError::internal(format!("source logical roots snapshot failed: {err}")))?
         .into_iter()
         .map(root_entry_from_spec)
@@ -350,7 +353,7 @@ pub async fn roots_preview(
             }
         }
     }
-    let grants = state.source.host_object_grants_snapshot().map_err(|err| {
+    let grants = state.source.host_object_grants_snapshot().await.map_err(|err| {
         eprintln!("fs_meta_api: roots_preview grants snapshot failed: {err}");
         ApiError::internal(format!("source grants snapshot failed: {err}"))
     })?;
@@ -374,6 +377,7 @@ pub async fn roots_put(
     let grants = state
         .source
         .host_object_grants_snapshot()
+        .await
         .map_err(|err| ApiError::internal(format!("source grants snapshot failed: {err}")))?;
     let preview = preview_roots(&roots, &grants)?;
     if !preview.unmatched_roots.is_empty() {
@@ -383,7 +387,7 @@ pub async fn roots_put(
         )));
     }
 
-    let previous_source_roots = state.source.logical_roots_snapshot().map_err(|err| {
+    let previous_source_roots = state.source.logical_roots_snapshot().await.map_err(|err| {
         ApiError::internal(format!("source logical roots snapshot failed: {err}"))
     })?;
     let previous_grants = grants.clone();
@@ -400,11 +404,12 @@ pub async fn roots_put(
             err
         })?;
     let previous_sink_roots = state.sink.cached_logical_roots_snapshot()?;
-    if let Err(err) = state.sink.update_logical_roots(roots.clone(), &grants) {
+    if let Err(err) = state.sink.update_logical_roots(roots.clone(), &grants).await {
         eprintln!("fs_meta_api: roots_put sink sync failed: {err}");
         let sink_rollback = state
             .sink
-            .update_logical_roots(previous_sink_roots, &previous_grants);
+            .update_logical_roots(previous_sink_roots, &previous_grants)
+            .await;
         let source_rollback = state
             .source
             .update_logical_roots(previous_source_roots)
@@ -467,6 +472,7 @@ pub async fn roots_put(
         roots_count: state
             .source
             .logical_roots_snapshot()
+            .await
             .map_err(|err| {
                 ApiError::internal(format!("source logical roots snapshot failed: {err}"))
             })?

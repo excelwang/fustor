@@ -144,12 +144,16 @@ pub(crate) fn shared_tokio_runtime() -> &'static tokio::runtime::Runtime {
 
 pub(crate) fn block_on_shared_runtime<F, T>(fut: F) -> T
 where
-    F: std::future::Future<Output = T>,
+    F: std::future::Future<Output = T> + Send,
+    T: Send,
 {
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(|| shared_tokio_runtime().block_on(fut))
-    } else {
-        shared_tokio_runtime().block_on(fut)
+    match tokio::runtime::Handle::try_current() {
+        Ok(_) => std::thread::scope(|scope| {
+            let join = scope.spawn(|| shared_tokio_runtime().block_on(fut));
+            join.join()
+                .expect("shared fs-meta runtime helper thread must not panic")
+        }),
+        Err(_) => shared_tokio_runtime().block_on(fut),
     }
 }
 
@@ -427,7 +431,7 @@ impl FSMetaApp {
         }
 
         if !self.sink.is_worker() {
-            self.sink.ensure_started()?;
+            self.sink.ensure_started().await?;
         }
         let mut guard = self.pump_task.lock().await;
         if guard.is_none() {
@@ -500,31 +504,33 @@ impl FSMetaApp {
                     format!("app:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            let Ok(params) =
-                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                            else {
-                                continue;
-                            };
-                            eprintln!(
-                                "fs_meta_runtime_app: public query request selected_group={:?} recursive={} path={}",
-                                params.scope.selected_group,
-                                params.scope.recursive,
-                                String::from_utf8_lossy(&params.scope.path)
-                            );
-                            let result: Result<Vec<Event>> = (|| {
+                        let boundary_for_calls = boundary_for_calls.clone();
+                        let caller_node = caller_node.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) else {
+                                    continue;
+                                };
+                                eprintln!(
+                                    "fs_meta_runtime_app: public query request selected_group={:?} recursive={} path={}",
+                                    params.scope.selected_group,
+                                    params.scope.recursive,
+                                    String::from_utf8_lossy(&params.scope.path)
+                                );
                                 let adapter = crate::runtime::seam::exchange_host_adapter(
                                     boundary_for_calls.clone(),
                                     caller_node.clone(),
                                     crate::runtime::routes::default_route_bindings(),
                                 );
-                                let payload = rmp_serde::to_vec(&params).map_err(|err| {
-                                    CnxError::Internal(format!(
-                                        "encode public query request failed: {err}"
-                                    ))
-                                })?;
-                                crate::runtime_app::block_on_shared_runtime(
+                                let result: Result<Vec<Event>> = async {
+                                    let payload = rmp_serde::to_vec(&params).map_err(|err| {
+                                        CnxError::Internal(format!(
+                                            "encode public query request failed: {err}"
+                                        ))
+                                    })?;
                                     capanix_host_adapter_fs::HostAdapter::call_collect(
                                         &adapter,
                                         ROUTE_TOKEN_FS_META_INTERNAL,
@@ -532,33 +538,37 @@ impl FSMetaApp {
                                         bytes::Bytes::from(payload),
                                         Duration::from_secs(30),
                                         Duration::from_secs(5),
-                                    ),
-                                )
-                            })();
-                            match result {
-                                Ok(mut events) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: public query response events={}",
-                                        events.len()
-                                    );
-                                    for event in &mut events {
-                                        let mut meta = event.metadata().clone();
-                                        meta.correlation_id = req.metadata().correlation_id;
-                                        responses.push(Event::new(
-                                            meta,
-                                            bytes::Bytes::copy_from_slice(event.payload_bytes()),
-                                        ));
+                                    )
+                                    .await
+                                }
+                                .await;
+                                match result {
+                                    Ok(mut events) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: public query response events={}",
+                                            events.len()
+                                        );
+                                        for event in &mut events {
+                                            let mut meta = event.metadata().clone();
+                                            meta.correlation_id = req.metadata().correlation_id;
+                                            responses.push(Event::new(
+                                                meta,
+                                                bytes::Bytes::copy_from_slice(
+                                                    event.payload_bytes(),
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: public query failed err={}",
+                                            err
+                                        );
                                     }
                                 }
-                                Err(err) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: public query failed err={}",
-                                        err
-                                    );
-                                }
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 tasks.push(endpoint);
@@ -587,37 +597,40 @@ impl FSMetaApp {
                     ),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            match sink.status_snapshot() {
-                                Ok(snapshot) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: sink status endpoint response groups={}",
-                                        snapshot.groups.len()
-                                    );
-                                    if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
-                                        responses.push(Event::new(
-                                            EventMetadata {
-                                                origin_id: req.metadata().origin_id.clone(),
-                                                timestamp_us: now_us(),
-                                                logical_ts: None,
-                                                correlation_id: req.metadata().correlation_id,
-                                                ingress_auth: None,
-                                                trace: None,
-                                            },
-                                            bytes::Bytes::from(payload),
-                                        ));
+                        let sink = sink.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                match sink.status_snapshot().await {
+                                    Ok(snapshot) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: sink status endpoint response groups={}",
+                                            snapshot.groups.len()
+                                        );
+                                        if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                            responses.push(Event::new(
+                                                EventMetadata {
+                                                    origin_id: req.metadata().origin_id.clone(),
+                                                    timestamp_us: now_us(),
+                                                    logical_ts: None,
+                                                    correlation_id: req.metadata().correlation_id,
+                                                    ingress_auth: None,
+                                                    trace: None,
+                                                },
+                                                bytes::Bytes::from(payload),
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: sink status endpoint failed err={}",
+                                            err
+                                        );
                                     }
                                 }
-                                Err(err) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: sink status endpoint failed err={}",
-                                        err
-                                    );
-                                }
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 tasks.push(endpoint);
@@ -646,54 +659,59 @@ impl FSMetaApp {
                     ),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            match source.observability_snapshot() {
-                                Ok(snapshot) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: source status endpoint response groups={} runners={}",
-                                        snapshot.source_primary_by_group.len(),
-                                        snapshot.last_force_find_runner_by_group.len()
-                                    );
-                                    if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
-                                        responses.push(Event::new(
-                                            EventMetadata {
-                                                origin_id: req.metadata().origin_id.clone(),
-                                                timestamp_us: now_us(),
-                                                logical_ts: None,
-                                                correlation_id: req.metadata().correlation_id,
-                                                ingress_auth: None,
-                                                trace: None,
-                                            },
-                                            bytes::Bytes::from(payload),
-                                        ));
+                        let source = source.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                match source.observability_snapshot().await {
+                                    Ok(snapshot) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: source status endpoint response groups={} runners={}",
+                                            snapshot.source_primary_by_group.len(),
+                                            snapshot.last_force_find_runner_by_group.len()
+                                        );
+                                        if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                            responses.push(Event::new(
+                                                EventMetadata {
+                                                    origin_id: req.metadata().origin_id.clone(),
+                                                    timestamp_us: now_us(),
+                                                    logical_ts: None,
+                                                    correlation_id: req.metadata().correlation_id,
+                                                    ingress_auth: None,
+                                                    trace: None,
+                                                },
+                                                bytes::Bytes::from(payload),
+                                            ));
+                                        }
                                     }
-                                }
-                                Err(err) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: source status endpoint failed err={}",
-                                        err
-                                    );
-                                    let snapshot = source.degraded_observability_snapshot(format!(
-                                        "source status snapshot unavailable: {err}"
-                                    ));
-                                    if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
-                                        responses.push(Event::new(
-                                            EventMetadata {
-                                                origin_id: req.metadata().origin_id.clone(),
-                                                timestamp_us: now_us(),
-                                                logical_ts: None,
-                                                correlation_id: req.metadata().correlation_id,
-                                                ingress_auth: None,
-                                                trace: None,
-                                            },
-                                            bytes::Bytes::from(payload),
-                                        ));
+                                    Err(err) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: source status endpoint failed err={}",
+                                            err
+                                        );
+                                        let snapshot = source
+                                            .degraded_observability_snapshot(format!(
+                                                "source status snapshot unavailable: {err}"
+                                            ))
+                                            .await;
+                                        if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                            responses.push(Event::new(
+                                                EventMetadata {
+                                                    origin_id: req.metadata().origin_id.clone(),
+                                                    timestamp_us: now_us(),
+                                                    logical_ts: None,
+                                                    correlation_id: req.metadata().correlation_id,
+                                                    ingress_auth: None,
+                                                    trace: None,
+                                                },
+                                                bytes::Bytes::from(payload),
+                                            ));
+                                        }
                                     }
                                 }
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 tasks.push(endpoint);
@@ -722,59 +740,67 @@ impl FSMetaApp {
                     ),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            let Ok(params) =
-                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                            else {
-                                continue;
-                            };
-                            eprintln!(
-                                "fs_meta_runtime_app: sink query proxy request selected_group={:?} recursive={} path={}",
-                                params.scope.selected_group,
-                                params.scope.recursive,
-                                String::from_utf8_lossy(&params.scope.path)
-                            );
-                            let result = sink.materialized_query_nonblocking(&params);
-                            match result {
-                                Ok(mut events) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: sink query proxy response events={}",
-                                        events.len()
-                                    );
-                                    for event in &mut events {
-                                        let mut meta = event.metadata().clone();
-                                        meta.correlation_id = req.metadata().correlation_id;
+                        let sink = sink.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) else {
+                                    continue;
+                                };
+                                eprintln!(
+                                    "fs_meta_runtime_app: sink query proxy request selected_group={:?} recursive={} path={}",
+                                    params.scope.selected_group,
+                                    params.scope.recursive,
+                                    String::from_utf8_lossy(&params.scope.path)
+                                );
+                                let result = sink.materialized_query_nonblocking(&params).await;
+                                match result {
+                                    Ok(mut events) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: sink query proxy response events={}",
+                                            events.len()
+                                        );
+                                        for event in &mut events {
+                                            let mut meta = event.metadata().clone();
+                                            meta.correlation_id = req.metadata().correlation_id;
+                                            responses.push(Event::new(
+                                                meta,
+                                                bytes::Bytes::copy_from_slice(
+                                                    event.payload_bytes(),
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: sink query proxy failed err={}",
+                                            err
+                                        );
                                         responses.push(Event::new(
-                                            meta,
-                                            bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                            EventMetadata {
+                                                origin_id: NodeId(
+                                                    params.scope
+                                                        .selected_group
+                                                        .clone()
+                                                        .unwrap_or_else(|| {
+                                                            "sink-query-proxy".to_string()
+                                                        }),
+                                                ),
+                                                timestamp_us: now_us(),
+                                                logical_ts: None,
+                                                correlation_id: req.metadata().correlation_id,
+                                                ingress_auth: None,
+                                                trace: None,
+                                            },
+                                            bytes::Bytes::from(err.to_string()),
                                         ));
                                     }
                                 }
-                                Err(err) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: sink query proxy failed err={}",
-                                        err
-                                    );
-                                    responses.push(Event::new(
-                                        EventMetadata {
-                                            origin_id: NodeId(
-                                                params.scope.selected_group.clone().unwrap_or_else(
-                                                    || "sink-query-proxy".to_string(),
-                                                ),
-                                            ),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        bytes::Bytes::from(err.to_string()),
-                                    ));
-                                }
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 tasks.push(endpoint);
@@ -803,58 +829,66 @@ impl FSMetaApp {
                     ),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            let Ok(params) =
-                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                            else {
-                                continue;
-                            };
-                            eprintln!(
-                                "fs_meta_runtime_app: source find proxy request selected_group={:?} recursive={} path={}",
-                                params.scope.selected_group,
-                                params.scope.recursive,
-                                String::from_utf8_lossy(&params.scope.path)
-                            );
-                            match source.force_find(&params) {
-                                Ok(mut events) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: source find proxy response events={}",
-                                        events.len()
-                                    );
-                                    for event in &mut events {
-                                        let mut meta = event.metadata().clone();
-                                        meta.correlation_id = req.metadata().correlation_id;
+                        let source = source.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) else {
+                                    continue;
+                                };
+                                eprintln!(
+                                    "fs_meta_runtime_app: source find proxy request selected_group={:?} recursive={} path={}",
+                                    params.scope.selected_group,
+                                    params.scope.recursive,
+                                    String::from_utf8_lossy(&params.scope.path)
+                                );
+                                match source.force_find(&params).await {
+                                    Ok(mut events) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: source find proxy response events={}",
+                                            events.len()
+                                        );
+                                        for event in &mut events {
+                                            let mut meta = event.metadata().clone();
+                                            meta.correlation_id = req.metadata().correlation_id;
+                                            responses.push(Event::new(
+                                                meta,
+                                                bytes::Bytes::copy_from_slice(
+                                                    event.payload_bytes(),
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                    Err(err) => {
+                                        eprintln!(
+                                            "fs_meta_runtime_app: source find proxy failed err={}",
+                                            err
+                                        );
                                         responses.push(Event::new(
-                                            meta,
-                                            bytes::Bytes::copy_from_slice(event.payload_bytes()),
+                                            EventMetadata {
+                                                origin_id: NodeId(
+                                                    params.scope
+                                                        .selected_group
+                                                        .clone()
+                                                        .unwrap_or_else(|| {
+                                                            "source-find-proxy".to_string()
+                                                        }),
+                                                ),
+                                                timestamp_us: now_us(),
+                                                logical_ts: None,
+                                                correlation_id: req.metadata().correlation_id,
+                                                ingress_auth: None,
+                                                trace: None,
+                                            },
+                                            bytes::Bytes::from(err.to_string()),
                                         ));
                                     }
                                 }
-                                Err(err) => {
-                                    eprintln!(
-                                        "fs_meta_runtime_app: source find proxy failed err={}",
-                                        err
-                                    );
-                                    responses.push(Event::new(
-                                        EventMetadata {
-                                            origin_id: NodeId(
-                                                params.scope.selected_group.clone().unwrap_or_else(
-                                                    || "source-find-proxy".to_string(),
-                                                ),
-                                            ),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        bytes::Bytes::from(err.to_string()),
-                                    ));
-                                }
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 tasks.push(endpoint);
@@ -877,14 +911,14 @@ impl FSMetaApp {
     }
 
     #[cfg(test)]
-    fn runtime_scoped_facade_group_ids(
+    async fn runtime_scoped_facade_group_ids(
         source: &SourceFacade,
         sink: &SinkFacade,
     ) -> Result<Vec<String>> {
-        let mut source_groups = source.scheduled_source_group_ids()?.unwrap_or_default();
-        let scan_groups = source.scheduled_scan_group_ids()?.unwrap_or_default();
+        let mut source_groups = source.scheduled_source_group_ids().await?.unwrap_or_default();
+        let scan_groups = source.scheduled_scan_group_ids().await?.unwrap_or_default();
         source_groups.extend(scan_groups);
-        let sink_groups = sink.scheduled_group_ids()?.unwrap_or_default();
+        let sink_groups = sink.scheduled_group_ids().await?.unwrap_or_default();
         if !source_groups.is_empty() && !sink_groups.is_empty() {
             return Ok(source_groups.intersection(&sink_groups).cloned().collect());
         }
@@ -895,13 +929,14 @@ impl FSMetaApp {
     }
 
     #[cfg(test)]
-    fn facade_candidate_group_ids(
+    async fn facade_candidate_group_ids(
         source: &SourceFacade,
         sink: &SinkFacade,
         bound_scopes: &[RuntimeBoundScope],
     ) -> Result<Vec<String>> {
         let logical_root_ids = source
-            .logical_roots_snapshot()?
+            .logical_roots_snapshot()
+            .await?
             .into_iter()
             .map(|root| root.id)
             .collect::<std::collections::BTreeSet<_>>();
@@ -916,7 +951,7 @@ impl FSMetaApp {
                 if trimmed.is_empty() {
                     continue;
                 }
-                if let Some(group_id) = source.resolve_group_id_for_object_ref(trimmed)? {
+                if let Some(group_id) = source.resolve_group_id_for_object_ref(trimmed).await? {
                     ids.insert(group_id);
                 }
             }
@@ -924,11 +959,11 @@ impl FSMetaApp {
         if !ids.is_empty() {
             return Ok(ids.into_iter().collect());
         }
-        Self::runtime_scoped_facade_group_ids(source, sink)
+        Self::runtime_scoped_facade_group_ids(source, sink).await
     }
 
     #[cfg(test)]
-    fn observation_candidate_group_ids(
+    async fn observation_candidate_group_ids(
         source: &SourceFacade,
         sink: &SinkFacade,
         pending: &PendingFacadeActivation,
@@ -937,21 +972,22 @@ impl FSMetaApp {
             return Ok(pending.group_ids.iter().cloned().collect());
         }
         Ok(
-            Self::facade_candidate_group_ids(source, sink, &pending.bound_scopes)?
+            Self::facade_candidate_group_ids(source, sink, &pending.bound_scopes)
+                .await?
                 .into_iter()
                 .collect(),
         )
     }
 
     #[cfg(test)]
-    fn observation_eligible_for(
+    async fn observation_eligible_for(
         source: &SourceFacade,
         sink: &SinkFacade,
         pending: &PendingFacadeActivation,
     ) -> Result<bool> {
-        let source_status = source.status_snapshot()?;
-        let sink_status = sink.status_snapshot()?;
-        let candidate_groups = Self::observation_candidate_group_ids(source, sink, pending)?;
+        let source_status = source.status_snapshot().await?;
+        let sink_status = sink.status_snapshot().await?;
+        let candidate_groups = Self::observation_candidate_group_ids(source, sink, pending).await?;
         let status = evaluate_observation_status(
             &candidate_group_observation_evidence(&source_status, &sink_status, &candidate_groups),
             ObservationTrustPolicy::candidate_generation(),
@@ -1556,7 +1592,7 @@ impl FSMetaApp {
         &self,
         params: &InternalQueryRequest,
     ) -> Result<std::collections::BTreeMap<String, TreeGroupPayload>> {
-        let events = self.sink.materialized_query(params)?;
+        let events = self.sink.materialized_query(params).await?;
         let mut grouped = std::collections::BTreeMap::<String, TreeGroupPayload>::new();
         for event in &events {
             let payload = rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
@@ -1572,7 +1608,7 @@ impl FSMetaApp {
     }
 
     pub async fn query_stats(&self, path: &[u8]) -> Result<SubtreeStats> {
-        let events = self.sink.subtree_stats(path)?;
+        let events = self.sink.subtree_stats(path).await?;
         let mut agg = SubtreeStats::default();
         for event in &events {
             let stats = rmp_serde::from_slice::<SubtreeStats>(event.payload_bytes())
@@ -1588,11 +1624,11 @@ impl FSMetaApp {
     }
 
     pub fn source_status_snapshot(&self) -> Result<crate::source::SourceStatusSnapshot> {
-        self.source.status_snapshot()
+        block_on_shared_runtime(self.source.status_snapshot())
     }
 
     pub fn sink_status_snapshot(&self) -> Result<crate::sink::SinkStatusSnapshot> {
-        self.sink.status_snapshot()
+        block_on_shared_runtime(self.sink.status_snapshot())
     }
 
     pub async fn trigger_rescan_when_ready(&self) -> Result<()> {
@@ -1600,7 +1636,7 @@ impl FSMetaApp {
     }
 
     pub fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
-        self.sink.query_node(path)
+        block_on_shared_runtime(self.sink.query_node(path))
     }
 }
 
@@ -2462,6 +2498,7 @@ mod tests {
                 app.sink.as_ref(),
                 &readiness_pending,
             )
+            .await
             .expect("tree readiness still gated on initial audit"),
             "replacement facade should not imply materialized tree readiness"
         );
@@ -2890,6 +2927,7 @@ mod tests {
         };
         assert!(
             !FSMetaApp::observation_eligible_for(app.source.as_ref(), app.sink.as_ref(), &pending)
+                .await
                 .expect("evaluate observation eligibility"),
             "runtime-managed facade gating must fail-closed when current generation group evidence is missing"
         );
@@ -2949,6 +2987,7 @@ mod tests {
         };
         assert!(
             !FSMetaApp::observation_eligible_for(app.source.as_ref(), app.sink.as_ref(), &pending)
+                .await
                 .expect("evaluate observation eligibility"),
             "cold start fixture intentionally lacks generation-scoped observation evidence"
         );
@@ -3018,6 +3057,7 @@ mod tests {
                 let groups = app
                     .source
                     .status_snapshot()
+                    .await
                     .expect("source status")
                     .concrete_roots
                     .into_iter()
@@ -3055,7 +3095,7 @@ mod tests {
             .await
             .expect("seed sink state");
 
-        let sink_status = app.sink.status_snapshot().expect("sink status");
+        let sink_status = app.sink.status_snapshot().await.expect("sink status");
         assert!(
             sink_status
                 .groups
@@ -3083,6 +3123,7 @@ mod tests {
         };
         assert!(
             FSMetaApp::observation_eligible_for(app.source.as_ref(), app.sink.as_ref(), &pending)
+                .await
                 .expect("evaluate observation eligibility"),
             "listener-only facade gating should use runtime-scoped source/sink groups instead of unrelated overflow on unbound groups"
         );
@@ -3123,6 +3164,7 @@ mod tests {
         assert_eq!(
             app.source
                 .host_object_grants_version_snapshot()
+                .await
                 .expect("snapshot version"),
             0
         );
@@ -3141,6 +3183,7 @@ mod tests {
         assert_eq!(
             app.source
                 .host_object_grants_version_snapshot()
+                .await
                 .expect("snapshot version"),
             0,
             "batch failure must not apply partial shared control effects"

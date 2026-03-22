@@ -1652,71 +1652,76 @@ impl FSMetaSource {
                         ),
                         source.shutdown.clone(),
                         move |requests| {
-                            let mut responses = Vec::new();
-                            for req in requests {
-                                if let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
-                                    req.payload_bytes(),
-                                ) {
-                                    if params.transport != QueryTransport::ForceFind {
-                                        log::warn!(
-                                            "boundary endpoint rejected non-force-find transport"
-                                        );
-                                        responses.push(build_error_marker_event(
-                                            &node_id_cloned,
-                                            req.metadata().correlation_id,
-                                            "force-find source invalid request transport",
-                                        ));
-                                        continue;
-                                    }
-                                    eprintln!(
-                                        "fs_meta_source: route force-find request correlation={:?} selected_group={:?} path={:?} recursive={}",
-                                        req.metadata().correlation_id,
-                                        params.scope.selected_group,
-                                        params.scope.path,
-                                        params.scope.recursive
-                                    );
-                                    match source_for_find.force_find(&params) {
-                                        Ok(grouped_events) => {
-                                            eprintln!(
-                                                "fs_meta_source: route force-find response correlation={:?} groups_events={}",
-                                                req.metadata().correlation_id,
-                                                grouped_events.len()
-                                            );
-                                            for event in grouped_events {
-                                                let mut meta = event.metadata().clone();
-                                                meta.correlation_id = req.metadata().correlation_id;
-                                                responses.push(Event::new(
-                                                    meta,
-                                                    bytes::Bytes::copy_from_slice(
-                                                        event.payload_bytes(),
-                                                    ),
-                                                ));
-                                            }
-                                        }
-                                        Err(err) => {
-                                            log::error!(
-                                                "boundary endpoint force-find failed: {:?}",
-                                                err
+                            let node_id_cloned = node_id_cloned.clone();
+                            let source_for_find = source_for_find.clone();
+                            async move {
+                                let mut responses = Vec::new();
+                                for req in requests {
+                                    if let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                        req.payload_bytes(),
+                                    ) {
+                                        if params.transport != QueryTransport::ForceFind {
+                                            log::warn!(
+                                                "boundary endpoint rejected non-force-find transport"
                                             );
                                             responses.push(build_error_marker_event(
                                                 &node_id_cloned,
                                                 req.metadata().correlation_id,
-                                                &err.to_string(),
+                                                "force-find source invalid request transport",
                                             ));
+                                            continue;
                                         }
+                                        eprintln!(
+                                            "fs_meta_source: route force-find request correlation={:?} selected_group={:?} path={:?} recursive={}",
+                                            req.metadata().correlation_id,
+                                            params.scope.selected_group,
+                                            params.scope.path,
+                                            params.scope.recursive
+                                        );
+                                        match source_for_find.force_find(&params) {
+                                            Ok(grouped_events) => {
+                                                eprintln!(
+                                                    "fs_meta_source: route force-find response correlation={:?} groups_events={}",
+                                                    req.metadata().correlation_id,
+                                                    grouped_events.len()
+                                                );
+                                                for event in grouped_events {
+                                                    let mut meta = event.metadata().clone();
+                                                    meta.correlation_id =
+                                                        req.metadata().correlation_id;
+                                                    responses.push(Event::new(
+                                                        meta,
+                                                        bytes::Bytes::copy_from_slice(
+                                                            event.payload_bytes(),
+                                                        ),
+                                                    ));
+                                                }
+                                            }
+                                            Err(err) => {
+                                                log::error!(
+                                                    "boundary endpoint force-find failed: {:?}",
+                                                    err
+                                                );
+                                                responses.push(build_error_marker_event(
+                                                    &node_id_cloned,
+                                                    req.metadata().correlation_id,
+                                                    &err.to_string(),
+                                                ));
+                                            }
+                                        }
+                                    } else {
+                                        log::warn!(
+                                            "boundary endpoint failed to parse InternalQueryRequest"
+                                        );
+                                        responses.push(build_error_marker_event(
+                                            &node_id_cloned,
+                                            req.metadata().correlation_id,
+                                            "force-find source invalid request payload",
+                                        ));
                                     }
-                                } else {
-                                    log::warn!(
-                                        "boundary endpoint failed to parse InternalQueryRequest"
-                                    );
-                                    responses.push(build_error_marker_event(
-                                        &node_id_cloned,
-                                        req.metadata().correlation_id,
-                                        "force-find source invalid request payload",
-                                    ));
                                 }
+                                responses
                             }
-                            responses
                         },
                     );
                     lock_or_recover(
@@ -1752,75 +1757,81 @@ impl FSMetaSource {
                         ),
                         source.shutdown.clone(),
                         move |requests| {
-                            eprintln!(
-                                "fs_meta_source: source.rescan endpoint start node={} requests={}",
-                                node_id_rescan.0,
-                                requests.len()
-                            );
-                            let expected = lock_or_recover(
-                                &rescan_roots,
-                                "source.rescan.endpoint.roots.expected",
-                            )
-                            .iter()
-                            .filter(|root| root.is_group_primary && root.spec.scan)
-                            .map(FSMetaSource::root_runtime_key)
-                            .collect::<Vec<_>>();
-                            if !expected.is_empty() {
-                                let deadline =
-                                    std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
-                                loop {
-                                    let ready = {
-                                        let health = lock_or_recover(
-                                            &rescan_fanout_health,
-                                            "source.rescan.endpoint.health",
-                                        );
-                                        expected.iter().all(|root_key| {
-                                            health
-                                                .object_ref
-                                                .get(root_key)
-                                                .is_some_and(|status| status == "running")
-                                        })
-                                    };
-                                    if ready || std::time::Instant::now() >= deadline {
-                                        break;
+                            let node_id_rescan = node_id_rescan.clone();
+                            let rescan_roots = rescan_roots.clone();
+                            let rescan_fanout_health = rescan_fanout_health.clone();
+                            let rescan_manual_intents = rescan_manual_intents.clone();
+                            async move {
+                                eprintln!(
+                                    "fs_meta_source: source.rescan endpoint start node={} requests={}",
+                                    node_id_rescan.0,
+                                    requests.len()
+                                );
+                                let expected = lock_or_recover(
+                                    &rescan_roots,
+                                    "source.rescan.endpoint.roots.expected",
+                                )
+                                .iter()
+                                .filter(|root| root.is_group_primary && root.spec.scan)
+                                .map(FSMetaSource::root_runtime_key)
+                                .collect::<Vec<_>>();
+                                if !expected.is_empty() {
+                                    let deadline =
+                                        std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
+                                    loop {
+                                        let ready = {
+                                            let health = lock_or_recover(
+                                                &rescan_fanout_health,
+                                                "source.rescan.endpoint.health",
+                                            );
+                                            expected.iter().all(|root_key| {
+                                                health
+                                                    .object_ref
+                                                    .get(root_key)
+                                                    .is_some_and(|status| status == "running")
+                                            })
+                                        };
+                                        if ready || std::time::Instant::now() >= deadline {
+                                            break;
+                                        }
+                                        tokio::time::sleep(RESCAN_READY_POLL_INTERVAL).await;
                                     }
-                                    std::thread::sleep(RESCAN_READY_POLL_INTERVAL);
                                 }
+
+                                let roots_snapshot = lock_or_recover(
+                                    &rescan_roots,
+                                    "source.rescan.endpoint.roots.trigger",
+                                )
+                                .clone();
+                                FSMetaSource::request_rescan_on_primary_roots(
+                                    &roots_snapshot,
+                                    Some(&rescan_fanout_health),
+                                    Some(&rescan_manual_intents),
+                                    "manual",
+                                );
+                                eprintln!(
+                                    "fs_meta_source: source.rescan endpoint triggered node={} expected_roots={}",
+                                    node_id_rescan.0,
+                                    expected.len()
+                                );
+
+                                requests
+                                    .into_iter()
+                                    .map(|req| {
+                                        Event::new(
+                                            EventMetadata {
+                                                origin_id: node_id_rescan.clone(),
+                                                timestamp_us: now_us(),
+                                                logical_ts: None,
+                                                correlation_id: req.metadata().correlation_id,
+                                                ingress_auth: None,
+                                                trace: None,
+                                            },
+                                            bytes::Bytes::from_static(b"accepted"),
+                                        )
+                                    })
+                                    .collect()
                             }
-
-                            let roots_snapshot = lock_or_recover(
-                                &rescan_roots,
-                                "source.rescan.endpoint.roots.trigger",
-                            )
-                            .clone();
-                            FSMetaSource::request_rescan_on_primary_roots(
-                                &roots_snapshot,
-                                Some(&rescan_fanout_health),
-                                Some(&rescan_manual_intents),
-                                "manual",
-                            );
-                            eprintln!(
-                                "fs_meta_source: source.rescan endpoint triggered node={} expected_roots={}",
-                                node_id_rescan.0,
-                                expected.len()
-                            );
-
-                            requests
-                                .into_iter()
-                                .map(|req| {
-                                    Event::new(
-                                        EventMetadata {
-                                            origin_id: node_id_rescan.clone(),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        bytes::Bytes::from_static(b"accepted"),
-                                    )
-                                })
-                                .collect()
                         },
                     );
                     lock_or_recover(
@@ -1854,74 +1865,81 @@ impl FSMetaSource {
                     format!("source:{}", route.0),
                     source.shutdown.clone(),
                     move |requests| {
-                        eprintln!(
-                            "fs_meta_source: source.rescan scoped endpoint start node={} requests={}",
-                            node_id_rescan_scoped.0,
-                            requests.len()
-                        );
-                        let expected = lock_or_recover(
-                            &rescan_roots_scoped,
-                            "source.rescan.scoped_endpoint.roots.expected",
-                        )
-                        .iter()
-                        .filter(|root| root.is_group_primary && root.spec.scan)
-                        .map(FSMetaSource::root_runtime_key)
-                        .collect::<Vec<_>>();
-                        if !expected.is_empty() {
-                            let deadline = std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
-                            loop {
-                                let ready = {
-                                    let health = lock_or_recover(
-                                        &rescan_fanout_health_scoped,
-                                        "source.rescan.scoped_endpoint.health",
-                                    );
-                                    expected.iter().all(|root_key| {
-                                        health
-                                            .object_ref
-                                            .get(root_key)
-                                            .is_some_and(|status| status == "running")
-                                    })
-                                };
-                                if ready || std::time::Instant::now() >= deadline {
-                                    break;
+                        let node_id_rescan_scoped = node_id_rescan_scoped.clone();
+                        let rescan_roots_scoped = rescan_roots_scoped.clone();
+                        let rescan_fanout_health_scoped = rescan_fanout_health_scoped.clone();
+                        let rescan_manual_intents_scoped = rescan_manual_intents_scoped.clone();
+                        async move {
+                            eprintln!(
+                                "fs_meta_source: source.rescan scoped endpoint start node={} requests={}",
+                                node_id_rescan_scoped.0,
+                                requests.len()
+                            );
+                            let expected = lock_or_recover(
+                                &rescan_roots_scoped,
+                                "source.rescan.scoped_endpoint.roots.expected",
+                            )
+                            .iter()
+                            .filter(|root| root.is_group_primary && root.spec.scan)
+                            .map(FSMetaSource::root_runtime_key)
+                            .collect::<Vec<_>>();
+                            if !expected.is_empty() {
+                                let deadline =
+                                    std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
+                                loop {
+                                    let ready = {
+                                        let health = lock_or_recover(
+                                            &rescan_fanout_health_scoped,
+                                            "source.rescan.scoped_endpoint.health",
+                                        );
+                                        expected.iter().all(|root_key| {
+                                            health
+                                                .object_ref
+                                                .get(root_key)
+                                                .is_some_and(|status| status == "running")
+                                        })
+                                    };
+                                    if ready || std::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    tokio::time::sleep(RESCAN_READY_POLL_INTERVAL).await;
                                 }
-                                std::thread::sleep(RESCAN_READY_POLL_INTERVAL);
                             }
+
+                            let roots_snapshot = lock_or_recover(
+                                &rescan_roots_scoped,
+                                "source.rescan.scoped_endpoint.roots.trigger",
+                            )
+                            .clone();
+                            FSMetaSource::request_rescan_on_primary_roots(
+                                &roots_snapshot,
+                                Some(&rescan_fanout_health_scoped),
+                                Some(&rescan_manual_intents_scoped),
+                                "manual",
+                            );
+                            eprintln!(
+                                "fs_meta_source: source.rescan scoped endpoint triggered node={} expected_roots={}",
+                                node_id_rescan_scoped.0,
+                                expected.len()
+                            );
+
+                            requests
+                                .into_iter()
+                                .map(|req| {
+                                    Event::new(
+                                        EventMetadata {
+                                            origin_id: node_id_rescan_scoped.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        bytes::Bytes::from_static(b"accepted"),
+                                    )
+                                })
+                                .collect()
                         }
-
-                        let roots_snapshot = lock_or_recover(
-                            &rescan_roots_scoped,
-                            "source.rescan.scoped_endpoint.roots.trigger",
-                        )
-                        .clone();
-                        FSMetaSource::request_rescan_on_primary_roots(
-                            &roots_snapshot,
-                            Some(&rescan_fanout_health_scoped),
-                            Some(&rescan_manual_intents_scoped),
-                            "manual",
-                        );
-                        eprintln!(
-                            "fs_meta_source: source.rescan scoped endpoint triggered node={} expected_roots={}",
-                            node_id_rescan_scoped.0,
-                            expected.len()
-                        );
-
-                        requests
-                            .into_iter()
-                            .map(|req| {
-                                Event::new(
-                                    EventMetadata {
-                                        origin_id: node_id_rescan_scoped.clone(),
-                                        timestamp_us: now_us(),
-                                        logical_ts: None,
-                                        correlation_id: req.metadata().correlation_id,
-                                        ingress_auth: None,
-                                        trace: None,
-                                    },
-                                    bytes::Bytes::from_static(b"accepted"),
-                                )
-                            })
-                            .collect()
                     },
                 );
                 lock_or_recover(
@@ -1972,71 +1990,78 @@ impl FSMetaSource {
                     ),
                     self.shutdown.clone(),
                     move |requests| {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            if let Ok(params) =
-                                rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
-                            {
-                                if params.transport != QueryTransport::ForceFind {
-                                    log::warn!(
-                                        "boundary endpoint rejected non-force-find transport"
-                                    );
-                                    responses.push(build_error_marker_event(
-                                        &node_id_cloned,
-                                        req.metadata().correlation_id,
-                                        "force-find source invalid request transport",
-                                    ));
-                                    continue;
-                                }
-                                eprintln!(
-                                    "fs_meta_source: route force-find request correlation={:?} selected_group={:?} path={:?} recursive={}",
-                                    req.metadata().correlation_id,
-                                    params.scope.selected_group,
-                                    params.scope.path,
-                                    params.scope.recursive
-                                );
-                                match source_for_find.force_find(&params) {
-                                    Ok(grouped_events) => {
-                                        eprintln!(
-                                            "fs_meta_source: route force-find response correlation={:?} groups_events={}",
-                                            req.metadata().correlation_id,
-                                            grouped_events.len()
-                                        );
-                                        for event in grouped_events {
-                                            let mut meta = event.metadata().clone();
-                                            meta.correlation_id = req.metadata().correlation_id;
-                                            responses.push(Event::new(
-                                                meta,
-                                                bytes::Bytes::copy_from_slice(
-                                                    event.payload_bytes(),
-                                                ),
-                                            ));
-                                        }
-                                    }
-                                    Err(err) => {
-                                        log::error!(
-                                            "boundary endpoint force-find failed: {:?}",
-                                            err
+                        let node_id_cloned = node_id_cloned.clone();
+                        let source_for_find = source_for_find.clone();
+                        async move {
+                            let mut responses = Vec::new();
+                            for req in requests {
+                                if let Ok(params) =
+                                    rmp_serde::from_slice::<InternalQueryRequest>(
+                                        req.payload_bytes(),
+                                    )
+                                {
+                                    if params.transport != QueryTransport::ForceFind {
+                                        log::warn!(
+                                            "boundary endpoint rejected non-force-find transport"
                                         );
                                         responses.push(build_error_marker_event(
                                             &node_id_cloned,
                                             req.metadata().correlation_id,
-                                            &err.to_string(),
+                                            "force-find source invalid request transport",
                                         ));
+                                        continue;
                                     }
+                                    eprintln!(
+                                        "fs_meta_source: route force-find request correlation={:?} selected_group={:?} path={:?} recursive={}",
+                                        req.metadata().correlation_id,
+                                        params.scope.selected_group,
+                                        params.scope.path,
+                                        params.scope.recursive
+                                    );
+                                    match source_for_find.force_find(&params) {
+                                        Ok(grouped_events) => {
+                                            eprintln!(
+                                                "fs_meta_source: route force-find response correlation={:?} groups_events={}",
+                                                req.metadata().correlation_id,
+                                                grouped_events.len()
+                                            );
+                                            for event in grouped_events {
+                                                let mut meta = event.metadata().clone();
+                                                meta.correlation_id =
+                                                    req.metadata().correlation_id;
+                                                responses.push(Event::new(
+                                                    meta,
+                                                    bytes::Bytes::copy_from_slice(
+                                                        event.payload_bytes(),
+                                                    ),
+                                                ));
+                                            }
+                                        }
+                                        Err(err) => {
+                                            log::error!(
+                                                "boundary endpoint force-find failed: {:?}",
+                                                err
+                                            );
+                                            responses.push(build_error_marker_event(
+                                                &node_id_cloned,
+                                                req.metadata().correlation_id,
+                                                &err.to_string(),
+                                            ));
+                                        }
+                                    }
+                                } else {
+                                    log::warn!(
+                                        "boundary endpoint failed to parse InternalQueryRequest"
+                                    );
+                                    responses.push(build_error_marker_event(
+                                        &node_id_cloned,
+                                        req.metadata().correlation_id,
+                                        "force-find source invalid request payload",
+                                    ));
                                 }
-                            } else {
-                                log::warn!(
-                                    "boundary endpoint failed to parse InternalQueryRequest"
-                                );
-                                responses.push(build_error_marker_event(
-                                    &node_id_cloned,
-                                    req.metadata().correlation_id,
-                                    "force-find source invalid request payload",
-                                ));
                             }
+                            responses
                         }
-                        responses
                     },
                 );
                 lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints.tasks")
@@ -2069,70 +2094,81 @@ impl FSMetaSource {
                     ),
                     self.shutdown.clone(),
                     move |requests| {
-                        eprintln!(
-                            "fs_meta_source: source.rescan endpoint start node={} requests={}",
-                            node_id_rescan.0,
-                            requests.len()
-                        );
-                        let expected =
-                            lock_or_recover(&rescan_roots, "source.rescan.endpoint.roots.expected")
-                                .iter()
-                                .filter(|root| root.is_group_primary && root.spec.scan)
-                                .map(FSMetaSource::root_runtime_key)
-                                .collect::<Vec<_>>();
-                        if !expected.is_empty() {
-                            let deadline = std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
-                            loop {
-                                let ready = {
-                                    let health = lock_or_recover(
-                                        &rescan_fanout_health,
-                                        "source.rescan.endpoint.health",
-                                    );
-                                    expected.iter().all(|root_key| {
-                                        health
-                                            .object_ref
-                                            .get(root_key)
-                                            .is_some_and(|status| status == "running")
-                                    })
-                                };
-                                if ready || std::time::Instant::now() >= deadline {
-                                    break;
+                        let node_id_rescan = node_id_rescan.clone();
+                        let rescan_roots = rescan_roots.clone();
+                        let rescan_fanout_health = rescan_fanout_health.clone();
+                        let rescan_manual_intents = rescan_manual_intents.clone();
+                        async move {
+                            eprintln!(
+                                "fs_meta_source: source.rescan endpoint start node={} requests={}",
+                                node_id_rescan.0,
+                                requests.len()
+                            );
+                            let expected = lock_or_recover(
+                                &rescan_roots,
+                                "source.rescan.endpoint.roots.expected",
+                            )
+                            .iter()
+                            .filter(|root| root.is_group_primary && root.spec.scan)
+                            .map(FSMetaSource::root_runtime_key)
+                            .collect::<Vec<_>>();
+                            if !expected.is_empty() {
+                                let deadline =
+                                    std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
+                                loop {
+                                    let ready = {
+                                        let health = lock_or_recover(
+                                            &rescan_fanout_health,
+                                            "source.rescan.endpoint.health",
+                                        );
+                                        expected.iter().all(|root_key| {
+                                            health
+                                                .object_ref
+                                                .get(root_key)
+                                                .is_some_and(|status| status == "running")
+                                        })
+                                    };
+                                    if ready || std::time::Instant::now() >= deadline {
+                                        break;
+                                    }
+                                    tokio::time::sleep(RESCAN_READY_POLL_INTERVAL).await;
                                 }
-                                std::thread::sleep(RESCAN_READY_POLL_INTERVAL);
                             }
+
+                            let roots_snapshot = lock_or_recover(
+                                &rescan_roots,
+                                "source.rescan.endpoint.roots.trigger",
+                            )
+                            .clone();
+                            FSMetaSource::request_rescan_on_primary_roots(
+                                &roots_snapshot,
+                                Some(&rescan_fanout_health),
+                                Some(&rescan_manual_intents),
+                                "manual",
+                            );
+                            eprintln!(
+                                "fs_meta_source: source.rescan endpoint triggered node={} expected_roots={}",
+                                node_id_rescan.0,
+                                expected.len()
+                            );
+
+                            requests
+                                .into_iter()
+                                .map(|req| {
+                                    Event::new(
+                                        EventMetadata {
+                                            origin_id: node_id_rescan.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        bytes::Bytes::from_static(b"accepted"),
+                                    )
+                                })
+                                .collect()
                         }
-
-                        let roots_snapshot =
-                            lock_or_recover(&rescan_roots, "source.rescan.endpoint.roots.trigger")
-                                .clone();
-                        FSMetaSource::request_rescan_on_primary_roots(
-                            &roots_snapshot,
-                            Some(&rescan_fanout_health),
-                            Some(&rescan_manual_intents),
-                            "manual",
-                        );
-                        eprintln!(
-                            "fs_meta_source: source.rescan endpoint triggered node={} expected_roots={}",
-                            node_id_rescan.0,
-                            expected.len()
-                        );
-
-                        requests
-                            .into_iter()
-                            .map(|req| {
-                                Event::new(
-                                    EventMetadata {
-                                        origin_id: node_id_rescan.clone(),
-                                        timestamp_us: now_us(),
-                                        logical_ts: None,
-                                        correlation_id: req.metadata().correlation_id,
-                                        ingress_auth: None,
-                                        trace: None,
-                                    },
-                                    bytes::Bytes::from_static(b"accepted"),
-                                )
-                            })
-                            .collect()
                     },
                 );
                 lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints.tasks")
@@ -2169,18 +2205,24 @@ impl FSMetaSource {
                     self.shutdown.clone(),
                     move || true,
                     move |events| {
-                        let roots_snapshot = lock_or_recover(
-                            &control_roots,
-                            "source.rescan.control_stream.roots.trigger",
-                        )
-                        .clone();
-                        for _ in 0..events.len() {
-                            FSMetaSource::request_rescan_on_primary_roots(
-                                &roots_snapshot,
-                                Some(&control_fanout_health),
-                                Some(&control_manual_rescan_intents),
-                                "manual",
-                            );
+                        let control_roots = control_roots.clone();
+                        let control_fanout_health = control_fanout_health.clone();
+                        let control_manual_rescan_intents =
+                            control_manual_rescan_intents.clone();
+                        async move {
+                            let roots_snapshot = lock_or_recover(
+                                &control_roots,
+                                "source.rescan.control_stream.roots.trigger",
+                            )
+                            .clone();
+                            for _ in 0..events.len() {
+                                FSMetaSource::request_rescan_on_primary_roots(
+                                    &roots_snapshot,
+                                    Some(&control_fanout_health),
+                                    Some(&control_manual_rescan_intents),
+                                    "manual",
+                                );
+                            }
                         }
                     },
                 );
@@ -2220,33 +2262,35 @@ impl FSMetaSource {
                     self.shutdown.clone(),
                     move || true,
                     move |events| {
-                        eprintln!(
-                            "fs_meta_source: source.roots control stream received node={} events={}",
-                            control_node_id.0,
-                            events.len()
-                        );
-                        for event in events {
-                            let payload = match decode_logical_roots_control_payload(
-                                event.payload_bytes(),
-                            ) {
-                                Ok(payload) => payload,
-                                Err(err) => {
+                        let source = source.clone();
+                        let control_node_id = control_node_id.clone();
+                        async move {
+                            eprintln!(
+                                "fs_meta_source: source.roots control stream received node={} events={}",
+                                control_node_id.0,
+                                events.len()
+                            );
+                            for event in events {
+                                let payload = match decode_logical_roots_control_payload(
+                                    event.payload_bytes(),
+                                ) {
+                                    Ok(payload) => payload,
+                                    Err(err) => {
+                                        log::warn!(
+                                            "source logical-roots control decode failed on node {}: {:?}",
+                                            control_node_id.0,
+                                            err
+                                        );
+                                        continue;
+                                    }
+                                };
+                                if let Err(err) = source.update_logical_roots(payload.roots).await {
                                     log::warn!(
-                                        "source logical-roots control decode failed on node {}: {:?}",
+                                        "source logical-roots control apply failed on node {}: {:?}",
                                         control_node_id.0,
                                         err
                                     );
-                                    continue;
                                 }
-                            };
-                            if let Err(err) = crate::runtime_app::shared_tokio_runtime()
-                                .block_on(source.update_logical_roots(payload.roots))
-                            {
-                                log::warn!(
-                                    "source logical-roots control apply failed on node {}: {:?}",
-                                    control_node_id.0,
-                                    err
-                                );
                             }
                         }
                     },
@@ -2282,74 +2326,81 @@ impl FSMetaSource {
                 format!("source:{}", route.0),
                 self.shutdown.clone(),
                 move |requests| {
-                    eprintln!(
-                        "fs_meta_source: source.rescan scoped endpoint start node={} requests={}",
-                        node_id_rescan_scoped.0,
-                        requests.len()
-                    );
-                    let expected = lock_or_recover(
-                        &rescan_roots_scoped,
-                        "source.rescan.scoped_endpoint.roots.expected",
-                    )
-                    .iter()
-                    .filter(|root| root.is_group_primary && root.spec.scan)
-                    .map(FSMetaSource::root_runtime_key)
-                    .collect::<Vec<_>>();
-                    if !expected.is_empty() {
-                        let deadline = std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
-                        loop {
-                            let ready = {
-                                let health = lock_or_recover(
-                                    &rescan_fanout_health_scoped,
-                                    "source.rescan.scoped_endpoint.health",
-                                );
-                                expected.iter().all(|root_key| {
-                                    health
-                                        .object_ref
-                                        .get(root_key)
-                                        .is_some_and(|status| status == "running")
-                                })
-                            };
-                            if ready || std::time::Instant::now() >= deadline {
-                                break;
+                    let node_id_rescan_scoped = node_id_rescan_scoped.clone();
+                    let rescan_roots_scoped = rescan_roots_scoped.clone();
+                    let rescan_fanout_health_scoped = rescan_fanout_health_scoped.clone();
+                    let rescan_manual_intents_scoped = rescan_manual_intents_scoped.clone();
+                    async move {
+                        eprintln!(
+                            "fs_meta_source: source.rescan scoped endpoint start node={} requests={}",
+                            node_id_rescan_scoped.0,
+                            requests.len()
+                        );
+                        let expected = lock_or_recover(
+                            &rescan_roots_scoped,
+                            "source.rescan.scoped_endpoint.roots.expected",
+                        )
+                        .iter()
+                        .filter(|root| root.is_group_primary && root.spec.scan)
+                        .map(FSMetaSource::root_runtime_key)
+                        .collect::<Vec<_>>();
+                        if !expected.is_empty() {
+                            let deadline =
+                                std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
+                            loop {
+                                let ready = {
+                                    let health = lock_or_recover(
+                                        &rescan_fanout_health_scoped,
+                                        "source.rescan.scoped_endpoint.health",
+                                    );
+                                    expected.iter().all(|root_key| {
+                                        health
+                                            .object_ref
+                                            .get(root_key)
+                                            .is_some_and(|status| status == "running")
+                                    })
+                                };
+                                if ready || std::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                tokio::time::sleep(RESCAN_READY_POLL_INTERVAL).await;
                             }
-                            std::thread::sleep(RESCAN_READY_POLL_INTERVAL);
                         }
+
+                        let roots_snapshot = lock_or_recover(
+                            &rescan_roots_scoped,
+                            "source.rescan.scoped_endpoint.roots.trigger",
+                        )
+                        .clone();
+                        FSMetaSource::request_rescan_on_primary_roots(
+                            &roots_snapshot,
+                            Some(&rescan_fanout_health_scoped),
+                            Some(&rescan_manual_intents_scoped),
+                            "manual",
+                        );
+                        eprintln!(
+                            "fs_meta_source: source.rescan scoped endpoint triggered node={} expected_roots={}",
+                            node_id_rescan_scoped.0,
+                            expected.len()
+                        );
+
+                        requests
+                            .into_iter()
+                            .map(|req| {
+                                Event::new(
+                                    EventMetadata {
+                                        origin_id: node_id_rescan_scoped.clone(),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: req.metadata().correlation_id,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    },
+                                    bytes::Bytes::from_static(b"accepted"),
+                                )
+                            })
+                            .collect()
                     }
-
-                    let roots_snapshot = lock_or_recover(
-                        &rescan_roots_scoped,
-                        "source.rescan.scoped_endpoint.roots.trigger",
-                    )
-                    .clone();
-                    FSMetaSource::request_rescan_on_primary_roots(
-                        &roots_snapshot,
-                        Some(&rescan_fanout_health_scoped),
-                        Some(&rescan_manual_intents_scoped),
-                        "manual",
-                    );
-                    eprintln!(
-                        "fs_meta_source: source.rescan scoped endpoint triggered node={} expected_roots={}",
-                        node_id_rescan_scoped.0,
-                        expected.len()
-                    );
-
-                    requests
-                        .into_iter()
-                        .map(|req| {
-                            Event::new(
-                                EventMetadata {
-                                    origin_id: node_id_rescan_scoped.clone(),
-                                    timestamp_us: now_us(),
-                                    logical_ts: None,
-                                    correlation_id: req.metadata().correlation_id,
-                                    ingress_auth: None,
-                                    trace: None,
-                                },
-                                bytes::Bytes::from_static(b"accepted"),
-                            )
-                        })
-                        .collect()
                 },
             );
             lock_or_recover(

@@ -581,7 +581,7 @@ impl RunningNode {
             .arg("--bind")
             .arg(bind_addr)
             .env("CAPANIX_HOME", &home_dir)
-            .env("CAPANIX_DECLARE_QUORUM_TIMEOUT_MS", "15000")
+            .env("CAPANIX_TARGET_QUORUM_TIMEOUT_MS", "15000")
             .env("RUST_LOG", "debug")
             .stdin(Stdio::null())
             .stdout(Stdio::from(stdout))
