@@ -7,6 +7,8 @@ version: 3.0.0
 > Mission: 在 Capanix 上以单一 fs-meta 域 authority 与单一 app 产品边界提供文件元数据能力，
 > 对外暴露稳定产品接口与可审计的 observation 结果；内部执行职责、隔离形态与升级/故障恢复路径可以演进，
 > 但 domain meaning 继续由 fs-meta 自身拥有。
+>
+> Canonical item references in this document use `VISION.<SECTION>.<ITEM>`.
 
 ## In-Scope
 
@@ -45,6 +47,7 @@ version: 3.0.0
 3. **AUDIT_REPAIR**: User wants周期性 audit 对索引漂移执行修正。
 4. **SENTINEL_FEEDBACK**: User wants哨兵信号触发自愈与降级可见性。
 5. **SINK_SINGLE_TREE_ARBITRATION**: User wants sink 在每个组内使用单树进行仲裁/构建，对外不暴露 member 子层。
+6. **DELETE_SEMANTICS_CONTINUITY**: User wants delete 语义在 realtime、audit、MID 与 rebuild 路径中保持显式、一致，避免已删节点静默回生或在不同恢复阶段失去明确生命周期解释。
 
 ### VISION.OBSERVATION_CONVERGENCE
 
@@ -64,6 +67,7 @@ version: 3.0.0
 
 1. **PRODUCT_CONFIGURATION_SPLIT**: User wants正式部署只暴露薄 bootstrap 配置面，而把业务监控范围配置留给产品 API 在运行时基于 runtime grants 完成，不把 platform-owned config/intention semantics 重新发明成 fs-meta 私有配置模型。
 2. **RELEASE_GENERATION_UPGRADE**: User wants新版本 fs-meta 通过单 app 边界的 release-generation cutover 升级，而不是手工编辑内部 desired-state 文档或节点 manifest。
+3. **DOMAIN_TRACEABILITY_CHAIN**: User wants formal fs-meta specs 保持从 vision 到 contracts/runtime workflows/verification anchors 的显式 item-level traceability，这样 ownership 与行为漂移可以被审计，而不是依赖读者猜测。
 
 ### VISION.APP_SCOPE
 

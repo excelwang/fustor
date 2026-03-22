@@ -28,6 +28,14 @@
 4. `fs-meta/tooling/` 可以依赖 bounded `fs-meta` / `fs-meta-deploy` types 和 optional daemon/bootstrap seams，但不得依赖 worker runtime internals 或重写 worker bootstrap。
 5. Helper-only upstream worker bootstrap support 仍负责 canonical `Timeout` / `TransportClosed` 分类、wall-clock timeout clipping、bootstrap/retry/lifecycle supervision；fs-meta 本地 crate 通过 `capanix-runtime-entry-sdk` 等更高层 helper 消费它，而不重定义这些 transport/bootstrap 语义。
 
+## ENGINEERING_GOVERNANCE.IMPLEMENTATION_REALIZATION_NOTES
+
+1. Exact upstream crate names, helper-layer topology, and package naming remain engineering constraints rather than formal L1-L3 authority, as long as the published ownership and behavior seams stay stable.
+2. Exact repo/package topology and source-file locations for worker servers, runtime glue, and release-compiler wiring are implementation material; current runtime worker entry files live under `fs-meta/app/src/workers/` and are governed here rather than by formal architecture clauses.
+3. Runtime realization currently uses compiled worker bindings and lower startup transport fields beneath the formal worker/mode model; names such as `__cnx_runtime.workers` and `workers.<role>.startup.path/socket_dir` are implementation detail, not product contract vocabulary.
+4. Current wrapper/helper entrypoints and platform-owned bootstrap control envelope names, including `RuntimeLoadedServiceApp::from_runtime_config(...)`, `AppBuilder`, `Init`, `Start`, `Ping`, and `Close`, remain implementation material beneath the formal readiness, failure-classification, and shutdown contracts.
+5. Package-local implementation tuning knobs such as `FS_META_SOURCE_SCAN_WORKERS`, `FS_META_SOURCE_AUDIT_INTERVAL_MS`, `FS_META_SOURCE_THROTTLE_INTERVAL_MS`, `FS_META_SINK_TOMBSTONE_TTL_MS`, `FS_META_SINK_TOMBSTONE_TOLERANCE_US`, and `FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS` are bounded implementation controls and MUST NOT redefine truth, cutover, or public query contracts.
+
 ## ENGINEERING_GOVERNANCE.VALIDATION_WORKFLOW
 
 1. `fs-meta/scripts/validate_specs.sh` 是 formal specs tree 的标准校验入口。

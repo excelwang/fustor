@@ -10,7 +10,7 @@ version: 3.0.0
 
 1. 管理入口节点提交 fs-meta app 期望状态（单点声明）。
 2. app config 通过 group/roots 逻辑声明监控分组与子路径范围（每组含 id、descriptor 选择规则、watch/scan，不含运行时节点枚举）。
-3. runtime/kernel privileged mutation path 将期望状态传播，并向已调度 run 注入薄 runtime ABI 上下文与编译后的 `__cnx_runtime.workers` worker bindings；resource-scoped HTTP API 继续附着在 one-cardinality fs-meta app facade unit 上，source/sink 的内部执行策略可独立演进，而 local-style `FSMetaApp::new(...)` 保持 deployment-neutral embedded 默认。
+3. runtime/kernel privileged mutation path 将期望状态传播，并向已调度 run 注入薄 runtime ABI 上下文与编译后的 runtime worker bindings；resource-scoped HTTP API 继续附着在 one-cardinality fs-meta app facade unit 上，source/sink 的内部执行策略可独立演进，而 local-style app construction 保持 deployment-neutral embedded 默认。
 4. app 使用 runtime 注入的 `host_object_grants`、宿主描述字段以及绑定宿主上的公共 host-fs facade 形成 app-owned groups。
 5. app 为每个已调度 mount-root object 启动独立 watch 管线并并流输出事件；同一 source group 内所有 member 都执行监听并维护 hot watch set。
 6. app 启动实时监听增量流并持续更新索引。
@@ -21,7 +21,7 @@ version: 3.0.0
 11. unit 作用域 authoritative commit journal 统一通过 runtime-owned `statecell_*` state-carrier boundary 提交；app 仅声明 `state_class`（`authoritative`/`volatile`），不声明底层 carrier 介质。
 12. sink 在每个 logical group 内维持单树仲裁/构建状态，对外查询响应不暴露 member 子层。
 13. `workers.sink.mode=external` 时，sink materialized tree 由独立 sink-worker 进程承载；主 fs-meta 进程通过 kernel data route 转发 sink 读写与控制帧，worker 仅消费相同的 runtime ABI、route-resolved opaque channels 与内部 sink protocol，worker 重启后走扫描/审计重建。
-14. worker-mode reconfiguration is generation-based: operator changes to `workers.source.mode` or `workers.sink.mode` are compiled into a new generation’s `__cnx_runtime.workers` bindings and take effect only through normal generation rollout, not through same-generation hot switching inside one running host.
+14. worker-mode reconfiguration is generation-based: operator changes to `workers.source.mode` or `workers.sink.mode` are compiled into a new generation’s runtime worker bindings and take effect only through normal generation rollout, not through same-generation hot switching inside one running host.
 
 ## [workflow] UnifiedAuditScanWorkflow
 

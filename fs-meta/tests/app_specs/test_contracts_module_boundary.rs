@@ -105,11 +105,16 @@ fn domain_contract_consumption_only() {
     let source = combined_source_text();
     let l0 = read_app_spec("specs/L0-VISION.md");
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
+    let governance = read_app_spec("docs/ENGINEERING_GOVERNANCE.md");
     assert!(source.contains("capanix_app_sdk"));
     assert!(l0.contains("consume fs-meta domain specs and root Convergence Vocabulary"));
     assert!(l1.contains("trace root/domain Convergence Vocabulary"));
-    assert!(l1.contains("FS_META_SOURCE_SCAN_WORKERS"));
-    assert!(l1.contains("FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS"));
+    assert!(l1.contains(
+        "exact dependency allowlists, package names, helper crates, file paths, and implementation tuning knob names live in engineering governance"
+    ));
+    assert!(l1.contains("bounded implementation tuning knobs may exist"));
+    assert!(governance.contains("FS_META_SOURCE_SCAN_WORKERS"));
+    assert!(governance.contains("FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS"));
 }
 
 #[test]
@@ -118,6 +123,7 @@ fn app_sdk_authoring_path_is_primary() {
     let spec = read_app_spec("specs/L2-ARCHITECTURE.md");
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     let cutover = read_app_spec("specs/L3-RUNTIME/OBSERVATION_CUTOVER.md");
+    let governance = read_app_spec("docs/ENGINEERING_GOVERNANCE.md");
     let app_manifest = read_app_spec("app/Cargo.toml");
     let app_lib = read_app_spec("app/src/lib.rs");
     let source_mod = read_app_spec("src/source/mod.rs");
@@ -128,23 +134,25 @@ fn app_sdk_authoring_path_is_primary() {
     let state_cell = read_app_spec("src/state/cell.rs");
     let authoring_lib = read_app_spec("lib/src/lib.rs");
     assert!(spec.contains(
-        "Ordinary app-facing business modules use the SDK family rooted in `capanix-app-sdk`"
+        "App-facing business modules consume bounded upstream authoring, runtime, and service surfaces"
     ));
-    assert!(
-        l1.contains(
-            "deploy compilation consumes internal deploy adapter shim `capanix-deploy-sdk`"
-        )
-    );
     assert!(l1.contains(
-        "`capanix-managed-state-sdk` supplies shared stateful observation declarations/evaluator only"
+        "stateful observation-facing business modules consume bounded upstream authoring, runtime, and deploy surfaces"
     ));
-    assert!(l1.contains("`capanix-service-sdk`"));
-    assert!(l1.contains("`capanix-runtime-entry-sdk`"));
-    assert!(l1.contains("service-first authoring primitives"));
-    assert!(l1.contains("top-level runtime-entry/bootstrap path"));
-    assert!(l1.contains("MUST NOT directly depend on or reference `capanix-kernel-api`"));
-    assert!(cutover.contains("capanix-service-sdk"));
-    assert!(cutover.contains("capanix-runtime-entry-sdk"));
+    assert!(l1.contains(
+        "exact dependency allowlists, package names, helper crates, file paths, and implementation tuning knob names live in engineering governance"
+    ));
+    assert!(governance.contains("`capanix-service-sdk`"));
+    assert!(governance.contains("`capanix-runtime-entry-sdk`"));
+    assert!(governance.contains("`capanix-deploy-sdk`"));
+    assert!(
+        cutover.contains("consume bounded")
+            && cutover.contains("app-facing observation, service, and runtime-entry surfaces")
+    );
+    assert!(
+        cutover.contains("helper-crate")
+            && cutover.contains("wrapper API names remain engineering-governance or")
+    );
     assert!(!cutover.contains(
         "boundary-conversion seams MAY consume `capanix-runtime-api` directly"
     ));
@@ -288,10 +296,10 @@ fn public_operational_support_surfaces_are_explicitly_non_authoritative() {
     let authoring_lib = read_app_spec("lib/src/lib.rs");
     let runtime_lib = read_app_spec("app/src/lib.rs");
     let deploy_lib = read_app_spec("deploy/src/lib.rs");
-    assert!(
-        l1.contains("bounded `fs-meta-deploy` remains the product-facing CLI/tooling namespace")
-    );
-    assert!(l2.contains("`fs-meta/deploy` is the internal product deployment compiler package"));
+    assert!(l1.contains("product-facing deploy/tooling namespace remains bounded"));
+    assert!(l2.contains(
+        "deploy compilation surface owns release-document generation and worker-binding compilation"
+    ));
     assert!(authoring_lib.contains("pub mod api;"));
     assert!(authoring_lib.contains("pub mod product_model;"));
     assert!(authoring_lib.contains("pub struct FSMetaConfig"));
@@ -328,7 +336,7 @@ fn worker_model_is_product_facing() {
     assert!(!l0.contains("`embedded | external`"));
     assert!(l1.contains("composed of three worker roles"));
     assert!(l1.contains("split as `3`, not `2`"));
-    assert!(l1.contains("workers.facade.mode"));
+    assert!(l1.contains("per-role mode fields"));
     assert!(l2.contains("workers.facade.mode"));
     assert!(l2.contains("Current baseline defaults: `facade-worker=embedded`"));
 }
@@ -511,6 +519,7 @@ fn observation_eligibility_gate_ownership() {
     let contracts = read_app_spec("specs/L1-CONTRACTS.md");
     let workflow = read_app_spec("specs/L3-RUNTIME/OBSERVATION_CUTOVER.md");
     let architecture = read_app_spec("specs/L2-ARCHITECTURE.md");
+    let governance = read_app_spec("docs/ENGINEERING_GOVERNANCE.md");
     let source_config = read_app_spec("lib/src/source/config.rs");
     let scanner = read_app_spec("src/source/scanner.rs");
     assert!(
@@ -533,11 +542,11 @@ fn observation_eligibility_gate_ownership() {
             && workflow.contains("`/on-demand-force-find` stays a freshness path"),
         "fs-meta app workflow should treat observation_eligible as materialized-query evidence while keeping force-find on the freshness path"
     );
-    assert!(
-        architecture.contains("Package-local implementation env seams remain bounded tuning knobs")
-    );
-    assert!(architecture.contains("FS_META_SOURCE_SCAN_WORKERS"));
-    assert!(architecture.contains("FS_META_SINK_TOMBSTONE_TOLERANCE_US"));
+    assert!(architecture.contains(
+        "Package-local implementation tuning knobs may exist, but they remain bounded implementation controls"
+    ));
+    assert!(governance.contains("FS_META_SOURCE_SCAN_WORKERS"));
+    assert!(governance.contains("FS_META_SINK_TOMBSTONE_TOLERANCE_US"));
     assert!(source_config.contains("FS_META_SOURCE_SCAN_WORKERS"));
     assert!(source_config.contains("FS_META_SINK_TOMBSTONE_TTL_MS"));
     assert!(scanner.contains("FS_META_SOURCE_AUDIT_DEEP_INTERVAL_ROUNDS"));
@@ -578,22 +587,17 @@ fn worker_mode_failure_boundary_is_explicit() {
     assert!(contracts.contains("`embedded` workers stay inside the shared host boundary"));
     assert!(contracts.contains("`external` workers run through isolated external worker hosting"));
     assert!(contracts.contains(
-        "upstream bridge-realization seam remains only the low-level external-worker bridge carrier"
+        "bridge-realization seam remains below the business-module contract boundary"
     ));
     assert!(contracts.contains(
-        "worker bootstrap, retry clipping, lifecycle supervision, and canonical transport/error classification remain confined to helper-only upstream support beneath `capanix-runtime-entry-sdk`"
+        "worker bootstrap, retry clipping, lifecycle supervision, and canonical transport/error classification remain runtime-helper implementation"
     ));
     assert!(!contracts.contains("log/socket ownership"));
     assert!(contracts.contains("canonical `Timeout` / `TransportClosed` categories"));
     assert!(architecture.contains("Product-facing worker modes are only `embedded | external`"));
     assert!(
-        architecture.contains("upstream bridge-realization seam is low-level carrier glue only")
+        architecture.contains("Worker bootstrap, lifecycle supervision, and transport classification remain below the business-module boundary")
     );
-    assert!(architecture.contains(
-        "helper-only upstream worker support beneath `capanix-runtime-entry-sdk` owns worker bootstrap"
-    ));
-    assert!(architecture.contains("typed control/grant"));
-    assert!(architecture.contains("`advanced::*` escape hatch"));
     assert!(!architecture.contains("route/state/channel"));
     assert!(architecture.contains(
         "The canonical worker transport contract MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping"
@@ -607,11 +611,11 @@ fn worker_mode_failure_boundary_is_explicit() {
     assert!(!app_lib.contains("pub struct FSMetaRuntimeWorkers"));
     assert!(!app_lib.contains("resolve_worker_artifact_binding("));
     assert!(runtime_app.contains("compiled runtime worker bindings must declare role"));
-    assert!(contracts.contains("workers.source.mode"));
-    assert!(contracts.contains("workers.sink.mode"));
-    assert!(contracts.contains("consumes only compiled `__cnx_runtime.workers` bindings"));
-    assert!(architecture.contains("consumes only compiled `__cnx_runtime.workers` bindings emitted by the fs-meta release compiler"));
-    assert!(workflow.contains("__cnx_runtime.workers"));
+    assert!(architecture.contains("workers.source.mode"));
+    assert!(architecture.contains("workers.sink.mode"));
+    assert!(contracts.contains("per-role mode fields"));
+    assert!(architecture.contains("compiled runtime worker bindings"));
+    assert!(workflow.contains("runtime worker bindings"));
     assert!(cargo.contains("crate-type = [\"rlib\", \"cdylib\"]"));
     assert!(runtime_app.contains("init_error"));
     assert!(runtime_app.contains("fs-meta runtime init failed"));
@@ -696,16 +700,21 @@ fn real_nfs_e2e_entrypoint_stays_aligned_with_support_preflight() {
 fn app_authoring_crate_stays_product_specific() {
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
+    let governance = read_app_spec("docs/ENGINEERING_GOVERNANCE.md");
     let authoring_manifest = read_app_spec("lib/Cargo.toml");
     let authoring_lib = read_app_spec("lib/src/lib.rs");
     let runtime_manifest = read_app_spec("app/Cargo.toml");
     let runtime_lib = read_app_spec("app/src/lib.rs");
     let runtime_config = read_app_spec("app/src/config.rs");
 
-    assert!(l1.contains("`fs-meta/lib` is the only developer-facing fs-meta authoring package"));
-    assert!(l1.contains("`fs-meta-runtime` and `fs-meta-deploy`"));
-    assert!(l2.contains("`fs-meta/lib` is the main developer-facing authoring/domain package"));
-    assert!(l2.contains("`fs-meta/app` is the internal `fs-meta-runtime` package and the canonical deployable runtime artifact package"));
+    assert!(l1.contains("developer-facing authoring surface stays bounded to fs-meta domain/types"));
+    assert!(l2.contains(
+        "product boundary separates bounded authoring/domain, runtime artifact, deploy compilation, and operator tooling surfaces"
+    ));
+    assert!(l2.contains("runtime artifact surface owns worker entry"));
+    assert!(governance.contains("`fs-meta/lib/` 是唯一的开发者-facing fs-meta authoring/domain package"));
+    assert!(governance.contains("`fs-meta/app/` 是内部 `fs-meta-runtime` package"));
+    assert!(governance.contains("`fs-meta/deploy/` 是内部 `fs-meta-deploy` package"));
     assert!(authoring_manifest.contains("name = \"fs-meta\""));
     assert!(authoring_manifest.contains("publish = false"));
     assert!(authoring_manifest.contains("description = \"fs-meta authoring and domain surface package\""));
@@ -796,7 +805,7 @@ fn crate_ownership_and_dependency_rules_are_explicit() {
     assert!(l2.contains(
         "`source-worker` and `sink-worker` remain the two operator-visible external worker roles"
     ));
-    assert!(l2.contains("shared `fs-meta/app` worker module"));
+    assert!(l2.contains("shared fs-meta worker runtime surface"));
 
     assert!(root_manifest.contains("capanix-worker-runtime-support"));
     assert!(!app_manifest.contains("capanix-worker-runtime-support"));

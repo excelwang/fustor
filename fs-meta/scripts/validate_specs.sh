@@ -10,7 +10,7 @@ trap 'rm -rf "${TMP_DIR}"' EXIT
 mkdir -p "${TMP_DIR}/specs"
 rsync -a "${DOMAIN_DIR}/specs/" "${TMP_DIR}/specs/"
 
-VALIDATOR="${HOME}/.codex/skills/vibespec/scripts/validate.py"
+VALIDATOR="${DOMAIN_DIR}/scripts/validate_specs_tree.py"
 PRECHECK="${DOMAIN_DIR}/scripts/specs_precheck.py"
 
 # Canonical contract-coverage audit source for the single fs-meta formal specs

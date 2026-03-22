@@ -119,10 +119,10 @@ fn local_dev_daemon_composition_only() {
         "fs-meta local-dev launcher should stay in the dedicated tooling package as an explicit optional feature over daemon seams"
     );
     assert!(
-        l2.contains("workspace package `fs-meta-tooling`")
+        l2.contains("Local-dev helpers remain tooling only")
             && l2.contains("feature-gated away from the default CLI install")
-            && l2.contains("run_with_host_passthrough_bootstrap")
-            && l2.contains("spawn_host_passthrough_endpoint")
+            && l2.contains("host-passthrough bootstrap")
+            && l2.contains("host-fs passthrough adaptation")
             && l2.contains("tooling only")
             && l2.contains("do not create new platform authority or alter daemon ownership"),
         "fs-meta architecture must document launcher composition as tooling-only daemon seam usage"

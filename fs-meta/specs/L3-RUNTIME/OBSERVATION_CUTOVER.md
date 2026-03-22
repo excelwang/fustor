@@ -4,13 +4,11 @@ version: 3.0.0
 
 # L3 Runtime: fs-meta Observation Cutover
 
-fs-meta stateful authoring consumes `capanix-managed-state-sdk`
-declarations/evaluator helpers; service-first authoring lowers through
-`capanix-service-sdk`, while the top-level runtime-entry/bootstrap path lowers through
-`capanix-runtime-entry-sdk` above the lower `capanix-app-sdk` Boundary Toolkit.
-Rare lower boundary/state bridge usage remains an explicit advanced escape hatch
-beneath that layer rather than a direct sanctioned app-facing path, while
-`capanix-kernel-api` remains below that line as a low-level mirror.
+fs-meta stateful authoring and runtime participation consume bounded
+app-facing observation, service, and runtime-entry surfaces above the
+low-level kernel mirror. Exact repo/package allowlists, helper-crate
+layering, and wrapper API names remain engineering-governance or
+implementation material rather than formal runtime contracts.
 
 Product-facing execution language remains `embedded | external` worker mode over
 one `fs-meta` app product container with three worker roles. This L3 document
@@ -40,8 +38,8 @@ that worker model.
 **Steps**
 
 1. HTTP facade listener readiness is necessary but not sufficient for trusted exposure.
-2. app evaluates `observation_eligible` from the same managed-state-sdk observation evaluator and package-local materialized observation evidence that feeds query `observation_status`: initial-audit completion on active scan-enabled primary groups, materialized degraded/overflow status, and stale-writer fencing evidence.
-3. the worker-facing runtime wrapper now lowers runtime loading through `RuntimeLoadedServiceApp::from_runtime_config(...)` plus `AppBuilder` wiring, while `capanix-managed-state-sdk` remains limited to declaration/evaluator helpers rather than owning a separate wrapper host.
+2. app evaluates `observation_eligible` from the same package-local observation evaluator and materialized observation evidence that feeds query `observation_status`: initial-audit completion on active scan-enabled primary groups, materialized degraded/overflow status, and stale-writer fencing evidence.
+3. the worker-facing runtime wrapper lowers runtime loading through the bounded app/runtime entry surface; exact helper API names and wrapper composition remain implementation detail as long as the observation evaluator stays app-owned.
 4. package-local status/health surfaces expose the materialized readiness evidence through source coverage and audit timing plus sink `initial_audit_completed` and `overflow_pending_audit`; these signals support cutover diagnostics but do not become a competing truth source.
 5. when facade activation remains pending because runtime exposure proof is still outstanding or listener spawn is retrying, package-local status/health surfaces also expose optional `facade.pending` diagnostics so operators can distinguish cutover waiting from generic host-boundary liveness.
 6. runtime consumes generation/bind/route proof to decide which active facade unit owns the resource-scoped one-cardinality HTTP facade, while the app uses `observation_eligible` to decide when `trusted-materialized` `/tree` and `/stats` may answer as current observation.
@@ -63,6 +61,6 @@ that worker model.
 1. product-facing failure domains are expressed only as `embedded` versus `external` workers.
 2. the current baseline keeps `facade-worker=embedded`, `source-worker=external`, and `sink-worker=external`.
 3. realization details such as artifact bootstrap, loader handoff, or runtime bridge wiring remain internal and do not redefine worker roles.
-4. runtime-managed worker realization consumes compiled `__cnx_runtime.workers` bindings rather than raw app-owned `config.workers` parsing during app load.
+4. runtime-managed worker realization consumes compiled runtime worker bindings rather than raw realization-specific startup fields during app load.
 5. constructor/bootstrap faults return typed `CnxError` or `init_error` before the app claims healthy external exposure.
 6. API bootstrap, embedded projection bootstrap, and worker/bootstrap faults stay on explicit error/log paths rather than routine `expect!`/panic control flow, and runtime task join failures are reported as typed app errors.

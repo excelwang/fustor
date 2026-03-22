@@ -1144,16 +1144,16 @@ fn test_runtime_support_transport_supervision_contracts() {
         read_capanix_repo_file("crates/worker-runtime-support/specs/L2-ARCHITECTURE.md");
 
     assert!(l2.contains(
-        "helper-only upstream worker support beneath `capanix-runtime-entry-sdk` owns worker bootstrap"
+        "Worker bootstrap, lifecycle supervision, and transport classification remain below the business-module boundary"
     ));
     assert!(l2.contains("MUST preserve canonical `Timeout` / `TransportClosed` categories plus wall-clock timeout clipping"));
     assert!(l3.contains("ExternalWorkerBootstrapTransport"));
     assert!(l3.contains("ExternalWorkerRetryAndErrorClassification"));
-    assert!(l3.contains("worker has accepted the platform-owned bootstrap envelope handshake"));
-    assert!(l3.contains("`Init` / `Start` / `Ping` / `Close`"));
+    assert!(l3.contains("required platform-owned handshake finishes"));
+    assert!(l3.contains("platform-owned worker-control handshake"));
     assert!(l3.contains("app-owned `OnControlFrame` remains a normal typed worker RPC"));
     assert!(l3.contains("transport failures remain transport-classified `CnxError`"));
-    assert!(l3.contains("absolute wall-clock deadline from `total_timeout`"));
+    assert!(l3.contains("absolute wall-clock deadline from the configured total timeout"));
     assert!(!l3.contains("absolute worker control/data socket paths"));
     assert!(!l3.contains("--worker-control-socket"));
     assert!(!l3.contains("--worker-data-socket"));
@@ -1178,9 +1178,9 @@ fn test_source_side_scan_unit_bootstrap_contract() {
     assert!(l2.contains(
         "`source-worker` and `sink-worker` remain the two operator-visible external worker roles"
     ));
-    assert!(l2.contains("shared `fs-meta/app` worker module"));
+    assert!(l2.contains("shared fs-meta worker runtime surface"));
     assert!(l3.contains("SharedWorkerModuleRoleDispatch"));
-    assert!(l3.contains("the shared worker module dispatches `worker_role`"));
+    assert!(l3.contains("the shared worker surface dispatches the requested role"));
     assert!(l3.contains(
         "`runtime.exec.scan` remains a source-side unit and reuses the `source-worker` server/runtime surface"
     ));

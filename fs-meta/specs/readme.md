@@ -7,11 +7,18 @@
 1. [L0-GLOSSARY.md](./L0-GLOSSARY.md)：术语边界。
 2. [L0-VISION.md](./L0-VISION.md)：产品目标、app/cli 边界与演化方向。
 3. [L1-CONTRACTS.md](./L1-CONTRACTS.md)：黑盒契约、app package 合约、cli/tooling 合约。
-4. [L2-ARCHITECTURE.md](./L2-ARCHITECTURE.md)：域架构、app package 分层、cli/tooling 边界、repo/specs 布局规则。
+4. [L2-ARCHITECTURE.md](./L2-ARCHITECTURE.md)：域架构、app package 分层、cli/tooling 边界与 formal ownership 约束。
 5. [L3-RUNTIME/API_HTTP.md](./L3-RUNTIME/API_HTTP.md)：当前 fs-meta 管理 API。
 6. [L3-RUNTIME/WORKFLOWS.md](./L3-RUNTIME/WORKFLOWS.md)：部署、登录、grants、roots、rescan 工作流。
 7. [L3-RUNTIME/OBSERVATION_CUTOVER.md](./L3-RUNTIME/OBSERVATION_CUTOVER.md)：cutover / observation eligibility / stale fencing 运行时流程。
 8. [L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md](./L3-RUNTIME/WORKER_RUNTIME_SUPPORT.md)：worker bootstrap / transport supervision / source-side scan unit realization。
+
+## Traceability Conventions
+
+1. L0 条目使用 canonical item ref：`VISION.<SECTION>.<ITEM>`。
+2. L1 条目使用 canonical item ref：`CONTRACTS.<SECTION>.<ITEM>`。
+3. `Covers L0:` 是 L1 到 L0 的 authoritative item-level traceability edge；section 级 `Traces to:` 仅作摘要，不替代 item-level 对齐。迁移期允许在同一 `Covers L0:` 行中同时保留 legacy short alias（`VISION.<ITEM>`）与 canonical full ref（`VISION.<SECTION>.<ITEM>`）以兼容现有 validator/tests。
+4. L2/L3 可以在语义上确有必要时提及上游 boundary family 或 runtime seam；完整 repo/package/dependency 治理规则仍属于工程治理材料。
 
 ## 非规格材料位置
 
