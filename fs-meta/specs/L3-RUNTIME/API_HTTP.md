@@ -213,7 +213,7 @@ GET /bound-route-metrics  -> BoundRouteMetricsResponse
 ## [decision] ProductConfigSurfaceSplit
 
 1. deploy-time product config is thin bootstrap config (`api/auth`) only.
-2. fs-meta consumes shared `capanix-config` / daemon / runtime config and intent boundaries for config loading, manifest discovery, and relation-target compilation; the product API does not redefine those platform-owned semantics.
+2. fs-meta consumes shared upstream config-loading, daemon/bootstrap, and runtime intent boundaries for config loading, manifest discovery, and relation-target compilation; the product API does not redefine those platform-owned semantics.
 3. runtime grants plus monitoring-roots APIs own online business monitoring scope.
 4. query-shaping knobs stay on query-path parameters (`path/pit_id/group_order/group_page_size/group_after/entry_page_size/entry_after/recursive/read_class`), not in deploy bootstrap config.
 5. internal desired-state/runtime policy fields are generated deployment details, not operator business parameters.

@@ -264,7 +264,7 @@ version: 3.0.0
    > Covers L0: VISION.EVOLUTION_AND_OPERATIONS.PRODUCT_CONFIGURATION_SPLIT
    > Responsibility: prevent operators from editing internal desired-state/runtime policy details as business configuration.
    > Verification: product deployment docs keep `fs-meta.yaml` limited to bootstrap API/auth concerns; deploy defaults to `roots=[]`; operators configure monitoring roots through `/runtime/grants`, `/monitoring/roots/preview`, and `/monitoring/roots`.
-   > Verification: fs-meta consumes shared `capanix-config` manifest/config and intent-compilation semantics through upstream deploy/runtime boundaries rather than redefining path precedence, manifest discovery, or relation-target meaning inside fs-meta specs.
+   > Verification: fs-meta consumes shared manifest/config loading and intent-compilation semantics through upstream deploy/runtime boundaries rather than redefining path precedence, manifest discovery, or relation-target meaning inside fs-meta specs.
 4. **RELEASE_GENERATION_CUTOVER**: **fs-meta System** MUST realize upgrades as higher-target-generation replacement on one fs-meta app boundary while preserving the product API base and replaying current monitoring roots/runtime grants into the new generation.
    > Covers L0: VISION.EVOLUTION_AND_OPERATIONS.RELEASE_GENERATION_UPGRADE
    > Responsibility: make binary upgrades explicit at the app package boundary while keeping authoritative truth replay and externally visible observations separate.
@@ -326,7 +326,7 @@ version: 3.0.0
 1. **FS_META_HTTP_API_BOUNDARY**: **fs-meta System** MUST expose fs-meta-domain management/observability HTTP API under one bounded resource-scoped namespace and keep API implementation inside fs-meta app module.
    > Covers L0: VISION.API_BOUNDARY.BOUNDED_PRODUCT_MANAGEMENT_NAMESPACE
    > Responsibility: keep external HTTP ingress owned by fs-meta domain/app package boundary without introducing runtime/daemon semantic coupling.
-   > Verification: fs-meta app starts HTTP API from `fs-meta/app/src/api/*`; request handlers operate through fs-meta source/sink abstractions; API auth-init/bind failure causes explicit app startup failure.
+   > Verification: fs-meta app starts the HTTP API from app-owned API ingress modules; request handlers operate through fs-meta source/sink abstractions; API auth-init/bind failure causes explicit app startup failure.
 
 2. **RESOURCE_SCOPED_DOMAIN_HTTP_FACADE**: **fs-meta System** MUST keep the public HTTP facade as a resource-scoped one-cardinality domain facade owned by fs-meta app package boundary rather than by kernel/runtime semantic layers.
    > Covers L0: VISION.QUERY_OUTCOME.RESOURCE_SCOPED_DOMAIN_HTTP_FACADE
@@ -471,7 +471,7 @@ version: 3.0.0
    > Covers L0: VISION.CLI_SCOPE.NO_RUNTIME_OR_PLATFORM_OWNERSHIP
 7. **NO_OBSERVATION_PLANE_OWNERSHIP**: **fs-meta System** MUST keep `state/effect observation plane` meaning such as `observation_eligible` out of the CLI package.
    > Covers L0: VISION.CLI_SCOPE.NO_OBSERVATION_PLANE_OWNERSHIP
-8. **LOCAL_DEV_DAEMON_COMPOSITION_ONLY**: An optional tooling-only local-dev launcher MAY ship the product-scoped `fsmeta-locald` binary as an explicit feature, but that launcher MUST remain tooling-only composition over `capanix-daemon` bootstrap seams and MUST NOT redefine daemon ingress, runtime planning, or kernel authority.
+8. **LOCAL_DEV_DAEMON_COMPOSITION_ONLY**: An optional tooling-only local-dev launcher MAY ship as an explicit feature, but that launcher MUST remain tooling-only composition over upstream daemon bootstrap seams and MUST NOT redefine daemon ingress, runtime planning, or kernel authority.
    > Covers L0: VISION.CLI_SCOPE.LOCAL_DEV_DAEMON_COMPOSITION_ONLY
 
 ---

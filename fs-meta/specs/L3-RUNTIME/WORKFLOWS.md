@@ -50,7 +50,7 @@ version: 3.0.0
 **Steps**
 
 1. source 读取 app config 中的 group/roots 逻辑声明。
-2. source 读取 `__cnx_runtime.host_object_grants`，其中每个 `mount-root` object 带 `object_ref`、`host_ref`、`host_ip`、`mount_point`、`fs_source`、`fs_type` 等 descriptors。
+2. source 读取 runtime 注入的 host-object grants，其中每个 `mount-root` object 带 `object_ref`、`host_ref`、`host_ip`、`mount_point`、`fs_source`、`fs_type` 等 descriptors。
 3. app 仅使用 descriptors + 管理配置形成 groups，不依赖 runtime 解释路径或节点含义。
 4. app 可使用 host descriptor selectors（例如 `host_ip`、`host_name`、`site/zone`）与 object descriptors（例如 `mount_point`、`fs_source`、`fs_type`）决定分组。
 5. on runtime grants-changed control event，source 按版本号执行在线增量重收敛（新增 object 启动新的本地执行分区，移除 object 有界回收旧分区），并触发定向重扫。
@@ -320,7 +320,7 @@ fn delete_aware_aggregate(records: &[FileMetaRecord]) -> Vec<FsMetaQueryNode>
 **Steps**
 
 1. operator runs `fsmeta deploy` with thin deploy config covering bootstrap API/auth concerns only.
-2. deploy helper consumes shared `capanix-config` config-loading, manifest-discovery, and intent-compilation semantics, then generates internal release desired-state material, runtime subscriptions, execution-shape material, and startup material without exposing those details as product knobs.
+2. deploy helper consumes shared upstream config-loading, manifest-discovery, and intent-compilation semantics, then generates internal release desired-state material, runtime subscriptions, execution-shape material, and startup material without exposing those details as product knobs.
 3. deployed service starts validly with `roots=[]`.
 4. operator discovers runtime grants, previews monitoring roots, and applies online business monitoring scope through bounded product APIs.
 5. manual rescan remains an explicit repair action instead of being folded into deploy-time bootstrap config.
