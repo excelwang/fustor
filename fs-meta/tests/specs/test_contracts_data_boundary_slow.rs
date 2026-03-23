@@ -371,7 +371,7 @@ async fn test_source_snapshot_commits_into_sink_query_shape() {
     .expect("inject source-origin snapshot event");
     let deadline = Instant::now() + Duration::from_secs(25);
     let node = loop {
-        if let Some(node) = app.query_node(b"/alpha.txt").unwrap() {
+        if let Some(node) = app.query_node(b"/alpha.txt").await.unwrap() {
             break node;
         }
         if Instant::now() >= deadline {
@@ -411,8 +411,8 @@ async fn test_sink_shadow_clock_tracks_source_event_timestamps() {
     .expect("inject source-origin events");
     let node_deadline = Instant::now() + Duration::from_secs(25);
     loop {
-        let one = app.query_node(b"/one.txt").unwrap();
-        let two = app.query_node(b"/two.txt").unwrap();
+        let one = app.query_node(b"/one.txt").await.unwrap();
+        let two = app.query_node(b"/two.txt").await.unwrap();
         if one.is_some() && two.is_some() {
             break;
         }
@@ -491,8 +491,8 @@ async fn test_reference_domain_slice_connectivity_fs_meta() {
     .expect("inject source-origin slice events");
     let deadline = Instant::now() + Duration::from_secs(25);
     let (slice_a, slice_b): (QueryNode, QueryNode) = loop {
-        let slice_a = app.query_node(b"/slice-a.txt").unwrap();
-        let slice_b = app.query_node(b"/slice-b.txt").unwrap();
+        let slice_a = app.query_node(b"/slice-a.txt").await.unwrap();
+        let slice_b = app.query_node(b"/slice-b.txt").await.unwrap();
         if let (Some(a), Some(b)) = (slice_a, slice_b) {
             break (a, b);
         }

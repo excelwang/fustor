@@ -377,19 +377,25 @@ struct SinkStateCell {
 }
 
 impl SinkStateCell {
-    fn new(source_cfg: &SourceConfig, commit_boundary: CommitBoundary) -> Self {
+    fn new(
+        source_cfg: &SourceConfig,
+        commit_boundary: CommitBoundary,
+        record_bootstrap: bool,
+    ) -> Self {
         let cell = Self {
             inner: Arc::new(RwLock::new(SinkState::new(source_cfg))),
             commit_boundary,
         };
-        cell.record_authoritative_commit(
-            "sink.bootstrap",
-            format!(
-                "roots={} exports={}",
-                source_cfg.roots.len(),
-                source_cfg.host_object_grants.len()
-            ),
-        );
+        if record_bootstrap {
+            cell.record_authoritative_commit(
+                "sink.bootstrap",
+                format!(
+                    "roots={} exports={}",
+                    source_cfg.roots.len(),
+                    source_cfg.host_object_grants.len()
+                ),
+            );
+        }
         cell
     }
 
@@ -459,18 +465,34 @@ impl SinkFileMeta {
         Self::with_boundaries_and_state_inner(node_id, boundary, state_boundary, source_cfg, false)
     }
 
+    pub(crate) fn with_boundaries_and_state_deferred_authority(
+        node_id: NodeId,
+        boundary: Option<Arc<dyn ChannelIoSubset>>,
+        state_boundary: Arc<dyn StateBoundary>,
+        source_cfg: SourceConfig,
+    ) -> Result<Self> {
+        Self::with_boundaries_and_state_inner(node_id, boundary, state_boundary, source_cfg, true)
+    }
+
     fn with_boundaries_and_state_inner(
         node_id: NodeId,
         boundary: Option<Arc<dyn ChannelIoSubset>>,
         state_boundary: Arc<dyn StateBoundary>,
         source_cfg: SourceConfig,
-        _defer_authority_read: bool,
+        defer_authority_read: bool,
     ) -> Result<Self> {
-        let authority = AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary)
-            .map_err(|err| {
-                CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
-            })?;
-        let state = SinkStateCell::new(&source_cfg, CommitBoundary::new(authority));
+        let authority = if defer_authority_read {
+            AuthorityJournal::deferred(SINK_RUNTIME_UNIT_ID, state_boundary)
+        } else {
+            AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary).map_err(
+                |err| {
+                    CnxError::InvalidInput(format!(
+                        "sink statecell authority init failed: {err}"
+                    ))
+                },
+            )?
+        };
+        let state = SinkStateCell::new(&source_cfg, CommitBoundary::new(authority), !defer_authority_read);
         let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
         let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
         let visibility_lag = Arc::new(Mutex::new(VisibilityLagTelemetry::default()));

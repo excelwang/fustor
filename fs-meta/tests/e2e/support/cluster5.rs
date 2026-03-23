@@ -91,10 +91,6 @@ fn classify_apply_release_retry(err: &str) -> Option<&'static str> {
         Some("tx_busy")
     } else if err.contains("relation-target replication quorum not reached") {
         Some("quorum")
-    } else if err.contains("\"category\": \"transport\"")
-        || err.contains("\"category\":\"transport\"")
-    {
-        Some("transport")
     } else {
         None
     }

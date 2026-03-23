@@ -417,6 +417,10 @@ impl FSMetaApp {
     }
 
     async fn initialize_from_control(&self) -> Result<()> {
+        eprintln!(
+            "fs_meta_runtime_app: initialize_from_control begin initialized={}",
+            self.control_initialized()
+        );
         if self.control_initialized() {
             return Ok(());
         }
@@ -431,19 +435,26 @@ impl FSMetaApp {
         }
 
         if !self.sink.is_worker() {
+            eprintln!("fs_meta_runtime_app: initialize_from_control sink.ensure_started begin");
             self.sink.ensure_started().await?;
+            eprintln!("fs_meta_runtime_app: initialize_from_control sink.ensure_started ok");
         }
         let mut guard = self.pump_task.lock().await;
         if guard.is_none() {
+            eprintln!("fs_meta_runtime_app: initialize_from_control source.start begin");
             *guard = self
                 .source
                 .start(self.sink.clone(), self.runtime_boundary.clone())
                 .await?;
+            eprintln!("fs_meta_runtime_app: initialize_from_control source.start ok");
         }
         drop(guard);
 
+        eprintln!("fs_meta_runtime_app: initialize_from_control endpoints begin");
         self.ensure_runtime_proxy_endpoints_started().await?;
+        eprintln!("fs_meta_runtime_app: initialize_from_control endpoints ok");
         self.control_initialized.store(true, Ordering::Release);
+        eprintln!("fs_meta_runtime_app: initialize_from_control done");
 
         Ok(())
     }
@@ -1480,6 +1491,13 @@ impl FSMetaApp {
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
+        eprintln!(
+            "fs_meta_runtime_app: on_control_frame begin source_signals={} sink_signals={} facade_signals={} initialized={}",
+            source_signals.len(),
+            sink_signals.len(),
+            facade_signals.len(),
+            self.control_initialized()
+        );
         if Self::should_initialize_from_control(&source_signals, &sink_signals, &facade_signals) {
             self.initialize_from_control().await?;
         } else if !self.control_initialized() {
@@ -1552,14 +1570,19 @@ impl FSMetaApp {
             }
         }
         if !source_signals.is_empty() {
+            eprintln!("fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals begin");
             self.source
                 .apply_orchestration_signals(&source_signals)
                 .await?;
+            eprintln!("fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals ok");
         }
         if !sink_signals.is_empty() {
+            eprintln!("fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals begin");
             self.sink.apply_orchestration_signals(&sink_signals).await?;
+            eprintln!("fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok");
         }
         self.ensure_runtime_proxy_endpoints_started().await?;
+        eprintln!("fs_meta_runtime_app: on_control_frame done");
         Ok(())
     }
 
@@ -1623,20 +1646,20 @@ impl FSMetaApp {
         Ok(agg)
     }
 
-    pub fn source_status_snapshot(&self) -> Result<crate::source::SourceStatusSnapshot> {
-        block_on_shared_runtime(self.source.status_snapshot())
+    pub async fn source_status_snapshot(&self) -> Result<crate::source::SourceStatusSnapshot> {
+        self.source.status_snapshot().await
     }
 
-    pub fn sink_status_snapshot(&self) -> Result<crate::sink::SinkStatusSnapshot> {
-        block_on_shared_runtime(self.sink.status_snapshot())
+    pub async fn sink_status_snapshot(&self) -> Result<crate::sink::SinkStatusSnapshot> {
+        self.sink.status_snapshot().await
     }
 
     pub async fn trigger_rescan_when_ready(&self) -> Result<()> {
         self.source.trigger_rescan_when_ready().await
     }
 
-    pub fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
-        block_on_shared_runtime(self.sink.query_node(path))
+    pub async fn query_node(&self, path: &[u8]) -> Result<Option<QueryNode>> {
+        self.sink.query_node(path).await
     }
 }
 

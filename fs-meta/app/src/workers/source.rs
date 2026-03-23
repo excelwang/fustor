@@ -126,7 +126,17 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn start(&self) -> Result<()> {
+        eprintln!(
+            "fs_meta_source_worker_client: ensure_started begin node={}",
+            self.node_id.0
+        );
         self.worker.ensure_started().await
+            .map(|_| {
+                eprintln!(
+                    "fs_meta_source_worker_client: ensure_started ok node={}",
+                    self.node_id.0
+                );
+            })
     }
 
     pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
@@ -485,8 +495,13 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
+        eprintln!(
+            "fs_meta_source_worker_client: on_control_frame begin node={} envelopes={}",
+            self.node_id.0,
+            envelopes.len()
+        );
         self.start().await?;
-        match Self::call_worker(
+        let result = match Self::call_worker(
             &self.client().await?,
             SourceWorkerRequest::OnControlFrame { envelopes },
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
@@ -498,7 +513,13 @@ impl SourceWorkerClientHandle {
                 "unexpected source worker response for on_control_frame: {:?}",
                 other
             ))),
-        }
+        };
+        eprintln!(
+            "fs_meta_source_worker_client: on_control_frame done node={} ok={}",
+            self.node_id.0,
+            result.is_ok()
+        );
+        result
     }
 
     pub async fn trigger_rescan_when_ready(&self) -> Result<()> {
@@ -799,7 +820,7 @@ impl SourceFacade {
 
     pub async fn publish_manual_rescan_signal(&self) -> Result<()> {
         match self {
-            Self::Local(source) => source.publish_manual_rescan_signal(),
+            Self::Local(source) => source.publish_manual_rescan_signal().await,
             Self::Worker(client) => client.publish_manual_rescan_signal().await,
         }
     }

@@ -80,12 +80,38 @@ fn is_statecell_not_found(err: &CnxError) -> bool {
     }
 }
 
+fn statecell_read_blocking(
+    state_boundary: &Arc<dyn StateBoundary>,
+    scope: &str,
+    request: StateCellReadRequest,
+) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope, CnxError> {
+    crate::runtime_app::block_on_shared_runtime(
+        state_boundary.statecell_read(local_state_boundary_bridge(scope), request),
+    )
+}
+
+fn statecell_write_blocking(
+    state_boundary: &Arc<dyn StateBoundary>,
+    scope: &str,
+    request: StateCellWriteRequest,
+) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope, CnxError> {
+    crate::runtime_app::block_on_shared_runtime(
+        state_boundary.statecell_write(local_state_boundary_bridge(scope), request),
+    )
+}
+
 #[derive(Clone)]
 pub(crate) struct AuthorityJournal {
     scope: Arc<str>,
     handle: StateCellHandle,
     state_boundary: Arc<dyn StateBoundary>,
-    state: Arc<Mutex<AuthoritySnapshot>>,
+    state: Arc<Mutex<AuthorityJournalState>>,
+}
+
+#[derive(Clone)]
+struct AuthorityJournalState {
+    loaded: bool,
+    snapshot: AuthoritySnapshot,
 }
 
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -142,8 +168,9 @@ impl SignalCell {
         state_boundary: Arc<dyn StateBoundary>,
     ) -> std::io::Result<Self> {
         let handle = signal_handle(scope, signal);
-        let loaded = match state_boundary.statecell_read(
-            local_state_boundary_bridge(scope),
+        let loaded = match statecell_read_blocking(
+            &state_boundary,
+            scope,
             StateCellReadRequest {
                 handle: handle.clone(),
             },
@@ -200,7 +227,7 @@ impl SignalCell {
         }
     }
 
-    pub(crate) fn emit(&self, requested_by: &str) -> Result<u64, CnxError> {
+    pub(crate) async fn emit(&self, requested_by: &str) -> Result<u64, CnxError> {
         let (payload, seq) = {
             let mut state = self
                 .state
@@ -214,14 +241,17 @@ impl SignalCell {
             })?;
             (payload, state.seq)
         };
-        let result = self.state_boundary.statecell_write(
-            local_state_boundary_bridge(&self.scope),
-            StateCellWriteRequest {
-                handle: self.handle.clone(),
-                payload,
-                lease_epoch: Some(seq),
-            },
-        )?;
+        let result = self
+            .state_boundary
+            .statecell_write(
+                local_state_boundary_bridge(&self.scope),
+                StateCellWriteRequest {
+                    handle: self.handle.clone(),
+                    payload,
+                    lease_epoch: Some(seq),
+                },
+            )
+            .await?;
         if result.status != "committed" && result.status != "ok" {
             return Err(CnxError::Internal(format!(
                 "statecell_write returned non-committed status for signal={} scope={}: {}",
@@ -231,17 +261,21 @@ impl SignalCell {
         Ok(seq)
     }
 
-    pub(crate) fn watch_since(
+    pub(crate) async fn watch_since(
         &self,
         from_offset: u64,
     ) -> Result<(u64, Vec<SignalEvent>), CnxError> {
-        let response = match self.state_boundary.statecell_watch(
-            local_state_boundary_bridge(&self.scope),
-            StateCellWatchRequest {
-                handle: self.handle.clone(),
-                from_offset: Some(from_offset),
-            },
-        ) {
+        let response = match self
+            .state_boundary
+            .statecell_watch(
+                local_state_boundary_bridge(&self.scope),
+                StateCellWatchRequest {
+                    handle: self.handle.clone(),
+                    from_offset: Some(from_offset),
+                },
+            )
+            .await
+        {
             Ok(response) => response,
             Err(err) if is_statecell_not_found(&err) => return Ok((from_offset, Vec::new())),
             Err(err) => return Err(err),
@@ -277,13 +311,14 @@ impl SignalCell {
 }
 
 impl AuthorityJournal {
-    pub(crate) fn from_state_boundary(
+    fn load_snapshot(
         scope: &str,
-        state_boundary: Arc<dyn StateBoundary>,
-    ) -> std::io::Result<Self> {
-        let handle = authority_handle(scope);
-        let loaded = match state_boundary.statecell_read(
-            local_state_boundary_bridge(scope),
+        handle: &StateCellHandle,
+        state_boundary: &Arc<dyn StateBoundary>,
+    ) -> std::io::Result<AuthoritySnapshot> {
+        match statecell_read_blocking(
+            state_boundary,
+            scope,
             StateCellReadRequest {
                 handle: handle.clone(),
             },
@@ -296,7 +331,7 @@ impl AuthorityJournal {
                     )));
                 }
                 if resp.payload.is_empty() {
-                    AuthoritySnapshot::empty(scope)
+                    Ok(AuthoritySnapshot::empty(scope))
                 } else {
                     let mut decoded: AuthoritySnapshot = rmp_serde::from_slice(&resp.payload)
                         .map_err(|err| {
@@ -318,25 +353,85 @@ impl AuthorityJournal {
                     if let Some(last) = decoded.entries.back() {
                         decoded.next_seq = decoded.next_seq.max(last.seq);
                     }
-                    decoded
+                    Ok(decoded)
                 }
             }
-            Err(err) if is_statecell_not_found(&err) => AuthoritySnapshot::empty(scope),
-            Err(err) => {
-                return Err(std::io::Error::other(format!(
-                    "statecell_read failed for scope={scope}: {err}"
-                )));
-            }
-        };
+            Err(err) if is_statecell_not_found(&err) => Ok(AuthoritySnapshot::empty(scope)),
+            Err(err) => Err(std::io::Error::other(format!(
+                "statecell_read failed for scope={scope}: {err}"
+            ))),
+        }
+    }
+
+    pub(crate) fn from_state_boundary(
+        scope: &str,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> std::io::Result<Self> {
+        let handle = authority_handle(scope);
+        let loaded = Self::load_snapshot(scope, &handle, &state_boundary)?;
         Ok(Self {
             scope: Arc::<str>::from(scope),
             handle,
             state_boundary,
-            state: Arc::new(Mutex::new(loaded)),
+            state: Arc::new(Mutex::new(AuthorityJournalState {
+                loaded: true,
+                snapshot: loaded,
+            })),
         })
     }
 
+    pub(crate) fn deferred(scope: &str, state_boundary: Arc<dyn StateBoundary>) -> Self {
+        let handle = authority_handle(scope);
+        Self {
+            scope: Arc::<str>::from(scope),
+            handle,
+            state_boundary,
+            state: Arc::new(Mutex::new(AuthorityJournalState {
+                loaded: false,
+                snapshot: AuthoritySnapshot::empty(scope),
+            })),
+        }
+    }
+
+    fn ensure_loaded(&self) {
+        let needs_load = match self.state.lock() {
+            Ok(state) => !state.loaded,
+            Err(poisoned) => !poisoned.into_inner().loaded,
+        };
+        if !needs_load {
+            return;
+        }
+        let loaded = Self::load_snapshot(&self.scope, &self.handle, &self.state_boundary);
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                log::warn!(
+                    "state-cell authority state lock poisoned during lazy load for scope={}; recovering",
+                    self.scope
+                );
+                poisoned.into_inner()
+            }
+        };
+        if state.loaded {
+            return;
+        }
+        match loaded {
+            Ok(snapshot) => {
+                state.snapshot = snapshot;
+            }
+            Err(err) => {
+                log::warn!(
+                    "state-cell authority lazy load failed for scope={}: {}",
+                    self.scope,
+                    err
+                );
+            }
+        }
+        state.loaded = true;
+    }
+
     pub(crate) fn append(&self, op: &str, detail: String) {
+        self.ensure_loaded();
         let (payload, lease_epoch) = {
             let mut state = match self.state.lock() {
                 Ok(guard) => guard,
@@ -348,17 +443,17 @@ impl AuthorityJournal {
                     poisoned.into_inner()
                 }
             };
-            state.next_seq = state.next_seq.wrapping_add(1);
+            state.snapshot.next_seq = state.snapshot.next_seq.wrapping_add(1);
             let entry = AuthorityEntry {
-                seq: state.next_seq,
+                seq: state.snapshot.next_seq,
                 scope: self.scope.to_string(),
                 op: op.to_string(),
                 detail,
                 committed_at_us: now_us(),
             };
-            state.entries.push_back(entry);
-            state.trim_tail();
-            let payload = match rmp_serde::to_vec_named(&*state) {
+            state.snapshot.entries.push_back(entry);
+            state.snapshot.trim_tail();
+            let payload = match rmp_serde::to_vec_named(&state.snapshot) {
                 Ok(bytes) => bytes,
                 Err(err) => {
                     log::warn!(
@@ -368,10 +463,11 @@ impl AuthorityJournal {
                     return;
                 }
             };
-            (payload, Some(state.next_seq))
+            (payload, Some(state.snapshot.next_seq))
         };
-        match self.state_boundary.statecell_write(
-            local_state_boundary_bridge(&self.scope),
+        match statecell_write_blocking(
+            &self.state_boundary,
+            &self.scope,
             StateCellWriteRequest {
                 handle: self.handle.clone(),
                 payload,
@@ -400,8 +496,8 @@ impl AuthorityJournal {
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         match self.state.lock() {
-            Ok(state) => state.entries.len(),
-            Err(poisoned) => poisoned.into_inner().entries.len(),
+            Ok(state) => state.snapshot.entries.len(),
+            Err(poisoned) => poisoned.into_inner().snapshot.entries.len(),
         }
     }
 }
@@ -409,10 +505,48 @@ impl AuthorityJournal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct UnsupportedBoundary;
 
     impl StateBoundary for UnsupportedBoundary {}
+
+    #[derive(Default)]
+    struct CountingBoundary {
+        reads: AtomicUsize,
+        writes: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl StateBoundary for CountingBoundary {
+        async fn statecell_read(
+            &self,
+            _ctx: BoundaryContext,
+            _request: StateCellReadRequest,
+        ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope, CnxError> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(capanix_app_sdk::runtime::KernelResultEnvelope {
+                correlation_id: None,
+                status: "ok".to_string(),
+                payload: Vec::new(),
+                diagnostics: None,
+            })
+        }
+
+        async fn statecell_write(
+            &self,
+            _ctx: BoundaryContext,
+            _request: StateCellWriteRequest,
+        ) -> Result<capanix_app_sdk::runtime::KernelResultEnvelope, CnxError> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            Ok(capanix_app_sdk::runtime::KernelResultEnvelope {
+                correlation_id: None,
+                status: "committed".to_string(),
+                payload: Vec::new(),
+                diagnostics: None,
+            })
+        }
+    }
 
     fn authoritative_handle(scope: &str) -> StateCellHandle {
         authority_handle(scope)
@@ -445,15 +579,14 @@ mod tests {
             entries: VecDeque::new(),
         })
         .expect("encode");
-        boundary
-            .statecell_write(
-                BoundaryContext::default(),
-                StateCellWriteRequest {
-                    handle,
-                    payload: bad_payload,
-                    lease_epoch: Some(1),
-                },
-            )
+        crate::runtime_app::block_on_shared_runtime(boundary.statecell_write(
+            BoundaryContext::default(),
+            StateCellWriteRequest {
+                handle,
+                payload: bad_payload,
+                lease_epoch: Some(1),
+            },
+        ))
             .expect("seed payload");
 
         let err = match AuthorityJournal::from_state_boundary("runtime.exec.source", boundary) {
@@ -481,5 +614,18 @@ mod tests {
                 .contains("statecell_read failed for scope=runtime.exec.source"),
             "unexpected authority init error: {err}"
         );
+    }
+
+    #[test]
+    fn deferred_authority_journal_defers_state_reads_until_first_append() {
+        let boundary = Arc::new(CountingBoundary::default());
+        let journal = AuthorityJournal::deferred("runtime.exec.sink", boundary.clone());
+        assert_eq!(boundary.reads.load(Ordering::Relaxed), 0);
+        assert_eq!(boundary.writes.load(Ordering::Relaxed), 0);
+
+        journal.append("sink.bootstrap", "roots=1 exports=1".to_string());
+
+        assert_eq!(boundary.reads.load(Ordering::Relaxed), 1);
+        assert_eq!(boundary.writes.load(Ordering::Relaxed), 1);
     }
 }

@@ -31,6 +31,7 @@ where
 struct SinkWorkerState {
     sink: Option<Arc<SinkFileMeta>>,
     node_id: Option<NodeId>,
+    pending_init: Option<(NodeId, SinkWorkerInitConfig)>,
     endpoints_started: bool,
     send_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Event>>>,
 }
@@ -46,23 +47,29 @@ fn bootstrap_not_ready() -> CnxError {
     CnxError::NotReady("worker not initialized".into())
 }
 
+async fn stop_sink_runtime(state: &mut SinkWorkerState) {
+    bootstrap_stop_sink_runtime(state).await;
+    state.pending_init = None;
+}
+
 fn bootstrap_init_sink_runtime(
     node_id: NodeId,
     config: SinkWorkerInitConfig,
     state: &mut SinkWorkerState,
-    state_boundary: Arc<dyn StateBoundary>,
+    runtime: &tokio::runtime::Handle,
 ) -> Result<(), CnxError> {
-    let mut source_cfg = SourceConfig::default();
-    source_cfg.roots = config.roots;
-    source_cfg.host_object_grants = config.host_object_grants;
-    source_cfg.sink_tombstone_ttl = Duration::from_millis(config.sink_tombstone_ttl_ms.max(1));
-    source_cfg.sink_tombstone_tolerance_us = config.sink_tombstone_tolerance_us;
-    let inner =
-        SinkFileMeta::with_boundaries_and_state(node_id.clone(), None, state_boundary, source_cfg)?;
-    state.sink = Some(Arc::new(inner));
+    eprintln!(
+        "fs_meta_sink_worker_server: bootstrap_init begin node={} roots={} grants={}",
+        node_id.0,
+        config.roots.len(),
+        config.host_object_grants.len()
+    );
+    let _ = block_on_runtime(runtime, stop_sink_runtime(state));
+    state.pending_init = Some((node_id.clone(), config));
     state.node_id = Some(node_id);
     state.endpoints_started = false;
     state.send_tx = None;
+    eprintln!("fs_meta_sink_worker_server: bootstrap_init ok");
     Ok(())
 }
 
@@ -70,16 +77,44 @@ fn bootstrap_start_sink_runtime(
     state: &mut SinkWorkerState,
     runtime: &tokio::runtime::Handle,
     io_boundary: Arc<dyn ChannelIoSubset>,
+    state_boundary: Arc<dyn StateBoundary>,
 ) -> Result<(), CnxError> {
     match state.sink.as_ref() {
         Some(_) if state.endpoints_started => Ok(()),
-        Some(sink) => {
+        Some(_) | None => {
+            if state.sink.is_none() {
+                let Some((node_id, config)) = state.pending_init.clone() else {
+                    return Err(bootstrap_not_ready());
+                };
+                let mut source_cfg = SourceConfig::default();
+                source_cfg.roots = config.roots;
+                source_cfg.host_object_grants = config.host_object_grants;
+                source_cfg.sink_tombstone_ttl =
+                    Duration::from_millis(config.sink_tombstone_ttl_ms.max(1));
+                source_cfg.sink_tombstone_tolerance_us = config.sink_tombstone_tolerance_us;
+                let inner = SinkFileMeta::with_boundaries_and_state_deferred_authority(
+                    node_id.clone(),
+                    None,
+                    state_boundary,
+                    source_cfg,
+                )?;
+                state.sink = Some(Arc::new(inner));
+            }
+            let Some(sink) = state.sink.as_ref() else {
+                return Err(bootstrap_not_ready());
+            };
             let Some(node_id) = state.node_id.clone() else {
                 return Err(CnxError::Internal(
                     "sink worker missing node_id during start".into(),
                 ));
             };
+            eprintln!(
+                "fs_meta_sink_worker_server: bootstrap_start begin node={} endpoints_started={}",
+                node_id.0,
+                state.endpoints_started
+            );
             sink.start_runtime_endpoints(io_boundary, node_id)?;
+            eprintln!("fs_meta_sink_worker_server: bootstrap_start endpoints ok");
             if state.send_tx.is_none() {
                 let (send_tx, mut send_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
                 let sink_for_send = sink.clone();
@@ -93,9 +128,9 @@ fn bootstrap_start_sink_runtime(
                 state.send_tx = Some(send_tx);
             }
             state.endpoints_started = true;
+            eprintln!("fs_meta_sink_worker_server: bootstrap_start ok");
             Ok(())
         }
-        None => Err(bootstrap_not_ready()),
     }
 }
 
@@ -259,6 +294,7 @@ pub fn run_sink_worker_server(
     let state = Arc::new(Mutex::new(SinkWorkerState {
         sink: None,
         node_id: None,
+        pending_init: None,
         endpoints_started: false,
         send_tx: None,
     }));
@@ -324,29 +360,49 @@ impl TypedWorkerBootstrapSession<SinkWorkerInitConfig> for SinkWorkerSession {
         payload: SinkWorkerInitConfig,
         context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<()> {
+        eprintln!(
+            "fs_meta_sink_worker_server: on_init node={} roots={} grants={}",
+            node_id.0,
+            payload.roots.len(),
+            payload.host_object_grants.len()
+        );
         let mut guard = self
             .state
             .lock()
             .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
-        bootstrap_init_sink_runtime(node_id, payload, &mut guard, context.state_boundary())
+        bootstrap_init_sink_runtime(node_id, payload, &mut guard, context.runtime_handle())
     }
 
     async fn on_start(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        eprintln!("fs_meta_sink_worker_server: on_start begin");
         let mut guard = self
             .state
             .lock()
             .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
-        bootstrap_start_sink_runtime(&mut guard, context.runtime_handle(), context.io_boundary())
+        let result = bootstrap_start_sink_runtime(
+            &mut guard,
+            context.runtime_handle(),
+            context.io_boundary(),
+            context.state_boundary(),
+        );
+        eprintln!(
+            "fs_meta_sink_worker_server: on_start done ok={}",
+            result.is_ok()
+        );
+        result
     }
 
     async fn on_ping(&mut self, _context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        eprintln!("fs_meta_sink_worker_server: on_ping begin");
         let guard = self
             .state
             .lock()
             .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
         if guard.sink.is_some() {
+            eprintln!("fs_meta_sink_worker_server: on_ping ok");
             Ok(())
         } else {
+            eprintln!("fs_meta_sink_worker_server: on_ping not_ready");
             Err(bootstrap_not_ready())
         }
     }
@@ -356,10 +412,7 @@ impl TypedWorkerBootstrapSession<SinkWorkerInitConfig> for SinkWorkerSession {
             .state
             .lock()
             .map_err(|_| CnxError::Internal("sink worker state lock poisoned".into()))?;
-        block_on_runtime(
-            context.runtime_handle(),
-            bootstrap_stop_sink_runtime(&mut guard),
-        );
+        block_on_runtime(context.runtime_handle(), stop_sink_runtime(&mut guard));
         Ok(())
     }
 }

@@ -188,8 +188,7 @@ fn bootstrap_start_source_runtime(
                 "source worker runtime missing during start".into(),
             ));
         };
-        source.start_runtime_endpoints(boundary.clone())?;
-        block_on_runtime(runtime, source.start_manual_rescan_watch())?;
+        block_on_runtime(runtime, source.start_runtime_endpoints(boundary.clone()))?;
         let source = source.clone();
         let stream = block_on_runtime(runtime, source.pub_())?;
         state.pump_task = Some(start_source_pump_with_stream(stream, boundary, runtime));
@@ -362,7 +361,7 @@ fn process_worker_request(
             }
         }
         SourceWorkerRequest::PublishManualRescanSignal => match state.source.as_ref() {
-            Some(source) => match source.publish_manual_rescan_signal() {
+            Some(source) => match block_on_runtime(runtime, source.publish_manual_rescan_signal()) {
                 Ok(()) => (SourceWorkerResponse::Ack, false),
                 Err(err) => (classify_source_worker_error(err), false),
             },

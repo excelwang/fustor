@@ -383,10 +383,12 @@ async fn wait_for_fixture_query_ready(app: &FSMetaApp) -> Result<(), Box<dyn std
         iteration += 1;
         let source_ready = app
             .source_status_snapshot()
+            .await
             .map(|status| !status.concrete_roots.is_empty())
             .unwrap_or(false);
         let sink_ready = app
             .sink_status_snapshot()
+            .await
             .map(|status| {
                 !status.groups.is_empty()
                     && status.live_nodes > 0

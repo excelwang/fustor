@@ -168,7 +168,16 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn ensure_started(&self) -> Result<()> {
-        self.worker.ensure_started().await
+        eprintln!(
+            "fs_meta_sink_worker_client: ensure_started begin node={}",
+            self.node_id.0
+        );
+        self.worker.ensure_started().await.map(|_| {
+            eprintln!(
+                "fs_meta_sink_worker_client: ensure_started ok node={}",
+                self.node_id.0
+            );
+        })
     }
 
     pub async fn update_logical_roots(
@@ -524,8 +533,13 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
+        eprintln!(
+            "fs_meta_sink_worker_client: on_control_frame begin node={} envelopes={}",
+            self.node_id.0,
+            envelopes.len()
+        );
         self.ensure_started().await?;
-        match Self::call_worker(
+        let result = match Self::call_worker(
             &self.client().await?,
             SinkWorkerRequest::OnControlFrame { envelopes },
             Duration::from_secs(5),
@@ -537,7 +551,13 @@ impl SinkWorkerClientHandle {
                 "unexpected sink worker response for on_control_frame: {:?}",
                 other
             ))),
-        }
+        };
+        eprintln!(
+            "fs_meta_sink_worker_client: on_control_frame done node={} ok={}",
+            self.node_id.0,
+            result.is_ok()
+        );
+        result
     }
 
     pub async fn close(&self) -> Result<()> {

@@ -1953,13 +1953,14 @@ impl FSMetaSource {
         Ok(source)
     }
 
-    pub fn start_runtime_endpoints(&self, boundary: Arc<dyn ChannelIoSubset>) -> Result<()> {
+    pub async fn start_runtime_endpoints(
+        &self,
+        boundary: Arc<dyn ChannelIoSubset>,
+    ) -> Result<()> {
         if !lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints").is_empty() {
             return Ok(());
         }
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(self.start_manual_rescan_watch()))?;
-        }
+        self.start_manual_rescan_watch().await?;
 
         let rescan_roots = self.state_cell.roots_handle();
         let rescan_fanout_health = self.state_cell.fanout_health_handle();
@@ -2583,9 +2584,10 @@ impl FSMetaSource {
         .collect()
     }
 
-    pub fn publish_manual_rescan_signal(&self) -> Result<()> {
+    pub async fn publish_manual_rescan_signal(&self) -> Result<()> {
         self.manual_rescan_signal
             .emit(&self.node_id.0)
+            .await
             .map(|_| ())
             .map_err(|err| {
                 CnxError::Internal(format!("publish manual rescan signal failed: {err}"))
@@ -2608,7 +2610,7 @@ impl FSMetaSource {
             let mut offset = 0_u64;
             let mut last_seq = initial_seq;
             loop {
-                match source.manual_rescan_signal.watch_since(offset) {
+                match source.manual_rescan_signal.watch_since(offset).await {
                     Ok((next_offset, updates)) => {
                         offset = next_offset;
                         for update in updates {

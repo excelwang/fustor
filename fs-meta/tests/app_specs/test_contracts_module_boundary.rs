@@ -717,6 +717,23 @@ fn e2e_apply_release_harness_stays_blackbox() {
 }
 
 #[test]
+fn e2e_apply_release_harness_does_not_retry_transport_failures() {
+    let cluster = read_app_spec("tests/e2e/support/cluster5.rs");
+    let start = cluster
+        .find("fn classify_apply_release_retry(")
+        .expect("cluster5 classify_apply_release_retry");
+    let end = cluster[start..]
+        .find("fn is_generation_conflict_apply_error(")
+        .map(|offset| start + offset)
+        .expect("cluster5 classify_apply_release_retry end");
+    let classify = &cluster[start..end];
+
+    assert!(!classify.contains("\"category\": \"transport\""));
+    assert!(!classify.contains("\"category\":\"transport\""));
+    assert!(!classify.contains("Some(\"transport\")"));
+}
+
+#[test]
 fn app_authoring_crate_stays_product_specific() {
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
