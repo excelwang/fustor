@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
@@ -13,6 +13,7 @@ use capanix_runtime_entry_sdk::worker_runtime::{
     run_worker_sidecar_server,
 };
 use futures_util::StreamExt;
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::source::FSMetaSource;
@@ -23,17 +24,6 @@ use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
 const SOURCE_WORKER_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const SOURCE_WORKER_STOP_ABORT_TIMEOUT: Duration = Duration::from_millis(250);
-
-fn block_on_runtime<F, T>(runtime: &tokio::runtime::Handle, fut: F) -> T
-where
-    F: std::future::Future<Output = T>,
-{
-    if tokio::runtime::Handle::try_current().is_ok() {
-        tokio::task::block_in_place(|| runtime.block_on(fut))
-    } else {
-        runtime.block_on(fut)
-    }
-}
 
 struct SourceWorkerState {
     source: Option<Arc<FSMetaSource>>,
@@ -77,19 +67,18 @@ async fn stop_source_runtime(state: &mut SourceWorkerState) {
     .await;
 }
 
-fn start_source_pump_with_stream<S>(
-    stream: S,
-    boundary: Arc<dyn ChannelIoSubset>,
-    runtime: &tokio::runtime::Handle,
-) -> JoinHandle<()>
+fn start_source_pump_with_stream<S>(stream: S, boundary: Arc<dyn ChannelIoSubset>) -> JoinHandle<()>
 where
     S: futures_util::Stream<Item = Vec<Event>> + Send + 'static,
 {
-    let runtime_for_spawn = runtime.clone();
-    let send_runtime = runtime.clone();
-    runtime_for_spawn.spawn(async move {
-        let mut lanes =
-            HashMap::<String, (tokio::sync::mpsc::UnboundedSender<Vec<Event>>, JoinHandle<()>)>::new();
+    tokio::spawn(async move {
+        let mut lanes = HashMap::<
+            String,
+            (
+                tokio::sync::mpsc::UnboundedSender<Vec<Event>>,
+                JoinHandle<()>,
+            ),
+        >::new();
 
         futures_util::pin_mut!(stream);
         while let Some(batch) = stream.next().await {
@@ -103,20 +92,19 @@ where
                 let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
                 let send_boundary = boundary.clone();
                 let lane_name = lane.clone();
-                let send_runtime = send_runtime.clone();
-                let task = tokio::task::spawn_blocking(move || {
-                    while let Some(batch) = rx.blocking_recv() {
-                        if let Err(err) = block_on_runtime(
-                            &send_runtime,
-                            send_boundary.channel_send(
+                let task = tokio::spawn(async move {
+                    while let Some(batch) = rx.recv().await {
+                        if let Err(err) = send_boundary
+                            .channel_send(
                                 BoundaryContext::default(),
                                 ChannelSendRequest {
                                     channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
                                     events: batch,
                                     timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
                                 },
-                            ),
-                        ) {
+                            )
+                            .await
+                        {
                             log::error!(
                                 "source worker pump failed to publish source batch on stream route lane={}: {:?}",
                                 lane_name,
@@ -147,20 +135,18 @@ fn bootstrap_not_ready() -> CnxError {
     CnxError::NotReady("worker not initialized".into())
 }
 
-fn bootstrap_init_source_runtime(
+async fn bootstrap_init_source_runtime(
     node_id: NodeId,
     config: SourceConfig,
     state: &mut SourceWorkerState,
-    runtime: &tokio::runtime::Handle,
 ) {
-    let _ = block_on_runtime(runtime, stop_source_runtime(state));
+    let _ = stop_source_runtime(state).await;
     state.pending_init = Some((node_id, config));
 }
 
-fn bootstrap_start_source_runtime(
+async fn bootstrap_start_source_runtime(
     state: &mut SourceWorkerState,
     boundary: Arc<dyn ChannelIoSubset>,
-    runtime: &tokio::runtime::Handle,
     state_boundary: Arc<dyn StateBoundary>,
 ) -> Result<()> {
     let should_restart = state
@@ -168,7 +154,7 @@ fn bootstrap_start_source_runtime(
         .as_ref()
         .is_some_and(tokio::task::JoinHandle::is_finished);
     if should_restart {
-        let _ = block_on_runtime(runtime, stop_source_runtime(state));
+        let _ = stop_source_runtime(state).await;
         return Err(CnxError::NotReady("worker not initialized".to_string()));
     }
     if state.source.is_none() {
@@ -188,26 +174,21 @@ fn bootstrap_start_source_runtime(
                 "source worker runtime missing during start".into(),
             ));
         };
-        block_on_runtime(runtime, source.start_runtime_endpoints(boundary.clone()))?;
+        source.start_runtime_endpoints(boundary.clone()).await?;
         let source = source.clone();
-        let stream = block_on_runtime(runtime, source.pub_())?;
-        state.pump_task = Some(start_source_pump_with_stream(stream, boundary, runtime));
+        let stream = source.pub_().await?;
+        state.pump_task = Some(start_source_pump_with_stream(stream, boundary));
     }
     Ok(())
 }
 
-fn process_worker_request(
+async fn process_worker_request(
     request: SourceWorkerRequest,
     state: &mut SourceWorkerState,
-    boundary: Arc<dyn ChannelIoSubset>,
-    runtime: &tokio::runtime::Handle,
-    state_boundary: Arc<dyn StateBoundary>,
 ) -> (SourceWorkerResponse, bool) {
-    let _ = boundary;
-    let _ = state_boundary;
     match request {
         SourceWorkerRequest::UpdateLogicalRoots { roots } => match state.source.as_ref() {
-            Some(source) => match runtime.block_on(source.update_logical_roots(roots)) {
+            Some(source) => match source.update_logical_roots(roots).await {
                 Ok(_) => (SourceWorkerResponse::Ack, false),
                 Err(err) => (classify_source_worker_error(err), false),
             },
@@ -361,7 +342,7 @@ fn process_worker_request(
             }
         }
         SourceWorkerRequest::PublishManualRescanSignal => match state.source.as_ref() {
-            Some(source) => match block_on_runtime(runtime, source.publish_manual_rescan_signal()) {
+            Some(source) => match source.publish_manual_rescan_signal().await {
                 Ok(()) => (SourceWorkerResponse::Ack, false),
                 Err(err) => (classify_source_worker_error(err), false),
             },
@@ -373,7 +354,7 @@ fn process_worker_request(
         SourceWorkerRequest::TriggerRescanWhenReady => match state.source.as_ref() {
             Some(source) => {
                 let source = source.clone();
-                runtime.spawn(async move {
+                tokio::spawn(async move {
                     source.trigger_rescan_when_ready().await;
                 });
                 (SourceWorkerResponse::Ack, false)
@@ -384,7 +365,7 @@ fn process_worker_request(
             ),
         },
         SourceWorkerRequest::OnControlFrame { envelopes } => match state.source.as_ref() {
-            Some(source) => match block_on_runtime(runtime, source.on_control_frame(&envelopes)) {
+            Some(source) => match source.on_control_frame(&envelopes).await {
                 Ok(_) => (SourceWorkerResponse::Ack, false),
                 Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
             },
@@ -421,19 +402,10 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
     async fn handle_request(
         &mut self,
         request: SourceWorkerRequest,
-        context: &WorkerSessionContext,
+        _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<WorkerLoopControl<SourceWorkerResponse>> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
-        let (response, stop) = process_worker_request(
-            request,
-            &mut guard,
-            context.io_boundary(),
-            context.runtime_handle(),
-            context.state_boundary(),
-        );
+        let mut guard = self.state.lock().await;
+        let (response, stop) = process_worker_request(request, &mut guard).await;
         Ok(if stop {
             WorkerLoopControl::Stop(response)
         } else {
@@ -444,18 +416,15 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
     async fn on_runtime_control(
         &mut self,
         envelopes: &[ControlEnvelope],
-        context: &WorkerSessionContext,
+        _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<()> {
-        let guard = self
-            .state
-            .lock()
-            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
+        let guard = self.state.lock().await;
         let Some(source) = guard.source.as_ref() else {
             return Err(CnxError::NotReady(
                 "worker runtime not initialized for runtime control frames".into(),
             ));
         };
-        block_on_runtime(context.runtime_handle(), source.on_control_frame(envelopes))
+        source.on_control_frame(envelopes).await
     }
 }
 
@@ -465,34 +434,21 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
         &mut self,
         node_id: NodeId,
         payload: SourceConfig,
-        context: &WorkerSessionContext,
+        _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<()> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
-        bootstrap_init_source_runtime(node_id, payload, &mut guard, context.runtime_handle());
+        let mut guard = self.state.lock().await;
+        bootstrap_init_source_runtime(node_id, payload, &mut guard).await;
         Ok(())
     }
 
     async fn on_start(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
-        bootstrap_start_source_runtime(
-            &mut guard,
-            context.io_boundary(),
-            context.runtime_handle(),
-            context.state_boundary(),
-        )
+        let mut guard = self.state.lock().await;
+        bootstrap_start_source_runtime(&mut guard, context.io_boundary(), context.state_boundary())
+            .await
     }
 
     async fn on_ping(&mut self, _context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
-        let guard = self
-            .state
-            .lock()
-            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
+        let guard = self.state.lock().await;
         if guard.source.is_some() {
             Ok(())
         } else {
@@ -500,12 +456,9 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
         }
     }
 
-    async fn on_close(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
-        let mut guard = self
-            .state
-            .lock()
-            .map_err(|_| CnxError::Internal("source worker state lock poisoned".into()))?;
-        block_on_runtime(context.runtime_handle(), stop_source_runtime(&mut guard));
+    async fn on_close(&mut self, _context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        let mut guard = self.state.lock().await;
+        stop_source_runtime(&mut guard).await;
         Ok(())
     }
 }

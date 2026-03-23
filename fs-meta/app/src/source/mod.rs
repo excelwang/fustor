@@ -1953,10 +1953,7 @@ impl FSMetaSource {
         Ok(source)
     }
 
-    pub async fn start_runtime_endpoints(
-        &self,
-        boundary: Arc<dyn ChannelIoSubset>,
-    ) -> Result<()> {
+    pub async fn start_runtime_endpoints(&self, boundary: Arc<dyn ChannelIoSubset>) -> Result<()> {
         if !lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints").is_empty() {
             return Ok(());
         }
@@ -1996,11 +1993,9 @@ impl FSMetaSource {
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
-                                if let Ok(params) =
-                                    rmp_serde::from_slice::<InternalQueryRequest>(
-                                        req.payload_bytes(),
-                                    )
-                                {
+                                if let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
+                                    req.payload_bytes(),
+                                ) {
                                     if params.transport != QueryTransport::ForceFind {
                                         log::warn!(
                                             "boundary endpoint rejected non-force-find transport"
@@ -2028,8 +2023,7 @@ impl FSMetaSource {
                                             );
                                             for event in grouped_events {
                                                 let mut meta = event.metadata().clone();
-                                                meta.correlation_id =
-                                                    req.metadata().correlation_id;
+                                                meta.correlation_id = req.metadata().correlation_id;
                                                 responses.push(Event::new(
                                                     meta,
                                                     bytes::Bytes::copy_from_slice(
@@ -2208,8 +2202,7 @@ impl FSMetaSource {
                     move |events| {
                         let control_roots = control_roots.clone();
                         let control_fanout_health = control_fanout_health.clone();
-                        let control_manual_rescan_intents =
-                            control_manual_rescan_intents.clone();
+                        let control_manual_rescan_intents = control_manual_rescan_intents.clone();
                         async move {
                             let roots_snapshot = lock_or_recover(
                                 &control_roots,
@@ -2346,8 +2339,7 @@ impl FSMetaSource {
                         .map(FSMetaSource::root_runtime_key)
                         .collect::<Vec<_>>();
                         if !expected.is_empty() {
-                            let deadline =
-                                std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
+                            let deadline = std::time::Instant::now() + RESCAN_READY_WAIT_TIMEOUT;
                             loop {
                                 let ready = {
                                     let health = lock_or_recover(

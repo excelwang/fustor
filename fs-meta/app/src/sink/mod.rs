@@ -486,13 +486,15 @@ impl SinkFileMeta {
         } else {
             AuthorityJournal::from_state_boundary(SINK_RUNTIME_UNIT_ID, state_boundary).map_err(
                 |err| {
-                    CnxError::InvalidInput(format!(
-                        "sink statecell authority init failed: {err}"
-                    ))
+                    CnxError::InvalidInput(format!("sink statecell authority init failed: {err}"))
                 },
             )?
         };
-        let state = SinkStateCell::new(&source_cfg, CommitBoundary::new(authority), !defer_authority_read);
+        let state = SinkStateCell::new(
+            &source_cfg,
+            CommitBoundary::new(authority),
+            !defer_authority_read,
+        );
         let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
         let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
         let visibility_lag = Arc::new(Mutex::new(VisibilityLagTelemetry::default()));

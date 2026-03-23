@@ -18,8 +18,7 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
 };
 
 use crate::query::api::{
-    merge_sink_status_snapshots, refresh_policy_from_host_object_grants,
-    route_sink_status_snapshot,
+    merge_sink_status_snapshots, refresh_policy_from_host_object_grants, route_sink_status_snapshot,
 };
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
@@ -77,19 +76,7 @@ pub async fn status(
             return Err(ApiError::internal(format!("sink status failed: {err}")));
         }
     };
-    let local_source = match state.source.observability_snapshot().await {
-        Ok(snapshot) => snapshot,
-        Err(err) if state.source.is_worker() => {
-            log::warn!("status falling back to degraded source snapshot: {err}");
-            state
-                .source
-                .degraded_observability_snapshot(format!("source worker unavailable: {err}"))
-                .await
-        }
-        Err(err) => {
-            return Err(ApiError::internal(format!("source status failed: {err}")));
-        }
-    };
+    let local_source = state.source.observability_snapshot_nonblocking().await;
     let (sink_status, source, runner_sets, sink_outcome, source_outcome) =
         merge_remote_status_snapshots(
             local_sink,
@@ -353,10 +340,14 @@ pub async fn roots_preview(
             }
         }
     }
-    let grants = state.source.host_object_grants_snapshot().await.map_err(|err| {
-        eprintln!("fs_meta_api: roots_preview grants snapshot failed: {err}");
-        ApiError::internal(format!("source grants snapshot failed: {err}"))
-    })?;
+    let grants = state
+        .source
+        .host_object_grants_snapshot()
+        .await
+        .map_err(|err| {
+            eprintln!("fs_meta_api: roots_preview grants snapshot failed: {err}");
+            ApiError::internal(format!("source grants snapshot failed: {err}"))
+        })?;
     Ok(Json(preview_roots(&roots, &grants)?))
 }
 
@@ -404,7 +395,11 @@ pub async fn roots_put(
             err
         })?;
     let previous_sink_roots = state.sink.cached_logical_roots_snapshot()?;
-    if let Err(err) = state.sink.update_logical_roots(roots.clone(), &grants).await {
+    if let Err(err) = state
+        .sink
+        .update_logical_roots(roots.clone(), &grants)
+        .await
+    {
         eprintln!("fs_meta_api: roots_put sink sync failed: {err}");
         let sink_rollback = state
             .sink

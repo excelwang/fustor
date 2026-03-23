@@ -23,7 +23,8 @@ use crate::runtime::orchestration::{
 use crate::runtime::routes::{
     METHOD_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
     METHOD_SOURCE_STATUS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_PROXY,
-    ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_INTERNAL,
+    ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
+    ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_INTERNAL,
     default_route_bindings,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -165,13 +166,25 @@ fn now_us() -> u64 {
 }
 
 fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
+    let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+    let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+    let source_status_route = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+    let source_find_route = format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL);
     match unit {
         FacadeRuntimeUnit::Facade => route_key == format!("{}.stream", ROUTE_KEY_FACADE_CONTROL),
         FacadeRuntimeUnit::Query => {
             route_key == format!("{}.req", ROUTE_KEY_QUERY)
-                || route_key == format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL)
+                || route_key == sink_query_proxy_route
+                || route_key == sink_status_route
+                || route_key == source_status_route
+                || route_key == source_find_route
         }
-        FacadeRuntimeUnit::QueryPeer => route_key == format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+        FacadeRuntimeUnit::QueryPeer => {
+            route_key == sink_query_proxy_route
+                || route_key == sink_status_route
+                || route_key == source_status_route
+                || route_key == source_find_route
+        }
     }
 }
 
@@ -492,12 +505,18 @@ impl FSMetaApp {
         let mut tasks = self.runtime_endpoint_tasks.lock().await;
         let mut spawned_routes = self.runtime_endpoint_routes.lock().await;
         let routes = default_route_bindings();
+        let query_active = self
+            .facade_gate
+            .unit_state(execution_units::QUERY_RUNTIME_UNIT_ID)?
+            .map(|(active, _)| active)
+            .unwrap_or(false);
+        let query_peer_active = self
+            .facade_gate
+            .unit_state(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)?
+            .map(|(active, _)| active)
+            .unwrap_or(false);
+        let internal_query_active = query_active || query_peer_active;
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
-            let query_active = self
-                .facade_gate
-                .unit_state(execution_units::QUERY_RUNTIME_UNIT_ID)?
-                .map(|(active, _)| active)
-                .unwrap_or(false);
             if !query_active || !spawned_routes.insert(route.0.clone()) {
                 // Not currently selected as query ingress owner, or already running.
             } else {
@@ -586,13 +605,8 @@ impl FSMetaApp {
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
-            let query_peer_active = self
-                .facade_gate
-                .unit_state(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)?
-                .map(|(active, _)| active)
-                .unwrap_or(false);
-            if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
-                // Not currently selected as peer sink-status owner, or already running.
+            if !internal_query_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as query/query-peer sink-status owner, or already running.
             } else {
                 let sink = self.sink.clone();
                 eprintln!(
@@ -612,7 +626,7 @@ impl FSMetaApp {
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
-                                match sink.status_snapshot().await {
+                                match sink.status_snapshot_nonblocking().await {
                                     Ok(snapshot) => {
                                         eprintln!(
                                             "fs_meta_runtime_app: sink status endpoint response groups={}",
@@ -648,13 +662,8 @@ impl FSMetaApp {
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS) {
-            let query_peer_active = self
-                .facade_gate
-                .unit_state(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)?
-                .map(|(active, _)| active)
-                .unwrap_or(false);
-            if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
-                // Not currently selected as peer source-status owner, or already running.
+            if !internal_query_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as query/query-peer source-status owner, or already running.
             } else {
                 let source = self.source.clone();
                 eprintln!(
@@ -674,51 +683,24 @@ impl FSMetaApp {
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
-                                match source.observability_snapshot().await {
-                                    Ok(snapshot) => {
-                                        eprintln!(
-                                            "fs_meta_runtime_app: source status endpoint response groups={} runners={}",
-                                            snapshot.source_primary_by_group.len(),
-                                            snapshot.last_force_find_runner_by_group.len()
-                                        );
-                                        if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
-                                            responses.push(Event::new(
-                                                EventMetadata {
-                                                    origin_id: req.metadata().origin_id.clone(),
-                                                    timestamp_us: now_us(),
-                                                    logical_ts: None,
-                                                    correlation_id: req.metadata().correlation_id,
-                                                    ingress_auth: None,
-                                                    trace: None,
-                                                },
-                                                bytes::Bytes::from(payload),
-                                            ));
-                                        }
-                                    }
-                                    Err(err) => {
-                                        eprintln!(
-                                            "fs_meta_runtime_app: source status endpoint failed err={}",
-                                            err
-                                        );
-                                        let snapshot = source
-                                            .degraded_observability_snapshot(format!(
-                                                "source status snapshot unavailable: {err}"
-                                            ))
-                                            .await;
-                                        if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
-                                            responses.push(Event::new(
-                                                EventMetadata {
-                                                    origin_id: req.metadata().origin_id.clone(),
-                                                    timestamp_us: now_us(),
-                                                    logical_ts: None,
-                                                    correlation_id: req.metadata().correlation_id,
-                                                    ingress_auth: None,
-                                                    trace: None,
-                                                },
-                                                bytes::Bytes::from(payload),
-                                            ));
-                                        }
-                                    }
+                                let snapshot = source.observability_snapshot_nonblocking().await;
+                                eprintln!(
+                                    "fs_meta_runtime_app: source status endpoint response groups={} runners={}",
+                                    snapshot.source_primary_by_group.len(),
+                                    snapshot.last_force_find_runner_by_group.len()
+                                );
+                                if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
+                                    responses.push(Event::new(
+                                        EventMetadata {
+                                            origin_id: req.metadata().origin_id.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: req.metadata().correlation_id,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        },
+                                        bytes::Bytes::from(payload),
+                                    ));
                                 }
                             }
                             responses
@@ -729,13 +711,8 @@ impl FSMetaApp {
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY_PROXY) {
-            let query_peer_active = self
-                .facade_gate
-                .unit_state(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)?
-                .map(|(active, _)| active)
-                .unwrap_or(false);
-            if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
-                // Not currently selected as peer query owner, or already running.
+            if !internal_query_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as query/query-peer proxy owner, or already running.
             } else {
                 eprintln!(
                     "fs_meta_runtime_app: spawning sink query proxy endpoint route={}",
@@ -792,7 +769,8 @@ impl FSMetaApp {
                                         responses.push(Event::new(
                                             EventMetadata {
                                                 origin_id: NodeId(
-                                                    params.scope
+                                                    params
+                                                        .scope
                                                         .selected_group
                                                         .clone()
                                                         .unwrap_or_else(|| {
@@ -818,13 +796,8 @@ impl FSMetaApp {
             }
         }
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
-            let query_peer_active = self
-                .facade_gate
-                .unit_state(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)?
-                .map(|(active, _)| active)
-                .unwrap_or(false);
-            if !query_peer_active || !spawned_routes.insert(route.0.clone()) {
-                // Not currently selected as peer query owner, or already running.
+            if !internal_query_active || !spawned_routes.insert(route.0.clone()) {
+                // Not currently selected as query/query-peer source-find owner, or already running.
             } else {
                 eprintln!(
                     "fs_meta_runtime_app: spawning source find proxy endpoint route={}",
@@ -880,7 +853,8 @@ impl FSMetaApp {
                                         responses.push(Event::new(
                                             EventMetadata {
                                                 origin_id: NodeId(
-                                                    params.scope
+                                                    params
+                                                        .scope
                                                         .selected_group
                                                         .clone()
                                                         .unwrap_or_else(|| {
@@ -926,7 +900,10 @@ impl FSMetaApp {
         source: &SourceFacade,
         sink: &SinkFacade,
     ) -> Result<Vec<String>> {
-        let mut source_groups = source.scheduled_source_group_ids().await?.unwrap_or_default();
+        let mut source_groups = source
+            .scheduled_source_group_ids()
+            .await?
+            .unwrap_or_default();
         let scan_groups = source.scheduled_scan_group_ids().await?.unwrap_or_default();
         source_groups.extend(scan_groups);
         let sink_groups = sink.scheduled_group_ids().await?.unwrap_or_default();
@@ -1570,14 +1547,20 @@ impl FSMetaApp {
             }
         }
         if !source_signals.is_empty() {
-            eprintln!("fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals begin");
+            eprintln!(
+                "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals begin"
+            );
             self.source
                 .apply_orchestration_signals(&source_signals)
                 .await?;
-            eprintln!("fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals ok");
+            eprintln!(
+                "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals ok"
+            );
         }
         if !sink_signals.is_empty() {
-            eprintln!("fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals begin");
+            eprintln!(
+                "fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals begin"
+            );
             self.sink.apply_orchestration_signals(&sink_signals).await?;
             eprintln!("fs_meta_runtime_app: on_control_frame sink.apply_orchestration_signals ok");
         }
@@ -2895,6 +2878,31 @@ mod tests {
                 .is_some_and(|msg| msg.contains("fs-meta api bind failed"))
         );
         app.close().await.expect("close fs-meta app");
+    }
+
+    #[test]
+    fn facade_route_key_matches_dual_owned_internal_query_routes_for_both_units() {
+        let sink_query_proxy = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
+        let sink_status = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+        let source_status = format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL);
+        let source_find = format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL);
+
+        for route in [
+            sink_query_proxy.as_str(),
+            sink_status.as_str(),
+            source_status.as_str(),
+            source_find.as_str(),
+        ] {
+            assert!(facade_route_key_matches(FacadeRuntimeUnit::Query, route));
+            assert!(facade_route_key_matches(
+                FacadeRuntimeUnit::QueryPeer,
+                route
+            ));
+        }
+        assert!(!facade_route_key_matches(
+            FacadeRuntimeUnit::QueryPeer,
+            &format!("{}.req", ROUTE_KEY_QUERY)
+        ));
     }
 
     #[tokio::test]

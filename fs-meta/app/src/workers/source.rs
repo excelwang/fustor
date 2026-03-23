@@ -29,6 +29,7 @@ const SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+const SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
 const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
@@ -117,6 +118,10 @@ impl SourceWorkerClientHandle {
         self.worker.client().await
     }
 
+    async fn existing_client(&self) -> Result<Option<TypedWorkerClient<SourceWorkerRpc>>> {
+        self.worker.existing_client().await
+    }
+
     async fn call_worker(
         client: &TypedWorkerClient<SourceWorkerRpc>,
         request: SourceWorkerRequest,
@@ -130,66 +135,65 @@ impl SourceWorkerClientHandle {
             "fs_meta_source_worker_client: ensure_started begin node={}",
             self.node_id.0
         );
-        self.worker.ensure_started().await
-            .map(|_| {
-                eprintln!(
-                    "fs_meta_source_worker_client: ensure_started ok node={}",
-                    self.node_id.0
-                );
-            })
+        self.worker.ensure_started().await.map(|_| {
+            eprintln!(
+                "fs_meta_source_worker_client: ensure_started ok node={}",
+                self.node_id.0
+            );
+        })
     }
 
     pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
         self.with_started_retry(|client| {
             let roots = roots.clone();
             async move {
-            let deadline = std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
-            loop {
-                let attempt_timeout = std::cmp::min(
-                    SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-                    deadline.saturating_duration_since(std::time::Instant::now()),
-                );
-                if attempt_timeout.is_zero() {
-                    return Err(CnxError::Timeout);
-                }
-                match Self::call_worker(
-                    &client,
-                    SourceWorkerRequest::UpdateLogicalRoots {
-                        roots: roots.clone(),
-                    },
-                    attempt_timeout,
-                )
-                .await
-                {
-                    Ok(SourceWorkerResponse::Ack) => {
-                        self.with_cache_mut(|cache| {
-                            cache.logical_roots = Some(roots.clone());
-                        });
-                        return Ok(());
+                let deadline = std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
+                loop {
+                    let attempt_timeout = std::cmp::min(
+                        SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+                        deadline.saturating_duration_since(std::time::Instant::now()),
+                    );
+                    if attempt_timeout.is_zero() {
+                        return Err(CnxError::Timeout);
                     }
-                    Err(CnxError::PeerError(message))
-                        if message == "worker not initialized"
-                            && std::time::Instant::now() < deadline =>
+                    match Self::call_worker(
+                        &client,
+                        SourceWorkerRequest::UpdateLogicalRoots {
+                            roots: roots.clone(),
+                        },
+                        attempt_timeout,
+                    )
+                    .await
                     {
-                        tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                        Ok(SourceWorkerResponse::Ack) => {
+                            self.with_cache_mut(|cache| {
+                                cache.logical_roots = Some(roots.clone());
+                            });
+                            return Ok(());
+                        }
+                        Err(CnxError::PeerError(message))
+                            if message == "worker not initialized"
+                                && std::time::Instant::now() < deadline =>
+                        {
+                            tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                        }
+                        Err(CnxError::InvalidInput(message)) => {
+                            return Err(CnxError::InvalidInput(message));
+                        }
+                        Ok(other) => {
+                            return Err(CnxError::ProtocolViolation(format!(
+                                "unexpected source worker response for update roots: {:?}",
+                                other
+                            )));
+                        }
+                        Err(CnxError::Timeout) | Err(CnxError::TransportClosed(_))
+                            if std::time::Instant::now() < deadline =>
+                        {
+                            tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                        }
+                        Err(err) => return Err(err),
                     }
-                    Err(CnxError::InvalidInput(message)) => {
-                        return Err(CnxError::InvalidInput(message));
-                    }
-                    Ok(other) => {
-                        return Err(CnxError::ProtocolViolation(format!(
-                            "unexpected source worker response for update roots: {:?}",
-                            other
-                        )));
-                    }
-                    Err(CnxError::Timeout) | Err(CnxError::TransportClosed(_))
-                        if std::time::Instant::now() < deadline =>
-                    {
-                        tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
-                    }
-                    Err(err) => return Err(err),
                 }
-            }
             }
         })
         .await
@@ -455,21 +459,21 @@ impl SourceWorkerClientHandle {
         self.with_started_retry(|client| {
             let params = params.clone();
             async move {
-            match Self::call_worker(
-                &client,
-                SourceWorkerRequest::ForceFind {
-                    request: params.clone(),
-                },
-                SOURCE_WORKER_FORCE_FIND_TIMEOUT,
-            )
-            .await?
-            {
-                SourceWorkerResponse::Events(events) => Ok(events),
-                other => Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for force-find: {:?}",
-                    other
-                ))),
-            }
+                match Self::call_worker(
+                    &client,
+                    SourceWorkerRequest::ForceFind {
+                        request: params.clone(),
+                    },
+                    SOURCE_WORKER_FORCE_FIND_TIMEOUT,
+                )
+                .await?
+                {
+                    SourceWorkerResponse::Events(events) => Ok(events),
+                    other => Err(CnxError::ProtocolViolation(format!(
+                        "unexpected source worker response for force-find: {:?}",
+                        other
+                    ))),
+                }
             }
         })
         .await
@@ -549,44 +553,176 @@ impl SourceWorkerClientHandle {
         Ok(())
     }
 
-    pub(crate) async fn observability_snapshot(&self) -> Result<SourceObservabilitySnapshot> {
+    async fn try_observability_snapshot_nonblocking(&self) -> Result<SourceObservabilitySnapshot> {
+        let Some(client) = self.existing_client().await? else {
+            return Ok(
+                self.degraded_observability_snapshot_from_cache("source worker status not started")
+            );
+        };
+
+        let lifecycle = Self::call_worker(
+            &client,
+            SourceWorkerRequest::LifecycleState,
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        );
+        let grants_version = Self::call_worker(
+            &client,
+            SourceWorkerRequest::HostObjectGrantsVersionSnapshot,
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        );
+        let grants = Self::call_worker(
+            &client,
+            SourceWorkerRequest::HostObjectGrantsSnapshot,
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        );
+        let logical_roots = Self::call_worker(
+            &client,
+            SourceWorkerRequest::LogicalRootsSnapshot,
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        );
+        let status = Self::call_worker(
+            &client,
+            SourceWorkerRequest::StatusSnapshot,
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        );
+        let source_primary_by_group = Self::call_worker(
+            &client,
+            SourceWorkerRequest::SourcePrimaryByGroupSnapshot,
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        );
+        let last_force_find_runner_by_group = Self::call_worker(
+            &client,
+            SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot,
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        );
+        let force_find_inflight_groups = Self::call_worker(
+            &client,
+            SourceWorkerRequest::ForceFindInflightGroupsSnapshot,
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        );
+
+        let (
+            lifecycle,
+            grants_version,
+            grants,
+            logical_roots,
+            status,
+            source_primary_by_group,
+            last_force_find_runner_by_group,
+            force_find_inflight_groups,
+        ) = tokio::join!(
+            lifecycle,
+            grants_version,
+            grants,
+            logical_roots,
+            status,
+            source_primary_by_group,
+            last_force_find_runner_by_group,
+            force_find_inflight_groups,
+        );
+
+        let lifecycle_state = match lifecycle? {
+            SourceWorkerResponse::LifecycleState(state) => state,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for lifecycle state: {:?}",
+                    other
+                )));
+            }
+        };
+        let host_object_grants_version = match grants_version? {
+            SourceWorkerResponse::HostObjectGrantsVersion(version) => version,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for host object grants version: {:?}",
+                    other
+                )));
+            }
+        };
+        let grants = match grants? {
+            SourceWorkerResponse::HostObjectGrants(grants) => grants,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for host object grants: {:?}",
+                    other
+                )));
+            }
+        };
+        let logical_roots = match logical_roots? {
+            SourceWorkerResponse::LogicalRoots(roots) => roots,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for logical roots: {:?}",
+                    other
+                )));
+            }
+        };
+        let status = match status? {
+            SourceWorkerResponse::StatusSnapshot(snapshot) => snapshot,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for status snapshot: {:?}",
+                    other
+                )));
+            }
+        };
+        let source_primary_by_group = match source_primary_by_group? {
+            SourceWorkerResponse::SourcePrimaryByGroup(groups) => groups,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for source-primary groups: {:?}",
+                    other
+                )));
+            }
+        };
+        let last_force_find_runner_by_group = match last_force_find_runner_by_group? {
+            SourceWorkerResponse::LastForceFindRunnerByGroup(groups) => groups,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for force-find runner groups: {:?}",
+                    other
+                )));
+            }
+        };
+        let force_find_inflight_groups = match force_find_inflight_groups? {
+            SourceWorkerResponse::ForceFindInflightGroups(groups) => groups,
+            other => {
+                return Err(CnxError::ProtocolViolation(format!(
+                    "unexpected source worker response for inflight force-find groups: {:?}",
+                    other
+                )));
+            }
+        };
+
+        self.with_cache_mut(|cache| {
+            cache.lifecycle_state = Some(lifecycle_state.clone());
+            cache.host_object_grants_version = Some(host_object_grants_version);
+            cache.grants = Some(grants.clone());
+            cache.logical_roots = Some(logical_roots.clone());
+            cache.status = Some(status.clone());
+            cache.source_primary_by_group = Some(source_primary_by_group.clone());
+            cache.last_force_find_runner_by_group = Some(last_force_find_runner_by_group.clone());
+            cache.force_find_inflight_groups = Some(force_find_inflight_groups.clone());
+        });
+
         Ok(SourceObservabilitySnapshot {
-            lifecycle_state: self.lifecycle_state_label().await?,
-            host_object_grants_version: self.host_object_grants_version_snapshot().await?,
-            grants: self.host_object_grants_snapshot().await?,
-            logical_roots: self.logical_roots_snapshot().await?,
-            status: self.status_snapshot().await?,
-            source_primary_by_group: self.source_primary_by_group_snapshot().await?,
-            last_force_find_runner_by_group: self
-                .last_force_find_runner_by_group_snapshot()
-                .await?,
-            force_find_inflight_groups: self.force_find_inflight_groups_snapshot().await?,
+            lifecycle_state,
+            host_object_grants_version,
+            grants,
+            logical_roots,
+            status,
+            source_primary_by_group,
+            last_force_find_runner_by_group,
+            force_find_inflight_groups,
         })
     }
 
-    pub(crate) async fn degraded_observability_snapshot(
-        &self,
-        reason: impl Into<String>,
-    ) -> SourceObservabilitySnapshot {
-        let reason = reason.into();
-        match self.client().await {
-            Ok(_) => self
-                .observability_snapshot()
-                .await
-                .unwrap_or_else(|_| self.degraded_observability_snapshot_from_cache(reason)),
-            Err(_) => build_degraded_worker_observability_snapshot(
-                &SourceWorkerSnapshotCache {
-                    lifecycle_state: Some(SOURCE_WORKER_DEGRADED_STATE.to_string()),
-                    host_object_grants_version: Some(0),
-                    grants: Some(self.config.host_object_grants.clone()),
-                    logical_roots: Some(self.config.roots.clone()),
-                    status: Some(SourceStatusSnapshot::default()),
-                    source_primary_by_group: Some(Default::default()),
-                    last_force_find_runner_by_group: Some(Default::default()),
-                    force_find_inflight_groups: Some(Vec::new()),
-                },
-                reason,
-            ),
+    pub(crate) async fn observability_snapshot_nonblocking(&self) -> SourceObservabilitySnapshot {
+        match self.try_observability_snapshot_nonblocking().await {
+            Ok(snapshot) => snapshot,
+            Err(err) => self.degraded_observability_snapshot_from_cache(format!(
+                "source worker unavailable: {err}"
+            )),
         }
     }
 }
@@ -869,31 +1005,19 @@ impl SourceFacade {
         }
     }
 
-    pub(crate) async fn degraded_observability_snapshot(
-        &self,
-        reason: impl Into<String>,
-    ) -> SourceObservabilitySnapshot {
-        let reason = reason.into();
+    pub(crate) async fn observability_snapshot_nonblocking(&self) -> SourceObservabilitySnapshot {
         match self {
-            Self::Local(source) => {
-                let mut snapshot = SourceObservabilitySnapshot {
-                    lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
-                    host_object_grants_version: source.host_object_grants_version_snapshot(),
-                    grants: source.host_object_grants_snapshot(),
-                    logical_roots: source.logical_roots_snapshot(),
-                    status: source.status_snapshot(),
-                    source_primary_by_group: source.source_primary_by_group_snapshot(),
-                    last_force_find_runner_by_group: source
-                        .last_force_find_runner_by_group_snapshot(),
-                    force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
-                };
-                snapshot
-                    .status
-                    .degraded_roots
-                    .push((SOURCE_WORKER_DEGRADED_ROOT_KEY.to_string(), reason));
-                snapshot
-            }
-            Self::Worker(client) => client.degraded_observability_snapshot(reason).await,
+            Self::Local(source) => SourceObservabilitySnapshot {
+                lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
+                host_object_grants_version: source.host_object_grants_version_snapshot(),
+                grants: source.host_object_grants_snapshot(),
+                logical_roots: source.logical_roots_snapshot(),
+                status: source.status_snapshot(),
+                source_primary_by_group: source.source_primary_by_group_snapshot(),
+                last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
+                force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
+            },
+            Self::Worker(client) => client.observability_snapshot_nonblocking().await,
         }
     }
 }
@@ -935,9 +1059,7 @@ fn spawn_local_source_pump(
                                             ROUTE_KEY_EVENTS
                                         )),
                                         events: batch,
-                                        timeout_ms: Some(
-                                            Duration::from_secs(5).as_millis() as u64
-                                        ),
+                                        timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
                                     },
                                 )
                                 .await

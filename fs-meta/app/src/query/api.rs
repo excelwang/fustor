@@ -1060,7 +1060,10 @@ fn base_router(state: ApiState) -> Router {
         .with_state(state)
 }
 
-pub(crate) async fn run_timed_query<Fut>(fut: Fut, timeout: Duration) -> Result<Vec<Event>, CnxError>
+pub(crate) async fn run_timed_query<Fut>(
+    fut: Fut,
+    timeout: Duration,
+) -> Result<Vec<Event>, CnxError>
 where
     Fut: std::future::Future<Output = Result<Vec<Event>, CnxError>>,
 {

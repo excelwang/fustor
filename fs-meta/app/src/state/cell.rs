@@ -587,7 +587,7 @@ mod tests {
                 lease_epoch: Some(1),
             },
         ))
-            .expect("seed payload");
+        .expect("seed payload");
 
         let err = match AuthorityJournal::from_state_boundary("runtime.exec.source", boundary) {
             Ok(_) => panic!("scope mismatch must fail"),

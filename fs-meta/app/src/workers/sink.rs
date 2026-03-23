@@ -189,22 +189,22 @@ impl SinkWorkerClientHandle {
             let roots = roots.clone();
             let host_object_grants = host_object_grants.clone();
             async move {
-            match Self::call_worker(
-                &client,
-                SinkWorkerRequest::UpdateLogicalRoots {
-                    roots: roots.clone(),
-                    host_object_grants: host_object_grants.clone(),
-                },
-                SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-            )
-            .await?
-            {
-                SinkWorkerResponse::Ack => Ok(()),
-                other => Err(CnxError::ProtocolViolation(format!(
-                    "unexpected sink worker response for update roots: {:?}",
-                    other
-                ))),
-            }
+                match Self::call_worker(
+                    &client,
+                    SinkWorkerRequest::UpdateLogicalRoots {
+                        roots: roots.clone(),
+                        host_object_grants: host_object_grants.clone(),
+                    },
+                    SINK_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+                )
+                .await?
+                {
+                    SinkWorkerResponse::Ack => Ok(()),
+                    other => Err(CnxError::ProtocolViolation(format!(
+                        "unexpected sink worker response for update roots: {:?}",
+                        other
+                    ))),
+                }
             }
         })
         .await?;
@@ -338,34 +338,34 @@ impl SinkWorkerClientHandle {
         self.with_started_retry(|client| {
             let path = path.clone();
             async move {
-            let request = InternalQueryRequest::materialized(
-                QueryOp::Tree,
-                QueryScope {
-                    path: path.clone(),
-                    recursive: false,
-                    max_depth: Some(0),
-                    selected_group: None,
-                },
-                None,
-            );
-            decode_exact_query_node(
-                match Self::call_worker(
-                    &client,
-                    SinkWorkerRequest::MaterializedQuery { request },
-                    SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+                let request = InternalQueryRequest::materialized(
+                    QueryOp::Tree,
+                    QueryScope {
+                        path: path.clone(),
+                        recursive: false,
+                        max_depth: Some(0),
+                        selected_group: None,
+                    },
+                    None,
+                );
+                decode_exact_query_node(
+                    match Self::call_worker(
+                        &client,
+                        SinkWorkerRequest::MaterializedQuery { request },
+                        SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+                    )
+                    .await?
+                    {
+                        SinkWorkerResponse::Events(events) => events,
+                        other => {
+                            return Err(CnxError::ProtocolViolation(format!(
+                                "unexpected sink worker response for materialized query: {:?}",
+                                other
+                            )));
+                        }
+                    },
+                    &path,
                 )
-                .await?
-                {
-                    SinkWorkerResponse::Events(events) => events,
-                    other => {
-                        return Err(CnxError::ProtocolViolation(format!(
-                            "unexpected sink worker response for materialized query: {:?}",
-                            other
-                        )));
-                    }
-                },
-                &path,
-            )
             }
         })
         .await
@@ -375,21 +375,21 @@ impl SinkWorkerClientHandle {
         self.with_started_retry(|client| {
             let request = request.clone();
             async move {
-            match Self::call_worker(
-                &client,
-                SinkWorkerRequest::MaterializedQuery {
-                    request: request.clone(),
-                },
-                SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-            )
-            .await?
-            {
-                SinkWorkerResponse::Events(events) => Ok(events),
-                other => Err(CnxError::ProtocolViolation(format!(
-                    "unexpected sink worker response for materialized query: {:?}",
-                    other
-                ))),
-            }
+                match Self::call_worker(
+                    &client,
+                    SinkWorkerRequest::MaterializedQuery {
+                        request: request.clone(),
+                    },
+                    SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+                )
+                .await?
+                {
+                    SinkWorkerResponse::Events(events) => Ok(events),
+                    other => Err(CnxError::ProtocolViolation(format!(
+                        "unexpected sink worker response for materialized query: {:?}",
+                        other
+                    ))),
+                }
             }
         })
         .await
@@ -421,30 +421,30 @@ impl SinkWorkerClientHandle {
         self.with_started_retry(|client| {
             let path = path.clone();
             async move {
-            match Self::call_worker(
-                &client,
-                SinkWorkerRequest::MaterializedQuery {
-                    request: InternalQueryRequest::materialized(
-                        QueryOp::Stats,
-                        QueryScope {
-                            path: path.clone(),
-                            recursive: true,
-                            max_depth: None,
-                            selected_group: None,
-                        },
-                        None,
-                    ),
-                },
-                SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
-            )
-            .await?
-            {
-                SinkWorkerResponse::Events(events) => Ok(events),
-                other => Err(CnxError::ProtocolViolation(format!(
-                    "unexpected sink worker response for materialized query: {:?}",
-                    other
-                ))),
-            }
+                match Self::call_worker(
+                    &client,
+                    SinkWorkerRequest::MaterializedQuery {
+                        request: InternalQueryRequest::materialized(
+                            QueryOp::Stats,
+                            QueryScope {
+                                path: path.clone(),
+                                recursive: true,
+                                max_depth: None,
+                                selected_group: None,
+                            },
+                            None,
+                        ),
+                    },
+                    SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT,
+                )
+                .await?
+                {
+                    SinkWorkerResponse::Events(events) => Ok(events),
+                    other => Err(CnxError::ProtocolViolation(format!(
+                        "unexpected sink worker response for materialized query: {:?}",
+                        other
+                    ))),
+                }
             }
         })
         .await
@@ -488,21 +488,21 @@ impl SinkWorkerClientHandle {
         self.with_started_retry(|client| {
             let events = events.clone();
             async move {
-            match Self::call_worker(
-                &client,
-                SinkWorkerRequest::Send {
-                    events: events.clone(),
-                },
-                Duration::from_secs(5),
-            )
-            .await?
-            {
-                SinkWorkerResponse::Ack => Ok(()),
-                other => Err(CnxError::ProtocolViolation(format!(
-                    "unexpected sink worker response for send: {:?}",
-                    other
-                ))),
-            }
+                match Self::call_worker(
+                    &client,
+                    SinkWorkerRequest::Send {
+                        events: events.clone(),
+                    },
+                    Duration::from_secs(5),
+                )
+                .await?
+                {
+                    SinkWorkerResponse::Ack => Ok(()),
+                    other => Err(CnxError::ProtocolViolation(format!(
+                        "unexpected sink worker response for send: {:?}",
+                        other
+                    ))),
+                }
             }
         })
         .await
@@ -514,10 +514,7 @@ impl SinkWorkerClientHandle {
         self.with_started_retry(|client| async move {
             match Self::call_worker(
                 &client,
-                SinkWorkerRequest::Recv {
-                    timeout_ms,
-                    limit,
-                },
+                SinkWorkerRequest::Recv { timeout_ms, limit },
                 Duration::from_secs(5),
             )
             .await?

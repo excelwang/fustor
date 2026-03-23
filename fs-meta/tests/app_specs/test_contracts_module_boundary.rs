@@ -827,6 +827,32 @@ fn source_and_sink_worker_server_bootstrap_live_in_artifact_crates() {
     assert!(worker_sink.contains("run_worker_sidecar_server::<SinkWorkerRpc"));
     assert!(worker_sink.contains("TypedWorkerBootstrapSession<SinkWorkerInitConfig>"));
     assert!(worker_sink.contains("SinkWorkerSession"));
+    assert!(!worker_source.contains("context.runtime_handle()"));
+    assert!(!worker_sink.contains("context.runtime_handle()"));
+    assert!(!worker_source.contains("runtime.block_on("));
+    assert!(!worker_sink.contains("runtime.block_on("));
+}
+
+#[test]
+fn status_paths_use_nonblocking_worker_observation_reads() {
+    let handlers = read_app_spec("src/api/handlers.rs");
+    let runtime_app = read_app_spec("src/runtime_app.rs");
+    let worker_source = read_app_spec("src/workers/source.rs");
+
+    assert!(handlers.contains("state.source.observability_snapshot_nonblocking().await"));
+    assert!(runtime_app.contains("sink.status_snapshot_nonblocking().await"));
+    assert!(runtime_app.contains("source.observability_snapshot_nonblocking().await"));
+    assert!(worker_source.contains("try_observability_snapshot_nonblocking"));
+    assert!(!worker_source.contains(
+        ".observability_snapshot()\n                .await\n                .unwrap_or_else"
+    ));
+    assert!(runtime_app.contains("let internal_query_active = query_active || query_peer_active;"));
+    assert!(
+        runtime_app
+            .contains("if !internal_query_active || !spawned_routes.insert(route.0.clone())")
+    );
+    assert!(runtime_app.contains("route_key == source_status_route"));
+    assert!(runtime_app.contains("route_key == source_find_route"));
 }
 
 #[test]

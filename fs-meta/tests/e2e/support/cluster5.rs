@@ -3,22 +3,22 @@
 
 use super::api_client::FsMetaApiClient;
 use super::control_protocol::{
-    AnnouncedResourceExport, ControlEnvelope, CtlRequest, CtlResponse,
-    canonical_ctl_command_value_bytes,
+    canonical_ctl_command_value_bytes, AnnouncedResourceExport, ControlEnvelope, CtlRequest,
+    CtlResponse,
 };
 use super::runtime_admin::{
     canonical_runtime_admin_command_value_bytes, decode_runtime_admin_or_kernel_response_value,
     encode_runtime_admin_request_value,
 };
-use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use fs_meta::{
-    RootSpec,
     api::config::{ApiAuthConfig, BootstrapAdminConfig},
+    RootSpec,
 };
-use fs_meta_deploy::{FsMetaReleaseSpec, build_release_doc_value};
+use fs_meta_deploy::{build_release_doc_value, FsMetaReleaseSpec};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 use std::fs::{self, File};
@@ -616,12 +616,10 @@ impl Cluster5 {
         let mut value = build_release_doc_value(&spec);
         value["target_generation"] = json!(generation);
         value["units"][0]["startup"]["path"] = json!(app_path.to_string_lossy().to_string());
-        value["units"][0]["startup"]["manifest"] = json!(
-            repo_root()
-                .join("fs-meta/fixtures/manifests/fs-meta.yaml")
-                .display()
-                .to_string()
-        );
+        value["units"][0]["startup"]["manifest"] = json!(repo_root()
+            .join("fs-meta/fixtures/manifests/fs-meta.yaml")
+            .display()
+            .to_string());
         value["units"][0]["version"] = json!(format!("real-nfs-{generation}"));
         value["units"][0]["restart_policy"] = json!("Never");
         value["units"][0]["policy"]["generation"] = json!(generation);

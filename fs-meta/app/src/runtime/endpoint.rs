@@ -189,14 +189,15 @@ async fn run_endpoint_loop<F, Fut>(
         if shutdown_for_task.is_cancelled() {
             break;
         }
-        let requests = match boundary.channel_recv(
-            ctx.clone(),
-            ChannelRecvRequest {
-                channel_key: request_channel.clone(),
-                timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
-            },
-        )
-        .await
+        let requests = match boundary
+            .channel_recv(
+                ctx.clone(),
+                ChannelRecvRequest {
+                    channel_key: request_channel.clone(),
+                    timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
+                },
+            )
+            .await
         {
             Ok(events) => events,
             Err(err) => {
@@ -234,14 +235,14 @@ async fn run_endpoint_loop<F, Fut>(
         }
         if let Err(err) = boundary
             .channel_send(
-            ctx.clone(),
-            ChannelSendRequest {
-                channel_key: reply_channel.clone(),
-                events: responses,
-                timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
-            },
-        )
-        .await
+                ctx.clone(),
+                ChannelSendRequest {
+                    channel_key: reply_channel.clone(),
+                    events: responses,
+                    timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
+                },
+            )
+            .await
         {
             log::warn!(
                 "endpoint task {} send failed for {}: {:?}",
@@ -281,14 +282,15 @@ async fn run_stream_loop<F, Fut, G>(
             "fs_meta_runtime_endpoint: stream loop recv route={} task={}",
             stream_channel.0, join_name
         );
-        let events = match boundary.channel_recv(
-            ctx.clone(),
-            ChannelRecvRequest {
-                channel_key: stream_channel.clone(),
-                timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
-            },
-        )
-        .await
+        let events = match boundary
+            .channel_recv(
+                ctx.clone(),
+                ChannelRecvRequest {
+                    channel_key: stream_channel.clone(),
+                    timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
+                },
+            )
+            .await
         {
             Ok(events) => events,
             Err(CnxError::Timeout) => continue,
