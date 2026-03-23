@@ -834,6 +834,19 @@ fn source_and_sink_worker_server_bootstrap_live_in_artifact_crates() {
 }
 
 #[test]
+fn sink_worker_bootstrap_defers_stream_consumption_until_start_completes() {
+    let sink_mod = read_app_spec("src/sink/mod.rs");
+    let worker_sink = read_app_spec("src/workers/sink_server.rs");
+
+    assert!(sink_mod.contains("stream_receive_enabled: Arc<AtomicBool>"));
+    assert!(sink_mod.contains("fn should_receive_stream_events(&self) -> bool"));
+    assert!(sink_mod.contains("pub(crate) fn enable_stream_receive(&self)"));
+    assert!(sink_mod.contains("self.disable_stream_receive();"));
+    assert!(sink_mod.contains("move || stream_sink_ready.should_receive_stream_events()"));
+    assert!(worker_sink.contains("sink.enable_stream_receive();"));
+}
+
+#[test]
 fn status_paths_use_nonblocking_worker_observation_reads() {
     let handlers = read_app_spec("src/api/handlers.rs");
     let runtime_app = read_app_spec("src/runtime_app.rs");

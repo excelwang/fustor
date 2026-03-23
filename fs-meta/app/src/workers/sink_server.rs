@@ -115,6 +115,7 @@ fn bootstrap_start_sink_runtime(
                 state.send_tx = Some(send_tx);
             }
             state.endpoints_started = true;
+            sink.enable_stream_receive();
             eprintln!("fs_meta_sink_worker_server: bootstrap_start ok");
             Ok(())
         }

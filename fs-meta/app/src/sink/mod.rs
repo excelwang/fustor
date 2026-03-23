@@ -11,6 +11,7 @@ pub(crate) mod query;
 pub(crate) mod tree;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant};
 
@@ -433,6 +434,7 @@ pub struct SinkFileMeta {
     host_object_grants: Arc<RwLock<Vec<GrantedMountRoot>>>,
     visibility_lag: Arc<Mutex<VisibilityLagTelemetry>>,
     pending_stream_events: Arc<Mutex<VecDeque<Event>>>,
+    stream_receive_enabled: Arc<AtomicBool>,
     unit_control: Arc<RuntimeUnitGate>,
     shutdown: CancellationToken,
     endpoint_tasks: Arc<Mutex<Vec<ManagedEndpointTask>>>,
@@ -499,6 +501,7 @@ impl SinkFileMeta {
         let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
         let visibility_lag = Arc::new(Mutex::new(VisibilityLagTelemetry::default()));
         let pending_stream_events = Arc::new(Mutex::new(VecDeque::new()));
+        let stream_receive_enabled = Arc::new(AtomicBool::new(false));
         let unit_control = Arc::new(if boundary.is_some() {
             RuntimeUnitGate::new_runtime_managed("sink-file-meta", SINK_RUNTIME_UNITS)
         } else {
@@ -510,6 +513,7 @@ impl SinkFileMeta {
             host_object_grants: host_object_grants.clone(),
             visibility_lag: visibility_lag.clone(),
             pending_stream_events: pending_stream_events.clone(),
+            stream_receive_enabled: stream_receive_enabled.clone(),
             unit_control: unit_control.clone(),
             shutdown: CancellationToken::new(),
             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -531,6 +535,7 @@ impl SinkFileMeta {
             let query_host_object_grants = host_object_grants.clone();
             let query_visibility_lag = visibility_lag.clone();
             let query_pending_stream_events = pending_stream_events.clone();
+            let query_stream_receive_enabled = stream_receive_enabled.clone();
             let query_unit_control = unit_control.clone();
             if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
                 log::info!(
@@ -550,6 +555,7 @@ impl SinkFileMeta {
                         let query_host_object_grants = query_host_object_grants.clone();
                         let query_visibility_lag = query_visibility_lag.clone();
                         let query_pending_stream_events = query_pending_stream_events.clone();
+                        let query_stream_receive_enabled = query_stream_receive_enabled.clone();
                         let query_unit_control = query_unit_control.clone();
                         async move {
                             let mut responses = Vec::new();
@@ -569,6 +575,8 @@ impl SinkFileMeta {
                                         host_object_grants: query_host_object_grants.clone(),
                                         visibility_lag: query_visibility_lag.clone(),
                                         pending_stream_events: query_pending_stream_events.clone(),
+                                        stream_receive_enabled: query_stream_receive_enabled
+                                            .clone(),
                                         unit_control: query_unit_control.clone(),
                                         shutdown: CancellationToken::new(),
                                         endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -610,6 +618,7 @@ impl SinkFileMeta {
             let internal_query_host_object_grants = host_object_grants.clone();
             let internal_query_visibility_lag = visibility_lag.clone();
             let internal_query_pending_stream_events = pending_stream_events.clone();
+            let internal_query_stream_receive_enabled = stream_receive_enabled.clone();
             let internal_query_unit_control = unit_control.clone();
             if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
                 log::info!(
@@ -634,6 +643,8 @@ impl SinkFileMeta {
                         let internal_query_visibility_lag = internal_query_visibility_lag.clone();
                         let internal_query_pending_stream_events =
                             internal_query_pending_stream_events.clone();
+                        let internal_query_stream_receive_enabled =
+                            internal_query_stream_receive_enabled.clone();
                         let internal_query_unit_control = internal_query_unit_control.clone();
                         async move {
                             let mut responses = Vec::new();
@@ -655,6 +666,8 @@ impl SinkFileMeta {
                                         visibility_lag: internal_query_visibility_lag.clone(),
                                         pending_stream_events: internal_query_pending_stream_events
                                             .clone(),
+                                        stream_receive_enabled:
+                                            internal_query_stream_receive_enabled.clone(),
                                         unit_control: internal_query_unit_control.clone(),
                                         shutdown: CancellationToken::new(),
                                         endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -696,6 +709,7 @@ impl SinkFileMeta {
             let internal_status_host_object_grants = host_object_grants.clone();
             let internal_status_visibility_lag = visibility_lag.clone();
             let internal_status_pending_stream_events = pending_stream_events.clone();
+            let internal_status_stream_receive_enabled = stream_receive_enabled.clone();
             let internal_status_unit_control = unit_control.clone();
             if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
                 log::info!(
@@ -720,6 +734,8 @@ impl SinkFileMeta {
                         let internal_status_visibility_lag = internal_status_visibility_lag.clone();
                         let internal_status_pending_stream_events =
                             internal_status_pending_stream_events.clone();
+                        let internal_status_stream_receive_enabled =
+                            internal_status_stream_receive_enabled.clone();
                         let internal_status_unit_control = internal_status_unit_control.clone();
                         async move {
                             let mut responses = Vec::new();
@@ -730,6 +746,8 @@ impl SinkFileMeta {
                                     host_object_grants: internal_status_host_object_grants.clone(),
                                     visibility_lag: internal_status_visibility_lag.clone(),
                                     pending_stream_events: internal_status_pending_stream_events
+                                        .clone(),
+                                    stream_receive_enabled: internal_status_stream_receive_enabled
                                         .clone(),
                                     unit_control: internal_status_unit_control.clone(),
                                     shutdown: CancellationToken::new(),
@@ -881,6 +899,7 @@ impl SinkFileMeta {
                     host_object_grants: stream_host_object_grants,
                     visibility_lag: stream_visibility_lag,
                     pending_stream_events: pending_stream_events.clone(),
+                    stream_receive_enabled: stream_receive_enabled.clone(),
                     unit_control: stream_unit_control,
                     shutdown: CancellationToken::new(),
                     endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -892,7 +911,7 @@ impl SinkFileMeta {
                     route,
                     format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
                     sink.shutdown.clone(),
-                    move || stream_sink_ready.has_scheduled_stream_targets(),
+                    move || stream_sink_ready.should_receive_stream_events(),
                     move |events| {
                         let stream_sink_apply = stream_sink_apply.clone();
                         async move {
@@ -911,6 +930,8 @@ impl SinkFileMeta {
                     METHOD_STREAM
                 );
             }
+
+            sink.enable_stream_receive();
         }
 
         Ok(sink)
@@ -921,12 +942,34 @@ impl SinkFileMeta {
         boundary: Arc<dyn ChannelIoSubset>,
         node_id: NodeId,
     ) -> Result<()> {
+        let start = Instant::now();
+        eprintln!(
+            "fs_meta_sink: start_runtime_endpoints begin node={}",
+            node_id.0
+        );
         if !lock_or_recover(&self.endpoint_tasks, "sink.start_runtime_endpoints").is_empty() {
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints skip node={} reason=already-started elapsed_ms={}",
+                node_id.0,
+                start.elapsed().as_millis()
+            );
             return Ok(());
         }
 
+        self.disable_stream_receive();
+
+        eprintln!(
+            "fs_meta_sink: start_runtime_endpoints adapter begin node={} elapsed_ms={}",
+            node_id.0,
+            start.elapsed().as_millis()
+        );
         let adapter =
             exchange_host_adapter(boundary.clone(), node_id.clone(), default_route_bindings());
+        eprintln!(
+            "fs_meta_sink: start_runtime_endpoints adapter ok node={} elapsed_ms={}",
+            node_id.0,
+            start.elapsed().as_millis()
+        );
         let routes = default_route_bindings();
 
         let query_state = self.state.clone();
@@ -935,8 +978,15 @@ impl SinkFileMeta {
         let query_host_object_grants = self.host_object_grants.clone();
         let query_visibility_lag = self.visibility_lag.clone();
         let query_pending_stream_events = self.pending_stream_events.clone();
+        let query_stream_receive_enabled = self.stream_receive_enabled.clone();
         let query_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_QUERY) {
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints query spawn begin node={} route={} elapsed_ms={}",
+                node_id_cloned.0,
+                route.0,
+                start.elapsed().as_millis()
+            );
             log::info!(
                 "bound route listening on {}.{} for sink {}",
                 ROUTE_TOKEN_FS_META,
@@ -954,6 +1004,7 @@ impl SinkFileMeta {
                     let query_host_object_grants = query_host_object_grants.clone();
                     let query_visibility_lag = query_visibility_lag.clone();
                     let query_pending_stream_events = query_pending_stream_events.clone();
+                    let query_stream_receive_enabled = query_stream_receive_enabled.clone();
                     let query_unit_control = query_unit_control.clone();
                     async move {
                         let mut responses = Vec::new();
@@ -967,6 +1018,7 @@ impl SinkFileMeta {
                                     host_object_grants: query_host_object_grants.clone(),
                                     visibility_lag: query_visibility_lag.clone(),
                                     pending_stream_events: query_pending_stream_events.clone(),
+                                    stream_receive_enabled: query_stream_receive_enabled.clone(),
                                     unit_control: query_unit_control.clone(),
                                     shutdown: CancellationToken::new(),
                                     endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -989,6 +1041,11 @@ impl SinkFileMeta {
                     }
                 },
             );
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints query spawn ok node={} elapsed_ms={}",
+                node_id_cloned.0,
+                start.elapsed().as_millis()
+            );
             lock_or_recover(
                 &self.endpoint_tasks,
                 "sink.start_runtime_endpoints.query_tasks",
@@ -1001,8 +1058,15 @@ impl SinkFileMeta {
         let internal_query_host_object_grants = self.host_object_grants.clone();
         let internal_query_visibility_lag = self.visibility_lag.clone();
         let internal_query_pending_stream_events = self.pending_stream_events.clone();
+        let internal_query_stream_receive_enabled = self.stream_receive_enabled.clone();
         let internal_query_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints internal_query spawn begin node={} route={} elapsed_ms={}",
+                node_id_cloned.0,
+                route.0,
+                start.elapsed().as_millis()
+            );
             log::info!(
                 "bound route listening on {}.{} for sink {}",
                 ROUTE_TOKEN_FS_META_INTERNAL,
@@ -1025,6 +1089,8 @@ impl SinkFileMeta {
                     let internal_query_visibility_lag = internal_query_visibility_lag.clone();
                     let internal_query_pending_stream_events =
                         internal_query_pending_stream_events.clone();
+                    let internal_query_stream_receive_enabled =
+                        internal_query_stream_receive_enabled.clone();
                     let internal_query_unit_control = internal_query_unit_control.clone();
                     async move {
                         let mut responses = Vec::new();
@@ -1038,6 +1104,8 @@ impl SinkFileMeta {
                                     host_object_grants: internal_query_host_object_grants.clone(),
                                     visibility_lag: internal_query_visibility_lag.clone(),
                                     pending_stream_events: internal_query_pending_stream_events
+                                        .clone(),
+                                    stream_receive_enabled: internal_query_stream_receive_enabled
                                         .clone(),
                                     unit_control: internal_query_unit_control.clone(),
                                     shutdown: CancellationToken::new(),
@@ -1061,6 +1129,11 @@ impl SinkFileMeta {
                     }
                 },
             );
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints internal_query spawn ok node={} elapsed_ms={}",
+                node_id_cloned.0,
+                start.elapsed().as_millis()
+            );
             lock_or_recover(
                 &self.endpoint_tasks,
                 "sink.start_runtime_endpoints.internal_query_tasks",
@@ -1073,8 +1146,15 @@ impl SinkFileMeta {
         let internal_status_host_object_grants = self.host_object_grants.clone();
         let internal_status_visibility_lag = self.visibility_lag.clone();
         let internal_status_pending_stream_events = self.pending_stream_events.clone();
+        let internal_status_stream_receive_enabled = self.stream_receive_enabled.clone();
         let internal_status_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints status spawn begin node={} route={} elapsed_ms={}",
+                node_id_cloned.0,
+                route.0,
+                start.elapsed().as_millis()
+            );
             log::info!(
                 "bound route listening on {}.{} for sink {}",
                 ROUTE_TOKEN_FS_META_INTERNAL,
@@ -1097,6 +1177,8 @@ impl SinkFileMeta {
                     let internal_status_visibility_lag = internal_status_visibility_lag.clone();
                     let internal_status_pending_stream_events =
                         internal_status_pending_stream_events.clone();
+                    let internal_status_stream_receive_enabled =
+                        internal_status_stream_receive_enabled.clone();
                     let internal_status_unit_control = internal_status_unit_control.clone();
                     async move {
                         let mut responses = Vec::new();
@@ -1107,6 +1189,8 @@ impl SinkFileMeta {
                                 host_object_grants: internal_status_host_object_grants.clone(),
                                 visibility_lag: internal_status_visibility_lag.clone(),
                                 pending_stream_events: internal_status_pending_stream_events
+                                    .clone(),
+                                stream_receive_enabled: internal_status_stream_receive_enabled
                                     .clone(),
                                 unit_control: internal_status_unit_control.clone(),
                                 shutdown: CancellationToken::new(),
@@ -1132,6 +1216,11 @@ impl SinkFileMeta {
                     }
                 },
             );
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints status spawn ok node={} elapsed_ms={}",
+                node_id_cloned.0,
+                start.elapsed().as_millis()
+            );
             lock_or_recover(
                 &self.endpoint_tasks,
                 "sink.start_runtime_endpoints.internal_status_tasks",
@@ -1141,8 +1230,15 @@ impl SinkFileMeta {
 
         const FORCE_FIND_SOURCE_REPLY_IDLE_GRACE_MS: u64 = 750;
         let node_id_proxy = node_id.clone();
+        let node_id_proxy_log = node_id_proxy.clone();
         let proxy_adapter = adapter.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META, METHOD_FIND) {
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints find spawn begin node={} route={} elapsed_ms={}",
+                node_id_proxy_log.0,
+                route.0,
+                start.elapsed().as_millis()
+            );
             log::info!(
                 "bound route listening on {}.{} for sink {}",
                 ROUTE_TOKEN_FS_META,
@@ -1213,6 +1309,11 @@ impl SinkFileMeta {
                     }
                 },
             );
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints find spawn ok node={} elapsed_ms={}",
+                node_id_proxy_log.0,
+                start.elapsed().as_millis()
+            );
             lock_or_recover(
                 &self.endpoint_tasks,
                 "sink.start_runtime_endpoints.find_tasks",
@@ -1224,14 +1325,22 @@ impl SinkFileMeta {
         let stream_root_specs = self.root_specs.clone();
         let stream_host_object_grants = self.host_object_grants.clone();
         let stream_visibility_lag = self.visibility_lag.clone();
+        let stream_receive_enabled = self.stream_receive_enabled.clone();
         let stream_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints stream spawn begin node={} route={} elapsed_ms={}",
+                node_id.0,
+                route.0,
+                start.elapsed().as_millis()
+            );
             let stream_sink = Arc::new(SinkFileMeta {
                 state: stream_state,
                 root_specs: stream_root_specs,
                 host_object_grants: stream_host_object_grants,
                 visibility_lag: stream_visibility_lag,
                 pending_stream_events: self.pending_stream_events.clone(),
+                stream_receive_enabled: stream_receive_enabled,
                 unit_control: stream_unit_control,
                 shutdown: CancellationToken::new(),
                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -1243,7 +1352,7 @@ impl SinkFileMeta {
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
                 self.shutdown.clone(),
-                move || stream_sink_ready.has_scheduled_stream_targets(),
+                move || stream_sink_ready.should_receive_stream_events(),
                 move |events| {
                     let stream_sink_apply = stream_sink_apply.clone();
                     async move {
@@ -1253,6 +1362,11 @@ impl SinkFileMeta {
                     }
                 },
             );
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints stream spawn ok node={} elapsed_ms={}",
+                node_id.0,
+                start.elapsed().as_millis()
+            );
             lock_or_recover(
                 &self.endpoint_tasks,
                 "sink.start_runtime_endpoints.stream_tasks",
@@ -1261,12 +1375,20 @@ impl SinkFileMeta {
         }
 
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL) {
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints roots_control spawn begin node={} route={} elapsed_ms={}",
+                node_id.0,
+                route.0,
+                start.elapsed().as_millis()
+            );
+            let roots_control_stream_receive_enabled = self.stream_receive_enabled.clone();
             let sink = Arc::new(SinkFileMeta {
                 state: self.state.clone(),
                 root_specs: self.root_specs.clone(),
                 host_object_grants: self.host_object_grants.clone(),
                 visibility_lag: self.visibility_lag.clone(),
                 pending_stream_events: self.pending_stream_events.clone(),
+                stream_receive_enabled: roots_control_stream_receive_enabled,
                 unit_control: self.unit_control.clone(),
                 shutdown: self.shutdown.clone(),
                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -1312,6 +1434,11 @@ impl SinkFileMeta {
                     }
                 },
             );
+            eprintln!(
+                "fs_meta_sink: start_runtime_endpoints roots_control spawn ok node={} elapsed_ms={}",
+                node_id.0,
+                start.elapsed().as_millis()
+            );
             lock_or_recover(
                 &self.endpoint_tasks,
                 "sink.start_runtime_endpoints.roots_control_tasks",
@@ -1319,6 +1446,11 @@ impl SinkFileMeta {
             .push(endpoint);
         }
 
+        eprintln!(
+            "fs_meta_sink: start_runtime_endpoints ok node={} elapsed_ms={}",
+            node_id.0,
+            start.elapsed().as_millis()
+        );
         Ok(())
     }
 
@@ -1338,6 +1470,8 @@ impl SinkFileMeta {
             );
             return Ok(());
         }
+
+        self.disable_stream_receive();
 
         let routes = default_route_bindings();
         let stream_state = self.state.clone();
@@ -1362,6 +1496,7 @@ impl SinkFileMeta {
                 host_object_grants: stream_host_object_grants,
                 visibility_lag: stream_visibility_lag,
                 pending_stream_events: self.pending_stream_events.clone(),
+                stream_receive_enabled: self.stream_receive_enabled.clone(),
                 unit_control: stream_unit_control,
                 shutdown: self.shutdown.clone(),
                 endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
@@ -1373,7 +1508,7 @@ impl SinkFileMeta {
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
                 self.shutdown.clone(),
-                move || stream_sink_ready.has_scheduled_stream_targets(),
+                move || stream_sink_ready.should_receive_stream_events(),
                 move |events| {
                     let stream_sink_apply = stream_sink_apply.clone();
                     async move {
@@ -1389,6 +1524,8 @@ impl SinkFileMeta {
             )
             .push(endpoint);
         }
+
+        self.enable_stream_receive();
 
         Ok(())
     }
@@ -1795,6 +1932,18 @@ impl SinkFileMeta {
             .unwrap_or(false)
     }
 
+    fn should_receive_stream_events(&self) -> bool {
+        self.stream_receive_enabled.load(Ordering::Acquire) && self.has_scheduled_stream_targets()
+    }
+
+    pub(crate) fn enable_stream_receive(&self) {
+        self.stream_receive_enabled.store(true, Ordering::Release);
+    }
+
+    pub(crate) fn disable_stream_receive(&self) {
+        self.stream_receive_enabled.store(false, Ordering::Release);
+    }
+
     fn ingest_stream_events(&self, events: &[Event]) -> Result<()> {
         if events.is_empty() {
             return Ok(());
@@ -2172,6 +2321,7 @@ impl SinkFileMeta {
     }
 
     pub async fn close(&self) -> Result<()> {
+        self.disable_stream_receive();
         self.shutdown.cancel();
         let mut endpoint_tasks = std::mem::take(&mut *lock_or_recover(
             &self.endpoint_tasks,
@@ -2937,6 +3087,25 @@ mod tests {
         let response = decode_tree_payload(&query_events[0]);
         assert!(payload_contains_path(&response, b"/kept.txt"));
         assert!(!payload_contains_path(&response, b"/ignored.txt"));
+    }
+
+    #[test]
+    fn stream_receive_gate_stays_closed_until_enabled() {
+        let sink = build_single_group_sink();
+        assert!(
+            !sink.should_receive_stream_events(),
+            "stream receive gate should stay closed before runtime startup"
+        );
+        sink.enable_stream_receive();
+        assert!(
+            sink.should_receive_stream_events(),
+            "stream receive gate should open only after bootstrap enables it"
+        );
+        sink.disable_stream_receive();
+        assert!(
+            !sink.should_receive_stream_events(),
+            "stream receive gate should close again during shutdown"
+        );
     }
 
     #[test]

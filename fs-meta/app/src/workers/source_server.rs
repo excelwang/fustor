@@ -140,8 +140,15 @@ async fn bootstrap_init_source_runtime(
     config: SourceConfig,
     state: &mut SourceWorkerState,
 ) {
+    eprintln!(
+        "fs_meta_source_worker_server: bootstrap_init begin node={} roots={} grants={}",
+        node_id.0,
+        config.roots.len(),
+        config.host_object_grants.len()
+    );
     let _ = stop_source_runtime(state).await;
     state.pending_init = Some((node_id, config));
+    eprintln!("fs_meta_source_worker_server: bootstrap_init ok");
 }
 
 async fn bootstrap_start_source_runtime(
@@ -161,9 +168,16 @@ async fn bootstrap_start_source_runtime(
         let Some((node_id, config)) = state.pending_init.clone() else {
             return Err(bootstrap_not_ready());
         };
+        eprintln!(
+            "fs_meta_source_worker_server: bootstrap_start build_source begin node={} roots={} grants={}",
+            node_id.0,
+            config.roots.len(),
+            config.host_object_grants.len()
+        );
         match FSMetaSource::with_boundaries_and_state(config, node_id, None, state_boundary) {
             Ok(inner) => {
                 state.source = Some(Arc::new(inner));
+                eprintln!("fs_meta_source_worker_server: bootstrap_start build_source ok");
             }
             Err(err) => return Err(err),
         }
@@ -174,11 +188,17 @@ async fn bootstrap_start_source_runtime(
                 "source worker runtime missing during start".into(),
             ));
         };
+        eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints begin");
         source.start_runtime_endpoints(boundary.clone()).await?;
+        eprintln!("fs_meta_source_worker_server: bootstrap_start endpoints ok");
         let source = source.clone();
+        eprintln!("fs_meta_source_worker_server: bootstrap_start pub begin");
         let stream = source.pub_().await?;
+        eprintln!("fs_meta_source_worker_server: bootstrap_start pub ok");
         state.pump_task = Some(start_source_pump_with_stream(stream, boundary));
+        eprintln!("fs_meta_source_worker_server: bootstrap_start pump ok");
     }
+    eprintln!("fs_meta_source_worker_server: bootstrap_start ok");
     Ok(())
 }
 
@@ -436,22 +456,38 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
         payload: SourceConfig,
         _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<()> {
+        eprintln!(
+            "fs_meta_source_worker_server: on_init node={} roots={} grants={}",
+            node_id.0,
+            payload.roots.len(),
+            payload.host_object_grants.len()
+        );
         let mut guard = self.state.lock().await;
         bootstrap_init_source_runtime(node_id, payload, &mut guard).await;
         Ok(())
     }
 
     async fn on_start(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        eprintln!("fs_meta_source_worker_server: on_start begin");
         let mut guard = self.state.lock().await;
-        bootstrap_start_source_runtime(&mut guard, context.io_boundary(), context.state_boundary())
-            .await
+        let result =
+            bootstrap_start_source_runtime(&mut guard, context.io_boundary(), context.state_boundary())
+                .await;
+        eprintln!(
+            "fs_meta_source_worker_server: on_start done ok={}",
+            result.is_ok()
+        );
+        result
     }
 
     async fn on_ping(&mut self, _context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
+        eprintln!("fs_meta_source_worker_server: on_ping begin");
         let guard = self.state.lock().await;
         if guard.source.is_some() {
+            eprintln!("fs_meta_source_worker_server: on_ping ok");
             Ok(())
         } else {
+            eprintln!("fs_meta_source_worker_server: on_ping not_ready");
             Err(bootstrap_not_ready())
         }
     }
