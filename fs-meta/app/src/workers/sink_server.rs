@@ -26,6 +26,24 @@ struct SinkWorkerState {
     send_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Event>>>,
 }
 
+enum SinkWorkerAction {
+    Immediate(SinkWorkerResponse, bool),
+    Send {
+        sink: Arc<SinkFileMeta>,
+        send_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Event>>>,
+        events: Vec<Event>,
+    },
+    Recv {
+        sink: Arc<SinkFileMeta>,
+        timeout_ms: Option<u64>,
+        limit: Option<usize>,
+    },
+    OnControlFrame {
+        sink: Arc<SinkFileMeta>,
+        envelopes: Vec<ControlEnvelope>,
+    },
+}
+
 fn classify_sink_worker_error(err: CnxError) -> SinkWorkerResponse {
     match err {
         CnxError::InvalidInput(message) => SinkWorkerResponse::InvalidInput(message),
@@ -132,139 +150,191 @@ async fn bootstrap_stop_sink_runtime(state: &mut SinkWorkerState) {
     state.endpoints_started = false;
 }
 
-async fn process_worker_request(
-    request: SinkWorkerRequest,
-    state: &mut SinkWorkerState,
-) -> (SinkWorkerResponse, bool) {
+fn plan_worker_request(request: SinkWorkerRequest, state: &SinkWorkerState) -> SinkWorkerAction {
     match request {
         SinkWorkerRequest::UpdateLogicalRoots {
             roots,
             host_object_grants,
         } => match state.sink.as_ref() {
-            Some(sink) => match sink.update_logical_roots(roots, &host_object_grants) {
-                Ok(_) => (SinkWorkerResponse::Ack, false),
-                Err(err) => (classify_sink_worker_error(err), false),
-            },
-            None => (
+            Some(sink) => {
+                eprintln!(
+                    "fs_meta_sink_worker_server: update_logical_roots begin roots={} grants={}",
+                    roots.len(),
+                    host_object_grants.len()
+                );
+                match sink.update_logical_roots(roots, &host_object_grants) {
+                    Ok(_) => {
+                        eprintln!("fs_meta_sink_worker_server: update_logical_roots ok");
+                        SinkWorkerAction::Immediate(SinkWorkerResponse::Ack, false)
+                    }
+                    Err(err) => {
+                        eprintln!(
+                            "fs_meta_sink_worker_server: update_logical_roots err={}",
+                            err
+                        );
+                        SinkWorkerAction::Immediate(classify_sink_worker_error(err), false)
+                    }
+                }
+            }
+            None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SinkWorkerRequest::LogicalRootsSnapshot => match state.sink.as_ref() {
             Some(sink) => match sink.logical_roots_snapshot() {
-                Ok(roots) => (SinkWorkerResponse::LogicalRoots(roots), false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                Ok(roots) => {
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::LogicalRoots(roots), false)
+                }
+                Err(err) => {
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::Error(err.to_string()), false)
+                }
             },
-            None => (
+            None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SinkWorkerRequest::ScheduledGroupIds => match state.sink.as_ref() {
             Some(sink) => match sink.scheduled_group_ids_snapshot() {
-                Ok(groups) => (
+                Ok(groups) => SinkWorkerAction::Immediate(
                     SinkWorkerResponse::ScheduledGroupIds(
                         groups.map(|groups| groups.into_iter().collect()),
                     ),
                     false,
                 ),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                Err(err) => {
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::Error(err.to_string()), false)
+                }
             },
-            None => (
+            None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SinkWorkerRequest::Health => match state.sink.as_ref() {
             Some(sink) => match sink.health() {
-                Ok(health) => (SinkWorkerResponse::Health(health), false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                Ok(health) => {
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::Health(health), false)
+                }
+                Err(err) => {
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::Error(err.to_string()), false)
+                }
             },
-            None => (
+            None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SinkWorkerRequest::StatusSnapshot => match state.sink.as_ref() {
             Some(sink) => match sink.status_snapshot() {
-                Ok(snapshot) => (SinkWorkerResponse::StatusSnapshot(snapshot), false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                Ok(snapshot) => {
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::StatusSnapshot(snapshot), false)
+                }
+                Err(err) => {
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::Error(err.to_string()), false)
+                }
             },
-            None => (
+            None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SinkWorkerRequest::VisibilityLagSamplesSince { since_us } => match state.sink.as_ref() {
-            Some(sink) => (
+            Some(sink) => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::VisibilityLagSamples(
                     sink.visibility_lag_samples_since(since_us),
                 ),
                 false,
             ),
-            None => (
+            None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SinkWorkerRequest::MaterializedQuery { request } => match state.sink.as_ref() {
             Some(sink) => match sink.materialized_query(&request) {
-                Ok(events) => (SinkWorkerResponse::Events(events), false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+                Ok(events) => {
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::Events(events), false)
+                }
+                Err(err) => {
+                    SinkWorkerAction::Immediate(SinkWorkerResponse::Error(err.to_string()), false)
+                }
             },
-            None => (
+            None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
-        SinkWorkerRequest::Send { events } => match state.sink.as_ref() {
-            Some(_) => match state.send_tx.as_ref() {
-                Some(send_tx) => match send_tx.send(events) {
-                    Ok(()) => (SinkWorkerResponse::Ack, false),
-                    Err(err) => (
-                        SinkWorkerResponse::Error(format!(
-                            "sink worker send queue unavailable: {} event(s) dropped",
-                            err.0.len()
-                        )),
-                        false,
-                    ),
-                },
-                None => match state.sink.as_ref() {
-                    Some(sink) => match sink.send(&events).await {
-                        Ok(_) => (SinkWorkerResponse::Ack, false),
-                        Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-                    },
-                    None => (
-                        SinkWorkerResponse::Error("worker not initialized".into()),
-                        false,
-                    ),
-                },
+        SinkWorkerRequest::Send { events } => match state.sink.clone() {
+            Some(sink) => SinkWorkerAction::Send {
+                sink,
+                send_tx: state.send_tx.clone(),
+                events,
             },
-            None => (
+            None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
-        SinkWorkerRequest::Recv { timeout_ms, limit } => match state.sink.as_ref() {
-            Some(sink) => match sink.recv(recv_opts(timeout_ms, limit)).await {
-                Ok(events) => (SinkWorkerResponse::Events(events), false),
-                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+        SinkWorkerRequest::Recv { timeout_ms, limit } => match state.sink.clone() {
+            Some(sink) => SinkWorkerAction::Recv {
+                sink,
+                timeout_ms,
+                limit,
             },
-            None => (
+            None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
-        SinkWorkerRequest::OnControlFrame { envelopes } => match state.sink.as_ref() {
-            Some(sink) => match sink.on_control_frame(&envelopes).await {
+        SinkWorkerRequest::OnControlFrame { envelopes } => match state.sink.clone() {
+            Some(sink) => SinkWorkerAction::OnControlFrame { sink, envelopes },
+            None => SinkWorkerAction::Immediate(
+                SinkWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
+    }
+}
+
+async fn execute_worker_action(action: SinkWorkerAction) -> (SinkWorkerResponse, bool) {
+    match action {
+        SinkWorkerAction::Immediate(response, stop) => (response, stop),
+        SinkWorkerAction::Send {
+            sink,
+            send_tx,
+            events,
+        } => match send_tx {
+            Some(send_tx) => match send_tx.send(events) {
+                Ok(()) => (SinkWorkerResponse::Ack, false),
+                Err(err) => (
+                    SinkWorkerResponse::Error(format!(
+                        "sink worker send queue unavailable: {} event(s) dropped",
+                        err.0.len()
+                    )),
+                    false,
+                ),
+            },
+            None => match sink.send(&events).await {
                 Ok(_) => (SinkWorkerResponse::Ack, false),
                 Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
             },
-            None => (
-                SinkWorkerResponse::Error("worker not initialized".into()),
-                false,
-            ),
         },
+        SinkWorkerAction::Recv {
+            sink,
+            timeout_ms,
+            limit,
+        } => match sink.recv(recv_opts(timeout_ms, limit)).await {
+            Ok(events) => (SinkWorkerResponse::Events(events), false),
+            Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+        },
+        SinkWorkerAction::OnControlFrame { sink, envelopes } => {
+            match sink.on_control_frame(&envelopes).await {
+                Ok(_) => (SinkWorkerResponse::Ack, false),
+                Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
+            }
+        }
     }
 }
 
@@ -297,8 +367,11 @@ impl TypedWorkerSession<SinkWorkerRpc> for SinkWorkerSession {
         request: SinkWorkerRequest,
         _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<WorkerLoopControl<SinkWorkerResponse>> {
-        let mut guard = self.state.lock().await;
-        let (response, stop) = process_worker_request(request, &mut guard).await;
+        let action = {
+            let guard = self.state.lock().await;
+            plan_worker_request(request, &guard)
+        };
+        let (response, stop) = execute_worker_action(action).await;
         Ok(if stop {
             WorkerLoopControl::Stop(response)
         } else {
@@ -311,8 +384,11 @@ impl TypedWorkerSession<SinkWorkerRpc> for SinkWorkerSession {
         envelopes: &[ControlEnvelope],
         _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<()> {
-        let guard = self.state.lock().await;
-        let Some(sink) = guard.sink.as_ref() else {
+        let sink = {
+            let guard = self.state.lock().await;
+            guard.sink.clone()
+        };
+        let Some(sink) = sink else {
             return Err(CnxError::NotReady(
                 "worker runtime not initialized for runtime control frames".into(),
             ));

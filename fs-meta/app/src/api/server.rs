@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::sync_channel;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
@@ -273,7 +274,31 @@ fn router(state: ApiState) -> Result<Router> {
         .with_state(state);
     Ok(management
         .nest("/api/fs-meta/v1", projection_router)
+        .layer(middleware::from_fn(request_logging))
         .layer(cors))
+}
+
+async fn request_logging(request: Request, next: Next) -> Response {
+    static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+
+    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+    let method = request.method().clone();
+    let path = request.uri().path().to_string();
+    let started_at = std::time::Instant::now();
+    eprintln!(
+        "fs_meta_api_server: request begin id={} method={} path={}",
+        request_id, method, path
+    );
+    let response = next.run(request).await;
+    eprintln!(
+        "fs_meta_api_server: request done id={} method={} path={} status={} elapsed_ms={}",
+        request_id,
+        method,
+        path,
+        response.status().as_u16(),
+        started_at.elapsed().as_millis()
+    );
+    response
 }
 
 async fn query_api_key_guard(

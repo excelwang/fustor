@@ -51,9 +51,8 @@ use crate::runtime::orchestration::{
     source_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
-    METHOD_SOURCE_FIND, METHOD_SOURCE_RESCAN, METHOD_SOURCE_RESCAN_CONTROL,
-    METHOD_SOURCE_ROOTS_CONTROL, ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
-    source_rescan_route_key_for,
+    METHOD_SOURCE_RESCAN, METHOD_SOURCE_RESCAN_CONTROL, METHOD_SOURCE_ROOTS_CONTROL,
+    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings, source_rescan_route_key_for,
 };
 use crate::runtime::unit_gate::RuntimeUnitGate;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
@@ -110,20 +109,6 @@ fn lock_or_recover<'a, T>(m: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
             poisoned.into_inner()
         }
     }
-}
-
-fn build_error_marker_event(node_id: &NodeId, correlation_id: Option<u64>, message: &str) -> Event {
-    Event::new(
-        EventMetadata {
-            origin_id: node_id.clone(),
-            timestamp_us: now_us(),
-            logical_ts: None,
-            correlation_id,
-            ingress_auth: None,
-            trace: None,
-        },
-        bytes::Bytes::copy_from_slice(message.as_bytes()),
-    )
 }
 
 fn encode_force_find_grouped_events(
@@ -1627,119 +1612,12 @@ impl FSMetaSource {
             let rescan_roots = source.state_cell.roots_handle();
             let rescan_fanout_health = source.state_cell.fanout_health_handle();
             let rescan_manual_intents = source.state_cell.manual_rescan_intents_handle();
-            let node_id_cloned = node_id.clone();
             let node_id_rescan = node_id.clone();
             let node_id_rescan_scoped = node_id.clone();
             let rescan_roots_scoped = rescan_roots.clone();
             let rescan_fanout_health_scoped = rescan_fanout_health.clone();
             let rescan_manual_intents_scoped = rescan_manual_intents.clone();
-            let source_for_find = source.clone();
             let routes = default_route_bindings();
-            match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
-                Ok(route) => {
-                    log::info!(
-                        "bound route listening on {}.{} for source {}",
-                        ROUTE_TOKEN_FS_META_INTERNAL,
-                        METHOD_SOURCE_FIND,
-                        node_id_cloned.0
-                    );
-                    let endpoint_task = ManagedEndpointTask::spawn(
-                        sys.clone(),
-                        route,
-                        format!(
-                            "source:{}:{}",
-                            ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND
-                        ),
-                        source.shutdown.clone(),
-                        move |requests| {
-                            let node_id_cloned = node_id_cloned.clone();
-                            let source_for_find = source_for_find.clone();
-                            async move {
-                                let mut responses = Vec::new();
-                                for req in requests {
-                                    if let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
-                                        req.payload_bytes(),
-                                    ) {
-                                        if params.transport != QueryTransport::ForceFind {
-                                            log::warn!(
-                                                "boundary endpoint rejected non-force-find transport"
-                                            );
-                                            responses.push(build_error_marker_event(
-                                                &node_id_cloned,
-                                                req.metadata().correlation_id,
-                                                "force-find source invalid request transport",
-                                            ));
-                                            continue;
-                                        }
-                                        eprintln!(
-                                            "fs_meta_source: route force-find request correlation={:?} selected_group={:?} path={:?} recursive={}",
-                                            req.metadata().correlation_id,
-                                            params.scope.selected_group,
-                                            params.scope.path,
-                                            params.scope.recursive
-                                        );
-                                        match source_for_find.force_find(&params) {
-                                            Ok(grouped_events) => {
-                                                eprintln!(
-                                                    "fs_meta_source: route force-find response correlation={:?} groups_events={}",
-                                                    req.metadata().correlation_id,
-                                                    grouped_events.len()
-                                                );
-                                                for event in grouped_events {
-                                                    let mut meta = event.metadata().clone();
-                                                    meta.correlation_id =
-                                                        req.metadata().correlation_id;
-                                                    responses.push(Event::new(
-                                                        meta,
-                                                        bytes::Bytes::copy_from_slice(
-                                                            event.payload_bytes(),
-                                                        ),
-                                                    ));
-                                                }
-                                            }
-                                            Err(err) => {
-                                                log::error!(
-                                                    "boundary endpoint force-find failed: {:?}",
-                                                    err
-                                                );
-                                                responses.push(build_error_marker_event(
-                                                    &node_id_cloned,
-                                                    req.metadata().correlation_id,
-                                                    &err.to_string(),
-                                                ));
-                                            }
-                                        }
-                                    } else {
-                                        log::warn!(
-                                            "boundary endpoint failed to parse InternalQueryRequest"
-                                        );
-                                        responses.push(build_error_marker_event(
-                                            &node_id_cloned,
-                                            req.metadata().correlation_id,
-                                            "force-find source invalid request payload",
-                                        ));
-                                    }
-                                }
-                                responses
-                            }
-                        },
-                    );
-                    lock_or_recover(
-                        &source.endpoint_tasks,
-                        "source.with_boundaries.endpoint_tasks",
-                    )
-                    .push(endpoint_task);
-                }
-                Err(err) => {
-                    log::error!(
-                        "failed to resolve source bound route {}.{}: {:?}",
-                        ROUTE_TOKEN_FS_META_INTERNAL,
-                        METHOD_SOURCE_FIND,
-                        err
-                    );
-                }
-            }
-
             match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
                 Ok(route) => {
                     log::info!(
@@ -1962,115 +1840,12 @@ impl FSMetaSource {
         let rescan_roots = self.state_cell.roots_handle();
         let rescan_fanout_health = self.state_cell.fanout_health_handle();
         let rescan_manual_intents = self.state_cell.manual_rescan_intents_handle();
-        let node_id_cloned = self.node_id.clone();
         let node_id_rescan = self.node_id.clone();
         let node_id_rescan_scoped = self.node_id.clone();
         let rescan_roots_scoped = rescan_roots.clone();
         let rescan_fanout_health_scoped = rescan_fanout_health.clone();
         let rescan_manual_intents_scoped = rescan_manual_intents.clone();
-        let source_for_find = self.clone();
         let routes = default_route_bindings();
-
-        match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND) {
-            Ok(route) => {
-                log::info!(
-                    "bound route listening on {}.{} for deferred source {}",
-                    ROUTE_TOKEN_FS_META_INTERNAL,
-                    METHOD_SOURCE_FIND,
-                    node_id_cloned.0
-                );
-                let endpoint_task = ManagedEndpointTask::spawn(
-                    boundary.clone(),
-                    route,
-                    format!(
-                        "source:{}:{}",
-                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND
-                    ),
-                    self.shutdown.clone(),
-                    move |requests| {
-                        let node_id_cloned = node_id_cloned.clone();
-                        let source_for_find = source_for_find.clone();
-                        async move {
-                            let mut responses = Vec::new();
-                            for req in requests {
-                                if let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
-                                    req.payload_bytes(),
-                                ) {
-                                    if params.transport != QueryTransport::ForceFind {
-                                        log::warn!(
-                                            "boundary endpoint rejected non-force-find transport"
-                                        );
-                                        responses.push(build_error_marker_event(
-                                            &node_id_cloned,
-                                            req.metadata().correlation_id,
-                                            "force-find source invalid request transport",
-                                        ));
-                                        continue;
-                                    }
-                                    eprintln!(
-                                        "fs_meta_source: route force-find request correlation={:?} selected_group={:?} path={:?} recursive={}",
-                                        req.metadata().correlation_id,
-                                        params.scope.selected_group,
-                                        params.scope.path,
-                                        params.scope.recursive
-                                    );
-                                    match source_for_find.force_find(&params) {
-                                        Ok(grouped_events) => {
-                                            eprintln!(
-                                                "fs_meta_source: route force-find response correlation={:?} groups_events={}",
-                                                req.metadata().correlation_id,
-                                                grouped_events.len()
-                                            );
-                                            for event in grouped_events {
-                                                let mut meta = event.metadata().clone();
-                                                meta.correlation_id = req.metadata().correlation_id;
-                                                responses.push(Event::new(
-                                                    meta,
-                                                    bytes::Bytes::copy_from_slice(
-                                                        event.payload_bytes(),
-                                                    ),
-                                                ));
-                                            }
-                                        }
-                                        Err(err) => {
-                                            log::error!(
-                                                "boundary endpoint force-find failed: {:?}",
-                                                err
-                                            );
-                                            responses.push(build_error_marker_event(
-                                                &node_id_cloned,
-                                                req.metadata().correlation_id,
-                                                &err.to_string(),
-                                            ));
-                                        }
-                                    }
-                                } else {
-                                    log::warn!(
-                                        "boundary endpoint failed to parse InternalQueryRequest"
-                                    );
-                                    responses.push(build_error_marker_event(
-                                        &node_id_cloned,
-                                        req.metadata().correlation_id,
-                                        "force-find source invalid request payload",
-                                    ));
-                                }
-                            }
-                            responses
-                        }
-                    },
-                );
-                lock_or_recover(&self.endpoint_tasks, "source.start_runtime_endpoints.tasks")
-                    .push(endpoint_task);
-            }
-            Err(err) => {
-                log::error!(
-                    "failed to resolve deferred source bound route {}.{}: {:?}",
-                    ROUTE_TOKEN_FS_META_INTERNAL,
-                    METHOD_SOURCE_FIND,
-                    err
-                );
-            }
-        }
 
         match routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN) {
             Ok(route) => {
@@ -2698,6 +2473,11 @@ impl FSMetaSource {
 
     /// Update logical roots online and reconcile concrete-root tasks without restart.
     pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
+        eprintln!(
+            "fs_meta_source: update_logical_roots begin node={} roots={}",
+            self.node_id.0,
+            roots.len()
+        );
         let mut cfg = self.config.clone();
         cfg.roots = roots;
         let root_specs = cfg.effective_roots().map_err(CnxError::InvalidInput)?;
@@ -2735,6 +2515,10 @@ impl FSMetaSource {
         self.state_cell.record_authoritative_commit(
             "source.update_logical_roots",
             format!("roots={} host_object_grants={}", root_count, grant_count),
+        );
+        eprintln!(
+            "fs_meta_source: update_logical_roots ok node={} roots={} grants={}",
+            self.node_id.0, root_count, grant_count
         );
         Ok(())
     }

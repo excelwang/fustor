@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -54,6 +54,17 @@ pub struct SourceWorkerClientHandle {
     worker_binding: RuntimeWorkerBinding,
     worker: TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
+    control_ops_inflight: Arc<AtomicUsize>,
+}
+
+struct InflightControlOpGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for InflightControlOpGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl SourceWorkerClientHandle {
@@ -77,8 +88,20 @@ impl SourceWorkerClientHandle {
                 logical_roots: Some(config.roots.clone()),
                 ..SourceWorkerSnapshotCache::default()
             })),
+            control_ops_inflight: Arc::new(AtomicUsize::new(0)),
             config,
         })
+    }
+
+    fn begin_control_op(&self) -> InflightControlOpGuard {
+        self.control_ops_inflight.fetch_add(1, Ordering::Relaxed);
+        InflightControlOpGuard {
+            counter: self.control_ops_inflight.clone(),
+        }
+    }
+
+    fn control_op_inflight(&self) -> bool {
+        self.control_ops_inflight.load(Ordering::Relaxed) > 0
     }
 
     fn with_cache_mut<T>(&self, f: impl FnOnce(&mut SourceWorkerSnapshotCache) -> T) -> T {
@@ -106,6 +129,20 @@ impl SourceWorkerClientHandle {
         build_degraded_worker_observability_snapshot(&guard, reason)
     }
 
+    fn update_cached_observability_snapshot(&self, snapshot: &SourceObservabilitySnapshot) {
+        self.with_cache_mut(|cache| {
+            cache.lifecycle_state = Some(snapshot.lifecycle_state.clone());
+            cache.host_object_grants_version = Some(snapshot.host_object_grants_version);
+            cache.grants = Some(snapshot.grants.clone());
+            cache.logical_roots = Some(snapshot.logical_roots.clone());
+            cache.status = Some(snapshot.status.clone());
+            cache.source_primary_by_group = Some(snapshot.source_primary_by_group.clone());
+            cache.last_force_find_runner_by_group =
+                Some(snapshot.last_force_find_runner_by_group.clone());
+            cache.force_find_inflight_groups = Some(snapshot.force_find_inflight_groups.clone());
+        });
+    }
+
     async fn with_started_retry<T, F, Fut>(&self, op: F) -> Result<T>
     where
         F: Fn(TypedWorkerClient<SourceWorkerRpc>) -> Fut,
@@ -130,6 +167,24 @@ impl SourceWorkerClientHandle {
         client.call_with_timeout(request, timeout).await
     }
 
+    async fn observability_snapshot_with_timeout(
+        &self,
+        client: &TypedWorkerClient<SourceWorkerRpc>,
+        timeout: Duration,
+    ) -> Result<SourceObservabilitySnapshot> {
+        match Self::call_worker(client, SourceWorkerRequest::ObservabilitySnapshot, timeout).await?
+        {
+            SourceWorkerResponse::ObservabilitySnapshot(snapshot) => {
+                self.update_cached_observability_snapshot(&snapshot);
+                Ok(snapshot)
+            }
+            other => Err(CnxError::ProtocolViolation(format!(
+                "unexpected source worker response for observability snapshot: {:?}",
+                other
+            ))),
+        }
+    }
+
     pub async fn start(&self) -> Result<()> {
         eprintln!(
             "fs_meta_source_worker_client: ensure_started begin node={}",
@@ -144,6 +199,12 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
+        let _inflight = self.begin_control_op();
+        eprintln!(
+            "fs_meta_source_worker_client: update_logical_roots begin node={} roots={}",
+            self.node_id.0,
+            roots.len()
+        );
         self.with_started_retry(|client| {
             let roots = roots.clone();
             async move {
@@ -169,6 +230,11 @@ impl SourceWorkerClientHandle {
                             self.with_cache_mut(|cache| {
                                 cache.logical_roots = Some(roots.clone());
                             });
+                            eprintln!(
+                                "fs_meta_source_worker_client: update_logical_roots ok node={} roots={}",
+                                self.node_id.0,
+                                roots.len()
+                            );
                             return Ok(());
                         }
                         Err(CnxError::PeerError(message))
@@ -480,6 +546,7 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn publish_manual_rescan_signal(&self) -> Result<()> {
+        let _inflight = self.begin_control_op();
         self.with_started_retry(|client| async move {
             match Self::call_worker(
                 &client,
@@ -499,6 +566,7 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
+        let _inflight = self.begin_control_op();
         eprintln!(
             "fs_meta_source_worker_client: on_control_frame begin node={} envelopes={}",
             self.node_id.0,
@@ -554,167 +622,30 @@ impl SourceWorkerClientHandle {
     }
 
     async fn try_observability_snapshot_nonblocking(&self) -> Result<SourceObservabilitySnapshot> {
+        if self.control_op_inflight() {
+            return Ok(
+                self.degraded_observability_snapshot_from_cache("source worker control in flight")
+            );
+        }
         let Some(client) = self.existing_client().await? else {
             return Ok(
                 self.degraded_observability_snapshot_from_cache("source worker status not started")
             );
         };
-
-        let lifecycle = Self::call_worker(
-            &client,
-            SourceWorkerRequest::LifecycleState,
-            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        eprintln!(
+            "fs_meta_source_worker_client: observability_snapshot begin node={} timeout_ms={}",
+            self.node_id.0,
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT.as_millis()
         );
-        let grants_version = Self::call_worker(
-            &client,
-            SourceWorkerRequest::HostObjectGrantsVersionSnapshot,
-            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
+        let result = self
+            .observability_snapshot_with_timeout(&client, SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT)
+            .await;
+        eprintln!(
+            "fs_meta_source_worker_client: observability_snapshot done node={} ok={}",
+            self.node_id.0,
+            result.is_ok()
         );
-        let grants = Self::call_worker(
-            &client,
-            SourceWorkerRequest::HostObjectGrantsSnapshot,
-            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
-        );
-        let logical_roots = Self::call_worker(
-            &client,
-            SourceWorkerRequest::LogicalRootsSnapshot,
-            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
-        );
-        let status = Self::call_worker(
-            &client,
-            SourceWorkerRequest::StatusSnapshot,
-            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
-        );
-        let source_primary_by_group = Self::call_worker(
-            &client,
-            SourceWorkerRequest::SourcePrimaryByGroupSnapshot,
-            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
-        );
-        let last_force_find_runner_by_group = Self::call_worker(
-            &client,
-            SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot,
-            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
-        );
-        let force_find_inflight_groups = Self::call_worker(
-            &client,
-            SourceWorkerRequest::ForceFindInflightGroupsSnapshot,
-            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT,
-        );
-
-        let (
-            lifecycle,
-            grants_version,
-            grants,
-            logical_roots,
-            status,
-            source_primary_by_group,
-            last_force_find_runner_by_group,
-            force_find_inflight_groups,
-        ) = tokio::join!(
-            lifecycle,
-            grants_version,
-            grants,
-            logical_roots,
-            status,
-            source_primary_by_group,
-            last_force_find_runner_by_group,
-            force_find_inflight_groups,
-        );
-
-        let lifecycle_state = match lifecycle? {
-            SourceWorkerResponse::LifecycleState(state) => state,
-            other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for lifecycle state: {:?}",
-                    other
-                )));
-            }
-        };
-        let host_object_grants_version = match grants_version? {
-            SourceWorkerResponse::HostObjectGrantsVersion(version) => version,
-            other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for host object grants version: {:?}",
-                    other
-                )));
-            }
-        };
-        let grants = match grants? {
-            SourceWorkerResponse::HostObjectGrants(grants) => grants,
-            other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for host object grants: {:?}",
-                    other
-                )));
-            }
-        };
-        let logical_roots = match logical_roots? {
-            SourceWorkerResponse::LogicalRoots(roots) => roots,
-            other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for logical roots: {:?}",
-                    other
-                )));
-            }
-        };
-        let status = match status? {
-            SourceWorkerResponse::StatusSnapshot(snapshot) => snapshot,
-            other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for status snapshot: {:?}",
-                    other
-                )));
-            }
-        };
-        let source_primary_by_group = match source_primary_by_group? {
-            SourceWorkerResponse::SourcePrimaryByGroup(groups) => groups,
-            other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for source-primary groups: {:?}",
-                    other
-                )));
-            }
-        };
-        let last_force_find_runner_by_group = match last_force_find_runner_by_group? {
-            SourceWorkerResponse::LastForceFindRunnerByGroup(groups) => groups,
-            other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for force-find runner groups: {:?}",
-                    other
-                )));
-            }
-        };
-        let force_find_inflight_groups = match force_find_inflight_groups? {
-            SourceWorkerResponse::ForceFindInflightGroups(groups) => groups,
-            other => {
-                return Err(CnxError::ProtocolViolation(format!(
-                    "unexpected source worker response for inflight force-find groups: {:?}",
-                    other
-                )));
-            }
-        };
-
-        self.with_cache_mut(|cache| {
-            cache.lifecycle_state = Some(lifecycle_state.clone());
-            cache.host_object_grants_version = Some(host_object_grants_version);
-            cache.grants = Some(grants.clone());
-            cache.logical_roots = Some(logical_roots.clone());
-            cache.status = Some(status.clone());
-            cache.source_primary_by_group = Some(source_primary_by_group.clone());
-            cache.last_force_find_runner_by_group = Some(last_force_find_runner_by_group.clone());
-            cache.force_find_inflight_groups = Some(force_find_inflight_groups.clone());
-        });
-
-        Ok(SourceObservabilitySnapshot {
-            lifecycle_state,
-            host_object_grants_version,
-            grants,
-            logical_roots,
-            status,
-            source_primary_by_group,
-            last_force_find_runner_by_group,
-            force_find_inflight_groups,
-        })
+        result
     }
 
     pub(crate) async fn observability_snapshot_nonblocking(&self) -> SourceObservabilitySnapshot {
@@ -725,10 +656,14 @@ impl SourceWorkerClientHandle {
             )),
         }
     }
+
+    pub(crate) fn cached_observability_snapshot(&self) -> SourceObservabilitySnapshot {
+        self.degraded_observability_snapshot_from_cache("source worker status served from cache")
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct SourceObservabilitySnapshot {
+pub struct SourceObservabilitySnapshot {
     pub lifecycle_state: String,
     pub host_object_grants_version: u64,
     pub grants: Vec<GrantedMountRoot>,
@@ -990,18 +925,15 @@ impl SourceFacade {
                 last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
                 force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
             }),
-            Self::Worker(client) => Ok(SourceObservabilitySnapshot {
-                lifecycle_state: client.lifecycle_state_label().await?,
-                host_object_grants_version: client.host_object_grants_version_snapshot().await?,
-                grants: client.host_object_grants_snapshot().await?,
-                logical_roots: client.logical_roots_snapshot().await?,
-                status: client.status_snapshot().await?,
-                source_primary_by_group: client.source_primary_by_group_snapshot().await?,
-                last_force_find_runner_by_group: client
-                    .last_force_find_runner_by_group_snapshot()
-                    .await?,
-                force_find_inflight_groups: client.force_find_inflight_groups_snapshot().await?,
-            }),
+            Self::Worker(client) => {
+                let worker_client = client.client().await?;
+                client
+                    .observability_snapshot_with_timeout(
+                        &worker_client,
+                        SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                    )
+                    .await
+            }
         }
     }
 
@@ -1020,6 +952,22 @@ impl SourceFacade {
             Self::Worker(client) => client.observability_snapshot_nonblocking().await,
         }
     }
+
+    pub(crate) fn cached_observability_snapshot(&self) -> SourceObservabilitySnapshot {
+        match self {
+            Self::Local(source) => SourceObservabilitySnapshot {
+                lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
+                host_object_grants_version: source.host_object_grants_version_snapshot(),
+                grants: source.host_object_grants_snapshot(),
+                logical_roots: source.logical_roots_snapshot(),
+                status: source.status_snapshot(),
+                source_primary_by_group: source.source_primary_by_group_snapshot(),
+                last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
+                force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
+            },
+            Self::Worker(client) => client.cached_observability_snapshot(),
+        }
+    }
 }
 
 fn spawn_local_source_pump(
@@ -1029,63 +977,30 @@ fn spawn_local_source_pump(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         if let Some(boundary) = boundary {
-            let mut lanes = HashMap::<
-                String,
-                (
-                    tokio::sync::mpsc::UnboundedSender<Vec<Event>>,
-                    JoinHandle<()>,
-                ),
-            >::new();
             tokio::pin!(stream);
             while let Some(batch) = stream.next().await {
-                let lane = batch
+                let origin = batch
                     .first()
                     .map(|event| event.metadata().origin_id.0.clone())
                     .unwrap_or_else(|| "__empty__".to_string());
-                let lane_tx = if let Some((tx, _)) = lanes.get(&lane) {
-                    tx.clone()
-                } else {
-                    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
-                    let send_boundary = boundary.clone();
-                    let lane_name = lane.clone();
-                    let task = tokio::spawn(async move {
-                        while let Some(batch) = rx.recv().await {
-                            if let Err(err) = send_boundary
-                                .channel_send(
-                                    BoundaryContext::default(),
-                                    ChannelSendRequest {
-                                        channel_key: ChannelKey(format!(
-                                            "{}.stream",
-                                            ROUTE_KEY_EVENTS
-                                        )),
-                                        events: batch,
-                                        timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
-                                    },
-                                )
-                                .await
-                            {
-                                log::error!(
-                                    "fs-meta app pump failed to publish source batch on stream route lane={}: {:?}",
-                                    lane_name,
-                                    err
-                                );
-                                break;
-                            }
-                        }
-                    });
-                    lanes.insert(lane.clone(), (tx.clone(), task));
-                    tx
-                };
-                if lane_tx.send(batch).is_err() {
+                if let Err(err) = boundary
+                    .channel_send(
+                        BoundaryContext::default(),
+                        ChannelSendRequest {
+                            channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                            events: batch,
+                            timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
+                        },
+                    )
+                    .await
+                {
+                    log::error!(
+                        "fs-meta app pump failed to publish source batch on stream route origin={}: {:?}",
+                        origin,
+                        err
+                    );
                     break;
                 }
-            }
-            let mut tasks = Vec::with_capacity(lanes.len());
-            for (_, (_, task)) in lanes.drain() {
-                tasks.push(task);
-            }
-            for task in tasks {
-                let _ = task.await;
             }
         } else {
             tokio::pin!(stream);

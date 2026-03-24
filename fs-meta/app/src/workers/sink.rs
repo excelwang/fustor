@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,6 +85,17 @@ pub struct SinkWorkerClientHandle {
     worker: TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
+    control_ops_inflight: Arc<AtomicUsize>,
+}
+
+struct InflightControlOpGuard {
+    counter: Arc<AtomicUsize>,
+}
+
+impl Drop for InflightControlOpGuard {
+    fn drop(&mut self) {
+        self.counter.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 impl SinkWorkerClientHandle {
@@ -106,7 +118,19 @@ impl SinkWorkerClientHandle {
             worker_binding,
             logical_roots_cache,
             status_cache: Arc::new(Mutex::new(SinkStatusSnapshot::default())),
+            control_ops_inflight: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    fn begin_control_op(&self) -> InflightControlOpGuard {
+        self.control_ops_inflight.fetch_add(1, Ordering::Relaxed);
+        InflightControlOpGuard {
+            counter: self.control_ops_inflight.clone(),
+        }
+    }
+
+    fn control_op_inflight(&self) -> bool {
+        self.control_ops_inflight.load(Ordering::Relaxed) > 0
     }
 
     async fn existing_client(&self) -> Result<Option<TypedWorkerClient<SinkWorkerRpc>>> {
@@ -185,6 +209,13 @@ impl SinkWorkerClientHandle {
         roots: Vec<crate::source::config::RootSpec>,
         host_object_grants: Vec<GrantedMountRoot>,
     ) -> Result<()> {
+        let _inflight = self.begin_control_op();
+        eprintln!(
+            "fs_meta_sink_worker_client: update_logical_roots begin node={} roots={} grants={}",
+            self.node_id.0,
+            roots.len(),
+            host_object_grants.len()
+        );
         self.with_started_retry(|client| {
             let roots = roots.clone();
             let host_object_grants = host_object_grants.clone();
@@ -199,7 +230,15 @@ impl SinkWorkerClientHandle {
                 )
                 .await?
                 {
-                    SinkWorkerResponse::Ack => Ok(()),
+                    SinkWorkerResponse::Ack => {
+                        eprintln!(
+                            "fs_meta_sink_worker_client: update_logical_roots ok node={} roots={} grants={}",
+                            self.node_id.0,
+                            roots.len(),
+                            host_object_grants.len()
+                        );
+                        Ok(())
+                    }
                     other => Err(CnxError::ProtocolViolation(format!(
                         "unexpected sink worker response for update roots: {:?}",
                         other
@@ -273,6 +312,9 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
+        if self.control_op_inflight() {
+            return self.cached_status_snapshot();
+        }
         match self.existing_client().await? {
             Some(client) => match Self::call_worker(
                 &client,
@@ -530,6 +572,7 @@ impl SinkWorkerClientHandle {
     }
 
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
+        let _inflight = self.begin_control_op();
         eprintln!(
             "fs_meta_sink_worker_client: on_control_frame begin node={} envelopes={}",
             self.node_id.0,
@@ -559,6 +602,10 @@ impl SinkWorkerClientHandle {
 
     pub async fn close(&self) -> Result<()> {
         self.worker.shutdown(Duration::from_secs(2)).await
+    }
+
+    pub(crate) fn cached_status_snapshot_for_status_route(&self) -> Result<SinkStatusSnapshot> {
+        self.cached_status_snapshot()
     }
 }
 
@@ -646,6 +693,13 @@ impl SinkFacade {
         match self {
             Self::Local(sink) => sink.status_snapshot(),
             Self::Worker(client) => client.status_snapshot_nonblocking().await,
+        }
+    }
+
+    pub(crate) fn cached_status_snapshot_for_status_route(&self) -> Result<SinkStatusSnapshot> {
+        match self {
+            Self::Local(sink) => sink.status_snapshot(),
+            Self::Worker(client) => client.cached_status_snapshot_for_status_route(),
         }
     }
 

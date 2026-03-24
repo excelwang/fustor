@@ -1,6 +1,6 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId};
@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::source::FSMetaSource;
 use crate::source::config::SourceConfig;
+use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
 use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
 
@@ -29,6 +30,50 @@ struct SourceWorkerState {
     source: Option<Arc<FSMetaSource>>,
     pending_init: Option<(NodeId, SourceConfig)>,
     pump_task: Option<JoinHandle<()>>,
+}
+
+enum SourceWorkerAction {
+    Immediate(SourceWorkerResponse, bool),
+    UpdateLogicalRoots {
+        source: Arc<FSMetaSource>,
+        roots: Vec<crate::source::config::RootSpec>,
+    },
+    PublishManualRescanSignal {
+        source: Arc<FSMetaSource>,
+    },
+    OnControlFrame {
+        source: Arc<FSMetaSource>,
+        envelopes: Vec<ControlEnvelope>,
+    },
+}
+
+fn next_source_worker_request_seq() -> u64 {
+    static NEXT_SEQ: AtomicU64 = AtomicU64::new(1);
+    NEXT_SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
+    match request {
+        SourceWorkerRequest::UpdateLogicalRoots { .. } => "UpdateLogicalRoots",
+        SourceWorkerRequest::LogicalRootsSnapshot => "LogicalRootsSnapshot",
+        SourceWorkerRequest::HostObjectGrantsSnapshot => "HostObjectGrantsSnapshot",
+        SourceWorkerRequest::HostObjectGrantsVersionSnapshot => "HostObjectGrantsVersionSnapshot",
+        SourceWorkerRequest::StatusSnapshot => "StatusSnapshot",
+        SourceWorkerRequest::ObservabilitySnapshot => "ObservabilitySnapshot",
+        SourceWorkerRequest::LifecycleState => "LifecycleState",
+        SourceWorkerRequest::ScheduledSourceGroupIds => "ScheduledSourceGroupIds",
+        SourceWorkerRequest::ScheduledScanGroupIds => "ScheduledScanGroupIds",
+        SourceWorkerRequest::SourcePrimaryByGroupSnapshot => "SourcePrimaryByGroupSnapshot",
+        SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot => {
+            "LastForceFindRunnerByGroupSnapshot"
+        }
+        SourceWorkerRequest::ForceFindInflightGroupsSnapshot => "ForceFindInflightGroupsSnapshot",
+        SourceWorkerRequest::ForceFind { .. } => "ForceFind",
+        SourceWorkerRequest::ResolveGroupIdForObjectRef { .. } => "ResolveGroupIdForObjectRef",
+        SourceWorkerRequest::PublishManualRescanSignal => "PublishManualRescanSignal",
+        SourceWorkerRequest::TriggerRescanWhenReady => "TriggerRescanWhenReady",
+        SourceWorkerRequest::OnControlFrame { .. } => "OnControlFrame",
+    }
 }
 
 fn classify_source_worker_error(err: CnxError) -> SourceWorkerResponse {
@@ -72,67 +117,49 @@ where
     S: futures_util::Stream<Item = Vec<Event>> + Send + 'static,
 {
     tokio::spawn(async move {
-        let mut lanes = HashMap::<
-            String,
-            (
-                tokio::sync::mpsc::UnboundedSender<Vec<Event>>,
-                JoinHandle<()>,
-            ),
-        >::new();
-
         futures_util::pin_mut!(stream);
         while let Some(batch) = stream.next().await {
-            let lane = batch
+            let origin = batch
                 .first()
                 .map(|event| event.metadata().origin_id.0.clone())
                 .unwrap_or_else(|| "__empty__".to_string());
-            let lane_tx = if let Some((tx, _)) = lanes.get(&lane) {
-                tx.clone()
-            } else {
-                let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<Event>>();
-                let send_boundary = boundary.clone();
-                let lane_name = lane.clone();
-                let task = tokio::spawn(async move {
-                    while let Some(batch) = rx.recv().await {
-                        if let Err(err) = send_boundary
-                            .channel_send(
-                                BoundaryContext::default(),
-                                ChannelSendRequest {
-                                    channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
-                                    events: batch,
-                                    timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
-                                },
-                            )
-                            .await
-                        {
-                            log::error!(
-                                "source worker pump failed to publish source batch on stream route lane={}: {:?}",
-                                lane_name,
-                                err
-                            );
-                            break;
-                        }
-                    }
-                });
-                lanes.insert(lane.clone(), (tx.clone(), task));
-                tx
-            };
-            if lane_tx.send(batch).is_err() {
+            if let Err(err) = boundary
+                .channel_send(
+                    BoundaryContext::default(),
+                    ChannelSendRequest {
+                        channel_key: ChannelKey(format!("{}.stream", ROUTE_KEY_EVENTS)),
+                        events: batch,
+                        timeout_ms: Some(Duration::from_secs(5).as_millis() as u64),
+                    },
+                )
+                .await
+            {
+                log::error!(
+                    "source worker pump failed to publish source batch on stream route origin={}: {:?}",
+                    origin,
+                    err
+                );
                 break;
             }
-        }
-        let mut tasks = Vec::with_capacity(lanes.len());
-        for (_, (_, task)) in lanes.drain() {
-            tasks.push(task);
-        }
-        for task in tasks {
-            let _ = task.await;
         }
     })
 }
 
 fn bootstrap_not_ready() -> CnxError {
     CnxError::NotReady("worker not initialized".into())
+}
+
+fn source_observability_snapshot(source: &FSMetaSource) -> SourceObservabilitySnapshot {
+    SourceObservabilitySnapshot {
+        lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
+        host_object_grants_version: source.host_object_grants_version_snapshot(),
+        grants: source.host_object_grants_snapshot(),
+        logical_roots: source.logical_roots_snapshot(),
+        status: source.status_snapshot(),
+        source_primary_by_group: source.source_primary_by_group_snapshot(),
+        last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
+        force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
+    }
 }
 
 async fn bootstrap_init_source_runtime(
@@ -202,198 +229,246 @@ async fn bootstrap_start_source_runtime(
     Ok(())
 }
 
-async fn process_worker_request(
+fn plan_worker_request(
     request: SourceWorkerRequest,
-    state: &mut SourceWorkerState,
-) -> (SourceWorkerResponse, bool) {
+    state: &SourceWorkerState,
+) -> SourceWorkerAction {
     match request {
-        SourceWorkerRequest::UpdateLogicalRoots { roots } => match state.source.as_ref() {
-            Some(source) => match source.update_logical_roots(roots).await {
-                Ok(_) => (SourceWorkerResponse::Ack, false),
-                Err(err) => (classify_source_worker_error(err), false),
-            },
-            None => (
+        SourceWorkerRequest::UpdateLogicalRoots { roots } => match state.source.clone() {
+            Some(source) => SourceWorkerAction::UpdateLogicalRoots { source, roots },
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::LogicalRootsSnapshot => match state.source.as_ref() {
-            Some(source) => (
+            Some(source) => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::LogicalRoots(source.logical_roots_snapshot()),
                 false,
             ),
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::HostObjectGrantsSnapshot => match state.source.as_ref() {
-            Some(source) => (
+            Some(source) => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::HostObjectGrants(source.host_object_grants_snapshot()),
                 false,
             ),
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::HostObjectGrantsVersionSnapshot => match state.source.as_ref() {
-            Some(source) => (
+            Some(source) => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::HostObjectGrantsVersion(
                     source.host_object_grants_version_snapshot(),
                 ),
                 false,
             ),
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::StatusSnapshot => match state.source.as_ref() {
-            Some(source) => (
+            Some(source) => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::StatusSnapshot(source.status_snapshot()),
                 false,
             ),
-            None => (
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
+        SourceWorkerRequest::ObservabilitySnapshot => match state.source.as_ref() {
+            Some(source) => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::ObservabilitySnapshot(source_observability_snapshot(source)),
+                false,
+            ),
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::LifecycleState => match state.source.as_ref() {
-            Some(source) => (
+            Some(source) => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::LifecycleState(
                     format!("{:?}", source.state()).to_ascii_lowercase(),
                 ),
                 false,
             ),
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::ScheduledSourceGroupIds => match state.source.as_ref() {
             Some(source) => match source.scheduled_source_group_ids() {
-                Ok(groups) => (
+                Ok(groups) => SourceWorkerAction::Immediate(
                     SourceWorkerResponse::ScheduledGroupIds(
                         groups.map(|group_ids| group_ids.into_iter().collect()),
                     ),
                     false,
                 ),
-                Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
+                Err(err) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::Error(err.to_string()),
+                    false,
+                ),
             },
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::ScheduledScanGroupIds => match state.source.as_ref() {
             Some(source) => match source.scheduled_scan_group_ids() {
-                Ok(groups) => (
+                Ok(groups) => SourceWorkerAction::Immediate(
                     SourceWorkerResponse::ScheduledGroupIds(
                         groups.map(|group_ids| group_ids.into_iter().collect()),
                     ),
                     false,
                 ),
-                Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
+                Err(err) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::Error(err.to_string()),
+                    false,
+                ),
             },
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::SourcePrimaryByGroupSnapshot => match state.source.as_ref() {
-            Some(source) => (
+            Some(source) => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::SourcePrimaryByGroup(
                     source.source_primary_by_group_snapshot(),
                 ),
                 false,
             ),
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::LastForceFindRunnerByGroupSnapshot => match state.source.as_ref() {
-            Some(source) => (
+            Some(source) => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::LastForceFindRunnerByGroup(
                     source.last_force_find_runner_by_group_snapshot(),
                 ),
                 false,
             ),
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::ForceFindInflightGroupsSnapshot => match state.source.as_ref() {
-            Some(source) => (
+            Some(source) => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::ForceFindInflightGroups(
                     source.force_find_inflight_groups_snapshot(),
                 ),
                 false,
             ),
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::ForceFind { request } => match state.source.as_ref() {
             Some(source) => match source.force_find(&request) {
-                Ok(events) => (SourceWorkerResponse::Events(events), false),
-                Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
+                Ok(events) => {
+                    SourceWorkerAction::Immediate(SourceWorkerResponse::Events(events), false)
+                }
+                Err(err) => SourceWorkerAction::Immediate(
+                    SourceWorkerResponse::Error(err.to_string()),
+                    false,
+                ),
             },
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
         SourceWorkerRequest::ResolveGroupIdForObjectRef { object_ref } => {
             match state.source.as_ref() {
-                Some(source) => (
+                Some(source) => SourceWorkerAction::Immediate(
                     SourceWorkerResponse::ResolveGroupIdForObjectRef(
                         source.resolve_group_id_for_object_ref(&object_ref),
                     ),
                     false,
                 ),
-                None => (
+                None => SourceWorkerAction::Immediate(
                     SourceWorkerResponse::Error("worker not initialized".into()),
                     false,
                 ),
             }
         }
-        SourceWorkerRequest::PublishManualRescanSignal => match state.source.as_ref() {
-            Some(source) => match source.publish_manual_rescan_signal().await {
-                Ok(()) => (SourceWorkerResponse::Ack, false),
-                Err(err) => (classify_source_worker_error(err), false),
-            },
-            None => (
+        SourceWorkerRequest::PublishManualRescanSignal => match state.source.clone() {
+            Some(source) => SourceWorkerAction::PublishManualRescanSignal { source },
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
-        SourceWorkerRequest::TriggerRescanWhenReady => match state.source.as_ref() {
+        SourceWorkerRequest::TriggerRescanWhenReady => match state.source.clone() {
             Some(source) => {
-                let source = source.clone();
                 tokio::spawn(async move {
                     source.trigger_rescan_when_ready().await;
                 });
-                (SourceWorkerResponse::Ack, false)
+                SourceWorkerAction::Immediate(SourceWorkerResponse::Ack, false)
             }
-            None => (
+            None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
             ),
         },
-        SourceWorkerRequest::OnControlFrame { envelopes } => match state.source.as_ref() {
-            Some(source) => match source.on_control_frame(&envelopes).await {
+        SourceWorkerRequest::OnControlFrame { envelopes } => match state.source.clone() {
+            Some(source) => SourceWorkerAction::OnControlFrame { source, envelopes },
+            None => SourceWorkerAction::Immediate(
+                SourceWorkerResponse::Error("worker not initialized".into()),
+                false,
+            ),
+        },
+    }
+}
+
+async fn execute_worker_action(action: SourceWorkerAction) -> (SourceWorkerResponse, bool) {
+    match action {
+        SourceWorkerAction::Immediate(response, stop) => (response, stop),
+        SourceWorkerAction::UpdateLogicalRoots { source, roots } => {
+            eprintln!(
+                "fs_meta_source_worker_server: update_logical_roots begin roots={}",
+                roots.len()
+            );
+            match source.update_logical_roots(roots).await {
+                Ok(_) => {
+                    eprintln!("fs_meta_source_worker_server: update_logical_roots ok");
+                    (SourceWorkerResponse::Ack, false)
+                }
+                Err(err) => {
+                    eprintln!(
+                        "fs_meta_source_worker_server: update_logical_roots err={}",
+                        err
+                    );
+                    (classify_source_worker_error(err), false)
+                }
+            }
+        }
+        SourceWorkerAction::PublishManualRescanSignal { source } => {
+            match source.publish_manual_rescan_signal().await {
+                Ok(()) => (SourceWorkerResponse::Ack, false),
+                Err(err) => (classify_source_worker_error(err), false),
+            }
+        }
+        SourceWorkerAction::OnControlFrame { source, envelopes } => {
+            match source.on_control_frame(&envelopes).await {
                 Ok(_) => (SourceWorkerResponse::Ack, false),
                 Err(err) => (SourceWorkerResponse::Error(err.to_string()), false),
-            },
-            None => (
-                SourceWorkerResponse::Error("worker not initialized".into()),
-                false,
-            ),
-        },
+            }
+        }
     }
 }
 
@@ -424,8 +499,21 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
         request: SourceWorkerRequest,
         _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<WorkerLoopControl<SourceWorkerResponse>> {
-        let mut guard = self.state.lock().await;
-        let (response, stop) = process_worker_request(request, &mut guard).await;
+        let request_seq = next_source_worker_request_seq();
+        let request_label = source_worker_request_label(&request);
+        eprintln!(
+            "fs_meta_source_worker_server: handle_request begin seq={} request={}",
+            request_seq, request_label
+        );
+        let action = {
+            let guard = self.state.lock().await;
+            plan_worker_request(request, &guard)
+        };
+        let (response, stop) = execute_worker_action(action).await;
+        eprintln!(
+            "fs_meta_source_worker_server: handle_request done seq={} request={} stop={}",
+            request_seq, request_label, stop
+        );
         Ok(if stop {
             WorkerLoopControl::Stop(response)
         } else {
@@ -438,13 +526,26 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
         envelopes: &[ControlEnvelope],
         _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<()> {
-        let guard = self.state.lock().await;
-        let Some(source) = guard.source.as_ref() else {
+        eprintln!(
+            "fs_meta_source_worker_server: on_runtime_control begin envelopes={}",
+            envelopes.len()
+        );
+        let source = {
+            let guard = self.state.lock().await;
+            guard.source.clone()
+        };
+        let Some(source) = source else {
             return Err(CnxError::NotReady(
                 "worker runtime not initialized for runtime control frames".into(),
             ));
         };
-        source.on_control_frame(envelopes).await
+        let result = source.on_control_frame(envelopes).await;
+        eprintln!(
+            "fs_meta_source_worker_server: on_runtime_control done envelopes={} ok={}",
+            envelopes.len(),
+            result.is_ok()
+        );
+        result
     }
 }
 
@@ -470,9 +571,12 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
     async fn on_start(&mut self, context: &WorkerSessionContext) -> capanix_app_sdk::Result<()> {
         eprintln!("fs_meta_source_worker_server: on_start begin");
         let mut guard = self.state.lock().await;
-        let result =
-            bootstrap_start_source_runtime(&mut guard, context.io_boundary(), context.state_boundary())
-                .await;
+        let result = bootstrap_start_source_runtime(
+            &mut guard,
+            context.io_boundary(),
+            context.state_boundary(),
+        )
+        .await;
         eprintln!(
             "fs_meta_source_worker_server: on_start done ok={}",
             result.is_ok()

@@ -734,6 +734,21 @@ fn e2e_apply_release_harness_does_not_retry_transport_failures() {
 }
 
 #[test]
+fn worker_servers_do_not_hold_state_mutex_across_async_control_or_rpc_calls() {
+    let source_server = read_app_spec("app/src/workers/source_server.rs");
+    let sink_server = read_app_spec("app/src/workers/sink_server.rs");
+
+    assert!(!source_server.contains("process_worker_request(request, &mut guard).await"));
+    assert!(!sink_server.contains("process_worker_request(request, &mut guard).await"));
+    assert!(!source_server.contains(
+        "let guard = self.state.lock().await;\n        let Some(source) = guard.source.as_ref()"
+    ));
+    assert!(!sink_server.contains(
+        "let guard = self.state.lock().await;\n        let Some(sink) = guard.sink.as_ref()"
+    ));
+}
+
+#[test]
 fn app_authoring_crate_stays_product_specific() {
     let l1 = read_app_spec("specs/L1-CONTRACTS.md");
     let l2 = read_app_spec("specs/L2-ARCHITECTURE.md");
@@ -849,13 +864,34 @@ fn sink_worker_bootstrap_defers_stream_consumption_until_start_completes() {
 #[test]
 fn status_paths_use_nonblocking_worker_observation_reads() {
     let handlers = read_app_spec("src/api/handlers.rs");
+    let query_api = read_app_spec("src/query/api.rs");
     let runtime_app = read_app_spec("src/runtime_app.rs");
+    let source_mod = read_app_spec("src/source/mod.rs");
+    let sink_mod = read_app_spec("src/sink/mod.rs");
     let worker_source = read_app_spec("src/workers/source.rs");
+    let worker_sink = read_app_spec("src/workers/sink.rs");
+    let worker_source_ipc = read_app_spec("src/workers/source_ipc.rs");
 
-    assert!(handlers.contains("state.source.observability_snapshot_nonblocking().await"));
-    assert!(runtime_app.contains("sink.status_snapshot_nonblocking().await"));
-    assert!(runtime_app.contains("source.observability_snapshot_nonblocking().await"));
+    assert!(handlers.contains("state.sink.cached_status_snapshot_for_status_route()"));
+    assert!(handlers.contains("state.source.cached_observability_snapshot()"));
+    assert!(!handlers.contains("state.sink.status_snapshot_nonblocking().await"));
+    assert!(!handlers.contains("state.source.observability_snapshot_nonblocking().await"));
+    assert!(query_api.contains("pub(crate) fn internal_status_request_payload() -> Bytes"));
+    assert!(runtime_app.contains("sink.cached_status_snapshot_for_status_route()"));
+    assert!(runtime_app.contains("source.cached_observability_snapshot()"));
+    assert!(!query_api.contains("METHOD_SOURCE_STATUS,\n            Bytes::new()"));
+    assert!(!query_api.contains("METHOD_SINK_STATUS,\n            Bytes::new()"));
+    assert!(!handlers.contains("METHOD_SOURCE_STATUS,\n            Bytes::new()"));
     assert!(worker_source.contains("try_observability_snapshot_nonblocking"));
+    assert!(worker_source.contains("cached_observability_snapshot"));
+    assert!(worker_source.contains("control_op_inflight()"));
+    assert!(worker_sink.contains("control_op_inflight()"));
+    assert!(worker_sink.contains("cached_status_snapshot_for_status_route"));
+    assert!(worker_source_ipc.contains("ObservabilitySnapshot"));
+    assert!(
+        !worker_source.contains("tokio::join!("),
+        "source worker observability reads must stay single-RPC to avoid status fanout timeouts"
+    );
     assert!(!worker_source.contains(
         ".observability_snapshot()\n                .await\n                .unwrap_or_else"
     ));
@@ -866,6 +902,31 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
     );
     assert!(runtime_app.contains("route_key == source_status_route"));
     assert!(runtime_app.contains("route_key == source_find_route"));
+    assert!(
+        !sink_mod.contains("routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)"),
+        "sink runtime endpoints must not bind sink-status; query/query-peer facade owns that route"
+    );
+    assert!(
+        !source_mod.contains("routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_FIND)"),
+        "source runtime endpoints must not bind source-find; query/query-peer facade owns that route"
+    );
+}
+
+#[test]
+fn source_stream_pumps_do_not_spawn_parallel_lane_writers() {
+    let worker_source = read_app_spec("src/workers/source.rs");
+    let worker_source_server = read_app_spec("src/workers/source_server.rs");
+
+    for source in [worker_source, worker_source_server] {
+        assert!(
+            !source.contains("let mut lanes ="),
+            "source stream pumps must serialize sends onto fs-meta.events instead of spawning per-origin lane writers"
+        );
+        assert!(
+            !source.contains("lane_tx"),
+            "source stream pumps must not retain per-lane sender queues for the shared events route"
+        );
+    }
 }
 
 #[test]

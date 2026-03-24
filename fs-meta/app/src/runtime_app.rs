@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
 
 use crate::api::facade_status::{
@@ -64,6 +64,53 @@ struct FacadeActivation {
     generation: u64,
     resource_ids: Vec<String>,
     handle: api::ApiServerHandle,
+}
+
+#[derive(Clone)]
+struct FacadeSpawnInProgress {
+    route_key: String,
+    resource_ids: Vec<String>,
+}
+
+impl FacadeSpawnInProgress {
+    fn from_pending(pending: &PendingFacadeActivation) -> Self {
+        Self {
+            route_key: pending.route_key.clone(),
+            resource_ids: pending.resource_ids.clone(),
+        }
+    }
+
+    fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {
+        self.route_key == pending.route_key && self.resource_ids == pending.resource_ids
+    }
+}
+
+#[derive(Clone)]
+struct ProcessFacadeClaim {
+    owner_instance_id: u64,
+    route_key: String,
+    resource_ids: Vec<String>,
+    bind_addr: String,
+}
+
+impl ProcessFacadeClaim {
+    fn from_pending(owner_instance_id: u64, pending: &PendingFacadeActivation) -> Option<Self> {
+        if facade_bind_addr_is_ephemeral(&pending.resolved.bind_addr) {
+            return None;
+        }
+        Some(Self {
+            owner_instance_id,
+            route_key: pending.route_key.clone(),
+            resource_ids: pending.resource_ids.clone(),
+            bind_addr: pending.resolved.bind_addr.clone(),
+        })
+    }
+
+    fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {
+        self.route_key == pending.route_key
+            && self.resource_ids == pending.resource_ids
+            && self.bind_addr == pending.resolved.bind_addr
+    }
 }
 
 #[derive(Clone)]
@@ -188,7 +235,48 @@ fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
     }
 }
 
+fn facade_bind_addr_is_ephemeral(bind_addr: &str) -> bool {
+    bind_addr
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse::<u16>().ok())
+        .is_some_and(|port| port == 0)
+}
+
+fn process_facade_claim_cell() -> &'static StdMutex<Option<ProcessFacadeClaim>> {
+    static CELL: OnceLock<StdMutex<Option<ProcessFacadeClaim>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+fn next_app_instance_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+fn clear_owned_process_facade_claim(instance_id: u64) {
+    let mut guard = match process_facade_claim_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if guard
+        .as_ref()
+        .is_some_and(|claim| claim.owner_instance_id == instance_id)
+    {
+        guard.take();
+    }
+}
+
+#[cfg(test)]
+fn clear_process_facade_claim_for_tests() {
+    clear_owned_process_facade_claim(0);
+    let mut guard = match process_facade_claim_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.take();
+}
+
 pub struct FSMetaApp {
+    instance_id: u64,
     config: FSMetaConfig,
     node_id: NodeId,
     runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
@@ -200,6 +288,8 @@ pub struct FSMetaApp {
     runtime_endpoint_routes: Mutex<std::collections::BTreeSet<String>>,
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
+    facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
+    control_frame_serial: Mutex<()>,
     facade_pending_status: SharedFacadePendingStatusCell,
     facade_gate: RuntimeUnitGate,
     control_initialized: AtomicBool,
@@ -351,6 +441,7 @@ impl FSMetaApp {
         };
         let query_sink = sink.clone();
         Ok(Self {
+            instance_id: next_app_instance_id(),
             config,
             node_id,
             runtime_boundary: boundary,
@@ -362,6 +453,8 @@ impl FSMetaApp {
             runtime_endpoint_routes: Mutex::new(std::collections::BTreeSet::new()),
             api_task: Arc::new(Mutex::new(None)),
             pending_facade: Arc::new(Mutex::new(None)),
+            facade_spawn_in_progress: Arc::new(Mutex::new(None)),
+            control_frame_serial: Mutex::new(()),
             facade_pending_status: shared_facade_pending_status_cell(),
             facade_gate: RuntimeUnitGate::new(
                 "fs-meta",
@@ -626,7 +719,7 @@ impl FSMetaApp {
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
-                                match sink.status_snapshot_nonblocking().await {
+                                match sink.cached_status_snapshot_for_status_route() {
                                     Ok(snapshot) => {
                                         eprintln!(
                                             "fs_meta_runtime_app: sink status endpoint response groups={}",
@@ -683,7 +776,7 @@ impl FSMetaApp {
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
-                                let snapshot = source.observability_snapshot_nonblocking().await;
+                                let snapshot = source.cached_observability_snapshot();
                                 eprintln!(
                                     "fs_meta_runtime_app: source status endpoint response groups={} runners={}",
                                     snapshot.source_primary_by_group.len(),
@@ -985,8 +1078,10 @@ impl FSMetaApp {
 
     async fn try_spawn_pending_facade(&self) -> Result<bool> {
         Self::try_spawn_pending_facade_from_parts(
+            self.instance_id,
             self.api_task.clone(),
             self.pending_facade.clone(),
+            self.facade_spawn_in_progress.clone(),
             self.facade_pending_status.clone(),
             self.node_id.clone(),
             self.runtime_boundary.clone(),
@@ -999,8 +1094,10 @@ impl FSMetaApp {
     }
 
     async fn try_spawn_pending_facade_from_parts(
+        instance_id: u64,
         api_task: Arc<Mutex<Option<FacadeActivation>>>,
         pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
+        facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
         facade_pending_status: SharedFacadePendingStatusCell,
         node_id: NodeId,
         runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
@@ -1009,9 +1106,93 @@ impl FSMetaApp {
         query_sink: Arc<SinkFacade>,
         query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     ) -> Result<bool> {
+        Self::try_spawn_pending_facade_from_parts_with_spawn(
+            instance_id,
+            api_task,
+            pending_facade,
+            facade_spawn_in_progress,
+            facade_pending_status,
+            node_id,
+            runtime_boundary,
+            source,
+            sink,
+            query_sink,
+            query_runtime_boundary,
+            |resolved,
+             node_id,
+             runtime_boundary,
+             source,
+             sink,
+             query_sink,
+             query_runtime_boundary,
+             facade_pending_status| async move {
+                api::spawn(
+                    resolved,
+                    node_id,
+                    runtime_boundary,
+                    source,
+                    sink,
+                    query_sink,
+                    query_runtime_boundary,
+                    facade_pending_status,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    async fn try_spawn_pending_facade_from_parts_with_spawn<Spawn, SpawnFut>(
+        instance_id: u64,
+        api_task: Arc<Mutex<Option<FacadeActivation>>>,
+        pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
+        facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
+        facade_pending_status: SharedFacadePendingStatusCell,
+        node_id: NodeId,
+        runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+        source: Arc<SourceFacade>,
+        sink: Arc<SinkFacade>,
+        query_sink: Arc<SinkFacade>,
+        query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
+        spawn_facade: Spawn,
+    ) -> Result<bool>
+    where
+        Spawn: FnOnce(
+            api::config::ResolvedApiConfig,
+            NodeId,
+            Option<Arc<dyn ChannelIoSubset>>,
+            Arc<SourceFacade>,
+            Arc<SinkFacade>,
+            Arc<SinkFacade>,
+            Option<Arc<dyn ChannelIoSubset>>,
+            SharedFacadePendingStatusCell,
+        ) -> SpawnFut,
+        SpawnFut: std::future::Future<Output = Result<api::ApiServerHandle>>,
+    {
         let Some(pending) = pending_facade.lock().await.clone() else {
             return Ok(false);
         };
+        if let Some(claim) = ProcessFacadeClaim::from_pending(instance_id, &pending) {
+            let mut guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some(existing) = guard.as_ref()
+                && existing.owner_instance_id != instance_id
+                && existing.matches_pending(&pending)
+            {
+                eprintln!(
+                    "fs_meta_runtime_app: facade process claim already owned instance_id={} generation={} route_key={} resources={:?} bind_addr={}",
+                    existing.owner_instance_id,
+                    pending.generation,
+                    pending.route_key,
+                    pending.resource_ids,
+                    pending.resolved.bind_addr
+                );
+                return Ok(false);
+            }
+            *guard = Some(claim);
+        }
         let mut same_resource_replacement = None::<(String, Vec<String>, u64)>;
         let replacing_existing = {
             let api_task_guard = api_task.lock().await;
@@ -1070,6 +1251,20 @@ impl FSMetaApp {
                 return Ok(true);
             }
         }
+        {
+            let mut inflight_guard = facade_spawn_in_progress.lock().await;
+            if let Some(inflight) = inflight_guard.as_ref() {
+                eprintln!(
+                    "fs_meta_runtime_app: facade spawn already in progress generation={} route_key={} resources={:?} same_resource={}",
+                    pending.generation,
+                    pending.route_key,
+                    pending.resource_ids,
+                    inflight.matches_pending(&pending)
+                );
+                return Ok(false);
+            }
+            *inflight_guard = Some(FacadeSpawnInProgress::from_pending(&pending));
+        }
         // Cold start has no prior facade to retain, so runtime confirmation is
         // sufficient to bring up the hosting boundary. Replacement also proceeds once
         // runtime confirms external exposure; materialized `/tree` and `/stats`
@@ -1080,7 +1275,7 @@ impl FSMetaApp {
             "fs_meta_runtime_app: spawning facade api server generation={} route_key={} resources={:?}",
             pending.generation, pending.route_key, pending.resource_ids
         );
-        let handle = api::spawn(
+        let spawn_result = spawn_facade(
             pending.resolved.clone(),
             node_id,
             runtime_boundary,
@@ -1090,41 +1285,75 @@ impl FSMetaApp {
             query_runtime_boundary,
             facade_pending_status.clone(),
         )
-        .await?;
+        .await;
+        {
+            let mut inflight_guard = facade_spawn_in_progress.lock().await;
+            if inflight_guard
+                .as_ref()
+                .is_some_and(|inflight| inflight.matches_pending(&pending))
+            {
+                inflight_guard.take();
+            }
+        }
+        let handle = match spawn_result {
+            Ok(handle) => handle,
+            Err(err) => {
+                let mut guard = match process_facade_claim_cell().lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                if guard.as_ref().is_some_and(|claim| {
+                    claim.owner_instance_id == instance_id && claim.matches_pending(&pending)
+                }) {
+                    guard.take();
+                }
+                return Err(err);
+            }
+        };
         eprintln!(
             "fs_meta_runtime_app: facade api::spawn returned generation={} route_key={}",
             pending.generation, pending.route_key
         );
 
-        let still_pending = {
+        let adopted_generation = {
             let pending_guard = pending_facade.lock().await;
-            pending_guard.as_ref().is_some_and(|candidate| {
-                candidate.generation == pending.generation
-                    && candidate.resource_ids == pending.resource_ids
+            pending_guard.as_ref().and_then(|candidate| {
+                (candidate.route_key == pending.route_key
+                    && candidate.resource_ids == pending.resource_ids)
+                    .then_some(candidate.generation)
             })
         };
-        if !still_pending {
+        let Some(adopted_generation) = adopted_generation else {
             eprintln!(
                 "fs_meta_runtime_app: shutting down stale facade handle generation={} route_key={}",
                 pending.generation, pending.route_key
             );
             handle.shutdown(Duration::from_secs(2)).await;
+            let mut guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if guard.as_ref().is_some_and(|claim| {
+                claim.owner_instance_id == instance_id && claim.matches_pending(&pending)
+            }) {
+                guard.take();
+            }
             return Ok(false);
-        }
+        };
 
         let previous = api_task.lock().await.replace(FacadeActivation {
             route_key: pending.route_key.clone(),
-            generation: pending.generation,
+            generation: adopted_generation,
             resource_ids: pending.resource_ids.clone(),
             handle,
         });
         eprintln!(
             "fs_meta_runtime_app: facade handle active generation={} route_key={} resources={:?}",
-            pending.generation, pending.route_key, pending.resource_ids
+            adopted_generation, pending.route_key, pending.resource_ids
         );
         let mut pending_guard = pending_facade.lock().await;
         if pending_guard.as_ref().is_some_and(|candidate| {
-            candidate.generation == pending.generation
+            candidate.route_key == pending.route_key
                 && candidate.resource_ids == pending.resource_ids
         }) {
             pending_guard.take();
@@ -1406,6 +1635,7 @@ impl FSMetaApp {
             );
             current.handle.shutdown(Duration::from_secs(2)).await;
         }
+        clear_owned_process_facade_claim(self.instance_id);
     }
 
     async fn apply_facade_deactivate(
@@ -1467,6 +1697,7 @@ impl FSMetaApp {
     }
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
+        let _serial_guard = self.control_frame_serial.lock().await;
         let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
         eprintln!(
             "fs_meta_runtime_app: on_control_frame begin source_signals={} sink_signals={} facade_signals={} initialized={}",
@@ -1576,8 +1807,10 @@ impl FSMetaApp {
     async fn service_close(&self) -> Result<()> {
         self.control_initialized.store(false, Ordering::Release);
         *self.pending_facade.lock().await = None;
+        *self.facade_spawn_in_progress.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
         self.shutdown_active_facade().await;
+        clear_owned_process_facade_claim(self.instance_id);
         self.source.close().await?;
         self.sink.close().await?;
         let mut endpoint_tasks = std::mem::take(&mut *self.runtime_endpoint_tasks.lock().await);
@@ -1849,8 +2082,10 @@ mod tests {
     use std::fs;
     use std::net::TcpListener;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::Duration;
     use tempfile::tempdir;
+    use tokio::sync::Notify;
 
     fn write_auth_files(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
         let passwd = dir.path().join("fs-meta.passwd");
@@ -2322,6 +2557,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn concurrent_on_control_frame_waits_for_serial_gate() {
+        let tmp = tempdir().expect("create temp dir");
+        let cfg = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
+                ..local_source_config()
+            },
+            api: api::ApiConfig::default(),
+        };
+        let app =
+            Arc::new(FSMetaApp::new(cfg, NodeId("single-app-node".into())).expect("init app"));
+        let serial_guard = app.control_frame_serial.lock().await;
+        let task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[activate_envelope("runtime.exec.source")])
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !task.is_finished(),
+            "concurrent control batch must wait for serialized control processing"
+        );
+
+        drop(serial_guard);
+        task.await
+            .expect("join serialized control task")
+            .expect("run serialized control frame");
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
     async fn standalone_facade_activation_uses_local_runtime_scope_fallback() {
         let tmp = tempdir().expect("create temp dir");
         let root_a = tmp.path().join("root-a");
@@ -2623,6 +2892,308 @@ mod tests {
             "same-resource generation refresh must clear pending diagnostics"
         );
         app.close().await.expect("close fs-meta app");
+    }
+
+    #[tokio::test]
+    async fn facade_spawn_singleflight_adopts_latest_same_resource_generation() {
+        let tmp = tempdir().expect("create temp dir");
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let cfg = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root", tmp.path())],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-1", tmp.path())],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: "single-app-listener".to_string(),
+                local_listener_resources: vec![api::config::ApiListenerResource {
+                    resource_id: "single-app-listener".to_string(),
+                    bind_addr: "127.0.0.1:0".to_string(),
+                }],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        };
+        let app = FSMetaApp::with_boundaries(
+            cfg,
+            NodeId("single-app-node".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app");
+        let pending_generation_1 = PendingFacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["single-app-listener".to_string()],
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: "single-app-listener".to_string(),
+                resource_ids: vec!["single-app-listener".to_string()],
+            }],
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: app
+                .config
+                .api
+                .resolve_for_candidate_ids(&["single-app-listener".to_string()])
+                .expect("resolve facade config"),
+        };
+        *app.pending_facade.lock().await = Some(pending_generation_1.clone());
+
+        let spawn_started = Arc::new(Notify::new());
+        let release_spawn = Arc::new(Notify::new());
+        let spawn_calls = Arc::new(AtomicUsize::new(0));
+        let first_attempt = tokio::spawn({
+            let api_task = app.api_task.clone();
+            let pending_facade = app.pending_facade.clone();
+            let facade_spawn_in_progress = app.facade_spawn_in_progress.clone();
+            let facade_pending_status = app.facade_pending_status.clone();
+            let node_id = app.node_id.clone();
+            let runtime_boundary = app.runtime_boundary.clone();
+            let source = app.source.clone();
+            let sink = app.sink.clone();
+            let query_sink = app.query_sink.clone();
+            let query_runtime_boundary = app.runtime_boundary.clone();
+            let spawn_started = spawn_started.clone();
+            let release_spawn = release_spawn.clone();
+            let spawn_calls = spawn_calls.clone();
+            async move {
+                FSMetaApp::try_spawn_pending_facade_from_parts_with_spawn(
+                    app.instance_id,
+                    api_task,
+                    pending_facade,
+                    facade_spawn_in_progress,
+                    facade_pending_status,
+                    node_id,
+                    runtime_boundary,
+                    source,
+                    sink,
+                    query_sink,
+                    query_runtime_boundary,
+                    move |resolved,
+                          node_id,
+                          runtime_boundary,
+                          source,
+                          sink,
+                          query_sink,
+                          query_runtime_boundary,
+                          facade_pending_status| {
+                        let spawn_started = spawn_started.clone();
+                        let release_spawn = release_spawn.clone();
+                        let spawn_calls = spawn_calls.clone();
+                        async move {
+                            spawn_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                            spawn_started.notify_one();
+                            release_spawn.notified().await;
+                            api::spawn(
+                                resolved,
+                                node_id,
+                                runtime_boundary,
+                                source,
+                                sink,
+                                query_sink,
+                                query_runtime_boundary,
+                                facade_pending_status,
+                            )
+                            .await
+                        }
+                    },
+                )
+                .await
+            }
+        });
+
+        spawn_started.notified().await;
+        *app.pending_facade.lock().await = Some(PendingFacadeActivation {
+            generation: 2,
+            ..pending_generation_1.clone()
+        });
+
+        let second_attempt = FSMetaApp::try_spawn_pending_facade_from_parts_with_spawn(
+            app.instance_id,
+            app.api_task.clone(),
+            app.pending_facade.clone(),
+            app.facade_spawn_in_progress.clone(),
+            app.facade_pending_status.clone(),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            move |_, _, _, _, _, _, _, _| async move {
+                panic!("duplicate facade spawn must be suppressed while same-resource spawn is in progress");
+                #[allow(unreachable_code)]
+                Err(CnxError::Internal("unreachable".into()))
+            },
+        )
+        .await
+        .expect("second same-resource facade activate should not fail");
+        assert!(
+            !second_attempt,
+            "same-resource spawn in progress should suppress duplicate facade spawn"
+        );
+
+        release_spawn.notify_one();
+
+        match first_attempt.await.expect("join first facade spawn") {
+            Ok(true) => {}
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Ok(false) => panic!("first facade spawn unexpectedly reported no activation"),
+            Err(err) => panic!("first facade spawn failed: {err}"),
+        }
+
+        assert_eq!(
+            spawn_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "same-resource facade activation must remain single-flight"
+        );
+        assert_eq!(
+            app.api_task
+                .lock()
+                .await
+                .as_ref()
+                .expect("active facade after single-flight spawn")
+                .generation,
+            2,
+            "returned facade handle should adopt the latest same-resource generation"
+        );
+        assert!(app.pending_facade.lock().await.is_none());
+        assert!(app.facade_spawn_in_progress.lock().await.is_none());
+        app.close().await.expect("close fs-meta app");
+    }
+
+    #[tokio::test]
+    async fn facade_spawn_dedupes_across_distinct_app_instances_with_same_fixed_bind() {
+        clear_process_facade_claim_for_tests();
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let listener_resource = api::config::ApiListenerResource {
+            resource_id: "shared-app-listener".to_string(),
+            bind_addr: bind_addr.clone(),
+        };
+        let (passwd_path_1, shadow_path_1) = write_auth_files(&tmp);
+        let cfg_1 = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root-1", tmp.path())],
+                host_object_grants: vec![granted_mount_root("node-a::root-1", tmp.path())],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: passwd_path_1,
+                    shadow_path: shadow_path_1,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        };
+        let app_1 = FSMetaApp::with_boundaries(
+            cfg_1,
+            NodeId("fixed-bind-node-a".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init first app");
+        *app_1.pending_facade.lock().await = Some(PendingFacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec![listener_resource.resource_id.clone()],
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: listener_resource.resource_id.clone(),
+                resource_ids: vec![listener_resource.resource_id.clone()],
+            }],
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: app_1
+                .config
+                .api
+                .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+                .expect("resolve first facade config"),
+        });
+        assert!(
+            app_1.try_spawn_pending_facade().await.expect("spawn first facade"),
+            "first app instance should claim and activate the fixed facade"
+        );
+
+        let (passwd_path_2, shadow_path_2) = write_auth_files(&tmp);
+        let cfg_2 = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("test-root-2", tmp.path())],
+                host_object_grants: vec![granted_mount_root("node-b::root-1", tmp.path())],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: listener_resource.resource_id.clone(),
+                local_listener_resources: vec![listener_resource.clone()],
+                auth: api::ApiAuthConfig {
+                    passwd_path: passwd_path_2,
+                    shadow_path: shadow_path_2,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        };
+        let app_2 = FSMetaApp::with_boundaries(
+            cfg_2,
+            NodeId("fixed-bind-node-b".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init second app");
+        *app_2.pending_facade.lock().await = Some(PendingFacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 2,
+            resource_ids: vec![listener_resource.resource_id.clone()],
+            bound_scopes: vec![RuntimeBoundScope {
+                scope_id: listener_resource.resource_id.clone(),
+                resource_ids: vec![listener_resource.resource_id.clone()],
+            }],
+            group_ids: Vec::new(),
+            runtime_managed: true,
+            runtime_exposure_confirmed: true,
+            resolved: app_2
+                .config
+                .api
+                .resolve_for_candidate_ids(std::slice::from_ref(&listener_resource.resource_id))
+                .expect("resolve second facade config"),
+        });
+        let second_spawn = app_2
+            .try_spawn_pending_facade()
+            .await
+            .expect("second app facade spawn should not error");
+        assert!(
+            !second_spawn,
+            "distinct app instance must not start a duplicate fixed-bind facade"
+        );
+        assert!(
+            app_2.api_task.lock().await.is_none(),
+            "second app instance must not activate a duplicate facade handle"
+        );
+
+        let claim = {
+            let guard = match process_facade_claim_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.clone().expect("fixed-bind facade claim should remain owned")
+        };
+        assert_eq!(claim.owner_instance_id, app_1.instance_id);
+        assert_eq!(claim.bind_addr, bind_addr);
+        assert_eq!(claim.resource_ids, vec![listener_resource.resource_id.clone()]);
+
+        app_2.close().await.expect("close second app");
+        app_1.close().await.expect("close first app");
+        clear_process_facade_claim_for_tests();
     }
 
     #[tokio::test]

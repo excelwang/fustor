@@ -8,7 +8,6 @@ use axum::{
     extract::{Path, State},
     http::{HeaderMap, header},
 };
-use bytes::Bytes;
 use capanix_app_sdk::CnxError;
 use capanix_app_sdk::Event;
 use capanix_app_sdk::runtime::{EventMetadata, NodeId};
@@ -18,7 +17,8 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
 };
 
 use crate::query::api::{
-    merge_sink_status_snapshots, refresh_policy_from_host_object_grants, route_sink_status_snapshot,
+    internal_status_request_payload, merge_sink_status_snapshots,
+    refresh_policy_from_host_object_grants, route_sink_status_snapshot,
 };
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
@@ -66,17 +66,17 @@ pub async fn status(
     let _ = authorize_management(&state, &headers)?;
     let started_at = Instant::now();
 
-    let local_sink = match state.sink.status_snapshot_nonblocking().await {
+    let local_sink = match state.sink.cached_status_snapshot_for_status_route() {
         Ok(snapshot) => snapshot,
         Err(err) if state.sink.is_worker() => {
-            log::warn!("status falling back to default sink snapshot: {err}");
+            log::warn!("status falling back to default cached sink snapshot: {err}");
             Default::default()
         }
         Err(err) => {
             return Err(ApiError::internal(format!("sink status failed: {err}")));
         }
     };
-    let local_source = state.source.observability_snapshot_nonblocking().await;
+    let local_source = state.source.cached_observability_snapshot();
     let (sink_status, source, runner_sets, sink_outcome, source_outcome) =
         merge_remote_status_snapshots(
             local_sink,
@@ -370,6 +370,10 @@ pub async fn roots_put(
         .host_object_grants_snapshot()
         .await
         .map_err(|err| ApiError::internal(format!("source grants snapshot failed: {err}")))?;
+    eprintln!(
+        "fs_meta_api: roots_put grants snapshot ok grants={}",
+        grants.len()
+    );
     let preview = preview_roots(&roots, &grants)?;
     if !preview.unmatched_roots.is_empty() {
         return Err(ApiError::bad_request(format!(
@@ -377,10 +381,15 @@ pub async fn roots_put(
             preview.unmatched_roots.join(", ")
         )));
     }
+    eprintln!("fs_meta_api: roots_put preview ok roots={}", roots.len());
 
     let previous_source_roots = state.source.logical_roots_snapshot().await.map_err(|err| {
         ApiError::internal(format!("source logical roots snapshot failed: {err}"))
     })?;
+    eprintln!(
+        "fs_meta_api: roots_put previous source roots ok roots={}",
+        previous_source_roots.len()
+    );
     let previous_grants = grants.clone();
     // roots apply updates app-owned authoritative root/group definitions and
     // refreshes source/sink state against current runtime grants and bound
@@ -394,7 +403,15 @@ pub async fn roots_put(
             eprintln!("fs_meta_api: roots_put source update failed: {err}");
             err
         })?;
+    eprintln!(
+        "fs_meta_api: roots_put source update ok roots={}",
+        roots.len()
+    );
     let previous_sink_roots = state.sink.cached_logical_roots_snapshot()?;
+    eprintln!(
+        "fs_meta_api: roots_put previous sink roots ok roots={}",
+        previous_sink_roots.len()
+    );
     if let Err(err) = state
         .sink
         .update_logical_roots(roots.clone(), &grants)
@@ -424,6 +441,10 @@ pub async fn roots_put(
             ))),
         };
     }
+    eprintln!(
+        "fs_meta_api: roots_put sink update ok roots={}",
+        roots.len()
+    );
     if let Some(boundary) = state.runtime_boundary.as_ref() {
         let payload = encode_logical_roots_control_payload(&roots).map_err(|err| {
             ApiError::internal(format!(
@@ -431,6 +452,11 @@ pub async fn roots_put(
             ))
         })?;
         for route_key in [ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SINK_ROOTS_CONTROL] {
+            eprintln!(
+                "fs_meta_api: roots_put control send begin route={} roots={}",
+                route_key,
+                roots.len()
+            );
             boundary
                 .channel_send(
                     BoundaryContext::default(),
@@ -459,9 +485,15 @@ pub async fn roots_put(
                         "logical roots control send failed route={route_key}: {err}"
                     ))
                 })?;
+            eprintln!(
+                "fs_meta_api: roots_put control send ok route={} roots={}",
+                route_key,
+                roots.len()
+            );
         }
     }
     refresh_policy_from_host_object_grants(&state.projection_policy, &grants);
+    eprintln!("fs_meta_api: roots_put policy refresh ok");
 
     Ok(Json(RootsUpdateResponse {
         roots_count: state
@@ -689,7 +721,7 @@ async fn route_source_observability_snapshot(
         .call_collect(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SOURCE_STATUS,
-            Bytes::new(),
+            internal_status_request_payload(),
             timeout,
             idle_after_first,
         )

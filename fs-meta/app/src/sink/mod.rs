@@ -44,9 +44,9 @@ use crate::runtime::orchestration::{
     sink_control_signals_from_envelopes,
 };
 use crate::runtime::routes::{
-    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SINK_STATUS,
-    METHOD_SOURCE_FIND, METHOD_STREAM, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS,
-    ROUTE_TOKEN_FS_META_INTERNAL, default_route_bindings,
+    METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SOURCE_FIND,
+    METHOD_STREAM, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL,
+    default_route_bindings,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -704,85 +704,6 @@ impl SinkFileMeta {
                 );
             }
 
-            let internal_status_state = state.clone();
-            let internal_status_root_specs = root_specs.clone();
-            let internal_status_host_object_grants = host_object_grants.clone();
-            let internal_status_visibility_lag = visibility_lag.clone();
-            let internal_status_pending_stream_events = pending_stream_events.clone();
-            let internal_status_stream_receive_enabled = stream_receive_enabled.clone();
-            let internal_status_unit_control = unit_control.clone();
-            if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
-                log::info!(
-                    "bound route listening on {}.{} for sink {}",
-                    ROUTE_TOKEN_FS_META_INTERNAL,
-                    METHOD_SINK_STATUS,
-                    node_id_cloned.0
-                );
-                let endpoint = ManagedEndpointTask::spawn(
-                    sys.clone(),
-                    route,
-                    format!(
-                        "sink:{}:{}",
-                        ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
-                    ),
-                    sink.shutdown.clone(),
-                    move |requests| {
-                        let internal_status_state = internal_status_state.clone();
-                        let internal_status_root_specs = internal_status_root_specs.clone();
-                        let internal_status_host_object_grants =
-                            internal_status_host_object_grants.clone();
-                        let internal_status_visibility_lag = internal_status_visibility_lag.clone();
-                        let internal_status_pending_stream_events =
-                            internal_status_pending_stream_events.clone();
-                        let internal_status_stream_receive_enabled =
-                            internal_status_stream_receive_enabled.clone();
-                        let internal_status_unit_control = internal_status_unit_control.clone();
-                        async move {
-                            let mut responses = Vec::new();
-                            for req in requests {
-                                let sink_impl = SinkFileMeta {
-                                    state: internal_status_state.clone(),
-                                    root_specs: internal_status_root_specs.clone(),
-                                    host_object_grants: internal_status_host_object_grants.clone(),
-                                    visibility_lag: internal_status_visibility_lag.clone(),
-                                    pending_stream_events: internal_status_pending_stream_events
-                                        .clone(),
-                                    stream_receive_enabled: internal_status_stream_receive_enabled
-                                        .clone(),
-                                    unit_control: internal_status_unit_control.clone(),
-                                    shutdown: CancellationToken::new(),
-                                    endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                                };
-                                if let Ok(snapshot) = sink_impl.status_snapshot()
-                                    && let Ok(payload) = rmp_serde::to_vec_named(&snapshot)
-                                {
-                                    responses.push(Event::new(
-                                        EventMetadata {
-                                            origin_id: req.metadata().origin_id.clone(),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        Bytes::from(payload),
-                                    ));
-                                }
-                            }
-                            responses
-                        }
-                    },
-                );
-                lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
-                    .push(endpoint);
-            } else {
-                log::error!(
-                    "failed to resolve route lookup for {}.{}",
-                    ROUTE_TOKEN_FS_META_INTERNAL,
-                    METHOD_SINK_STATUS
-                );
-            }
-
             // 2. Fresh find path: proxy to source live-scan endpoint through host-adapter SDK.
             //
             // This path must collect correlated reply batches from all matching source
@@ -1137,93 +1058,6 @@ impl SinkFileMeta {
             lock_or_recover(
                 &self.endpoint_tasks,
                 "sink.start_runtime_endpoints.internal_query_tasks",
-            )
-            .push(endpoint);
-        }
-
-        let internal_status_state = self.state.clone();
-        let internal_status_root_specs = self.root_specs.clone();
-        let internal_status_host_object_grants = self.host_object_grants.clone();
-        let internal_status_visibility_lag = self.visibility_lag.clone();
-        let internal_status_pending_stream_events = self.pending_stream_events.clone();
-        let internal_status_stream_receive_enabled = self.stream_receive_enabled.clone();
-        let internal_status_unit_control = self.unit_control.clone();
-        if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS) {
-            eprintln!(
-                "fs_meta_sink: start_runtime_endpoints status spawn begin node={} route={} elapsed_ms={}",
-                node_id_cloned.0,
-                route.0,
-                start.elapsed().as_millis()
-            );
-            log::info!(
-                "bound route listening on {}.{} for sink {}",
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SINK_STATUS,
-                node_id_cloned.0
-            );
-            let endpoint = ManagedEndpointTask::spawn(
-                boundary.clone(),
-                route,
-                format!(
-                    "sink:{}:{}",
-                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS
-                ),
-                self.shutdown.clone(),
-                move |requests| {
-                    let internal_status_state = internal_status_state.clone();
-                    let internal_status_root_specs = internal_status_root_specs.clone();
-                    let internal_status_host_object_grants =
-                        internal_status_host_object_grants.clone();
-                    let internal_status_visibility_lag = internal_status_visibility_lag.clone();
-                    let internal_status_pending_stream_events =
-                        internal_status_pending_stream_events.clone();
-                    let internal_status_stream_receive_enabled =
-                        internal_status_stream_receive_enabled.clone();
-                    let internal_status_unit_control = internal_status_unit_control.clone();
-                    async move {
-                        let mut responses = Vec::new();
-                        for req in requests {
-                            let sink_impl = SinkFileMeta {
-                                state: internal_status_state.clone(),
-                                root_specs: internal_status_root_specs.clone(),
-                                host_object_grants: internal_status_host_object_grants.clone(),
-                                visibility_lag: internal_status_visibility_lag.clone(),
-                                pending_stream_events: internal_status_pending_stream_events
-                                    .clone(),
-                                stream_receive_enabled: internal_status_stream_receive_enabled
-                                    .clone(),
-                                unit_control: internal_status_unit_control.clone(),
-                                shutdown: CancellationToken::new(),
-                                endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
-                            };
-                            if let Ok(snapshot) = sink_impl.status_snapshot()
-                                && let Ok(payload) = rmp_serde::to_vec_named(&snapshot)
-                            {
-                                responses.push(Event::new(
-                                    EventMetadata {
-                                        origin_id: req.metadata().origin_id.clone(),
-                                        timestamp_us: now_us(),
-                                        logical_ts: None,
-                                        correlation_id: req.metadata().correlation_id,
-                                        ingress_auth: None,
-                                        trace: None,
-                                    },
-                                    Bytes::from(payload),
-                                ));
-                            }
-                        }
-                        responses
-                    }
-                },
-            );
-            eprintln!(
-                "fs_meta_sink: start_runtime_endpoints status spawn ok node={} elapsed_ms={}",
-                node_id_cloned.0,
-                start.elapsed().as_millis()
-            );
-            lock_or_recover(
-                &self.endpoint_tasks,
-                "sink.start_runtime_endpoints.internal_status_tasks",
             )
             .push(endpoint);
         }
@@ -1798,6 +1632,11 @@ impl SinkFileMeta {
         roots: Vec<RootSpec>,
         host_object_grants: &[GrantedMountRoot],
     ) -> Result<()> {
+        eprintln!(
+            "fs_meta_sink: update_logical_roots begin roots={} grants={}",
+            roots.len(),
+            host_object_grants.len()
+        );
         let root_count = roots.len();
         let grant_count = host_object_grants.len();
         let bound_scopes = roots
@@ -1823,6 +1662,10 @@ impl SinkFileMeta {
         self.state.record_authoritative_commit(
             "sink.update_logical_roots",
             format!("roots={} grants={}", root_count, grant_count),
+        );
+        eprintln!(
+            "fs_meta_sink: update_logical_roots ok roots={} grants={}",
+            root_count, grant_count
         );
         Ok(())
     }

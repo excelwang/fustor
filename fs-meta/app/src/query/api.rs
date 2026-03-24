@@ -375,6 +375,12 @@ pub(crate) fn merge_sink_status_snapshots(
     merged
 }
 
+pub(crate) fn internal_status_request_payload() -> Bytes {
+    // Keep status RPCs on a non-empty wire shape so request/reply lanes do not depend on
+    // zero-length payload semantics.
+    Bytes::from_static(&[0x80])
+}
+
 fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> SourceStatusSnapshot {
     if snapshots.is_empty() {
         return SourceStatusSnapshot::default();
@@ -419,7 +425,7 @@ async fn route_source_status_snapshot(
         .call_collect(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SOURCE_STATUS,
-            Bytes::new(),
+            internal_status_request_payload(),
             timeout,
             MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
         )
@@ -447,7 +453,7 @@ pub(crate) async fn route_sink_status_snapshot(
         .call_collect(
             ROUTE_TOKEN_FS_META_INTERNAL,
             METHOD_SINK_STATUS,
-            Bytes::new(),
+            internal_status_request_payload(),
             timeout,
             MATERIALIZED_ROUTE_COLLECT_IDLE_GRACE,
         )

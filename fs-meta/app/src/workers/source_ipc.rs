@@ -6,6 +6,7 @@ use capanix_app_sdk::{CnxError, Event, Result};
 use crate::query::request::InternalQueryRequest;
 use crate::source::SourceStatusSnapshot;
 use crate::source::config::{GrantedMountRoot, RootSpec};
+use crate::workers::source::SourceObservabilitySnapshot;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum SourceWorkerRequest {
@@ -14,6 +15,7 @@ pub enum SourceWorkerRequest {
     HostObjectGrantsSnapshot,
     HostObjectGrantsVersionSnapshot,
     StatusSnapshot,
+    ObservabilitySnapshot,
     LifecycleState,
     ScheduledSourceGroupIds,
     ScheduledScanGroupIds,
@@ -34,6 +36,7 @@ pub enum SourceWorkerResponse {
     HostObjectGrants(Vec<GrantedMountRoot>),
     HostObjectGrantsVersion(u64),
     StatusSnapshot(SourceStatusSnapshot),
+    ObservabilitySnapshot(SourceObservabilitySnapshot),
     LifecycleState(String),
     ScheduledGroupIds(Option<Vec<String>>),
     SourcePrimaryByGroup(BTreeMap<String, String>),

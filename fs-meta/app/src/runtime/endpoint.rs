@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::sync::mpsc::{Receiver, sync_channel};
+use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
 use std::time::Duration;
 
 use capanix_app_sdk::runtime::RouteKey;
@@ -14,8 +14,6 @@ enum EndpointJoin {
     Tokio(JoinHandle<()>),
     Thread(std::thread::JoinHandle<()>),
 }
-
-const ENDPOINT_TASK_READY_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) struct ManagedEndpointTask {
     name: String,
@@ -50,12 +48,11 @@ impl ManagedEndpointTask {
     }
 
     fn wait_until_ready(name: &str, ready_rx: Receiver<()>) {
-        if ready_rx.recv_timeout(ENDPOINT_TASK_READY_TIMEOUT).is_err() {
-            log::warn!(
-                "endpoint task {} did not report ready within {:?}",
-                name,
-                ENDPOINT_TASK_READY_TIMEOUT
-            );
+        match ready_rx.try_recv() {
+            Ok(()) | Err(TryRecvError::Disconnected) => {}
+            Err(TryRecvError::Empty) => {
+                log::debug!("endpoint task {} ready wait deferred", name);
+            }
         }
     }
 
@@ -200,6 +197,21 @@ async fn run_endpoint_loop<F, Fut>(
             .await
         {
             Ok(events) => events,
+            Err(CnxError::Timeout) => continue,
+            Err(err @ CnxError::NotSupported(_))
+            | Err(err @ CnxError::NotReady(_))
+            | Err(err @ CnxError::TransportClosed(_))
+            | Err(err @ CnxError::ChannelClosed)
+            | Err(err @ CnxError::LinkError(_)) => {
+                log::debug!(
+                    "endpoint task {} recv retry for {} after transient error: {:?}",
+                    join_name,
+                    route.0,
+                    err
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             Err(err) => {
                 log::warn!(
                     "endpoint task {} recv failed for {}: {:?}",
@@ -214,6 +226,12 @@ async fn run_endpoint_loop<F, Fut>(
         if requests.is_empty() {
             continue;
         }
+        eprintln!(
+            "fs_meta_runtime_endpoint: request batch recv route={} task={} events={}",
+            request_channel.0,
+            join_name,
+            requests.len()
+        );
 
         let correlation_id = shared_correlation_id(&requests);
         let mut responses = handler(requests).await;
@@ -231,8 +249,13 @@ async fn run_endpoint_loop<F, Fut>(
         }
 
         if responses.is_empty() {
+            eprintln!(
+                "fs_meta_runtime_endpoint: request batch handled with no replies route={} task={}",
+                request_channel.0, join_name
+            );
             continue;
         }
+        let response_count = responses.len();
         if let Err(err) = boundary
             .channel_send(
                 ctx.clone(),
@@ -252,6 +275,10 @@ async fn run_endpoint_loop<F, Fut>(
             );
             break;
         }
+        eprintln!(
+            "fs_meta_runtime_endpoint: request batch replies sent route={} task={} events={}",
+            reply_channel.0, join_name, response_count
+        );
     }
 }
 
@@ -340,21 +367,34 @@ mod tests {
 
     struct RecordingBoundary {
         recv_keys: Mutex<Vec<String>>,
-        fail_once: Mutex<bool>,
+        first_failure: Mutex<Option<FirstFailure>>,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FirstFailure {
+        NotSupported,
+        Timeout,
     }
 
     impl RecordingBoundary {
         fn new() -> Self {
             Self {
                 recv_keys: Mutex::new(Vec::new()),
-                fail_once: Mutex::new(false),
+                first_failure: Mutex::new(None),
             }
         }
 
         fn fail_once() -> Self {
             Self {
                 recv_keys: Mutex::new(Vec::new()),
-                fail_once: Mutex::new(true),
+                first_failure: Mutex::new(Some(FirstFailure::NotSupported)),
+            }
+        }
+
+        fn timeout_once() -> Self {
+            Self {
+                recv_keys: Mutex::new(Vec::new()),
+                first_failure: Mutex::new(Some(FirstFailure::Timeout)),
             }
         }
     }
@@ -370,10 +410,14 @@ mod tests {
                 .lock()
                 .expect("recv_keys lock")
                 .push(request.channel_key.0);
-            let mut fail_once = self.fail_once.lock().expect("fail_once lock");
-            if *fail_once {
-                *fail_once = false;
-                return Err(CnxError::NotSupported("transient attach gap".into()));
+            let mut first_failure = self.first_failure.lock().expect("first_failure lock");
+            if let Some(failure) = first_failure.take() {
+                return match failure {
+                    FirstFailure::NotSupported => {
+                        Err(CnxError::NotSupported("transient attach gap".into()))
+                    }
+                    FirstFailure::Timeout => Err(CnxError::Timeout),
+                };
             }
             Err(CnxError::Internal("stop after first recv".into()))
         }
@@ -414,6 +458,61 @@ mod tests {
                 "fs-meta.events:v1.stream".to_string(),
                 "fs-meta.events:v1.stream".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn endpoint_loop_retries_timeout_recv_errors() {
+        let boundary = Arc::new(RecordingBoundary::timeout_once());
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("sink-status:v1.req".into()),
+            "test-endpoint".into(),
+            CancellationToken::new(),
+            Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec![
+                "sink-status:v1.req".to_string(),
+                "sink-status:v1.req".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn endpoint_loop_retries_transient_recv_errors() {
+        let boundary = Arc::new(RecordingBoundary::fail_once());
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("sink-status:v1.req".into()),
+            "test-endpoint".into(),
+            CancellationToken::new(),
+            Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec![
+                "sink-status:v1.req".to_string(),
+                "sink-status:v1.req".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn wait_until_ready_does_not_block_inside_runtime() {
+        let (_tx, rx) = sync_channel::<()>(1);
+        let started = std::time::Instant::now();
+        crate::runtime_app::shared_tokio_runtime().block_on(async {
+            ManagedEndpointTask::wait_until_ready("test-endpoint", rx);
+        });
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "ready wait should not block tokio runtime threads"
         );
     }
 }

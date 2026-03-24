@@ -418,8 +418,8 @@ fn root_spec_app_scope_json(root: &RootSpec) -> serde_json::Value {
         }));
         unit_scopes.push(serde_json::json!({
             "unit_id": "runtime.exec.query-peer",
-            "eligibility": "resource_visible_nodes",
-            "cardinality": "one"
+            "eligibility": "scope_members",
+            "cardinality": "all"
         }));
     }
     if root.scan {
@@ -443,4 +443,32 @@ fn generation_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watched_roots_bind_query_peer_on_all_scope_members() {
+        let scope = root_spec_app_scope_json(&RootSpec::new("nfs1", "/mnt/nfs1"));
+        let unit_scopes = scope
+            .get("unit_scopes")
+            .and_then(serde_json::Value::as_array)
+            .expect("unit_scopes array");
+        let query_peer = unit_scopes
+            .iter()
+            .find(|entry| {
+                entry.get("unit_id") == Some(&serde_json::json!("runtime.exec.query-peer"))
+            })
+            .expect("query-peer unit scope");
+        assert_eq!(
+            query_peer.get("eligibility"),
+            Some(&serde_json::json!("scope_members"))
+        );
+        assert_eq!(
+            query_peer.get("cardinality"),
+            Some(&serde_json::json!("all"))
+        );
+    }
 }
