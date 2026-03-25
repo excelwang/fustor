@@ -1894,6 +1894,21 @@ impl SinkFileMeta {
             return Ok(());
         }
 
+        let debug_apply_events = std::env::var_os("FSMETA_DEBUG_SINK_APPLY_EVENTS").is_some();
+        if debug_apply_events {
+            let mut incoming_by_origin = BTreeMap::<String, usize>::new();
+            for event in events {
+                *incoming_by_origin
+                    .entry(event.metadata().origin_id.0.clone())
+                    .or_insert(0) += 1;
+            }
+            eprintln!(
+                "fs_meta_sink: apply_events incoming total={} origins={:?}",
+                events.len(),
+                incoming_by_origin
+            );
+        }
+
         let runtime_scoped = self.unit_control.has_runtime_state();
         let mut skipped_events = 0usize;
         let mut pending_lag_samples = Vec::new();
@@ -2019,6 +2034,16 @@ impl SinkFileMeta {
                 pending_lag_samples.push(sample);
             }
             group_state.refresh_initial_audit_completed();
+        }
+
+        if debug_apply_events {
+            eprintln!(
+                "fs_meta_sink: apply_events processed total={} control={} data={} skipped={}",
+                events.len(),
+                control_events,
+                data_events,
+                skipped_events
+            );
         }
         drop(state);
         self.state.record_authoritative_commit(

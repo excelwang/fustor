@@ -24,7 +24,7 @@ use crate::runtime::orchestration::{
     split_app_control_signals,
 };
 use crate::runtime::routes::{
-    METHOD_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
+    METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_QUERY_PROXY, METHOD_SINK_STATUS, METHOD_SOURCE_FIND,
     METHOD_SOURCE_STATUS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_QUERY, ROUTE_KEY_SINK_QUERY_PROXY,
     ROUTE_KEY_SINK_STATUS_INTERNAL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
     ROUTE_KEY_SOURCE_STATUS_INTERNAL, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_INTERNAL,
@@ -331,6 +331,29 @@ fn selected_group_empty_materialized_reply(
         bytes::Bytes::from(payload),
     )))
 }
+
+fn should_bridge_selected_group_sink_query(
+    request: &InternalQueryRequest,
+    local_events: &[Event],
+) -> bool {
+    if request.op != crate::query::QueryOp::Tree || request.scope.selected_group.is_none() {
+        return false;
+    }
+    let has_materialized_tree_data = local_events.iter().any(|event| {
+        matches!(
+            rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes()),
+            Ok(MaterializedQueryPayload::Tree(payload))
+                if payload.root.exists || payload.root.has_children || !payload.entries.is_empty()
+        )
+    });
+    !has_materialized_tree_data
+}
+
+// Bridge from query-peer proxy to internal sink query must stay best-effort.
+// Keep this timeout short so proxy requests are never pinned behind an
+// unavailable internal sink-query route.
+const SINK_QUERY_PROXY_BRIDGE_TIMEOUT: Duration = Duration::from_millis(750);
+const SINK_QUERY_PROXY_BRIDGE_IDLE_GRACE: Duration = Duration::from_millis(150);
 
 fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
     let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
@@ -948,6 +971,7 @@ impl FSMetaApp {
                     "fs_meta_runtime_app: spawning sink query proxy endpoint route={}",
                     route.0
                 );
+                let boundary_for_calls = boundary.clone();
                 let sink = self.sink.clone();
                 let source = self.source.clone();
                 let node_id = self.node_id.clone();
@@ -960,6 +984,11 @@ impl FSMetaApp {
                     ),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
+                        let adapter = crate::runtime::seam::exchange_host_adapter(
+                            boundary_for_calls.clone(),
+                            node_id.clone(),
+                            crate::runtime::routes::default_route_bindings(),
+                        );
                         let sink = sink.clone();
                         let source = source.clone();
                         let node_id = node_id.clone();
@@ -984,6 +1013,71 @@ impl FSMetaApp {
                                             "fs_meta_runtime_app: sink query proxy response events={}",
                                             events.len()
                                         );
+                                        for event in &events {
+                                            match rmp_serde::from_slice::<MaterializedQueryPayload>(
+                                                event.payload_bytes(),
+                                            ) {
+                                                Ok(MaterializedQueryPayload::Tree(payload)) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: sink query proxy payload group={} root_exists={} entries={} has_children={}",
+                                                        event.metadata().origin_id.0,
+                                                        payload.root.exists,
+                                                        payload.entries.len(),
+                                                        payload.root.has_children
+                                                    );
+                                                }
+                                                Ok(MaterializedQueryPayload::Stats(_)) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: sink query proxy payload group={} stats",
+                                                        event.metadata().origin_id.0
+                                                    );
+                                                }
+                                                Err(err) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: sink query proxy payload decode failed group={} err={}",
+                                                        event.metadata().origin_id.0,
+                                                        err
+                                                    );
+                                                }
+                                            }
+                                        }
+                                        if should_bridge_selected_group_sink_query(&params, &events)
+                                        {
+                                            match rmp_serde::to_vec(&params) {
+                                                Ok(payload) => {
+                                                    match capanix_host_adapter_fs::HostAdapter::call_collect(
+                                                        &adapter,
+                                                        ROUTE_TOKEN_FS_META_INTERNAL,
+                                                        METHOD_SINK_QUERY,
+                                                        bytes::Bytes::from(payload),
+                                                        SINK_QUERY_PROXY_BRIDGE_TIMEOUT,
+                                                        SINK_QUERY_PROXY_BRIDGE_IDLE_GRACE,
+                                                    )
+                                                    .await
+                                                    {
+                                                        Ok(mut bridged) => {
+                                                            eprintln!(
+                                                                "fs_meta_runtime_app: sink query proxy bridged internal sink query events={}",
+                                                                bridged.len()
+                                                            );
+                                                            events.append(&mut bridged);
+                                                        }
+                                                        Err(err) => {
+                                                            eprintln!(
+                                                                "fs_meta_runtime_app: sink query proxy bridge failed err={}",
+                                                                err
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                Err(err) => {
+                                                    eprintln!(
+                                                        "fs_meta_runtime_app: sink query proxy bridge encode failed err={}",
+                                                        err
+                                                    );
+                                                }
+                                            }
+                                        }
                                         if events.is_empty() {
                                             let should_emit_empty = if params
                                                 .scope
@@ -2659,6 +2753,77 @@ mod tests {
             &NodeId("node-a".into()),
             &BTreeMap::from([("nfs2".to_string(), "node-a::nfs2".to_string())]),
             &unselected,
+        ));
+    }
+
+    #[test]
+    fn selected_group_tree_empty_local_payload_requires_sink_query_bridge() {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs2".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+        let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
+            .expect("build empty reply")
+            .expect("selected-group reply");
+
+        assert!(should_bridge_selected_group_sink_query(
+            &request,
+            &[empty_event]
+        ));
+    }
+
+    #[test]
+    fn selected_group_tree_nonempty_local_payload_skips_sink_query_bridge() {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs2".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+        let payload = rmp_serde::to_vec_named(&query::MaterializedQueryPayload::Tree(
+            query::TreeGroupPayload {
+                reliability: query::GroupReliability {
+                    reliable: true,
+                    unreliable_reason: None,
+                },
+                stability: query::TreeStability::not_evaluated(),
+                root: query::TreePageRoot {
+                    path: b"/force-find-stress".to_vec(),
+                    size: 0,
+                    modified_time_us: 1,
+                    is_dir: true,
+                    exists: true,
+                    has_children: true,
+                },
+                entries: Vec::new(),
+            },
+        ))
+        .expect("encode non-empty tree payload");
+        let local_event = Event::new(
+            EventMetadata {
+                origin_id: NodeId("nfs2".to_string()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: Some(11),
+                ingress_auth: None,
+                trace: None,
+            },
+            Bytes::from(payload),
+        );
+
+        assert!(!should_bridge_selected_group_sink_query(
+            &request,
+            &[local_event]
         ));
     }
 

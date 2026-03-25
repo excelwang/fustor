@@ -1,0 +1,4 @@
+interface:
+  display_name: "Fs-meta Cross-Repo Gate"
+  short_description: "Baton workflow for fs-meta blockers"
+  default_prompt: "Use $fs-meta-cross-repo-gate to run the current fustor-capanix blocker workflow through one shared blocker-state document and a coordinator-plus-one-worker baton loop."
