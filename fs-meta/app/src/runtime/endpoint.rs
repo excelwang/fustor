@@ -10,6 +10,15 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
+fn debug_source_status_lifecycle_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_SOURCE_STATUS_LIFECYCLE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
 enum EndpointJoin {
     Tokio(JoinHandle<()>),
     Thread(std::thread::JoinHandle<()>),
@@ -27,8 +36,14 @@ impl ManagedEndpointTask {
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         if tokio::runtime::Handle::try_current().is_ok() {
+            if debug_source_status_lifecycle_enabled() {
+                eprintln!("fs_meta_runtime_endpoint: spawn_join mode=current-runtime");
+            }
             EndpointJoin::Tokio(tokio::spawn(runner))
         } else {
+            if debug_source_status_lifecycle_enabled() {
+                eprintln!("fs_meta_runtime_endpoint: spawn_join mode=shared-runtime-thread");
+            }
             EndpointJoin::Thread(std::thread::spawn(move || {
                 crate::runtime_app::shared_tokio_runtime().block_on(runner)
             }))
@@ -178,6 +193,14 @@ async fn run_endpoint_loop<F, Fut>(
     F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
 {
+    if debug_source_status_lifecycle_enabled() {
+        eprintln!(
+            "fs_meta_runtime_endpoint: loop_start route={} task={} thread={:?}",
+            route.0,
+            join_name,
+            std::thread::current().name()
+        );
+    }
     let ctx = BoundaryContext::default();
     let request_channel = ChannelKey(route.0.clone());
     let reply_channel = ChannelKey(format!("{}:reply", route.0));

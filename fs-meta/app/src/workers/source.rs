@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +33,57 @@ const SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT: Duration = Duration::from_secs(5)
 const SOURCE_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
 const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
+
+fn debug_source_status_lifecycle_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_SOURCE_STATUS_LIFECYCLE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn next_source_status_trace_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+struct SourceStatusTraceGuard {
+    node_id: String,
+    trace_id: u64,
+    phase: &'static str,
+    completed: bool,
+}
+
+impl SourceStatusTraceGuard {
+    fn new(node_id: String, trace_id: u64, phase: &'static str) -> Self {
+        Self {
+            node_id,
+            trace_id,
+            phase,
+            completed: false,
+        }
+    }
+
+    fn phase(&mut self, phase: &'static str) {
+        self.phase = phase;
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SourceStatusTraceGuard {
+    fn drop(&mut self) {
+        if debug_source_status_lifecycle_enabled() && !self.completed {
+            eprintln!(
+                "fs_meta_source_worker_client: observability_snapshot dropped node={} trace_id={} phase={}",
+                self.node_id, self.trace_id, self.phase
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 struct SourceWorkerSnapshotCache {
@@ -632,19 +683,29 @@ impl SourceWorkerClientHandle {
                 self.degraded_observability_snapshot_from_cache("source worker status not started")
             );
         };
+        let trace_id = next_source_status_trace_id();
+        let mut trace_guard = SourceStatusTraceGuard::new(
+            self.node_id.0.clone(),
+            trace_id,
+            "before_rpc_await",
+        );
         eprintln!(
-            "fs_meta_source_worker_client: observability_snapshot begin node={} timeout_ms={}",
+            "fs_meta_source_worker_client: observability_snapshot begin node={} timeout_ms={} trace_id={}",
             self.node_id.0,
-            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT.as_millis()
+            SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT.as_millis(),
+            trace_id
         );
         let result = self
             .observability_snapshot_with_timeout(&client, SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT)
             .await;
+        trace_guard.phase("after_rpc_await");
         eprintln!(
-            "fs_meta_source_worker_client: observability_snapshot done node={} ok={}",
+            "fs_meta_source_worker_client: observability_snapshot done node={} ok={} trace_id={}",
             self.node_id.0,
-            result.is_ok()
+            result.is_ok(),
+            trace_id
         );
+        trace_guard.complete();
         result
     }
 
@@ -655,10 +716,6 @@ impl SourceWorkerClientHandle {
                 "source worker unavailable: {err}"
             )),
         }
-    }
-
-    pub(crate) fn cached_observability_snapshot(&self) -> SourceObservabilitySnapshot {
-        self.degraded_observability_snapshot_from_cache("source worker status served from cache")
     }
 }
 
@@ -950,22 +1007,6 @@ impl SourceFacade {
                 force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
             },
             Self::Worker(client) => client.observability_snapshot_nonblocking().await,
-        }
-    }
-
-    pub(crate) fn cached_observability_snapshot(&self) -> SourceObservabilitySnapshot {
-        match self {
-            Self::Local(source) => SourceObservabilitySnapshot {
-                lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
-                host_object_grants_version: source.host_object_grants_version_snapshot(),
-                grants: source.host_object_grants_snapshot(),
-                logical_roots: source.logical_roots_snapshot(),
-                status: source.status_snapshot(),
-                source_primary_by_group: source.source_primary_by_group_snapshot(),
-                last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
-                force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
-            },
-            Self::Worker(client) => client.cached_observability_snapshot(),
         }
     }
 }

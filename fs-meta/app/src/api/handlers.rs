@@ -66,7 +66,7 @@ pub async fn status(
     let _ = authorize_management(&state, &headers)?;
     let started_at = Instant::now();
 
-    let local_sink = match state.sink.cached_status_snapshot_for_status_route() {
+    let local_sink = match state.sink.status_snapshot_nonblocking().await {
         Ok(snapshot) => snapshot,
         Err(err) if state.sink.is_worker() => {
             log::warn!("status falling back to default cached sink snapshot: {err}");
@@ -76,7 +76,7 @@ pub async fn status(
             return Err(ApiError::internal(format!("sink status failed: {err}")));
         }
     };
-    let local_source = state.source.cached_observability_snapshot();
+    let local_source = state.source.observability_snapshot_nonblocking().await;
     let (sink_status, source, runner_sets, sink_outcome, source_outcome) =
         merge_remote_status_snapshots(
             local_sink,
@@ -196,6 +196,23 @@ fn local_runner_sets(local_source: &SourceObservabilitySnapshot) -> BTreeMap<Str
         .collect()
 }
 
+fn merge_source_runner_sets(
+    primary: BTreeMap<String, Vec<String>>,
+    fallback: BTreeMap<String, Vec<String>>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut merged = primary
+        .into_iter()
+        .map(|(group, runners)| (group, runners.into_iter().collect::<BTreeSet<_>>()))
+        .collect::<BTreeMap<_, _>>();
+    for (group, runners) in fallback {
+        merged.entry(group).or_default().extend(runners);
+    }
+    merged
+        .into_iter()
+        .map(|(group, runners)| (group, runners.into_iter().collect()))
+        .collect()
+}
+
 async fn merge_remote_status_snapshots<SinkCollect, SinkFuture, SourceCollect, SourceFuture>(
     local_sink: SinkStatusSnapshot,
     local_source: SourceObservabilitySnapshot,
@@ -234,6 +251,7 @@ where
         sink_collect(boundary.clone(), node_id.clone()),
         source_collect(boundary, node_id),
     );
+    let local_source_runner_sets = local_runner_sets(&local_source);
 
     let (sink_status, sink_outcome) = match sink_result {
         Ok(snapshot) => (
@@ -248,13 +266,16 @@ where
     let (source, runner_sets, source_outcome) = match source_result {
         Ok((snapshot, runner_sets)) => (
             merge_source_observability(local_source, snapshot),
-            runner_sets,
+            merge_source_runner_sets(runner_sets, local_source_runner_sets.clone()),
             StatusRouteOutcome::Ok,
         ),
         Err(err) => {
             log_status_route_fallback("source", &err);
-            let runner_sets = local_runner_sets(&local_source);
-            (local_source, runner_sets, classify_status_route_error(&err))
+            (
+                local_source,
+                local_source_runner_sets,
+                classify_status_route_error(&err),
+            )
         }
     };
 
@@ -739,13 +760,108 @@ async fn route_source_observability_snapshot(
 }
 
 fn merge_source_observability(
-    mut local: SourceObservabilitySnapshot,
+    local: SourceObservabilitySnapshot,
     aggregated: SourceObservabilitySnapshot,
 ) -> SourceObservabilitySnapshot {
-    local.source_primary_by_group = aggregated.source_primary_by_group;
-    local.last_force_find_runner_by_group = aggregated.last_force_find_runner_by_group;
-    local.force_find_inflight_groups = aggregated.force_find_inflight_groups;
-    local
+    const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
+    const SOURCE_WORKER_CACHE_REASON: &str = "source worker status served from cache";
+
+    fn has_live_data(snapshot: &SourceObservabilitySnapshot) -> bool {
+        !snapshot.grants.is_empty()
+            || !snapshot.logical_roots.is_empty()
+            || !snapshot.status.logical_roots.is_empty()
+            || !snapshot.status.concrete_roots.is_empty()
+            || !snapshot.source_primary_by_group.is_empty()
+            || !snapshot.last_force_find_runner_by_group.is_empty()
+            || !snapshot.force_find_inflight_groups.is_empty()
+    }
+
+    let (mut merged, fallback) = if has_live_data(&aggregated) {
+        (aggregated, local)
+    } else {
+        (local, aggregated)
+    };
+
+    merged.host_object_grants_version = merged
+        .host_object_grants_version
+        .max(fallback.host_object_grants_version);
+
+    let mut grant_map = merged
+        .grants
+        .into_iter()
+        .map(|grant| (grant.object_ref.clone(), grant))
+        .collect::<BTreeMap<_, _>>();
+    for grant in fallback.grants {
+        grant_map.entry(grant.object_ref.clone()).or_insert(grant);
+    }
+    merged.grants = grant_map.into_values().collect();
+
+    let mut root_map = merged
+        .logical_roots
+        .into_iter()
+        .map(|root| (root.id.clone(), root))
+        .collect::<BTreeMap<_, _>>();
+    for root in fallback.logical_roots {
+        root_map.entry(root.id.clone()).or_insert(root);
+    }
+    merged.logical_roots = root_map.into_values().collect();
+
+    let mut logical_root_map = merged
+        .status
+        .logical_roots
+        .into_iter()
+        .map(|entry| (entry.root_id.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    for entry in fallback.status.logical_roots {
+        logical_root_map.entry(entry.root_id.clone()).or_insert(entry);
+    }
+    merged.status.logical_roots = logical_root_map.into_values().collect();
+
+    let mut concrete_root_map = merged
+        .status
+        .concrete_roots
+        .into_iter()
+        .map(|entry| (entry.root_key.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    for entry in fallback.status.concrete_roots {
+        concrete_root_map.entry(entry.root_key.clone()).or_insert(entry);
+    }
+    merged.status.concrete_roots = concrete_root_map.into_values().collect();
+
+    let merged_has_live_data = has_live_data(&merged);
+    let mut degraded_root_map = merged
+        .status
+        .degraded_roots
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+    for (root_key, reason) in fallback.status.degraded_roots {
+        if merged_has_live_data
+            && root_key == SOURCE_WORKER_DEGRADED_ROOT_KEY
+            && reason == SOURCE_WORKER_CACHE_REASON
+        {
+            continue;
+        }
+        degraded_root_map.entry(root_key).or_insert(reason);
+    }
+    merged.status.degraded_roots = degraded_root_map.into_iter().collect();
+
+    for (group, object_ref) in fallback.source_primary_by_group {
+        merged.source_primary_by_group.entry(group).or_insert(object_ref);
+    }
+    for (group, runner) in fallback.last_force_find_runner_by_group {
+        merged
+            .last_force_find_runner_by_group
+            .entry(group)
+            .or_insert(runner);
+    }
+
+    let mut inflight = merged
+        .force_find_inflight_groups
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    inflight.extend(fallback.force_find_inflight_groups);
+    merged.force_find_inflight_groups = inflight.into_iter().collect();
+    merged
 }
 
 fn merge_source_observability_snapshots(
@@ -983,6 +1099,9 @@ fn authorize_management(
 mod tests {
     use super::*;
     use crate::source::SourceStatusSnapshot;
+    use crate::source::config::GrantedMountRoot;
+    use crate::source::{SourceConcreteRootHealthSnapshot, SourceLogicalRootHealthSnapshot};
+    use crate::RootSpec;
     use crate::workers::source::SourceObservabilitySnapshot;
     use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
 
@@ -994,9 +1113,58 @@ mod tests {
         SourceObservabilitySnapshot {
             lifecycle_state: "ready".to_string(),
             host_object_grants_version: 1,
-            grants: Vec::new(),
-            logical_roots: Vec::new(),
-            status: SourceStatusSnapshot::default(),
+            grants: vec![GrantedMountRoot {
+                object_ref: "node-a::nfs1".to_string(),
+                host_ref: "node-a".to_string(),
+                host_ip: "10.0.0.11".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: BTreeMap::new(),
+                mount_point: "/mnt/nfs1".into(),
+                fs_source: "srv:/nfs1".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            }],
+            logical_roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            status: SourceStatusSnapshot {
+                logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                    root_id: "nfs1".to_string(),
+                    status: "healthy".to_string(),
+                    matched_grants: 1,
+                    active_members: 1,
+                    coverage_mode: "watch".to_string(),
+                }],
+                concrete_roots: vec![SourceConcreteRootHealthSnapshot {
+                    root_key: "nfs1@node-a".to_string(),
+                    logical_root_id: "nfs1".to_string(),
+                    object_ref: "node-a::nfs1".to_string(),
+                    status: "healthy".to_string(),
+                    coverage_mode: "watch".to_string(),
+                    watch_enabled: true,
+                    scan_enabled: true,
+                    is_group_primary: true,
+                    active: true,
+                    watch_lru_capacity: 1024,
+                    audit_interval_ms: 300_000,
+                    overflow_count: 0,
+                    overflow_pending: false,
+                    rescan_pending: false,
+                    last_rescan_reason: None,
+                    last_error: None,
+                    last_audit_started_at_us: None,
+                    last_audit_completed_at_us: None,
+                    last_audit_duration_ms: None,
+                    current_revision: Some(1),
+                    candidate_revision: None,
+                    candidate_status: None,
+                    draining_revision: None,
+                    draining_status: None,
+                }],
+                degraded_roots: Vec::new(),
+            },
             source_primary_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
             last_force_find_runner_by_group: BTreeMap::from([(
                 "nfs1".to_string(),
@@ -1140,5 +1308,120 @@ mod tests {
         assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
         assert_eq!(source_outcome, StatusRouteOutcome::Ok);
+    }
+
+    #[test]
+    fn merge_source_observability_prefers_live_collect_data_over_stale_cache() {
+        let local = SourceObservabilitySnapshot {
+            lifecycle_state: "degraded_worker_unreachable".to_string(),
+            host_object_grants_version: 1,
+            grants: vec![GrantedMountRoot {
+                object_ref: "node-a::nfs1".to_string(),
+                host_ref: "node-a".to_string(),
+                host_ip: "10.0.0.11".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: BTreeMap::new(),
+                mount_point: "/mnt/nfs1".into(),
+                fs_source: "srv:/nfs1".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            }],
+            logical_roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            status: SourceStatusSnapshot {
+                degraded_roots: vec![(
+                    "source-worker".to_string(),
+                    "source worker status served from cache".to_string(),
+                )],
+                ..SourceStatusSnapshot::default()
+            },
+            source_primary_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
+            last_force_find_runner_by_group: BTreeMap::new(),
+            force_find_inflight_groups: Vec::new(),
+        };
+        let aggregated = SourceObservabilitySnapshot {
+            lifecycle_state: "ready".to_string(),
+            host_object_grants_version: 7,
+            grants: vec![GrantedMountRoot {
+                object_ref: "node-b::nfs2".to_string(),
+                host_ref: "node-b".to_string(),
+                host_ip: "10.0.0.12".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: BTreeMap::new(),
+                mount_point: "/mnt/nfs2".into(),
+                fs_source: "srv:/nfs2".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: Vec::new(),
+                interfaces: Vec::new(),
+                active: true,
+            }],
+            logical_roots: vec![RootSpec::new("nfs2", "/mnt/nfs2")],
+            status: SourceStatusSnapshot {
+                logical_roots: vec![SourceLogicalRootHealthSnapshot {
+                    root_id: "nfs2".to_string(),
+                    status: "healthy".to_string(),
+                    matched_grants: 1,
+                    active_members: 1,
+                    coverage_mode: "watch".to_string(),
+                }],
+                concrete_roots: vec![SourceConcreteRootHealthSnapshot {
+                    root_key: "nfs2@node-b".to_string(),
+                    logical_root_id: "nfs2".to_string(),
+                    object_ref: "node-b::nfs2".to_string(),
+                    status: "healthy".to_string(),
+                    coverage_mode: "watch".to_string(),
+                    watch_enabled: true,
+                    scan_enabled: true,
+                    is_group_primary: true,
+                    active: true,
+                    watch_lru_capacity: 1024,
+                    audit_interval_ms: 300_000,
+                    overflow_count: 0,
+                    overflow_pending: false,
+                    rescan_pending: false,
+                    last_rescan_reason: None,
+                    last_error: None,
+                    last_audit_started_at_us: None,
+                    last_audit_completed_at_us: None,
+                    last_audit_duration_ms: None,
+                    current_revision: Some(1),
+                    candidate_revision: None,
+                    candidate_status: None,
+                    draining_revision: None,
+                    draining_status: None,
+                }],
+                degraded_roots: Vec::new(),
+            },
+            source_primary_by_group: BTreeMap::from([("nfs2".to_string(), "node-b".to_string())]),
+            last_force_find_runner_by_group: BTreeMap::from([(
+                "nfs2".to_string(),
+                "node-b".to_string(),
+            )]),
+            force_find_inflight_groups: vec!["nfs2".to_string()],
+        };
+
+        let merged = merge_source_observability(local, aggregated);
+
+        assert_eq!(merged.lifecycle_state, "ready");
+        assert_eq!(merged.host_object_grants_version, 7);
+        assert_eq!(merged.grants.len(), 2);
+        assert_eq!(merged.logical_roots.len(), 2);
+        assert!(
+            merged
+                .status
+                .degraded_roots
+                .iter()
+                .all(|(_, reason)| reason != "source worker status served from cache")
+        );
+        assert_eq!(
+            merged.source_primary_by_group.get("nfs2"),
+            Some(&"node-b".to_string())
+        );
+        assert_eq!(merged.force_find_inflight_groups, vec!["nfs2".to_string()]);
     }
 }

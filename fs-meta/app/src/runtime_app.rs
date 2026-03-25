@@ -205,6 +205,59 @@ where
     }
 }
 
+fn debug_source_status_lifecycle_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_SOURCE_STATUS_LIFECYCLE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn next_source_status_endpoint_trace_id() -> u64 {
+    static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+struct SourceStatusEndpointTraceGuard {
+    route: String,
+    correlation: Option<u64>,
+    trace_id: u64,
+    phase: &'static str,
+    completed: bool,
+}
+
+impl SourceStatusEndpointTraceGuard {
+    fn new(route: String, correlation: Option<u64>, trace_id: u64, phase: &'static str) -> Self {
+        Self {
+            route,
+            correlation,
+            trace_id,
+            phase,
+            completed: false,
+        }
+    }
+
+    fn phase(&mut self, phase: &'static str) {
+        self.phase = phase;
+    }
+
+    fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+
+impl Drop for SourceStatusEndpointTraceGuard {
+    fn drop(&mut self) {
+        if debug_source_status_lifecycle_enabled() && !self.completed {
+            eprintln!(
+                "fs_meta_runtime_app: source status endpoint dropped route={} correlation={:?} trace_id={} phase={}",
+                self.route, self.correlation, self.trace_id, self.phase
+            );
+        }
+    }
+}
+
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
         Ok(d) => d.as_micros() as u64,
@@ -719,7 +772,7 @@ impl FSMetaApp {
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
-                                match sink.cached_status_snapshot_for_status_route() {
+                                match sink.status_snapshot_nonblocking().await {
                                     Ok(snapshot) => {
                                         eprintln!(
                                             "fs_meta_runtime_app: sink status endpoint response groups={}",
@@ -776,11 +829,32 @@ impl FSMetaApp {
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
-                                let snapshot = source.cached_observability_snapshot();
+                                let trace_id = next_source_status_endpoint_trace_id();
+                                let route_name = format!(
+                                    "{}:{}",
+                                    ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS
+                                );
+                                let mut trace_guard = SourceStatusEndpointTraceGuard::new(
+                                    route_name,
+                                    req.metadata().correlation_id,
+                                    trace_id,
+                                    "before_source_snapshot_await",
+                                );
+                                if debug_source_status_lifecycle_enabled() {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: source status endpoint begin correlation={:?} trace_id={}",
+                                        req.metadata().correlation_id,
+                                        trace_id
+                                    );
+                                }
+                                let snapshot = source.observability_snapshot_nonblocking().await;
+                                trace_guard.phase("after_source_snapshot_await");
                                 eprintln!(
-                                    "fs_meta_runtime_app: source status endpoint response groups={} runners={}",
+                                    "fs_meta_runtime_app: source status endpoint response groups={} runners={} correlation={:?} trace_id={}",
                                     snapshot.source_primary_by_group.len(),
-                                    snapshot.last_force_find_runner_by_group.len()
+                                    snapshot.last_force_find_runner_by_group.len(),
+                                    req.metadata().correlation_id,
+                                    trace_id
                                 );
                                 if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
                                     responses.push(Event::new(
@@ -795,6 +869,7 @@ impl FSMetaApp {
                                         bytes::Bytes::from(payload),
                                     ));
                                 }
+                                trace_guard.complete();
                             }
                             responses
                         }
@@ -3122,7 +3197,10 @@ mod tests {
                 .expect("resolve first facade config"),
         });
         assert!(
-            app_1.try_spawn_pending_facade().await.expect("spawn first facade"),
+            app_1
+                .try_spawn_pending_facade()
+                .await
+                .expect("spawn first facade"),
             "first app instance should claim and activate the fixed facade"
         );
 
@@ -3185,11 +3263,16 @@ mod tests {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            guard.clone().expect("fixed-bind facade claim should remain owned")
+            guard
+                .clone()
+                .expect("fixed-bind facade claim should remain owned")
         };
         assert_eq!(claim.owner_instance_id, app_1.instance_id);
         assert_eq!(claim.bind_addr, bind_addr);
-        assert_eq!(claim.resource_ids, vec![listener_resource.resource_id.clone()]);
+        assert_eq!(
+            claim.resource_ids,
+            vec![listener_resource.resource_id.clone()]
+        );
 
         app_2.close().await.expect("close second app");
         app_1.close().await.expect("close first app");
