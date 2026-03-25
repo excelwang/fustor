@@ -1696,17 +1696,16 @@ impl FSMetaSource {
                                 requests
                                     .into_iter()
                                     .map(|req| {
-                                        Event::new(
-                                            EventMetadata {
-                                                origin_id: node_id_rescan.clone(),
-                                                timestamp_us: now_us(),
-                                                logical_ts: None,
-                                                correlation_id: req.metadata().correlation_id,
-                                                ingress_auth: None,
-                                                trace: None,
-                                            },
-                                            bytes::Bytes::from_static(b"accepted"),
-                                        )
+                                        let mut meta = EventMetadata {
+                                            origin_id: node_id_rescan.clone(),
+                                            timestamp_us: now_us(),
+                                            logical_ts: None,
+                                            correlation_id: None,
+                                            ingress_auth: None,
+                                            trace: None,
+                                        };
+                                        meta.correlation_id = req.metadata().correlation_id;
+                                        Event::new(meta, bytes::Bytes::from_static(b"accepted"))
                                     })
                                     .collect()
                             }
@@ -1804,17 +1803,16 @@ impl FSMetaSource {
                             requests
                                 .into_iter()
                                 .map(|req| {
-                                    Event::new(
-                                        EventMetadata {
-                                            origin_id: node_id_rescan_scoped.clone(),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        bytes::Bytes::from_static(b"accepted"),
-                                    )
+                                    let mut meta = EventMetadata {
+                                        origin_id: node_id_rescan_scoped.clone(),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: None,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    };
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    Event::new(meta, bytes::Bytes::from_static(b"accepted"))
                                 })
                                 .collect()
                         }
@@ -1925,17 +1923,16 @@ impl FSMetaSource {
                             requests
                                 .into_iter()
                                 .map(|req| {
-                                    Event::new(
-                                        EventMetadata {
-                                            origin_id: node_id_rescan.clone(),
-                                            timestamp_us: now_us(),
-                                            logical_ts: None,
-                                            correlation_id: req.metadata().correlation_id,
-                                            ingress_auth: None,
-                                            trace: None,
-                                        },
-                                        bytes::Bytes::from_static(b"accepted"),
-                                    )
+                                    let mut meta = EventMetadata {
+                                        origin_id: node_id_rescan.clone(),
+                                        timestamp_us: now_us(),
+                                        logical_ts: None,
+                                        correlation_id: None,
+                                        ingress_auth: None,
+                                        trace: None,
+                                    };
+                                    meta.correlation_id = req.metadata().correlation_id;
+                                    Event::new(meta, bytes::Bytes::from_static(b"accepted"))
                                 })
                                 .collect()
                         }
@@ -2155,17 +2152,16 @@ impl FSMetaSource {
                         requests
                             .into_iter()
                             .map(|req| {
-                                Event::new(
-                                    EventMetadata {
-                                        origin_id: node_id_rescan_scoped.clone(),
-                                        timestamp_us: now_us(),
-                                        logical_ts: None,
-                                        correlation_id: req.metadata().correlation_id,
-                                        ingress_auth: None,
-                                        trace: None,
-                                    },
-                                    bytes::Bytes::from_static(b"accepted"),
-                                )
+                                let mut meta = EventMetadata {
+                                    origin_id: node_id_rescan_scoped.clone(),
+                                    timestamp_us: now_us(),
+                                    logical_ts: None,
+                                    correlation_id: None,
+                                    ingress_auth: None,
+                                    trace: None,
+                                };
+                                meta.correlation_id = req.metadata().correlation_id;
+                                Event::new(meta, bytes::Bytes::from_static(b"accepted"))
                             })
                             .collect()
                     }
@@ -3825,6 +3821,7 @@ impl FSMetaSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ControlEvent;
     use capanix_runtime_entry_sdk::control::{
         RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate, RuntimeHostDescriptor,
         RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType,
@@ -4652,6 +4649,76 @@ mod tests {
                 .await;
         assert!(ready);
         assert!(started.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[tokio::test]
+    async fn pub_initial_scan_preserves_epoch_boundaries_for_each_primary_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base = std::env::temp_dir().join(format!("fs-meta-pub-initial-scan-{unique}"));
+        let nfs1 = base.join("nfs1");
+        let nfs2 = base.join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("a.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("b.txt"), b"b").expect("seed nfs2");
+
+        let mut cfg = SourceConfig::default();
+        let mut root_a = RootSpec::new("nfs1", nfs1.clone());
+        root_a.watch = false;
+        let mut root_b = RootSpec::new("nfs2", nfs2.clone());
+        root_b.watch = false;
+        cfg.roots = vec![root_a, root_b];
+        cfg.host_object_grants = vec![
+            test_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone(), true),
+            test_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone(), true),
+        ];
+
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut control_counts = std::collections::BTreeMap::<String, usize>::new();
+        let mut data_counts = std::collections::BTreeMap::<String, usize>::new();
+        while tokio::time::Instant::now() < deadline {
+            let batch = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .expect("initial scan batch wait should not time out")
+                .expect("pub stream should yield initial scan batch");
+            for event in batch {
+                let origin = event.metadata().origin_id.0.clone();
+                if rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok() {
+                    *control_counts.entry(origin).or_insert(0) += 1;
+                } else {
+                    *data_counts.entry(origin).or_insert(0) += 1;
+                }
+            }
+            let complete = ["node-a::nfs1", "node-a::nfs2"].iter().all(|origin| {
+                control_counts.get(*origin).copied() == Some(2)
+                    && data_counts.get(*origin).copied().unwrap_or(0) > 0
+            });
+            if complete {
+                break;
+            }
+        }
+
+        source.close().await.expect("close source");
+
+        assert_eq!(control_counts.get("node-a::nfs1").copied(), Some(2));
+        assert_eq!(control_counts.get("node-a::nfs2").copied(), Some(2));
+        assert!(
+            data_counts.get("node-a::nfs1").copied().unwrap_or(0) > 0,
+            "nfs1 should publish at least one materialized record"
+        );
+        assert!(
+            data_counts.get("node-a::nfs2").copied().unwrap_or(0) > 0,
+            "nfs2 should publish at least one materialized record"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
     }
 
     #[test]

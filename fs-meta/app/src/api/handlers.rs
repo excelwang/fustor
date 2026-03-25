@@ -813,7 +813,9 @@ fn merge_source_observability(
         .map(|entry| (entry.root_id.clone(), entry))
         .collect::<BTreeMap<_, _>>();
     for entry in fallback.status.logical_roots {
-        logical_root_map.entry(entry.root_id.clone()).or_insert(entry);
+        logical_root_map
+            .entry(entry.root_id.clone())
+            .or_insert(entry);
     }
     merged.status.logical_roots = logical_root_map.into_values().collect();
 
@@ -824,7 +826,9 @@ fn merge_source_observability(
         .map(|entry| (entry.root_key.clone(), entry))
         .collect::<BTreeMap<_, _>>();
     for entry in fallback.status.concrete_roots {
-        concrete_root_map.entry(entry.root_key.clone()).or_insert(entry);
+        concrete_root_map
+            .entry(entry.root_key.clone())
+            .or_insert(entry);
     }
     merged.status.concrete_roots = concrete_root_map.into_values().collect();
 
@@ -846,7 +850,10 @@ fn merge_source_observability(
     merged.status.degraded_roots = degraded_root_map.into_iter().collect();
 
     for (group, object_ref) in fallback.source_primary_by_group {
-        merged.source_primary_by_group.entry(group).or_insert(object_ref);
+        merged
+            .source_primary_by_group
+            .entry(group)
+            .or_insert(object_ref);
     }
     for (group, runner) in fallback.last_force_find_runner_by_group {
         merged
@@ -1098,10 +1105,10 @@ fn authorize_management(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::RootSpec;
     use crate::source::SourceStatusSnapshot;
     use crate::source::config::GrantedMountRoot;
     use crate::source::{SourceConcreteRootHealthSnapshot, SourceLogicalRootHealthSnapshot};
-    use crate::RootSpec;
     use crate::workers::source::SourceObservabilitySnapshot;
     use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
 

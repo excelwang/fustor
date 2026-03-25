@@ -7,7 +7,6 @@ use capanix_app_sdk::{CnxError, Event};
 use capanix_runtime_entry_sdk::advanced::boundary::{
     BoundaryContext, ChannelIoSubset, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
 };
-use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 fn debug_source_status_lifecycle_enabled() -> bool {
@@ -20,7 +19,6 @@ fn debug_source_status_lifecycle_enabled() -> bool {
 }
 
 enum EndpointJoin {
-    Tokio(JoinHandle<()>),
     Thread(std::thread::JoinHandle<()>),
 }
 
@@ -35,19 +33,16 @@ impl ManagedEndpointTask {
     where
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
-        if tokio::runtime::Handle::try_current().is_ok() {
-            if debug_source_status_lifecycle_enabled() {
-                eprintln!("fs_meta_runtime_endpoint: spawn_join mode=current-runtime");
-            }
-            EndpointJoin::Tokio(tokio::spawn(runner))
-        } else {
-            if debug_source_status_lifecycle_enabled() {
-                eprintln!("fs_meta_runtime_endpoint: spawn_join mode=shared-runtime-thread");
-            }
-            EndpointJoin::Thread(std::thread::spawn(move || {
-                crate::runtime_app::shared_tokio_runtime().block_on(runner)
-            }))
+        if debug_source_status_lifecycle_enabled() {
+            eprintln!("fs_meta_runtime_endpoint: spawn_join mode=dedicated-runtime-thread");
         }
+        EndpointJoin::Thread(std::thread::spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build dedicated fs-meta endpoint runtime")
+                .block_on(runner)
+        }))
     }
 
     fn spawn_join_with_ready<Fut>(runner: Fut) -> (EndpointJoin, Receiver<()>)
@@ -139,19 +134,6 @@ impl ManagedEndpointTask {
             return;
         };
         match join {
-            EndpointJoin::Tokio(join) => match tokio::time::timeout(wait_timeout, join).await {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => {
-                    log::warn!("endpoint task {} join failed: {:?}", self.name, err);
-                }
-                Err(_) => {
-                    log::warn!(
-                        "endpoint task {} did not exit within {:?}",
-                        self.name,
-                        wait_timeout
-                    );
-                }
-            },
             EndpointJoin::Thread(join) => {
                 if tokio::runtime::Handle::try_current().is_ok() {
                     let blocking_join = tokio::task::spawn_blocking(move || join.join());
@@ -393,6 +375,10 @@ mod tests {
         first_failure: Mutex<Option<FirstFailure>>,
     }
 
+    struct ThreadRecordingBoundary {
+        thread_name_tx: Mutex<Option<std::sync::mpsc::SyncSender<Option<String>>>>,
+    }
+
     #[derive(Clone, Copy)]
     enum FirstFailure {
         NotSupported,
@@ -422,6 +408,14 @@ mod tests {
         }
     }
 
+    impl ThreadRecordingBoundary {
+        fn new(tx: std::sync::mpsc::SyncSender<Option<String>>) -> Self {
+            Self {
+                thread_name_tx: Mutex::new(Some(tx)),
+            }
+        }
+    }
+
     #[async_trait::async_trait]
     impl ChannelIoSubset for RecordingBoundary {
         async fn channel_recv(
@@ -444,6 +438,71 @@ mod tests {
             }
             Err(CnxError::Internal("stop after first recv".into()))
         }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for ThreadRecordingBoundary {
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            if let Some(tx) = self
+                .thread_name_tx
+                .lock()
+                .expect("thread_name_tx lock")
+                .take()
+            {
+                let _ = tx.send(std::thread::current().name().map(str::to_string));
+            }
+            Err(CnxError::Internal("stop after first recv".into()))
+        }
+    }
+
+    #[test]
+    fn spawned_endpoint_thread_does_not_run_on_shared_runtime_worker() {
+        let (tx, rx) = sync_channel(1);
+        let boundary = Arc::new(ThreadRecordingBoundary::new(tx));
+        let mut endpoint = ManagedEndpointTask::spawn(
+            boundary,
+            RouteKey("sink-status:v1.req".into()),
+            "test-endpoint",
+            CancellationToken::new(),
+            |_events: Vec<Event>| std::future::ready(Vec::new()),
+        );
+
+        let thread_name = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("endpoint loop should attempt recv");
+
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_secs(1)));
+
+        assert_ne!(thread_name.as_deref(), Some("fs-meta-shared-runtime"));
+    }
+
+    #[test]
+    fn spawned_endpoint_from_shared_runtime_moves_off_shared_runtime_worker() {
+        let (tx, rx) = sync_channel(1);
+        let mut endpoint = crate::runtime_app::shared_tokio_runtime().block_on(async {
+            let boundary = Arc::new(ThreadRecordingBoundary::new(tx));
+            ManagedEndpointTask::spawn(
+                boundary,
+                RouteKey("sink-status:v1.req".into()),
+                "test-endpoint",
+                CancellationToken::new(),
+                |_events: Vec<Event>| std::future::ready(Vec::new()),
+            )
+        });
+
+        let thread_name = rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("endpoint loop should attempt recv");
+
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_secs(1)));
+
+        assert_ne!(thread_name.as_deref(), Some("fs-meta-shared-runtime"));
     }
 
     #[test]

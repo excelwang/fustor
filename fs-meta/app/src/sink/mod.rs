@@ -269,7 +269,11 @@ impl GroupSinkState {
     }
 
     fn refresh_initial_audit_completed(&mut self) {
-        self.initial_audit_completed = self.audit_epoch_completed && self.tree.node_count() > 0;
+        let has_live_materialized_nodes = self
+            .tree
+            .aggregate_at(b"/")
+            .is_some_and(|aggregate| aggregate.total_nodes > 0);
+        self.initial_audit_completed = self.audit_epoch_completed && has_live_materialized_nodes;
     }
 }
 
@@ -2053,6 +2057,8 @@ impl SinkFileMeta {
             ));
         }
         let state = self.state.read()?;
+        let debug_materialized_query =
+            std::env::var_os("FSMETA_DEBUG_SINK_MATERIALIZED_QUERY").is_some();
 
         let dir_path = if request.scope.path.is_empty() {
             b"/".to_vec()
@@ -2079,6 +2085,27 @@ impl SinkFileMeta {
                         tree_options.read_class,
                         group.last_coverage_recovered_at,
                     );
+                    if debug_materialized_query {
+                        let live_nodes = group
+                            .tree
+                            .aggregate_at(b"/")
+                            .map(|aggregate| aggregate.total_nodes)
+                            .unwrap_or(0);
+                        eprintln!(
+                            "fs_meta_sink: materialized_query group={} selected={:?} path={} recursive={} node_count={} live_nodes={} audit_epoch_completed={} initial_audit_completed={} root_exists={} entries={} has_children={}",
+                            group_id,
+                            selected_group,
+                            String::from_utf8_lossy(&dir_path),
+                            request.scope.recursive,
+                            group.tree.node_count(),
+                            live_nodes,
+                            group.audit_epoch_completed,
+                            group.initial_audit_completed,
+                            response.root.exists,
+                            response.entries.len(),
+                            response.root.has_children
+                        );
+                    }
                     rmp_serde::to_vec_named(&MaterializedQueryPayload::Tree(response))
                 }
                 QueryOp::Stats => {
@@ -2247,6 +2274,16 @@ mod tests {
     }
 
     fn mk_record(path: &[u8], file_name: &str, ts: u64, event_kind: EventKind) -> FileMetaRecord {
+        mk_record_with_track(path, file_name, ts, event_kind, crate::SyncTrack::Scan)
+    }
+
+    fn mk_record_with_track(
+        path: &[u8],
+        file_name: &str,
+        ts: u64,
+        event_kind: EventKind,
+        source: crate::SyncTrack,
+    ) -> FileMetaRecord {
         FileMetaRecord::from_unix(
             path.to_vec(),
             file_name.as_bytes().to_vec(),
@@ -2260,7 +2297,7 @@ mod tests {
             },
             event_kind,
             true,
-            crate::SyncTrack::Scan,
+            source,
             b"/".to_vec(),
             ts,
             false,
@@ -2883,6 +2920,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn buffered_audit_control_events_restore_initial_audit_after_grants_catch_up() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![
+            RootSpec::new("root-a", "/mnt/nfs1"),
+            RootSpec::new("root-b", "/mnt/nfs2"),
+        ];
+        cfg.host_object_grants = vec![granted_mount_root(
+            "node-a::exp-a",
+            "node-a",
+            "10.0.0.11",
+            "/mnt/nfs1",
+            true,
+        )];
+        let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
+            .expect("init sink");
+
+        let activate =
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("root-a", &["node-a::exp-a"]),
+                    bound_scope_with_resources("root-b", &["node-b::exp-b"]),
+                ],
+            }))
+            .expect("encode activate");
+        sink.on_control_frame(&[activate])
+            .await
+            .expect("activate should pass");
+
+        sink.ingest_stream_events(&[
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                1,
+            ),
+            mk_source_event(
+                "node-b::exp-b",
+                mk_record(b"/ready.txt", "ready.txt", 2, EventKind::Update),
+            ),
+            mk_control_event(
+                "node-b::exp-b",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                3,
+            ),
+        ])
+        .expect("stream ingest should buffer scheduled root-b events");
+
+        let grants_changed = host_object_grants_changed_envelope(
+            1,
+            &[
+                granted_mount_root("node-a::exp-a", "node-a", "10.0.0.11", "/mnt/nfs1", true),
+                granted_mount_root("node-b::exp-b", "node-b", "10.0.0.12", "/mnt/nfs2", true),
+            ],
+        );
+        sink.on_control_frame(&[grants_changed])
+            .await
+            .expect("grants change should flush buffered stream events");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let snapshot = sink.status_snapshot().expect("sink status");
+            if snapshot
+                .groups
+                .iter()
+                .find(|group| group.group_id == "root-b")
+                .is_some_and(|group| group.initial_audit_completed)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for buffered control events to restore initial audit"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn runtime_scoped_send_ignores_out_of_scope_group_events() {
         let mut cfg = SourceConfig::default();
         cfg.roots = vec![
@@ -3106,6 +3231,68 @@ mod tests {
         assert!(
             snapshot.groups[0].initial_audit_completed,
             "materialized root should unlock initial audit readiness after audit completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_audit_completion_rejects_tombstone_only_state() {
+        let sink = build_single_group_sink();
+        sink.send(&[
+            mk_source_event(
+                "node-a::exp",
+                mk_record_with_track(
+                    b"/gone.txt",
+                    "gone.txt",
+                    1,
+                    EventKind::Update,
+                    crate::SyncTrack::Realtime,
+                ),
+            ),
+            mk_source_event(
+                "node-a::exp",
+                mk_record_with_track(
+                    b"/gone.txt",
+                    "gone.txt",
+                    2,
+                    EventKind::Delete,
+                    crate::SyncTrack::Realtime,
+                ),
+            ),
+            mk_control_event(
+                "node-a::exp",
+                ControlEvent::EpochStart {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                3,
+            ),
+            mk_control_event(
+                "node-a::exp",
+                ControlEvent::EpochEnd {
+                    epoch_id: 0,
+                    epoch_type: EpochType::Audit,
+                },
+                4,
+            ),
+        ])
+        .await
+        .expect("apply tombstone-only audit state");
+
+        let snapshot = sink.status_snapshot().expect("sink status");
+        assert_eq!(snapshot.groups.len(), 1);
+        assert!(
+            !snapshot.groups[0].initial_audit_completed,
+            "tombstone-only state must not satisfy initial audit readiness"
+        );
+
+        let events = sink
+            .materialized_query(&default_materialized_request())
+            .expect("query response");
+        let response = decode_tree_payload(&events[0]);
+        assert!(!response.root.exists, "tombstone-only root must stay empty");
+        assert!(
+            response.entries.is_empty(),
+            "tombstone-only tree must not expose entries"
         );
     }
 }

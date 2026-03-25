@@ -684,11 +684,8 @@ impl SourceWorkerClientHandle {
             );
         };
         let trace_id = next_source_status_trace_id();
-        let mut trace_guard = SourceStatusTraceGuard::new(
-            self.node_id.0.clone(),
-            trace_id,
-            "before_rpc_await",
-        );
+        let mut trace_guard =
+            SourceStatusTraceGuard::new(self.node_id.0.clone(), trace_id, "before_rpc_await");
         eprintln!(
             "fs_meta_source_worker_client: observability_snapshot begin node={} timeout_ms={} trace_id={}",
             self.node_id.0,

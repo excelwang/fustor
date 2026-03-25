@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -80,14 +79,11 @@ fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<Que
 #[derive(Clone)]
 pub struct SinkWorkerClientHandle {
     node_id: NodeId,
-    config: SourceConfig,
     worker_factory: RuntimeWorkerClientFactory,
-    worker_binding: RuntimeWorkerBinding,
     worker: TypedRuntimeWorkerClient<SinkWorkerRpc, SourceConfig>,
     logical_roots_cache: Arc<Mutex<Vec<crate::source::config::RootSpec>>>,
     status_cache: Arc<Mutex<SinkStatusSnapshot>>,
     control_ops_inflight: Arc<AtomicUsize>,
-    remote_client_cache: Arc<Mutex<BTreeMap<String, Arc<SinkWorkerClientHandle>>>>,
 }
 
 struct InflightControlOpGuard {
@@ -115,13 +111,10 @@ impl SinkWorkerClientHandle {
                 worker_binding.clone(),
             )?,
             node_id,
-            config,
             worker_factory,
-            worker_binding,
             logical_roots_cache,
             status_cache: Arc::new(Mutex::new(SinkStatusSnapshot::default())),
             control_ops_inflight: Arc::new(AtomicUsize::new(0)),
-            remote_client_cache: Arc::new(Mutex::new(BTreeMap::new())),
         })
     }
 
@@ -134,34 +127,6 @@ impl SinkWorkerClientHandle {
 
     fn control_op_inflight(&self) -> bool {
         self.control_ops_inflight.load(Ordering::Relaxed) > 0
-    }
-
-    fn cached_remote_client(&self, node_id: &NodeId) -> Result<Option<Arc<Self>>> {
-        self.remote_client_cache
-            .lock()
-            .map(|guard| guard.get(&node_id.0).cloned())
-            .map_err(|_| CnxError::Internal("sink worker remote client cache lock poisoned".into()))
-    }
-
-    fn remote_client(&self, node_id: &NodeId) -> Result<Arc<Self>> {
-        if let Some(existing) = self.cached_remote_client(node_id)? {
-            return Ok(existing);
-        }
-        // Reuse one remote client per peer node so direct-node queries do not
-        // churn duplicate worker hosts on the canonical sink route.
-        let remote = Arc::new(Self::new(
-            node_id.clone(),
-            self.config.clone(),
-            self.worker_binding.clone(),
-            self.worker_factory.clone(),
-        )?);
-        let mut guard = self.remote_client_cache.lock().map_err(|_| {
-            CnxError::Internal("sink worker remote client cache lock poisoned".into())
-        })?;
-        Ok(guard
-            .entry(node_id.0.clone())
-            .or_insert_with(|| remote.clone())
-            .clone())
     }
 
     async fn existing_client(&self) -> Result<Option<TypedWorkerClient<SinkWorkerRpc>>> {
@@ -780,24 +745,6 @@ impl SinkFacade {
         match self {
             Self::Local(sink) => sink.materialized_query(request),
             Self::Worker(client) => client.materialized_query_nonblocking(request.clone()).await,
-        }
-    }
-
-    pub async fn materialized_query_via_node(
-        &self,
-        node_id: &NodeId,
-        request: &InternalQueryRequest,
-    ) -> Result<Vec<Event>> {
-        match self {
-            Self::Local(sink) => sink.materialized_query(request),
-            Self::Worker(client) => {
-                if client.node_id == *node_id {
-                    client.materialized_query(request.clone()).await
-                } else {
-                    let remote = client.remote_client(node_id)?;
-                    remote.materialized_query(request.clone()).await
-                }
-            }
         }
     }
 

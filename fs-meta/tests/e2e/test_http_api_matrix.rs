@@ -1516,6 +1516,24 @@ fn normalize_tree_like_json(value: &mut Value) {
                 map.insert("id".into(), Value::String("oracle-pit".into()));
                 map.insert("expires_at_ms".into(), Value::Number(0u64.into()));
             }
+            if is_materialized_tree_group_envelope(map) {
+                map.insert("reliable".into(), Value::String("oracle-dynamic".into()));
+                map.insert(
+                    "unreliable_reason".into(),
+                    Value::String("oracle-dynamic".into()),
+                );
+                map.insert(
+                    "stability".into(),
+                    json!({
+                        "mode": "oracle-dynamic",
+                        "state": "oracle-dynamic",
+                        "quiet_window_ms": "oracle-dynamic",
+                        "observed_quiet_for_ms": "oracle-dynamic",
+                        "remaining_ms": "oracle-dynamic",
+                        "blocked_reasons": ["oracle-dynamic"],
+                    }),
+                );
+            }
             for child in map.values_mut() {
                 normalize_tree_like_json(child);
             }
@@ -1529,7 +1547,126 @@ fn normalize_tree_like_json(value: &mut Value) {
     }
 }
 
+fn is_materialized_tree_group_envelope(map: &serde_json::Map<String, Value>) -> bool {
+    map.contains_key("group")
+        && map.contains_key("reliable")
+        && map.contains_key("unreliable_reason")
+        && map.contains_key("stability")
+        && map
+            .get("meta")
+            .and_then(Value::as_object)
+            .and_then(|meta| meta.get("read_class"))
+            .and_then(Value::as_str)
+            == Some("trusted-materialized")
+}
+
+fn validate_materialized_tree_group_dynamic_fields(value: &Value) -> Result<(), String> {
+    match value {
+        Value::Object(map) => {
+            if is_materialized_tree_group_envelope(map) {
+                let group = map
+                    .get("group")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<unknown>");
+                if map.get("reliable").and_then(Value::as_bool).is_none() {
+                    return Err(format!(
+                        "trusted-materialized group {group} missing boolean reliable: {value}"
+                    ));
+                }
+                match map.get("unreliable_reason") {
+                    Some(Value::Null) => {}
+                    Some(Value::String(reason))
+                        if matches!(
+                            reason.as_str(),
+                            "Unattested"
+                                | "SuspectNodes"
+                                | "BlindSpotsDetected"
+                                | "WatchOverflowPendingAudit"
+                        ) => {}
+                    Some(other) => {
+                        return Err(format!(
+                            "trusted-materialized group {group} has invalid unreliable_reason {other}"
+                        ));
+                    }
+                    None => {
+                        return Err(format!(
+                            "trusted-materialized group {group} missing unreliable_reason: {value}"
+                        ));
+                    }
+                }
+                let stability =
+                    map.get("stability")
+                        .and_then(Value::as_object)
+                        .ok_or_else(|| {
+                            format!(
+                            "trusted-materialized group {group} missing stability object: {value}"
+                        )
+                        })?;
+                let mode = stability
+                    .get("mode")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "trusted-materialized group {group} missing stability.mode: {value}"
+                        )
+                    })?;
+                if !matches!(mode, "none" | "quiet-window") {
+                    return Err(format!(
+                        "trusted-materialized group {group} has invalid stability.mode={mode}: {value}"
+                    ));
+                }
+                let state = stability
+                    .get("state")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| {
+                        format!(
+                            "trusted-materialized group {group} missing stability.state: {value}"
+                        )
+                    })?;
+                if !matches!(
+                    state,
+                    "not-evaluated" | "stable" | "unstable" | "unknown" | "degraded"
+                ) {
+                    return Err(format!(
+                        "trusted-materialized group {group} has invalid stability.state={state}: {value}"
+                    ));
+                }
+                for key in ["quiet_window_ms", "observed_quiet_for_ms", "remaining_ms"] {
+                    if !stability
+                        .get(key)
+                        .is_some_and(|field| field.is_null() || field.is_u64())
+                    {
+                        return Err(format!(
+                            "trusted-materialized group {group} has invalid stability.{key}: {value}"
+                        ));
+                    }
+                }
+                if !stability
+                    .get("blocked_reasons")
+                    .and_then(Value::as_array)
+                    .is_some_and(|reasons| reasons.iter().all(Value::is_string))
+                {
+                    return Err(format!(
+                        "trusted-materialized group {group} has invalid stability.blocked_reasons: {value}"
+                    ));
+                }
+            }
+            for child in map.values() {
+                validate_materialized_tree_group_dynamic_fields(child)?;
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                validate_materialized_tree_group_dynamic_fields(item)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn assert_json_eq(label: &str, actual: &Value, expected: &Value) -> Result<(), String> {
+    validate_materialized_tree_group_dynamic_fields(actual)?;
     let mut actual_normalized = actual.clone();
     let mut expected_normalized = expected.clone();
     normalize_tree_like_json(&mut actual_normalized);

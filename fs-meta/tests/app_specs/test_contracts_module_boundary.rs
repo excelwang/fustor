@@ -913,20 +913,27 @@ fn status_paths_use_nonblocking_worker_observation_reads() {
 }
 
 #[test]
-fn direct_node_sink_queries_reuse_remote_worker_clients() {
+fn selected_group_materialized_queries_use_query_peer_routes_not_peer_worker_helpers() {
     let worker_sink = read_app_spec("src/workers/sink.rs");
-    let (_, after_fn) = worker_sink
-        .split_once("pub async fn materialized_query_via_node")
-        .expect("materialized_query_via_node exists");
-    let body = after_fn
-        .split_once("    pub async fn subtree_stats")
-        .expect("materialized_query_via_node body bounded")
-        .0;
+    let query_api = read_app_spec("src/query/api.rs");
 
-    assert!(worker_sink.contains("remote_client_cache"));
-    assert!(worker_sink.contains("fn remote_client(&self, node_id: &NodeId) -> Result<Arc<Self>>"));
-    assert!(body.contains("let remote = client.remote_client(node_id)?;"));
-    assert!(!body.contains("SinkWorkerClientHandle::new("));
+    assert!(
+        !worker_sink.contains("remote_client_cache"),
+        "sink worker clients must not spawn peer-specific helper handles for direct-node queries"
+    );
+    assert!(
+        !worker_sink.contains("pub async fn materialized_query_via_node"),
+        "selected-group materialized queries should be routed via sink-side execution routes"
+    );
+    assert!(query_api.contains("METHOD_SINK_QUERY_PROXY"));
+    assert!(
+        query_api.contains("query_materialized_events selected-group route owner_node="),
+        "query api should route selected-group materialized queries through query-peer fanout routes"
+    );
+    assert!(
+        !query_api.contains("sink.materialized_query_via_node"),
+        "query api must not bypass sink-side routes by spawning peer worker clients"
+    );
 }
 
 #[test]
