@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::Duration;
@@ -11,8 +12,10 @@ use crate::query::TreeGroupPayload;
 use crate::query::observation::{
     ObservationTrustPolicy, candidate_group_observation_evidence, evaluate_observation_status,
 };
+use crate::query::reliability::GroupReliability;
 #[cfg(test)]
 use crate::query::tree::ObservationState;
+use crate::query::tree::{TreePageRoot, TreeStability};
 use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryNode, SubtreeStats};
 use crate::runtime::endpoint::ManagedEndpointTask;
 use crate::runtime::execution_units;
@@ -88,7 +91,9 @@ impl FacadeSpawnInProgress {
 #[derive(Clone)]
 struct ProcessFacadeClaim {
     owner_instance_id: u64,
+    #[cfg_attr(not(test), allow(dead_code))]
     route_key: String,
+    #[cfg_attr(not(test), allow(dead_code))]
     resource_ids: Vec<String>,
     bind_addr: String,
 }
@@ -107,9 +112,7 @@ impl ProcessFacadeClaim {
     }
 
     fn matches_pending(&self, pending: &PendingFacadeActivation) -> bool {
-        self.route_key == pending.route_key
-            && self.resource_ids == pending.resource_ids
-            && self.bind_addr == pending.resolved.bind_addr
+        self.bind_addr == pending.resolved.bind_addr
     }
 }
 
@@ -265,6 +268,70 @@ fn now_us() -> u64 {
     }
 }
 
+fn should_emit_selected_group_empty_materialized_reply(
+    node_id: &NodeId,
+    source_primary_by_group: &BTreeMap<String, String>,
+    request: &InternalQueryRequest,
+) -> bool {
+    let Some(group_id) = request.scope.selected_group.as_deref() else {
+        return false;
+    };
+    let Some(primary_object_ref) = source_primary_by_group.get(group_id) else {
+        return false;
+    };
+    primary_object_ref
+        .split_once("::")
+        .map(|(owner_node_id, _)| owner_node_id)
+        .unwrap_or(primary_object_ref.as_str())
+        == node_id.0
+}
+
+fn selected_group_empty_materialized_reply(
+    request: &InternalQueryRequest,
+    correlation_id: Option<u64>,
+) -> Result<Option<Event>> {
+    let Some(group_id) = request.scope.selected_group.as_ref() else {
+        return Ok(None);
+    };
+    let payload = match request.op {
+        crate::query::QueryOp::Tree => {
+            rmp_serde::to_vec_named(&MaterializedQueryPayload::Tree(TreeGroupPayload {
+                reliability: GroupReliability::from_reason(Some(
+                    crate::shared_types::query::UnreliableReason::Unattested,
+                )),
+                stability: TreeStability::not_evaluated(),
+                root: TreePageRoot {
+                    path: request.scope.path.clone(),
+                    size: 0,
+                    modified_time_us: 0,
+                    is_dir: true,
+                    exists: false,
+                    has_children: false,
+                },
+                entries: Vec::new(),
+            }))
+            .map_err(|err| CnxError::Internal(format!("encode empty tree payload failed: {err}")))?
+        }
+        crate::query::QueryOp::Stats => {
+            rmp_serde::to_vec_named(&MaterializedQueryPayload::Stats(SubtreeStats::default()))
+                .map_err(|err| {
+                    CnxError::Internal(format!("encode empty stats payload failed: {err}"))
+                })?
+        }
+    };
+    Ok(Some(Event::new(
+        EventMetadata {
+            origin_id: NodeId(group_id.clone()),
+            timestamp_us: now_us(),
+            logical_ts: None,
+            correlation_id,
+            ingress_auth: None,
+            trace: None,
+        },
+        bytes::Bytes::from(payload),
+    )))
+}
+
 fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
     let sink_query_proxy_route = format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY);
     let sink_status_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
@@ -295,9 +362,9 @@ fn facade_bind_addr_is_ephemeral(bind_addr: &str) -> bool {
         .is_some_and(|port| port == 0)
 }
 
-fn process_facade_claim_cell() -> &'static StdMutex<Option<ProcessFacadeClaim>> {
-    static CELL: OnceLock<StdMutex<Option<ProcessFacadeClaim>>> = OnceLock::new();
-    CELL.get_or_init(|| StdMutex::new(None))
+fn process_facade_claim_cell() -> &'static StdMutex<BTreeMap<String, ProcessFacadeClaim>> {
+    static CELL: OnceLock<StdMutex<BTreeMap<String, ProcessFacadeClaim>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(BTreeMap::new()))
 }
 
 fn next_app_instance_id() -> u64 {
@@ -310,12 +377,7 @@ fn clear_owned_process_facade_claim(instance_id: u64) {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    if guard
-        .as_ref()
-        .is_some_and(|claim| claim.owner_instance_id == instance_id)
-    {
-        guard.take();
-    }
+    guard.retain(|_, claim| claim.owner_instance_id != instance_id);
 }
 
 #[cfg(test)]
@@ -325,7 +387,7 @@ fn clear_process_facade_claim_for_tests() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
-    guard.take();
+    guard.clear();
 }
 
 pub struct FSMetaApp {
@@ -887,6 +949,8 @@ impl FSMetaApp {
                     route.0
                 );
                 let sink = self.sink.clone();
+                let source = self.source.clone();
+                let node_id = self.node_id.clone();
                 let endpoint = ManagedEndpointTask::spawn(
                     boundary.clone(),
                     route,
@@ -897,6 +961,8 @@ impl FSMetaApp {
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
                         let sink = sink.clone();
+                        let source = source.clone();
+                        let node_id = node_id.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
@@ -918,6 +984,41 @@ impl FSMetaApp {
                                             "fs_meta_runtime_app: sink query proxy response events={}",
                                             events.len()
                                         );
+                                        if events.is_empty() {
+                                            let should_emit_empty = if params
+                                                .scope
+                                                .selected_group
+                                                .is_some()
+                                            {
+                                                let snapshot = source
+                                                    .observability_snapshot_nonblocking()
+                                                    .await;
+                                                should_emit_selected_group_empty_materialized_reply(
+                                                    &node_id,
+                                                    &snapshot.source_primary_by_group,
+                                                    &params,
+                                                )
+                                            } else {
+                                                false
+                                            };
+                                            if should_emit_empty {
+                                                match selected_group_empty_materialized_reply(
+                                                    &params,
+                                                    req.metadata().correlation_id,
+                                                ) {
+                                                    Ok(Some(event)) => {
+                                                        responses.push(event);
+                                                        continue;
+                                                    }
+                                                    Ok(None) => {}
+                                                    Err(err) => {
+                                                        eprintln!(
+                                                            "fs_meta_runtime_app: sink query proxy empty reply encode failed: {err}"
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
                                         for event in &mut events {
                                             let mut meta = event.metadata().clone();
                                             meta.correlation_id = req.metadata().correlation_id;
@@ -1252,7 +1353,7 @@ impl FSMetaApp {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if let Some(existing) = guard.as_ref()
+            if let Some(existing) = guard.get(&claim.bind_addr)
                 && existing.owner_instance_id != instance_id
                 && existing.matches_pending(&pending)
             {
@@ -1266,7 +1367,7 @@ impl FSMetaApp {
                 );
                 return Ok(false);
             }
-            *guard = Some(claim);
+            guard.insert(claim.bind_addr.clone(), claim);
         }
         let mut same_resource_replacement = None::<(String, Vec<String>, u64)>;
         let replacing_existing = {
@@ -1377,10 +1478,10 @@ impl FSMetaApp {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
-                if guard.as_ref().is_some_and(|claim| {
+                if guard.get(&pending.resolved.bind_addr).is_some_and(|claim| {
                     claim.owner_instance_id == instance_id && claim.matches_pending(&pending)
                 }) {
-                    guard.take();
+                    guard.remove(&pending.resolved.bind_addr);
                 }
                 return Err(err);
             }
@@ -1408,10 +1509,10 @@ impl FSMetaApp {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if guard.as_ref().is_some_and(|claim| {
+            if guard.get(&pending.resolved.bind_addr).is_some_and(|claim| {
                 claim.owner_instance_id == instance_id && claim.matches_pending(&pending)
             }) {
-                guard.take();
+                guard.remove(&pending.resolved.bind_addr);
             }
             return Ok(false);
         };
@@ -2433,6 +2534,134 @@ mod tests {
         .expect("empty roots should be accepted as valid deployed state");
     }
 
+    #[test]
+    fn selected_group_empty_materialized_reply_emits_empty_tree_payload() {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/retired".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs4".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+
+        let event = selected_group_empty_materialized_reply(&request, Some(42))
+            .expect("build empty reply")
+            .expect("selected-group reply");
+        assert_eq!(event.metadata().origin_id.0, "nfs4");
+        assert_eq!(event.metadata().correlation_id, Some(42));
+
+        let payload =
+            rmp_serde::from_slice::<query::MaterializedQueryPayload>(event.payload_bytes())
+                .expect("decode empty tree payload");
+        let query::MaterializedQueryPayload::Tree(tree) = payload else {
+            panic!("expected tree payload");
+        };
+        assert!(!tree.reliability.reliable);
+        assert_eq!(
+            tree.reliability.unreliable_reason,
+            Some(crate::shared_types::query::UnreliableReason::Unattested)
+        );
+        assert_eq!(tree.root.path, b"/retired".to_vec());
+        assert!(!tree.root.exists);
+        assert!(tree.entries.is_empty());
+    }
+
+    #[test]
+    fn selected_group_empty_materialized_reply_emits_empty_stats_payload() {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Stats,
+            query::QueryScope {
+                path: b"/retired".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs4".to_string()),
+            },
+            None,
+        );
+
+        let event = selected_group_empty_materialized_reply(&request, Some(7))
+            .expect("build empty reply")
+            .expect("selected-group reply");
+        assert_eq!(event.metadata().origin_id.0, "nfs4");
+        assert_eq!(event.metadata().correlation_id, Some(7));
+
+        let payload =
+            rmp_serde::from_slice::<query::MaterializedQueryPayload>(event.payload_bytes())
+                .expect("decode empty stats payload");
+        let query::MaterializedQueryPayload::Stats(stats) = payload else {
+            panic!("expected stats payload");
+        };
+        assert_eq!(stats.total_nodes, 0);
+        assert_eq!(stats.total_files, 0);
+        assert_eq!(stats.total_dirs, 0);
+        assert_eq!(stats.total_size, 0);
+    }
+
+    #[test]
+    fn selected_group_empty_materialized_reply_only_owner_peer_emits_synthetic_empty() {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs2".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+        let source_primary_by_group =
+            BTreeMap::from([("nfs2".to_string(), "node-a::nfs2".to_string())]);
+
+        assert!(should_emit_selected_group_empty_materialized_reply(
+            &NodeId("node-a".into()),
+            &source_primary_by_group,
+            &request,
+        ));
+        assert!(!should_emit_selected_group_empty_materialized_reply(
+            &NodeId("node-c".into()),
+            &source_primary_by_group,
+            &request,
+        ));
+    }
+
+    #[test]
+    fn selected_group_empty_materialized_reply_skips_missing_or_unselected_groups() {
+        let selected = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs2".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+        let unselected = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: None,
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+
+        assert!(!should_emit_selected_group_empty_materialized_reply(
+            &NodeId("node-a".into()),
+            &BTreeMap::new(),
+            &selected,
+        ));
+        assert!(!should_emit_selected_group_empty_materialized_reply(
+            &NodeId("node-a".into()),
+            &BTreeMap::from([("nfs2".to_string(), "node-a::nfs2".to_string())]),
+            &unselected,
+        ));
+    }
+
     #[tokio::test]
     async fn request_and_stream_fail_closed_until_control_initializes_app() {
         let app = FSMetaApp::new(
@@ -3264,7 +3493,8 @@ mod tests {
                 Err(poisoned) => poisoned.into_inner(),
             };
             guard
-                .clone()
+                .get(&bind_addr)
+                .cloned()
                 .expect("fixed-bind facade claim should remain owned")
         };
         assert_eq!(claim.owner_instance_id, app_1.instance_id);

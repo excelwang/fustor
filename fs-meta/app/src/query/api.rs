@@ -510,6 +510,8 @@ async fn load_materialized_status_snapshots(
         },
         QueryBackend::Local { .. } => source.status_snapshot().await?,
     };
+    let readiness_groups = scan_enabled_readiness_groups(state)?;
+    let source_status = filter_source_status_snapshot(source_status, &readiness_groups);
     let sink_status = match &state.backend {
         QueryBackend::Route {
             boundary,
@@ -530,7 +532,6 @@ async fn load_materialized_status_snapshots(
         },
         QueryBackend::Local { .. } => sink.status_snapshot().await?,
     };
-    let readiness_groups = scan_enabled_readiness_groups(state)?;
     let sink_status = {
         let mut cache = state.materialized_sink_status_cache.lock().map_err(|_| {
             CnxError::Internal("materialized sink status cache lock poisoned".into())
@@ -589,6 +590,32 @@ fn filter_sink_status_snapshot(
         groups,
         ..SinkStatusSnapshot::default()
     }])
+}
+
+fn filter_source_status_snapshot(
+    snapshot: SourceStatusSnapshot,
+    allowed_groups: &BTreeSet<String>,
+) -> SourceStatusSnapshot {
+    if allowed_groups.is_empty() {
+        return snapshot;
+    }
+    SourceStatusSnapshot {
+        logical_roots: snapshot
+            .logical_roots
+            .into_iter()
+            .filter(|root| allowed_groups.contains(&root.root_id))
+            .collect(),
+        concrete_roots: snapshot
+            .concrete_roots
+            .into_iter()
+            .filter(|root| allowed_groups.contains(&root.logical_root_id))
+            .collect(),
+        degraded_roots: snapshot
+            .degraded_roots
+            .into_iter()
+            .filter(|(root_id, _)| allowed_groups.contains(root_id))
+            .collect(),
+    }
 }
 
 fn merge_with_cached_sink_status_snapshot(
@@ -1176,13 +1203,22 @@ async fn query_materialized_events(
         QueryBackend::Route {
             boundary,
             origin_id,
-            sink: _sink,
+            sink,
             source,
         } => {
             if let Some(group_id) = params.scope.selected_group.as_deref()
                 && let Some(node_id) =
                     materialized_owner_node_for_group(source.as_ref(), group_id).await?
             {
+                if node_id == origin_id {
+                    let result = run_timed_query(sink.materialized_query(&params), timeout).await;
+                    eprintln!(
+                        "fs_meta_query_api: query_materialized_events selected-group route owner_node={} local_owner=true ok={}",
+                        node_id.0,
+                        result.is_ok()
+                    );
+                    return result;
+                }
                 let adapter = exchange_host_adapter(
                     boundary.clone(),
                     origin_id.clone(),
@@ -1201,7 +1237,7 @@ async fn query_materialized_events(
                     )
                     .await;
                 eprintln!(
-                    "fs_meta_query_api: query_materialized_events selected-group route owner_node={} ok={}",
+                    "fs_meta_query_api: query_materialized_events selected-group route owner_node={} local_owner=false ok={}",
                     node_id.0,
                     result.is_ok()
                 );
@@ -3956,6 +3992,194 @@ mod tests {
         };
         let sink_status = SinkStatusSnapshot::default();
         assert!(materialized_query_readiness_error(&source_status, &sink_status).is_none());
+    }
+
+    #[test]
+    fn filter_source_status_snapshot_drops_groups_outside_current_roots() {
+        let snapshot = SourceStatusSnapshot {
+            logical_roots: vec![
+                crate::source::SourceLogicalRootHealthSnapshot {
+                    root_id: "root-a".into(),
+                    status: "ok".into(),
+                    matched_grants: 1,
+                    active_members: 1,
+                    coverage_mode: "audit_only".into(),
+                },
+                crate::source::SourceLogicalRootHealthSnapshot {
+                    root_id: "root-b".into(),
+                    status: "ok".into(),
+                    matched_grants: 1,
+                    active_members: 1,
+                    coverage_mode: "audit_only".into(),
+                },
+            ],
+            concrete_roots: vec![
+                crate::source::SourceConcreteRootHealthSnapshot {
+                    root_key: "root-a-key".into(),
+                    logical_root_id: "root-a".into(),
+                    object_ref: "obj-a".into(),
+                    status: "ok".into(),
+                    coverage_mode: "audit_only".into(),
+                    watch_enabled: false,
+                    scan_enabled: true,
+                    is_group_primary: true,
+                    active: true,
+                    watch_lru_capacity: 0,
+                    audit_interval_ms: 10_000,
+                    overflow_count: 0,
+                    overflow_pending: false,
+                    rescan_pending: false,
+                    last_rescan_reason: None,
+                    last_error: None,
+                    last_audit_started_at_us: None,
+                    last_audit_completed_at_us: None,
+                    last_audit_duration_ms: None,
+                    current_revision: None,
+                    candidate_revision: None,
+                    candidate_status: None,
+                    draining_revision: None,
+                    draining_status: None,
+                },
+                crate::source::SourceConcreteRootHealthSnapshot {
+                    root_key: "root-b-key".into(),
+                    logical_root_id: "root-b".into(),
+                    object_ref: "obj-b".into(),
+                    status: "ok".into(),
+                    coverage_mode: "audit_only".into(),
+                    watch_enabled: false,
+                    scan_enabled: true,
+                    is_group_primary: true,
+                    active: true,
+                    watch_lru_capacity: 0,
+                    audit_interval_ms: 10_000,
+                    overflow_count: 0,
+                    overflow_pending: false,
+                    rescan_pending: false,
+                    last_rescan_reason: None,
+                    last_error: None,
+                    last_audit_started_at_us: None,
+                    last_audit_completed_at_us: None,
+                    last_audit_duration_ms: None,
+                    current_revision: None,
+                    candidate_revision: None,
+                    candidate_status: None,
+                    draining_revision: None,
+                    draining_status: None,
+                },
+            ],
+            degraded_roots: vec![
+                ("root-a".into(), "degraded".into()),
+                ("root-b".into(), "degraded".into()),
+            ],
+        };
+        let filtered =
+            filter_source_status_snapshot(snapshot, &BTreeSet::from(["root-b".to_string()]));
+        assert_eq!(filtered.logical_roots.len(), 1);
+        assert_eq!(filtered.logical_roots[0].root_id, "root-b");
+        assert_eq!(filtered.concrete_roots.len(), 1);
+        assert_eq!(filtered.concrete_roots[0].logical_root_id, "root-b");
+        assert_eq!(
+            filtered.degraded_roots,
+            vec![("root-b".to_string(), "degraded".to_string())]
+        );
+    }
+
+    #[test]
+    fn materialized_query_readiness_ignores_stale_source_groups_outside_current_roots() {
+        let source_status = SourceStatusSnapshot {
+            logical_roots: vec![
+                crate::source::SourceLogicalRootHealthSnapshot {
+                    root_id: "root-a".into(),
+                    status: "ok".into(),
+                    matched_grants: 1,
+                    active_members: 1,
+                    coverage_mode: "audit_only".into(),
+                },
+                crate::source::SourceLogicalRootHealthSnapshot {
+                    root_id: "root-b".into(),
+                    status: "ok".into(),
+                    matched_grants: 1,
+                    active_members: 1,
+                    coverage_mode: "audit_only".into(),
+                },
+            ],
+            concrete_roots: vec![
+                crate::source::SourceConcreteRootHealthSnapshot {
+                    root_key: "root-a-key".into(),
+                    logical_root_id: "root-a".into(),
+                    object_ref: "obj-a".into(),
+                    status: "ok".into(),
+                    coverage_mode: "audit_only".into(),
+                    watch_enabled: false,
+                    scan_enabled: true,
+                    is_group_primary: true,
+                    active: true,
+                    watch_lru_capacity: 0,
+                    audit_interval_ms: 10_000,
+                    overflow_count: 0,
+                    overflow_pending: false,
+                    rescan_pending: false,
+                    last_rescan_reason: None,
+                    last_error: None,
+                    last_audit_started_at_us: None,
+                    last_audit_completed_at_us: None,
+                    last_audit_duration_ms: None,
+                    current_revision: None,
+                    candidate_revision: None,
+                    candidate_status: None,
+                    draining_revision: None,
+                    draining_status: None,
+                },
+                crate::source::SourceConcreteRootHealthSnapshot {
+                    root_key: "root-b-key".into(),
+                    logical_root_id: "root-b".into(),
+                    object_ref: "obj-b".into(),
+                    status: "ok".into(),
+                    coverage_mode: "audit_only".into(),
+                    watch_enabled: false,
+                    scan_enabled: true,
+                    is_group_primary: true,
+                    active: true,
+                    watch_lru_capacity: 0,
+                    audit_interval_ms: 10_000,
+                    overflow_count: 0,
+                    overflow_pending: false,
+                    rescan_pending: false,
+                    last_rescan_reason: None,
+                    last_error: None,
+                    last_audit_started_at_us: None,
+                    last_audit_completed_at_us: None,
+                    last_audit_duration_ms: None,
+                    current_revision: None,
+                    candidate_revision: None,
+                    candidate_status: None,
+                    draining_revision: None,
+                    draining_status: None,
+                },
+            ],
+            degraded_roots: Vec::new(),
+        };
+        let sink_status = SinkStatusSnapshot {
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "root-b".into(),
+                primary_object_ref: "obj-b".into(),
+                total_nodes: 4,
+                live_nodes: 4,
+                tombstoned_count: 0,
+                attested_count: 4,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 1,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                estimated_heap_bytes: 1,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+        let filtered_source =
+            filter_source_status_snapshot(source_status, &BTreeSet::from(["root-b".to_string()]));
+        assert!(materialized_query_readiness_error(&filtered_source, &sink_status).is_none());
     }
 
     #[tokio::test]

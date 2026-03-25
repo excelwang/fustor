@@ -931,6 +931,10 @@ fn selected_group_materialized_queries_use_query_peer_routes_not_peer_worker_hel
         "query api should route selected-group materialized queries through query-peer fanout routes"
     );
     assert!(
+        query_api.contains("if node_id == origin_id"),
+        "selected-group materialized queries must short-circuit self-owned groups locally instead of fanouting away from the owner"
+    );
+    assert!(
         !query_api.contains("sink.materialized_query_via_node"),
         "query api must not bypass sink-side routes by spawning peer worker clients"
     );

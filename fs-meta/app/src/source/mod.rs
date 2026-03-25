@@ -3822,6 +3822,8 @@ impl FSMetaSource {
 mod tests {
     use super::*;
     use crate::ControlEvent;
+    use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
+    use crate::sink::SinkFileMeta;
     use capanix_runtime_entry_sdk::control::{
         RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate, RuntimeHostDescriptor,
         RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType,
@@ -3931,6 +3933,37 @@ mod tests {
             .iter()
             .map(|event| event.metadata().origin_id.0.clone())
             .collect()
+    }
+
+    fn selected_group_tree_contains_path(
+        sink: &SinkFileMeta,
+        group_id: &str,
+        query_path: &[u8],
+        needle_path: &[u8],
+    ) -> bool {
+        let request = InternalQueryRequest::materialized(
+            QueryOp::Tree,
+            QueryScope {
+                path: query_path.to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some(group_id.to_string()),
+            },
+            Some(Default::default()),
+        );
+        let Ok(events) = sink.materialized_query(&request) else {
+            return false;
+        };
+        let Some(event) = events.first() else {
+            return false;
+        };
+        match rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes()) {
+            Ok(MaterializedQueryPayload::Tree(payload)) => {
+                (payload.root.exists && payload.root.path == needle_path)
+                    || payload.entries.iter().any(|entry| entry.path == needle_path)
+            }
+            _ => false,
+        }
     }
 
     #[test]
@@ -4718,6 +4751,219 @@ mod tests {
             "nfs2 should publish at least one materialized record"
         );
 
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn manual_rescan_replays_epoch_and_data_for_each_primary_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base = std::env::temp_dir().join(format!("fs-meta-manual-rescan-all-roots-{unique}"));
+        let nfs1 = base.join("nfs1");
+        let nfs2 = base.join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("a.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("b.txt"), b"b").expect("seed nfs2");
+
+        let mut cfg = SourceConfig::default();
+        let mut root_a = RootSpec::new("nfs1", nfs1.clone());
+        root_a.watch = false;
+        let mut root_b = RootSpec::new("nfs2", nfs2.clone());
+        root_b.watch = false;
+        cfg.roots = vec![root_a, root_b];
+        cfg.host_object_grants = vec![
+            test_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone(), true),
+            test_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone(), true),
+        ];
+
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+        let mut control_counts = std::collections::BTreeMap::<String, usize>::new();
+        let mut data_counts = std::collections::BTreeMap::<String, usize>::new();
+
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            let batch = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .expect("initial scan batch wait should not time out")
+                .expect("pub stream should yield initial scan batch");
+            for event in batch {
+                let origin = event.metadata().origin_id.0.clone();
+                if rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok() {
+                    *control_counts.entry(origin).or_insert(0) += 1;
+                } else {
+                    *data_counts.entry(origin).or_insert(0) += 1;
+                }
+            }
+            let complete = ["node-a::nfs1", "node-a::nfs2"].iter().all(|origin| {
+                control_counts.get(*origin).copied() == Some(2)
+                    && data_counts.get(*origin).copied().unwrap_or(0) > 0
+            });
+            if complete {
+                break;
+            }
+        }
+
+        let nfs1_initial_data = data_counts.get("node-a::nfs1").copied().unwrap_or(0);
+        let nfs2_initial_data = data_counts.get("node-a::nfs2").copied().unwrap_or(0);
+        assert_eq!(control_counts.get("node-a::nfs1").copied(), Some(2));
+        assert_eq!(control_counts.get("node-a::nfs2").copied(), Some(2));
+        assert!(nfs1_initial_data > 0, "nfs1 initial scan should emit data");
+        assert!(nfs2_initial_data > 0, "nfs2 initial scan should emit data");
+
+        std::fs::write(nfs1.join("after-rescan.txt"), b"aa").expect("append nfs1 file");
+        std::fs::write(nfs2.join("after-rescan.txt"), b"bb").expect("append nfs2 file");
+        source
+            .publish_manual_rescan_signal()
+            .await
+            .expect("publish manual rescan signal");
+
+        let rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < rescan_deadline {
+            let batch = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .expect("manual rescan batch wait should not time out")
+                .expect("pub stream should yield manual rescan batch");
+            for event in batch {
+                let origin = event.metadata().origin_id.0.clone();
+                if rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok() {
+                    *control_counts.entry(origin).or_insert(0) += 1;
+                } else {
+                    *data_counts.entry(origin).or_insert(0) += 1;
+                }
+            }
+            let complete = control_counts.get("node-a::nfs1").copied().unwrap_or(0) >= 4
+                && control_counts.get("node-a::nfs2").copied().unwrap_or(0) >= 4
+                && data_counts.get("node-a::nfs1").copied().unwrap_or(0) > nfs1_initial_data
+                && data_counts.get("node-a::nfs2").copied().unwrap_or(0) > nfs2_initial_data;
+            if complete {
+                break;
+            }
+        }
+
+        source.close().await.expect("close source");
+
+        assert!(
+            control_counts.get("node-a::nfs1").copied().unwrap_or(0) >= 4,
+            "nfs1 should emit a second epoch after manual rescan: {control_counts:?}"
+        );
+        assert!(
+            control_counts.get("node-a::nfs2").copied().unwrap_or(0) >= 4,
+            "nfs2 should emit a second epoch after manual rescan: {control_counts:?}"
+        );
+        assert!(
+            data_counts.get("node-a::nfs1").copied().unwrap_or(0) > nfs1_initial_data,
+            "nfs1 should emit additional data after manual rescan: {data_counts:?}"
+        );
+        assert!(
+            data_counts.get("node-a::nfs2").copied().unwrap_or(0) > nfs2_initial_data,
+            "nfs2 should emit additional data after manual rescan: {data_counts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn manual_rescan_source_to_sink_materializes_new_entries_for_each_primary_root() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base =
+            std::env::temp_dir().join(format!("fs-meta-manual-rescan-source-sink-{unique}"));
+        let nfs1 = base.join("nfs1");
+        let nfs2 = base.join("nfs2");
+        let subdir = "force-find-stress";
+        std::fs::create_dir_all(nfs1.join(subdir)).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join(subdir)).expect("create nfs2 dir");
+        std::fs::write(nfs1.join(subdir).join("seed.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join(subdir).join("seed.txt"), b"b").expect("seed nfs2");
+
+        let mut cfg = SourceConfig::default();
+        let mut root_a = RootSpec::new("nfs1", nfs1.clone());
+        root_a.watch = false;
+        let mut root_b = RootSpec::new("nfs2", nfs2.clone());
+        root_b.watch = false;
+        cfg.roots = vec![root_a, root_b];
+        cfg.host_object_grants = vec![
+            test_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone(), true),
+            test_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone(), true),
+        ];
+
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let sink = SinkFileMeta::with_boundaries(NodeId("node-a".to_string()), None, cfg)
+            .expect("init sink");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+        let query_dir = b"/force-find-stress";
+        let query_root = b"/force-find-stress";
+        let query_new = b"/force-find-stress/after-rescan.txt";
+
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(&batch).await.expect("apply initial batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_ready =
+                selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root);
+            let nfs2_ready =
+                selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root);
+            if nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_root),
+            "nfs1 initial materialization should exist"
+        );
+        assert!(
+            selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_root),
+            "nfs2 initial materialization should exist"
+        );
+
+        std::fs::write(nfs1.join(subdir).join("after-rescan.txt"), b"aa")
+            .expect("append nfs1 file");
+        std::fs::write(nfs2.join(subdir).join("after-rescan.txt"), b"bb")
+            .expect("append nfs2 file");
+        source
+            .publish_manual_rescan_signal()
+            .await
+            .expect("publish manual rescan signal");
+
+        let rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < rescan_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(&batch).await.expect("apply rescan batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_done =
+                selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_new);
+            let nfs2_done =
+                selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_new);
+            if nfs1_done && nfs2_done {
+                break;
+            }
+        }
+
+        assert!(
+            selected_group_tree_contains_path(&sink, "nfs1", query_dir, query_new),
+            "nfs1 should materialize its post-rescan file"
+        );
+        assert!(
+            selected_group_tree_contains_path(&sink, "nfs2", query_dir, query_new),
+            "nfs2 should materialize its post-rescan file"
+        );
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close sink");
         let _ = std::fs::remove_dir_all(base);
     }
 

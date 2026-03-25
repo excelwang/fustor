@@ -593,7 +593,7 @@ fn run_query_baseline_phase(
     ])?;
     let force_find_pit_id = pit_id(&force_find_paged)?;
     let force_find_next_group = group_page_next_cursor(&force_find_paged)?;
-    let force_find_next_entry_after = group_page_next_entry_after(&force_find_paged)?;
+    let force_find_next_entry_after = group_page_next_entry_after_optional(&force_find_paged)?;
     let force_find_first_group = first_group_key(&force_find_paged)?;
     if force_find_first_group != expected_group_sequence[0] {
         return Err(format!(
@@ -652,17 +652,19 @@ fn run_query_baseline_phase(
         400,
         "read_class must be fresh on /on-demand-force-find",
     )?;
-    assert_error(
-        session.client().force_find_raw(
-            session.query_api_key(),
-            &[
-                ("path", "/".to_string()),
-                ("entry_after", force_find_next_entry_after.clone()),
-            ],
-        )?,
-        400,
-        "pit_id is required when using group_after or entry_after",
-    )?;
+    if let Some(force_find_next_entry_after) = force_find_next_entry_after {
+        assert_error(
+            session.client().force_find_raw(
+                session.query_api_key(),
+                &[
+                    ("path", "/".to_string()),
+                    ("entry_after", force_find_next_entry_after.clone()),
+                ],
+            )?,
+            400,
+            "pit_id is required when using group_after or entry_after",
+        )?;
+    }
     assert_error(
         session.client().tree_raw(
             session.query_api_key(),
@@ -1387,12 +1389,26 @@ fn group_page_next_cursor(payload: &Value) -> Result<String, String> {
 }
 
 fn group_page_next_entry_after(payload: &Value) -> Result<String, String> {
+    group_page_next_entry_after_optional(payload)?
+        .ok_or_else(|| format!("response missing group_page.next_entry_after: {payload}"))
+}
+
+fn group_page_next_entry_after_optional(payload: &Value) -> Result<Option<String>, String> {
     payload
         .get("group_page")
         .and_then(|page| page.get("next_entry_after"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .ok_or_else(|| format!("response missing group_page.next_entry_after: {payload}"))
+        .map(|value| match value {
+            Value::Null => Ok(None),
+            Value::String(value) => Ok(Some(value.clone())),
+            other => Err(format!(
+                "response contains invalid group_page.next_entry_after type: {other}"
+            )),
+        })
+        .unwrap_or_else(|| {
+            Err(format!(
+                "response missing group_page.next_entry_after: {payload}"
+            ))
+        })
 }
 
 fn entry_paths_for_group(payload: &Value, group_key: &str) -> Result<Vec<String>, String> {
