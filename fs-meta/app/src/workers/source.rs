@@ -1076,8 +1076,223 @@ impl TypedWorkerInit<SourceConfig> for SourceWorkerRpc {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
+    use capanix_app_sdk::raw::{
+        BoundaryContext, ChannelBoundary, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
+        StateBoundary,
+    };
+    use capanix_app_sdk::runtime::{
+        LogLevel, RuntimeWorkerBinding, RuntimeWorkerLauncherKind, in_memory_state_boundary,
+    };
+    use capanix_app_sdk::worker::WorkerMode;
+    use capanix_runtime_entry_sdk::worker_runtime::RuntimeWorkerClientFactory;
     use capanix_runtime_entry_sdk::worker_runtime::TypedWorkerRpc;
-    use std::path::PathBuf;
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    use std::time::Duration;
+    use tempfile::tempdir;
+    use tokio::sync::{Mutex as AsyncMutex, Notify};
+
+    use crate::ControlEvent;
+
+    #[derive(Default)]
+    struct LoopbackWorkerBoundary {
+        channels: AsyncMutex<HashMap<String, Vec<Event>>>,
+        closed: StdMutex<HashSet<String>>,
+        changed: Notify,
+    }
+
+    #[async_trait]
+    impl ChannelIoSubset for LoopbackWorkerBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> Result<()> {
+            {
+                let mut channels = self.channels.lock().await;
+                channels
+                    .entry(request.channel_key.0)
+                    .or_default()
+                    .extend(request.events);
+            }
+            self.changed.notify_waiters();
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelRecvRequest,
+        ) -> Result<Vec<Event>> {
+            let deadline = request
+                .timeout_ms
+                .map(Duration::from_millis)
+                .map(|timeout| tokio::time::Instant::now() + timeout);
+            loop {
+                {
+                    let mut channels = self.channels.lock().await;
+                    if let Some(events) = channels.remove(&request.channel_key.0)
+                        && !events.is_empty()
+                    {
+                        return Ok(events);
+                    }
+                }
+                {
+                    let closed = self.closed.lock().expect("loopback closed lock");
+                    if closed.contains(&request.channel_key.0) {
+                        return Err(CnxError::ChannelClosed);
+                    }
+                }
+                let notified = self.changed.notified();
+                if let Some(deadline) = deadline {
+                    match tokio::time::timeout_at(deadline, notified).await {
+                        Ok(()) => {}
+                        Err(_) => return Err(CnxError::Timeout),
+                    }
+                } else {
+                    notified.await;
+                }
+            }
+        }
+
+        fn channel_close(&self, _ctx: BoundaryContext, channel: ChannelKey) -> Result<()> {
+            self.closed
+                .lock()
+                .expect("loopback closed lock")
+                .insert(channel.0);
+            self.changed.notify_waiters();
+            Ok(())
+        }
+    }
+
+    impl ChannelBoundary for LoopbackWorkerBoundary {
+        fn log(&self, _ctx: BoundaryContext, _level: LogLevel, _msg: &str) {}
+    }
+
+    impl StateBoundary for LoopbackWorkerBoundary {}
+
+    fn fs_meta_runtime_lib_filename() -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            "libfs_meta_runtime.dylib"
+        }
+        #[cfg(target_os = "windows")]
+        {
+            "fs_meta_runtime.dll"
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        {
+            "libfs_meta_runtime.so"
+        }
+    }
+
+    fn fs_meta_runtime_workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    fn fs_meta_worker_module_path() -> PathBuf {
+        static BIN: OnceLock<PathBuf> = OnceLock::new();
+        BIN.get_or_init(|| {
+            for name in ["CAPANIX_FS_META_APP_BINARY", "DATANIX_FS_META_APP_SO"] {
+                if let Ok(path) = std::env::var(name) {
+                    let resolved = PathBuf::from(path);
+                    if resolved.exists() {
+                        return resolved;
+                    }
+                }
+            }
+            let root = fs_meta_runtime_workspace_root();
+            let lib_name = fs_meta_runtime_lib_filename();
+            for candidate in [
+                root.join("target/debug").join(lib_name),
+                root.join("target/debug/deps").join(lib_name),
+                root.join(".target/debug").join(lib_name),
+                root.join(".target/debug/deps").join(lib_name),
+            ] {
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+            panic!("fs-meta worker module not found; set CAPANIX_FS_META_APP_BINARY");
+        })
+        .clone()
+    }
+
+    fn external_source_worker_binding(socket_dir: &Path) -> RuntimeWorkerBinding {
+        RuntimeWorkerBinding {
+            role_id: "source".to_string(),
+            mode: WorkerMode::External,
+            launcher_kind: RuntimeWorkerLauncherKind::WorkerHost,
+            module_path: Some(fs_meta_worker_module_path()),
+            socket_dir: Some(socket_dir.to_path_buf()),
+        }
+    }
+
+    fn worker_source_root(id: &str, path: &Path) -> RootSpec {
+        let mut root = RootSpec::new(id, path);
+        root.watch = false;
+        root.scan = true;
+        root
+    }
+
+    fn worker_source_export(
+        object_ref: &str,
+        host_ref: &str,
+        host_ip: &str,
+        mount_point: PathBuf,
+    ) -> GrantedMountRoot {
+        GrantedMountRoot {
+            object_ref: object_ref.to_string(),
+            host_ref: host_ref.to_string(),
+            host_ip: host_ip.to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: Default::default(),
+            mount_point,
+            fs_source: object_ref.to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: vec![],
+            interfaces: vec![],
+            active: true,
+        }
+    }
+
+    async fn recv_loopback_events(
+        boundary: &LoopbackWorkerBoundary,
+        timeout_ms: u64,
+    ) -> Result<Vec<Event>> {
+        boundary
+            .channel_recv(
+                BoundaryContext::default(),
+                ChannelRecvRequest {
+                    channel_key: ChannelKey("fs-meta.events:v1.stream".to_string()),
+                    timeout_ms: Some(timeout_ms),
+                },
+            )
+            .await
+    }
+
+    fn record_control_and_data_counts(
+        control_counts: &mut std::collections::BTreeMap<String, usize>,
+        data_counts: &mut std::collections::BTreeMap<String, usize>,
+        batch: Vec<Event>,
+    ) {
+        for event in batch {
+            let origin = event.metadata().origin_id.0.clone();
+            if rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok() {
+                *control_counts.entry(origin).or_insert(0) += 1;
+            } else {
+                *data_counts.entry(origin).or_insert(0) += 1;
+            }
+        }
+    }
 
     #[test]
     fn source_worker_rpc_preserves_invalid_input_response_category() {
@@ -1155,5 +1370,134 @@ mod tests {
                 "source worker unavailable".to_string()
             )
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_source_worker_emits_initial_and_manual_rescan_batches_for_each_primary_root()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
+            .expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_source_root("nfs1", &nfs1),
+                worker_source_root("nfs2", &nfs2),
+            ],
+            host_object_grants: vec![
+                worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory = RuntimeWorkerClientFactory::new(
+            boundary.clone(),
+            boundary.clone(),
+            state_boundary,
+        );
+        let client = SourceWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let mut control_counts = std::collections::BTreeMap::<String, usize>::new();
+        let mut data_counts = std::collections::BTreeMap::<String, usize>::new();
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match recv_loopback_events(&boundary, 250).await {
+                Ok(batch) => record_control_and_data_counts(
+                    &mut control_counts,
+                    &mut data_counts,
+                    batch,
+                ),
+                Err(CnxError::Timeout) => continue,
+                Err(err) => panic!("initial batch recv failed: {err}"),
+            }
+            let complete = ["node-a::nfs1", "node-a::nfs2"].iter().all(|origin| {
+                control_counts.get(*origin).copied() == Some(2)
+                    && data_counts.get(*origin).copied().unwrap_or(0) > 0
+            });
+            if complete {
+                break;
+            }
+        }
+
+        let nfs1_initial_data = data_counts.get("node-a::nfs1").copied().unwrap_or(0);
+        let nfs2_initial_data = data_counts.get("node-a::nfs2").copied().unwrap_or(0);
+        assert_eq!(control_counts.get("node-a::nfs1").copied(), Some(2));
+        assert_eq!(control_counts.get("node-a::nfs2").copied(), Some(2));
+        assert!(nfs1_initial_data > 0, "nfs1 should emit initial data");
+        assert!(nfs2_initial_data > 0, "nfs2 should emit initial data");
+
+        std::fs::write(
+            nfs1.join("force-find-stress").join("after-rescan.txt"),
+            b"aa",
+        )
+        .expect("append nfs1 file");
+        std::fs::write(
+            nfs2.join("force-find-stress").join("after-rescan.txt"),
+            b"bb",
+        )
+        .expect("append nfs2 file");
+        tokio::time::timeout(Duration::from_secs(8), client.publish_manual_rescan_signal())
+            .await
+            .expect("manual rescan publish timed out")
+            .expect("publish manual rescan");
+
+        let rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < rescan_deadline {
+            match recv_loopback_events(&boundary, 250).await {
+                Ok(batch) => record_control_and_data_counts(
+                    &mut control_counts,
+                    &mut data_counts,
+                    batch,
+                ),
+                Err(CnxError::Timeout) => continue,
+                Err(err) => panic!("manual rescan batch recv failed: {err}"),
+            }
+            let complete = control_counts.get("node-a::nfs1").copied().unwrap_or(0) >= 4
+                && control_counts.get("node-a::nfs2").copied().unwrap_or(0) >= 4
+                && data_counts.get("node-a::nfs1").copied().unwrap_or(0) > nfs1_initial_data
+                && data_counts.get("node-a::nfs2").copied().unwrap_or(0) > nfs2_initial_data;
+            if complete {
+                break;
+            }
+        }
+
+        assert!(
+            control_counts.get("node-a::nfs1").copied().unwrap_or(0) >= 4,
+            "nfs1 should emit a second epoch after manual rescan: {control_counts:?}"
+        );
+        assert!(
+            control_counts.get("node-a::nfs2").copied().unwrap_or(0) >= 4,
+            "nfs2 should emit a second epoch after manual rescan: {control_counts:?}"
+        );
+        assert!(
+            data_counts.get("node-a::nfs1").copied().unwrap_or(0) > nfs1_initial_data,
+            "nfs1 should emit additional data after manual rescan: {data_counts:?}"
+        );
+        assert!(
+            data_counts.get("node-a::nfs2").copied().unwrap_or(0) > nfs2_initial_data,
+            "nfs2 should emit additional data after manual rescan: {data_counts:?}"
+        );
+
+        client.close().await.expect("close source worker");
     }
 }

@@ -842,3 +842,389 @@ impl TypedWorkerInit<SourceConfig> for SinkWorkerRpc {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use capanix_app_sdk::raw::{
+        BoundaryContext, ChannelBoundary, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
+        StateBoundary,
+    };
+    use capanix_app_sdk::runtime::{
+        LogLevel, RuntimeWorkerBinding, RuntimeWorkerLauncherKind, in_memory_state_boundary,
+    };
+    use capanix_app_sdk::worker::WorkerMode;
+    use futures_util::StreamExt;
+    use std::collections::{HashMap, HashSet};
+    use std::path::{Path, PathBuf};
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    use tempfile::tempdir;
+    use tokio::sync::{Mutex as AsyncMutex, Notify};
+    use tokio::time::Duration;
+
+    use crate::source::FSMetaSource;
+    use crate::source::config::RootSpec;
+
+    #[derive(Default)]
+    struct LoopbackWorkerBoundary {
+        channels: AsyncMutex<HashMap<String, Vec<Event>>>,
+        closed: StdMutex<HashSet<String>>,
+        changed: Notify,
+    }
+
+    #[async_trait]
+    impl ChannelIoSubset for LoopbackWorkerBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> Result<()> {
+            {
+                let mut channels = self.channels.lock().await;
+                channels
+                    .entry(request.channel_key.0)
+                    .or_default()
+                    .extend(request.events);
+            }
+            self.changed.notify_waiters();
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelRecvRequest,
+        ) -> Result<Vec<Event>> {
+            let deadline = request
+                .timeout_ms
+                .map(Duration::from_millis)
+                .map(|timeout| tokio::time::Instant::now() + timeout);
+            loop {
+                {
+                    let mut channels = self.channels.lock().await;
+                    if let Some(events) = channels.remove(&request.channel_key.0)
+                        && !events.is_empty()
+                    {
+                        return Ok(events);
+                    }
+                }
+                {
+                    let closed = self.closed.lock().expect("loopback closed lock");
+                    if closed.contains(&request.channel_key.0) {
+                        return Err(CnxError::ChannelClosed);
+                    }
+                }
+                let notified = self.changed.notified();
+                if let Some(deadline) = deadline {
+                    match tokio::time::timeout_at(deadline, notified).await {
+                        Ok(()) => {}
+                        Err(_) => return Err(CnxError::Timeout),
+                    }
+                } else {
+                    notified.await;
+                }
+            }
+        }
+
+        fn channel_close(&self, _ctx: BoundaryContext, channel: ChannelKey) -> Result<()> {
+            self.closed
+                .lock()
+                .expect("loopback closed lock")
+                .insert(channel.0);
+            self.changed.notify_waiters();
+            Ok(())
+        }
+    }
+
+    impl ChannelBoundary for LoopbackWorkerBoundary {
+        fn log(&self, _ctx: BoundaryContext, _level: LogLevel, _msg: &str) {}
+    }
+
+    impl StateBoundary for LoopbackWorkerBoundary {}
+
+    fn fs_meta_runtime_lib_filename() -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            "libfs_meta_runtime.dylib"
+        }
+        #[cfg(target_os = "windows")]
+        {
+            "fs_meta_runtime.dll"
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        {
+            "libfs_meta_runtime.so"
+        }
+    }
+
+    fn fs_meta_runtime_workspace_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .expect("workspace root")
+            .to_path_buf()
+    }
+
+    fn fs_meta_worker_module_path() -> PathBuf {
+        static BIN: OnceLock<PathBuf> = OnceLock::new();
+        BIN.get_or_init(|| {
+            for name in ["CAPANIX_FS_META_APP_BINARY", "DATANIX_FS_META_APP_SO"] {
+                if let Ok(path) = std::env::var(name) {
+                    let resolved = PathBuf::from(path);
+                    if resolved.exists() {
+                        return resolved;
+                    }
+                }
+            }
+            let root = fs_meta_runtime_workspace_root();
+            let lib_name = fs_meta_runtime_lib_filename();
+            for candidate in [
+                root.join("target/debug").join(lib_name),
+                root.join("target/debug/deps").join(lib_name),
+                root.join(".target/debug").join(lib_name),
+                root.join(".target/debug/deps").join(lib_name),
+            ] {
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+            panic!("fs-meta worker module not found; set CAPANIX_FS_META_APP_BINARY");
+        })
+        .clone()
+    }
+
+    fn external_sink_worker_binding(socket_dir: &Path) -> RuntimeWorkerBinding {
+        RuntimeWorkerBinding {
+            role_id: "sink".to_string(),
+            mode: WorkerMode::External,
+            launcher_kind: RuntimeWorkerLauncherKind::WorkerHost,
+            module_path: Some(fs_meta_worker_module_path()),
+            socket_dir: Some(socket_dir.to_path_buf()),
+        }
+    }
+
+    fn sink_worker_root(id: &str, path: &Path) -> RootSpec {
+        let mut root = RootSpec::new(id, path);
+        root.watch = false;
+        root.scan = true;
+        root
+    }
+
+    fn sink_worker_export(
+        object_ref: &str,
+        host_ref: &str,
+        host_ip: &str,
+        mount_point: PathBuf,
+    ) -> GrantedMountRoot {
+        GrantedMountRoot {
+            object_ref: object_ref.to_string(),
+            host_ref: host_ref.to_string(),
+            host_ip: host_ip.to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: Default::default(),
+            mount_point,
+            fs_source: object_ref.to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: vec![],
+            interfaces: vec![],
+            active: true,
+        }
+    }
+
+    fn selected_group_request(path: &[u8], group_id: &str) -> InternalQueryRequest {
+        InternalQueryRequest::materialized(
+            QueryOp::Tree,
+            QueryScope {
+                path: path.to_vec(),
+                recursive: false,
+                max_depth: Some(0),
+                selected_group: Some(group_id.to_string()),
+            },
+            None,
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_sink_worker_materializes_each_local_primary_root_from_source_batches() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
+            .expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                sink_worker_root("nfs1", &nfs1),
+                sink_worker_root("nfs2", &nfs2),
+            ],
+            host_object_grants: vec![
+                sink_worker_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                sink_worker_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory = RuntimeWorkerClientFactory::new(
+            boundary.clone(),
+            boundary.clone(),
+            state_boundary,
+        );
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply initial batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1")
+            .is_some();
+            let nfs2_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2")
+            .is_some();
+            if nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs1"))
+                    .await
+                    .expect("query nfs1 after initial"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs1 after initial")
+            .is_some(),
+            "nfs1 initial materialization should exist",
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(b"/force-find-stress", "nfs2"))
+                    .await
+                    .expect("query nfs2 after initial"),
+                b"/force-find-stress",
+            )
+            .expect("decode nfs2 after initial")
+            .is_some(),
+            "nfs2 initial materialization should exist",
+        );
+
+        std::fs::write(
+            nfs1.join("force-find-stress").join("after-rescan.txt"),
+            b"aa",
+        )
+        .expect("append nfs1 file");
+        std::fs::write(
+            nfs2.join("force-find-stress").join("after-rescan.txt"),
+            b"bb",
+        )
+        .expect("append nfs2 file");
+        source
+            .publish_manual_rescan_signal()
+            .await
+            .expect("publish manual rescan");
+
+        let rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < rescan_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => sink.send(batch).await.expect("apply rescan batch"),
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_done = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(
+                    b"/force-find-stress/after-rescan.txt",
+                    "nfs1",
+                ))
+                .await
+                .expect("query nfs1 rescan"),
+                b"/force-find-stress/after-rescan.txt",
+            )
+            .expect("decode nfs1 rescan")
+            .is_some();
+            let nfs2_done = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(
+                    b"/force-find-stress/after-rescan.txt",
+                    "nfs2",
+                ))
+                .await
+                .expect("query nfs2 rescan"),
+                b"/force-find-stress/after-rescan.txt",
+            )
+            .expect("decode nfs2 rescan")
+            .is_some();
+            if nfs1_done && nfs2_done {
+                break;
+            }
+        }
+
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(
+                    b"/force-find-stress/after-rescan.txt",
+                    "nfs1",
+                ))
+                .await
+                .expect("query nfs1 final"),
+                b"/force-find-stress/after-rescan.txt",
+            )
+            .expect("decode nfs1 final")
+            .is_some(),
+            "nfs1 should materialize its post-rescan file",
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(
+                    b"/force-find-stress/after-rescan.txt",
+                    "nfs2",
+                ))
+                .await
+                .expect("query nfs2 final"),
+                b"/force-find-stress/after-rescan.txt",
+            )
+            .expect("decode nfs2 final")
+            .is_some(),
+            "nfs2 should materialize its post-rescan file",
+        );
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close sink worker");
+    }
+}

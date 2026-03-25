@@ -56,6 +56,8 @@ use tokio::task::JoinHandle;
 
 use crate::sink::SinkFileMeta;
 #[cfg(test)]
+use crate::sink::{SinkGroupStatusSnapshot, SinkStatusSnapshot};
+#[cfg(test)]
 use crate::source::config::SourceConfig;
 
 // Top-level fs-meta runtime-entry/bootstrap glue lowers through
@@ -269,21 +271,16 @@ fn now_us() -> u64 {
 }
 
 fn should_emit_selected_group_empty_materialized_reply(
-    node_id: &NodeId,
+    _node_id: &NodeId,
     source_primary_by_group: &BTreeMap<String, String>,
     request: &InternalQueryRequest,
 ) -> bool {
     let Some(group_id) = request.scope.selected_group.as_deref() else {
         return false;
     };
-    let Some(primary_object_ref) = source_primary_by_group.get(group_id) else {
-        return false;
-    };
-    primary_object_ref
-        .split_once("::")
-        .map(|(owner_node_id, _)| owner_node_id)
-        .unwrap_or(primary_object_ref.as_str())
-        == node_id.0
+    // Selected-group proxy requests must settle explicitly even on non-owner
+    // peers; returning no reply here can leave fanout batches unresolved.
+    source_primary_by_group.contains_key(group_id)
 }
 
 fn selected_group_empty_materialized_reply(
@@ -332,11 +329,43 @@ fn selected_group_empty_materialized_reply(
     )))
 }
 
+fn selected_group_bridge_eligible_from_sink_status(
+    request: &InternalQueryRequest,
+    snapshot: &crate::sink::SinkStatusSnapshot,
+) -> bool {
+    let Some(selected_group) = request.scope.selected_group.as_ref() else {
+        return true;
+    };
+    snapshot
+        .groups
+        .iter()
+        .any(|group| group.group_id == *selected_group && group.live_nodes > 0)
+}
+
 fn should_bridge_selected_group_sink_query(
     request: &InternalQueryRequest,
     local_events: &[Event],
+    local_selected_group_bridge_eligible: bool,
 ) -> bool {
     if request.op != crate::query::QueryOp::Tree || request.scope.selected_group.is_none() {
+        return false;
+    }
+    if !local_selected_group_bridge_eligible {
+        return false;
+    }
+    let selected_group = request
+        .scope
+        .selected_group
+        .as_deref()
+        .expect("selected_group must be present for bridge decision");
+    let has_selected_group_tree_payload = local_events.iter().any(|event| {
+        event.metadata().origin_id.0 == selected_group
+            && matches!(
+                rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes()),
+                Ok(MaterializedQueryPayload::Tree(_))
+            )
+    });
+    if has_selected_group_tree_payload {
         return false;
     }
     let has_materialized_tree_data = local_events.iter().any(|event| {
@@ -1041,8 +1070,21 @@ impl FSMetaApp {
                                                 }
                                             }
                                         }
-                                        if should_bridge_selected_group_sink_query(&params, &events)
-                                        {
+                                        let local_selected_group_bridge_eligible = sink
+                                            .status_snapshot_nonblocking()
+                                            .await
+                                            .ok()
+                                            .map(|snapshot| {
+                                                selected_group_bridge_eligible_from_sink_status(
+                                                    &params, &snapshot,
+                                                )
+                                            })
+                                            .unwrap_or(true);
+                                        if should_bridge_selected_group_sink_query(
+                                            &params,
+                                            &events,
+                                            local_selected_group_bridge_eligible,
+                                        ) {
                                             match rmp_serde::to_vec(&params) {
                                                 Ok(payload) => {
                                                     match capanix_host_adapter_fs::HostAdapter::call_collect(
@@ -2337,8 +2379,13 @@ mod tests {
     use crate::{ControlEvent, FileMetaRecord};
     use crate::{FSMetaConfig, FSMetaProductConfig, api, query, source};
     use bytes::Bytes;
+    use capanix_app_sdk::raw::{
+        BoundaryContext, ChannelBoundary, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
+        StateBoundary,
+    };
     use capanix_app_sdk::runtime::{
-        EventMetadata, RuntimeWorkerBinding, RuntimeWorkerBindings, RuntimeWorkerLauncherKind,
+        EventMetadata, LogLevel, RuntimeWorkerBinding, RuntimeWorkerBindings,
+        RuntimeWorkerLauncherKind, in_memory_state_boundary,
     };
     use capanix_host_fs_types::UnixStat;
     use capanix_runtime_entry_sdk::control::{
@@ -2349,13 +2396,16 @@ mod tests {
     };
     use reqwest::Client;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::fs;
     use std::net::TcpListener;
+    use std::path::{Path, PathBuf};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Mutex as StdMutex, OnceLock};
     use std::time::Duration;
     use tempfile::tempdir;
-    use tokio::sync::Notify;
+    use tokio::sync::{Mutex as AsyncMutex, Notify};
 
     fn write_auth_files(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
         let passwd = dir.path().join("fs-meta.passwd");
@@ -2458,6 +2508,45 @@ mod tests {
         .expect("encode activate envelope with scopes")
     }
 
+    fn activate_envelope_with_scope_rows(
+        unit_id: &str,
+        scopes: &[(&str, &[&str])],
+        generation: u64,
+    ) -> ControlEnvelope {
+        activate_envelope_with_route_key_and_scope_rows(
+            unit_id,
+            facade_control_stream_route(),
+            scopes,
+            generation,
+        )
+    }
+
+    fn activate_envelope_with_route_key_and_scope_rows(
+        unit_id: &str,
+        route_key: String,
+        scopes: &[(&str, &[&str])],
+        generation: u64,
+    ) -> ControlEnvelope {
+        encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+            route_key,
+            unit_id: unit_id.to_string(),
+            lease: None,
+            generation,
+            expires_at_ms: 60_000,
+            bound_scopes: scopes
+                .iter()
+                .map(|(scope_id, resource_ids)| RuntimeBoundScope {
+                    scope_id: (*scope_id).to_string(),
+                    resource_ids: resource_ids
+                        .iter()
+                        .map(|id| (*id).to_string())
+                        .collect(),
+                })
+                .collect(),
+        }))
+        .expect("encode activate envelope with scope rows")
+    }
+
     fn host_object_grants_changed_envelope(version: u64, mount_point: &str) -> ControlEnvelope {
         encode_runtime_host_grant_change(&RuntimeHostGrantChange {
             version,
@@ -2528,11 +2617,234 @@ mod tests {
         }
     }
 
+    fn worker_root(id: &str, path: &Path) -> source::config::RootSpec {
+        let mut root = source::config::RootSpec::new(id, path);
+        root.watch = false;
+        root.scan = true;
+        root
+    }
+
+    fn worker_export(
+        object_ref: &str,
+        host_ref: &str,
+        host_ip: &str,
+        mount_point: PathBuf,
+    ) -> source::config::GrantedMountRoot {
+        source::config::GrantedMountRoot {
+            object_ref: object_ref.to_string(),
+            host_ref: host_ref.to_string(),
+            host_ip: host_ip.to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: Default::default(),
+            mount_point,
+            fs_source: object_ref.to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: vec![],
+            interfaces: vec![],
+            active: true,
+        }
+    }
+
+    fn selected_group_file_request(path: &[u8], group_id: &str) -> InternalQueryRequest {
+        InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: path.to_vec(),
+                recursive: false,
+                max_depth: Some(0),
+                selected_group: Some(group_id.to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        )
+    }
+
+    fn decode_tree_group_payloads(
+        events: Vec<Event>,
+    ) -> Result<std::collections::BTreeMap<String, TreeGroupPayload>> {
+        let mut grouped = std::collections::BTreeMap::new();
+        for event in events {
+            let payload = rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
+                .map_err(|err| {
+                    CnxError::Internal(format!(
+                        "decode selected-group tree payload failed: {err}"
+                    ))
+                })?;
+            let MaterializedQueryPayload::Tree(payload) = payload else {
+                return Err(CnxError::Internal(
+                    "unexpected stats payload for selected-group tree query".into(),
+                ));
+            };
+            grouped.insert(event.metadata().origin_id.0.clone(), payload);
+        }
+        Ok(grouped)
+    }
+
+    async fn selected_group_proxy_tree(
+        boundary: Arc<dyn ChannelIoSubset>,
+        caller_node: NodeId,
+        request: &InternalQueryRequest,
+    ) -> Result<std::collections::BTreeMap<String, TreeGroupPayload>> {
+        let adapter = crate::runtime::seam::exchange_host_adapter(
+            boundary,
+            caller_node,
+            crate::runtime::routes::default_route_bindings(),
+        );
+        let payload = rmp_serde::to_vec(request).map_err(|err| {
+            CnxError::Internal(format!("encode selected-group request failed: {err}"))
+        })?;
+        let events = capanix_host_adapter_fs::HostAdapter::call_collect(
+            &adapter,
+            ROUTE_TOKEN_FS_META_INTERNAL,
+            METHOD_SINK_QUERY_PROXY,
+            Bytes::from(payload),
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+        )
+        .await?;
+        decode_tree_group_payloads(events)
+    }
+
     fn reserve_bind_addr() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind temp listener");
         let addr = listener.local_addr().expect("local addr");
         drop(listener);
         addr.to_string()
+    }
+
+    #[derive(Default)]
+    struct LoopbackWorkerBoundary {
+        channels: AsyncMutex<HashMap<String, Vec<Event>>>,
+        closed: StdMutex<std::collections::HashSet<String>>,
+        changed: Notify,
+    }
+
+    #[async_trait]
+    impl ChannelIoSubset for LoopbackWorkerBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> Result<()> {
+            {
+                let mut channels = self.channels.lock().await;
+                channels
+                    .entry(request.channel_key.0)
+                    .or_default()
+                    .extend(request.events);
+            }
+            self.changed.notify_waiters();
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelRecvRequest,
+        ) -> Result<Vec<Event>> {
+            let deadline = request
+                .timeout_ms
+                .map(Duration::from_millis)
+                .map(|timeout| tokio::time::Instant::now() + timeout);
+            loop {
+                {
+                    let mut channels = self.channels.lock().await;
+                    if let Some(events) = channels.remove(&request.channel_key.0)
+                        && !events.is_empty()
+                    {
+                        return Ok(events);
+                    }
+                }
+                {
+                    let closed = self.closed.lock().expect("loopback closed lock");
+                    if closed.contains(&request.channel_key.0) {
+                        return Err(CnxError::ChannelClosed);
+                    }
+                }
+                let notified = self.changed.notified();
+                if let Some(deadline) = deadline {
+                    match tokio::time::timeout_at(deadline, notified).await {
+                        Ok(()) => {}
+                        Err(_) => return Err(CnxError::Timeout),
+                    }
+                } else {
+                    notified.await;
+                }
+            }
+        }
+
+        fn channel_close(&self, _ctx: BoundaryContext, channel: ChannelKey) -> Result<()> {
+            self.closed
+                .lock()
+                .expect("loopback closed lock")
+                .insert(channel.0);
+            self.changed.notify_waiters();
+            Ok(())
+        }
+    }
+
+    impl ChannelBoundary for LoopbackWorkerBoundary {
+        fn log(&self, _ctx: BoundaryContext, _level: LogLevel, _msg: &str) {}
+    }
+
+    impl StateBoundary for LoopbackWorkerBoundary {}
+
+    fn fs_meta_runtime_lib_filename() -> &'static str {
+        #[cfg(target_os = "macos")]
+        {
+            "libfs_meta_runtime.dylib"
+        }
+        #[cfg(target_os = "windows")]
+        {
+            "fs_meta_runtime.dll"
+        }
+        #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+        {
+            "libfs_meta_runtime.so"
+        }
+    }
+
+    fn runtime_test_worker_module_path() -> PathBuf {
+        static BIN: OnceLock<PathBuf> = OnceLock::new();
+        BIN.get_or_init(|| {
+            for name in ["CAPANIX_FS_META_APP_BINARY", "DATANIX_FS_META_APP_SO"] {
+                if let Ok(path) = std::env::var(name) {
+                    let resolved = PathBuf::from(path);
+                    if resolved.exists() {
+                        return resolved;
+                    }
+                }
+            }
+            let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .expect("workspace root")
+                .to_path_buf();
+            let lib_name = fs_meta_runtime_lib_filename();
+            for candidate in [
+                root.join("target/debug").join(lib_name),
+                root.join("target/debug/deps").join(lib_name),
+                root.join(".target/debug").join(lib_name),
+                root.join(".target/debug/deps").join(lib_name),
+            ] {
+                if candidate.exists() {
+                    return candidate;
+                }
+            }
+            panic!("fs-meta worker module not found; set CAPANIX_FS_META_APP_BINARY");
+        })
+        .clone()
+    }
+
+    fn external_runtime_worker_binding(role_id: &str, socket_dir: &Path) -> RuntimeWorkerBinding {
+        RuntimeWorkerBinding {
+            role_id: role_id.to_string(),
+            mode: WorkerMode::External,
+            launcher_kind: RuntimeWorkerLauncherKind::WorkerHost,
+            module_path: Some(runtime_test_worker_module_path()),
+            socket_dir: Some(socket_dir.to_path_buf()),
+        }
     }
 
     fn facade_pending_status(app: &FSMetaApp) -> SharedFacadePendingStatus {
@@ -2695,7 +3007,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_group_empty_materialized_reply_only_owner_peer_emits_synthetic_empty() {
+    fn selected_group_empty_materialized_reply_emits_on_non_owner_peers_when_group_known() {
         let request = query::InternalQueryRequest::materialized(
             query::QueryOp::Tree,
             query::QueryScope {
@@ -2714,7 +3026,7 @@ mod tests {
             &source_primary_by_group,
             &request,
         ));
-        assert!(!should_emit_selected_group_empty_materialized_reply(
+        assert!(should_emit_selected_group_empty_materialized_reply(
             &NodeId("node-c".into()),
             &source_primary_by_group,
             &request,
@@ -2757,7 +3069,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_group_tree_empty_local_payload_requires_sink_query_bridge() {
+    fn selected_group_tree_missing_local_payload_requires_sink_query_bridge() {
         let request = query::InternalQueryRequest::materialized(
             query::QueryOp::Tree,
             query::QueryScope {
@@ -2768,13 +3080,10 @@ mod tests {
             },
             Some(query::TreeQueryOptions::default()),
         );
-        let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
-            .expect("build empty reply")
-            .expect("selected-group reply");
-
         assert!(should_bridge_selected_group_sink_query(
             &request,
-            &[empty_event]
+            &[],
+            true,
         ));
     }
 
@@ -2823,7 +3132,150 @@ mod tests {
 
         assert!(!should_bridge_selected_group_sink_query(
             &request,
-            &[local_event]
+            &[local_event],
+            true,
+        ));
+    }
+
+    #[test]
+    fn selected_group_tree_empty_payload_skips_sink_query_bridge_when_no_local_sink_groups() {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs2".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+        let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
+            .expect("build empty reply")
+            .expect("selected-group reply");
+
+        assert!(!should_bridge_selected_group_sink_query(
+            &request,
+            &[empty_event],
+            false,
+        ));
+    }
+
+    #[test]
+    fn selected_group_tree_empty_payload_skips_sink_query_bridge_when_selected_group_missing_locally()
+    {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs2".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+        let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
+            .expect("build empty reply")
+            .expect("selected-group reply");
+
+        assert!(!should_bridge_selected_group_sink_query(
+            &request,
+            &[empty_event],
+            false,
+        ));
+    }
+
+    #[test]
+    fn selected_group_tree_empty_local_payload_skips_bridge_when_selected_group_payload_present() {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs2".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+        let empty_event = selected_group_empty_materialized_reply(&request, Some(11))
+            .expect("build empty reply")
+            .expect("selected-group reply");
+
+        assert!(!should_bridge_selected_group_sink_query(
+            &request,
+            &[empty_event],
+            true,
+        ));
+    }
+
+    #[test]
+    fn selected_group_bridge_eligibility_skips_group_with_zero_live_nodes() {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs2".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+        let snapshot = SinkStatusSnapshot {
+            groups: vec![SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "root-b".to_string(),
+                total_nodes: 0,
+                live_nodes: 0,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 0,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: false,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+
+        assert!(!selected_group_bridge_eligible_from_sink_status(
+            &request, &snapshot
+        ));
+    }
+
+    #[test]
+    fn selected_group_bridge_eligibility_requires_live_nodes() {
+        let request = query::InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: b"/force-find-stress".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some("nfs2".to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        );
+        let snapshot = SinkStatusSnapshot {
+            groups: vec![SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "root-b".to_string(),
+                total_nodes: 1,
+                live_nodes: 1,
+                tombstoned_count: 0,
+                attested_count: 1,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 1,
+                shadow_lag_us: 0,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                estimated_heap_bytes: 64,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+
+        assert!(selected_group_bridge_eligible_from_sink_status(
+            &request, &snapshot
         ));
     }
 
@@ -4346,6 +4798,158 @@ mod tests {
             .flat_map(|group| group.entries.iter().map(|entry| entry.path.clone()))
             .collect();
         assert!(paths.iter().any(|path| path == b"/hello.txt"));
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_runtime_app_selected_group_proxy_materializes_each_local_primary_root() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+        fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+                    host_object_grants: vec![
+                        worker_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                        worker_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+                    ],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".to_string()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init external-worker runtime app");
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+        ])
+        .await
+        .expect("apply runtime control");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            let sink_groups = app
+                .sink
+                .scheduled_group_ids()
+                .await
+                .expect("sink groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups
+                && scan_groups == expected_groups
+                && sink_groups == expected_groups
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < scheduling_deadline,
+                "timed out waiting for runtime scope convergence: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        for group_id in ["nfs1", "nfs2"] {
+            let request = selected_group_file_request(b"/force-find-stress/seed.txt", group_id);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            let mut direct_ready = false;
+            let mut proxy_ready = false;
+            let mut last_proxy_keys = Vec::<String>::new();
+            let mut last_proxy_err = None::<String>;
+            while tokio::time::Instant::now() < deadline {
+                match app.query_tree(&request).await {
+                    Ok(grouped) => {
+                        if grouped.get(group_id).is_some_and(|payload| payload.root.exists) {
+                            direct_ready = true;
+                        }
+                    }
+                    Err(_) => {}
+                }
+                match selected_group_proxy_tree(
+                    boundary.clone(),
+                    NodeId("node-a".to_string()),
+                    &request,
+                )
+                .await
+                {
+                    Ok(grouped) => {
+                        last_proxy_keys = grouped.keys().cloned().collect();
+                        last_proxy_err = None;
+                        if grouped.get(group_id).is_some_and(|payload| payload.root.exists) {
+                            proxy_ready = true;
+                        }
+                    }
+                    Err(err) => {
+                        last_proxy_err = Some(err.to_string());
+                    }
+                }
+                if direct_ready && proxy_ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                direct_ready,
+                "direct sink query should materialize selected group {group_id}"
+            );
+            assert!(
+                proxy_ready,
+                "selected-group proxy query should materialize selected group {group_id}: last_proxy_keys={last_proxy_keys:?} last_proxy_err={last_proxy_err:?}"
+            );
+        }
 
         app.close().await.expect("close app");
     }
