@@ -122,9 +122,6 @@ pub fn build_release_doc_value(spec: &FsMetaReleaseSpec) -> serde_json::Value {
                             },
                             "runtime.exec.scan": {
                                 "enabled": false
-                            },
-                            "runtime.exec.facade": {
-                                "enabled": true
                             }
                         }
                     }
@@ -702,5 +699,30 @@ mod tests {
                 "startup manifest activation routes must cover release runtime.route_units key {route_key}"
             );
         }
+    }
+
+    #[test]
+    fn facade_state_carrier_is_disabled_for_resource_scoped_failover() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let facade_state_carrier = release_doc["units"][0]["runtime"]["state_carrier"]["units"]
+            .get("runtime.exec.facade")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|row| row.get("enabled"))
+            .and_then(serde_json::Value::as_bool);
+
+        assert!(
+            facade_state_carrier != Some(true),
+            "resource-scoped one-cardinality facade must not stay pinned through runtime state carrier"
+        );
     }
 }

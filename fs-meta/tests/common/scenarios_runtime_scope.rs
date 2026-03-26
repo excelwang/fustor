@@ -323,8 +323,7 @@ pub(crate) fn scenario_runtime_orchestrated_worker_hosting_config_apply_e2e() ->
                             "state_carrier": {
                                 "enabled": true,
                                 "units": {
-                                    "runtime.exec.scan": { "enabled": false },
-                                    "runtime.exec.facade": { "enabled": true }
+                                    "runtime.exec.scan": { "enabled": false }
                                 }
                             }
                         },
@@ -714,8 +713,7 @@ pub(crate) fn scenario_single_entrypoint_distributed_apply_e2e() -> Result<(), S
                             "state_carrier": {
                                 "enabled": true,
                                 "units": {
-                                    "runtime.exec.scan": { "enabled": false },
-                                    "runtime.exec.facade": { "enabled": true }
+                                    "runtime.exec.scan": { "enabled": false }
                                 }
                             }
                         },

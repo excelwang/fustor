@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum OperationalMode {
@@ -191,7 +191,8 @@ fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
                 &harness.app_id,
                 "runtime.exec.sink",
             )?;
-            sink_holder = current_sink_holder(&harness.cluster, &harness.app_id)?;
+            sink_holder =
+                current_sink_holder_for_group(&harness.cluster, &harness.app_id, "nfs2")?;
             if !node_a_source_pids.is_empty() && !node_a_sink_pids.is_empty() {
                 return Ok(true);
             }
@@ -351,7 +352,8 @@ fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Result
                 &harness.app_id,
                 "runtime.exec.sink",
             )?;
-            sink_holder = current_sink_holder(&harness.cluster, &harness.app_id)?;
+            sink_holder =
+                current_sink_holder_for_group(&harness.cluster, &harness.app_id, "nfs2")?;
             if !node_a_source_pids.is_empty()
                 && !node_a_sink_pids.is_empty()
                 && sink_holder.as_deref() == Some("node-a")
@@ -1034,21 +1036,31 @@ fn scenario_visibility_change_and_sink_selection(
             .unwrap_or(false))
     })?;
 
-    wait_until(
-        Duration::from_secs(60),
-        "source active on nfs2 visible members",
-        || {
+    {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
             let a =
                 cluster.unit_active_pids_for_instance("node-a", app_id, "runtime.exec.source")?;
             let c =
                 cluster.unit_active_pids_for_instance("node-c", app_id, "runtime.exec.source")?;
             let d =
                 cluster.unit_active_pids_for_instance("node-d", app_id, "runtime.exec.source")?;
-            Ok(!a.is_empty() && !c.is_empty() && !d.is_empty())
-        },
-    )?;
+            if !a.is_empty() && !c.is_empty() && !d.is_empty() {
+                break;
+            }
+            if Instant::now() > deadline {
+                let raw_metrics_a = cluster.ctl_ok("node-a", json!({ "command": "metrics_get" }))?;
+                let raw_metrics_c = cluster.ctl_ok("node-c", json!({ "command": "metrics_get" }))?;
+                let raw_metrics_d = cluster.ctl_ok("node-d", json!({ "command": "metrics_get" }))?;
+                return Err(format!(
+                    "timeout waiting for source active on nfs2 visible members: node-a pids={a:?} raw_metrics={raw_metrics_a} node-c pids={c:?} raw_metrics={raw_metrics_c} node-d pids={d:?} raw_metrics={raw_metrics_d}"
+                ));
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
 
-    let before_holder = current_sink_holder(cluster, app_id)?;
+    let before_holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?;
     cluster
         .withdraw_resources_clusterwide(&cluster.node_id("node-d")?, vec!["nfs2".to_string()])?;
     let _ = lab.unmount_export("node-d", "nfs2");
@@ -1068,11 +1080,11 @@ fn scenario_visibility_change_and_sink_selection(
         Duration::from_secs(90),
         "sink holder not on withdrawn node",
         || {
-            let holder = current_sink_holder(cluster, app_id)?;
+            let holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?;
             Ok(holder.is_some() && holder != Some("node-d".to_string()))
         },
     )?;
-    let after_holder = current_sink_holder(cluster, app_id)?
+    let after_holder = current_sink_holder_for_group(cluster, app_id, "nfs2")?
         .ok_or_else(|| "sink holder disappeared after visibility change".to_string())?;
     if after_holder == "node-d" {
         return Err("sink holder remained on withdrawn node-d".to_string());
@@ -1306,15 +1318,65 @@ fn current_roots_payload(session: &mut OperatorSession) -> Result<Value, String>
 }
 
 fn current_sink_holder(cluster: &Cluster5, app_id: &str) -> Result<Option<String>, String> {
-    let mut holders = Vec::new();
+    current_sink_holder_for_scope(cluster, app_id, None)
+}
+
+fn current_sink_holder_for_group(
+    cluster: &Cluster5,
+    app_id: &str,
+    group_id: &str,
+) -> Result<Option<String>, String> {
+    current_sink_holder_for_scope(cluster, app_id, Some(group_id))
+}
+
+#[derive(Debug, Clone)]
+struct SinkHolderSnapshot {
+    node_name: String,
+    active_pids: BTreeSet<u32>,
+    bound_scopes: BTreeSet<String>,
+}
+
+fn current_sink_holder_for_scope(
+    cluster: &Cluster5,
+    app_id: &str,
+    group_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut snapshots = Vec::new();
     for node_name in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
         let pids = cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.sink")?;
-        if !pids.is_empty() {
-            holders.push(node_name.to_string());
+        let bound_scopes =
+            unit_bound_scope_ids_from_activation_status(cluster, node_name, "runtime.exec.sink")?;
+        snapshots.push(SinkHolderSnapshot {
+            node_name: node_name.to_string(),
+            active_pids: pids,
+            bound_scopes,
+        });
+    }
+    unique_sink_holder_from_snapshots(&snapshots, group_id)
+}
+
+fn unique_sink_holder_from_snapshots(
+    snapshots: &[SinkHolderSnapshot],
+    group_id: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut holders = Vec::new();
+    let mut debug_rows = Vec::new();
+    for snapshot in snapshots {
+        debug_rows.push(format!(
+            "{} pids={:?} scopes={:?}",
+            snapshot.node_name, snapshot.active_pids, snapshot.bound_scopes
+        ));
+        let matches_group = group_id
+            .map(|scope_id| snapshot.bound_scopes.contains(scope_id))
+            .unwrap_or(true);
+        if !snapshot.active_pids.is_empty() && matches_group {
+            holders.push(snapshot.node_name.clone());
         }
     }
     if holders.len() > 1 {
-        return Err(format!("multiple sink holders detected: {holders:?}"));
+        return Err(format!(
+            "multiple sink holders detected: {holders:?} snapshots={debug_rows:?}"
+        ));
     }
     Ok(holders.into_iter().next())
 }
@@ -2025,4 +2087,25 @@ fn unique_suffix() -> u128 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0)
+}
+
+#[test]
+fn sink_holder_selection_ignores_nodes_without_target_scope() {
+    let snapshots = vec![
+        SinkHolderSnapshot {
+            node_name: "node-a".to_string(),
+            active_pids: BTreeSet::from([1]),
+            bound_scopes: BTreeSet::from(["nfs2".to_string()]),
+        },
+        SinkHolderSnapshot {
+            node_name: "node-b".to_string(),
+            active_pids: BTreeSet::from([2]),
+            bound_scopes: BTreeSet::from(["nfs3".to_string()]),
+        },
+    ];
+
+    assert_eq!(
+        unique_sink_holder_from_snapshots(&snapshots, Some("nfs2")).expect("nfs2 holder"),
+        Some("node-a".to_string())
+    );
 }

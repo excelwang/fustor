@@ -20,7 +20,7 @@ use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -673,19 +673,7 @@ impl Cluster5 {
         instance_id: &str,
     ) -> Result<BTreeSet<u32>, String> {
         let status = self.status(node_name)?;
-        Ok(status
-            .get("daemon")
-            .and_then(|v| v.get("managed_processes"))
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter(|row| {
-                        row.get("instance_id").and_then(Value::as_str) == Some(instance_id)
-                    })
-                    .filter_map(|row| row.get("pid").and_then(Value::as_u64).map(|v| v as u32))
-                    .collect::<BTreeSet<_>>()
-            })
-            .unwrap_or_default())
+        Ok(managed_host_pids_for_instance_from_status(&status, instance_id))
     }
 
     pub fn unit_active_pids_for_instance(
@@ -695,44 +683,11 @@ impl Cluster5 {
         unit_id: &str,
     ) -> Result<BTreeSet<u32>, String> {
         let status = self.status(node_name)?;
-        let managed = self.managed_host_pids_for_instance(node_name, instance_id)?;
-        let routes = status
-            .get("daemon")
-            .and_then(|v| v.get("activation"))
-            .and_then(|v| v.get("routes"))
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut out = BTreeSet::new();
-        for route in routes {
-            let Some(apps) = route.get("apps").and_then(Value::as_array) else {
-                continue;
-            };
-            for row in apps {
-                let active_unit = row
-                    .get("unit_ids")
-                    .and_then(Value::as_array)
-                    .is_some_and(|units| units.iter().any(|v| v.as_str() == Some(unit_id)));
-                if !active_unit {
-                    continue;
-                }
-                if row.get("delivered").and_then(Value::as_bool) != Some(true) {
-                    continue;
-                }
-                if row.get("gate").and_then(Value::as_str) != Some("activated") {
-                    continue;
-                }
-                if row.get("op").and_then(Value::as_str) != Some("activate") {
-                    continue;
-                }
-                if let Some(pid) = row.get("pid").and_then(Value::as_u64).map(|v| v as u32) {
-                    if managed.contains(&pid) {
-                        out.insert(pid);
-                    }
-                }
-            }
-        }
-        Ok(out)
+        Ok(unit_active_pids_for_instance_from_status(
+            &status,
+            instance_id,
+            unit_id,
+        ))
     }
 
     pub fn facade_pids_for_instance(
@@ -1598,12 +1553,7 @@ fn request_layered_local_status(socket_path: &Path) -> Result<Value, String> {
         .get("result")
         .cloned()
         .ok_or_else(|| "metrics_get missing result".to_string())?;
-    let daemon = metrics.get("daemon").cloned().unwrap_or_else(|| json!({}));
-    Ok(json!({
-        "cluster": cluster,
-        "metrics": metrics,
-        "daemon": daemon,
-    }))
+    Ok(layered_local_status_from_parts(cluster, metrics))
 }
 
 fn status_has_reachable_node(status: &Value, node_id: &str) -> bool {
@@ -1747,6 +1697,189 @@ fn canonicalize_value(value: serde_json::Value) -> serde_json::Value {
     }
 }
 
+fn managed_host_pids_for_instance_from_status(
+    status: &Value,
+    instance_id: &str,
+) -> BTreeSet<u32> {
+    status
+        .get("daemon")
+        .and_then(|v| v.get("managed_processes"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row.get("instance_id").and_then(Value::as_str) == Some(instance_id))
+                .filter_map(|row| row.get("pid").and_then(Value::as_u64).map(|v| v as u32))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn layered_local_status_from_parts(cluster: Value, metrics: Value) -> Value {
+    let mut daemon = metrics
+        .get("daemon")
+        .cloned()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| json!({}));
+    if let Some(daemon_obj) = daemon.as_object_mut() {
+        if let Some(rows) = merge_unique_json_arrays(
+            daemon_obj.get("managed_processes"),
+            metrics.get("managed_processes"),
+        ) {
+            daemon_obj.insert("managed_processes".to_string(), rows);
+        }
+        if let Some(activation) =
+            merge_activation_payloads(daemon_obj.get("activation"), metrics.get("activation"))
+        {
+            daemon_obj.insert("activation".to_string(), activation);
+        }
+    }
+    json!({
+        "cluster": cluster,
+        "metrics": metrics,
+        "daemon": daemon,
+    })
+}
+
+fn merge_unique_json_arrays(existing: Option<&Value>, fallback: Option<&Value>) -> Option<Value> {
+    let mut merged = Vec::new();
+    let mut seen = BTreeSet::new();
+    for source in [existing, fallback] {
+        let Some(rows) = source.and_then(Value::as_array) else {
+            continue;
+        };
+        for row in rows {
+            let key = canonicalize_value(row.clone()).to_string();
+            if seen.insert(key) {
+                merged.push(row.clone());
+            }
+        }
+    }
+    if merged.is_empty() {
+        None
+    } else {
+        Some(Value::Array(merged))
+    }
+}
+
+fn merge_activation_payloads(existing: Option<&Value>, fallback: Option<&Value>) -> Option<Value> {
+    let existing_routes = existing
+        .and_then(|value| value.get("routes"))
+        .and_then(Value::as_array);
+    let fallback_routes = fallback
+        .and_then(|value| value.get("routes"))
+        .and_then(Value::as_array);
+
+    let mut merged_routes: Vec<Value> = Vec::new();
+    let mut route_positions: BTreeMap<String, usize> = BTreeMap::new();
+    for source in [existing_routes, fallback_routes] {
+        let Some(routes) = source else {
+            continue;
+        };
+        for route in routes {
+            let key = route
+                .get("route_key")
+                .and_then(Value::as_str)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| canonicalize_value(route.clone()).to_string());
+            if let Some(index) = route_positions.get(&key).copied() {
+                merged_routes[index] = merge_activation_route(&merged_routes[index], route);
+            } else {
+                route_positions.insert(key, merged_routes.len());
+                merged_routes.push(route.clone());
+            }
+        }
+    }
+
+    if merged_routes.is_empty() {
+        existing.cloned().or_else(|| fallback.cloned())
+    } else {
+        Some(json!({ "routes": merged_routes }))
+    }
+}
+
+fn merge_activation_route(existing: &Value, fallback: &Value) -> Value {
+    let mut merged = existing.clone();
+    let Some(merged_obj) = merged.as_object_mut() else {
+        return fallback.clone();
+    };
+
+    for key in ["active_pids", "apps"] {
+        if let Some(rows) = merge_unique_json_arrays(existing.get(key), fallback.get(key)) {
+            merged_obj.insert(key.to_string(), rows);
+        }
+    }
+
+    if let Some(fallback_obj) = fallback.as_object() {
+        for (key, value) in fallback_obj {
+            if !merged_obj.contains_key(key) || merged_obj.get(key).is_some_and(Value::is_null) {
+                merged_obj.insert(key.clone(), value.clone());
+            }
+        }
+    }
+
+    merged
+}
+
+fn unit_active_pids_for_instance_from_status(
+    status: &Value,
+    instance_id: &str,
+    unit_id: &str,
+) -> BTreeSet<u32> {
+    let managed = managed_host_pids_for_instance_from_status(status, instance_id);
+    let routes = status
+        .get("daemon")
+        .and_then(|v| v.get("activation"))
+        .and_then(|v| v.get("routes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut out = BTreeSet::new();
+    for route in routes {
+        let Some(apps) = route.get("apps").and_then(Value::as_array) else {
+            continue;
+        };
+        let route_active_pids = route
+            .get("active_pids")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_u64().map(|v| v as u32))
+                    .filter(|pid| managed.contains(pid))
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut route_mentions_unit = false;
+        for row in apps {
+            let active_unit = row
+                .get("unit_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|units| units.iter().any(|v| v.as_str() == Some(unit_id)));
+            if !active_unit {
+                continue;
+            }
+            route_mentions_unit = true;
+            if row.get("delivered").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            if row.get("gate").and_then(Value::as_str) != Some("activated") {
+                continue;
+            }
+            if row.get("op").and_then(Value::as_str) != Some("activate") {
+                continue;
+            }
+            if let Some(pid) = row.get("pid").and_then(Value::as_u64).map(|v| v as u32) {
+                if managed.contains(&pid) {
+                    out.insert(pid);
+                }
+            }
+        }
+        if route_mentions_unit {
+            out.extend(route_active_pids);
+        }
+    }
+    out
+}
+
 fn signed_auth_for_payload_bytes(
     command_bytes: Vec<u8>,
     scopes: &[&str],
@@ -1812,4 +1945,169 @@ fn next_auth_seq_global() -> u64 {
         .unwrap_or(1);
     NEXT.get_or_init(|| AtomicU64::new(seed))
         .fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unit_active_pids_surfaces_route_level_active_pids_for_managed_instance() {
+        let status = json!({
+            "daemon": {
+                "managed_processes": [
+                    { "instance_id": "app-1", "pid": 1 }
+                ],
+                "activation": {
+                    "routes": [
+                        {
+                            "route_key": "source-manual-rescan:v1.req",
+                            "active_pids": [1],
+                            "apps": [
+                                {
+                                    "unit_ids": ["runtime.exec.source"],
+                                    "bound_scopes_by_unit": {
+                                        "runtime.exec.source": [
+                                            { "scope_id": "nfs2" }
+                                        ]
+                                    },
+                                    "delivered": false,
+                                    "gate": "runtime_exposure_confirmed",
+                                    "op": "activate"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            unit_active_pids_for_instance_from_status(&status, "app-1", "runtime.exec.source"),
+            BTreeSet::from([1]),
+        );
+    }
+
+    #[test]
+    fn unit_active_pids_ignores_unmanaged_route_level_active_pids() {
+        let status = json!({
+            "daemon": {
+                "managed_processes": [
+                    { "instance_id": "app-1", "pid": 1 }
+                ],
+                "activation": {
+                    "routes": [
+                        {
+                            "route_key": "source-manual-rescan:v1.req",
+                            "active_pids": [2],
+                            "apps": [
+                                {
+                                    "unit_ids": ["runtime.exec.source"],
+                                    "delivered": false,
+                                    "gate": "runtime_exposure_confirmed",
+                                    "op": "activate"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        });
+
+        assert!(
+            unit_active_pids_for_instance_from_status(&status, "app-1", "runtime.exec.source")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn layered_status_promotes_activation_payload_for_source_readiness() {
+        let status = layered_local_status_from_parts(
+            json!({ "nodes": [] }),
+            json!({
+                "uptime_secs": 1,
+                "health": "ok",
+                "daemon": {
+                    "managed_processes": [
+                        { "instance_id": "app-1", "pid": 1 }
+                    ]
+                },
+                "activation": {
+                    "routes": [
+                        {
+                            "route_key": "source-manual-rescan:v1.req",
+                            "active_pids": [1],
+                            "apps": [
+                                {
+                                    "unit_ids": ["runtime.exec.source"],
+                                    "delivered": false,
+                                    "gate": "runtime_exposure_confirmed",
+                                    "op": "activate"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        );
+
+        assert_eq!(
+            unit_active_pids_for_instance_from_status(&status, "app-1", "runtime.exec.source"),
+            BTreeSet::from([1]),
+        );
+    }
+
+    #[test]
+    fn layered_status_prefers_richer_top_level_activation_for_source_readiness() {
+        let status = layered_local_status_from_parts(
+            json!({ "nodes": [] }),
+            json!({
+                "uptime_secs": 1,
+                "health": "ok",
+                "daemon": {
+                    "managed_processes": [],
+                    "activation": {
+                        "routes": [
+                            {
+                                "route_key": "source-manual-rescan:v1.req",
+                                "active_pids": [],
+                                "apps": [
+                                    {
+                                        "unit_ids": ["runtime.exec.source"],
+                                        "delivered": false,
+                                        "gate": "runtime_exposure_confirmed",
+                                        "op": "activate"
+                                    }
+                                ]
+                            }
+                        ]
+                    }
+                },
+                "managed_processes": [
+                    { "instance_id": "app-1", "pid": 1 }
+                ],
+                "activation": {
+                    "routes": [
+                        {
+                            "route_key": "source-manual-rescan:v1.req",
+                            "active_pids": [1],
+                            "apps": [
+                                {
+                                    "unit_ids": ["runtime.exec.source"],
+                                    "delivered": false,
+                                    "gate": "runtime_exposure_confirmed",
+                                    "op": "activate"
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }),
+        );
+
+        assert_eq!(
+            unit_active_pids_for_instance_from_status(&status, "app-1", "runtime.exec.source"),
+            BTreeSet::from([1]),
+        );
+    }
 }
