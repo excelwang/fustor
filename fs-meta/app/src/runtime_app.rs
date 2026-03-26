@@ -270,6 +270,60 @@ fn now_us() -> u64 {
     }
 }
 
+fn summarize_groups_by_node(groups: &BTreeMap<String, Vec<String>>) -> Vec<String> {
+    groups
+        .iter()
+        .map(|(node_id, groups)| format!("{node_id}={}", groups.join("|")))
+        .collect()
+}
+
+fn summarize_counts_by_node(counts: &BTreeMap<String, u64>) -> Vec<String> {
+    counts
+        .iter()
+        .map(|(node_id, count)| format!("{node_id}={count}"))
+        .collect()
+}
+
+fn summarize_sink_groups(groups: &[crate::sink::SinkGroupStatusSnapshot]) -> Vec<String> {
+    groups
+        .iter()
+        .map(|group| {
+            format!(
+                "{}:live={} total={} init={} rev={}",
+                group.group_id,
+                group.live_nodes,
+                group.total_nodes,
+                group.initial_audit_completed,
+                group.materialized_revision
+            )
+        })
+        .collect()
+}
+
+fn summarize_sink_status_endpoint(snapshot: &crate::sink::SinkStatusSnapshot) -> String {
+    format!(
+        "groups={} group_details={:?} scheduled={:?} received_batches={:?} received_events={:?} received_origin_counts={:?} stream_received_batches={:?} stream_received_events={:?} stream_received_origin_counts={:?} stream_ready_origin_counts={:?} stream_deferred_origin_counts={:?} stream_dropped_origin_counts={:?} stream_applied_batches={:?} stream_applied_events={:?} stream_applied_control_events={:?} stream_applied_data_events={:?} stream_applied_origin_counts={:?} stream_last_applied_at_us={:?}",
+        snapshot.groups.len(),
+        summarize_sink_groups(&snapshot.groups),
+        summarize_groups_by_node(&snapshot.scheduled_groups_by_node),
+        summarize_counts_by_node(&snapshot.received_batches_by_node),
+        summarize_counts_by_node(&snapshot.received_events_by_node),
+        summarize_groups_by_node(&snapshot.received_origin_counts_by_node),
+        summarize_counts_by_node(&snapshot.stream_received_batches_by_node),
+        summarize_counts_by_node(&snapshot.stream_received_events_by_node),
+        summarize_groups_by_node(&snapshot.stream_received_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.stream_ready_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.stream_deferred_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.stream_dropped_origin_counts_by_node),
+        summarize_counts_by_node(&snapshot.stream_applied_batches_by_node),
+        summarize_counts_by_node(&snapshot.stream_applied_events_by_node),
+        summarize_counts_by_node(&snapshot.stream_applied_control_events_by_node),
+        summarize_counts_by_node(&snapshot.stream_applied_data_events_by_node),
+        summarize_groups_by_node(&snapshot.stream_applied_origin_counts_by_node),
+        summarize_counts_by_node(&snapshot.stream_last_applied_at_us_by_node),
+    )
+}
+
 fn should_emit_selected_group_empty_materialized_reply(
     _node_id: &NodeId,
     source_primary_by_group: &BTreeMap<String, String>,
@@ -889,8 +943,8 @@ impl FSMetaApp {
                                 match sink.status_snapshot_nonblocking().await {
                                     Ok(snapshot) => {
                                         eprintln!(
-                                            "fs_meta_runtime_app: sink status endpoint response groups={}",
-                                            snapshot.groups.len()
+                                            "fs_meta_runtime_app: sink status endpoint response {}",
+                                            summarize_sink_status_endpoint(&snapshot)
                                         );
                                         if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
                                             responses.push(Event::new(
@@ -3319,6 +3373,7 @@ mod tests {
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
+                materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
             ..SinkStatusSnapshot::default()
@@ -3355,6 +3410,7 @@ mod tests {
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+                materialized_revision: 2,
                 estimated_heap_bytes: 64,
             }],
             ..SinkStatusSnapshot::default()

@@ -104,13 +104,17 @@ fn summarize_groups_by_node(
 
 fn summarize_source_observability_snapshot(snapshot: &SourceObservabilitySnapshot) -> String {
     format!(
-        "lifecycle={} primaries={} runners={} source={:?} scan={:?} control={:?} degraded={:?}",
+        "lifecycle={} primaries={} runners={} source={:?} scan={:?} control={:?} published_batches={:?} published_events={:?} published_origins={:?} published_origin_counts={:?} degraded={:?}",
         snapshot.lifecycle_state,
         snapshot.source_primary_by_group.len(),
         snapshot.last_force_find_runner_by_group.len(),
         summarize_groups_by_node(&snapshot.scheduled_source_groups_by_node),
         summarize_groups_by_node(&snapshot.scheduled_scan_groups_by_node),
         summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node),
+        snapshot.published_batches_by_node,
+        snapshot.published_events_by_node,
+        summarize_groups_by_node(&snapshot.last_published_origins_by_node),
+        summarize_groups_by_node(&snapshot.published_origin_counts_by_node),
         snapshot.status.degraded_roots
     )
 }
@@ -179,6 +183,15 @@ struct SourceWorkerSnapshotCache {
     scheduled_source_groups_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
     scheduled_scan_groups_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
     last_control_frame_signals_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    published_batches_by_node: Option<std::collections::BTreeMap<String, u64>>,
+    published_events_by_node: Option<std::collections::BTreeMap<String, u64>>,
+    published_control_events_by_node: Option<std::collections::BTreeMap<String, u64>>,
+    published_data_events_by_node: Option<std::collections::BTreeMap<String, u64>>,
+    last_published_at_us_by_node: Option<std::collections::BTreeMap<String, u64>>,
+    last_published_origins_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    published_origin_counts_by_node:
         Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
@@ -282,6 +295,18 @@ impl SourceWorkerClientHandle {
                 Some(snapshot.scheduled_scan_groups_by_node.clone());
             cache.last_control_frame_signals_by_node =
                 Some(snapshot.last_control_frame_signals_by_node.clone());
+            cache.published_batches_by_node = Some(snapshot.published_batches_by_node.clone());
+            cache.published_events_by_node = Some(snapshot.published_events_by_node.clone());
+            cache.published_control_events_by_node =
+                Some(snapshot.published_control_events_by_node.clone());
+            cache.published_data_events_by_node =
+                Some(snapshot.published_data_events_by_node.clone());
+            cache.last_published_at_us_by_node =
+                Some(snapshot.last_published_at_us_by_node.clone());
+            cache.last_published_origins_by_node =
+                Some(snapshot.last_published_origins_by_node.clone());
+            cache.published_origin_counts_by_node =
+                Some(snapshot.published_origin_counts_by_node.clone());
         });
     }
 
@@ -866,6 +891,13 @@ pub struct SourceObservabilitySnapshot {
     pub scheduled_source_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
     pub scheduled_scan_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
     pub last_control_frame_signals_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_batches_by_node: std::collections::BTreeMap<String, u64>,
+    pub published_events_by_node: std::collections::BTreeMap<String, u64>,
+    pub published_control_events_by_node: std::collections::BTreeMap<String, u64>,
+    pub published_data_events_by_node: std::collections::BTreeMap<String, u64>,
+    pub last_published_at_us_by_node: std::collections::BTreeMap<String, u64>,
+    pub last_published_origins_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 fn scheduled_groups_by_node(
@@ -915,6 +947,28 @@ fn build_degraded_worker_observability_snapshot(
             .unwrap_or_default(),
         last_control_frame_signals_by_node: cache
             .last_control_frame_signals_by_node
+            .clone()
+            .unwrap_or_default(),
+        published_batches_by_node: cache.published_batches_by_node.clone().unwrap_or_default(),
+        published_events_by_node: cache.published_events_by_node.clone().unwrap_or_default(),
+        published_control_events_by_node: cache
+            .published_control_events_by_node
+            .clone()
+            .unwrap_or_default(),
+        published_data_events_by_node: cache
+            .published_data_events_by_node
+            .clone()
+            .unwrap_or_default(),
+        last_published_at_us_by_node: cache
+            .last_published_at_us_by_node
+            .clone()
+            .unwrap_or_default(),
+        last_published_origins_by_node: cache
+            .last_published_origins_by_node
+            .clone()
+            .unwrap_or_default(),
+        published_origin_counts_by_node: cache
+            .published_origin_counts_by_node
             .clone()
             .unwrap_or_default(),
     }
@@ -1155,6 +1209,13 @@ impl SourceFacade {
                     source.scheduled_scan_group_ids(),
                 ),
                 last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
+                published_batches_by_node: std::collections::BTreeMap::new(),
+                published_events_by_node: std::collections::BTreeMap::new(),
+                published_control_events_by_node: std::collections::BTreeMap::new(),
+                published_data_events_by_node: std::collections::BTreeMap::new(),
+                last_published_at_us_by_node: std::collections::BTreeMap::new(),
+                last_published_origins_by_node: std::collections::BTreeMap::new(),
+                published_origin_counts_by_node: std::collections::BTreeMap::new(),
             }),
             Self::Worker(client) => {
                 let worker_client = client.client().await?;
@@ -1188,6 +1249,13 @@ impl SourceFacade {
                     source.scheduled_scan_group_ids(),
                 ),
                 last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
+                published_batches_by_node: std::collections::BTreeMap::new(),
+                published_events_by_node: std::collections::BTreeMap::new(),
+                published_control_events_by_node: std::collections::BTreeMap::new(),
+                published_data_events_by_node: std::collections::BTreeMap::new(),
+                last_published_at_us_by_node: std::collections::BTreeMap::new(),
+                last_published_origins_by_node: std::collections::BTreeMap::new(),
+                published_origin_counts_by_node: std::collections::BTreeMap::new(),
             },
             Self::Worker(client) => client.observability_snapshot_nonblocking().await,
         }
@@ -1625,6 +1693,13 @@ mod tests {
                 vec!["group-a".to_string()],
             )])),
             last_control_frame_signals_by_node: Some(std::collections::BTreeMap::new()),
+            published_batches_by_node: Some(std::collections::BTreeMap::new()),
+            published_events_by_node: Some(std::collections::BTreeMap::new()),
+            published_control_events_by_node: Some(std::collections::BTreeMap::new()),
+            published_data_events_by_node: Some(std::collections::BTreeMap::new()),
+            last_published_at_us_by_node: Some(std::collections::BTreeMap::new()),
+            last_published_origins_by_node: Some(std::collections::BTreeMap::new()),
+            published_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
         };
 
         let snapshot =

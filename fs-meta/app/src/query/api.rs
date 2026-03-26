@@ -98,10 +98,14 @@ fn summarize_groups_by_node(
 
 fn summarize_sink_status_route_snapshot(snapshot: &SinkStatusSnapshot) -> String {
     format!(
-        "groups={} scheduled={:?} control={:?}",
+        "groups={} scheduled={:?} control={:?} received_batches={:?} received_events={:?} received_origins={:?} received_origin_counts={:?}",
         snapshot.groups.len(),
         summarize_groups_by_node(&snapshot.scheduled_groups_by_node),
-        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node)
+        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node),
+        snapshot.received_batches_by_node,
+        snapshot.received_events_by_node,
+        summarize_groups_by_node(&snapshot.last_received_origins_by_node),
+        summarize_groups_by_node(&snapshot.received_origin_counts_by_node)
     )
 }
 
@@ -376,9 +380,48 @@ pub(crate) fn merge_sink_status_snapshots(
     let mut groups = BTreeMap::<String, crate::sink::SinkGroupStatusSnapshot>::new();
     let mut scheduled_groups_by_node = BTreeMap::<String, Vec<String>>::new();
     let mut last_control_frame_signals_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut received_batches_by_node = BTreeMap::<String, u64>::new();
+    let mut received_events_by_node = BTreeMap::<String, u64>::new();
+    let mut received_control_events_by_node = BTreeMap::<String, u64>::new();
+    let mut received_data_events_by_node = BTreeMap::<String, u64>::new();
+    let mut last_received_at_us_by_node = BTreeMap::<String, u64>::new();
+    let mut last_received_origins_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut received_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut stream_received_batches_by_node = BTreeMap::<String, u64>::new();
+    let mut stream_received_events_by_node = BTreeMap::<String, u64>::new();
+    let mut stream_received_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut stream_ready_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut stream_deferred_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut stream_dropped_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut stream_applied_batches_by_node = BTreeMap::<String, u64>::new();
+    let mut stream_applied_events_by_node = BTreeMap::<String, u64>::new();
+    let mut stream_applied_control_events_by_node = BTreeMap::<String, u64>::new();
+    let mut stream_applied_data_events_by_node = BTreeMap::<String, u64>::new();
+    let mut stream_applied_origin_counts_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut stream_last_applied_at_us_by_node = BTreeMap::<String, u64>::new();
     for snapshot in snapshots {
         scheduled_groups_by_node.extend(snapshot.scheduled_groups_by_node);
         last_control_frame_signals_by_node.extend(snapshot.last_control_frame_signals_by_node);
+        received_batches_by_node.extend(snapshot.received_batches_by_node);
+        received_events_by_node.extend(snapshot.received_events_by_node);
+        received_control_events_by_node.extend(snapshot.received_control_events_by_node);
+        received_data_events_by_node.extend(snapshot.received_data_events_by_node);
+        last_received_at_us_by_node.extend(snapshot.last_received_at_us_by_node);
+        last_received_origins_by_node.extend(snapshot.last_received_origins_by_node);
+        received_origin_counts_by_node.extend(snapshot.received_origin_counts_by_node);
+        stream_received_batches_by_node.extend(snapshot.stream_received_batches_by_node);
+        stream_received_events_by_node.extend(snapshot.stream_received_events_by_node);
+        stream_received_origin_counts_by_node.extend(snapshot.stream_received_origin_counts_by_node);
+        stream_ready_origin_counts_by_node.extend(snapshot.stream_ready_origin_counts_by_node);
+        stream_deferred_origin_counts_by_node.extend(snapshot.stream_deferred_origin_counts_by_node);
+        stream_dropped_origin_counts_by_node.extend(snapshot.stream_dropped_origin_counts_by_node);
+        stream_applied_batches_by_node.extend(snapshot.stream_applied_batches_by_node);
+        stream_applied_events_by_node.extend(snapshot.stream_applied_events_by_node);
+        stream_applied_control_events_by_node
+            .extend(snapshot.stream_applied_control_events_by_node);
+        stream_applied_data_events_by_node.extend(snapshot.stream_applied_data_events_by_node);
+        stream_applied_origin_counts_by_node.extend(snapshot.stream_applied_origin_counts_by_node);
+        stream_last_applied_at_us_by_node.extend(snapshot.stream_last_applied_at_us_by_node);
         for group in snapshot.groups {
             groups
                 .entry(group.group_id.clone())
@@ -407,6 +450,25 @@ pub(crate) fn merge_sink_status_snapshots(
     merged.groups = groups.into_values().collect();
     merged.scheduled_groups_by_node = scheduled_groups_by_node;
     merged.last_control_frame_signals_by_node = last_control_frame_signals_by_node;
+    merged.received_batches_by_node = received_batches_by_node;
+    merged.received_events_by_node = received_events_by_node;
+    merged.received_control_events_by_node = received_control_events_by_node;
+    merged.received_data_events_by_node = received_data_events_by_node;
+    merged.last_received_at_us_by_node = last_received_at_us_by_node;
+    merged.last_received_origins_by_node = last_received_origins_by_node;
+    merged.received_origin_counts_by_node = received_origin_counts_by_node;
+    merged.stream_received_batches_by_node = stream_received_batches_by_node;
+    merged.stream_received_events_by_node = stream_received_events_by_node;
+    merged.stream_received_origin_counts_by_node = stream_received_origin_counts_by_node;
+    merged.stream_ready_origin_counts_by_node = stream_ready_origin_counts_by_node;
+    merged.stream_deferred_origin_counts_by_node = stream_deferred_origin_counts_by_node;
+    merged.stream_dropped_origin_counts_by_node = stream_dropped_origin_counts_by_node;
+    merged.stream_applied_batches_by_node = stream_applied_batches_by_node;
+    merged.stream_applied_events_by_node = stream_applied_events_by_node;
+    merged.stream_applied_control_events_by_node = stream_applied_control_events_by_node;
+    merged.stream_applied_data_events_by_node = stream_applied_data_events_by_node;
+    merged.stream_applied_origin_counts_by_node = stream_applied_origin_counts_by_node;
+    merged.stream_last_applied_at_us_by_node = stream_last_applied_at_us_by_node;
     merged.groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
     for group in &merged.groups {
         merged.live_nodes += group.live_nodes;
@@ -3221,6 +3283,7 @@ mod tests {
             shadow_lag_us: 0,
             overflow_pending_audit: false,
             initial_audit_completed,
+            materialized_revision: 1,
             estimated_heap_bytes: 0,
         }
     }
@@ -3287,6 +3350,95 @@ mod tests {
             .map(|group| group.group_id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(merged_groups, vec!["nfs1"]);
+    }
+
+    #[test]
+    fn merge_sink_status_snapshots_preserves_received_origin_counts_by_node() {
+        let merged = merge_sink_status_snapshots(vec![
+            SinkStatusSnapshot {
+                scheduled_groups_by_node: BTreeMap::from([(
+                    "node-a".to_string(),
+                    vec!["nfs1".to_string()],
+                )]),
+                received_batches_by_node: BTreeMap::from([("node-a".to_string(), 11)]),
+                received_events_by_node: BTreeMap::from([("node-a".to_string(), 111)]),
+                received_control_events_by_node: BTreeMap::from([("node-a".to_string(), 2)]),
+                received_data_events_by_node: BTreeMap::from([("node-a".to_string(), 109)]),
+                last_received_at_us_by_node: BTreeMap::from([("node-a".to_string(), 123)]),
+                last_received_origins_by_node: BTreeMap::from([(
+                    "node-a".to_string(),
+                    vec!["node-a::nfs1=2".to_string()],
+                )]),
+                received_origin_counts_by_node: BTreeMap::from([(
+                    "node-a".to_string(),
+                    vec!["node-a::nfs1=111".to_string()],
+                )]),
+                stream_applied_batches_by_node: BTreeMap::from([("node-a".to_string(), 5)]),
+                stream_applied_events_by_node: BTreeMap::from([("node-a".to_string(), 50)]),
+                stream_applied_control_events_by_node: BTreeMap::from([("node-a".to_string(), 4)]),
+                stream_applied_data_events_by_node: BTreeMap::from([("node-a".to_string(), 46)]),
+                stream_applied_origin_counts_by_node: BTreeMap::from([(
+                    "node-a".to_string(),
+                    vec!["node-a::nfs1=50".to_string()],
+                )]),
+                stream_last_applied_at_us_by_node: BTreeMap::from([("node-a".to_string(), 321)]),
+                ..SinkStatusSnapshot::default()
+            },
+            SinkStatusSnapshot {
+                scheduled_groups_by_node: BTreeMap::from([(
+                    "node-b".to_string(),
+                    vec!["nfs2".to_string()],
+                )]),
+                received_batches_by_node: BTreeMap::from([("node-b".to_string(), 22)]),
+                received_events_by_node: BTreeMap::from([("node-b".to_string(), 222)]),
+                received_control_events_by_node: BTreeMap::from([("node-b".to_string(), 3)]),
+                received_data_events_by_node: BTreeMap::from([("node-b".to_string(), 219)]),
+                last_received_at_us_by_node: BTreeMap::from([("node-b".to_string(), 456)]),
+                last_received_origins_by_node: BTreeMap::from([(
+                    "node-b".to_string(),
+                    vec!["node-b::nfs2=1".to_string()],
+                )]),
+                received_origin_counts_by_node: BTreeMap::from([(
+                    "node-b".to_string(),
+                    vec!["node-b::nfs2=222".to_string()],
+                )]),
+                stream_applied_batches_by_node: BTreeMap::from([("node-b".to_string(), 6)]),
+                stream_applied_events_by_node: BTreeMap::from([("node-b".to_string(), 60)]),
+                stream_applied_control_events_by_node: BTreeMap::from([("node-b".to_string(), 5)]),
+                stream_applied_data_events_by_node: BTreeMap::from([("node-b".to_string(), 55)]),
+                stream_applied_origin_counts_by_node: BTreeMap::from([(
+                    "node-b".to_string(),
+                    vec!["node-b::nfs2=60".to_string()],
+                )]),
+                stream_last_applied_at_us_by_node: BTreeMap::from([("node-b".to_string(), 654)]),
+                ..SinkStatusSnapshot::default()
+            },
+        ]);
+
+        assert_eq!(merged.received_batches_by_node.get("node-a"), Some(&11));
+        assert_eq!(merged.received_batches_by_node.get("node-b"), Some(&22));
+        assert_eq!(merged.received_events_by_node.get("node-a"), Some(&111));
+        assert_eq!(merged.received_events_by_node.get("node-b"), Some(&222));
+        assert_eq!(merged.stream_applied_batches_by_node.get("node-a"), Some(&5));
+        assert_eq!(merged.stream_applied_batches_by_node.get("node-b"), Some(&6));
+        assert_eq!(merged.stream_applied_events_by_node.get("node-a"), Some(&50));
+        assert_eq!(merged.stream_applied_events_by_node.get("node-b"), Some(&60));
+        assert_eq!(
+            merged.last_received_origins_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=2".to_string()])
+        );
+        assert_eq!(
+            merged.last_received_origins_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=1".to_string()])
+        );
+        assert_eq!(
+            merged.received_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=111".to_string()])
+        );
+        assert_eq!(
+            merged.received_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=222".to_string()])
+        );
     }
 
     #[test]
@@ -3914,6 +4066,12 @@ mod tests {
                 last_audit_started_at_us: Some(10),
                 last_audit_completed_at_us: Some(20),
                 last_audit_duration_ms: Some(1),
+                emitted_batch_count: 0,
+                emitted_event_count: 0,
+                emitted_control_event_count: 0,
+                emitted_data_event_count: 0,
+                last_emitted_at_us: None,
+                last_emitted_origins: Vec::new(),
                 current_revision: None,
                 candidate_revision: None,
                 candidate_status: None,
@@ -3945,8 +4103,10 @@ mod tests {
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: false,
+                materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
+            ..SinkStatusSnapshot::default()
         };
 
         let err = materialized_query_readiness_error(&source_status, &sink_status)
@@ -4001,6 +4161,12 @@ mod tests {
                     last_audit_started_at_us: None,
                     last_audit_completed_at_us: None,
                     last_audit_duration_ms: None,
+                    emitted_batch_count: 0,
+                    emitted_event_count: 0,
+                    emitted_control_event_count: 0,
+                    emitted_data_event_count: 0,
+                    last_emitted_at_us: None,
+                    last_emitted_origins: Vec::new(),
                     current_revision: None,
                     candidate_revision: None,
                     candidate_status: None,
@@ -4027,6 +4193,12 @@ mod tests {
                     last_audit_started_at_us: None,
                     last_audit_completed_at_us: None,
                     last_audit_duration_ms: None,
+                    emitted_batch_count: 0,
+                    emitted_event_count: 0,
+                    emitted_control_event_count: 0,
+                    emitted_data_event_count: 0,
+                    last_emitted_at_us: None,
+                    last_emitted_origins: Vec::new(),
                     current_revision: None,
                     candidate_revision: None,
                     candidate_status: None,
@@ -4080,6 +4252,12 @@ mod tests {
                     last_audit_started_at_us: None,
                     last_audit_completed_at_us: None,
                     last_audit_duration_ms: None,
+                    emitted_batch_count: 0,
+                    emitted_event_count: 0,
+                    emitted_control_event_count: 0,
+                    emitted_data_event_count: 0,
+                    last_emitted_at_us: None,
+                    last_emitted_origins: Vec::new(),
                     current_revision: None,
                     candidate_revision: None,
                     candidate_status: None,
@@ -4106,6 +4284,12 @@ mod tests {
                     last_audit_started_at_us: None,
                     last_audit_completed_at_us: None,
                     last_audit_duration_ms: None,
+                    emitted_batch_count: 0,
+                    emitted_event_count: 0,
+                    emitted_control_event_count: 0,
+                    emitted_data_event_count: 0,
+                    last_emitted_at_us: None,
+                    last_emitted_origins: Vec::new(),
                     current_revision: None,
                     candidate_revision: None,
                     candidate_status: None,
@@ -4170,6 +4354,12 @@ mod tests {
                     last_audit_started_at_us: None,
                     last_audit_completed_at_us: None,
                     last_audit_duration_ms: None,
+                    emitted_batch_count: 0,
+                    emitted_event_count: 0,
+                    emitted_control_event_count: 0,
+                    emitted_data_event_count: 0,
+                    last_emitted_at_us: None,
+                    last_emitted_origins: Vec::new(),
                     current_revision: None,
                     candidate_revision: None,
                     candidate_status: None,
@@ -4196,6 +4386,12 @@ mod tests {
                     last_audit_started_at_us: None,
                     last_audit_completed_at_us: None,
                     last_audit_duration_ms: None,
+                    emitted_batch_count: 0,
+                    emitted_event_count: 0,
+                    emitted_control_event_count: 0,
+                    emitted_data_event_count: 0,
+                    last_emitted_at_us: None,
+                    last_emitted_origins: Vec::new(),
                     current_revision: None,
                     candidate_revision: None,
                     candidate_status: None,
@@ -4219,6 +4415,7 @@ mod tests {
                 shadow_lag_us: 0,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+                materialized_revision: 1,
                 estimated_heap_bytes: 1,
             }],
             ..SinkStatusSnapshot::default()

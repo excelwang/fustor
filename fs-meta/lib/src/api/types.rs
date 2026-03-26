@@ -89,6 +89,12 @@ pub struct StatusSourceConcreteRoot {
     pub last_audit_started_at_us: Option<u64>,
     pub last_audit_completed_at_us: Option<u64>,
     pub last_audit_duration_ms: Option<u64>,
+    pub emitted_batch_count: u64,
+    pub emitted_event_count: u64,
+    pub emitted_control_event_count: u64,
+    pub emitted_data_event_count: u64,
+    pub last_emitted_at_us: Option<u64>,
+    pub last_emitted_origins: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -112,6 +118,13 @@ pub struct StatusSourceDebug {
     pub scheduled_source_groups_by_node: BTreeMap<String, Vec<String>>,
     pub scheduled_scan_groups_by_node: BTreeMap<String, Vec<String>>,
     pub last_control_frame_signals_by_node: BTreeMap<String, Vec<String>>,
+    pub published_batches_by_node: BTreeMap<String, u64>,
+    pub published_events_by_node: BTreeMap<String, u64>,
+    pub published_control_events_by_node: BTreeMap<String, u64>,
+    pub published_data_events_by_node: BTreeMap<String, u64>,
+    pub last_published_at_us_by_node: BTreeMap<String, u64>,
+    pub last_published_origins_by_node: BTreeMap<String, Vec<String>>,
+    pub published_origin_counts_by_node: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -148,6 +161,13 @@ pub struct StatusSink {
 pub struct StatusSinkDebug {
     pub scheduled_groups_by_node: BTreeMap<String, Vec<String>>,
     pub last_control_frame_signals_by_node: BTreeMap<String, Vec<String>>,
+    pub received_batches_by_node: BTreeMap<String, u64>,
+    pub received_events_by_node: BTreeMap<String, u64>,
+    pub received_control_events_by_node: BTreeMap<String, u64>,
+    pub received_data_events_by_node: BTreeMap<String, u64>,
+    pub last_received_at_us_by_node: BTreeMap<String, u64>,
+    pub last_received_origins_by_node: BTreeMap<String, Vec<String>>,
+    pub received_origin_counts_by_node: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

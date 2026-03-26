@@ -408,6 +408,9 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
     scenario_force_find_smoke(&mut harness.lab, &mut harness.session)?;
     let node_a_id = harness.cluster.node_id("node-a")?;
 
+    let node_a_nfs1_object_ref = format!("{node_a_id}::nfs1");
+    let node_a_nfs2_object_ref = format!("{node_a_id}::nfs2");
+
     let mut nfs1_nodes = 0u64;
     let mut nfs2_nodes = 0u64;
     let mut node_a_source = BTreeSet::new();
@@ -415,6 +418,22 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
     let mut node_a_sink = BTreeSet::new();
     let mut node_a_source_control = Vec::<String>::new();
     let mut node_a_sink_control = Vec::<String>::new();
+    let mut node_a_source_published_batches = 0u64;
+    let mut node_a_source_published_events = 0u64;
+    let mut node_a_source_published_control = 0u64;
+    let mut node_a_source_published_data = 0u64;
+    let mut node_a_source_published_origins = Vec::<String>::new();
+    let mut node_a_source_published_origin_counts = Vec::<String>::new();
+    let mut node_a_sink_received_batches = 0u64;
+    let mut node_a_sink_received_events = 0u64;
+    let mut node_a_sink_received_control = 0u64;
+    let mut node_a_sink_received_data = 0u64;
+    let mut node_a_sink_received_origins = Vec::<String>::new();
+    let mut node_a_sink_received_origin_counts = Vec::<String>::new();
+    let mut node_a_nfs1_concrete = Vec::<String>::new();
+    let mut nfs2_primary = None::<String>;
+    let mut nfs2_logical = None::<String>;
+    let mut node_a_nfs2_concrete = Vec::<String>::new();
     wait_until(
         Duration::from_secs(90),
         "preserved pre-force-find activation capture",
@@ -456,6 +475,88 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 "last_control_frame_signals_by_node",
                 &node_a_id,
             );
+            node_a_source_published_batches = status_debug_u64_by_node(
+                &status,
+                "source",
+                "published_batches_by_node",
+                &node_a_id,
+            );
+            node_a_source_published_events = status_debug_u64_by_node(
+                &status,
+                "source",
+                "published_events_by_node",
+                &node_a_id,
+            );
+            node_a_source_published_control = status_debug_u64_by_node(
+                &status,
+                "source",
+                "published_control_events_by_node",
+                &node_a_id,
+            );
+            node_a_source_published_data = status_debug_u64_by_node(
+                &status,
+                "source",
+                "published_data_events_by_node",
+                &node_a_id,
+            );
+            node_a_source_published_origins = status_debug_strings_by_node(
+                &status,
+                "source",
+                "last_published_origins_by_node",
+                &node_a_id,
+            );
+            node_a_source_published_origin_counts = status_debug_strings_by_node(
+                &status,
+                "source",
+                "published_origin_counts_by_node",
+                &node_a_id,
+            );
+            node_a_sink_received_batches = status_debug_u64_by_node(
+                &status,
+                "sink",
+                "received_batches_by_node",
+                &node_a_id,
+            );
+            node_a_sink_received_events = status_debug_u64_by_node(
+                &status,
+                "sink",
+                "received_events_by_node",
+                &node_a_id,
+            );
+            node_a_sink_received_control = status_debug_u64_by_node(
+                &status,
+                "sink",
+                "received_control_events_by_node",
+                &node_a_id,
+            );
+            node_a_sink_received_data = status_debug_u64_by_node(
+                &status,
+                "sink",
+                "received_data_events_by_node",
+                &node_a_id,
+            );
+            node_a_sink_received_origins = status_debug_strings_by_node(
+                &status,
+                "sink",
+                "last_received_origins_by_node",
+                &node_a_id,
+            );
+            node_a_sink_received_origin_counts = status_debug_strings_by_node(
+                &status,
+                "sink",
+                "received_origin_counts_by_node",
+                &node_a_id,
+            );
+            node_a_nfs1_concrete = source_concrete_root_summaries(
+                &mut harness.session,
+                &node_a_nfs1_object_ref,
+            )?;
+            nfs2_primary = source_primary_for_group(&mut harness.session, "nfs2")?;
+            nfs2_logical = source_logical_root_summary(&mut harness.session, "nfs2")?;
+            node_a_nfs2_concrete = source_concrete_root_summaries(
+                &mut harness.session,
+                &node_a_nfs2_object_ref,
+            )?;
             if nfs1_nodes > 0
                 && nfs2_nodes == 0
                 && node_a_sink.contains("nfs2")
@@ -465,13 +566,13 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 return Ok(true);
             }
             Err(format!(
-                "nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+                "nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
             ))
         },
     )?;
 
     eprintln!(
-        "[fs-meta-api-ops] activation-scope-preserved nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+        "[fs-meta-api-ops] activation-scope-preserved nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
     );
     assert!(
         node_a_sink.contains("nfs2"),
@@ -1182,6 +1283,121 @@ fn status_debug_strings_by_node(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
+}
+
+fn status_debug_u64_by_node(
+    status: &Value,
+    section: &str,
+    field: &str,
+    node_name: &str,
+) -> u64 {
+    status
+        .get(section)
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get(field))
+        .and_then(|v| v.get(node_name))
+        .and_then(Value::as_u64)
+        .unwrap_or_default()
+}
+
+fn source_logical_root_summary(
+    session: &mut OperatorSession,
+    root_id: &str,
+) -> Result<Option<String>, String> {
+    for status in session.status_all()? {
+        if let Some(root) = status
+            .get("source")
+            .and_then(|source| source.get("logical_roots"))
+            .and_then(Value::as_array)
+            .and_then(|roots| {
+                roots.iter()
+                    .find(|root| root.get("root_id").and_then(Value::as_str) == Some(root_id))
+            })
+        {
+            let status_label = root.get("status").and_then(Value::as_str).unwrap_or("<missing>");
+            let matched_grants = root
+                .get("matched_grants")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let active_members = root
+                .get("active_members")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let coverage_mode = root
+                .get("coverage_mode")
+                .and_then(Value::as_str)
+                .unwrap_or("<missing>");
+            return Ok(Some(format!(
+                "status={status_label} matched_grants={matched_grants} active_members={active_members} coverage_mode={coverage_mode}"
+            )));
+        }
+    }
+    Ok(None)
+}
+
+fn source_concrete_root_summaries(
+    session: &mut OperatorSession,
+    object_ref: &str,
+) -> Result<Vec<String>, String> {
+    let mut summaries = Vec::<String>::new();
+    for status in session.status_all()? {
+        if let Some(root) = status
+            .get("source")
+            .and_then(|source| source.get("concrete_roots"))
+            .and_then(Value::as_array)
+            .and_then(|roots| {
+                roots.iter().find(|root| {
+                    root.get("object_ref").and_then(Value::as_str) == Some(object_ref)
+                })
+            })
+        {
+            summaries.push(format!(
+                "object_ref={} status={} coverage_mode={} watch_enabled={} scan_enabled={} is_group_primary={} active={} rescan_pending={} overflow_pending={} last_rescan_reason={:?} last_audit_started_at_us={:?} last_audit_completed_at_us={:?} emitted_batch_count={:?} emitted_event_count={:?} emitted_control_event_count={:?} emitted_data_event_count={:?} last_emitted_at_us={:?} last_emitted_origins={:?} current_revision={:?} candidate_revision={:?} draining_revision={:?} last_error={:?}",
+                object_ref,
+                root.get("status").and_then(Value::as_str).unwrap_or("<missing>"),
+                root.get("coverage_mode")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>"),
+                root.get("watch_enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                root.get("scan_enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                root.get("is_group_primary")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                root.get("active").and_then(Value::as_bool).unwrap_or(false),
+                root.get("rescan_pending")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                root.get("overflow_pending")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                root.get("last_rescan_reason").cloned().unwrap_or(Value::Null),
+                root.get("last_audit_started_at_us").cloned().unwrap_or(Value::Null),
+                root.get("last_audit_completed_at_us")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                root.get("emitted_batch_count").cloned().unwrap_or(Value::Null),
+                root.get("emitted_event_count").cloned().unwrap_or(Value::Null),
+                root.get("emitted_control_event_count")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                root.get("emitted_data_event_count")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                root.get("last_emitted_at_us").cloned().unwrap_or(Value::Null),
+                root.get("last_emitted_origins").cloned().unwrap_or(Value::Null),
+                root.get("current_revision").cloned().unwrap_or(Value::Null),
+                root.get("candidate_revision").cloned().unwrap_or(Value::Null),
+                root.get("draining_revision").cloned().unwrap_or(Value::Null),
+                root.get("last_error").cloned().unwrap_or(Value::Null)
+            ));
+        }
+    }
+    summaries.sort();
+    Ok(summaries)
 }
 
 fn source_primary_for_group(

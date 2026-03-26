@@ -97,10 +97,26 @@ fn summarize_groups_by_node(
 
 fn summarize_sink_status_snapshot(snapshot: &SinkStatusSnapshot) -> String {
     format!(
-        "groups={} scheduled={:?} control={:?}",
+        "groups={} scheduled={:?} control={:?} received_batches={:?} received_events={:?} received_origins={:?} received_origin_counts={:?} stream_received_batches={:?} stream_received_events={:?} stream_received_origin_counts={:?} stream_ready_origin_counts={:?} stream_deferred_origin_counts={:?} stream_dropped_origin_counts={:?} stream_applied_batches={:?} stream_applied_events={:?} stream_applied_control_events={:?} stream_applied_data_events={:?} stream_applied_origin_counts={:?} stream_last_applied_at_us={:?}",
         snapshot.groups.len(),
         summarize_groups_by_node(&snapshot.scheduled_groups_by_node),
-        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node)
+        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node),
+        snapshot.received_batches_by_node,
+        snapshot.received_events_by_node,
+        summarize_groups_by_node(&snapshot.last_received_origins_by_node),
+        summarize_groups_by_node(&snapshot.received_origin_counts_by_node),
+        snapshot.stream_received_batches_by_node,
+        snapshot.stream_received_events_by_node,
+        summarize_groups_by_node(&snapshot.stream_received_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.stream_ready_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.stream_deferred_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.stream_dropped_origin_counts_by_node),
+        snapshot.stream_applied_batches_by_node,
+        snapshot.stream_applied_events_by_node,
+        snapshot.stream_applied_control_events_by_node,
+        snapshot.stream_applied_data_events_by_node,
+        summarize_groups_by_node(&snapshot.stream_applied_origin_counts_by_node),
+        snapshot.stream_last_applied_at_us_by_node
     )
 }
 

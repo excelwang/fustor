@@ -84,11 +84,39 @@ fn debug_control_scope_capture_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
 }
 
+fn debug_stream_delivery_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_STREAM_DELIVERY").is_some()
+}
+
 fn summarize_bound_scopes(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
     bound_scopes
         .iter()
         .map(|scope| format!("{}=>{}", scope.scope_id, scope.resource_ids.join("|")))
         .collect()
+}
+
+fn collect_event_origin_counts(events: &[Event]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::<String, u64>::new();
+    for event in events {
+        *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+    }
+    counts
+}
+
+fn format_origin_counts(counts: &BTreeMap<String, u64>) -> Vec<String> {
+    counts
+        .iter()
+        .map(|(origin, count)| format!("{origin}={count}"))
+        .collect()
+}
+
+fn accumulate_origin_counts(
+    target: &mut BTreeMap<String, u64>,
+    incoming: &BTreeMap<String, u64>,
+) {
+    for (origin, count) in incoming {
+        *target.entry(origin.clone()).or_default() += *count;
+    }
 }
 
 fn build_error_marker_event(node_id: &NodeId, correlation_id: Option<u64>, message: &str) -> Event {
@@ -194,6 +222,7 @@ pub struct SinkGroupStatusSnapshot {
     pub shadow_lag_us: u64,
     pub overflow_pending_audit: bool,
     pub initial_audit_completed: bool,
+    pub materialized_revision: u64,
     pub estimated_heap_bytes: u64,
 }
 
@@ -209,6 +238,41 @@ pub struct SinkStatusSnapshot {
     pub groups: Vec<SinkGroupStatusSnapshot>,
     pub scheduled_groups_by_node: BTreeMap<String, Vec<String>>,
     pub last_control_frame_signals_by_node: BTreeMap<String, Vec<String>>,
+    pub received_batches_by_node: BTreeMap<String, u64>,
+    pub received_events_by_node: BTreeMap<String, u64>,
+    pub received_control_events_by_node: BTreeMap<String, u64>,
+    pub received_data_events_by_node: BTreeMap<String, u64>,
+    pub last_received_at_us_by_node: BTreeMap<String, u64>,
+    pub last_received_origins_by_node: BTreeMap<String, Vec<String>>,
+    pub received_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub stream_received_batches_by_node: BTreeMap<String, u64>,
+    pub stream_received_events_by_node: BTreeMap<String, u64>,
+    pub stream_received_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub stream_ready_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub stream_deferred_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub stream_dropped_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub stream_applied_batches_by_node: BTreeMap<String, u64>,
+    pub stream_applied_events_by_node: BTreeMap<String, u64>,
+    pub stream_applied_control_events_by_node: BTreeMap<String, u64>,
+    pub stream_applied_data_events_by_node: BTreeMap<String, u64>,
+    pub stream_applied_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub stream_last_applied_at_us_by_node: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamDeliveryStats {
+    received_batches: u64,
+    received_events: u64,
+    received_origin_counts: BTreeMap<String, u64>,
+    ready_origin_counts: BTreeMap<String, u64>,
+    deferred_origin_counts: BTreeMap<String, u64>,
+    dropped_origin_counts: BTreeMap<String, u64>,
+    applied_batches: u64,
+    applied_events: u64,
+    applied_control_events: u64,
+    applied_data_events: u64,
+    applied_origin_counts: BTreeMap<String, u64>,
+    last_applied_at_us: u64,
 }
 
 fn sample_visibility_lag(
@@ -451,6 +515,7 @@ pub struct SinkFileMeta {
     root_specs: Arc<RwLock<Vec<RootSpec>>>,
     host_object_grants: Arc<RwLock<Vec<GrantedMountRoot>>>,
     visibility_lag: Arc<Mutex<VisibilityLagTelemetry>>,
+    stream_delivery_stats: Arc<Mutex<StreamDeliveryStats>>,
     pending_stream_events: Arc<Mutex<VecDeque<Event>>>,
     stream_receive_enabled: Arc<AtomicBool>,
     unit_control: Arc<RuntimeUnitGate>,
@@ -518,6 +583,7 @@ impl SinkFileMeta {
         let root_specs = Arc::new(RwLock::new(source_cfg.roots.clone()));
         let host_object_grants = Arc::new(RwLock::new(source_cfg.host_object_grants.clone()));
         let visibility_lag = Arc::new(Mutex::new(VisibilityLagTelemetry::default()));
+        let stream_delivery_stats = Arc::new(Mutex::new(StreamDeliveryStats::default()));
         let pending_stream_events = Arc::new(Mutex::new(VecDeque::new()));
         let stream_receive_enabled = Arc::new(AtomicBool::new(false));
         let unit_control = Arc::new(if boundary.is_some() {
@@ -531,6 +597,7 @@ impl SinkFileMeta {
             root_specs: root_specs.clone(),
             host_object_grants: host_object_grants.clone(),
             visibility_lag: visibility_lag.clone(),
+            stream_delivery_stats: stream_delivery_stats.clone(),
             pending_stream_events: pending_stream_events.clone(),
             stream_receive_enabled: stream_receive_enabled.clone(),
             unit_control: unit_control.clone(),
@@ -553,6 +620,7 @@ impl SinkFileMeta {
             let query_root_specs = root_specs.clone();
             let query_host_object_grants = host_object_grants.clone();
             let query_visibility_lag = visibility_lag.clone();
+            let query_stream_delivery_stats = stream_delivery_stats.clone();
             let query_pending_stream_events = pending_stream_events.clone();
             let query_stream_receive_enabled = stream_receive_enabled.clone();
             let query_unit_control = unit_control.clone();
@@ -575,6 +643,7 @@ impl SinkFileMeta {
                         let query_root_specs = query_root_specs.clone();
                         let query_host_object_grants = query_host_object_grants.clone();
                         let query_visibility_lag = query_visibility_lag.clone();
+                        let query_stream_delivery_stats = query_stream_delivery_stats.clone();
                         let query_pending_stream_events = query_pending_stream_events.clone();
                         let query_stream_receive_enabled = query_stream_receive_enabled.clone();
                         let query_unit_control = query_unit_control.clone();
@@ -597,6 +666,8 @@ impl SinkFileMeta {
                                         root_specs: query_root_specs.clone(),
                                         host_object_grants: query_host_object_grants.clone(),
                                         visibility_lag: query_visibility_lag.clone(),
+                                        stream_delivery_stats:
+                                            query_stream_delivery_stats.clone(),
                                         pending_stream_events: query_pending_stream_events.clone(),
                                         stream_receive_enabled: query_stream_receive_enabled
                                             .clone(),
@@ -641,6 +712,7 @@ impl SinkFileMeta {
             let internal_query_root_specs = root_specs.clone();
             let internal_query_host_object_grants = host_object_grants.clone();
             let internal_query_visibility_lag = visibility_lag.clone();
+            let internal_query_stream_delivery_stats = stream_delivery_stats.clone();
             let internal_query_pending_stream_events = pending_stream_events.clone();
             let internal_query_stream_receive_enabled = stream_receive_enabled.clone();
             let internal_query_unit_control = unit_control.clone();
@@ -667,6 +739,8 @@ impl SinkFileMeta {
                         let internal_query_host_object_grants =
                             internal_query_host_object_grants.clone();
                         let internal_query_visibility_lag = internal_query_visibility_lag.clone();
+                        let internal_query_stream_delivery_stats =
+                            internal_query_stream_delivery_stats.clone();
                         let internal_query_pending_stream_events =
                             internal_query_pending_stream_events.clone();
                         let internal_query_stream_receive_enabled =
@@ -692,6 +766,8 @@ impl SinkFileMeta {
                                         host_object_grants: internal_query_host_object_grants
                                             .clone(),
                                         visibility_lag: internal_query_visibility_lag.clone(),
+                                        stream_delivery_stats:
+                                            internal_query_stream_delivery_stats.clone(),
                                         pending_stream_events: internal_query_pending_stream_events
                                             .clone(),
                                         stream_receive_enabled:
@@ -841,6 +917,7 @@ impl SinkFileMeta {
             let stream_root_specs = root_specs.clone();
             let stream_host_object_grants = host_object_grants.clone();
             let stream_visibility_lag = visibility_lag.clone();
+            let stream_delivery_stats = stream_delivery_stats.clone();
             let stream_unit_control = unit_control.clone();
             if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
                 let stream_sink = Arc::new(SinkFileMeta {
@@ -849,6 +926,7 @@ impl SinkFileMeta {
                     root_specs: stream_root_specs,
                     host_object_grants: stream_host_object_grants,
                     visibility_lag: stream_visibility_lag,
+                    stream_delivery_stats,
                     pending_stream_events: pending_stream_events.clone(),
                     stream_receive_enabled: stream_receive_enabled.clone(),
                     unit_control: stream_unit_control,
@@ -928,6 +1006,7 @@ impl SinkFileMeta {
         let query_root_specs = self.root_specs.clone();
         let query_host_object_grants = self.host_object_grants.clone();
         let query_visibility_lag = self.visibility_lag.clone();
+        let query_stream_delivery_stats = self.stream_delivery_stats.clone();
         let query_pending_stream_events = self.pending_stream_events.clone();
         let query_stream_receive_enabled = self.stream_receive_enabled.clone();
         let query_unit_control = self.unit_control.clone();
@@ -956,6 +1035,7 @@ impl SinkFileMeta {
                     let query_root_specs = query_root_specs.clone();
                     let query_host_object_grants = query_host_object_grants.clone();
                     let query_visibility_lag = query_visibility_lag.clone();
+                    let query_stream_delivery_stats = query_stream_delivery_stats.clone();
                     let query_pending_stream_events = query_pending_stream_events.clone();
                     let query_stream_receive_enabled = query_stream_receive_enabled.clone();
                     let query_unit_control = query_unit_control.clone();
@@ -972,6 +1052,8 @@ impl SinkFileMeta {
                                     root_specs: query_root_specs.clone(),
                                     host_object_grants: query_host_object_grants.clone(),
                                     visibility_lag: query_visibility_lag.clone(),
+                                    stream_delivery_stats:
+                                        query_stream_delivery_stats.clone(),
                                     pending_stream_events: query_pending_stream_events.clone(),
                                     stream_receive_enabled: query_stream_receive_enabled.clone(),
                                     unit_control: query_unit_control.clone(),
@@ -1013,6 +1095,7 @@ impl SinkFileMeta {
         let internal_query_root_specs = self.root_specs.clone();
         let internal_query_host_object_grants = self.host_object_grants.clone();
         let internal_query_visibility_lag = self.visibility_lag.clone();
+        let internal_query_stream_delivery_stats = self.stream_delivery_stats.clone();
         let internal_query_pending_stream_events = self.pending_stream_events.clone();
         let internal_query_stream_receive_enabled = self.stream_receive_enabled.clone();
         let internal_query_unit_control = self.unit_control.clone();
@@ -1045,6 +1128,8 @@ impl SinkFileMeta {
                     let internal_query_host_object_grants =
                         internal_query_host_object_grants.clone();
                     let internal_query_visibility_lag = internal_query_visibility_lag.clone();
+                    let internal_query_stream_delivery_stats =
+                        internal_query_stream_delivery_stats.clone();
                     let internal_query_pending_stream_events =
                         internal_query_pending_stream_events.clone();
                     let internal_query_stream_receive_enabled =
@@ -1063,6 +1148,8 @@ impl SinkFileMeta {
                                     root_specs: internal_query_root_specs.clone(),
                                     host_object_grants: internal_query_host_object_grants.clone(),
                                     visibility_lag: internal_query_visibility_lag.clone(),
+                                    stream_delivery_stats:
+                                        internal_query_stream_delivery_stats.clone(),
                                     pending_stream_events: internal_query_pending_stream_events
                                         .clone(),
                                     stream_receive_enabled: internal_query_stream_receive_enabled
@@ -1199,6 +1286,7 @@ impl SinkFileMeta {
         let stream_root_specs = self.root_specs.clone();
         let stream_host_object_grants = self.host_object_grants.clone();
         let stream_visibility_lag = self.visibility_lag.clone();
+        let stream_delivery_stats = self.stream_delivery_stats.clone();
         let stream_receive_enabled = self.stream_receive_enabled.clone();
         let stream_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
@@ -1214,6 +1302,7 @@ impl SinkFileMeta {
                 root_specs: stream_root_specs,
                 host_object_grants: stream_host_object_grants,
                 visibility_lag: stream_visibility_lag,
+                stream_delivery_stats,
                 pending_stream_events: self.pending_stream_events.clone(),
                 stream_receive_enabled: stream_receive_enabled,
                 unit_control: stream_unit_control,
@@ -1263,6 +1352,7 @@ impl SinkFileMeta {
                 root_specs: self.root_specs.clone(),
                 host_object_grants: self.host_object_grants.clone(),
                 visibility_lag: self.visibility_lag.clone(),
+                stream_delivery_stats: self.stream_delivery_stats.clone(),
                 pending_stream_events: self.pending_stream_events.clone(),
                 stream_receive_enabled: roots_control_stream_receive_enabled,
                 unit_control: self.unit_control.clone(),
@@ -1354,6 +1444,7 @@ impl SinkFileMeta {
         let stream_root_specs = self.root_specs.clone();
         let stream_host_object_grants = self.host_object_grants.clone();
         let stream_visibility_lag = self.visibility_lag.clone();
+        let stream_delivery_stats = self.stream_delivery_stats.clone();
         let stream_unit_control = self.unit_control.clone();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
             eprintln!(
@@ -1372,6 +1463,7 @@ impl SinkFileMeta {
                 root_specs: stream_root_specs,
                 host_object_grants: stream_host_object_grants,
                 visibility_lag: stream_visibility_lag,
+                stream_delivery_stats,
                 pending_stream_events: self.pending_stream_events.clone(),
                 stream_receive_enabled: self.stream_receive_enabled.clone(),
                 unit_control: stream_unit_control,
@@ -1771,6 +1863,7 @@ impl SinkFileMeta {
                 },
                 overflow_pending_audit: group.overflow_pending_audit,
                 initial_audit_completed: group.initial_audit_completed,
+                materialized_revision: group.materialized_revision,
                 estimated_heap_bytes,
             });
         }
@@ -1780,6 +1873,75 @@ impl SinkFileMeta {
             snapshot
                 .scheduled_groups_by_node
                 .insert(self.node_id.0.clone(), groups.into_iter().collect());
+        }
+        if let Ok(stats) = self.stream_delivery_stats.lock() {
+            if stats.received_batches > 0 {
+                snapshot
+                    .stream_received_batches_by_node
+                    .insert(self.node_id.0.clone(), stats.received_batches);
+            }
+            if stats.received_events > 0 {
+                snapshot
+                    .stream_received_events_by_node
+                    .insert(self.node_id.0.clone(), stats.received_events);
+            }
+            if !stats.received_origin_counts.is_empty() {
+                snapshot.stream_received_origin_counts_by_node.insert(
+                    self.node_id.0.clone(),
+                    format_origin_counts(&stats.received_origin_counts),
+                );
+            }
+            if !stats.ready_origin_counts.is_empty() {
+                snapshot.stream_ready_origin_counts_by_node.insert(
+                    self.node_id.0.clone(),
+                    format_origin_counts(&stats.ready_origin_counts),
+                );
+            }
+            if !stats.deferred_origin_counts.is_empty() {
+                snapshot.stream_deferred_origin_counts_by_node.insert(
+                    self.node_id.0.clone(),
+                    format_origin_counts(&stats.deferred_origin_counts),
+                );
+            }
+            if !stats.dropped_origin_counts.is_empty() {
+                snapshot.stream_dropped_origin_counts_by_node.insert(
+                    self.node_id.0.clone(),
+                    format_origin_counts(&stats.dropped_origin_counts),
+                );
+            }
+            if stats.applied_batches > 0 {
+                snapshot
+                    .stream_applied_batches_by_node
+                    .insert(self.node_id.0.clone(), stats.applied_batches);
+            }
+            if stats.applied_events > 0 {
+                snapshot
+                    .stream_applied_events_by_node
+                    .insert(self.node_id.0.clone(), stats.applied_events);
+            }
+            if stats.applied_control_events > 0 {
+                snapshot.stream_applied_control_events_by_node.insert(
+                    self.node_id.0.clone(),
+                    stats.applied_control_events,
+                );
+            }
+            if stats.applied_data_events > 0 {
+                snapshot
+                    .stream_applied_data_events_by_node
+                    .insert(self.node_id.0.clone(), stats.applied_data_events);
+            }
+            if !stats.applied_origin_counts.is_empty() {
+                snapshot.stream_applied_origin_counts_by_node.insert(
+                    self.node_id.0.clone(),
+                    format_origin_counts(&stats.applied_origin_counts),
+                );
+            }
+            if stats.last_applied_at_us > 0 {
+                snapshot.stream_last_applied_at_us_by_node.insert(
+                    self.node_id.0.clone(),
+                    stats.last_applied_at_us,
+                );
+            }
         }
         Ok(snapshot)
     }
@@ -1866,6 +2028,7 @@ impl SinkFileMeta {
 
         let configured = self.configured_stream_object_refs()?;
         let scheduled = self.scheduled_stream_object_refs()?.unwrap_or_default();
+        let incoming_counts = collect_event_origin_counts(events);
         let mut ready = Vec::new();
         let mut deferred = VecDeque::new();
         let mut dropped = 0usize;
@@ -1879,6 +2042,57 @@ impl SinkFileMeta {
             } else {
                 dropped += 1;
             }
+        }
+
+        let ready_counts = collect_event_origin_counts(&ready);
+        let ready_control_count = ready
+            .iter()
+            .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok())
+            .count() as u64;
+        let ready_data_count = ready.len() as u64 - ready_control_count;
+        let deferred_events = deferred.iter().cloned().collect::<Vec<_>>();
+        let deferred_counts = collect_event_origin_counts(&deferred_events);
+        let dropped_counts = incoming_counts
+            .iter()
+            .map(|(origin, count)| {
+                let ready = ready_counts.get(origin).copied().unwrap_or(0);
+                let deferred = deferred_counts.get(origin).copied().unwrap_or(0);
+                (origin.clone(), count.saturating_sub(ready + deferred))
+            })
+            .filter(|(_, count)| *count > 0)
+            .collect::<BTreeMap<_, _>>();
+
+        {
+            let mut stats = lock_or_recover(
+                &self.stream_delivery_stats,
+                "sink.ingest_stream_events.stream_delivery_stats",
+            );
+            stats.received_batches = stats.received_batches.saturating_add(1);
+            stats.received_events = stats.received_events.saturating_add(events.len() as u64);
+            accumulate_origin_counts(&mut stats.received_origin_counts, &incoming_counts);
+            accumulate_origin_counts(&mut stats.ready_origin_counts, &ready_counts);
+            accumulate_origin_counts(&mut stats.deferred_origin_counts, &deferred_counts);
+            accumulate_origin_counts(&mut stats.dropped_origin_counts, &dropped_counts);
+        }
+
+        if debug_stream_delivery_enabled() {
+            eprintln!(
+                "fs_meta_sink: ingest_stream_events classify node={} configured={:?} scheduled={:?} incoming={:?} ready={:?} deferred={:?} dropped={}",
+                self.node_id.0,
+                configured,
+                scheduled,
+                format_origin_counts(&incoming_counts),
+                format_origin_counts(&ready_counts),
+                format_origin_counts(&deferred_counts),
+                dropped
+            );
+            eprintln!(
+                "fs_meta_sink: ingest_stream_events counts node={} ready={} deferred={} dropped={}",
+                self.node_id.0,
+                ready.len(),
+                deferred_events.len(),
+                dropped
+            );
         }
 
         if !deferred.is_empty() {
@@ -1901,6 +2115,19 @@ impl SinkFileMeta {
         }
         if !ready.is_empty() {
             self.apply_events(&ready)?;
+            let mut stats = lock_or_recover(
+                &self.stream_delivery_stats,
+                "sink.ingest_stream_events.stream_delivery_stats.applied",
+            );
+            stats.applied_batches = stats.applied_batches.saturating_add(1);
+            stats.applied_events = stats.applied_events.saturating_add(ready.len() as u64);
+            stats.applied_control_events = stats
+                .applied_control_events
+                .saturating_add(ready_control_count);
+            stats.applied_data_events =
+                stats.applied_data_events.saturating_add(ready_data_count);
+            accumulate_origin_counts(&mut stats.applied_origin_counts, &ready_counts);
+            stats.last_applied_at_us = now_us();
         }
         Ok(())
     }
@@ -1939,6 +2166,25 @@ impl SinkFileMeta {
         }
         if !ready.is_empty() {
             self.apply_events(&ready)?;
+            let ready_counts = collect_event_origin_counts(&ready);
+            let ready_control_count = ready
+                .iter()
+                .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok())
+                .count() as u64;
+            let ready_data_count = ready.len() as u64 - ready_control_count;
+            let mut stats = lock_or_recover(
+                &self.stream_delivery_stats,
+                "sink.flush_buffered_stream_events.stream_delivery_stats.applied",
+            );
+            stats.applied_batches = stats.applied_batches.saturating_add(1);
+            stats.applied_events = stats.applied_events.saturating_add(ready.len() as u64);
+            stats.applied_control_events = stats
+                .applied_control_events
+                .saturating_add(ready_control_count);
+            stats.applied_data_events =
+                stats.applied_data_events.saturating_add(ready_data_count);
+            accumulate_origin_counts(&mut stats.applied_origin_counts, &ready_counts);
+            stats.last_applied_at_us = now_us();
         }
         Ok(())
     }

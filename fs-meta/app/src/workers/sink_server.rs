@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,6 +27,7 @@ struct SinkWorkerState {
     endpoints_started: bool,
     send_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Event>>>,
     last_control_frame_signals: Vec<String>,
+    received_stats: Arc<StdMutex<ReceivedBatchStats>>,
 }
 
 enum SinkWorkerAction {
@@ -34,6 +36,7 @@ enum SinkWorkerAction {
         sink: Arc<SinkFileMeta>,
         send_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Event>>>,
         events: Vec<Event>,
+        received_stats: Arc<StdMutex<ReceivedBatchStats>>,
     },
     Recv {
         sink: Arc<SinkFileMeta>,
@@ -44,6 +47,26 @@ enum SinkWorkerAction {
         sink: Arc<SinkFileMeta>,
         envelopes: Vec<ControlEnvelope>,
     },
+}
+
+#[derive(Default)]
+struct ReceivedBatchStats {
+    batch_count: u64,
+    event_count: u64,
+    control_event_count: u64,
+    data_event_count: u64,
+    last_received_at_us: Option<u64>,
+    last_received_origins: Vec<String>,
+    received_origin_counts: std::collections::BTreeMap<String, u64>,
+}
+
+struct ReceivedBatchUpdate {
+    event_count: u64,
+    control_event_count: u64,
+    data_event_count: u64,
+    last_received_at_us: Option<u64>,
+    last_received_origins: Vec<String>,
+    received_origin_counts: std::collections::BTreeMap<String, u64>,
 }
 
 fn classify_sink_worker_error(err: CnxError) -> SinkWorkerResponse {
@@ -130,6 +153,94 @@ fn summarize_event_origins(events: &[Event]) -> Vec<String> {
         .collect()
 }
 
+fn lock_received_stats<'a>(
+    stats: &'a Arc<StdMutex<ReceivedBatchStats>>,
+) -> std::sync::MutexGuard<'a, ReceivedBatchStats> {
+    match stats.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("sink worker received stats lock poisoned; recovering state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn summarize_received_batch(batch: &[Event]) -> ReceivedBatchUpdate {
+    let mut control = 0u64;
+    let mut data = 0u64;
+    let mut last_received_at_us = None::<u64>;
+    for event in batch {
+        last_received_at_us = Some(
+            last_received_at_us
+                .map(|current| current.max(event.metadata().timestamp_us))
+                .unwrap_or(event.metadata().timestamp_us),
+        );
+        if rmp_serde::from_slice::<crate::ControlEvent>(event.payload_bytes()).is_ok() {
+            control += 1;
+        } else {
+            data += 1;
+        }
+    }
+    ReceivedBatchUpdate {
+        event_count: batch.len() as u64,
+        control_event_count: control,
+        data_event_count: data,
+        last_received_at_us,
+        last_received_origins: summarize_event_origins(batch),
+        received_origin_counts: batch.iter().fold(
+            std::collections::BTreeMap::<String, u64>::new(),
+            |mut acc, event| {
+                *acc.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+                acc
+            },
+        ),
+    }
+}
+
+fn update_received_stats(stats: &Arc<StdMutex<ReceivedBatchStats>>, update: &ReceivedBatchUpdate) {
+    let mut guard = lock_received_stats(stats);
+    guard.batch_count = guard.batch_count.saturating_add(1);
+    guard.event_count = guard.event_count.saturating_add(update.event_count);
+    guard.control_event_count = guard
+        .control_event_count
+        .saturating_add(update.control_event_count);
+    guard.data_event_count = guard
+        .data_event_count
+        .saturating_add(update.data_event_count);
+    guard.last_received_at_us = update.last_received_at_us;
+    guard.last_received_origins = update.last_received_origins.clone();
+    for (origin, count) in &update.received_origin_counts {
+        *guard.received_origin_counts.entry(origin.clone()).or_default() += *count;
+    }
+}
+
+fn received_stats_snapshot(
+    stats: &Arc<StdMutex<ReceivedBatchStats>>,
+) -> (
+    u64,
+    u64,
+    u64,
+    u64,
+    Option<u64>,
+    Vec<String>,
+    Vec<String>,
+) {
+    let guard = lock_received_stats(stats);
+    (
+        guard.batch_count,
+        guard.event_count,
+        guard.control_event_count,
+        guard.data_event_count,
+        guard.last_received_at_us,
+        guard.last_received_origins.clone(),
+        guard
+            .received_origin_counts
+            .iter()
+            .map(|(origin, count)| format!("{origin}={count}"))
+            .collect(),
+    )
+}
+
 fn summarize_sink_snapshot_groups(snapshot: &crate::sink::SinkStatusSnapshot) -> Vec<String> {
     snapshot
         .groups
@@ -170,6 +281,7 @@ async fn bootstrap_init_sink_runtime(
     state.endpoints_started = false;
     state.send_tx = None;
     state.last_control_frame_signals.clear();
+    *lock_received_stats(&state.received_stats) = ReceivedBatchStats::default();
     eprintln!("fs_meta_sink_worker_server: bootstrap_init ok");
     Ok(())
 }
@@ -337,6 +449,15 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) 
             Some(sink) => match sink.status_snapshot() {
                 Ok(mut snapshot) => {
                     if let Some(node_id) = state.node_id.as_ref() {
+                        let (
+                            received_batches,
+                            received_events,
+                            received_control,
+                            received_data,
+                            last_received_at_us,
+                            last_received_origins,
+                            received_origin_counts,
+                        ) = received_stats_snapshot(&state.received_stats);
                         snapshot.last_control_frame_signals_by_node =
                             if state.last_control_frame_signals.is_empty() {
                                 std::collections::BTreeMap::new()
@@ -346,6 +467,45 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) 
                                     state.last_control_frame_signals.clone(),
                                 )])
                             };
+                        snapshot.received_batches_by_node = if received_batches == 0 {
+                            std::collections::BTreeMap::new()
+                        } else {
+                            std::collections::BTreeMap::from([(node_id.0.clone(), received_batches)])
+                        };
+                        snapshot.received_events_by_node = if received_events == 0 {
+                            std::collections::BTreeMap::new()
+                        } else {
+                            std::collections::BTreeMap::from([(node_id.0.clone(), received_events)])
+                        };
+                        snapshot.received_control_events_by_node = if received_control == 0 {
+                            std::collections::BTreeMap::new()
+                        } else {
+                            std::collections::BTreeMap::from([(node_id.0.clone(), received_control)])
+                        };
+                        snapshot.received_data_events_by_node = if received_data == 0 {
+                            std::collections::BTreeMap::new()
+                        } else {
+                            std::collections::BTreeMap::from([(node_id.0.clone(), received_data)])
+                        };
+                        snapshot.last_received_at_us_by_node = last_received_at_us
+                            .map(|value| std::collections::BTreeMap::from([(node_id.0.clone(), value)]))
+                            .unwrap_or_default();
+                        snapshot.last_received_origins_by_node = if last_received_origins.is_empty() {
+                            std::collections::BTreeMap::new()
+                        } else {
+                            std::collections::BTreeMap::from([(
+                                node_id.0.clone(),
+                                last_received_origins,
+                            )])
+                        };
+                        snapshot.received_origin_counts_by_node = if received_origin_counts.is_empty() {
+                            std::collections::BTreeMap::new()
+                        } else {
+                            std::collections::BTreeMap::from([(
+                                node_id.0.clone(),
+                                received_origin_counts,
+                            )])
+                        };
                     }
                     SinkWorkerAction::Immediate(SinkWorkerResponse::StatusSnapshot(snapshot), false)
                 }
@@ -409,6 +569,7 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) 
                 sink,
                 send_tx: state.send_tx.clone(),
                 events,
+                received_stats: state.received_stats.clone(),
             },
             None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
@@ -462,9 +623,15 @@ async fn execute_worker_action(action: SinkWorkerAction) -> (SinkWorkerResponse,
             sink,
             send_tx,
             events,
+            received_stats,
         } => match send_tx {
-            Some(send_tx) => match send_tx.send(events) {
-                Ok(()) => (SinkWorkerResponse::Ack, false),
+            Some(send_tx) => {
+                let update = summarize_received_batch(&events);
+                match send_tx.send(events) {
+                Ok(()) => {
+                    update_received_stats(&received_stats, &update);
+                    (SinkWorkerResponse::Ack, false)
+                }
                 Err(err) => (
                     SinkWorkerResponse::Error(format!(
                         "sink worker send queue unavailable: {} event(s) dropped",
@@ -472,11 +639,18 @@ async fn execute_worker_action(action: SinkWorkerAction) -> (SinkWorkerResponse,
                     )),
                     false,
                 ),
-            },
-            None => match sink.send(&events).await {
-                Ok(_) => (SinkWorkerResponse::Ack, false),
+            }
+            }
+            None => {
+                let update = summarize_received_batch(&events);
+                match sink.send(&events).await {
+                Ok(_) => {
+                    update_received_stats(&received_stats, &update);
+                    (SinkWorkerResponse::Ack, false)
+                }
                 Err(err) => (SinkWorkerResponse::Error(err.to_string()), false),
-            },
+            }
+            }
         },
         SinkWorkerAction::Recv {
             sink,
@@ -506,6 +680,7 @@ pub fn run_sink_worker_server(
         endpoints_started: false,
         send_tx: None,
         last_control_frame_signals: Vec::new(),
+        received_stats: Arc::new(StdMutex::new(ReceivedBatchStats::default())),
     }));
     run_worker_sidecar_server::<SinkWorkerRpc, _, SinkWorkerInitConfig>(
         control_socket_path,

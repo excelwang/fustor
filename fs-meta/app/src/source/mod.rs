@@ -239,6 +239,12 @@ pub struct SourceConcreteRootHealthSnapshot {
     pub last_audit_started_at_us: Option<u64>,
     pub last_audit_completed_at_us: Option<u64>,
     pub last_audit_duration_ms: Option<u64>,
+    pub emitted_batch_count: u64,
+    pub emitted_event_count: u64,
+    pub emitted_control_event_count: u64,
+    pub emitted_data_event_count: u64,
+    pub last_emitted_at_us: Option<u64>,
+    pub last_emitted_origins: Vec<String>,
     pub current_revision: Option<u64>,
     pub candidate_revision: Option<u64>,
     pub candidate_status: Option<String>,
@@ -445,6 +451,12 @@ struct ConcreteRootHealthEntry {
     last_audit_started_at_us: Option<u64>,
     last_audit_completed_at_us: Option<u64>,
     last_audit_duration_ms: Option<u64>,
+    emitted_batch_count: u64,
+    emitted_event_count: u64,
+    emitted_control_event_count: u64,
+    emitted_data_event_count: u64,
+    last_emitted_at_us: Option<u64>,
+    last_emitted_origins: Vec<String>,
     current_revision: Option<u64>,
     candidate_revision: Option<u64>,
     candidate_status: Option<String>,
@@ -485,6 +497,12 @@ impl ConcreteRootHealthEntry {
             last_audit_started_at_us: None,
             last_audit_completed_at_us: None,
             last_audit_duration_ms: None,
+            emitted_batch_count: 0,
+            emitted_event_count: 0,
+            emitted_control_event_count: 0,
+            emitted_data_event_count: 0,
+            last_emitted_at_us: None,
+            last_emitted_origins: Vec::new(),
             current_revision: None,
             candidate_revision: None,
             candidate_status: None,
@@ -1488,6 +1506,56 @@ impl FSMetaSource {
         detail.last_audit_duration_ms = Some(completed_at_us.saturating_sub(started_at_us) / 1_000);
     }
 
+    fn summarize_emitted_origins(events: &[Event]) -> Vec<String> {
+        let mut counts = BTreeMap::<String, usize>::new();
+        for event in events {
+            *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+        }
+        counts
+            .into_iter()
+            .map(|(origin, count)| format!("{origin}={count}"))
+            .collect()
+    }
+
+    fn mark_root_emitted_batch(
+        fanout_health: &Arc<Mutex<FanoutHealthState>>,
+        root_key: &str,
+        batch: &[Event],
+    ) {
+        let mut control = 0u64;
+        let mut data = 0u64;
+        let mut last_emitted_at_us = None::<u64>;
+        for event in batch {
+            last_emitted_at_us = Some(
+                last_emitted_at_us
+                    .map(|current| current.max(event.metadata().timestamp_us))
+                    .unwrap_or(event.metadata().timestamp_us),
+            );
+            if rmp_serde::from_slice::<crate::ControlEvent>(event.payload_bytes()).is_ok() {
+                control += 1;
+            } else {
+                data += 1;
+            }
+        }
+        let mut health = lock_or_recover(fanout_health, "source.object_health.emitted_batch");
+        let detail = health
+            .object_ref_detail
+            .entry(root_key.to_string())
+            .or_default();
+        detail.emitted_batch_count = detail.emitted_batch_count.saturating_add(1);
+        detail.emitted_event_count = detail
+            .emitted_event_count
+            .saturating_add(batch.len() as u64);
+        detail.emitted_control_event_count = detail
+            .emitted_control_event_count
+            .saturating_add(control);
+        detail.emitted_data_event_count = detail
+            .emitted_data_event_count
+            .saturating_add(data);
+        detail.last_emitted_at_us = last_emitted_at_us;
+        detail.last_emitted_origins = Self::summarize_emitted_origins(batch);
+    }
+
     fn request_rescan_on_primary_roots(
         roots: &[RootRuntime],
         fanout_health: Option<&Arc<Mutex<FanoutHealthState>>>,
@@ -2342,6 +2410,12 @@ impl FSMetaSource {
                 last_audit_started_at_us: entry.last_audit_started_at_us,
                 last_audit_completed_at_us: entry.last_audit_completed_at_us,
                 last_audit_duration_ms: entry.last_audit_duration_ms,
+                emitted_batch_count: entry.emitted_batch_count,
+                emitted_event_count: entry.emitted_event_count,
+                emitted_control_event_count: entry.emitted_control_event_count,
+                emitted_data_event_count: entry.emitted_data_event_count,
+                last_emitted_at_us: entry.last_emitted_at_us,
+                last_emitted_origins: entry.last_emitted_origins.clone(),
                 current_revision: entry.current_revision,
                 candidate_revision: entry.candidate_revision,
                 candidate_status: entry.candidate_status.clone(),
@@ -2679,6 +2753,7 @@ impl FSMetaSource {
                             if task_cancel.is_cancelled() || global_shutdown.is_cancelled() {
                                 break;
                             }
+                            Self::mark_root_emitted_batch(&fanout_health, &root_key, &batch);
                             if out_tx.send(batch).is_err() {
                                 Self::update_root_task_slot_health(
                                     &fanout_health,

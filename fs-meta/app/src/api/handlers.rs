@@ -65,12 +65,16 @@ fn summarize_groups_by_node(
 
 fn summarize_source_status_route_snapshot(snapshot: &SourceObservabilitySnapshot) -> String {
     format!(
-        "primaries={} runners={} source={:?} scan={:?} control={:?}",
+        "primaries={} runners={} source={:?} scan={:?} control={:?} published_batches={:?} published_events={:?} published_origins={:?} published_origin_counts={:?}",
         snapshot.source_primary_by_group.len(),
         snapshot.last_force_find_runner_by_group.len(),
         summarize_groups_by_node(&snapshot.scheduled_source_groups_by_node),
         summarize_groups_by_node(&snapshot.scheduled_scan_groups_by_node),
-        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node)
+        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node),
+        snapshot.published_batches_by_node,
+        snapshot.published_events_by_node,
+        summarize_groups_by_node(&snapshot.last_published_origins_by_node),
+        summarize_groups_by_node(&snapshot.published_origin_counts_by_node),
     )
 }
 
@@ -185,6 +189,13 @@ pub async fn status(
             debug: StatusSinkDebug {
                 scheduled_groups_by_node: sink_status.scheduled_groups_by_node,
                 last_control_frame_signals_by_node: sink_status.last_control_frame_signals_by_node,
+                received_batches_by_node: sink_status.received_batches_by_node,
+                received_events_by_node: sink_status.received_events_by_node,
+                received_control_events_by_node: sink_status.received_control_events_by_node,
+                received_data_events_by_node: sink_status.received_data_events_by_node,
+                last_received_at_us_by_node: sink_status.last_received_at_us_by_node,
+                last_received_origins_by_node: sink_status.last_received_origins_by_node,
+                received_origin_counts_by_node: sink_status.received_origin_counts_by_node,
             },
         },
         facade: state
@@ -709,6 +720,13 @@ fn status_source_from_observability(
         scheduled_source_groups_by_node,
         scheduled_scan_groups_by_node,
         last_control_frame_signals_by_node,
+        published_batches_by_node,
+        published_events_by_node,
+        published_control_events_by_node,
+        published_data_events_by_node,
+        last_published_at_us_by_node,
+        last_published_origins_by_node,
+        published_origin_counts_by_node,
     } = source;
     let crate::source::SourceStatusSnapshot {
         logical_roots: status_logical_roots,
@@ -757,6 +775,12 @@ fn status_source_from_observability(
                 last_audit_started_at_us: entry.last_audit_started_at_us,
                 last_audit_completed_at_us: entry.last_audit_completed_at_us,
                 last_audit_duration_ms: entry.last_audit_duration_ms,
+                emitted_batch_count: entry.emitted_batch_count,
+                emitted_event_count: entry.emitted_event_count,
+                emitted_control_event_count: entry.emitted_control_event_count,
+                emitted_data_event_count: entry.emitted_data_event_count,
+                last_emitted_at_us: entry.last_emitted_at_us,
+                last_emitted_origins: entry.last_emitted_origins,
             })
             .collect(),
         debug: super::types::StatusSourceDebug {
@@ -767,6 +791,13 @@ fn status_source_from_observability(
             scheduled_source_groups_by_node,
             scheduled_scan_groups_by_node,
             last_control_frame_signals_by_node,
+            published_batches_by_node,
+            published_events_by_node,
+            published_control_events_by_node,
+            published_data_events_by_node,
+            last_published_at_us_by_node,
+            last_published_origins_by_node,
+            published_origin_counts_by_node,
         },
     }
 }
@@ -828,6 +859,13 @@ fn merge_source_observability(
             || !snapshot.scheduled_source_groups_by_node.is_empty()
             || !snapshot.scheduled_scan_groups_by_node.is_empty()
             || !snapshot.last_control_frame_signals_by_node.is_empty()
+            || !snapshot.published_batches_by_node.is_empty()
+            || !snapshot.published_events_by_node.is_empty()
+            || !snapshot.published_control_events_by_node.is_empty()
+            || !snapshot.published_data_events_by_node.is_empty()
+            || !snapshot.last_published_at_us_by_node.is_empty()
+            || !snapshot.last_published_origins_by_node.is_empty()
+            || !snapshot.published_origin_counts_by_node.is_empty()
     }
 
     let (mut merged, fallback) = if has_live_data(&aggregated) {
@@ -933,6 +971,39 @@ fn merge_source_observability(
             .entry(node_id)
             .or_insert(signals);
     }
+    for (node_id, count) in fallback.published_batches_by_node {
+        merged.published_batches_by_node.entry(node_id).or_insert(count);
+    }
+    for (node_id, count) in fallback.published_events_by_node {
+        merged.published_events_by_node.entry(node_id).or_insert(count);
+    }
+    for (node_id, count) in fallback.published_control_events_by_node {
+        merged
+            .published_control_events_by_node
+            .entry(node_id)
+            .or_insert(count);
+    }
+    for (node_id, count) in fallback.published_data_events_by_node {
+        merged
+            .published_data_events_by_node
+            .entry(node_id)
+            .or_insert(count);
+    }
+    for (node_id, ts) in fallback.last_published_at_us_by_node {
+        merged.last_published_at_us_by_node.entry(node_id).or_insert(ts);
+    }
+    for (node_id, origins) in fallback.last_published_origins_by_node {
+        merged
+            .last_published_origins_by_node
+            .entry(node_id)
+            .or_insert(origins);
+    }
+    for (node_id, origins) in fallback.published_origin_counts_by_node {
+        merged
+            .published_origin_counts_by_node
+            .entry(node_id)
+            .or_insert(origins);
+    }
 
     let mut inflight = merged
         .force_find_inflight_groups
@@ -960,6 +1031,13 @@ fn merge_source_observability_snapshots(
             scheduled_source_groups_by_node: BTreeMap::new(),
             scheduled_scan_groups_by_node: BTreeMap::new(),
             last_control_frame_signals_by_node: BTreeMap::new(),
+            published_batches_by_node: BTreeMap::new(),
+            published_events_by_node: BTreeMap::new(),
+            published_control_events_by_node: BTreeMap::new(),
+            published_data_events_by_node: BTreeMap::new(),
+            last_published_at_us_by_node: BTreeMap::new(),
+            last_published_origins_by_node: BTreeMap::new(),
+            published_origin_counts_by_node: BTreeMap::new(),
         };
     };
 
@@ -1020,6 +1098,27 @@ fn merge_source_observability_snapshots(
         merged
             .last_control_frame_signals_by_node
             .extend(snapshot.last_control_frame_signals_by_node);
+        merged
+            .published_batches_by_node
+            .extend(snapshot.published_batches_by_node);
+        merged
+            .published_events_by_node
+            .extend(snapshot.published_events_by_node);
+        merged
+            .published_control_events_by_node
+            .extend(snapshot.published_control_events_by_node);
+        merged
+            .published_data_events_by_node
+            .extend(snapshot.published_data_events_by_node);
+        merged
+            .last_published_at_us_by_node
+            .extend(snapshot.last_published_at_us_by_node);
+        merged
+            .last_published_origins_by_node
+            .extend(snapshot.last_published_origins_by_node);
+        merged
+            .published_origin_counts_by_node
+            .extend(snapshot.published_origin_counts_by_node);
         inflight.extend(snapshot.force_find_inflight_groups);
         for grant in snapshot.grants {
             grant_map.entry(grant.object_ref.clone()).or_insert(grant);
@@ -1248,6 +1347,12 @@ mod tests {
                     last_audit_started_at_us: None,
                     last_audit_completed_at_us: None,
                     last_audit_duration_ms: None,
+                    emitted_batch_count: 0,
+                    emitted_event_count: 0,
+                    emitted_control_event_count: 0,
+                    emitted_data_event_count: 0,
+                    last_emitted_at_us: None,
+                    last_emitted_origins: Vec::new(),
                     current_revision: Some(1),
                     candidate_revision: None,
                     candidate_status: None,
@@ -1271,6 +1376,13 @@ mod tests {
                 vec!["nfs1".to_string()],
             )]),
             last_control_frame_signals_by_node: BTreeMap::new(),
+            published_batches_by_node: BTreeMap::new(),
+            published_events_by_node: BTreeMap::new(),
+            published_control_events_by_node: BTreeMap::new(),
+            published_data_events_by_node: BTreeMap::new(),
+            last_published_at_us_by_node: BTreeMap::new(),
+            last_published_origins_by_node: BTreeMap::new(),
+            published_origin_counts_by_node: BTreeMap::new(),
         }
     }
 
@@ -1294,6 +1406,7 @@ mod tests {
                 shadow_lag_us: 12,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+                materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
             ..SinkStatusSnapshot::default()
@@ -1348,6 +1461,7 @@ mod tests {
                 shadow_lag_us: 22,
                 overflow_pending_audit: false,
                 initial_audit_completed: true,
+                materialized_revision: 1,
                 estimated_heap_bytes: 0,
             }],
             ..SinkStatusSnapshot::default()
@@ -1457,6 +1571,13 @@ mod tests {
                 "node-a".to_string(),
                 vec!["activate nfs1".to_string()],
             )]),
+            published_batches_by_node: BTreeMap::new(),
+            published_events_by_node: BTreeMap::new(),
+            published_control_events_by_node: BTreeMap::new(),
+            published_data_events_by_node: BTreeMap::new(),
+            last_published_at_us_by_node: BTreeMap::new(),
+            last_published_origins_by_node: BTreeMap::new(),
+            published_origin_counts_by_node: BTreeMap::new(),
         };
         let aggregated = SourceObservabilitySnapshot {
             lifecycle_state: "ready".to_string(),
@@ -1505,6 +1626,12 @@ mod tests {
                     last_audit_started_at_us: None,
                     last_audit_completed_at_us: None,
                     last_audit_duration_ms: None,
+                    emitted_batch_count: 0,
+                    emitted_event_count: 0,
+                    emitted_control_event_count: 0,
+                    emitted_data_event_count: 0,
+                    last_emitted_at_us: None,
+                    last_emitted_origins: Vec::new(),
                     current_revision: Some(1),
                     candidate_revision: None,
                     candidate_status: None,
@@ -1530,6 +1657,19 @@ mod tests {
             last_control_frame_signals_by_node: BTreeMap::from([(
                 "node-b".to_string(),
                 vec!["activate nfs2".to_string()],
+            )]),
+            published_batches_by_node: BTreeMap::from([("node-b".to_string(), 7)]),
+            published_events_by_node: BTreeMap::from([("node-b".to_string(), 77)]),
+            published_control_events_by_node: BTreeMap::from([("node-b".to_string(), 3)]),
+            published_data_events_by_node: BTreeMap::from([("node-b".to_string(), 74)]),
+            last_published_at_us_by_node: BTreeMap::from([("node-b".to_string(), 42)]),
+            last_published_origins_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=1".to_string()],
+            )]),
+            published_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=77".to_string()],
             )]),
         };
 
@@ -1566,6 +1706,16 @@ mod tests {
             merged.last_control_frame_signals_by_node.get("node-b"),
             Some(&vec!["activate nfs2".to_string()])
         );
+        assert_eq!(merged.published_batches_by_node.get("node-b"), Some(&7));
+        assert_eq!(merged.published_events_by_node.get("node-b"), Some(&77));
+        assert_eq!(
+            merged.last_published_origins_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=1".to_string()])
+        );
+        assert_eq!(
+            merged.published_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=77".to_string()])
+        );
         assert_eq!(merged.force_find_inflight_groups, vec!["nfs2".to_string()]);
     }
 
@@ -1592,6 +1742,19 @@ mod tests {
                 "node-a".to_string(),
                 vec!["activate nfs1".to_string()],
             )]),
+            published_batches_by_node: BTreeMap::from([("node-a".to_string(), 11)]),
+            published_events_by_node: BTreeMap::from([("node-a".to_string(), 111)]),
+            published_control_events_by_node: BTreeMap::from([("node-a".to_string(), 2)]),
+            published_data_events_by_node: BTreeMap::from([("node-a".to_string(), 109)]),
+            last_published_at_us_by_node: BTreeMap::from([("node-a".to_string(), 123)]),
+            last_published_origins_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=2".to_string()],
+            )]),
+            published_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=111".to_string()],
+            )]),
         };
         let node_b = SourceObservabilitySnapshot {
             lifecycle_state: "ready".to_string(),
@@ -1614,6 +1777,19 @@ mod tests {
                 "node-b".to_string(),
                 vec!["activate nfs2".to_string()],
             )]),
+            published_batches_by_node: BTreeMap::from([("node-b".to_string(), 22)]),
+            published_events_by_node: BTreeMap::from([("node-b".to_string(), 222)]),
+            published_control_events_by_node: BTreeMap::from([("node-b".to_string(), 3)]),
+            published_data_events_by_node: BTreeMap::from([("node-b".to_string(), 219)]),
+            last_published_at_us_by_node: BTreeMap::from([("node-b".to_string(), 456)]),
+            last_published_origins_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=1".to_string()],
+            )]),
+            published_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=222".to_string()],
+            )]),
         };
 
         let merged = merge_source_observability_snapshots(vec![node_a, node_b]);
@@ -1625,6 +1801,26 @@ mod tests {
         assert_eq!(
             merged.last_control_frame_signals_by_node.get("node-b"),
             Some(&vec!["activate nfs2".to_string()])
+        );
+        assert_eq!(merged.published_batches_by_node.get("node-a"), Some(&11));
+        assert_eq!(merged.published_batches_by_node.get("node-b"), Some(&22));
+        assert_eq!(merged.published_events_by_node.get("node-a"), Some(&111));
+        assert_eq!(merged.published_events_by_node.get("node-b"), Some(&222));
+        assert_eq!(
+            merged.last_published_origins_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=2".to_string()])
+        );
+        assert_eq!(
+            merged.last_published_origins_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=1".to_string()])
+        );
+        assert_eq!(
+            merged.published_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=111".to_string()])
+        );
+        assert_eq!(
+            merged.published_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=222".to_string()])
         );
     }
 }

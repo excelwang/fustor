@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -32,6 +33,27 @@ struct SourceWorkerState {
     pending_init: Option<(NodeId, SourceConfig)>,
     pump_task: Option<JoinHandle<()>>,
     last_control_frame_signals: Vec<String>,
+    published_stats: Arc<StdMutex<PublishedBatchStats>>,
+}
+
+#[derive(Default)]
+struct PublishedBatchStats {
+    batch_count: u64,
+    event_count: u64,
+    control_event_count: u64,
+    data_event_count: u64,
+    last_published_at_us: Option<u64>,
+    last_published_origins: Vec<String>,
+    published_origin_counts: std::collections::BTreeMap<String, u64>,
+}
+
+struct PublishedBatchUpdate {
+    event_count: u64,
+    control_event_count: u64,
+    data_event_count: u64,
+    last_published_at_us: Option<u64>,
+    last_published_origins: Vec<String>,
+    published_origin_counts: std::collections::BTreeMap<String, u64>,
 }
 
 enum SourceWorkerAction {
@@ -80,6 +102,10 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
 
 fn debug_control_scope_capture_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn debug_source_batch_flow_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_SOURCE_BATCH_FLOW").is_some()
 }
 
 fn summarize_bound_scopes(
@@ -137,6 +163,100 @@ fn summarize_source_control_signals(signals: &[SourceControlSignal]) -> Vec<Stri
         .collect()
 }
 
+fn summarize_event_origins(events: &[Event]) -> Vec<String> {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for event in events {
+        *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(origin, count)| format!("{origin}={count}"))
+        .collect()
+}
+
+fn summarize_event_batch(events: &[Event]) -> String {
+    let mut control = 0usize;
+    let mut data = 0usize;
+    for event in events {
+        if rmp_serde::from_slice::<crate::ControlEvent>(event.payload_bytes()).is_ok() {
+            control += 1;
+        } else {
+            data += 1;
+        }
+    }
+    format!(
+        "len={} control={} data={} origins={:?}",
+        events.len(),
+        control,
+        data,
+        summarize_event_origins(events)
+    )
+}
+
+fn lock_publish_stats<'a>(
+    stats: &'a Arc<StdMutex<PublishedBatchStats>>,
+) -> std::sync::MutexGuard<'a, PublishedBatchStats> {
+    match stats.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!("source worker publish stats lock poisoned; recovering state");
+            poisoned.into_inner()
+        }
+    }
+}
+
+fn summarize_published_batch(batch: &[Event]) -> PublishedBatchUpdate {
+    let mut control = 0u64;
+    let mut data = 0u64;
+    let mut last_published_at_us = None::<u64>;
+    for event in batch {
+        last_published_at_us = Some(
+            last_published_at_us
+                .map(|current| current.max(event.metadata().timestamp_us))
+                .unwrap_or(event.metadata().timestamp_us),
+        );
+        if rmp_serde::from_slice::<crate::ControlEvent>(event.payload_bytes()).is_ok() {
+            control += 1;
+        } else {
+            data += 1;
+        }
+    }
+    PublishedBatchUpdate {
+        event_count: batch.len() as u64,
+        control_event_count: control,
+        data_event_count: data,
+        last_published_at_us,
+        last_published_origins: summarize_event_origins(batch),
+        published_origin_counts: batch.iter().fold(
+            std::collections::BTreeMap::<String, u64>::new(),
+            |mut acc, event| {
+                *acc.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+                acc
+            },
+        ),
+    }
+}
+
+fn update_published_stats(
+    stats: &Arc<StdMutex<PublishedBatchStats>>,
+    update: &PublishedBatchUpdate,
+) {
+    let mut guard = lock_publish_stats(stats);
+    guard.batch_count = guard.batch_count.saturating_add(1);
+    guard.event_count = guard.event_count.saturating_add(update.event_count);
+    guard.control_event_count = guard
+        .control_event_count
+        .saturating_add(update.control_event_count);
+    guard.data_event_count = guard
+        .data_event_count
+        .saturating_add(update.data_event_count);
+    guard.last_published_at_us = update.last_published_at_us;
+    guard.last_published_origins = update.last_published_origins.clone();
+    for (origin, count) in &update.published_origin_counts {
+        *guard.published_origin_counts.entry(origin.clone()).or_default() += *count;
+    }
+}
+
 fn classify_source_worker_error(err: CnxError) -> SourceWorkerResponse {
     match err {
         CnxError::InvalidInput(message) => SourceWorkerResponse::InvalidInput(message),
@@ -174,17 +294,33 @@ async fn stop_source_runtime(state: &mut SourceWorkerState) {
     .await;
 }
 
-fn start_source_pump_with_stream<S>(stream: S, boundary: Arc<dyn ChannelIoSubset>) -> JoinHandle<()>
+fn start_source_pump_with_stream<S>(
+    stream: S,
+    boundary: Arc<dyn ChannelIoSubset>,
+    published_stats: Arc<StdMutex<PublishedBatchStats>>,
+) -> JoinHandle<()>
 where
     S: futures_util::Stream<Item = Vec<Event>> + Send + 'static,
 {
     tokio::spawn(async move {
         futures_util::pin_mut!(stream);
         while let Some(batch) = stream.next().await {
+            let summary = if debug_source_batch_flow_enabled() {
+                Some(summarize_event_batch(&batch))
+            } else {
+                None
+            };
+            let publish_update = summarize_published_batch(&batch);
             let origin = batch
                 .first()
                 .map(|event| event.metadata().origin_id.0.clone())
                 .unwrap_or_else(|| "__empty__".to_string());
+            if let Some(summary) = &summary {
+                eprintln!(
+                    "fs_meta_source_worker_server: publish_batch begin origin={} {}",
+                    origin, summary
+                );
+            }
             if let Err(err) = boundary
                 .channel_send(
                     BoundaryContext::default(),
@@ -202,6 +338,13 @@ where
                     err
                 );
                 break;
+            }
+            update_published_stats(&published_stats, &publish_update);
+            if let Some(summary) = &summary {
+                eprintln!(
+                    "fs_meta_source_worker_server: publish_batch ok origin={} {}",
+                    origin, summary
+                );
             }
         }
     })
@@ -224,8 +367,10 @@ fn last_control_frame_signals_by_node(
 fn source_observability_snapshot(
     source: &FSMetaSource,
     last_control_frame_signals: &[String],
+    published_stats: &Arc<StdMutex<PublishedBatchStats>>,
 ) -> SourceObservabilitySnapshot {
     let node_id = source.node_id();
+    let published = lock_publish_stats(published_stats);
     SourceObservabilitySnapshot {
         lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
         host_object_grants_version: source.host_object_grants_version_snapshot(),
@@ -257,6 +402,46 @@ fn source_observability_snapshot(
             &node_id,
             last_control_frame_signals,
         ),
+        published_batches_by_node: std::collections::BTreeMap::from([(
+            node_id.0.clone(),
+            published.batch_count,
+        )]),
+        published_events_by_node: std::collections::BTreeMap::from([(
+            node_id.0.clone(),
+            published.event_count,
+        )]),
+        published_control_events_by_node: std::collections::BTreeMap::from([(
+            node_id.0.clone(),
+            published.control_event_count,
+        )]),
+        published_data_events_by_node: std::collections::BTreeMap::from([(
+            node_id.0.clone(),
+            published.data_event_count,
+        )]),
+        last_published_at_us_by_node: published
+            .last_published_at_us
+            .map(|ts| std::collections::BTreeMap::from([(node_id.0.clone(), ts)]))
+            .unwrap_or_default(),
+        last_published_origins_by_node: (!published.last_published_origins.is_empty())
+            .then(|| {
+                std::collections::BTreeMap::from([(
+                    node_id.0.clone(),
+                    published.last_published_origins.clone(),
+                )])
+            })
+            .unwrap_or_default(),
+        published_origin_counts_by_node: (!published.published_origin_counts.is_empty())
+            .then(|| {
+                std::collections::BTreeMap::from([(
+                    node_id.0.clone(),
+                    published
+                        .published_origin_counts
+                        .iter()
+                        .map(|(origin, count)| format!("{origin}={count}"))
+                        .collect::<Vec<_>>(),
+                )])
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -274,6 +459,7 @@ async fn bootstrap_init_source_runtime(
     let _ = stop_source_runtime(state).await;
     state.pending_init = Some((node_id, config));
     state.last_control_frame_signals.clear();
+    *lock_publish_stats(&state.published_stats) = PublishedBatchStats::default();
     eprintln!("fs_meta_source_worker_server: bootstrap_init ok");
 }
 
@@ -321,7 +507,11 @@ async fn bootstrap_start_source_runtime(
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub begin");
         let stream = source.pub_().await?;
         eprintln!("fs_meta_source_worker_server: bootstrap_start pub ok");
-        state.pump_task = Some(start_source_pump_with_stream(stream, boundary));
+        state.pump_task = Some(start_source_pump_with_stream(
+            stream,
+            boundary,
+            state.published_stats.clone(),
+        ));
         eprintln!("fs_meta_source_worker_server: bootstrap_start pump ok");
     }
     eprintln!("fs_meta_source_worker_server: bootstrap_start ok");
@@ -387,6 +577,7 @@ fn plan_worker_request(
                 SourceWorkerResponse::ObservabilitySnapshot(source_observability_snapshot(
                     source,
                     &state.last_control_frame_signals,
+                    &state.published_stats,
                 )),
                 false,
             ),
@@ -597,6 +788,7 @@ pub fn run_source_worker_server(
         pending_init: None,
         pump_task: None,
         last_control_frame_signals: Vec::new(),
+        published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
     }));
     run_worker_sidecar_server::<SourceWorkerRpc, _, SourceConfig>(
         control_socket_path,

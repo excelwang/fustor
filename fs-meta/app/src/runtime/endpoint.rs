@@ -18,6 +18,26 @@ fn debug_source_status_lifecycle_enabled() -> bool {
     })
 }
 
+fn debug_stream_delivery_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_STREAM_DELIVERY")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn summarize_event_origins(events: &[Event]) -> Vec<String> {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for event in events {
+        *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(origin, count)| format!("{origin}={count}"))
+        .collect()
+}
+
 enum EndpointJoin {
     Thread(std::thread::JoinHandle<()>),
 }
@@ -355,6 +375,16 @@ async fn run_stream_loop<F, Fut, G>(
 
         if events.is_empty() {
             continue;
+        }
+
+        if debug_stream_delivery_enabled() {
+            eprintln!(
+                "fs_meta_runtime_endpoint: stream delivery route={} task={} events={} origins={:?}",
+                stream_channel.0,
+                join_name,
+                events.len(),
+                summarize_event_origins(&events)
+            );
         }
 
         handler(events).await;
