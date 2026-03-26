@@ -499,7 +499,12 @@ fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> So
     let mut logical_root_map = BTreeMap::new();
     let mut concrete_root_map = BTreeMap::new();
     let mut degraded_root_map = BTreeMap::new();
+    let mut current_stream_generation = None;
     for snapshot in snapshots {
+        current_stream_generation = std::cmp::max(
+            current_stream_generation,
+            snapshot.current_stream_generation,
+        );
         for entry in snapshot.logical_roots {
             logical_root_map
                 .entry(entry.root_id.clone())
@@ -516,6 +521,7 @@ fn merge_source_status_snapshots(mut snapshots: Vec<SourceStatusSnapshot>) -> So
     }
 
     SourceStatusSnapshot {
+        current_stream_generation,
         logical_roots: logical_root_map.into_values().collect(),
         concrete_roots: concrete_root_map.into_values().collect(),
         degraded_roots: degraded_root_map.into_iter().collect(),
@@ -706,6 +712,7 @@ fn filter_source_status_snapshot(
         return snapshot;
     }
     SourceStatusSnapshot {
+        current_stream_generation: snapshot.current_stream_generation,
         logical_roots: snapshot
             .logical_roots
             .into_iter()
@@ -4045,6 +4052,7 @@ mod tests {
     #[test]
     fn materialized_query_readiness_waits_for_initial_audit_completion() {
         let source_status = SourceStatusSnapshot {
+            current_stream_generation: None,
             logical_roots: Vec::new(),
             concrete_roots: vec![crate::source::SourceConcreteRootHealthSnapshot {
                 root_key: "root-a-key".into(),
@@ -4074,10 +4082,18 @@ mod tests {
                 emitted_path_event_count: 0,
                 last_emitted_at_us: None,
                 last_emitted_origins: Vec::new(),
+                forwarded_batch_count: 0,
+                forwarded_event_count: 0,
+                forwarded_path_event_count: 0,
+                last_forwarded_at_us: None,
+                last_forwarded_origins: Vec::new(),
                 current_revision: None,
+                current_stream_generation: None,
                 candidate_revision: None,
+                candidate_stream_generation: None,
                 candidate_status: None,
                 draining_revision: None,
+                draining_stream_generation: None,
                 draining_status: None,
             }],
             degraded_roots: Vec::new(),
@@ -4120,6 +4136,7 @@ mod tests {
     #[test]
     fn materialized_query_readiness_fail_closed_when_sink_group_missing() {
         let source_status = SourceStatusSnapshot {
+            current_stream_generation: None,
             logical_roots: vec![crate::source::SourceLogicalRootHealthSnapshot {
                 root_id: "root-a".into(),
                 status: "ok".into(),
@@ -4141,6 +4158,7 @@ mod tests {
     #[test]
     fn materialized_query_readiness_ignores_inactive_or_non_scan_groups() {
         let source_status = SourceStatusSnapshot {
+            current_stream_generation: None,
             logical_roots: Vec::new(),
             concrete_roots: vec![
                 crate::source::SourceConcreteRootHealthSnapshot {
@@ -4171,10 +4189,18 @@ mod tests {
                     emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
+                    forwarded_batch_count: 0,
+                    forwarded_event_count: 0,
+                    forwarded_path_event_count: 0,
+                    last_forwarded_at_us: None,
+                    last_forwarded_origins: Vec::new(),
                     current_revision: None,
+                    current_stream_generation: None,
                     candidate_revision: None,
+                    candidate_stream_generation: None,
                     candidate_status: None,
                     draining_revision: None,
+                    draining_stream_generation: None,
                     draining_status: None,
                 },
                 crate::source::SourceConcreteRootHealthSnapshot {
@@ -4205,10 +4231,18 @@ mod tests {
                     emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
+                    forwarded_batch_count: 0,
+                    forwarded_event_count: 0,
+                    forwarded_path_event_count: 0,
+                    last_forwarded_at_us: None,
+                    last_forwarded_origins: Vec::new(),
                     current_revision: None,
+                    current_stream_generation: None,
                     candidate_revision: None,
+                    candidate_stream_generation: None,
                     candidate_status: None,
                     draining_revision: None,
+                    draining_stream_generation: None,
                     draining_status: None,
                 },
             ],
@@ -4221,6 +4255,7 @@ mod tests {
     #[test]
     fn filter_source_status_snapshot_drops_groups_outside_current_roots() {
         let snapshot = SourceStatusSnapshot {
+            current_stream_generation: None,
             logical_roots: vec![
                 crate::source::SourceLogicalRootHealthSnapshot {
                     root_id: "root-a".into(),
@@ -4266,10 +4301,18 @@ mod tests {
                     emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
+                    forwarded_batch_count: 0,
+                    forwarded_event_count: 0,
+                    forwarded_path_event_count: 0,
+                    last_forwarded_at_us: None,
+                    last_forwarded_origins: Vec::new(),
                     current_revision: None,
+                    current_stream_generation: None,
                     candidate_revision: None,
+                    candidate_stream_generation: None,
                     candidate_status: None,
                     draining_revision: None,
+                    draining_stream_generation: None,
                     draining_status: None,
                 },
                 crate::source::SourceConcreteRootHealthSnapshot {
@@ -4300,10 +4343,18 @@ mod tests {
                     emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
+                    forwarded_batch_count: 0,
+                    forwarded_event_count: 0,
+                    forwarded_path_event_count: 0,
+                    last_forwarded_at_us: None,
+                    last_forwarded_origins: Vec::new(),
                     current_revision: None,
+                    current_stream_generation: None,
                     candidate_revision: None,
+                    candidate_stream_generation: None,
                     candidate_status: None,
                     draining_revision: None,
+                    draining_stream_generation: None,
                     draining_status: None,
                 },
             ],
@@ -4327,6 +4378,7 @@ mod tests {
     #[test]
     fn materialized_query_readiness_ignores_stale_source_groups_outside_current_roots() {
         let source_status = SourceStatusSnapshot {
+            current_stream_generation: None,
             logical_roots: vec![
                 crate::source::SourceLogicalRootHealthSnapshot {
                     root_id: "root-a".into(),
@@ -4372,10 +4424,18 @@ mod tests {
                     emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
+                    forwarded_batch_count: 0,
+                    forwarded_event_count: 0,
+                    forwarded_path_event_count: 0,
+                    last_forwarded_at_us: None,
+                    last_forwarded_origins: Vec::new(),
                     current_revision: None,
+                    current_stream_generation: None,
                     candidate_revision: None,
+                    candidate_stream_generation: None,
                     candidate_status: None,
                     draining_revision: None,
+                    draining_stream_generation: None,
                     draining_status: None,
                 },
                 crate::source::SourceConcreteRootHealthSnapshot {
@@ -4406,10 +4466,18 @@ mod tests {
                     emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
+                    forwarded_batch_count: 0,
+                    forwarded_event_count: 0,
+                    forwarded_path_event_count: 0,
+                    last_forwarded_at_us: None,
+                    last_forwarded_origins: Vec::new(),
                     current_revision: None,
+                    current_stream_generation: None,
                     candidate_revision: None,
+                    candidate_stream_generation: None,
                     candidate_status: None,
                     draining_revision: None,
+                    draining_stream_generation: None,
                     draining_status: None,
                 },
             ],

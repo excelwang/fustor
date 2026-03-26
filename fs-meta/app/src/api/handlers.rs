@@ -65,7 +65,7 @@ fn summarize_groups_by_node(
 
 fn summarize_source_status_route_snapshot(snapshot: &SourceObservabilitySnapshot) -> String {
     format!(
-        "primaries={} runners={} source={:?} scan={:?} control={:?} published_batches={:?} published_events={:?} published_origins={:?} published_origin_counts={:?}",
+        "primaries={} runners={} source={:?} scan={:?} control={:?} published_batches={:?} published_events={:?} published_origins={:?} published_origin_counts={:?} enqueued_path_counts={:?} pending_path_counts={:?} yielded_path_counts={:?} summarized_path_counts={:?} published_path_counts={:?}",
         snapshot.source_primary_by_group.len(),
         snapshot.last_force_find_runner_by_group.len(),
         summarize_groups_by_node(&snapshot.scheduled_source_groups_by_node),
@@ -75,6 +75,11 @@ fn summarize_source_status_route_snapshot(snapshot: &SourceObservabilitySnapshot
         snapshot.published_events_by_node,
         summarize_groups_by_node(&snapshot.last_published_origins_by_node),
         summarize_groups_by_node(&snapshot.published_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.enqueued_path_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.pending_path_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.yielded_path_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.summarized_path_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.published_path_origin_counts_by_node),
     )
 }
 
@@ -728,9 +733,14 @@ fn status_source_from_observability(
         last_published_origins_by_node,
         published_origin_counts_by_node,
         published_path_capture_target,
+        enqueued_path_origin_counts_by_node,
+        pending_path_origin_counts_by_node,
+        yielded_path_origin_counts_by_node,
+        summarized_path_origin_counts_by_node,
         published_path_origin_counts_by_node,
     } = source;
     let crate::source::SourceStatusSnapshot {
+        current_stream_generation,
         logical_roots: status_logical_roots,
         concrete_roots,
         degraded_roots,
@@ -785,9 +795,23 @@ fn status_source_from_observability(
                 emitted_path_event_count: entry.emitted_path_event_count,
                 last_emitted_at_us: entry.last_emitted_at_us,
                 last_emitted_origins: entry.last_emitted_origins,
+                forwarded_batch_count: entry.forwarded_batch_count,
+                forwarded_event_count: entry.forwarded_event_count,
+                forwarded_path_event_count: entry.forwarded_path_event_count,
+                last_forwarded_at_us: entry.last_forwarded_at_us,
+                last_forwarded_origins: entry.last_forwarded_origins,
+                current_revision: entry.current_revision,
+                current_stream_generation: entry.current_stream_generation,
+                candidate_revision: entry.candidate_revision,
+                candidate_stream_generation: entry.candidate_stream_generation,
+                candidate_status: entry.candidate_status,
+                draining_revision: entry.draining_revision,
+                draining_stream_generation: entry.draining_stream_generation,
+                draining_status: entry.draining_status,
             })
             .collect(),
         debug: super::types::StatusSourceDebug {
+            current_stream_generation,
             source_primary_by_group,
             last_force_find_runner_by_group,
             last_force_find_runners_by_group: runner_sets,
@@ -803,6 +827,10 @@ fn status_source_from_observability(
             last_published_origins_by_node,
             published_origin_counts_by_node,
             published_path_capture_target,
+            enqueued_path_origin_counts_by_node,
+            pending_path_origin_counts_by_node,
+            yielded_path_origin_counts_by_node,
+            summarized_path_origin_counts_by_node,
             published_path_origin_counts_by_node,
         },
     }
@@ -873,6 +901,10 @@ fn merge_source_observability(
             || !snapshot.last_published_origins_by_node.is_empty()
             || !snapshot.published_origin_counts_by_node.is_empty()
             || snapshot.published_path_capture_target.is_some()
+            || !snapshot.enqueued_path_origin_counts_by_node.is_empty()
+            || !snapshot.pending_path_origin_counts_by_node.is_empty()
+            || !snapshot.yielded_path_origin_counts_by_node.is_empty()
+            || !snapshot.summarized_path_origin_counts_by_node.is_empty()
             || !snapshot.published_path_origin_counts_by_node.is_empty()
     }
 
@@ -1015,6 +1047,30 @@ fn merge_source_observability(
     if merged.published_path_capture_target.is_none() {
         merged.published_path_capture_target = fallback.published_path_capture_target;
     }
+    for (node_id, origins) in fallback.enqueued_path_origin_counts_by_node {
+        merged
+            .enqueued_path_origin_counts_by_node
+            .entry(node_id)
+            .or_insert(origins);
+    }
+    for (node_id, origins) in fallback.pending_path_origin_counts_by_node {
+        merged
+            .pending_path_origin_counts_by_node
+            .entry(node_id)
+            .or_insert(origins);
+    }
+    for (node_id, origins) in fallback.yielded_path_origin_counts_by_node {
+        merged
+            .yielded_path_origin_counts_by_node
+            .entry(node_id)
+            .or_insert(origins);
+    }
+    for (node_id, origins) in fallback.summarized_path_origin_counts_by_node {
+        merged
+            .summarized_path_origin_counts_by_node
+            .entry(node_id)
+            .or_insert(origins);
+    }
     for (node_id, origins) in fallback.published_path_origin_counts_by_node {
         merged
             .published_path_origin_counts_by_node
@@ -1056,6 +1112,10 @@ fn merge_source_observability_snapshots(
             last_published_origins_by_node: BTreeMap::new(),
             published_origin_counts_by_node: BTreeMap::new(),
             published_path_capture_target: None,
+            enqueued_path_origin_counts_by_node: BTreeMap::new(),
+            pending_path_origin_counts_by_node: BTreeMap::new(),
+            yielded_path_origin_counts_by_node: BTreeMap::new(),
+            summarized_path_origin_counts_by_node: BTreeMap::new(),
             published_path_origin_counts_by_node: BTreeMap::new(),
         };
     };
@@ -1141,6 +1201,18 @@ fn merge_source_observability_snapshots(
         if merged.published_path_capture_target.is_none() {
             merged.published_path_capture_target = snapshot.published_path_capture_target;
         }
+        merged
+            .enqueued_path_origin_counts_by_node
+            .extend(snapshot.enqueued_path_origin_counts_by_node);
+        merged
+            .pending_path_origin_counts_by_node
+            .extend(snapshot.pending_path_origin_counts_by_node);
+        merged
+            .yielded_path_origin_counts_by_node
+            .extend(snapshot.yielded_path_origin_counts_by_node);
+        merged
+            .summarized_path_origin_counts_by_node
+            .extend(snapshot.summarized_path_origin_counts_by_node);
         merged
             .published_path_origin_counts_by_node
             .extend(snapshot.published_path_origin_counts_by_node);
@@ -1345,6 +1417,7 @@ mod tests {
             }],
             logical_roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
             status: SourceStatusSnapshot {
+                current_stream_generation: Some(11),
                 logical_roots: vec![SourceLogicalRootHealthSnapshot {
                     root_id: "nfs1".to_string(),
                     status: "healthy".to_string(),
@@ -1380,10 +1453,18 @@ mod tests {
                     emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
+                    forwarded_batch_count: 0,
+                    forwarded_event_count: 0,
+                    forwarded_path_event_count: 0,
+                    last_forwarded_at_us: None,
+                    last_forwarded_origins: Vec::new(),
                     current_revision: Some(1),
+                    current_stream_generation: Some(11),
                     candidate_revision: None,
+                    candidate_stream_generation: None,
                     candidate_status: None,
                     draining_revision: None,
+                    draining_stream_generation: None,
                     draining_status: None,
                 }],
                 degraded_roots: Vec::new(),
@@ -1411,6 +1492,10 @@ mod tests {
             last_published_origins_by_node: BTreeMap::new(),
             published_origin_counts_by_node: BTreeMap::new(),
             published_path_capture_target: None,
+            enqueued_path_origin_counts_by_node: BTreeMap::new(),
+            pending_path_origin_counts_by_node: BTreeMap::new(),
+            yielded_path_origin_counts_by_node: BTreeMap::new(),
+            summarized_path_origin_counts_by_node: BTreeMap::new(),
             published_path_origin_counts_by_node: BTreeMap::new(),
         }
     }
@@ -1440,6 +1525,77 @@ mod tests {
             }],
             ..SinkStatusSnapshot::default()
         }
+    }
+
+    #[test]
+    fn status_source_from_observability_preserves_debug_path_origin_counts() {
+        let source = SourceObservabilitySnapshot {
+            enqueued_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs2=15".to_string()],
+            )]),
+            pending_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs2=3".to_string()],
+            )]),
+            yielded_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs2=12".to_string()],
+            )]),
+            summarized_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs2=7".to_string()],
+            )]),
+            published_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=5".to_string()],
+            )]),
+            ..local_source_snapshot()
+        };
+
+        let status = status_source_from_observability(source, BTreeMap::new(), Vec::new());
+
+        assert_eq!(
+            status.debug.enqueued_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs2=15".to_string()])
+        );
+        assert_eq!(
+            status.debug.pending_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs2=3".to_string()])
+        );
+        assert_eq!(
+            status.debug.yielded_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs2=12".to_string()])
+        );
+        assert_eq!(
+            status
+                .debug
+                .summarized_path_origin_counts_by_node
+                .get("node-a"),
+            Some(&vec!["node-a::nfs2=7".to_string()])
+        );
+        assert_eq!(
+            status.debug.published_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=5".to_string()])
+        );
+    }
+
+    #[test]
+    fn status_source_from_observability_preserves_concrete_root_transition_fields() {
+        let status = status_source_from_observability(local_source_snapshot(), BTreeMap::new(), Vec::new());
+
+        assert_eq!(status.debug.current_stream_generation, Some(11));
+        let root = status
+            .concrete_roots
+            .iter()
+            .find(|entry| entry.object_ref == "node-a::nfs1")
+            .expect("concrete root present");
+        assert_eq!(root.current_revision, Some(1));
+        assert_eq!(root.current_stream_generation, Some(11));
+        assert_eq!(root.candidate_revision, None);
+        assert_eq!(root.candidate_stream_generation, None);
+        assert_eq!(root.draining_revision, None);
+        assert_eq!(root.draining_stream_generation, None);
     }
 
     #[tokio::test]
@@ -1608,6 +1764,16 @@ mod tests {
             last_published_origins_by_node: BTreeMap::new(),
             published_origin_counts_by_node: BTreeMap::new(),
             published_path_capture_target: None,
+            enqueued_path_origin_counts_by_node: BTreeMap::new(),
+            pending_path_origin_counts_by_node: BTreeMap::new(),
+            yielded_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=19".to_string()],
+            )]),
+            summarized_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=13".to_string()],
+            )]),
             published_path_origin_counts_by_node: BTreeMap::new(),
         };
         let aggregated = SourceObservabilitySnapshot {
@@ -1630,6 +1796,7 @@ mod tests {
             }],
             logical_roots: vec![RootSpec::new("nfs2", "/mnt/nfs2")],
             status: SourceStatusSnapshot {
+                current_stream_generation: Some(13),
                 logical_roots: vec![SourceLogicalRootHealthSnapshot {
                     root_id: "nfs2".to_string(),
                     status: "healthy".to_string(),
@@ -1665,10 +1832,18 @@ mod tests {
                     emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
+                    forwarded_batch_count: 0,
+                    forwarded_event_count: 0,
+                    forwarded_path_event_count: 0,
+                    last_forwarded_at_us: None,
+                    last_forwarded_origins: Vec::new(),
                     current_revision: Some(1),
+                    current_stream_generation: Some(13),
                     candidate_revision: None,
+                    candidate_stream_generation: None,
                     candidate_status: None,
                     draining_revision: None,
+                    draining_stream_generation: None,
                     draining_status: None,
                 }],
                 degraded_roots: Vec::new(),
@@ -1705,6 +1880,22 @@ mod tests {
                 vec!["node-b::nfs2=77".to_string()],
             )]),
             published_path_capture_target: None,
+            enqueued_path_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=31".to_string()],
+            )]),
+            pending_path_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=2".to_string()],
+            )]),
+            yielded_path_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=29".to_string()],
+            )]),
+            summarized_path_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=23".to_string()],
+            )]),
             published_path_origin_counts_by_node: BTreeMap::new(),
         };
 
@@ -1751,6 +1942,30 @@ mod tests {
             merged.published_origin_counts_by_node.get("node-b"),
             Some(&vec!["node-b::nfs2=77".to_string()])
         );
+        assert_eq!(
+            merged.yielded_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=19".to_string()])
+        );
+        assert_eq!(
+            merged.yielded_path_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=29".to_string()])
+        );
+        assert_eq!(
+            merged.enqueued_path_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=31".to_string()])
+        );
+        assert_eq!(
+            merged.pending_path_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=2".to_string()])
+        );
+        assert_eq!(
+            merged.summarized_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=13".to_string()])
+        );
+        assert_eq!(
+            merged.summarized_path_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=23".to_string()])
+        );
         assert_eq!(merged.force_find_inflight_groups, vec!["nfs2".to_string()]);
     }
 
@@ -1791,6 +2006,22 @@ mod tests {
                 vec!["node-a::nfs1=111".to_string()],
             )]),
             published_path_capture_target: None,
+            enqueued_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=11".to_string()],
+            )]),
+            pending_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=2".to_string()],
+            )]),
+            yielded_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=9".to_string()],
+            )]),
+            summarized_path_origin_counts_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["node-a::nfs1=7".to_string()],
+            )]),
             published_path_origin_counts_by_node: BTreeMap::new(),
         };
         let node_b = SourceObservabilitySnapshot {
@@ -1828,6 +2059,22 @@ mod tests {
                 vec!["node-b::nfs2=222".to_string()],
             )]),
             published_path_capture_target: None,
+            enqueued_path_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=12".to_string()],
+            )]),
+            pending_path_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=2".to_string()],
+            )]),
+            yielded_path_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=10".to_string()],
+            )]),
+            summarized_path_origin_counts_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["node-b::nfs2=8".to_string()],
+            )]),
             published_path_origin_counts_by_node: BTreeMap::new(),
         };
 
@@ -1860,6 +2107,38 @@ mod tests {
         assert_eq!(
             merged.published_origin_counts_by_node.get("node-b"),
             Some(&vec!["node-b::nfs2=222".to_string()])
+        );
+        assert_eq!(
+            merged.enqueued_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=11".to_string()])
+        );
+        assert_eq!(
+            merged.enqueued_path_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=12".to_string()])
+        );
+        assert_eq!(
+            merged.pending_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=2".to_string()])
+        );
+        assert_eq!(
+            merged.pending_path_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=2".to_string()])
+        );
+        assert_eq!(
+            merged.yielded_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=9".to_string()])
+        );
+        assert_eq!(
+            merged.yielded_path_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=10".to_string()])
+        );
+        assert_eq!(
+            merged.summarized_path_origin_counts_by_node.get("node-a"),
+            Some(&vec!["node-a::nfs1=7".to_string()])
+        );
+        assert_eq!(
+            merged.summarized_path_origin_counts_by_node.get("node-b"),
+            Some(&vec!["node-b::nfs2=8".to_string()])
         );
     }
 }

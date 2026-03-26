@@ -97,6 +97,19 @@ pub struct StatusSourceConcreteRoot {
     pub emitted_path_event_count: u64,
     pub last_emitted_at_us: Option<u64>,
     pub last_emitted_origins: Vec<String>,
+    pub forwarded_batch_count: u64,
+    pub forwarded_event_count: u64,
+    pub forwarded_path_event_count: u64,
+    pub last_forwarded_at_us: Option<u64>,
+    pub last_forwarded_origins: Vec<String>,
+    pub current_revision: Option<u64>,
+    pub current_stream_generation: Option<u64>,
+    pub candidate_revision: Option<u64>,
+    pub candidate_stream_generation: Option<u64>,
+    pub candidate_status: Option<String>,
+    pub draining_revision: Option<u64>,
+    pub draining_stream_generation: Option<u64>,
+    pub draining_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -113,6 +126,7 @@ pub struct StatusSource {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusSourceDebug {
+    pub current_stream_generation: Option<u64>,
     pub source_primary_by_group: BTreeMap<String, String>,
     pub last_force_find_runner_by_group: BTreeMap<String, String>,
     pub last_force_find_runners_by_group: BTreeMap<String, Vec<String>>,
@@ -128,6 +142,10 @@ pub struct StatusSourceDebug {
     pub last_published_origins_by_node: BTreeMap<String, Vec<String>>,
     pub published_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub published_path_capture_target: Option<String>,
+    pub enqueued_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub pending_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub yielded_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub summarized_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub published_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
 }
 

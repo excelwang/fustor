@@ -422,8 +422,13 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
     let mut node_a_source_published_events = 0u64;
     let mut node_a_source_published_control = 0u64;
     let mut node_a_source_published_data = 0u64;
+    let mut node_a_source_current_stream_generation = None::<u64>;
     let mut node_a_source_published_origins = Vec::<String>::new();
     let mut node_a_source_published_origin_counts = Vec::<String>::new();
+    let mut node_a_source_enqueued_path_origin_counts = Vec::<String>::new();
+    let mut node_a_source_pending_path_origin_counts = Vec::<String>::new();
+    let mut node_a_source_yielded_path_origin_counts = Vec::<String>::new();
+    let mut node_a_source_summarized_path_origin_counts = Vec::<String>::new();
     let mut node_a_source_published_path_origin_counts = Vec::<String>::new();
     let mut node_a_sink_received_batches = 0u64;
     let mut node_a_sink_received_events = 0u64;
@@ -536,6 +541,11 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 "published_data_events_by_node",
                 &node_a_id,
             );
+            node_a_source_current_stream_generation = status
+                .get("source")
+                .and_then(|source| source.get("debug"))
+                .and_then(|debug| debug.get("current_stream_generation"))
+                .and_then(Value::as_u64);
             node_a_source_published_origins = status_debug_strings_by_node(
                 &status,
                 "source",
@@ -546,6 +556,30 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 &status,
                 "source",
                 "published_origin_counts_by_node",
+                &node_a_id,
+            );
+            node_a_source_enqueued_path_origin_counts = status_debug_strings_by_node(
+                &status,
+                "source",
+                "enqueued_path_origin_counts_by_node",
+                &node_a_id,
+            );
+            node_a_source_pending_path_origin_counts = status_debug_strings_by_node(
+                &status,
+                "source",
+                "pending_path_origin_counts_by_node",
+                &node_a_id,
+            );
+            node_a_source_yielded_path_origin_counts = status_debug_strings_by_node(
+                &status,
+                "source",
+                "yielded_path_origin_counts_by_node",
+                &node_a_id,
+            );
+            node_a_source_summarized_path_origin_counts = status_debug_strings_by_node(
+                &status,
+                "source",
+                "summarized_path_origin_counts_by_node",
                 &node_a_id,
             );
             node_a_source_published_path_origin_counts = status_debug_strings_by_node(
@@ -609,14 +643,119 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 return Ok(true);
             }
             Err(format!(
-                "nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
+                "nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_current_stream_generation={node_a_source_current_stream_generation:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_enqueued_path_origin_counts={node_a_source_enqueued_path_origin_counts:?} source_pending_path_origin_counts={node_a_source_pending_path_origin_counts:?} source_yielded_path_origin_counts={node_a_source_yielded_path_origin_counts:?} source_summarized_path_origin_counts={node_a_source_summarized_path_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
             ))
         },
     )?;
 
     eprintln!(
-        "[fs-meta-api-ops] activation-scope-preserved nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
+        "[fs-meta-api-ops] activation-scope-preserved nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_current_stream_generation={node_a_source_current_stream_generation:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_enqueued_path_origin_counts={node_a_source_enqueued_path_origin_counts:?} source_pending_path_origin_counts={node_a_source_pending_path_origin_counts:?} source_yielded_path_origin_counts={node_a_source_yielded_path_origin_counts:?} source_summarized_path_origin_counts={node_a_source_summarized_path_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
     );
+    if let Some(window_secs) = debug_publish_lag_window_secs() {
+        let mut late_path_counts = node_a_source_published_path_origin_counts.clone();
+        let mut late_nfs2_nodes = nfs2_nodes;
+        let mut late_published_events = node_a_source_published_events;
+        let mut late_published_data = node_a_source_published_data;
+        let mut late_last_published_at_us = 0u64;
+        let initial_nfs1_path_count =
+            published_origin_count(&node_a_source_published_path_origin_counts, &node_a_nfs1_object_ref);
+        let initial_nfs2_path_count =
+            published_origin_count(&node_a_source_published_path_origin_counts, &node_a_nfs2_object_ref);
+        let initial_nfs1_emitted_path_events = source_concrete_root_field_u64(
+            &mut harness.session,
+            &node_a_nfs1_object_ref,
+            "emitted_path_event_count",
+        )?;
+        let initial_nfs2_emitted_path_events = source_concrete_root_field_u64(
+            &mut harness.session,
+            &node_a_nfs2_object_ref,
+            "emitted_path_event_count",
+        )?;
+        let initial_nfs1_transition = source_concrete_root_transition_snapshot(
+            &mut harness.session,
+            &node_a_nfs1_object_ref,
+        )?;
+        let initial_nfs2_transition = source_concrete_root_transition_snapshot(
+            &mut harness.session,
+            &node_a_nfs2_object_ref,
+        )?;
+        let mut late_nfs1_emitted_path_events = initial_nfs1_emitted_path_events;
+        let mut late_nfs2_emitted_path_events = initial_nfs2_emitted_path_events;
+        let mut late_nfs1_transition = initial_nfs1_transition.clone();
+        let mut late_nfs2_transition = initial_nfs2_transition.clone();
+        let mut saw_late_publish = published_origin_counts_include(
+            &late_path_counts,
+            &node_a_nfs2_object_ref,
+        );
+        let mut saw_late_tree = late_nfs2_nodes > 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(window_secs);
+        while std::time::Instant::now() < deadline {
+            let tree = harness.session.tree(&[
+                ("path", "/force-find-stress".to_string()),
+                ("recursive", "true".to_string()),
+            ])?;
+            late_nfs2_nodes = group_total_nodes(&tree, "nfs2");
+            let status = harness.session.status()?;
+            late_published_events = status_debug_u64_by_node(
+                &status,
+                "source",
+                "published_events_by_node",
+                &node_a_id,
+            );
+            late_published_data = status_debug_u64_by_node(
+                &status,
+                "source",
+                "published_data_events_by_node",
+                &node_a_id,
+            );
+            late_last_published_at_us = status_debug_u64_by_node(
+                &status,
+                "source",
+                "last_published_at_us_by_node",
+                &node_a_id,
+            );
+            late_nfs1_emitted_path_events = source_concrete_root_field_u64(
+                &mut harness.session,
+                &node_a_nfs1_object_ref,
+                "emitted_path_event_count",
+            )?;
+            late_nfs2_emitted_path_events = source_concrete_root_field_u64(
+                &mut harness.session,
+                &node_a_nfs2_object_ref,
+                "emitted_path_event_count",
+            )?;
+            late_nfs1_transition = source_concrete_root_transition_snapshot(
+                &mut harness.session,
+                &node_a_nfs1_object_ref,
+            )?;
+            late_nfs2_transition = source_concrete_root_transition_snapshot(
+                &mut harness.session,
+                &node_a_nfs2_object_ref,
+            )?;
+            late_path_counts = status_debug_strings_by_node(
+                &status,
+                "source",
+                "published_path_origin_counts_by_node",
+                &node_a_id,
+            );
+            saw_late_publish =
+                published_origin_counts_include(&late_path_counts, &node_a_nfs2_object_ref);
+            saw_late_tree = late_nfs2_nodes > 0;
+            if saw_late_publish || saw_late_tree {
+                break;
+            }
+            thread::sleep(Duration::from_millis(250));
+        }
+        let late_nfs1_path_count = published_origin_count(&late_path_counts, &node_a_nfs1_object_ref);
+        let late_nfs2_path_count = published_origin_count(&late_path_counts, &node_a_nfs2_object_ref);
+        eprintln!(
+            "[fs-meta-api-ops] activation-scope-preserved-lag-window window_secs={window_secs} saw_late_publish={saw_late_publish} saw_late_tree={saw_late_tree} initial_published_events={node_a_source_published_events} initial_published_data={node_a_source_published_data} late_published_events={late_published_events} late_published_data={late_published_data} late_last_published_at_us={late_last_published_at_us} initial_nfs1_path_count={initial_nfs1_path_count} late_nfs1_path_count={late_nfs1_path_count} initial_nfs2_path_count={initial_nfs2_path_count} late_nfs2_path_count={late_nfs2_path_count} initial_nfs1_emitted_path_events={initial_nfs1_emitted_path_events} late_nfs1_emitted_path_events={late_nfs1_emitted_path_events} initial_nfs2_emitted_path_events={initial_nfs2_emitted_path_events} late_nfs2_emitted_path_events={late_nfs2_emitted_path_events} initial_nfs1_transition={} late_nfs1_transition={} initial_nfs2_transition={} late_nfs2_transition={} initial_path_counts={node_a_source_published_path_origin_counts:?} late_path_counts={late_path_counts:?} initial_nfs2_nodes={nfs2_nodes} late_nfs2_nodes={late_nfs2_nodes}",
+            initial_nfs1_transition.summary(),
+            late_nfs1_transition.summary(),
+            initial_nfs2_transition.summary(),
+            late_nfs2_transition.summary()
+        );
+    }
     assert!(
         node_a_sink.contains("nfs2"),
         "preserved failing shape should still show node-a sink coverage for nfs2 before first force-find: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
@@ -1343,6 +1482,79 @@ fn status_debug_u64_by_node(
         .unwrap_or_default()
 }
 
+fn debug_publish_lag_window_secs() -> Option<u64> {
+    std::env::var("FSMETA_DEBUG_PUBLISH_LAG_WINDOW_SECS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+}
+
+fn published_origin_counts_include(entries: &[String], object_ref: &str) -> bool {
+    let prefix = format!("{object_ref}=");
+    entries.iter().any(|entry| entry.starts_with(&prefix))
+}
+
+fn published_origin_count(entries: &[String], object_ref: &str) -> u64 {
+    let prefix = format!("{object_ref}=");
+    entries
+        .iter()
+        .find_map(|entry| {
+            let value = entry.strip_prefix(&prefix)?;
+            value.parse::<u64>().ok()
+        })
+        .unwrap_or_default()
+}
+
+#[derive(Clone, Debug, Default)]
+struct ConcreteRootTransitionSnapshot {
+    status: String,
+    rescan_pending: bool,
+    overflow_pending: bool,
+    last_rescan_reason: Option<String>,
+    last_audit_completed_at_us: Option<u64>,
+    emitted_event_count: u64,
+    emitted_path_event_count: u64,
+    last_emitted_at_us: Option<u64>,
+    forwarded_event_count: u64,
+    forwarded_path_event_count: u64,
+    last_forwarded_at_us: Option<u64>,
+    current_revision: Option<u64>,
+    current_stream_generation: Option<u64>,
+    candidate_revision: Option<u64>,
+    candidate_stream_generation: Option<u64>,
+    candidate_status: Option<String>,
+    draining_revision: Option<u64>,
+    draining_stream_generation: Option<u64>,
+    draining_status: Option<String>,
+}
+
+impl ConcreteRootTransitionSnapshot {
+    fn summary(&self) -> String {
+        format!(
+            "status={} rescan_pending={} overflow_pending={} last_rescan_reason={:?} last_audit_completed_at_us={:?} emitted_event_count={} emitted_path_event_count={} last_emitted_at_us={:?} forwarded_event_count={} forwarded_path_event_count={} last_forwarded_at_us={:?} current_revision={:?} current_stream_generation={:?} candidate_revision={:?} candidate_stream_generation={:?} candidate_status={:?} draining_revision={:?} draining_stream_generation={:?} draining_status={:?}",
+            self.status,
+            self.rescan_pending,
+            self.overflow_pending,
+            self.last_rescan_reason,
+            self.last_audit_completed_at_us,
+            self.emitted_event_count,
+            self.emitted_path_event_count,
+            self.last_emitted_at_us,
+            self.forwarded_event_count,
+            self.forwarded_path_event_count,
+            self.last_forwarded_at_us,
+            self.current_revision,
+            self.current_stream_generation,
+            self.candidate_revision,
+            self.candidate_stream_generation,
+            self.candidate_status,
+            self.draining_revision,
+            self.draining_stream_generation,
+            self.draining_status
+        )
+    }
+}
+
 fn source_logical_root_summary(
     session: &mut OperatorSession,
     root_id: &str,
@@ -1395,7 +1607,7 @@ fn source_concrete_root_summaries(
             })
         {
             summaries.push(format!(
-                "object_ref={} status={} coverage_mode={} watch_enabled={} scan_enabled={} is_group_primary={} active={} rescan_pending={} overflow_pending={} last_rescan_reason={:?} last_audit_started_at_us={:?} last_audit_completed_at_us={:?} emitted_batch_count={:?} emitted_event_count={:?} emitted_control_event_count={:?} emitted_data_event_count={:?} emitted_path_capture_target={:?} emitted_path_event_count={:?} last_emitted_at_us={:?} last_emitted_origins={:?} current_revision={:?} candidate_revision={:?} draining_revision={:?} last_error={:?}",
+                "object_ref={} status={} coverage_mode={} watch_enabled={} scan_enabled={} is_group_primary={} active={} rescan_pending={} overflow_pending={} last_rescan_reason={:?} last_audit_started_at_us={:?} last_audit_completed_at_us={:?} emitted_batch_count={:?} emitted_event_count={:?} emitted_control_event_count={:?} emitted_data_event_count={:?} emitted_path_capture_target={:?} emitted_path_event_count={:?} last_emitted_at_us={:?} last_emitted_origins={:?} forwarded_batch_count={:?} forwarded_event_count={:?} forwarded_path_event_count={:?} last_forwarded_at_us={:?} last_forwarded_origins={:?} current_revision={:?} current_stream_generation={:?} candidate_revision={:?} candidate_stream_generation={:?} draining_revision={:?} draining_stream_generation={:?} last_error={:?}",
                 object_ref,
                 root.get("status").and_then(Value::as_str).unwrap_or("<missing>"),
                 root.get("coverage_mode")
@@ -1438,15 +1650,149 @@ fn source_concrete_root_summaries(
                     .unwrap_or(Value::Null),
                 root.get("last_emitted_at_us").cloned().unwrap_or(Value::Null),
                 root.get("last_emitted_origins").cloned().unwrap_or(Value::Null),
+                root.get("forwarded_batch_count").cloned().unwrap_or(Value::Null),
+                root.get("forwarded_event_count").cloned().unwrap_or(Value::Null),
+                root.get("forwarded_path_event_count")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                root.get("last_forwarded_at_us")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                root.get("last_forwarded_origins")
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 root.get("current_revision").cloned().unwrap_or(Value::Null),
+                root.get("current_stream_generation")
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 root.get("candidate_revision").cloned().unwrap_or(Value::Null),
+                root.get("candidate_stream_generation")
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 root.get("draining_revision").cloned().unwrap_or(Value::Null),
+                root.get("draining_stream_generation")
+                    .cloned()
+                    .unwrap_or(Value::Null),
                 root.get("last_error").cloned().unwrap_or(Value::Null)
             ));
         }
     }
     summaries.sort();
     Ok(summaries)
+}
+
+fn source_concrete_root_field_u64(
+    session: &mut OperatorSession,
+    object_ref: &str,
+    field: &str,
+) -> Result<u64, String> {
+    for status in session.status_all()? {
+        if let Some(value) = status
+            .get("source")
+            .and_then(|source| source.get("concrete_roots"))
+            .and_then(Value::as_array)
+            .and_then(|roots| {
+                roots.iter().find(|root| {
+                    root.get("object_ref").and_then(Value::as_str) == Some(object_ref)
+                })
+            })
+            .and_then(|root| root.get(field))
+            .and_then(Value::as_u64)
+        {
+            return Ok(value);
+        }
+    }
+    Ok(0)
+}
+
+fn source_concrete_root_transition_snapshot(
+    session: &mut OperatorSession,
+    object_ref: &str,
+) -> Result<ConcreteRootTransitionSnapshot, String> {
+    for status in session.status_all()? {
+        if let Some(root) = status
+            .get("source")
+            .and_then(|source| source.get("concrete_roots"))
+            .and_then(Value::as_array)
+            .and_then(|roots| {
+                roots.iter().find(|root| {
+                    root.get("object_ref").and_then(Value::as_str) == Some(object_ref)
+                })
+            })
+        {
+            return Ok(ConcreteRootTransitionSnapshot {
+                status: root
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("<missing>")
+                    .to_string(),
+                rescan_pending: root
+                    .get("rescan_pending")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                overflow_pending: root
+                    .get("overflow_pending")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                last_rescan_reason: root
+                    .get("last_rescan_reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                last_audit_completed_at_us: root
+                    .get("last_audit_completed_at_us")
+                    .and_then(Value::as_u64),
+                emitted_event_count: root
+                    .get("emitted_event_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                emitted_path_event_count: root
+                    .get("emitted_path_event_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                last_emitted_at_us: root
+                    .get("last_emitted_at_us")
+                    .and_then(Value::as_u64),
+                forwarded_event_count: root
+                    .get("forwarded_event_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                forwarded_path_event_count: root
+                    .get("forwarded_path_event_count")
+                    .and_then(Value::as_u64)
+                    .unwrap_or_default(),
+                last_forwarded_at_us: root
+                    .get("last_forwarded_at_us")
+                    .and_then(Value::as_u64),
+                current_revision: root
+                    .get("current_revision")
+                    .and_then(Value::as_u64),
+                current_stream_generation: root
+                    .get("current_stream_generation")
+                    .and_then(Value::as_u64),
+                candidate_revision: root
+                    .get("candidate_revision")
+                    .and_then(Value::as_u64),
+                candidate_stream_generation: root
+                    .get("candidate_stream_generation")
+                    .and_then(Value::as_u64),
+                candidate_status: root
+                    .get("candidate_status")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                draining_revision: root
+                    .get("draining_revision")
+                    .and_then(Value::as_u64),
+                draining_stream_generation: root
+                    .get("draining_stream_generation")
+                    .and_then(Value::as_u64),
+                draining_status: root
+                    .get("draining_status")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+    }
+    Ok(ConcreteRootTransitionSnapshot::default())
 }
 
 fn source_primary_for_group(

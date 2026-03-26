@@ -47,6 +47,7 @@ struct PublishedBatchStats {
     last_published_at_us: Option<u64>,
     last_published_origins: Vec<String>,
     published_origin_counts: std::collections::BTreeMap<String, u64>,
+    summarized_path_origin_counts: std::collections::BTreeMap<String, u64>,
     published_path_origin_counts: std::collections::BTreeMap<String, u64>,
 }
 
@@ -236,7 +237,27 @@ fn lock_publish_stats<'a>(
     }
 }
 
-fn summarize_published_batch(batch: &[Event]) -> PublishedBatchUpdate {
+fn published_path_origin_counts_for_target(
+    batch: &[Event],
+    path_capture_target: Option<&[u8]>,
+) -> std::collections::BTreeMap<String, u64> {
+    path_capture_target
+        .map(|target| {
+            summarize_published_batch_path_counts(batch, target)
+                .into_iter()
+                .filter_map(|entry| {
+                    let (origin, count) = entry.rsplit_once('=')?;
+                    Some((origin.to_string(), count.parse::<u64>().ok()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn summarize_published_batch_with_target(
+    batch: &[Event],
+    path_capture_target: Option<&[u8]>,
+) -> PublishedBatchUpdate {
     let mut control = 0u64;
     let mut data = 0u64;
     let mut last_published_at_us = None::<u64>;
@@ -265,19 +286,15 @@ fn summarize_published_batch(batch: &[Event]) -> PublishedBatchUpdate {
                 acc
             },
         ),
-        published_path_origin_counts: debug_stream_path_capture_target()
-            .as_deref()
-            .map(|target| {
-                summarize_published_batch_path_counts(batch, target)
-                    .into_iter()
-                    .filter_map(|entry| {
-                        let (origin, count) = entry.rsplit_once('=')?;
-                        Some((origin.to_string(), count.parse::<u64>().ok()?))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
+        published_path_origin_counts: published_path_origin_counts_for_target(
+            batch,
+            path_capture_target,
+        ),
     }
+}
+
+fn summarize_published_batch(batch: &[Event]) -> PublishedBatchUpdate {
+    summarize_published_batch_with_target(batch, debug_stream_path_capture_target().as_deref())
 }
 
 fn update_published_stats(
@@ -301,6 +318,19 @@ fn update_published_stats(
     for (origin, count) in &update.published_path_origin_counts {
         *guard
             .published_path_origin_counts
+            .entry(origin.clone())
+            .or_default() += *count;
+    }
+}
+
+fn record_summarized_path_stats(
+    stats: &Arc<StdMutex<PublishedBatchStats>>,
+    update: &PublishedBatchUpdate,
+) {
+    let mut guard = lock_publish_stats(stats);
+    for (origin, count) in &update.published_path_origin_counts {
+        *guard
+            .summarized_path_origin_counts
             .entry(origin.clone())
             .or_default() += *count;
     }
@@ -396,6 +426,7 @@ where
                 );
                 break;
             }
+            record_summarized_path_stats(&published_stats, &publish_update);
             update_published_stats(&published_stats, &publish_update);
             if let Some(summary) = &summary {
                 eprintln!(
@@ -428,6 +459,9 @@ fn source_observability_snapshot(
 ) -> SourceObservabilitySnapshot {
     let node_id = source.node_id();
     let published = lock_publish_stats(published_stats);
+    let enqueued_path_origin_counts = source.enqueued_path_origin_counts_snapshot();
+    let pending_path_origin_counts = source.pending_path_origin_counts_snapshot();
+    let yielded_path_origin_counts = source.yielded_path_origin_counts_snapshot();
     SourceObservabilitySnapshot {
         lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
         host_object_grants_version: source.host_object_grants_version_snapshot(),
@@ -501,6 +535,51 @@ fn source_observability_snapshot(
             .unwrap_or_default(),
         published_path_capture_target: debug_stream_path_capture_target()
             .map(|target| String::from_utf8_lossy(&target).into_owned()),
+        enqueued_path_origin_counts_by_node: (!enqueued_path_origin_counts.is_empty())
+            .then(|| {
+                std::collections::BTreeMap::from([(
+                    node_id.0.clone(),
+                    enqueued_path_origin_counts
+                        .iter()
+                        .map(|(origin, count)| format!("{origin}={count}"))
+                        .collect::<Vec<_>>(),
+                )])
+            })
+            .unwrap_or_default(),
+        pending_path_origin_counts_by_node: (!pending_path_origin_counts.is_empty())
+            .then(|| {
+                std::collections::BTreeMap::from([(
+                    node_id.0.clone(),
+                    pending_path_origin_counts
+                        .iter()
+                        .map(|(origin, count)| format!("{origin}={count}"))
+                        .collect::<Vec<_>>(),
+                )])
+            })
+            .unwrap_or_default(),
+        yielded_path_origin_counts_by_node: (!yielded_path_origin_counts.is_empty())
+            .then(|| {
+                std::collections::BTreeMap::from([(
+                    node_id.0.clone(),
+                    yielded_path_origin_counts
+                        .iter()
+                        .map(|(origin, count)| format!("{origin}={count}"))
+                        .collect::<Vec<_>>(),
+                )])
+            })
+            .unwrap_or_default(),
+        summarized_path_origin_counts_by_node: (!published.summarized_path_origin_counts.is_empty())
+            .then(|| {
+                std::collections::BTreeMap::from([(
+                    node_id.0.clone(),
+                    published
+                        .summarized_path_origin_counts
+                        .iter()
+                        .map(|(origin, count)| format!("{origin}={count}"))
+                        .collect::<Vec<_>>(),
+                )])
+            })
+            .unwrap_or_default(),
         published_path_origin_counts_by_node: (!published.published_path_origin_counts.is_empty())
             .then(|| {
                 std::collections::BTreeMap::from([(
@@ -980,5 +1059,241 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
         let mut guard = self.state.lock().await;
         stop_source_runtime(&mut guard).await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    use futures_util::StreamExt;
+    use tempfile::tempdir;
+
+    use crate::source::config::GrantedMountRoot;
+    use crate::source::config::RootSpec;
+
+    fn test_root(id: &str, path: PathBuf) -> RootSpec {
+        let mut root = RootSpec::new(id, path);
+        root.watch = false;
+        root.scan = true;
+        root
+    }
+
+    fn test_export(object_ref: &str, mount_point: PathBuf) -> GrantedMountRoot {
+        GrantedMountRoot {
+            object_ref: object_ref.to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "10.0.0.11".to_string(),
+            host_name: None,
+            site: None,
+            zone: None,
+            host_labels: Default::default(),
+            mount_point,
+            fs_source: object_ref.to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: vec![],
+            interfaces: vec![],
+            active: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn published_path_accounting_counts_newly_seeded_subtree_for_each_primary_root() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("data")).expect("create nfs1 data dir");
+        std::fs::create_dir_all(nfs2.join("data")).expect("create nfs2 data dir");
+        std::fs::write(nfs1.join("data").join("a.txt"), b"a").expect("seed nfs1 data");
+        std::fs::write(nfs2.join("data").join("b.txt"), b"b").expect("seed nfs2 data");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_root("nfs1", nfs1.clone()),
+                test_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1.clone()),
+                test_export("node-a::nfs2", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut initial_counts = std::collections::BTreeMap::<String, usize>::new();
+        while tokio::time::Instant::now() < initial_deadline {
+            let Some(batch) = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .expect("initial batch wait should not time out")
+            else {
+                break;
+            };
+            for event in batch {
+                if rmp_serde::from_slice::<crate::ControlEvent>(event.payload_bytes()).is_ok() {
+                    continue;
+                }
+                *initial_counts
+                    .entry(event.metadata().origin_id.0.clone())
+                    .or_insert(0) += 1;
+            }
+            if ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| initial_counts.get(*origin).copied().unwrap_or(0) > 0)
+            {
+                break;
+            }
+        }
+        assert!(
+            ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| initial_counts.get(*origin).copied().unwrap_or(0) > 0),
+            "initial stream should emit baseline data for both primary roots: {initial_counts:?}"
+        );
+
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 subtree");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 subtree");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"aa")
+            .expect("seed nfs1 subtree");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"bb")
+            .expect("seed nfs2 subtree");
+        source
+            .publish_manual_rescan_signal()
+            .await
+            .expect("publish manual rescan");
+
+        let force_find_target = b"/force-find-stress";
+        let published_stats = Arc::new(StdMutex::new(PublishedBatchStats::default()));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            let batch = match tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+            {
+                Ok(Some(batch)) => batch,
+                Ok(None) => break,
+                Err(_) => continue,
+            };
+            let update = summarize_published_batch_with_target(&batch, Some(force_find_target));
+            update_published_stats(&published_stats, &update);
+
+            let guard = lock_publish_stats(&published_stats);
+            let ready = ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| guard.published_path_origin_counts.get(*origin).copied().unwrap_or(0) > 0);
+            drop(guard);
+            if ready {
+                break;
+            }
+        }
+
+        source.close().await.expect("close source");
+
+        let published_counts = lock_publish_stats(&published_stats)
+            .published_path_origin_counts
+            .clone();
+        assert!(
+            published_counts.get("node-a::nfs1").copied().unwrap_or(0) > 0,
+            "published-path accounting should include newly seeded subtree for nfs1: {published_counts:?}"
+        );
+        assert!(
+            published_counts.get("node-a::nfs2").copied().unwrap_or(0) > 0,
+            "published-path accounting should include newly seeded subtree for nfs2: {published_counts:?}"
+        );
+    }
+
+    #[test]
+    fn observability_snapshot_request_preserves_live_published_path_counts_from_stats() {
+        unsafe {
+            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_root("nfs1", nfs1.clone()),
+                test_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1),
+                test_export("node-a::nfs2", nfs2),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let published_stats = Arc::new(StdMutex::new(PublishedBatchStats {
+            batch_count: 12,
+            event_count: 345,
+            control_event_count: 6,
+            data_event_count: 339,
+            last_published_at_us: Some(123456),
+            last_published_origins: vec!["node-a::nfs2=4".to_string()],
+            published_origin_counts: std::collections::BTreeMap::from([
+                ("node-a::nfs1".to_string(), 335),
+                ("node-a::nfs2".to_string(), 10),
+            ]),
+            summarized_path_origin_counts: std::collections::BTreeMap::from([
+                ("node-a::nfs1".to_string(), 333),
+                ("node-a::nfs2".to_string(), 7),
+            ]),
+            published_path_origin_counts: std::collections::BTreeMap::from([
+                ("node-a::nfs1".to_string(), 333),
+                ("node-a::nfs2".to_string(), 7),
+            ]),
+        }));
+        let mut state = SourceWorkerState {
+            source: Some(Arc::new(source)),
+            pending_init: None,
+            pump_task: None,
+            last_control_frame_signals: vec!["tick unit=runtime.exec.scan".to_string()],
+            published_stats,
+        };
+
+        let action = plan_worker_request(SourceWorkerRequest::ObservabilitySnapshot, &mut state);
+        let SourceWorkerAction::Immediate(
+            SourceWorkerResponse::ObservabilitySnapshot(snapshot),
+            false,
+        ) = action
+        else {
+            panic!("observability snapshot request should return immediate snapshot response");
+        };
+
+        assert_eq!(
+            snapshot.published_path_capture_target.as_deref(),
+            Some("/force-find-stress")
+        );
+        let counts = snapshot
+            .published_path_origin_counts_by_node
+            .get("node-a")
+            .cloned()
+            .unwrap_or_default();
+        let summarized = snapshot
+            .summarized_path_origin_counts_by_node
+            .get("node-a")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            summarized.iter().any(|entry| entry == "node-a::nfs1=333"),
+            "snapshot should preserve nfs1 summarized path counts from live stats: {summarized:?}"
+        );
+        assert!(
+            summarized.iter().any(|entry| entry == "node-a::nfs2=7"),
+            "snapshot should preserve nfs2 summarized path counts from live stats: {summarized:?}"
+        );
+        assert!(
+            counts.iter().any(|entry| entry == "node-a::nfs1=333"),
+            "snapshot should preserve nfs1 published path counts from live stats: {counts:?}"
+        );
+        assert!(
+            counts.iter().any(|entry| entry == "node-a::nfs2=7"),
+            "snapshot should preserve nfs2 published path counts from live stats: {counts:?}"
+        );
     }
 }

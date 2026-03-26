@@ -104,7 +104,7 @@ fn summarize_groups_by_node(
 
 fn summarize_source_observability_snapshot(snapshot: &SourceObservabilitySnapshot) -> String {
     format!(
-        "lifecycle={} primaries={} runners={} source={:?} scan={:?} control={:?} published_batches={:?} published_events={:?} published_origins={:?} published_origin_counts={:?} degraded={:?}",
+        "lifecycle={} primaries={} runners={} source={:?} scan={:?} control={:?} published_batches={:?} published_events={:?} published_origins={:?} published_origin_counts={:?} published_path_target={:?} enqueued_path_counts={:?} pending_path_counts={:?} yielded_path_counts={:?} summarized_path_counts={:?} published_path_counts={:?} degraded={:?}",
         snapshot.lifecycle_state,
         snapshot.source_primary_by_group.len(),
         snapshot.last_force_find_runner_by_group.len(),
@@ -115,6 +115,12 @@ fn summarize_source_observability_snapshot(snapshot: &SourceObservabilitySnapsho
         snapshot.published_events_by_node,
         summarize_groups_by_node(&snapshot.last_published_origins_by_node),
         summarize_groups_by_node(&snapshot.published_origin_counts_by_node),
+        snapshot.published_path_capture_target,
+        summarize_groups_by_node(&snapshot.enqueued_path_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.pending_path_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.yielded_path_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.summarized_path_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.published_path_origin_counts_by_node),
         snapshot.status.degraded_roots
     )
 }
@@ -194,6 +200,14 @@ struct SourceWorkerSnapshotCache {
     published_origin_counts_by_node:
         Option<std::collections::BTreeMap<String, Vec<String>>>,
     published_path_capture_target: Option<String>,
+    enqueued_path_origin_counts_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    pending_path_origin_counts_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    yielded_path_origin_counts_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    summarized_path_origin_counts_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
     published_path_origin_counts_by_node:
         Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
@@ -312,6 +326,14 @@ impl SourceWorkerClientHandle {
                 Some(snapshot.published_origin_counts_by_node.clone());
             cache.published_path_capture_target =
                 snapshot.published_path_capture_target.clone();
+            cache.enqueued_path_origin_counts_by_node =
+                Some(snapshot.enqueued_path_origin_counts_by_node.clone());
+            cache.pending_path_origin_counts_by_node =
+                Some(snapshot.pending_path_origin_counts_by_node.clone());
+            cache.yielded_path_origin_counts_by_node =
+                Some(snapshot.yielded_path_origin_counts_by_node.clone());
+            cache.summarized_path_origin_counts_by_node =
+                Some(snapshot.summarized_path_origin_counts_by_node.clone());
             cache.published_path_origin_counts_by_node =
                 Some(snapshot.published_path_origin_counts_by_node.clone());
         });
@@ -906,6 +928,14 @@ pub struct SourceObservabilitySnapshot {
     pub last_published_origins_by_node: std::collections::BTreeMap<String, Vec<String>>,
     pub published_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
     pub published_path_capture_target: Option<String>,
+    pub enqueued_path_origin_counts_by_node:
+        std::collections::BTreeMap<String, Vec<String>>,
+    pub pending_path_origin_counts_by_node:
+        std::collections::BTreeMap<String, Vec<String>>,
+    pub yielded_path_origin_counts_by_node:
+        std::collections::BTreeMap<String, Vec<String>>,
+    pub summarized_path_origin_counts_by_node:
+        std::collections::BTreeMap<String, Vec<String>>,
     pub published_path_origin_counts_by_node:
         std::collections::BTreeMap<String, Vec<String>>,
 }
@@ -982,6 +1012,22 @@ fn build_degraded_worker_observability_snapshot(
             .clone()
             .unwrap_or_default(),
         published_path_capture_target: cache.published_path_capture_target.clone(),
+        enqueued_path_origin_counts_by_node: cache
+            .enqueued_path_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+        pending_path_origin_counts_by_node: cache
+            .pending_path_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+        yielded_path_origin_counts_by_node: cache
+            .yielded_path_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+        summarized_path_origin_counts_by_node: cache
+            .summarized_path_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
         published_path_origin_counts_by_node: cache
             .published_path_origin_counts_by_node
             .clone()
@@ -1232,6 +1278,10 @@ impl SourceFacade {
                 last_published_origins_by_node: std::collections::BTreeMap::new(),
                 published_origin_counts_by_node: std::collections::BTreeMap::new(),
                 published_path_capture_target: None,
+                enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+                pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+                yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+                summarized_path_origin_counts_by_node: std::collections::BTreeMap::new(),
                 published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
             }),
             Self::Worker(client) => {
@@ -1274,6 +1324,10 @@ impl SourceFacade {
                 last_published_origins_by_node: std::collections::BTreeMap::new(),
                 published_origin_counts_by_node: std::collections::BTreeMap::new(),
                 published_path_capture_target: None,
+                enqueued_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+                pending_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+                yielded_path_origin_counts_by_node: std::collections::BTreeMap::new(),
+                summarized_path_origin_counts_by_node: std::collections::BTreeMap::new(),
                 published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
             },
             Self::Worker(client) => client.observability_snapshot_nonblocking().await,
@@ -1371,7 +1425,9 @@ mod tests {
     use tokio::sync::{Mutex as AsyncMutex, Notify};
 
     use crate::ControlEvent;
+    use crate::FileMetaRecord;
     use crate::query::models::QueryNode;
+    use crate::query::path::is_under_query_path;
     use crate::query::path::root_file_name_bytes;
     use crate::query::request::{MaterializedQueryPayload, QueryOp, QueryScope};
     use crate::runtime::execution_units::{
@@ -1379,6 +1435,14 @@ mod tests {
     };
     use crate::runtime::routes::ROUTE_KEY_QUERY;
     use crate::workers::sink::SinkWorkerClientHandle;
+
+    #[cfg(target_os = "linux")]
+    mod real_nfs_lab {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/runtime_app_real_nfs_lab.rs"
+        ));
+    }
 
     #[derive(Default)]
     struct LoopbackWorkerBoundary {
@@ -1656,6 +1720,21 @@ mod tests {
         }
     }
 
+    fn record_path_data_counts(
+        path_counts: &mut std::collections::BTreeMap<String, usize>,
+        batch: &[Event],
+        target: &[u8],
+    ) {
+        for event in batch {
+            let Ok(record) = rmp_serde::from_slice::<FileMetaRecord>(event.payload_bytes()) else {
+                continue;
+            };
+            if is_under_query_path(&record.path, target) {
+                *path_counts.entry(event.metadata().origin_id.0.clone()).or_insert(0) += 1;
+            }
+        }
+    }
+
     #[test]
     fn source_worker_rpc_preserves_invalid_input_response_category() {
         let err = SourceWorkerRpc::into_result(SourceWorkerResponse::InvalidInput(
@@ -1690,6 +1769,7 @@ mod tests {
             }]),
             logical_roots: Some(vec![RootSpec::new("root-a", "/mnt/nfs-a")]),
             status: Some(SourceStatusSnapshot {
+                current_stream_generation: None,
                 logical_roots: vec![],
                 concrete_roots: vec![],
                 degraded_roots: vec![("existing-root".to_string(), "already degraded".to_string())],
@@ -1719,6 +1799,12 @@ mod tests {
             last_published_at_us_by_node: Some(std::collections::BTreeMap::new()),
             last_published_origins_by_node: Some(std::collections::BTreeMap::new()),
             published_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
+            published_path_capture_target: None,
+            enqueued_path_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
+            pending_path_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
+            yielded_path_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
+            summarized_path_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
+            published_path_origin_counts_by_node: Some(std::collections::BTreeMap::new()),
         };
 
         let snapshot =
@@ -2115,5 +2201,308 @@ mod tests {
 
         source.close().await.expect("close source worker");
         sink.close().await.expect("close sink worker");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+    async fn external_source_worker_real_nfs_manual_rescan_publishes_newly_seeded_subtree_alongside_baseline_path(
+    ) {
+        let preflight = real_nfs_lab::RealNfsPreflight::detect();
+        if !preflight.enabled {
+            eprintln!(
+                "skip real-nfs external source worker publish-path test: {}",
+                preflight
+                    .reason
+                    .unwrap_or_else(|| "real-nfs preflight failed".to_string())
+            );
+            return;
+        }
+
+        let mut lab = real_nfs_lab::NfsLab::start().expect("start NFS lab");
+        let nfs1 = lab
+            .mount_export("node-a", "nfs1")
+            .expect("mount node-a nfs1 export");
+        let nfs2 = lab
+            .mount_export("node-a", "nfs2")
+            .expect("mount node-a nfs2 export");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_source_root("nfs1", &nfs1),
+                worker_source_root("nfs2", &nfs2),
+            ],
+            host_object_grants: vec![
+                worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory = RuntimeWorkerClientFactory::new(
+            boundary.clone(),
+            boundary.clone(),
+            state_boundary,
+        );
+        let client = SourceWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let baseline_target = b"/data";
+        let force_find_target = b"/force-find-stress";
+        let mut baseline_counts = std::collections::BTreeMap::<String, usize>::new();
+        let mut force_find_counts = std::collections::BTreeMap::<String, usize>::new();
+        let baseline_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < baseline_deadline {
+            match recv_loopback_events(&boundary, 250).await {
+                Ok(batch) => {
+                    record_path_data_counts(&mut baseline_counts, &batch, baseline_target);
+                    record_path_data_counts(&mut force_find_counts, &batch, force_find_target);
+                }
+                Err(CnxError::Timeout) => continue,
+                Err(err) => panic!("initial publish recv failed: {err}"),
+            }
+            let baseline_ready = ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| baseline_counts.get(*origin).copied().unwrap_or(0) > 0);
+            if baseline_ready {
+                break;
+            }
+        }
+
+        assert!(
+            ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| baseline_counts.get(*origin).copied().unwrap_or(0) > 0),
+            "baseline /data should publish for both local primary roots over the external source stream: {baseline_counts:?}"
+        );
+        assert!(
+            force_find_counts.is_empty(),
+            "new subtree target should stay absent before it is seeded and manually rescanned: {force_find_counts:?}"
+        );
+
+        lab.mkdir("nfs1", "force-find-stress")
+            .expect("create nfs1 force-find dir");
+        lab.mkdir("nfs2", "force-find-stress")
+            .expect("create nfs2 force-find dir");
+        lab.write_file("nfs1", "force-find-stress/seed.txt", "a\n")
+            .expect("seed nfs1 force-find subtree");
+        lab.write_file("nfs2", "force-find-stress/seed.txt", "b\n")
+            .expect("seed nfs2 force-find subtree");
+
+        tokio::time::timeout(Duration::from_secs(8), client.publish_manual_rescan_signal())
+            .await
+            .expect("manual rescan publish timed out")
+            .expect("publish manual rescan");
+
+        let force_find_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while tokio::time::Instant::now() < force_find_deadline {
+            match recv_loopback_events(&boundary, 250).await {
+                Ok(batch) => {
+                    record_path_data_counts(&mut force_find_counts, &batch, force_find_target);
+                }
+                Err(CnxError::Timeout) => continue,
+                Err(err) => panic!("manual rescan publish recv failed: {err}"),
+            }
+            let subtree_ready = ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| force_find_counts.get(*origin).copied().unwrap_or(0) > 0);
+            if subtree_ready {
+                break;
+            }
+        }
+
+        assert!(
+            ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| force_find_counts.get(*origin).copied().unwrap_or(0) > 0),
+            "newly seeded /force-find-stress subtree should publish for both local primary roots after manual rescan over the external source stream: {force_find_counts:?}"
+        );
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_source_worker_nonblocking_observability_can_serve_stale_published_path_counts_during_control_inflight(
+    ) {
+        let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
+        unsafe {
+            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("data")).expect("create nfs1 data dir");
+        std::fs::create_dir_all(nfs2.join("data")).expect("create nfs2 data dir");
+        std::fs::write(nfs1.join("data").join("a.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("data").join("b.txt"), b"b").expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_source_root("nfs1", &nfs1),
+                worker_source_root("nfs2", &nfs2),
+            ],
+            host_object_grants: vec![
+                worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory = RuntimeWorkerClientFactory::new(
+            boundary.clone(),
+            boundary.clone(),
+            state_boundary,
+        );
+        let client = SourceWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let baseline_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let baseline_target = b"/data";
+        let mut baseline_counts = std::collections::BTreeMap::<String, usize>::new();
+        while tokio::time::Instant::now() < baseline_deadline {
+            match recv_loopback_events(&boundary, 250).await {
+                Ok(batch) => record_path_data_counts(&mut baseline_counts, &batch, baseline_target),
+                Err(CnxError::Timeout) => continue,
+                Err(err) => panic!("initial publish recv failed: {err}"),
+            }
+            if ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| baseline_counts.get(*origin).copied().unwrap_or(0) > 0)
+            {
+                break;
+            }
+        }
+        assert!(
+            ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| baseline_counts.get(*origin).copied().unwrap_or(0) > 0),
+            "baseline /data should publish for both local primary roots: {baseline_counts:?}"
+        );
+
+        let primed_worker = client.client().await.expect("connect source worker");
+        let primed = client
+            .observability_snapshot_with_timeout(
+                &primed_worker,
+                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+            )
+            .await
+            .expect("prime cached observability snapshot");
+        assert_eq!(
+            primed.published_path_capture_target.as_deref(),
+            Some("/force-find-stress"),
+            "primed snapshot should carry the configured path target"
+        );
+        assert!(
+            primed
+                .published_path_origin_counts_by_node
+                .get("node-a")
+                .is_none_or(Vec::is_empty),
+            "before seeding subtree, cached path counts should be empty: {:?}",
+            primed.published_path_origin_counts_by_node
+        );
+
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 subtree");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 subtree");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"aa")
+            .expect("seed nfs1 subtree");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"bb")
+            .expect("seed nfs2 subtree");
+
+        tokio::time::timeout(Duration::from_secs(8), client.publish_manual_rescan_signal())
+            .await
+            .expect("manual rescan publish timed out")
+            .expect("publish manual rescan");
+
+        let force_find_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let force_find_target = b"/force-find-stress";
+        let mut force_find_counts = std::collections::BTreeMap::<String, usize>::new();
+        while tokio::time::Instant::now() < force_find_deadline {
+            match recv_loopback_events(&boundary, 250).await {
+                Ok(batch) => {
+                    record_path_data_counts(&mut force_find_counts, &batch, force_find_target)
+                }
+                Err(CnxError::Timeout) => continue,
+                Err(err) => panic!("manual rescan publish recv failed: {err}"),
+            }
+            if ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| force_find_counts.get(*origin).copied().unwrap_or(0) > 0)
+            {
+                break;
+            }
+        }
+        assert!(
+            ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| force_find_counts.get(*origin).copied().unwrap_or(0) > 0),
+            "manual rescan should publish /force-find-stress for both roots before stale-observability check: {force_find_counts:?}"
+        );
+
+        let inflight = client.begin_control_op();
+        let stale = client.observability_snapshot_nonblocking().await;
+        drop(inflight);
+        assert_eq!(
+            stale.lifecycle_state,
+            SOURCE_WORKER_DEGRADED_STATE,
+            "control-inflight nonblocking snapshot should use cached fallback"
+        );
+        assert!(
+            stale
+                .published_path_origin_counts_by_node
+                .get("node-a")
+                .is_none_or(Vec::is_empty),
+            "cached fallback should still reflect stale pre-rescan path counts: {:?}",
+            stale.published_path_origin_counts_by_node
+        );
+
+        let live_worker = client.client().await.expect("reconnect source worker");
+        let live = client
+            .observability_snapshot_with_timeout(&live_worker, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
+            .await
+            .expect("fetch live post-rescan observability snapshot");
+        let live_counts = live
+            .published_path_origin_counts_by_node
+            .get("node-a")
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            live_counts.iter().any(|entry| entry.starts_with("node-a::nfs1=")),
+            "live worker snapshot should include nfs1 /force-find-stress path counts: {live_counts:?}"
+        );
+        assert!(
+            live_counts.iter().any(|entry| entry.starts_with("node-a::nfs2=")),
+            "live worker snapshot should include nfs2 /force-find-stress path counts after rescan: {live_counts:?}"
+        );
+
+        client.close().await.expect("close source worker");
+        match previous {
+            Some(value) => unsafe { std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value) },
+            None => unsafe { std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE") },
+        }
     }
 }

@@ -9,7 +9,7 @@ pub(crate) mod scanner;
 pub(crate) mod sentinel;
 pub(crate) mod watcher;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -267,18 +267,33 @@ pub struct SourceConcreteRootHealthSnapshot {
     pub emitted_path_event_count: u64,
     pub last_emitted_at_us: Option<u64>,
     pub last_emitted_origins: Vec<String>,
+    pub forwarded_batch_count: u64,
+    pub forwarded_event_count: u64,
+    pub forwarded_path_event_count: u64,
+    pub last_forwarded_at_us: Option<u64>,
+    pub last_forwarded_origins: Vec<String>,
     pub current_revision: Option<u64>,
+    pub current_stream_generation: Option<u64>,
     pub candidate_revision: Option<u64>,
+    pub candidate_stream_generation: Option<u64>,
     pub candidate_status: Option<String>,
     pub draining_revision: Option<u64>,
+    pub draining_stream_generation: Option<u64>,
     pub draining_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct SourceStatusSnapshot {
+    pub current_stream_generation: Option<u64>,
     pub logical_roots: Vec<SourceLogicalRootHealthSnapshot>,
     pub concrete_roots: Vec<SourceConcreteRootHealthSnapshot>,
     pub degraded_roots: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct CurrentStreamPathFrontierStats {
+    generation: Option<u64>,
+    enqueued_path_origin_counts: BTreeMap<String, u64>,
 }
 
 fn map_target_path_to_root(
@@ -338,6 +353,20 @@ fn should_process_rescan_reason(current_is_group_primary: bool, reason: RescanRe
     }
 }
 
+fn summarize_event_path_origins(events: &[Event], query_path: &[u8]) -> BTreeMap<String, u64> {
+    events
+        .iter()
+        .filter_map(|event| {
+            let record = rmp_serde::from_slice::<FileMetaRecord>(event.payload_bytes()).ok()?;
+            is_under_query_path(&record.path, query_path)
+                .then(|| event.metadata().origin_id.0.clone())
+        })
+        .fold(BTreeMap::<String, u64>::new(), |mut acc, origin| {
+            *acc.entry(origin).or_default() += 1;
+            acc
+        })
+}
+
 /// Lifecycle state of the source app.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleState {
@@ -382,6 +411,10 @@ pub struct FSMetaSource {
     runtime_refresh_rescan: Arc<AtomicBool>,
     /// Single-flight guard for background runtime refresh.
     runtime_refresh_running: Arc<AtomicBool>,
+    /// Live path-target counts observed at the `pub_()` yield seam.
+    yielded_path_origin_counts: Arc<Mutex<BTreeMap<String, u64>>>,
+    /// Current shared-stream path-target counts successfully queued before dequeue.
+    enqueued_path_origin_counts: Arc<Mutex<CurrentStreamPathFrontierStats>>,
 }
 
 #[derive(Clone)]
@@ -430,6 +463,7 @@ enum RootTaskRole {
 
 struct RootTaskSlot {
     revision: u64,
+    stream_generation: u64,
     signature: RootTaskSignature,
     handle: RootTaskHandle,
 }
@@ -437,6 +471,12 @@ struct RootTaskSlot {
 struct RootTaskEntry {
     active: RootTaskSlot,
     candidate: Option<RootTaskSlot>,
+}
+
+#[derive(Clone)]
+struct SourceStreamBinding {
+    generation: u64,
+    tx: mpsc::UnboundedSender<Vec<Event>>,
 }
 
 struct RootTaskReplacementFallback {
@@ -480,10 +520,18 @@ struct ConcreteRootHealthEntry {
     emitted_path_event_count: u64,
     last_emitted_at_us: Option<u64>,
     last_emitted_origins: Vec<String>,
+    forwarded_batch_count: u64,
+    forwarded_event_count: u64,
+    forwarded_path_event_count: u64,
+    last_forwarded_at_us: Option<u64>,
+    last_forwarded_origins: Vec<String>,
     current_revision: Option<u64>,
+    current_stream_generation: Option<u64>,
     candidate_revision: Option<u64>,
+    candidate_stream_generation: Option<u64>,
     candidate_status: Option<String>,
     draining_revision: Option<u64>,
+    draining_stream_generation: Option<u64>,
     draining_status: Option<String>,
 }
 
@@ -527,10 +575,18 @@ impl ConcreteRootHealthEntry {
             emitted_path_event_count: 0,
             last_emitted_at_us: None,
             last_emitted_origins: Vec::new(),
+            forwarded_batch_count: 0,
+            forwarded_event_count: 0,
+            forwarded_path_event_count: 0,
+            last_forwarded_at_us: None,
+            last_forwarded_origins: Vec::new(),
             current_revision: None,
+            current_stream_generation: None,
             candidate_revision: None,
+            candidate_stream_generation: None,
             candidate_status: None,
             draining_revision: None,
+            draining_stream_generation: None,
             draining_status: None,
         }
     }
@@ -553,12 +609,13 @@ struct SourceStateCell {
     logical_roots: Arc<Mutex<Vec<RootSpec>>>,
     roots: Arc<Mutex<Vec<RootRuntime>>>,
     root_tasks: Arc<Mutex<HashMap<String, RootTaskEntry>>>,
-    stream_tx: Arc<Mutex<Option<mpsc::UnboundedSender<Vec<Event>>>>>,
+    stream_binding: Arc<Mutex<Option<SourceStreamBinding>>>,
     manual_rescan_intents: Arc<Mutex<HashMap<String, ManualRescanIntent>>>,
     logical_root_fanout: Arc<Mutex<HashMap<String, Vec<GrantedMountRoot>>>>,
     fanout_health: Arc<Mutex<FanoutHealthState>>,
     host_object_grants: Arc<Mutex<Vec<GrantedMountRoot>>>,
     root_task_revision: Arc<AtomicU64>,
+    stream_generation: Arc<AtomicU64>,
     commit_boundary: CommitBoundary,
 }
 
@@ -575,12 +632,13 @@ impl SourceStateCell {
             logical_roots: Arc::new(Mutex::new(logical_roots)),
             roots: Arc::new(Mutex::new(roots)),
             root_tasks: Arc::new(Mutex::new(HashMap::new())),
-            stream_tx: Arc::new(Mutex::new(None)),
+            stream_binding: Arc::new(Mutex::new(None)),
             manual_rescan_intents: Arc::new(Mutex::new(HashMap::new())),
             logical_root_fanout: Arc::new(Mutex::new(logical_root_fanout)),
             fanout_health,
             host_object_grants: Arc::new(Mutex::new(host_object_grants)),
             root_task_revision: Arc::new(AtomicU64::new(1)),
+            stream_generation: Arc::new(AtomicU64::new(1)),
             commit_boundary,
         };
         let root_count = lock_or_recover(&cell.logical_roots, "source.state.bootstrap.roots").len();
@@ -614,6 +672,10 @@ impl SourceStateCell {
 
     fn next_root_task_revision(&self) -> u64 {
         self.root_task_revision.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn next_stream_generation(&self) -> u64 {
+        self.stream_generation.fetch_add(1, Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -1195,10 +1257,46 @@ impl FSMetaSource {
         slot: RootTaskSlot,
         retired: bool,
     ) {
-        Self::mark_root_task_draining(fanout_health, root_key, slot.revision, "draining");
+        Self::mark_root_task_draining(
+            fanout_health,
+            root_key,
+            slot.revision,
+            slot.stream_generation,
+            "draining",
+        );
         slot.handle.cancel.cancel();
         let _ = tokio::time::timeout(Duration::from_secs(2), slot.handle.join).await;
-        Self::finish_root_task_draining(fanout_health, root_key, slot.revision, retired);
+        Self::finish_root_task_draining(
+            fanout_health,
+            root_key,
+            slot.revision,
+            slot.stream_generation,
+            retired,
+        );
+    }
+
+    async fn restart_root_tasks_for_current_stream(&self) {
+        let existing = {
+            let mut tasks = lock_or_recover(
+                &self.state_cell.root_tasks,
+                "source.restart_root_tasks_for_current_stream",
+            );
+            tasks.drain().collect::<Vec<_>>()
+        };
+        for (key, entry) in existing {
+            Self::cancel_root_task_slot(
+                &self.state_cell.fanout_health,
+                &key,
+                entry.active,
+                true,
+            )
+            .await;
+            if let Some(candidate) = entry.candidate {
+                candidate.handle.cancel.cancel();
+                let _ = tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
+                Self::clear_root_task_candidate_health(&self.state_cell.fanout_health, &key);
+            }
+        }
     }
 
     fn close_rescan_channels(rescan_channel_open: &mut bool, periodic_channel_open: &mut bool) {
@@ -1316,6 +1414,7 @@ impl FSMetaSource {
         fanout_health: &Arc<Mutex<FanoutHealthState>>,
         root_key: &str,
         revision: u64,
+        stream_generation: u64,
         role: RootTaskRole,
         status: impl Into<String>,
     ) {
@@ -1332,6 +1431,7 @@ impl FSMetaSource {
                     .or_default();
                 detail.status = status.clone();
                 detail.current_revision = Some(revision);
+                detail.current_stream_generation = Some(stream_generation);
                 if status == "running" {
                     detail.last_error = None;
                 } else if let Some(reason) = status.split_once(": ").map(|(_, reason)| reason) {
@@ -1344,6 +1444,7 @@ impl FSMetaSource {
                     .entry(root_key.to_string())
                     .or_default();
                 detail.candidate_revision = Some(revision);
+                detail.candidate_stream_generation = Some(stream_generation);
                 detail.candidate_status = Some(status.clone());
                 if status == "running" {
                     detail.last_error = None;
@@ -1356,6 +1457,7 @@ impl FSMetaSource {
         fanout_health: &Arc<Mutex<FanoutHealthState>>,
         root_key: &str,
         revision: u64,
+        stream_generation: u64,
         status: impl Into<String>,
     ) {
         let status = status.into();
@@ -1374,6 +1476,7 @@ impl FSMetaSource {
             .entry(root_key.to_string())
             .or_default();
         detail.draining_revision = Some(revision);
+        detail.draining_stream_generation = Some(stream_generation);
         detail.draining_status = Some(status.clone());
         if current_matches {
             detail.status = status;
@@ -1387,6 +1490,7 @@ impl FSMetaSource {
         let mut health = lock_or_recover(fanout_health, "source.object_health.candidate_clear");
         if let Some(detail) = health.object_ref_detail.get_mut(root_key) {
             detail.candidate_revision = None;
+            detail.candidate_stream_generation = None;
             detail.candidate_status = None;
         }
     }
@@ -1395,6 +1499,7 @@ impl FSMetaSource {
         fanout_health: &Arc<Mutex<FanoutHealthState>>,
         root_key: &str,
         revision: u64,
+        stream_generation: u64,
         status: impl Into<String>,
     ) {
         let status = status.into();
@@ -1404,6 +1509,7 @@ impl FSMetaSource {
             .entry(root_key.to_string())
             .or_default();
         detail.candidate_revision = Some(revision);
+        detail.candidate_stream_generation = Some(stream_generation);
         detail.candidate_status = Some(status.clone());
         if let Some(reason) = status.split_once(": ").map(|(_, reason)| reason) {
             detail.last_error = Some(reason.to_string());
@@ -1414,6 +1520,7 @@ impl FSMetaSource {
         fanout_health: &Arc<Mutex<FanoutHealthState>>,
         root_key: &str,
         revision: u64,
+        stream_generation: u64,
     ) {
         let mut health = lock_or_recover(fanout_health, "source.object_health.promote");
         let promoted_status = health
@@ -1430,7 +1537,9 @@ impl FSMetaSource {
             .entry(root_key.to_string())
             .or_default();
         detail.current_revision = Some(revision);
+        detail.current_stream_generation = Some(stream_generation);
         detail.candidate_revision = None;
+        detail.candidate_stream_generation = None;
         detail.candidate_status = None;
         detail.status = promoted_status;
         detail.last_error = None;
@@ -1440,11 +1549,13 @@ impl FSMetaSource {
         fanout_health: &Arc<Mutex<FanoutHealthState>>,
         root_key: &str,
         revision: u64,
+        stream_generation: u64,
         retired: bool,
     ) {
         let mut health = lock_or_recover(fanout_health, "source.object_health.draining_finish");
         if let Some(detail) = health.object_ref_detail.get_mut(root_key) {
             detail.draining_revision = Some(revision);
+            detail.draining_stream_generation = Some(stream_generation);
             detail.draining_status = Some(if retired {
                 "retired".to_string()
             } else {
@@ -1457,6 +1568,41 @@ impl FSMetaSource {
         let mut health = lock_or_recover(fanout_health, "source.object_health");
         health.object_ref.remove(root_key);
         health.object_ref_detail.remove(root_key);
+    }
+
+    fn reset_current_stream_path_frontier_stats(&self, generation: u64) {
+        *lock_or_recover(
+            &self.enqueued_path_origin_counts,
+            "source.current_stream_path_frontier.reset",
+        ) = CurrentStreamPathFrontierStats {
+            generation: Some(generation),
+            enqueued_path_origin_counts: BTreeMap::new(),
+        };
+        lock_or_recover(
+            &self.yielded_path_origin_counts,
+            "source.current_stream_path_frontier.reset.yielded",
+        )
+        .clear();
+    }
+
+    fn record_current_stream_enqueued_path_counts(
+        frontier: &Arc<Mutex<CurrentStreamPathFrontierStats>>,
+        generation: u64,
+        path_origin_counts: &BTreeMap<String, u64>,
+    ) {
+        if path_origin_counts.is_empty() {
+            return;
+        }
+        let mut stats = lock_or_recover(
+            frontier,
+            "source.current_stream_path_frontier.enqueue",
+        );
+        if stats.generation != Some(generation) {
+            return;
+        }
+        for (origin, count) in path_origin_counts {
+            *stats.enqueued_path_origin_counts.entry(origin.clone()).or_default() += *count;
+        }
     }
 
     fn set_object_last_error(
@@ -1541,6 +1687,63 @@ impl FSMetaSource {
             .collect()
     }
 
+    fn current_stream_queue_key(events: &[Event]) -> Option<String> {
+        let origins = events
+            .iter()
+            .map(|event| event.metadata().origin_id.0.clone())
+            .collect::<BTreeSet<_>>();
+        match origins.len() {
+            0 => None,
+            1 => origins.into_iter().next(),
+            _ => Some(origins.into_iter().collect::<Vec<_>>().join("|")),
+        }
+    }
+
+    fn enqueue_current_stream_batch(
+        pending_by_queue: &mut BTreeMap<String, VecDeque<Vec<Event>>>,
+        ready_queues: &mut VecDeque<String>,
+        events: Vec<Event>,
+    ) {
+        if events.is_empty() {
+            return;
+        }
+        let queue_key = Self::current_stream_queue_key(&events)
+            .unwrap_or_else(|| "__empty_current_stream_batch__".to_string());
+        let queue = pending_by_queue.entry(queue_key.clone()).or_default();
+        if queue.is_empty() {
+            ready_queues.push_back(queue_key);
+        }
+        queue.push_back(events);
+    }
+
+    fn dequeue_current_stream_batch(
+        pending_by_queue: &mut BTreeMap<String, VecDeque<Vec<Event>>>,
+        ready_queues: &mut VecDeque<String>,
+    ) -> Option<Vec<Event>> {
+        while let Some(queue_key) = ready_queues.pop_front() {
+            let mut remove_queue = false;
+            let batch = {
+                let Some(queue) = pending_by_queue.get_mut(&queue_key) else {
+                    continue;
+                };
+                let batch = queue.pop_front();
+                if queue.is_empty() {
+                    remove_queue = true;
+                } else {
+                    ready_queues.push_back(queue_key.clone());
+                }
+                batch
+            };
+            if remove_queue {
+                pending_by_queue.remove(&queue_key);
+            }
+            if batch.is_some() {
+                return batch;
+            }
+        }
+        None
+    }
+
     fn mark_root_emitted_batch(
         fanout_health: &Arc<Mutex<FanoutHealthState>>,
         root_key: &str,
@@ -1595,6 +1798,30 @@ impl FSMetaSource {
                 detail.last_emitted_origins,
             );
         }
+    }
+
+    fn mark_root_forwarded_batch(
+        fanout_health: &Arc<Mutex<FanoutHealthState>>,
+        root_key: &str,
+        event_count: u64,
+        path_event_count: u64,
+        last_forwarded_at_us: Option<u64>,
+        last_forwarded_origins: Vec<String>,
+    ) {
+        let mut health = lock_or_recover(fanout_health, "source.object_health.forwarded_batch");
+        let detail = health
+            .object_ref_detail
+            .entry(root_key.to_string())
+            .or_default();
+        detail.forwarded_batch_count = detail.forwarded_batch_count.saturating_add(1);
+        detail.forwarded_event_count = detail
+            .forwarded_event_count
+            .saturating_add(event_count);
+        detail.forwarded_path_event_count = detail
+            .forwarded_path_event_count
+            .saturating_add(path_event_count);
+        detail.last_forwarded_at_us = last_forwarded_at_us;
+        detail.last_forwarded_origins = last_forwarded_origins;
     }
 
     fn request_rescan_on_primary_roots(
@@ -1736,6 +1963,10 @@ impl FSMetaSource {
             runtime_refresh_dirty: Arc::new(AtomicBool::new(false)),
             runtime_refresh_rescan: Arc::new(AtomicBool::new(false)),
             runtime_refresh_running: Arc::new(AtomicBool::new(false)),
+            yielded_path_origin_counts: Arc::new(Mutex::new(BTreeMap::new())),
+            enqueued_path_origin_counts: Arc::new(Mutex::new(
+                CurrentStreamPathFrontierStats::default(),
+            )),
         };
 
         if let Some(sys) = boundary {
@@ -2414,6 +2645,12 @@ impl FSMetaSource {
     }
 
     pub fn status_snapshot(&self) -> SourceStatusSnapshot {
+        let current_stream_generation = lock_or_recover(
+            &self.state_cell.stream_binding,
+            "source.status.snapshot.stream_binding",
+        )
+        .as_ref()
+        .map(|binding| binding.generation);
         let health = lock_or_recover(&self.state_cell.fanout_health, "source.status.snapshot");
         let mut logical_roots = health
             .logical_root_detail
@@ -2460,20 +2697,59 @@ impl FSMetaSource {
                 emitted_path_event_count: entry.emitted_path_event_count,
                 last_emitted_at_us: entry.last_emitted_at_us,
                 last_emitted_origins: entry.last_emitted_origins.clone(),
+                forwarded_batch_count: entry.forwarded_batch_count,
+                forwarded_event_count: entry.forwarded_event_count,
+                forwarded_path_event_count: entry.forwarded_path_event_count,
+                last_forwarded_at_us: entry.last_forwarded_at_us,
+                last_forwarded_origins: entry.last_forwarded_origins.clone(),
                 current_revision: entry.current_revision,
+                current_stream_generation: entry.current_stream_generation,
                 candidate_revision: entry.candidate_revision,
+                candidate_stream_generation: entry.candidate_stream_generation,
                 candidate_status: entry.candidate_status.clone(),
                 draining_revision: entry.draining_revision,
+                draining_stream_generation: entry.draining_stream_generation,
                 draining_status: entry.draining_status.clone(),
             })
             .collect::<Vec<_>>();
         concrete_roots.sort_by(|a, b| a.root_key.cmp(&b.root_key));
 
         SourceStatusSnapshot {
+            current_stream_generation,
             logical_roots,
             concrete_roots,
             degraded_roots: self.sentinel.degraded_roots(),
         }
+    }
+
+    pub fn yielded_path_origin_counts_snapshot(&self) -> BTreeMap<String, u64> {
+        lock_or_recover(
+            &self.yielded_path_origin_counts,
+            "source.yielded_path_origin_counts.snapshot",
+        )
+        .clone()
+    }
+
+    pub fn enqueued_path_origin_counts_snapshot(&self) -> BTreeMap<String, u64> {
+        lock_or_recover(
+            &self.enqueued_path_origin_counts,
+            "source.enqueued_path_origin_counts.snapshot",
+        )
+        .enqueued_path_origin_counts
+        .clone()
+    }
+
+    pub fn pending_path_origin_counts_snapshot(&self) -> BTreeMap<String, u64> {
+        let enqueued = self.enqueued_path_origin_counts_snapshot();
+        let yielded = self.yielded_path_origin_counts_snapshot();
+        let mut pending = BTreeMap::new();
+        for (origin, count) in enqueued {
+            let remaining = count.saturating_sub(yielded.get(&origin).copied().unwrap_or(0));
+            if remaining > 0 {
+                pending.insert(origin, remaining);
+            }
+        }
+        pending
     }
 
     pub fn source_primary_by_group_snapshot(&self) -> BTreeMap<String, String> {
@@ -2725,6 +3001,7 @@ impl FSMetaSource {
         &self,
         root: RootRuntime,
         out_tx: mpsc::UnboundedSender<Vec<Event>>,
+        stream_generation: u64,
         role: RootTaskRole,
         revision: u64,
     ) -> RootTaskHandle {
@@ -2739,6 +3016,7 @@ impl FSMetaSource {
         let fanout_health = self.state_cell.fanout_health_handle();
         let roots_handle = self.state_cell.roots_handle();
         let manual_rescan_intents = self.state_cell.manual_rescan_intents_handle();
+        let enqueued_path_origin_counts = self.enqueued_path_origin_counts.clone();
         let sentinel = self.sentinel.clone();
         let apply_startup_delay = self.boundary.is_some();
         let join = tokio::spawn(async move {
@@ -2752,6 +3030,7 @@ impl FSMetaSource {
                     &fanout_health,
                     &root_key,
                     revision,
+                    stream_generation,
                     role,
                     "warming",
                 );
@@ -2777,6 +3056,7 @@ impl FSMetaSource {
                             &fanout_health,
                             &root_key,
                             revision,
+                            stream_generation,
                             role,
                             "running",
                         );
@@ -2797,17 +3077,77 @@ impl FSMetaSource {
                             if task_cancel.is_cancelled() || global_shutdown.is_cancelled() {
                                 break;
                             }
+                            let path_capture_target = debug_stream_path_capture_target();
+                            let path_matching = path_capture_target
+                                .as_deref()
+                                .map(|target| count_events_under_query_path(&batch, target))
+                                .unwrap_or_default();
+                            let path_origin_counts = path_capture_target
+                                .as_deref()
+                                .filter(|_| path_matching > 0)
+                                .map(|target| {
+                                    batch.iter()
+                                        .filter_map(|event| {
+                                            let record = rmp_serde::from_slice::<FileMetaRecord>(
+                                                event.payload_bytes(),
+                                            )
+                                            .ok()?;
+                                            is_under_query_path(&record.path, target)
+                                                .then(|| event.metadata().origin_id.0.clone())
+                                        })
+                                        .fold(BTreeMap::<String, u64>::new(), |mut acc, origin| {
+                                            *acc.entry(origin).or_default() += 1;
+                                            acc
+                                        })
+                                })
+                                .unwrap_or_default();
+                            let path_origins = path_origin_counts
+                                .iter()
+                                .map(|(origin, count)| format!("{origin}={count}"))
+                                .collect::<Vec<_>>();
+                            let last_forwarded_at_us = batch
+                                .iter()
+                                .map(|event| event.metadata().timestamp_us)
+                                .max();
+                            let last_forwarded_origins = Self::summarize_emitted_origins(&batch);
+                            let batch_len = batch.len() as u64;
                             Self::mark_root_emitted_batch(&fanout_health, &root_key, &batch);
+                            if let Some(target) = path_capture_target.as_deref()
+                                && path_matching > 0
+                            {
+                                eprintln!(
+                                    "fs_meta_source: outflow_path_capture root_key={} target={} matching_events={} batch_events={} origins={:?}",
+                                    root_key,
+                                    String::from_utf8_lossy(target),
+                                    path_matching,
+                                    batch.len(),
+                                    path_origins
+                                );
+                            }
                             if out_tx.send(batch).is_err() {
                                 Self::update_root_task_slot_health(
                                     &fanout_health,
                                     &root_key,
                                     revision,
+                                    stream_generation,
                                     role,
                                     "output_closed",
                                 );
                                 return;
                             }
+                            Self::record_current_stream_enqueued_path_counts(
+                                &enqueued_path_origin_counts,
+                                stream_generation,
+                                &path_origin_counts,
+                            );
+                            Self::mark_root_forwarded_batch(
+                                &fanout_health,
+                                &root_key,
+                                batch_len,
+                                path_matching,
+                                last_forwarded_at_us,
+                                last_forwarded_origins,
+                            );
                         }
                         backoff = Duration::from_secs(1);
                     }
@@ -2823,6 +3163,7 @@ impl FSMetaSource {
                             &fanout_health,
                             &root_key,
                             revision,
+                            stream_generation,
                             role,
                             format!("error: {err}"),
                         );
@@ -2853,6 +3194,7 @@ impl FSMetaSource {
                 &fanout_health,
                 &root_key,
                 revision,
+                stream_generation,
                 role,
                 "stopped",
             );
@@ -2865,11 +3207,16 @@ impl FSMetaSource {
     }
 
     async fn reconcile_root_tasks(&self, desired_roots: &[RootRuntime]) {
-        let out_tx =
-            lock_or_recover(&self.state_cell.stream_tx, "source.reconcile.stream_tx").clone();
-        let Some(out_tx) = out_tx else {
+        let stream_binding = lock_or_recover(
+            &self.state_cell.stream_binding,
+            "source.reconcile.stream_binding",
+        )
+        .clone();
+        let Some(stream_binding) = stream_binding else {
             return;
         };
+        let out_tx = stream_binding.tx.clone();
+        let stream_generation = stream_binding.generation;
 
         let desired_root_keys = desired_roots
             .iter()
@@ -2967,6 +3314,7 @@ impl FSMetaSource {
                         let handle = self.spawn_root_task(
                             root.clone(),
                             out_tx.clone(),
+                            stream_generation,
                             RootTaskRole::Candidate,
                             revision,
                         );
@@ -2977,6 +3325,7 @@ impl FSMetaSource {
                         ));
                         existing_entry.candidate = Some(RootTaskSlot {
                             revision,
+                            stream_generation,
                             signature: signature.clone(),
                             handle,
                         });
@@ -2986,6 +3335,7 @@ impl FSMetaSource {
                         let handle = self.spawn_root_task(
                             root.clone(),
                             out_tx.clone(),
+                            stream_generation,
                             RootTaskRole::Active,
                             revision,
                         );
@@ -2995,6 +3345,7 @@ impl FSMetaSource {
                             RootTaskEntry {
                                 active: RootTaskSlot {
                                     revision,
+                                    stream_generation,
                                     signature: signature.clone(),
                                     handle,
                                 },
@@ -3011,6 +3362,7 @@ impl FSMetaSource {
                 &self.state_cell.fanout_health,
                 &key,
                 stale.revision,
+                stale.stream_generation,
                 "draining",
             );
             stale.handle.cancel.cancel();
@@ -3019,6 +3371,7 @@ impl FSMetaSource {
                 &self.state_cell.fanout_health,
                 &key,
                 stale.revision,
+                stale.stream_generation,
                 true,
             );
             Self::clear_root_task_candidate_health(&self.state_cell.fanout_health, &key);
@@ -3058,6 +3411,7 @@ impl FSMetaSource {
             let handle = self.spawn_root_task(
                 replacement.root.clone(),
                 out_tx.clone(),
+                stream_generation,
                 RootTaskRole::Active,
                 revision,
             );
@@ -3071,6 +3425,7 @@ impl FSMetaSource {
                 RootTaskEntry {
                     active: RootTaskSlot {
                         revision,
+                        stream_generation,
                         signature: replacement.expected_signature,
                         handle,
                     },
@@ -3135,12 +3490,14 @@ impl FSMetaSource {
                     &self.state_cell.fanout_health,
                     &key,
                     candidate.revision,
+                    candidate.stream_generation,
                 );
                 let old_active = std::mem::replace(&mut entry.active, candidate);
                 Self::mark_root_task_draining(
                     &self.state_cell.fanout_health,
                     &key,
                     old_active.revision,
+                    old_active.stream_generation,
                     "draining",
                 );
                 promoted_old.push((key.clone(), old_active));
@@ -3188,6 +3545,7 @@ impl FSMetaSource {
                 &self.state_cell.fanout_health,
                 &fallback.key,
                 candidate.revision,
+                candidate.stream_generation,
                 "timed_out: overlap candidate did not become ready",
             );
             candidate.handle.cancel.cancel();
@@ -3205,6 +3563,7 @@ impl FSMetaSource {
             let handle = self.spawn_root_task(
                 fallback.root.clone(),
                 out_tx.clone(),
+                stream_generation,
                 RootTaskRole::Active,
                 revision,
             );
@@ -3218,6 +3577,7 @@ impl FSMetaSource {
                 RootTaskEntry {
                     active: RootTaskSlot {
                         revision,
+                        stream_generation,
                         signature: fallback.expected_signature,
                         handle,
                     },
@@ -3267,21 +3627,95 @@ impl FSMetaSource {
         }
         self.start_manual_rescan_watch().await?;
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<Vec<Event>>();
-        *lock_or_recover(&self.state_cell.stream_tx, "source.pub.stream_tx") = Some(out_tx.clone());
+        let stream_generation = self.state_cell.next_stream_generation();
+        let had_existing_stream = lock_or_recover(
+            &self.state_cell.stream_binding,
+            "source.pub.stream_binding",
+        )
+        .replace(SourceStreamBinding {
+            generation: stream_generation,
+            tx: out_tx.clone(),
+        })
+        .is_some();
+        self.reset_current_stream_path_frontier_stats(stream_generation);
         *lock_or_recover(&self.state, "source.pub.state") = LifecycleState::Scanning;
         let roots_snapshot = lock_or_recover(&self.state_cell.roots, "source.pub.roots").clone();
+        if had_existing_stream {
+            self.restart_root_tasks_for_current_stream().await;
+        }
         self.reconcile_root_tasks(&roots_snapshot).await;
         *lock_or_recover(&self.state, "source.pub.state.ready") = LifecycleState::Ready;
 
         let shutdown = self.shutdown.clone();
+        let yielded_path_origin_counts = self.yielded_path_origin_counts.clone();
         let output_stream = stream! {
+            let mut pending_by_queue = BTreeMap::<String, VecDeque<Vec<Event>>>::new();
+            let mut ready_queues = VecDeque::<String>::new();
+            let mut input_closed = false;
             loop {
+                while !input_closed {
+                    match out_rx.try_recv() {
+                        Ok(events) => {
+                            Self::enqueue_current_stream_batch(
+                                &mut pending_by_queue,
+                                &mut ready_queues,
+                                events,
+                            );
+                        }
+                        Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                        Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                            input_closed = true;
+                            break;
+                        }
+                    }
+                }
+                if let Some(events) = Self::dequeue_current_stream_batch(
+                    &mut pending_by_queue,
+                    &mut ready_queues,
+                ) {
+                    if let Some(target) = debug_stream_path_capture_target().as_deref() {
+                        let matching = count_events_under_query_path(&events, target);
+                        let path_origin_counts = summarize_event_path_origins(&events, target);
+                        if !path_origin_counts.is_empty() {
+                            let mut yielded = lock_or_recover(
+                                &yielded_path_origin_counts,
+                                "source.pub.yielded_path_origin_counts",
+                            );
+                            for (origin, count) in &path_origin_counts {
+                                *yielded.entry(origin.clone()).or_default() += *count;
+                            }
+                        }
+                        if matching > 0 {
+                            let path_origins = path_origin_counts
+                                .into_iter()
+                                .map(|(origin, count)| format!("{origin}={count}"))
+                                .collect::<Vec<_>>();
+                            eprintln!(
+                                "fs_meta_source: pub_stream_path_capture target={} matching_events={} batch_events={} origins={:?}",
+                                String::from_utf8_lossy(target),
+                                matching,
+                                events.len(),
+                                path_origins
+                            );
+                        }
+                    }
+                    yield events;
+                    continue;
+                }
+                if input_closed {
+                    break;
+                }
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     batch = out_rx.recv() => match batch {
-                        Some(events) if !events.is_empty() => yield events,
-                        Some(_) => {},
-                        None => break,
+                        Some(events) => {
+                            Self::enqueue_current_stream_batch(
+                                &mut pending_by_queue,
+                                &mut ready_queues,
+                                events,
+                            );
+                        }
+                        None => input_closed = true,
                     }
                 }
             }
@@ -3937,7 +4371,10 @@ impl FSMetaSource {
                 let _ = tokio::time::timeout(Duration::from_secs(2), candidate.handle.join).await;
             }
         }
-        *lock_or_recover(&self.state_cell.stream_tx, "source.close.stream_tx") = None;
+        *lock_or_recover(
+            &self.state_cell.stream_binding,
+            "source.close.stream_binding",
+        ) = None;
         let mut endpoint_tasks = std::mem::take(&mut *lock_or_recover(
             &self.endpoint_tasks,
             "source.close.endpoints",
@@ -4073,6 +4510,37 @@ mod tests {
             .iter()
             .map(|event| event.metadata().origin_id.0.clone())
             .collect()
+    }
+
+    fn mk_source_record_event(origin: &str, path: &[u8], file_name: &[u8], ts: u64) -> Event {
+        let record = FileMetaRecord::scan_update(
+            path.to_vec(),
+            file_name.to_vec(),
+            capanix_host_fs_types::UnixStat {
+                is_dir: false,
+                size: 1,
+                mtime_us: ts,
+                ctime_us: ts,
+                dev: None,
+                ino: None,
+            },
+            b"/force-find-stress".to_vec(),
+            ts,
+            false,
+        );
+        Event::new(
+            EventMetadata {
+                origin_id: NodeId(origin.to_string()),
+                timestamp_us: ts,
+                logical_ts: None,
+                correlation_id: None,
+                ingress_auth: None,
+                trace: None,
+            },
+            bytes::Bytes::from(
+                rmp_serde::to_vec_named(&record).expect("encode source record event"),
+            ),
+        )
     }
 
     fn selected_group_tree_contains_path(
@@ -4769,6 +5237,7 @@ mod tests {
             &health,
             &root_key,
             1,
+            7,
             RootTaskRole::Active,
             "running",
         );
@@ -4776,6 +5245,7 @@ mod tests {
             &health,
             &root_key,
             2,
+            8,
             RootTaskRole::Candidate,
             "warming",
         );
@@ -4787,12 +5257,14 @@ mod tests {
             .find(|entry| entry.root_key == root_key)
             .expect("concrete root health exists");
         assert_eq!(entry.current_revision, Some(1));
+        assert_eq!(entry.current_stream_generation, Some(7));
         assert_eq!(entry.candidate_revision, Some(2));
+        assert_eq!(entry.candidate_stream_generation, Some(8));
         assert_eq!(entry.candidate_status.as_deref(), Some("warming"));
 
-        FSMetaSource::promote_root_task_candidate_health(&health, &root_key, 2);
-        FSMetaSource::mark_root_task_draining(&health, &root_key, 1, "draining");
-        FSMetaSource::finish_root_task_draining(&health, &root_key, 1, true);
+        FSMetaSource::promote_root_task_candidate_health(&health, &root_key, 2, 8);
+        FSMetaSource::mark_root_task_draining(&health, &root_key, 1, 7, "draining");
+        FSMetaSource::finish_root_task_draining(&health, &root_key, 1, 7, true);
 
         let snapshot = source.status_snapshot();
         let entry = snapshot
@@ -4801,8 +5273,11 @@ mod tests {
             .find(|entry| entry.root_key == root_key)
             .expect("concrete root health exists after promote");
         assert_eq!(entry.current_revision, Some(2));
+        assert_eq!(entry.current_stream_generation, Some(8));
         assert_eq!(entry.candidate_revision, None);
+        assert_eq!(entry.candidate_stream_generation, None);
         assert_eq!(entry.draining_revision, Some(1));
+        assert_eq!(entry.draining_stream_generation, Some(7));
         assert_eq!(entry.draining_status.as_deref(), Some("retired"));
     }
 
@@ -5107,6 +5582,415 @@ mod tests {
         let _ = std::fs::remove_dir_all(base);
     }
 
+    #[tokio::test]
+    async fn pub_stream_yielded_path_counts_include_newly_seeded_subtree_for_each_primary_root() {
+        unsafe {
+            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base = std::env::temp_dir().join(format!("fs-meta-pub-yielded-path-counts-{unique}"));
+        let nfs1 = base.join("nfs1");
+        let nfs2 = base.join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 subtree");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 subtree");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"aa")
+            .expect("seed nfs1 subtree");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"bb")
+            .expect("seed nfs2 subtree");
+
+        let mut cfg = SourceConfig::default();
+        let mut root_a = RootSpec::new("nfs1", nfs1.clone());
+        root_a.watch = false;
+        let mut root_b = RootSpec::new("nfs2", nfs2.clone());
+        root_b.watch = false;
+        cfg.roots = vec![root_a, root_b];
+        cfg.host_object_grants = vec![
+            test_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone(), true),
+            test_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone(), true),
+        ];
+
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(_batch)) => {}
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let counts = source.yielded_path_origin_counts_snapshot();
+            let ready = ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| counts.get(*origin).copied().unwrap_or(0) > 0);
+            if ready {
+                break;
+            }
+        }
+
+        source.close().await.expect("close source");
+
+        let counts = source.yielded_path_origin_counts_snapshot();
+        assert!(
+            counts.get("node-a::nfs1").copied().unwrap_or(0) > 0,
+            "yielded path counts should include newly seeded subtree for nfs1: {counts:?}"
+        );
+        assert!(
+            counts.get("node-a::nfs2").copied().unwrap_or(0) > 0,
+            "yielded path counts should include newly seeded subtree for nfs2: {counts:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[tokio::test]
+    async fn current_pub_stream_preserves_mixed_origin_target_membership_once_batch_is_dequeued() {
+        let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
+        unsafe {
+            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
+        }
+
+        let source = FSMetaSource::with_boundaries(
+            SourceConfig::default(),
+            NodeId("node-a".to_string()),
+            None,
+        )
+        .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+        let stream_binding = lock_or_recover(
+            &source.state_cell.stream_binding,
+            "test.current_pub_stream_preserves_mixed_origin.stream_binding",
+        )
+        .as_ref()
+        .expect("stream binding present")
+        .clone();
+        let batch = vec![
+            mk_source_record_event(
+                "node-a::nfs1",
+                b"/force-find-stress/nfs1.txt",
+                b"nfs1.txt",
+                1,
+            ),
+            mk_source_record_event(
+                "node-a::nfs2",
+                b"/force-find-stress/nfs2.txt",
+                b"nfs2.txt",
+                2,
+            ),
+        ];
+        let enqueued_counts = summarize_event_path_origins(&batch, b"/force-find-stress");
+        FSMetaSource::record_current_stream_enqueued_path_counts(
+            &source.enqueued_path_origin_counts,
+            stream_binding.generation,
+            &enqueued_counts,
+        );
+        stream_binding
+            .tx
+            .send(batch)
+            .expect("enqueue mixed-origin batch");
+
+        let batch = tokio::time::timeout(Duration::from_millis(250), stream.next())
+            .await
+            .expect("dequeued batch wait should not time out")
+            .expect("pub stream should yield injected batch");
+        let enqueued_counts = source.enqueued_path_origin_counts_snapshot();
+        let counts = source.yielded_path_origin_counts_snapshot();
+        let pending_counts = source.pending_path_origin_counts_snapshot();
+
+        source.close().await.expect("close source");
+
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE");
+            }
+        }
+
+        assert_eq!(
+            event_origin_ids(&batch),
+            BTreeSet::from(["node-a::nfs1".to_string(), "node-a::nfs2".to_string()])
+        );
+        assert_eq!(enqueued_counts.get("node-a::nfs1").copied(), Some(1));
+        assert_eq!(enqueued_counts.get("node-a::nfs2").copied(), Some(1));
+        assert_eq!(counts.get("node-a::nfs1").copied(), Some(1));
+        assert_eq!(counts.get("node-a::nfs2").copied(), Some(1));
+        assert!(
+            pending_counts.is_empty(),
+            "once the mixed batch is dequeued, no target-path backlog should remain: {pending_counts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn current_pub_stream_surfaces_ready_later_origin_within_bounded_fairness_window() {
+        let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
+        unsafe {
+            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
+        }
+
+        let source = FSMetaSource::with_boundaries(
+            SourceConfig::default(),
+            NodeId("node-a".to_string()),
+            None,
+        )
+        .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+        let stream_binding = lock_or_recover(
+            &source.state_cell.stream_binding,
+            "test.current_pub_stream_fifo.stream_binding",
+        )
+        .as_ref()
+        .expect("stream binding present")
+        .clone();
+
+        let nfs1_backlog_batches = 128u64;
+        for ts in 1..=nfs1_backlog_batches {
+            let batch = vec![mk_source_record_event(
+                "node-a::nfs1",
+                b"/force-find-stress/nfs1.txt",
+                b"nfs1.txt",
+                ts,
+            )];
+            FSMetaSource::record_current_stream_enqueued_path_counts(
+                &source.enqueued_path_origin_counts,
+                stream_binding.generation,
+                &summarize_event_path_origins(&batch, b"/force-find-stress"),
+            );
+            stream_binding
+                .tx
+                .send(batch)
+                .expect("enqueue nfs1 backlog batch");
+        }
+        let nfs2_batch = vec![mk_source_record_event(
+            "node-a::nfs2",
+            b"/force-find-stress/nfs2.txt",
+            b"nfs2.txt",
+            nfs1_backlog_batches + 1,
+        )];
+        FSMetaSource::record_current_stream_enqueued_path_counts(
+            &source.enqueued_path_origin_counts,
+            stream_binding.generation,
+            &summarize_event_path_origins(&nfs2_batch, b"/force-find-stress"),
+        );
+        stream_binding
+            .tx
+            .send(nfs2_batch)
+            .expect("enqueue nfs2 batch behind backlog");
+
+        let fairness_window = 8usize;
+        let mut seen_origins = BTreeSet::<String>::new();
+        for _ in 0..fairness_window {
+            let batch = tokio::time::timeout(Duration::from_millis(250), stream.next())
+                .await
+                .expect("fairness-window batch wait should not time out")
+                .expect("pub stream should yield a fairness-window batch");
+            seen_origins.extend(event_origin_ids(&batch));
+            if seen_origins.contains("node-a::nfs2") {
+                break;
+            }
+        }
+
+        let enqueued_counts = source.enqueued_path_origin_counts_snapshot();
+        let yielded_counts = source.yielded_path_origin_counts_snapshot();
+        let pending_counts = source.pending_path_origin_counts_snapshot();
+
+        source.close().await.expect("close source");
+
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE");
+            }
+        }
+
+        assert_eq!(
+            enqueued_counts.get("node-a::nfs1").copied(),
+            Some(nfs1_backlog_batches)
+        );
+        assert_eq!(enqueued_counts.get("node-a::nfs2").copied(), Some(1));
+        assert!(
+            seen_origins.contains("node-a::nfs2"),
+            "an already-enqueued second root should surface within the bounded fairness window instead of remaining fully buried behind historical backlog: seen={seen_origins:?} yielded={yielded_counts:?} pending={pending_counts:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_pub_stream_after_partial_root_respawn_still_yields_all_primary_roots() {
+        let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
+        unsafe {
+            std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
+        }
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let base = std::env::temp_dir().join(format!("fs-meta-second-pub-stream-{unique}"));
+        let nfs1 = base.join("nfs1");
+        let nfs2 = base.join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 subtree");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 subtree");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"aa")
+            .expect("seed nfs1 subtree");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"bb")
+            .expect("seed nfs2 subtree");
+
+        let mut cfg = SourceConfig::default();
+        let mut root_a = RootSpec::new("nfs1", nfs1.clone());
+        root_a.watch = false;
+        let mut root_b = RootSpec::new("nfs2", nfs2.clone());
+        root_b.watch = false;
+        cfg.roots = vec![root_a, root_b];
+        cfg.host_object_grants = vec![
+            test_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone(), true),
+            test_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone(), true),
+        ];
+
+        let source = FSMetaSource::with_boundaries(cfg, NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let mut first_stream = source.pub_().await.expect("start first source pub stream");
+        let target = b"/force-find-stress";
+
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut initial_counts = BTreeMap::<String, u64>::new();
+        while tokio::time::Instant::now() < initial_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), first_stream.next()).await {
+                Ok(Some(batch)) => {
+                    for (origin, count) in summarize_event_path_origins(&batch, target) {
+                        *initial_counts.entry(origin).or_default() += count;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            if ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| initial_counts.get(*origin).copied().unwrap_or(0) > 0)
+            {
+                break;
+            }
+        }
+        assert!(
+            ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| initial_counts.get(*origin).copied().unwrap_or(0) > 0),
+            "first stream should receive initial subtree data for both roots: {initial_counts:?}"
+        );
+
+        let initial_nfs2_forwarded = source
+            .status_snapshot()
+            .concrete_roots
+            .into_iter()
+            .find(|entry| entry.object_ref == "node-a::nfs2")
+            .expect("nfs2 concrete root exists")
+            .forwarded_path_event_count;
+
+        let mut second_stream = source.pub_().await.expect("start second source pub stream");
+        let mut desired_roots =
+            lock_or_recover(&source.state_cell.roots, "test.second_pub_stream.roots").clone();
+        desired_roots
+            .iter_mut()
+            .find(|root| root.object_ref == "node-a::nfs1")
+            .expect("nfs1 desired root exists")
+            .spec
+            .audit_interval_ms = Some(1_234);
+        *lock_or_recover(
+            &source.state_cell.roots,
+            "test.second_pub_stream.roots.replace",
+        ) = desired_roots.clone();
+        source.reconcile_root_tasks(&desired_roots).await;
+
+        source
+            .publish_manual_rescan_signal()
+            .await
+            .expect("publish manual rescan");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(6);
+        let mut second_stream_counts = BTreeMap::<String, u64>::new();
+        while tokio::time::Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(250), second_stream.next()).await {
+                Ok(Some(batch)) => {
+                    for (origin, count) in summarize_event_path_origins(&batch, target) {
+                        *second_stream_counts.entry(origin).or_default() += count;
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            if ["node-a::nfs1", "node-a::nfs2"]
+                .iter()
+                .all(|origin| second_stream_counts.get(*origin).copied().unwrap_or(0) > 0)
+            {
+                break;
+            }
+        }
+
+        let final_snapshot = source.status_snapshot();
+        let final_nfs2_forwarded = final_snapshot
+            .concrete_roots
+            .iter()
+            .find(|entry| entry.object_ref == "node-a::nfs2")
+            .expect("nfs2 concrete root exists after rescan")
+            .forwarded_path_event_count;
+        let final_generations = final_snapshot
+            .concrete_roots
+            .iter()
+            .map(|entry| (entry.object_ref.clone(), entry.current_stream_generation))
+            .collect::<BTreeMap<_, _>>();
+
+        source.close().await.expect("close source");
+
+        if let Some(value) = previous {
+            unsafe {
+                std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE");
+            }
+        }
+
+        assert!(
+            final_nfs2_forwarded > initial_nfs2_forwarded,
+            "nfs2 should still forward subtree events during the manual-rescan window: initial={initial_nfs2_forwarded} final={final_nfs2_forwarded}"
+        );
+        assert!(
+            second_stream_counts.get("node-a::nfs1").copied().unwrap_or(0) > 0,
+            "second stream should receive nfs1 subtree data after the partial respawn: {second_stream_counts:?}"
+        );
+        assert!(
+            second_stream_counts.get("node-a::nfs2").copied().unwrap_or(0) > 0,
+            "second stream should keep receiving nfs2 subtree data after the partial respawn instead of leaving nfs2 on a stale sender: {second_stream_counts:?}; initial_nfs2_forwarded={initial_nfs2_forwarded} final_nfs2_forwarded={final_nfs2_forwarded}"
+        );
+        assert_eq!(
+            final_snapshot.current_stream_generation,
+            Some(2),
+            "second pub stream should advance the bound stream generation"
+        );
+        assert_eq!(
+            final_generations.get("node-a::nfs1"),
+            Some(&Some(2)),
+            "nfs1 should be bound to the second pub stream generation: {final_generations:?}"
+        );
+        assert_eq!(
+            final_generations.get("node-a::nfs2"),
+            Some(&Some(2)),
+            "nfs2 should be rebound onto the second pub stream generation instead of staying on a stale sender: {final_generations:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
     fn close_rescan_channels_disables_periodic_and_rescan() {
         let mut rescan_open = true;
@@ -5149,7 +6033,13 @@ mod tests {
 
         let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<Event>>();
         drop(out_rx);
-        *lock_or_recover(&source.state_cell.stream_tx, "test.fallback.stream_tx") = Some(out_tx);
+        *lock_or_recover(
+            &source.state_cell.stream_binding,
+            "test.fallback.stream_binding",
+        ) = Some(SourceStreamBinding {
+            generation: 4,
+            tx: out_tx,
+        });
         source
             .state_cell
             .root_task_revision
@@ -5159,11 +6049,13 @@ mod tests {
             RootTaskEntry {
                 active: RootTaskSlot {
                     revision: 1,
+                    stream_generation: 3,
                     signature: stale_signature,
                     handle: pending_root_task_handle(),
                 },
                 candidate: Some(RootTaskSlot {
                     revision: 2,
+                    stream_generation: 3,
                     signature: desired_signature.clone(),
                     handle: pending_root_task_handle(),
                 }),
@@ -5173,6 +6065,7 @@ mod tests {
             &source.state_cell.fanout_health_handle(),
             &root_key,
             1,
+            3,
             RootTaskRole::Active,
             "running",
         );
@@ -5180,6 +6073,7 @@ mod tests {
             &source.state_cell.fanout_health_handle(),
             &root_key,
             2,
+            3,
             RootTaskRole::Candidate,
             "warming",
         );
