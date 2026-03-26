@@ -78,6 +78,33 @@ const FORCE_FIND_ROUTE_COLLECT_IDLE_GRACE: Duration = Duration::from_secs(5);
 const FORCE_FIND_MIN_INFLIGHT_HOLD: Duration = Duration::from_secs(2);
 const FORCE_FIND_INFLIGHT_CONFLICT_PREFIX: &str = "force-find inflight conflict:";
 
+fn debug_status_route_fanin_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_STATUS_ROUTE_FANIN")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn summarize_groups_by_node(
+    groups: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    groups
+        .iter()
+        .map(|(node_id, groups)| format!("{node_id}={}", groups.join("|")))
+        .collect()
+}
+
+fn summarize_sink_status_route_snapshot(snapshot: &SinkStatusSnapshot) -> String {
+    format!(
+        "groups={} scheduled={:?} control={:?}",
+        snapshot.groups.len(),
+        summarize_groups_by_node(&snapshot.scheduled_groups_by_node),
+        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node)
+    )
+}
+
 #[derive(Deserialize)]
 pub struct ApiParams {
     pub path: Option<String>,
@@ -347,7 +374,11 @@ pub(crate) fn merge_sink_status_snapshots(
     }
 
     let mut groups = BTreeMap::<String, crate::sink::SinkGroupStatusSnapshot>::new();
+    let mut scheduled_groups_by_node = BTreeMap::<String, Vec<String>>::new();
+    let mut last_control_frame_signals_by_node = BTreeMap::<String, Vec<String>>::new();
     for snapshot in snapshots {
+        scheduled_groups_by_node.extend(snapshot.scheduled_groups_by_node);
+        last_control_frame_signals_by_node.extend(snapshot.last_control_frame_signals_by_node);
         for group in snapshot.groups {
             groups
                 .entry(group.group_id.clone())
@@ -374,6 +405,8 @@ pub(crate) fn merge_sink_status_snapshots(
 
     let mut merged = SinkStatusSnapshot::default();
     merged.groups = groups.into_values().collect();
+    merged.scheduled_groups_by_node = scheduled_groups_by_node;
+    merged.last_control_frame_signals_by_node = last_control_frame_signals_by_node;
     merged.groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
     for group in &merged.groups {
         merged.live_nodes += group.live_nodes;
@@ -478,6 +511,17 @@ pub(crate) async fn route_sink_status_snapshot(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if debug_status_route_fanin_enabled() {
+        let summaries = snapshots
+            .iter()
+            .map(summarize_sink_status_route_snapshot)
+            .collect::<Vec<_>>();
+        eprintln!(
+            "fs_meta_api_status: sink_route_collect events={} snapshots={:?}",
+            snapshots.len(),
+            summaries
+        );
+    }
     Ok(merge_sink_status_snapshots(snapshots))
 }
 
@@ -3886,6 +3930,8 @@ mod tests {
             blind_spot_count: 0,
             shadow_time_us: 0,
             estimated_heap_bytes: 0,
+            scheduled_groups_by_node: BTreeMap::new(),
+            last_control_frame_signals_by_node: BTreeMap::new(),
             groups: vec![crate::sink::SinkGroupStatusSnapshot {
                 group_id: "root-a".into(),
                 primary_object_ref: "obj-a".into(),

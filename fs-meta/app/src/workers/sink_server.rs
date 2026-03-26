@@ -12,6 +12,7 @@ use capanix_runtime_entry_sdk::worker_runtime::{
 use tokio::sync::Mutex;
 
 use crate::sink::SinkFileMeta;
+use crate::runtime::orchestration::{SinkControlSignal, sink_control_signals_from_envelopes};
 use crate::source::config::SourceConfig;
 use crate::workers::sink::SinkWorkerRpc;
 use crate::workers::sink_ipc::{
@@ -24,6 +25,7 @@ struct SinkWorkerState {
     pending_init: Option<(NodeId, SinkWorkerInitConfig)>,
     endpoints_started: bool,
     send_tx: Option<tokio::sync::mpsc::UnboundedSender<Vec<Event>>>,
+    last_control_frame_signals: Vec<String>,
 }
 
 enum SinkWorkerAction {
@@ -55,9 +57,100 @@ fn bootstrap_not_ready() -> CnxError {
     CnxError::NotReady("worker not initialized".into())
 }
 
+fn debug_control_scope_capture_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn debug_sink_query_flow_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_SINK_QUERY_FLOW").is_some()
+}
+
+fn summarize_bound_scopes(
+    bound_scopes: &[capanix_runtime_entry_sdk::control::RuntimeBoundScope],
+) -> Vec<String> {
+    bound_scopes
+        .iter()
+        .map(|scope| format!("{}=>{}", scope.scope_id, scope.resource_ids.join("|")))
+        .collect()
+}
+
+fn summarize_sink_control_signals(signals: &[SinkControlSignal]) -> Vec<String> {
+    signals
+        .iter()
+        .map(|signal| match signal {
+            SinkControlSignal::Activate {
+                unit,
+                route_key,
+                generation,
+                bound_scopes,
+                ..
+            } => format!(
+                "activate unit={} route={} generation={} scopes={:?}",
+                unit.unit_id(),
+                route_key,
+                generation,
+                summarize_bound_scopes(bound_scopes)
+            ),
+            SinkControlSignal::Deactivate {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "deactivate unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SinkControlSignal::Tick {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "tick unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SinkControlSignal::RuntimeHostGrantChange { .. } => "host_grant_change".into(),
+            SinkControlSignal::Passthrough(_) => "passthrough".into(),
+        })
+        .collect()
+}
+
+fn summarize_event_origins(events: &[Event]) -> Vec<String> {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for event in events {
+        *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(origin, count)| format!("{origin}={count}"))
+        .collect()
+}
+
+fn summarize_sink_snapshot_groups(snapshot: &crate::sink::SinkStatusSnapshot) -> Vec<String> {
+    snapshot
+        .groups
+        .iter()
+        .map(|group| {
+            format!(
+                "{}:total={} live={} audit={} init={}",
+                group.group_id,
+                group.total_nodes,
+                group.live_nodes,
+                group.overflow_pending_audit,
+                group.initial_audit_completed
+            )
+        })
+        .collect()
+}
+
 async fn stop_sink_runtime(state: &mut SinkWorkerState) {
     bootstrap_stop_sink_runtime(state).await;
     state.pending_init = None;
+    state.last_control_frame_signals.clear();
 }
 
 async fn bootstrap_init_sink_runtime(
@@ -76,6 +169,7 @@ async fn bootstrap_init_sink_runtime(
     state.node_id = Some(node_id);
     state.endpoints_started = false;
     state.send_tx = None;
+    state.last_control_frame_signals.clear();
     eprintln!("fs_meta_sink_worker_server: bootstrap_init ok");
     Ok(())
 }
@@ -125,8 +219,21 @@ fn bootstrap_start_sink_runtime(
                 let sink_for_send = sink.clone();
                 tokio::spawn(async move {
                     while let Some(events) = send_rx.recv().await {
+                        if debug_sink_query_flow_enabled() {
+                            eprintln!(
+                                "fs_meta_sink_worker_server: async_send_apply begin origins={:?}",
+                                summarize_event_origins(&events)
+                            );
+                        }
                         if let Err(err) = sink_for_send.send(&events).await {
                             eprintln!("fs_meta_sink_worker: async Send apply failed: {err}");
+                        } else if debug_sink_query_flow_enabled()
+                            && let Ok(snapshot) = sink_for_send.status_snapshot()
+                        {
+                            eprintln!(
+                                "fs_meta_sink_worker_server: async_send_apply ok groups={:?}",
+                                summarize_sink_snapshot_groups(&snapshot)
+                            );
                         }
                     }
                 });
@@ -150,7 +257,7 @@ async fn bootstrap_stop_sink_runtime(state: &mut SinkWorkerState) {
     state.endpoints_started = false;
 }
 
-fn plan_worker_request(request: SinkWorkerRequest, state: &SinkWorkerState) -> SinkWorkerAction {
+fn plan_worker_request(request: SinkWorkerRequest, state: &mut SinkWorkerState) -> SinkWorkerAction {
     match request {
         SinkWorkerRequest::UpdateLogicalRoots {
             roots,
@@ -228,7 +335,18 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &SinkWorkerState) -> S
         },
         SinkWorkerRequest::StatusSnapshot => match state.sink.as_ref() {
             Some(sink) => match sink.status_snapshot() {
-                Ok(snapshot) => {
+                Ok(mut snapshot) => {
+                    if let Some(node_id) = state.node_id.as_ref() {
+                        snapshot.last_control_frame_signals_by_node =
+                            if state.last_control_frame_signals.is_empty() {
+                                std::collections::BTreeMap::new()
+                            } else {
+                                std::collections::BTreeMap::from([(
+                                    node_id.0.clone(),
+                                    state.last_control_frame_signals.clone(),
+                                )])
+                            };
+                    }
                     SinkWorkerAction::Immediate(SinkWorkerResponse::StatusSnapshot(snapshot), false)
                 }
                 Err(err) => {
@@ -253,14 +371,34 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &SinkWorkerState) -> S
             ),
         },
         SinkWorkerRequest::MaterializedQuery { request } => match state.sink.as_ref() {
-            Some(sink) => match sink.materialized_query(&request) {
-                Ok(events) => {
+            Some(sink) => {
+                if debug_sink_query_flow_enabled()
+                    && let Ok(snapshot) = sink.status_snapshot()
+                {
+                    eprintln!(
+                        "fs_meta_sink_worker_server: materialized_query begin selected_group={:?} path={} groups={:?}",
+                        request.scope.selected_group,
+                        String::from_utf8_lossy(&request.scope.path),
+                        summarize_sink_snapshot_groups(&snapshot)
+                    );
+                }
+                match sink.materialized_query(&request) {
+                    Ok(events) => {
+                        if debug_sink_query_flow_enabled() {
+                            eprintln!(
+                                "fs_meta_sink_worker_server: materialized_query ok selected_group={:?} path={} origins={:?}",
+                                request.scope.selected_group,
+                                String::from_utf8_lossy(&request.scope.path),
+                                summarize_event_origins(&events)
+                            );
+                        }
                     SinkWorkerAction::Immediate(SinkWorkerResponse::Events(events), false)
+                    }
+                    Err(err) => {
+                        SinkWorkerAction::Immediate(SinkWorkerResponse::Error(err.to_string()), false)
+                    }
                 }
-                Err(err) => {
-                    SinkWorkerAction::Immediate(SinkWorkerResponse::Error(err.to_string()), false)
-                }
-            },
+            }
             None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -289,7 +427,26 @@ fn plan_worker_request(request: SinkWorkerRequest, state: &SinkWorkerState) -> S
             ),
         },
         SinkWorkerRequest::OnControlFrame { envelopes } => match state.sink.clone() {
-            Some(sink) => SinkWorkerAction::OnControlFrame { sink, envelopes },
+            Some(sink) => {
+                let node_id = state
+                    .node_id
+                    .as_ref()
+                    .map(|node_id| node_id.0.as_str())
+                    .unwrap_or("__missing_node_id__");
+                let summary = match sink_control_signals_from_envelopes(&envelopes) {
+                    Ok(signals) => summarize_sink_control_signals(&signals),
+                    Err(err) => vec![format!("decode_err={err}")],
+                };
+                state.last_control_frame_signals = summary.clone();
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_server: on_control_frame summary node={} signals={:?}",
+                        node_id,
+                        summary
+                    );
+                }
+                SinkWorkerAction::OnControlFrame { sink, envelopes }
+            }
             None => SinkWorkerAction::Immediate(
                 SinkWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -348,6 +505,7 @@ pub fn run_sink_worker_server(
         pending_init: None,
         endpoints_started: false,
         send_tx: None,
+        last_control_frame_signals: Vec::new(),
     }));
     run_worker_sidecar_server::<SinkWorkerRpc, _, SinkWorkerInitConfig>(
         control_socket_path,
@@ -368,8 +526,8 @@ impl TypedWorkerSession<SinkWorkerRpc> for SinkWorkerSession {
         _context: &WorkerSessionContext,
     ) -> capanix_app_sdk::Result<WorkerLoopControl<SinkWorkerResponse>> {
         let action = {
-            let guard = self.state.lock().await;
-            plan_worker_request(request, &guard)
+            let mut guard = self.state.lock().await;
+            plan_worker_request(request, &mut guard)
         };
         let (response, stop) = execute_worker_action(action).await;
         Ok(if stop {

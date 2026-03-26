@@ -79,6 +79,24 @@ pub fn run_nfs_retire() -> Result<(), String> {
     run_mode(OperationalMode::NfsRetire)
 }
 
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn activation_scope_capture_preserved_layout_distributed() {
+    run_activation_scope_capture_preserved_layout().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn activation_scope_capture_nfs2_visibility_contracted_to_node_a() {
+    run_activation_scope_capture_nfs2_visibility_contracted_to_node_a().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn activation_scope_capture_force_find_preserved_pre_force_find() {
+    run_activation_scope_capture_force_find_preserved_pre_force_find().unwrap();
+}
+
 fn run_mode(mode: OperationalMode) -> Result<(), String> {
     if let Some(reason) = skip_unless_real_nfs_enabled() {
         eprintln!("[fs-meta-api-ops] skipped: {reason}");
@@ -140,6 +158,341 @@ fn run_mode(mode: OperationalMode) -> Result<(), String> {
             scenario_nfs_retire(&harness.cluster, &mut harness.lab, &mut harness.session)?;
         }
     }
+
+    Ok(())
+}
+
+fn run_activation_scope_capture_preserved_layout() -> Result<(), String> {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-api-ops] activation-scope skipped: {reason}");
+        return Ok(());
+    }
+    let mut harness = build_operational_harness("fs-meta-activation-scope", false, 1)?;
+    scenario_force_find_smoke(&mut harness.lab, &mut harness.session)?;
+    let _ = harness.session.tree(&[
+        ("path", "/force-find-stress".to_string()),
+        ("recursive", "true".to_string()),
+    ])?;
+
+    let mut node_a_source_pids = BTreeSet::new();
+    let mut node_a_sink_pids = BTreeSet::new();
+    let mut sink_holder = None::<String>;
+    wait_until(
+        Duration::from_secs(90),
+        "node-a runtime activation reaches source and sink units",
+        || {
+            node_a_source_pids = harness.cluster.unit_active_pids_for_instance(
+                "node-a",
+                &harness.app_id,
+                "runtime.exec.source",
+            )?;
+            node_a_sink_pids = harness.cluster.unit_active_pids_for_instance(
+                "node-a",
+                &harness.app_id,
+                "runtime.exec.sink",
+            )?;
+            sink_holder = current_sink_holder(&harness.cluster, &harness.app_id)?;
+            if !node_a_source_pids.is_empty() && !node_a_sink_pids.is_empty() {
+                return Ok(true);
+            }
+            Err(format!(
+                "node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?}"
+            ))
+        },
+    )?;
+
+    let mut node_a_source = BTreeSet::new();
+    let mut node_a_scan = BTreeSet::new();
+    let mut node_a_sink = BTreeSet::new();
+    let mut node_a_routes = Vec::<String>::new();
+    wait_until(
+        Duration::from_secs(30),
+        "distributed activation scope capture converges",
+        || {
+            node_a_routes = activation_route_summaries(&harness.cluster, "node-a")?;
+            node_a_source = unit_bound_scope_ids_from_activation_status(
+                &harness.cluster,
+                "node-a",
+                "runtime.exec.source",
+            )?;
+            node_a_scan = unit_bound_scope_ids_from_activation_status(
+                &harness.cluster,
+                "node-a",
+                "runtime.exec.scan",
+            )?;
+            node_a_sink = unit_bound_scope_ids_from_activation_status(
+                &harness.cluster,
+                "node-a",
+                "runtime.exec.sink",
+            )?;
+            if !node_a_routes.is_empty()
+                && node_a_sink.contains("nfs1")
+                && node_a_sink.contains("nfs2")
+            {
+                return Ok(true);
+            }
+            Err(format!(
+                "node-a routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+            ))
+        },
+    )?;
+
+    eprintln!(
+        "[fs-meta-api-ops] activation-scope-capture node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?} routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+    assert!(
+        node_a_source.contains("nfs1"),
+        "incoming activation summary should include nfs1 on node-a source: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+    assert!(
+        node_a_scan.contains("nfs1"),
+        "incoming activation summary should include nfs1 on node-a scan: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+    assert!(
+        node_a_sink.contains("nfs2"),
+        "preserved layout should bind node-a sink/query for nfs2: sink={node_a_sink:?}"
+    );
+    assert!(
+        node_a_source.contains("nfs2"),
+        "incoming activation summary should include nfs2 on node-a source when node-a is a visible nfs2 scope member: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+    assert!(
+        node_a_scan.contains("nfs2"),
+        "incoming activation summary should include nfs2 on node-a scan when node-a is a visible nfs2 scope member: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+
+    Ok(())
+}
+
+fn run_activation_scope_capture_nfs2_visibility_contracted_to_node_a() -> Result<(), String> {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-api-ops] activation-scope-node-a skipped: {reason}");
+        return Ok(());
+    }
+
+    let mut harness = build_operational_harness("fs-meta-activation-scope-node-a", false, 1)?;
+    let single_root = json!([root_payload("nfs2", &harness.lab.export_source("nfs2"), "/")]);
+    harness.session.update_roots(&single_root)?;
+    harness.session.rescan()?;
+
+    wait_until(Duration::from_secs(30), "single root nfs2 active", || {
+        let current = harness.session.monitoring_roots()?;
+        Ok(current
+            .get("roots")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.len() == 1 && rows[0].get("id").and_then(Value::as_str) == Some("nfs2")
+            })
+            .unwrap_or(false))
+    })?;
+
+    wait_until(
+        Duration::from_secs(60),
+        "source active on nfs2 visible members",
+        || {
+            let a = harness.cluster.unit_active_pids_for_instance(
+                "node-a",
+                &harness.app_id,
+                "runtime.exec.source",
+            )?;
+            let c = harness.cluster.unit_active_pids_for_instance(
+                "node-c",
+                &harness.app_id,
+                "runtime.exec.source",
+            )?;
+            let d = harness.cluster.unit_active_pids_for_instance(
+                "node-d",
+                &harness.app_id,
+                "runtime.exec.source",
+            )?;
+            if !a.is_empty() && !c.is_empty() && !d.is_empty() {
+                return Ok(true);
+            }
+            Err(format!("node-a={a:?} node-c={c:?} node-d={d:?}"))
+        },
+    )?;
+
+    for node_name in ["node-c", "node-d"] {
+        harness.cluster.withdraw_resources_clusterwide(
+            &harness.cluster.node_id(node_name)?,
+            vec!["nfs2".to_string()],
+        )?;
+        let _ = harness.lab.unmount_export(node_name, "nfs2");
+    }
+
+    wait_until(
+        Duration::from_secs(60),
+        "nfs2 withdrawn from node-c/node-d grants",
+        || {
+            let grants = harness.session.runtime_grants()?;
+            Ok(!grants
+                .to_string()
+                .contains(&format!("{}::nfs2", harness.cluster.node_id("node-c")?))
+                && !grants
+                    .to_string()
+                    .contains(&format!("{}::nfs2", harness.cluster.node_id("node-d")?)))
+        },
+    )?;
+
+    let mut node_a_source_pids = BTreeSet::new();
+    let mut node_a_sink_pids = BTreeSet::new();
+    let mut sink_holder = None::<String>;
+    wait_until(
+        Duration::from_secs(90),
+        "node-a becomes sole nfs2 source/sink holder",
+        || {
+            node_a_source_pids = harness.cluster.unit_active_pids_for_instance(
+                "node-a",
+                &harness.app_id,
+                "runtime.exec.source",
+            )?;
+            node_a_sink_pids = harness.cluster.unit_active_pids_for_instance(
+                "node-a",
+                &harness.app_id,
+                "runtime.exec.sink",
+            )?;
+            sink_holder = current_sink_holder(&harness.cluster, &harness.app_id)?;
+            if !node_a_source_pids.is_empty()
+                && !node_a_sink_pids.is_empty()
+                && sink_holder.as_deref() == Some("node-a")
+            {
+                return Ok(true);
+            }
+            Err(format!(
+                "node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?}"
+            ))
+        },
+    )?;
+
+    let node_a_routes = activation_route_summaries(&harness.cluster, "node-a")?;
+    let node_a_source = unit_bound_scope_ids_from_activation_status(
+        &harness.cluster,
+        "node-a",
+        "runtime.exec.source",
+    )?;
+    let node_a_scan =
+        unit_bound_scope_ids_from_activation_status(&harness.cluster, "node-a", "runtime.exec.scan")?;
+    let node_a_sink =
+        unit_bound_scope_ids_from_activation_status(&harness.cluster, "node-a", "runtime.exec.sink")?;
+
+    eprintln!(
+        "[fs-meta-api-ops] activation-scope-node-a source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?} routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+    assert!(
+        !node_a_routes.is_empty(),
+        "node-a activation routes should exist once source/sink activation is delivered: source_pids={node_a_source_pids:?} sink_pids={node_a_sink_pids:?} sink_holder={sink_holder:?}"
+    );
+    assert!(
+        node_a_source.contains("nfs2"),
+        "node-a source scopes should include nfs2 after visibility contraction: routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+    assert!(
+        node_a_scan.contains("nfs2"),
+        "node-a scan scopes should include nfs2 after visibility contraction: routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+    assert!(
+        node_a_sink.contains("nfs2"),
+        "node-a sink scopes should include nfs2 after visibility contraction: routes={node_a_routes:?} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?}"
+    );
+
+    Ok(())
+}
+
+fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<(), String> {
+    if let Some(reason) = skip_unless_real_nfs_enabled() {
+        eprintln!("[fs-meta-api-ops] activation-scope-preserved skipped: {reason}");
+        return Ok(());
+    }
+
+    let mut harness = build_operational_harness("fs-meta-activation-force-find-preserved", false, 1)?;
+    scenario_force_find_smoke(&mut harness.lab, &mut harness.session)?;
+    let node_a_id = harness.cluster.node_id("node-a")?;
+
+    let mut nfs1_nodes = 0u64;
+    let mut nfs2_nodes = 0u64;
+    let mut node_a_source = BTreeSet::new();
+    let mut node_a_scan = BTreeSet::new();
+    let mut node_a_sink = BTreeSet::new();
+    let mut node_a_source_control = Vec::<String>::new();
+    let mut node_a_sink_control = Vec::<String>::new();
+    wait_until(
+        Duration::from_secs(90),
+        "preserved pre-force-find activation capture",
+        || {
+            let tree = harness.session.tree(&[
+                ("path", "/force-find-stress".to_string()),
+                ("recursive", "true".to_string()),
+            ])?;
+            nfs1_nodes = group_total_nodes(&tree, "nfs1");
+            nfs2_nodes = group_total_nodes(&tree, "nfs2");
+            let status = harness.session.status()?;
+            node_a_source = status_debug_groups_by_node(
+                &status,
+                "source",
+                "scheduled_source_groups_by_node",
+                &node_a_id,
+            );
+            node_a_scan = status_debug_groups_by_node(
+                &status,
+                "source",
+                "scheduled_scan_groups_by_node",
+                &node_a_id,
+            );
+            node_a_sink = status_debug_groups_by_node(
+                &status,
+                "sink",
+                "scheduled_groups_by_node",
+                &node_a_id,
+            );
+            node_a_source_control = status_debug_strings_by_node(
+                &status,
+                "source",
+                "last_control_frame_signals_by_node",
+                &node_a_id,
+            );
+            node_a_sink_control = status_debug_strings_by_node(
+                &status,
+                "sink",
+                "last_control_frame_signals_by_node",
+                &node_a_id,
+            );
+            if nfs1_nodes > 0
+                && nfs2_nodes == 0
+                && node_a_sink.contains("nfs2")
+                && !node_a_source_control.is_empty()
+                && !node_a_sink_control.is_empty()
+            {
+                return Ok(true);
+            }
+            Err(format!(
+                "nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+            ))
+        },
+    )?;
+
+    eprintln!(
+        "[fs-meta-api-ops] activation-scope-preserved nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+    );
+    assert!(
+        node_a_sink.contains("nfs2"),
+        "preserved failing shape should still show node-a sink coverage for nfs2 before first force-find: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+    );
+    assert!(
+        node_a_source.contains("nfs2"),
+        "final /status source shaping omits node-a nfs2 coverage before preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+    );
+    assert!(
+        node_a_scan.contains("nfs2"),
+        "final /status scan shaping omits node-a nfs2 coverage before preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+    );
+    assert!(
+        !node_a_source_control.is_empty(),
+        "final /status source control shaping should remain non-empty on node-a during preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+    );
+    assert!(
+        !node_a_sink_control.is_empty(),
+        "final /status sink control shaping should remain non-empty on node-a during preserved failure: source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?}"
+    );
 
     Ok(())
 }
@@ -692,6 +1045,143 @@ fn current_facade_holders(cluster: &Cluster5, app_id: &str) -> Result<Vec<(Strin
         }
     }
     Ok(holders)
+}
+
+fn unit_bound_scope_ids_from_activation_status(
+    cluster: &Cluster5,
+    node_name: &str,
+    unit_id: &str,
+) -> Result<BTreeSet<String>, String> {
+    let status = cluster.status(node_name)?;
+    let routes = status
+        .get("daemon")
+        .and_then(|v| v.get("activation"))
+        .and_then(|v| v.get("routes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut scope_ids = BTreeSet::new();
+    for route in routes {
+        let Some(apps) = route.get("apps").and_then(Value::as_array) else {
+            continue;
+        };
+        for row in apps {
+            let active_unit = row
+                .get("unit_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|units| units.iter().any(|v| v.as_str() == Some(unit_id)));
+            if !active_unit {
+                continue;
+            }
+            let Some(scopes) = row
+                .get("bound_scopes_by_unit")
+                .and_then(|v| v.get(unit_id))
+                .and_then(Value::as_array)
+            else {
+                continue;
+            };
+            for scope in scopes {
+                if let Some(scope_id) = scope.get("scope_id").and_then(Value::as_str) {
+                    if !scope_id.trim().is_empty() {
+                        scope_ids.insert(scope_id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    Ok(scope_ids)
+}
+
+fn activation_route_summaries(cluster: &Cluster5, node_name: &str) -> Result<Vec<String>, String> {
+    let status = cluster.status(node_name)?;
+    let routes = status
+        .get("daemon")
+        .and_then(|v| v.get("activation"))
+        .and_then(|v| v.get("routes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut summaries = Vec::new();
+    for route in routes {
+        let route_key = route
+            .get("route_key")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let state = route
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let active_pids = route
+            .get("active_pids")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let apps = route
+            .get("apps")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for row in apps {
+            let units = row.get("unit_ids").cloned().unwrap_or_else(|| json!([]));
+            let scopes = row
+                .get("bound_scopes_by_unit")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let gate = row.get("gate").and_then(Value::as_str).unwrap_or("<unknown>");
+            let delivered = row
+                .get("delivered")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            summaries.push(format!(
+                "route={route_key} state={state} active_pids={active_pids} units={units} gate={gate} delivered={delivered} scopes={scopes}"
+            ));
+        }
+    }
+    summaries.sort();
+    Ok(summaries)
+}
+
+fn status_debug_groups_by_node(
+    status: &Value,
+    section: &str,
+    field: &str,
+    node_name: &str,
+) -> BTreeSet<String> {
+    status
+        .get(section)
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get(field))
+        .and_then(|v| v.get(node_name))
+        .and_then(Value::as_array)
+        .map(|groups| {
+            groups
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn status_debug_strings_by_node(
+    status: &Value,
+    section: &str,
+    field: &str,
+    node_name: &str,
+) -> Vec<String> {
+    status
+        .get(section)
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get(field))
+        .and_then(|v| v.get(node_name))
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
 }
 
 fn source_primary_for_group(

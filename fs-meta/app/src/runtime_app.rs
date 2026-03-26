@@ -2407,6 +2407,14 @@ mod tests {
     use tempfile::tempdir;
     use tokio::sync::{Mutex as AsyncMutex, Notify};
 
+    #[cfg(target_os = "linux")]
+    mod real_nfs_lab {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/runtime_app_real_nfs_lab.rs"
+        ));
+    }
+
     fn write_auth_files(dir: &tempfile::TempDir) -> (std::path::PathBuf, std::path::PathBuf) {
         let passwd = dir.path().join("fs-meta.passwd");
         let shadow = dir.path().join("fs-meta.shadow");
@@ -2574,6 +2582,47 @@ mod tests {
         .expect("encode runtime host object grants changed envelope")
     }
 
+    fn host_object_grants_changed_rows_envelope(
+        version: u64,
+        rows: &[(&str, &str, &str, &str, &str, bool)],
+    ) -> ControlEnvelope {
+        encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+            version,
+            grants: rows
+                .iter()
+                .map(
+                    |(object_ref, host_ref, host_ip, mount_point, fs_source, active)| {
+                        RuntimeHostGrant {
+                            object_ref: (*object_ref).to_string(),
+                            object_type: RuntimeHostObjectType::MountRoot,
+                            interfaces: vec!["posix-fs".to_string(), "inotify".to_string()],
+                            host: RuntimeHostDescriptor {
+                                host_ref: (*host_ref).to_string(),
+                                host_ip: (*host_ip).to_string(),
+                                host_name: Some((*host_ref).to_string()),
+                                site: None,
+                                zone: None,
+                                host_labels: Default::default(),
+                            },
+                            object: RuntimeObjectDescriptor {
+                                mount_point: (*mount_point).to_string(),
+                                fs_source: (*fs_source).to_string(),
+                                fs_type: "nfs".to_string(),
+                                mount_options: Vec::new(),
+                            },
+                            grant_state: if *active {
+                                RuntimeHostGrantState::Active
+                            } else {
+                                RuntimeHostGrantState::Revoked
+                            },
+                        }
+                    },
+                )
+                .collect(),
+        })
+        .expect("encode runtime host object grants changed rows envelope")
+    }
+
     #[allow(dead_code)]
     fn tick_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
         encode_runtime_unit_tick(&RuntimeUnitTick {
@@ -2624,10 +2673,34 @@ mod tests {
         root
     }
 
+    fn worker_fs_source_root(id: &str, fs_source: &str) -> source::config::RootSpec {
+        source::config::RootSpec {
+            id: id.to_string(),
+            selector: source::config::RootSelector {
+                fs_source: Some(fs_source.to_string()),
+                ..Default::default()
+            },
+            subpath_scope: PathBuf::from("/"),
+            watch: false,
+            scan: true,
+            audit_interval_ms: None,
+        }
+    }
+
     fn worker_export(
         object_ref: &str,
         host_ref: &str,
         host_ip: &str,
+        mount_point: PathBuf,
+    ) -> source::config::GrantedMountRoot {
+        worker_export_with_fs_source(object_ref, host_ref, host_ip, object_ref, mount_point)
+    }
+
+    fn worker_export_with_fs_source(
+        object_ref: &str,
+        host_ref: &str,
+        host_ip: &str,
+        fs_source: &str,
         mount_point: PathBuf,
     ) -> source::config::GrantedMountRoot {
         source::config::GrantedMountRoot {
@@ -2639,10 +2712,10 @@ mod tests {
             zone: None,
             host_labels: Default::default(),
             mount_point,
-            fs_source: object_ref.to_string(),
+            fs_source: fs_source.to_string(),
             fs_type: "nfs".to_string(),
             mount_options: vec![],
-            interfaces: vec![],
+            interfaces: vec!["posix-fs".to_string(), "inotify".to_string()],
             active: true,
         }
     }
@@ -2654,6 +2727,19 @@ mod tests {
                 path: path.to_vec(),
                 recursive: false,
                 max_depth: Some(0),
+                selected_group: Some(group_id.to_string()),
+            },
+            Some(query::TreeQueryOptions::default()),
+        )
+    }
+
+    fn selected_group_dir_request(path: &[u8], group_id: &str) -> InternalQueryRequest {
+        InternalQueryRequest::materialized(
+            query::QueryOp::Tree,
+            query::QueryScope {
+                path: path.to_vec(),
+                recursive: true,
+                max_depth: None,
                 selected_group: Some(group_id.to_string()),
             },
             Some(query::TreeQueryOptions::default()),
@@ -4950,6 +5036,893 @@ mod tests {
                 "selected-group proxy query should materialize selected group {group_id}: last_proxy_keys={last_proxy_keys:?} last_proxy_err={last_proxy_err:?}"
             );
         }
+
+        app.close().await.expect("close app");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+    async fn external_runtime_app_selected_group_proxy_materializes_each_local_primary_root_real_nfs(
+    ) {
+        let preflight = real_nfs_lab::RealNfsPreflight::detect();
+        if !preflight.enabled {
+            eprintln!(
+                "skip real-nfs runtime-app selected-group proxy test: {}",
+                preflight
+                    .reason
+                    .unwrap_or_else(|| "real-nfs preflight failed".to_string())
+            );
+            return;
+        }
+
+        let mut lab = real_nfs_lab::NfsLab::start().expect("start NFS lab");
+        lab.mkdir("nfs1", "force-find-stress")
+            .expect("create nfs1 force-find dir");
+        lab.mkdir("nfs2", "force-find-stress")
+            .expect("create nfs2 force-find dir");
+        lab.write_file("nfs1", "force-find-stress/seed.txt", "a\n")
+            .expect("seed nfs1");
+        lab.write_file("nfs2", "force-find-stress/seed.txt", "b\n")
+            .expect("seed nfs2");
+        let nfs1 = lab
+            .mount_export("node-a", "nfs1")
+            .expect("mount node-a nfs1 export");
+        let nfs2 = lab
+            .mount_export("node-a", "nfs2")
+            .expect("mount node-a nfs2 export");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+                    host_object_grants: vec![
+                        worker_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                        worker_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+                    ],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".to_string()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init external-worker runtime app");
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+        ])
+        .await
+        .expect("apply runtime control");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            let sink_groups = app
+                .sink
+                .scheduled_group_ids()
+                .await
+                .expect("sink groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups
+                && scan_groups == expected_groups
+                && sink_groups == expected_groups
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < scheduling_deadline,
+                "timed out waiting for runtime scope convergence: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        for group_id in ["nfs1", "nfs2"] {
+            let request = selected_group_dir_request(b"/force-find-stress", group_id);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut direct_ready = false;
+            let mut proxy_ready = false;
+            let mut last_direct_exists = None::<bool>;
+            let mut last_proxy_exists = None::<bool>;
+            let mut last_proxy_keys = Vec::<String>::new();
+            let mut last_proxy_err = None::<String>;
+            while tokio::time::Instant::now() < deadline {
+                match app.query_tree(&request).await {
+                    Ok(grouped) => {
+                        let exists = grouped.get(group_id).map(|payload| payload.root.exists);
+                        last_direct_exists = exists;
+                        if exists == Some(true) {
+                            direct_ready = true;
+                        }
+                    }
+                    Err(_) => {}
+                }
+                match selected_group_proxy_tree(
+                    boundary.clone(),
+                    NodeId("node-a".to_string()),
+                    &request,
+                )
+                .await
+                {
+                    Ok(grouped) => {
+                        last_proxy_keys = grouped.keys().cloned().collect();
+                        last_proxy_exists = grouped.get(group_id).map(|payload| payload.root.exists);
+                        last_proxy_err = None;
+                        if last_proxy_exists == Some(true) {
+                            proxy_ready = true;
+                        }
+                    }
+                    Err(err) => {
+                        last_proxy_err = Some(err.to_string());
+                    }
+                }
+                if direct_ready && proxy_ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                direct_ready,
+                "real-nfs direct sink query should materialize selected group {group_id}: last_direct_exists={last_direct_exists:?}"
+            );
+            assert!(
+                proxy_ready,
+                "real-nfs selected-group proxy query should materialize selected group {group_id}: last_proxy_exists={last_proxy_exists:?} last_proxy_keys={last_proxy_keys:?} last_proxy_err={last_proxy_err:?}"
+            );
+        }
+
+        app.close().await.expect("close app");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+    async fn external_runtime_app_selected_group_proxy_real_nfs_remote_same_group_grant_keeps_owner_host_materialized(
+    ) {
+        let preflight = real_nfs_lab::RealNfsPreflight::detect();
+        if !preflight.enabled {
+            eprintln!(
+                "skip real-nfs runtime-app distributed-grant test: {}",
+                preflight
+                    .reason
+                    .unwrap_or_else(|| "real-nfs preflight failed".to_string())
+            );
+            return;
+        }
+
+        let mut lab = real_nfs_lab::NfsLab::start().expect("start NFS lab");
+        lab.mkdir("nfs1", "force-find-stress")
+            .expect("create nfs1 force-find dir");
+        lab.mkdir("nfs2", "force-find-stress")
+            .expect("create nfs2 force-find dir");
+        lab.write_file("nfs1", "force-find-stress/seed.txt", "a\n")
+            .expect("seed nfs1");
+        lab.write_file("nfs2", "force-find-stress/seed.txt", "b\n")
+            .expect("seed nfs2");
+
+        let nfs1_source = lab.export_source("nfs1");
+        let nfs2_source = lab.export_source("nfs2");
+        let nfs1 = lab
+            .mount_export("node-a", "nfs1")
+            .expect("mount node-a nfs1 export");
+        let nfs2_owner = lab
+            .mount_export("node-a", "nfs2")
+            .expect("mount node-a nfs2 export");
+        let nfs2_remote = lab
+            .mount_export("node-c", "nfs2")
+            .expect("mount node-c nfs2 export");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_fs_source_root("nfs1", &nfs1_source),
+                        worker_fs_source_root("nfs2", &nfs2_source),
+                    ],
+                    host_object_grants: vec![
+                        worker_export_with_fs_source(
+                            "node-a::nfs1",
+                            "node-a",
+                            "10.0.0.11",
+                            &nfs1_source,
+                            nfs1.clone(),
+                        ),
+                        worker_export_with_fs_source(
+                            "node-a::nfs2",
+                            "node-a",
+                            "10.0.0.12",
+                            &nfs2_source,
+                            nfs2_owner.clone(),
+                        ),
+                        worker_export_with_fs_source(
+                            "node-c::nfs2",
+                            "node-c",
+                            "10.0.0.31",
+                            &nfs2_source,
+                            nfs2_remote.clone(),
+                        ),
+                    ],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".to_string()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init external-worker runtime app");
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+        ])
+        .await
+        .expect("apply runtime control");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            let sink_groups = app
+                .sink
+                .scheduled_group_ids()
+                .await
+                .expect("sink groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups
+                && scan_groups == expected_groups
+                && sink_groups == expected_groups
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < scheduling_deadline,
+                "timed out waiting for runtime scope convergence: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let primary_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let primary = app
+                .source
+                .source_primary_by_group_snapshot()
+                .await
+                .expect("source primary snapshot");
+            let matched_grants = app
+                .source
+                .status_snapshot()
+                .await
+                .expect("source status snapshot")
+                .logical_roots
+                .into_iter()
+                .find(|root| root.root_id == "nfs2")
+                .map(|root| root.matched_grants);
+            if primary.get("nfs2").map(String::as_str) == Some("node-a::nfs2")
+                && matched_grants == Some(2)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < primary_deadline,
+                "timed out waiting for distributed grant snapshot: primary={primary:?} matched_grants={matched_grants:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        for group_id in ["nfs1", "nfs2"] {
+            let request = selected_group_dir_request(b"/force-find-stress", group_id);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut direct_ready = false;
+            let mut proxy_ready = false;
+            let mut last_direct_exists = None::<bool>;
+            let mut last_proxy_exists = None::<bool>;
+            let mut last_proxy_keys = Vec::<String>::new();
+            let mut last_proxy_err = None::<String>;
+            while tokio::time::Instant::now() < deadline {
+                match app.query_tree(&request).await {
+                    Ok(grouped) => {
+                        let exists = grouped.get(group_id).map(|payload| payload.root.exists);
+                        last_direct_exists = exists;
+                        if exists == Some(true) {
+                            direct_ready = true;
+                        }
+                    }
+                    Err(_) => {}
+                }
+                match selected_group_proxy_tree(
+                    boundary.clone(),
+                    NodeId("node-a".to_string()),
+                    &request,
+                )
+                .await
+                {
+                    Ok(grouped) => {
+                        last_proxy_keys = grouped.keys().cloned().collect();
+                        last_proxy_exists = grouped.get(group_id).map(|payload| payload.root.exists);
+                        last_proxy_err = None;
+                        if last_proxy_exists == Some(true) {
+                            proxy_ready = true;
+                        }
+                    }
+                    Err(err) => {
+                        last_proxy_err = Some(err.to_string());
+                    }
+                }
+                if direct_ready && proxy_ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                direct_ready,
+                "direct sink query should materialize selected group {group_id} with remote same-group grant: last_direct_exists={last_direct_exists:?}"
+            );
+            assert!(
+                proxy_ready,
+                "selected-group proxy query should materialize selected group {group_id} with remote same-group grant: last_proxy_exists={last_proxy_exists:?} last_proxy_keys={last_proxy_keys:?} last_proxy_err={last_proxy_err:?}"
+            );
+        }
+
+        app.close().await.expect("close app");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+    async fn external_runtime_app_selected_group_proxy_real_nfs_grant_change_after_activation_keeps_owner_host_materialized(
+    ) {
+        let preflight = real_nfs_lab::RealNfsPreflight::detect();
+        if !preflight.enabled {
+            eprintln!(
+                "skip real-nfs runtime-app grant-change test: {}",
+                preflight
+                    .reason
+                    .unwrap_or_else(|| "real-nfs preflight failed".to_string())
+            );
+            return;
+        }
+
+        let mut lab = real_nfs_lab::NfsLab::start().expect("start NFS lab");
+        lab.mkdir("nfs1", "force-find-stress")
+            .expect("create nfs1 force-find dir");
+        lab.mkdir("nfs2", "force-find-stress")
+            .expect("create nfs2 force-find dir");
+        lab.write_file("nfs1", "force-find-stress/seed.txt", "a\n")
+            .expect("seed nfs1");
+        lab.write_file("nfs2", "force-find-stress/seed.txt", "b\n")
+            .expect("seed nfs2");
+
+        let nfs1_source = lab.export_source("nfs1");
+        let nfs2_source = lab.export_source("nfs2");
+        let nfs1 = lab
+            .mount_export("node-a", "nfs1")
+            .expect("mount node-a nfs1 export");
+        let nfs2_owner = lab
+            .mount_export("node-a", "nfs2")
+            .expect("mount node-a nfs2 export");
+        let nfs2_remote = lab
+            .mount_export("node-c", "nfs2")
+            .expect("mount node-c nfs2 export");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_fs_source_root("nfs1", &nfs1_source),
+                        worker_fs_source_root("nfs2", &nfs2_source),
+                    ],
+                    host_object_grants: Vec::new(),
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".to_string()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init external-worker runtime app");
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+        ])
+        .await
+        .expect("apply runtime control");
+
+        app.on_control_frame(&[host_object_grants_changed_rows_envelope(
+            1,
+            &[
+                (
+                    "node-a::nfs1",
+                    "node-a",
+                    "10.0.0.11",
+                    nfs1.to_string_lossy().as_ref(),
+                    &nfs1_source,
+                    true,
+                ),
+                (
+                    "node-a::nfs2",
+                    "node-a",
+                    "10.0.0.12",
+                    nfs2_owner.to_string_lossy().as_ref(),
+                    &nfs2_source,
+                    true,
+                ),
+                (
+                    "node-c::nfs2",
+                    "node-c",
+                    "10.0.0.31",
+                    nfs2_remote.to_string_lossy().as_ref(),
+                    &nfs2_source,
+                    true,
+                ),
+            ],
+        )])
+        .await
+        .expect("apply runtime host grants changed");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let grants_version = app
+                .source
+                .host_object_grants_version_snapshot()
+                .await
+                .expect("host object grants version");
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            let sink_groups = app
+                .sink
+                .scheduled_group_ids()
+                .await
+                .expect("sink groups")
+                .unwrap_or_default();
+            let source_status = app
+                .source
+                .status_snapshot()
+                .await
+                .expect("source status snapshot");
+            let nfs2_grants = source_status
+                .logical_roots
+                .iter()
+                .find(|root| root.root_id == "nfs2")
+                .map(|root| root.matched_grants);
+            if grants_version == 1
+                && source_groups == expected_groups
+                && scan_groups == expected_groups
+                && sink_groups == expected_groups
+                && nfs2_grants == Some(2)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for post-grant-change convergence: version={grants_version} source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} nfs2_grants={nfs2_grants:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        for group_id in ["nfs1", "nfs2"] {
+            let request = selected_group_dir_request(b"/force-find-stress", group_id);
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut direct_ready = false;
+            let mut proxy_ready = false;
+            let mut last_direct_exists = None::<bool>;
+            let mut last_proxy_exists = None::<bool>;
+            let mut last_proxy_keys = Vec::<String>::new();
+            let mut last_proxy_err = None::<String>;
+            while tokio::time::Instant::now() < deadline {
+                match app.query_tree(&request).await {
+                    Ok(grouped) => {
+                        let exists = grouped.get(group_id).map(|payload| payload.root.exists);
+                        last_direct_exists = exists;
+                        if exists == Some(true) {
+                            direct_ready = true;
+                        }
+                    }
+                    Err(_) => {}
+                }
+                match selected_group_proxy_tree(
+                    boundary.clone(),
+                    NodeId("node-a".to_string()),
+                    &request,
+                )
+                .await
+                {
+                    Ok(grouped) => {
+                        last_proxy_keys = grouped.keys().cloned().collect();
+                        last_proxy_exists = grouped.get(group_id).map(|payload| payload.root.exists);
+                        last_proxy_err = None;
+                        if last_proxy_exists == Some(true) {
+                            proxy_ready = true;
+                        }
+                    }
+                    Err(err) => {
+                        last_proxy_err = Some(err.to_string());
+                    }
+                }
+                if direct_ready && proxy_ready {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            assert!(
+                direct_ready,
+                "direct sink query should materialize selected group {group_id} after grant-change fanout: last_direct_exists={last_direct_exists:?}"
+            );
+            assert!(
+                proxy_ready,
+                "selected-group proxy query should materialize selected group {group_id} after grant-change fanout: last_proxy_exists={last_proxy_exists:?} last_proxy_keys={last_proxy_keys:?} last_proxy_err={last_proxy_err:?}"
+            );
+        }
+
+        app.close().await.expect("close app");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+    async fn external_runtime_app_selected_group_proxy_real_nfs_peer_owned_source_scope_leaves_group_unmaterialized(
+    ) {
+        let preflight = real_nfs_lab::RealNfsPreflight::detect();
+        if !preflight.enabled {
+            eprintln!(
+                "skip real-nfs runtime-app peer-scope test: {}",
+                preflight
+                    .reason
+                    .unwrap_or_else(|| "real-nfs preflight failed".to_string())
+            );
+            return;
+        }
+
+        let mut lab = real_nfs_lab::NfsLab::start().expect("start NFS lab");
+        lab.mkdir("nfs1", "force-find-stress")
+            .expect("create nfs1 force-find dir");
+        lab.mkdir("nfs2", "force-find-stress")
+            .expect("create nfs2 force-find dir");
+        lab.write_file("nfs1", "force-find-stress/seed.txt", "a\n")
+            .expect("seed nfs1");
+        lab.write_file("nfs2", "force-find-stress/seed.txt", "b\n")
+            .expect("seed nfs2");
+
+        let nfs1_source = lab.export_source("nfs1");
+        let nfs2_source = lab.export_source("nfs2");
+        let nfs1 = lab
+            .mount_export("node-a", "nfs1")
+            .expect("mount node-a nfs1 export");
+        let nfs2_owner = lab
+            .mount_export("node-a", "nfs2")
+            .expect("mount node-a nfs2 export");
+        let nfs2_remote = lab
+            .mount_export("node-c", "nfs2")
+            .expect("mount node-c nfs2 export");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![
+                        worker_fs_source_root("nfs1", &nfs1_source),
+                        worker_fs_source_root("nfs2", &nfs2_source),
+                    ],
+                    host_object_grants: Vec::new(),
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("node-a".to_string()),
+            Some(boundary.clone()),
+            Some(boundary.clone()),
+            state_boundary,
+        )
+        .expect("init external-worker runtime app");
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"])],
+                1,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("nfs1", &["node-a::nfs1"]), ("nfs2", &["node-a::nfs2"])],
+                1,
+            ),
+        ])
+        .await
+        .expect("apply runtime control");
+
+        app.on_control_frame(&[host_object_grants_changed_rows_envelope(
+            1,
+            &[
+                (
+                    "node-a::nfs1",
+                    "node-a",
+                    "10.0.0.11",
+                    nfs1.to_string_lossy().as_ref(),
+                    &nfs1_source,
+                    true,
+                ),
+                (
+                    "node-a::nfs2",
+                    "node-a",
+                    "10.0.0.12",
+                    nfs2_owner.to_string_lossy().as_ref(),
+                    &nfs2_source,
+                    true,
+                ),
+                (
+                    "node-c::nfs2",
+                    "node-c",
+                    "10.0.0.31",
+                    nfs2_remote.to_string_lossy().as_ref(),
+                    &nfs2_source,
+                    true,
+                ),
+            ],
+        )])
+        .await
+        .expect("apply runtime host grants changed");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            let sink_groups = app
+                .sink
+                .scheduled_group_ids()
+                .await
+                .expect("sink groups")
+                .unwrap_or_default();
+            let source_status = app
+                .source
+                .status_snapshot()
+                .await
+                .expect("source status snapshot");
+            let nfs2_grants = source_status
+                .logical_roots
+                .iter()
+                .find(|root| root.root_id == "nfs2")
+                .map(|root| root.matched_grants);
+            if source_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+                && scan_groups == std::collections::BTreeSet::from(["nfs1".to_string()])
+                && sink_groups
+                    == std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])
+                && nfs2_grants == Some(2)
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for peer-owned source-scope convergence: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?} nfs2_grants={nfs2_grants:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let nfs1_request = selected_group_dir_request(b"/force-find-stress", "nfs1");
+        let nfs1_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut nfs1_direct_ready = false;
+        let mut nfs1_proxy_ready = false;
+        while tokio::time::Instant::now() < nfs1_deadline {
+            if app
+                .query_tree(&nfs1_request)
+                .await
+                .ok()
+                .and_then(|grouped| grouped.get("nfs1").map(|payload| payload.root.exists))
+                == Some(true)
+            {
+                nfs1_direct_ready = true;
+            }
+            if selected_group_proxy_tree(boundary.clone(), NodeId("node-a".to_string()), &nfs1_request)
+                .await
+                .ok()
+                .and_then(|grouped| grouped.get("nfs1").map(|payload| payload.root.exists))
+                == Some(true)
+            {
+                nfs1_proxy_ready = true;
+            }
+            if nfs1_direct_ready && nfs1_proxy_ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(nfs1_direct_ready, "nfs1 direct query should still materialize");
+        assert!(nfs1_proxy_ready, "nfs1 selected-group proxy should still materialize");
+
+        let nfs2_request = selected_group_dir_request(b"/force-find-stress", "nfs2");
+        let nfs2_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let mut last_direct_exists = None::<bool>;
+        let mut last_proxy_exists = None::<bool>;
+        let mut last_proxy_keys = Vec::<String>::new();
+        let mut last_proxy_err = None::<String>;
+        while tokio::time::Instant::now() < nfs2_deadline {
+            if let Ok(grouped) = app.query_tree(&nfs2_request).await {
+                last_direct_exists = grouped.get("nfs2").map(|payload| payload.root.exists);
+            }
+            match selected_group_proxy_tree(boundary.clone(), NodeId("node-a".to_string()), &nfs2_request)
+                .await
+            {
+                Ok(grouped) => {
+                    last_proxy_keys = grouped.keys().cloned().collect();
+                    last_proxy_exists = grouped.get("nfs2").map(|payload| payload.root.exists);
+                    last_proxy_err = None;
+                }
+                Err(err) => {
+                    last_proxy_err = Some(err.to_string());
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        assert_eq!(
+            last_direct_exists,
+            Some(false),
+            "peer-owned local source scope should leave nfs2 direct query unmaterialized before force-find"
+        );
+        assert_eq!(
+            last_proxy_exists,
+            Some(false),
+            "peer-owned local source scope should leave nfs2 selected-group proxy unmaterialized before force-find: last_proxy_keys={last_proxy_keys:?} last_proxy_err={last_proxy_err:?}"
+        );
 
         app.close().await.expect("close app");
     }

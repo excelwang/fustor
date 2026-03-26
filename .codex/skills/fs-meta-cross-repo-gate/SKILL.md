@@ -25,6 +25,10 @@ One-click activation phrases:
 - Re-read it before every new bounded iteration.
 - The side named by the current first raw failing boundary is the active owner.
 - While the blocker remains on `fustor`, the worker is the only side allowed to update `/root/repo/capanix/todo.md`.
+- Treat the blocker-state document as a rolling state document, not an append-only history log.
+- Keep only the active blocker, current first raw boundary, current exact seam, latest evidence that still changes the plan, and remaining validation order.
+- Compress closed seams to short "closed / do not revisit without fresh raw evidence" bullets.
+- Remove stale artifact lists, superseded reruns, and completed sub-iterations once they no longer affect the current blocker.
 
 ## Quick Start
 
@@ -43,6 +47,7 @@ When `fustor` owns the blocker:
 - Use red-test-first discipline at the owning layer before any fix.
 - Prefer the narrowest preserved reproducer named by the blocker-state document before broader validation.
 - Update `/root/repo/capanix/todo.md` only when new first-boundary evidence, repo-local closure, or execution order changes are proven.
+- When updating `/root/repo/capanix/todo.md`, rewrite the affected blocker section into its new minimal state instead of appending another long historical tranche.
 
 Required worker end markers:
 

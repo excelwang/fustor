@@ -41,8 +41,38 @@ use super::types::{
     QueryApiKeysResponse, RescanResponse, RevokeQueryApiKeyResponse, RootEntry, RootPreviewItem,
     RootSelectorEntry, RootUpdateEntry, RootsPreviewResponse, RootsResponse, RootsUpdateRequest,
     RootsUpdateResponse, RuntimeGrantsResponse, StatusFacade, StatusFacadePending, StatusResponse,
-    StatusSink, StatusSinkGroup, StatusSource, StatusSourceConcreteRoot, StatusSourceLogicalRoot,
+    StatusSink, StatusSinkDebug, StatusSinkGroup, StatusSource, StatusSourceConcreteRoot,
+    StatusSourceLogicalRoot,
 };
+
+fn debug_status_route_fanin_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_STATUS_ROUTE_FANIN")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn summarize_groups_by_node(
+    groups: &BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    groups
+        .iter()
+        .map(|(node_id, groups)| format!("{node_id}={}", groups.join("|")))
+        .collect()
+}
+
+fn summarize_source_status_route_snapshot(snapshot: &SourceObservabilitySnapshot) -> String {
+    format!(
+        "primaries={} runners={} source={:?} scan={:?} control={:?}",
+        snapshot.source_primary_by_group.len(),
+        snapshot.last_force_find_runner_by_group.len(),
+        summarize_groups_by_node(&snapshot.scheduled_source_groups_by_node),
+        summarize_groups_by_node(&snapshot.scheduled_scan_groups_by_node),
+        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node)
+    )
+}
 
 pub async fn login(
     State(state): State<ApiState>,
@@ -152,6 +182,10 @@ pub async fn status(
                     estimated_heap_bytes: group.estimated_heap_bytes,
                 })
                 .collect(),
+            debug: StatusSinkDebug {
+                scheduled_groups_by_node: sink_status.scheduled_groups_by_node,
+                last_control_frame_signals_by_node: sink_status.last_control_frame_signals_by_node,
+            },
         },
         facade: state
             .facade_pending
@@ -672,6 +706,9 @@ fn status_source_from_observability(
         source_primary_by_group,
         last_force_find_runner_by_group,
         force_find_inflight_groups: _source_force_find_inflight_groups,
+        scheduled_source_groups_by_node,
+        scheduled_scan_groups_by_node,
+        last_control_frame_signals_by_node,
     } = source;
     let crate::source::SourceStatusSnapshot {
         logical_roots: status_logical_roots,
@@ -727,6 +764,9 @@ fn status_source_from_observability(
             last_force_find_runner_by_group,
             last_force_find_runners_by_group: runner_sets,
             force_find_inflight_groups,
+            scheduled_source_groups_by_node,
+            scheduled_scan_groups_by_node,
+            last_control_frame_signals_by_node,
         },
     }
 }
@@ -755,6 +795,17 @@ async fn route_source_observability_snapshot(
             )
         })
         .collect::<Result<Vec<_>, _>>()?;
+    if debug_status_route_fanin_enabled() {
+        let summaries = snapshots
+            .iter()
+            .map(summarize_source_status_route_snapshot)
+            .collect::<Vec<_>>();
+        eprintln!(
+            "fs_meta_api_status: source_route_collect events={} snapshots={:?}",
+            snapshots.len(),
+            summaries
+        );
+    }
     let runner_sets = source_runner_sets(&snapshots);
     Ok((merge_source_observability_snapshots(snapshots), runner_sets))
 }
@@ -774,6 +825,9 @@ fn merge_source_observability(
             || !snapshot.source_primary_by_group.is_empty()
             || !snapshot.last_force_find_runner_by_group.is_empty()
             || !snapshot.force_find_inflight_groups.is_empty()
+            || !snapshot.scheduled_source_groups_by_node.is_empty()
+            || !snapshot.scheduled_scan_groups_by_node.is_empty()
+            || !snapshot.last_control_frame_signals_by_node.is_empty()
     }
 
     let (mut merged, fallback) = if has_live_data(&aggregated) {
@@ -861,6 +915,24 @@ fn merge_source_observability(
             .entry(group)
             .or_insert(runner);
     }
+    for (node_id, groups) in fallback.scheduled_source_groups_by_node {
+        merged
+            .scheduled_source_groups_by_node
+            .entry(node_id)
+            .or_insert(groups);
+    }
+    for (node_id, groups) in fallback.scheduled_scan_groups_by_node {
+        merged
+            .scheduled_scan_groups_by_node
+            .entry(node_id)
+            .or_insert(groups);
+    }
+    for (node_id, signals) in fallback.last_control_frame_signals_by_node {
+        merged
+            .last_control_frame_signals_by_node
+            .entry(node_id)
+            .or_insert(signals);
+    }
 
     let mut inflight = merged
         .force_find_inflight_groups
@@ -885,6 +957,9 @@ fn merge_source_observability_snapshots(
             source_primary_by_group: BTreeMap::new(),
             last_force_find_runner_by_group: BTreeMap::new(),
             force_find_inflight_groups: Vec::new(),
+            scheduled_source_groups_by_node: BTreeMap::new(),
+            scheduled_scan_groups_by_node: BTreeMap::new(),
+            last_control_frame_signals_by_node: BTreeMap::new(),
         };
     };
 
@@ -936,6 +1011,15 @@ fn merge_source_observability_snapshots(
         merged
             .last_force_find_runner_by_group
             .extend(snapshot.last_force_find_runner_by_group);
+        merged
+            .scheduled_source_groups_by_node
+            .extend(snapshot.scheduled_source_groups_by_node);
+        merged
+            .scheduled_scan_groups_by_node
+            .extend(snapshot.scheduled_scan_groups_by_node);
+        merged
+            .last_control_frame_signals_by_node
+            .extend(snapshot.last_control_frame_signals_by_node);
         inflight.extend(snapshot.force_find_inflight_groups);
         for grant in snapshot.grants {
             grant_map.entry(grant.object_ref.clone()).or_insert(grant);
@@ -1178,12 +1262,25 @@ mod tests {
                 "node-a".to_string(),
             )]),
             force_find_inflight_groups: Vec::new(),
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::new(),
         }
     }
 
     fn local_sink_snapshot() -> SinkStatusSnapshot {
         SinkStatusSnapshot {
             live_nodes: 1,
+            scheduled_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
             groups: vec![crate::sink::SinkGroupStatusSnapshot {
                 group_id: "nfs1".to_string(),
                 primary_object_ref: "obj-a".to_string(),
@@ -1348,6 +1445,18 @@ mod tests {
             source_primary_by_group: BTreeMap::from([("nfs1".to_string(), "node-a".to_string())]),
             last_force_find_runner_by_group: BTreeMap::new(),
             force_find_inflight_groups: Vec::new(),
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["activate nfs1".to_string()],
+            )]),
         };
         let aggregated = SourceObservabilitySnapshot {
             lifecycle_state: "ready".to_string(),
@@ -1410,6 +1519,18 @@ mod tests {
                 "node-b".to_string(),
             )]),
             force_find_inflight_groups: vec!["nfs2".to_string()],
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs2".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs2".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["activate nfs2".to_string()],
+            )]),
         };
 
         let merged = merge_source_observability(local, aggregated);
@@ -1429,6 +1550,81 @@ mod tests {
             merged.source_primary_by_group.get("nfs2"),
             Some(&"node-b".to_string())
         );
+        assert_eq!(
+            merged.scheduled_source_groups_by_node.get("node-a"),
+            Some(&vec!["nfs1".to_string()])
+        );
+        assert_eq!(
+            merged.scheduled_source_groups_by_node.get("node-b"),
+            Some(&vec!["nfs2".to_string()])
+        );
+        assert_eq!(
+            merged.last_control_frame_signals_by_node.get("node-a"),
+            Some(&vec!["activate nfs1".to_string()])
+        );
+        assert_eq!(
+            merged.last_control_frame_signals_by_node.get("node-b"),
+            Some(&vec!["activate nfs2".to_string()])
+        );
         assert_eq!(merged.force_find_inflight_groups, vec!["nfs2".to_string()]);
+    }
+
+    #[test]
+    fn merge_source_observability_snapshots_preserves_last_control_signals_by_node() {
+        let node_a = SourceObservabilitySnapshot {
+            lifecycle_state: "ready".to_string(),
+            host_object_grants_version: 1,
+            grants: Vec::new(),
+            logical_roots: Vec::new(),
+            status: SourceStatusSnapshot::default(),
+            source_primary_by_group: BTreeMap::new(),
+            last_force_find_runner_by_group: BTreeMap::new(),
+            force_find_inflight_groups: Vec::new(),
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["activate nfs1".to_string()],
+            )]),
+        };
+        let node_b = SourceObservabilitySnapshot {
+            lifecycle_state: "ready".to_string(),
+            host_object_grants_version: 1,
+            grants: Vec::new(),
+            logical_roots: Vec::new(),
+            status: SourceStatusSnapshot::default(),
+            source_primary_by_group: BTreeMap::new(),
+            last_force_find_runner_by_group: BTreeMap::new(),
+            force_find_inflight_groups: Vec::new(),
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs2".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs2".to_string()],
+            )]),
+            last_control_frame_signals_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["activate nfs2".to_string()],
+            )]),
+        };
+
+        let merged = merge_source_observability_snapshots(vec![node_a, node_b]);
+
+        assert_eq!(
+            merged.last_control_frame_signals_by_node.get("node-a"),
+            Some(&vec!["activate nfs1".to_string()])
+        );
+        assert_eq!(
+            merged.last_control_frame_signals_by_node.get("node-b"),
+            Some(&vec!["activate nfs2".to_string()])
+        );
     }
 }

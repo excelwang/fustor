@@ -12,6 +12,27 @@ In the current local environment, that document defaults to:
 
 Do not overrule that document from memory. Re-read it before every new iteration.
 
+## Blocker-State Hygiene
+
+Treat the blocker-state document as a rolling state summary, not a forensic transcript.
+
+When updating it:
+
+- Keep only the currently active blocker or blockers.
+- Keep the current first raw failing boundary and current exact seam explicit.
+- Keep one preserved blocker-localizing reproducer and only the latest raw evidence that still changes the plan.
+- Summarize closed seams in one short bullet each when they still matter as "do not revisit without fresh raw evidence" constraints.
+- Remove stale artifact lists, superseded rerun commands, and old sub-iteration notes once they no longer affect the current plan.
+- Rewrite the affected blocker section into its new minimal state instead of appending another historical tranche.
+
+The blocker-state document should let the next active owner answer these questions quickly:
+
+- What is still broken?
+- Where is the first raw boundary now?
+- What exact seam is currently owned?
+- What evidence still matters?
+- What should happen next?
+
 ## Governing Specs
 
 Read the spec files that govern the current blocker line before changing code.
@@ -44,6 +65,7 @@ When a preserved downstream case depends on sibling-repo binaries or environment
 - If a `fustor` repo-local bug is identified, add or update the owning red test first, prove it fails, then fix, then run impacted verification.
 - Capture raw unretried evidence before claiming the boundary moved back to `capanix`.
 - Do not update `/root/repo/capanix/todo.md` unless the new state is supported by first-boundary evidence.
+- When a seam is closed or ruled out, compress it immediately instead of letting completed detail accumulate in the blocker-state document.
 
 ## Acceptance
 

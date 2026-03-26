@@ -14,7 +14,7 @@ use futures_util::StreamExt;
 use tokio::task::JoinHandle;
 
 use crate::query::request::InternalQueryRequest;
-use crate::runtime::orchestration::SourceControlSignal;
+use crate::runtime::orchestration::{SourceControlSignal, source_control_signals_from_envelopes};
 use crate::runtime::routes::ROUTE_KEY_EVENTS;
 use crate::source::config::{GrantedMountRoot, RootSpec, SourceConfig};
 use crate::source::{FSMetaSource, SourceStatusSnapshot};
@@ -33,6 +33,87 @@ const SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT: Duration = Duration::from_secs(5)
 const SOURCE_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
 const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
+
+fn debug_control_scope_capture_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn summarize_bound_scopes(
+    bound_scopes: &[capanix_runtime_entry_sdk::control::RuntimeBoundScope],
+) -> Vec<String> {
+    bound_scopes
+        .iter()
+        .map(|scope| format!("{}=>{}", scope.scope_id, scope.resource_ids.join("|")))
+        .collect()
+}
+
+fn summarize_source_control_signals(signals: &[SourceControlSignal]) -> Vec<String> {
+    signals
+        .iter()
+        .map(|signal| match signal {
+            SourceControlSignal::Activate {
+                unit,
+                route_key,
+                generation,
+                bound_scopes,
+                ..
+            } => format!(
+                "activate unit={} route={} generation={} scopes={:?}",
+                unit.unit_id(),
+                route_key,
+                generation,
+                summarize_bound_scopes(bound_scopes)
+            ),
+            SourceControlSignal::Deactivate {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "deactivate unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SourceControlSignal::Tick {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "tick unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SourceControlSignal::RuntimeHostGrantChange { .. } => "host_grant_change".into(),
+            SourceControlSignal::ManualRescan { .. } => "manual_rescan".into(),
+            SourceControlSignal::Passthrough(_) => "passthrough".into(),
+        })
+        .collect()
+}
+
+fn summarize_groups_by_node(
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    groups
+        .iter()
+        .map(|(node_id, groups)| format!("{node_id}={}", groups.join("|")))
+        .collect()
+}
+
+fn summarize_source_observability_snapshot(snapshot: &SourceObservabilitySnapshot) -> String {
+    format!(
+        "lifecycle={} primaries={} runners={} source={:?} scan={:?} control={:?} degraded={:?}",
+        snapshot.lifecycle_state,
+        snapshot.source_primary_by_group.len(),
+        snapshot.last_force_find_runner_by_group.len(),
+        summarize_groups_by_node(&snapshot.scheduled_source_groups_by_node),
+        summarize_groups_by_node(&snapshot.scheduled_scan_groups_by_node),
+        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node),
+        snapshot.status.degraded_roots
+    )
+}
 
 fn debug_source_status_lifecycle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -95,6 +176,10 @@ struct SourceWorkerSnapshotCache {
     source_primary_by_group: Option<std::collections::BTreeMap<String, String>>,
     last_force_find_runner_by_group: Option<std::collections::BTreeMap<String, String>>,
     force_find_inflight_groups: Option<Vec<String>>,
+    scheduled_source_groups_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    scheduled_scan_groups_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    last_control_frame_signals_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -191,6 +276,12 @@ impl SourceWorkerClientHandle {
             cache.last_force_find_runner_by_group =
                 Some(snapshot.last_force_find_runner_by_group.clone());
             cache.force_find_inflight_groups = Some(snapshot.force_find_inflight_groups.clone());
+            cache.scheduled_source_groups_by_node =
+                Some(snapshot.scheduled_source_groups_by_node.clone());
+            cache.scheduled_scan_groups_by_node =
+                Some(snapshot.scheduled_scan_groups_by_node.clone());
+            cache.last_control_frame_signals_by_node =
+                Some(snapshot.last_control_frame_signals_by_node.clone());
         });
     }
 
@@ -226,6 +317,13 @@ impl SourceWorkerClientHandle {
         match Self::call_worker(client, SourceWorkerRequest::ObservabilitySnapshot, timeout).await?
         {
             SourceWorkerResponse::ObservabilitySnapshot(snapshot) => {
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_source_worker_client: observability_snapshot reply node={} {}",
+                        self.node_id.0,
+                        summarize_source_observability_snapshot(&snapshot)
+                    );
+                }
                 self.update_cached_observability_snapshot(&snapshot);
                 Ok(snapshot)
             }
@@ -623,6 +721,19 @@ impl SourceWorkerClientHandle {
             self.node_id.0,
             envelopes.len()
         );
+        if debug_control_scope_capture_enabled() {
+            match source_control_signals_from_envelopes(&envelopes) {
+                Ok(signals) => eprintln!(
+                    "fs_meta_source_worker_client: on_control_frame summary node={} signals={:?}",
+                    self.node_id.0,
+                    summarize_source_control_signals(&signals)
+                ),
+                Err(err) => eprintln!(
+                    "fs_meta_source_worker_client: on_control_frame summary node={} decode_err={}",
+                    self.node_id.0, err
+                ),
+            }
+        }
         self.start().await?;
         let result = match Self::call_worker(
             &self.client().await?,
@@ -674,14 +785,28 @@ impl SourceWorkerClientHandle {
 
     async fn try_observability_snapshot_nonblocking(&self) -> Result<SourceObservabilitySnapshot> {
         if self.control_op_inflight() {
-            return Ok(
-                self.degraded_observability_snapshot_from_cache("source worker control in flight")
-            );
+            let snapshot =
+                self.degraded_observability_snapshot_from_cache("source worker control in flight");
+            if debug_control_scope_capture_enabled() {
+                eprintln!(
+                    "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=control_inflight {}",
+                    self.node_id.0,
+                    summarize_source_observability_snapshot(&snapshot)
+                );
+            }
+            return Ok(snapshot);
         }
         let Some(client) = self.existing_client().await? else {
-            return Ok(
-                self.degraded_observability_snapshot_from_cache("source worker status not started")
-            );
+            let snapshot =
+                self.degraded_observability_snapshot_from_cache("source worker status not started");
+            if debug_control_scope_capture_enabled() {
+                eprintln!(
+                    "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=not_started {}",
+                    self.node_id.0,
+                    summarize_source_observability_snapshot(&snapshot)
+                );
+            }
+            return Ok(snapshot);
         };
         let trace_id = next_source_status_trace_id();
         let mut trace_guard =
@@ -709,9 +834,21 @@ impl SourceWorkerClientHandle {
     pub(crate) async fn observability_snapshot_nonblocking(&self) -> SourceObservabilitySnapshot {
         match self.try_observability_snapshot_nonblocking().await {
             Ok(snapshot) => snapshot,
-            Err(err) => self.degraded_observability_snapshot_from_cache(format!(
-                "source worker unavailable: {err}"
-            )),
+            Err(err) => {
+                let snapshot =
+                    self.degraded_observability_snapshot_from_cache(format!(
+                        "source worker unavailable: {err}"
+                    ));
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
+                        self.node_id.0,
+                        err,
+                        summarize_source_observability_snapshot(&snapshot)
+                    );
+                }
+                snapshot
+            }
         }
     }
 }
@@ -726,6 +863,25 @@ pub struct SourceObservabilitySnapshot {
     pub source_primary_by_group: std::collections::BTreeMap<String, String>,
     pub last_force_find_runner_by_group: std::collections::BTreeMap<String, String>,
     pub force_find_inflight_groups: Vec<String>,
+    pub scheduled_source_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub scheduled_scan_groups_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub last_control_frame_signals_by_node: std::collections::BTreeMap<String, Vec<String>>,
+}
+
+fn scheduled_groups_by_node(
+    node_id: &NodeId,
+    groups: Result<Option<std::collections::BTreeSet<String>>>,
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    let Ok(Some(groups)) = groups else {
+        return std::collections::BTreeMap::new();
+    };
+    if groups.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    std::collections::BTreeMap::from([(
+        node_id.0.clone(),
+        groups.into_iter().collect::<Vec<_>>(),
+    )])
 }
 
 fn build_degraded_worker_observability_snapshot(
@@ -749,6 +905,18 @@ fn build_degraded_worker_observability_snapshot(
             .clone()
             .unwrap_or_default(),
         force_find_inflight_groups: cache.force_find_inflight_groups.clone().unwrap_or_default(),
+        scheduled_source_groups_by_node: cache
+            .scheduled_source_groups_by_node
+            .clone()
+            .unwrap_or_default(),
+        scheduled_scan_groups_by_node: cache
+            .scheduled_scan_groups_by_node
+            .clone()
+            .unwrap_or_default(),
+        last_control_frame_signals_by_node: cache
+            .last_control_frame_signals_by_node
+            .clone()
+            .unwrap_or_default(),
     }
 }
 
@@ -978,6 +1146,15 @@ impl SourceFacade {
                 source_primary_by_group: source.source_primary_by_group_snapshot(),
                 last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
                 force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
+                scheduled_source_groups_by_node: scheduled_groups_by_node(
+                    &source.node_id(),
+                    source.scheduled_source_group_ids(),
+                ),
+                scheduled_scan_groups_by_node: scheduled_groups_by_node(
+                    &source.node_id(),
+                    source.scheduled_scan_group_ids(),
+                ),
+                last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
             }),
             Self::Worker(client) => {
                 let worker_client = client.client().await?;
@@ -1002,6 +1179,15 @@ impl SourceFacade {
                 source_primary_by_group: source.source_primary_by_group_snapshot(),
                 last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
                 force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
+                scheduled_source_groups_by_node: scheduled_groups_by_node(
+                    &source.node_id(),
+                    source.scheduled_source_group_ids(),
+                ),
+                scheduled_scan_groups_by_node: scheduled_groups_by_node(
+                    &source.node_id(),
+                    source.scheduled_scan_group_ids(),
+                ),
+                last_control_frame_signals_by_node: std::collections::BTreeMap::new(),
             },
             Self::Worker(client) => client.observability_snapshot_nonblocking().await,
         }
@@ -1085,6 +1271,9 @@ mod tests {
         LogLevel, RuntimeWorkerBinding, RuntimeWorkerLauncherKind, in_memory_state_boundary,
     };
     use capanix_app_sdk::worker::WorkerMode;
+    use capanix_runtime_entry_sdk::control::{
+        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
+    };
     use capanix_runtime_entry_sdk::worker_runtime::RuntimeWorkerClientFactory;
     use capanix_runtime_entry_sdk::worker_runtime::TypedWorkerRpc;
     use std::collections::{HashMap, HashSet};
@@ -1095,6 +1284,14 @@ mod tests {
     use tokio::sync::{Mutex as AsyncMutex, Notify};
 
     use crate::ControlEvent;
+    use crate::query::models::QueryNode;
+    use crate::query::path::root_file_name_bytes;
+    use crate::query::request::{MaterializedQueryPayload, QueryOp, QueryScope};
+    use crate::runtime::execution_units::{
+        SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
+    };
+    use crate::runtime::routes::ROUTE_KEY_QUERY;
+    use crate::workers::sink::SinkWorkerClientHandle;
 
     #[derive(Default)]
     struct LoopbackWorkerBoundary {
@@ -1234,6 +1431,16 @@ mod tests {
         }
     }
 
+    fn external_sink_worker_binding(socket_dir: &Path) -> RuntimeWorkerBinding {
+        RuntimeWorkerBinding {
+            role_id: "sink".to_string(),
+            mode: WorkerMode::External,
+            launcher_kind: RuntimeWorkerLauncherKind::WorkerHost,
+            module_path: Some(fs_meta_worker_module_path()),
+            socket_dir: Some(socket_dir.to_path_buf()),
+        }
+    }
+
     fn worker_source_root(id: &str, path: &Path) -> RootSpec {
         let mut root = RootSpec::new(id, path);
         root.watch = false;
@@ -1262,6 +1469,74 @@ mod tests {
             interfaces: vec![],
             active: true,
         }
+    }
+
+    fn bound_scope_with_resources(scope_id: &str, resource_ids: &[&str]) -> RuntimeBoundScope {
+        RuntimeBoundScope {
+            scope_id: scope_id.to_string(),
+            resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
+    fn selected_group_request(path: &[u8], group_id: &str) -> InternalQueryRequest {
+        InternalQueryRequest::materialized(
+            QueryOp::Tree,
+            QueryScope {
+                path: path.to_vec(),
+                recursive: false,
+                max_depth: Some(0),
+                selected_group: Some(group_id.to_string()),
+            },
+            None,
+        )
+    }
+
+    fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
+        let mut selected = None::<QueryNode>;
+        for event in &events {
+            let payload = rmp_serde::from_slice::<MaterializedQueryPayload>(event.payload_bytes())
+                .map_err(|e| CnxError::Internal(format!("decode query response failed: {e}")))?;
+            let MaterializedQueryPayload::Tree(response) = payload else {
+                return Err(CnxError::Internal(
+                    "unexpected stats payload for query_node".into(),
+                ));
+            };
+            let mut consider = |node: QueryNode| {
+                if node.path != path {
+                    return;
+                }
+                match selected.as_mut() {
+                    Some(existing) if existing.modified_time_us > node.modified_time_us => {}
+                    Some(existing) => *existing = node,
+                    None => selected = Some(node),
+                }
+            };
+            if response.root.exists {
+                consider(QueryNode {
+                    path: response.root.path.clone(),
+                    file_name: root_file_name_bytes(&response.root.path),
+                    size: response.root.size,
+                    modified_time_us: response.root.modified_time_us,
+                    is_dir: response.root.is_dir,
+                    monitoring_attested: response.reliability.reliable,
+                    is_suspect: false,
+                    is_blind_spot: false,
+                });
+            }
+            for entry in response.entries {
+                consider(QueryNode {
+                    path: entry.path.clone(),
+                    file_name: root_file_name_bytes(&entry.path),
+                    size: entry.size,
+                    modified_time_us: entry.modified_time_us,
+                    is_dir: entry.is_dir,
+                    monitoring_attested: response.reliability.reliable,
+                    is_suspect: false,
+                    is_blind_spot: false,
+                });
+            }
+        }
+        Ok(selected)
     }
 
     async fn recv_loopback_events(
@@ -1341,6 +1616,15 @@ mod tests {
                 "obj-a".to_string(),
             )])),
             force_find_inflight_groups: Some(vec!["group-a".to_string()]),
+            scheduled_source_groups_by_node: Some(std::collections::BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["group-a".to_string()],
+            )])),
+            scheduled_scan_groups_by_node: Some(std::collections::BTreeMap::from([(
+                "node-a".to_string(),
+                vec!["group-a".to_string()],
+            )])),
+            last_control_frame_signals_by_node: Some(std::collections::BTreeMap::new()),
         };
 
         let snapshot =
@@ -1361,6 +1645,14 @@ mod tests {
         assert_eq!(
             snapshot.force_find_inflight_groups,
             vec!["group-a".to_string()]
+        );
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-a"),
+            Some(&vec!["group-a".to_string()])
+        );
+        assert_eq!(
+            snapshot.scheduled_scan_groups_by_node.get("node-a"),
+            Some(&vec!["group-a".to_string()])
         );
         assert_eq!(snapshot.status.degraded_roots.len(), 2);
         assert_eq!(
@@ -1499,5 +1791,235 @@ mod tests {
         );
 
         client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_source_worker_stream_batches_reach_sink_worker_for_each_scheduled_primary_root(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
+            .expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                worker_source_root("nfs1", &nfs1),
+                worker_source_root("nfs2", &nfs2),
+            ],
+            host_object_grants: vec![
+                worker_source_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                worker_source_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let source_factory = RuntimeWorkerClientFactory::new(
+            boundary.clone(),
+            boundary.clone(),
+            in_memory_state_boundary(),
+        );
+        let sink_factory = RuntimeWorkerClientFactory::new(
+            boundary.clone(),
+            boundary.clone(),
+            in_memory_state_boundary(),
+        );
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        std::fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        std::fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let source = SourceWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg.clone(),
+            external_source_worker_binding(&source_socket_dir),
+            source_factory,
+        )
+        .expect("construct source worker client");
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_sink_worker_binding(&sink_socket_dir),
+            sink_factory,
+        )
+        .expect("construct sink worker client");
+
+        source
+            .on_control_frame(vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: ROUTE_KEY_QUERY.to_string(),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 1,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: ROUTE_KEY_QUERY.to_string(),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 1,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                    ],
+                }))
+                .expect("encode source-scan activate"),
+            ])
+            .await
+            .expect("activate source worker");
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: SINK_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("activate sink worker");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let scheduling_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            let sink_groups = sink
+                .status_snapshot()
+                .await
+                .expect("sink status")
+                .scheduled_groups_by_node
+                .get("node-a")
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>();
+            if source_groups == expected_groups
+                && scan_groups == expected_groups
+                && sink_groups == expected_groups
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < scheduling_deadline,
+                "timed out waiting for source/sink schedule convergence: source={source_groups:?} scan={scan_groups:?} sink={sink_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let mut control_counts = std::collections::BTreeMap::<String, usize>::new();
+        let mut data_counts = std::collections::BTreeMap::<String, usize>::new();
+        let selected_file = b"/force-find-stress/seed.txt";
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            match recv_loopback_events(&boundary, 250).await {
+                Ok(batch) => {
+                    let mut control = 0usize;
+                    for event in &batch {
+                        let origin = event.metadata().origin_id.0.clone();
+                        if rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok() {
+                            *control_counts.entry(origin).or_insert(0) += 1;
+                            control += 1;
+                        } else {
+                            *data_counts.entry(origin).or_insert(0) += 1;
+                        }
+                    }
+                    if control < batch.len() {
+                        sink.send(batch).await.expect("forward source batch to sink");
+                    }
+                }
+                Err(CnxError::Timeout) => continue,
+                Err(err) => panic!("stream batch recv failed: {err}"),
+            }
+            let complete = ["node-a::nfs1", "node-a::nfs2"].iter().all(|origin| {
+                control_counts.get(*origin).copied().unwrap_or(0) > 0
+                    && data_counts.get(*origin).copied().unwrap_or(0) > 0
+            });
+            let nfs1_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_file, "nfs1"))
+                    .await
+                    .expect("query nfs1"),
+                selected_file,
+            )
+            .expect("decode nfs1")
+            .is_some();
+            let nfs2_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+                    .await
+                    .expect("query nfs2"),
+                selected_file,
+            )
+            .expect("decode nfs2")
+            .is_some();
+            if complete && nfs1_ready && nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            control_counts.get("node-a::nfs1").copied().unwrap_or(0) > 0,
+            "nfs1 should publish at least one control event on the external source stream: {control_counts:?}"
+        );
+        assert!(
+            control_counts.get("node-a::nfs2").copied().unwrap_or(0) > 0,
+            "nfs2 should publish at least one control event on the external source stream: {control_counts:?}"
+        );
+        assert!(
+            data_counts.get("node-a::nfs1").copied().unwrap_or(0) > 0,
+            "nfs1 should produce at least one data batch on the external source stream: {data_counts:?}"
+        );
+        assert!(
+            data_counts.get("node-a::nfs2").copied().unwrap_or(0) > 0,
+            "nfs2 should produce at least one data batch on the external source stream: {data_counts:?}"
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_file, "nfs1"))
+                    .await
+                    .expect("query nfs1 final"),
+                selected_file,
+            )
+            .expect("decode nfs1 final")
+            .is_some(),
+            "nfs1 should materialize after forwarding external source batches into sink.send(...)",
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+                    .await
+                    .expect("query nfs2 final"),
+                selected_file,
+            )
+            .expect("decode nfs2 final")
+            .is_some(),
+            "nfs2 should materialize after forwarding external source batches into sink.send(...)",
+        );
+
+        source.close().await.expect("close source worker");
+        sink.close().await.expect("close sink worker");
     }
 }

@@ -28,6 +28,82 @@ const SINK_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SINK_WORKER_FORCE_FIND_REPLY_IDLE_GRACE: Duration = Duration::from_secs(5);
 const SINK_WORKER_MATERIALIZED_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
+fn debug_control_scope_capture_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn summarize_bound_scopes(
+    bound_scopes: &[capanix_runtime_entry_sdk::control::RuntimeBoundScope],
+) -> Vec<String> {
+    bound_scopes
+        .iter()
+        .map(|scope| format!("{}=>{}", scope.scope_id, scope.resource_ids.join("|")))
+        .collect()
+}
+
+fn summarize_sink_control_signals(signals: &[SinkControlSignal]) -> Vec<String> {
+    signals
+        .iter()
+        .map(|signal| match signal {
+            SinkControlSignal::Activate {
+                unit,
+                route_key,
+                generation,
+                bound_scopes,
+                ..
+            } => format!(
+                "activate unit={} route={} generation={} scopes={:?}",
+                unit.unit_id(),
+                route_key,
+                generation,
+                summarize_bound_scopes(bound_scopes)
+            ),
+            SinkControlSignal::Deactivate {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "deactivate unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SinkControlSignal::Tick {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "tick unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SinkControlSignal::RuntimeHostGrantChange { .. } => "host_grant_change".into(),
+            SinkControlSignal::Passthrough(_) => "passthrough".into(),
+        })
+        .collect()
+}
+
+fn summarize_groups_by_node(
+    groups: &std::collections::BTreeMap<String, Vec<String>>,
+) -> Vec<String> {
+    groups
+        .iter()
+        .map(|(node_id, groups)| format!("{node_id}={}", groups.join("|")))
+        .collect()
+}
+
+fn summarize_sink_status_snapshot(snapshot: &SinkStatusSnapshot) -> String {
+    format!(
+        "groups={} scheduled={:?} control={:?}",
+        snapshot.groups.len(),
+        summarize_groups_by_node(&snapshot.scheduled_groups_by_node),
+        summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node)
+    )
+}
+
 fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
     let mut selected = None::<QueryNode>;
     for event in &events {
@@ -303,13 +379,28 @@ impl SinkWorkerClientHandle {
                 )));
             }
         };
+        if debug_control_scope_capture_enabled() {
+            eprintln!(
+                "fs_meta_sink_worker_client: status_snapshot reply node={} {}",
+                self.node_id.0,
+                summarize_sink_status_snapshot(&snapshot)
+            );
+        }
         self.update_cached_status_snapshot(snapshot.clone())?;
         Ok(snapshot)
     }
 
     pub async fn status_snapshot_nonblocking(&self) -> Result<SinkStatusSnapshot> {
         if self.control_op_inflight() {
-            return self.cached_status_snapshot();
+            let snapshot = self.cached_status_snapshot()?;
+            if debug_control_scope_capture_enabled() {
+                eprintln!(
+                    "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=control_inflight {}",
+                    self.node_id.0,
+                    summarize_sink_status_snapshot(&snapshot)
+                );
+            }
+            return Ok(snapshot);
         }
         match self.existing_client().await? {
             Some(client) => match Self::call_worker(
@@ -326,12 +417,40 @@ impl SinkWorkerClientHandle {
                             snapshot
                         )));
                     };
+                    if debug_control_scope_capture_enabled() {
+                        eprintln!(
+                            "fs_meta_sink_worker_client: status_snapshot reply node={} {}",
+                            self.node_id.0,
+                            summarize_sink_status_snapshot(&snapshot)
+                        );
+                    }
                     self.update_cached_status_snapshot(snapshot.clone())?;
                     Ok(snapshot)
                 }
-                Err(_) => self.cached_status_snapshot(),
+                Err(err) => {
+                    let snapshot = self.cached_status_snapshot()?;
+                    if debug_control_scope_capture_enabled() {
+                        eprintln!(
+                            "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
+                            self.node_id.0,
+                            err,
+                            summarize_sink_status_snapshot(&snapshot)
+                        );
+                    }
+                    Ok(snapshot)
+                }
             },
-            None => self.cached_status_snapshot(),
+            None => {
+                let snapshot = self.cached_status_snapshot()?;
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_sink_worker_client: status_snapshot cache_fallback node={} reason=not_started {}",
+                        self.node_id.0,
+                        summarize_sink_status_snapshot(&snapshot)
+                    );
+                }
+                Ok(snapshot)
+            }
         }
     }
 
@@ -574,6 +693,19 @@ impl SinkWorkerClientHandle {
             self.node_id.0,
             envelopes.len()
         );
+        if debug_control_scope_capture_enabled() {
+            match sink_control_signals_from_envelopes(&envelopes) {
+                Ok(signals) => eprintln!(
+                    "fs_meta_sink_worker_client: on_control_frame summary node={} signals={:?}",
+                    self.node_id.0,
+                    summarize_sink_control_signals(&signals)
+                ),
+                Err(err) => eprintln!(
+                    "fs_meta_sink_worker_client: on_control_frame summary node={} decode_err={}",
+                    self.node_id.0, err
+                ),
+            }
+        }
         self.ensure_started().await?;
         let result = match Self::call_worker(
             &self.client().await?,
@@ -855,6 +987,9 @@ mod tests {
         LogLevel, RuntimeWorkerBinding, RuntimeWorkerLauncherKind, in_memory_state_boundary,
     };
     use capanix_app_sdk::worker::WorkerMode;
+    use capanix_runtime_entry_sdk::control::{
+        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
+    };
     use futures_util::StreamExt;
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
@@ -865,6 +1000,7 @@ mod tests {
 
     use crate::source::FSMetaSource;
     use crate::source::config::RootSpec;
+    use crate::runtime::routes::ROUTE_KEY_QUERY;
 
     #[derive(Default)]
     struct LoopbackWorkerBoundary {
@@ -1047,6 +1183,13 @@ mod tests {
         )
     }
 
+    fn bound_scope_with_resources(scope_id: &str, resource_ids: &[&str]) -> RuntimeBoundScope {
+        RuntimeBoundScope {
+            scope_id: scope_id.to_string(),
+            resource_ids: resource_ids.iter().map(|id| (*id).to_string()).collect(),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn external_sink_worker_materializes_each_local_primary_root_from_source_batches() {
         let tmp = tempdir().expect("create temp dir");
@@ -1222,6 +1365,195 @@ mod tests {
             .expect("decode nfs2 final")
             .is_some(),
             "nfs2 should materialize its post-rescan file",
+        );
+
+        source.close().await.expect("close source");
+        sink.close().await.expect("close sink worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_sink_worker_schedules_group_before_it_materializes_until_batches_arrive() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
+        std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
+            .expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
+            .expect("seed nfs2");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                sink_worker_root("nfs1", &nfs1),
+                sink_worker_root("nfs2", &nfs2),
+            ],
+            host_object_grants: vec![
+                sink_worker_export("node-a::nfs1", "node-a", "10.0.0.11", nfs1.clone()),
+                sink_worker_export("node-a::nfs2", "node-a", "10.0.0.12", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(cfg.clone(), NodeId("node-a".to_string()), None)
+            .expect("init source");
+        let mut stream = source.pub_().await.expect("start source pub stream");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory = RuntimeWorkerClientFactory::new(
+            boundary.clone(),
+            boundary.clone(),
+            state_boundary,
+        );
+        let sink = SinkWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_sink_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct sink worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), sink.ensure_started())
+            .await
+            .expect("sink worker start timed out")
+            .expect("start sink worker");
+        sink.on_control_frame(vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: ROUTE_KEY_QUERY.to_string(),
+                unit_id: "runtime.exec.sink".to_string(),
+                lease: None,
+                generation: 1,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    bound_scope_with_resources("nfs1", &["node-a::nfs1"]),
+                    bound_scope_with_resources("nfs2", &["node-a::nfs2"]),
+                ],
+            }))
+            .expect("encode sink activate"),
+        ])
+        .await
+        .expect("activate sink groups");
+
+        let selected_file = b"/force-find-stress/seed.txt";
+        let mut deferred_nfs2_batches = Vec::<Vec<Event>>::new();
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < initial_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => {
+                    let mut nfs1_batch = Vec::new();
+                    let mut nfs2_batch = Vec::new();
+                    for event in batch {
+                        match event.metadata().origin_id.0.as_str() {
+                            "node-a::nfs1" => nfs1_batch.push(event),
+                            "node-a::nfs2" => nfs2_batch.push(event),
+                            _ => {}
+                        }
+                    }
+                    if !nfs2_batch.is_empty() {
+                        deferred_nfs2_batches.push(nfs2_batch);
+                    }
+                    if !nfs1_batch.is_empty() {
+                        sink.send(nfs1_batch)
+                            .await
+                            .expect("apply nfs1-only batch");
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => continue,
+            }
+            let nfs1_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_file, "nfs1"))
+                    .await
+                    .expect("query nfs1 while nfs2 withheld"),
+                selected_file,
+            )
+            .expect("decode nfs1 while nfs2 withheld")
+            .is_some();
+            if nfs1_ready {
+                break;
+            }
+        }
+
+        let status = sink
+            .status_snapshot()
+            .await
+            .expect("status snapshot after nfs1-only send");
+        assert_eq!(
+            status
+                .scheduled_groups_by_node
+                .get("node-a")
+                .cloned()
+                .unwrap_or_default(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+            "scheduled group coverage should reflect both roots before nfs2 materializes",
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_file, "nfs1"))
+                    .await
+                    .expect("query nfs1 after nfs1-only send"),
+                selected_file,
+            )
+            .expect("decode nfs1 after nfs1-only send")
+            .is_some(),
+            "nfs1 should materialize once its batches are sent",
+        );
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+                    .await
+                    .expect("query nfs2 before batches arrive"),
+                selected_file,
+            )
+            .expect("decode nfs2 before batches arrive")
+            .is_none(),
+            "nfs2 should stay empty until its own batches are sent",
+        );
+
+        for batch in deferred_nfs2_batches.drain(..) {
+            sink.send(batch).await.expect("apply deferred nfs2 batch");
+        }
+        let nfs2_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < nfs2_deadline {
+            match tokio::time::timeout(Duration::from_millis(250), stream.next()).await {
+                Ok(Some(batch)) => {
+                    let nfs2_batch = batch
+                        .into_iter()
+                        .filter(|event| event.metadata().origin_id.0 == "node-a::nfs2")
+                        .collect::<Vec<_>>();
+                    if !nfs2_batch.is_empty() {
+                        sink.send(nfs2_batch)
+                            .await
+                            .expect("apply remaining nfs2 batch");
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => continue,
+            }
+            let nfs2_ready = decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+                    .await
+                    .expect("query nfs2 after deferred batches"),
+                selected_file,
+            )
+            .expect("decode nfs2 after deferred batches")
+            .is_some();
+            if nfs2_ready {
+                break;
+            }
+        }
+
+        assert!(
+            decode_exact_query_node(
+                sink.materialized_query(selected_group_request(selected_file, "nfs2"))
+                    .await
+                    .expect("query nfs2 final"),
+                selected_file,
+            )
+            .expect("decode nfs2 final")
+            .is_some(),
+            "nfs2 should materialize on the same sink-worker seam once its batches arrive",
         );
 
         source.close().await.expect("close source");

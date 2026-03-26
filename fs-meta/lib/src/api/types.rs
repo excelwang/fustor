@@ -109,6 +109,9 @@ pub struct StatusSourceDebug {
     pub last_force_find_runner_by_group: BTreeMap<String, String>,
     pub last_force_find_runners_by_group: BTreeMap<String, Vec<String>>,
     pub force_find_inflight_groups: Vec<String>,
+    pub scheduled_source_groups_by_node: BTreeMap<String, Vec<String>>,
+    pub scheduled_scan_groups_by_node: BTreeMap<String, Vec<String>>,
+    pub last_control_frame_signals_by_node: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -138,6 +141,13 @@ pub struct StatusSink {
     pub shadow_time_us: u64,
     pub estimated_heap_bytes: u64,
     pub groups: Vec<StatusSinkGroup>,
+    pub debug: StatusSinkDebug,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusSinkDebug {
+    pub scheduled_groups_by_node: BTreeMap<String, Vec<String>>,
+    pub last_control_frame_signals_by_node: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

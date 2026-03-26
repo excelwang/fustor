@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 
 use crate::source::FSMetaSource;
 use crate::source::config::SourceConfig;
+use crate::runtime::orchestration::{SourceControlSignal, source_control_signals_from_envelopes};
 use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
 use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
@@ -30,6 +31,7 @@ struct SourceWorkerState {
     source: Option<Arc<FSMetaSource>>,
     pending_init: Option<(NodeId, SourceConfig)>,
     pump_task: Option<JoinHandle<()>>,
+    last_control_frame_signals: Vec<String>,
 }
 
 enum SourceWorkerAction {
@@ -76,6 +78,65 @@ fn source_worker_request_label(request: &SourceWorkerRequest) -> &'static str {
     }
 }
 
+fn debug_control_scope_capture_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn summarize_bound_scopes(
+    bound_scopes: &[capanix_runtime_entry_sdk::control::RuntimeBoundScope],
+) -> Vec<String> {
+    bound_scopes
+        .iter()
+        .map(|scope| format!("{}=>{}", scope.scope_id, scope.resource_ids.join("|")))
+        .collect()
+}
+
+fn summarize_source_control_signals(signals: &[SourceControlSignal]) -> Vec<String> {
+    signals
+        .iter()
+        .map(|signal| match signal {
+            SourceControlSignal::Activate {
+                unit,
+                route_key,
+                generation,
+                bound_scopes,
+                ..
+            } => format!(
+                "activate unit={} route={} generation={} scopes={:?}",
+                unit.unit_id(),
+                route_key,
+                generation,
+                summarize_bound_scopes(bound_scopes)
+            ),
+            SourceControlSignal::Deactivate {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "deactivate unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SourceControlSignal::Tick {
+                unit,
+                route_key,
+                generation,
+                ..
+            } => format!(
+                "tick unit={} route={} generation={}",
+                unit.unit_id(),
+                route_key,
+                generation
+            ),
+            SourceControlSignal::RuntimeHostGrantChange { .. } => "host_grant_change".into(),
+            SourceControlSignal::ManualRescan { .. } => "manual_rescan".into(),
+            SourceControlSignal::Passthrough(_) => "passthrough".into(),
+        })
+        .collect()
+}
+
 fn classify_source_worker_error(err: CnxError) -> SourceWorkerResponse {
     match err {
         CnxError::InvalidInput(message) => SourceWorkerResponse::InvalidInput(message),
@@ -101,6 +162,7 @@ async fn stop_source_runtime_with_timeouts(
         }
     }
     state.source = None;
+    state.last_control_frame_signals.clear();
 }
 
 async fn stop_source_runtime(state: &mut SourceWorkerState) {
@@ -149,7 +211,21 @@ fn bootstrap_not_ready() -> CnxError {
     CnxError::NotReady("worker not initialized".into())
 }
 
-fn source_observability_snapshot(source: &FSMetaSource) -> SourceObservabilitySnapshot {
+fn last_control_frame_signals_by_node(
+    node_id: &NodeId,
+    signals: &[String],
+) -> std::collections::BTreeMap<String, Vec<String>> {
+    if signals.is_empty() {
+        return std::collections::BTreeMap::new();
+    }
+    std::collections::BTreeMap::from([(node_id.0.clone(), signals.to_vec())])
+}
+
+fn source_observability_snapshot(
+    source: &FSMetaSource,
+    last_control_frame_signals: &[String],
+) -> SourceObservabilitySnapshot {
+    let node_id = source.node_id();
     SourceObservabilitySnapshot {
         lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
         host_object_grants_version: source.host_object_grants_version_snapshot(),
@@ -159,6 +235,28 @@ fn source_observability_snapshot(source: &FSMetaSource) -> SourceObservabilitySn
         source_primary_by_group: source.source_primary_by_group_snapshot(),
         last_force_find_runner_by_group: source.last_force_find_runner_by_group_snapshot(),
         force_find_inflight_groups: source.force_find_inflight_groups_snapshot(),
+        scheduled_source_groups_by_node: source
+            .scheduled_source_group_ids()
+            .ok()
+            .flatten()
+            .filter(|groups| !groups.is_empty())
+            .map(|groups| {
+                std::collections::BTreeMap::from([(node_id.0.clone(), groups.into_iter().collect())])
+            })
+            .unwrap_or_default(),
+        scheduled_scan_groups_by_node: source
+            .scheduled_scan_group_ids()
+            .ok()
+            .flatten()
+            .filter(|groups| !groups.is_empty())
+            .map(|groups| {
+                std::collections::BTreeMap::from([(node_id.0.clone(), groups.into_iter().collect())])
+            })
+            .unwrap_or_default(),
+        last_control_frame_signals_by_node: last_control_frame_signals_by_node(
+            &node_id,
+            last_control_frame_signals,
+        ),
     }
 }
 
@@ -175,6 +273,7 @@ async fn bootstrap_init_source_runtime(
     );
     let _ = stop_source_runtime(state).await;
     state.pending_init = Some((node_id, config));
+    state.last_control_frame_signals.clear();
     eprintln!("fs_meta_source_worker_server: bootstrap_init ok");
 }
 
@@ -231,7 +330,7 @@ async fn bootstrap_start_source_runtime(
 
 fn plan_worker_request(
     request: SourceWorkerRequest,
-    state: &SourceWorkerState,
+    state: &mut SourceWorkerState,
 ) -> SourceWorkerAction {
     match request {
         SourceWorkerRequest::UpdateLogicalRoots { roots } => match state.source.clone() {
@@ -285,7 +384,10 @@ fn plan_worker_request(
         },
         SourceWorkerRequest::ObservabilitySnapshot => match state.source.as_ref() {
             Some(source) => SourceWorkerAction::Immediate(
-                SourceWorkerResponse::ObservabilitySnapshot(source_observability_snapshot(source)),
+                SourceWorkerResponse::ObservabilitySnapshot(source_observability_snapshot(
+                    source,
+                    &state.last_control_frame_signals,
+                )),
                 false,
             ),
             None => SourceWorkerAction::Immediate(
@@ -426,7 +528,21 @@ fn plan_worker_request(
             ),
         },
         SourceWorkerRequest::OnControlFrame { envelopes } => match state.source.clone() {
-            Some(source) => SourceWorkerAction::OnControlFrame { source, envelopes },
+            Some(source) => {
+                let summary = match source_control_signals_from_envelopes(&envelopes) {
+                    Ok(signals) => summarize_source_control_signals(&signals),
+                    Err(err) => vec![format!("decode_err={err}")],
+                };
+                state.last_control_frame_signals = summary.clone();
+                if debug_control_scope_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_source_worker_server: on_control_frame summary node={} signals={:?}",
+                        source.node_id().0,
+                        summary
+                    );
+                }
+                SourceWorkerAction::OnControlFrame { source, envelopes }
+            }
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -480,6 +596,7 @@ pub fn run_source_worker_server(
         source: None,
         pending_init: None,
         pump_task: None,
+        last_control_frame_signals: Vec::new(),
     }));
     run_worker_sidecar_server::<SourceWorkerRpc, _, SourceConfig>(
         control_socket_path,
@@ -506,8 +623,8 @@ impl TypedWorkerSession<SourceWorkerRpc> for SourceWorkerSession {
             request_seq, request_label
         );
         let action = {
-            let guard = self.state.lock().await;
-            plan_worker_request(request, &guard)
+            let mut guard = self.state.lock().await;
+            plan_worker_request(request, &mut guard)
         };
         let (response, stop) = execute_worker_action(action).await;
         eprintln!(

@@ -111,6 +111,17 @@ fn lock_or_recover<'a, T>(m: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
     }
 }
 
+fn debug_control_scope_capture_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn summarize_bound_scopes(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
+    bound_scopes
+        .iter()
+        .map(|scope| format!("{}=>{}", scope.scope_id, scope.resource_ids.join("|")))
+        .collect()
+}
+
 fn encode_force_find_grouped_events(
     source_events: &[Event],
     query_path: &[u8],
@@ -662,6 +673,16 @@ impl FSMetaSource {
                     bound_scopes,
                     ..
                 } => {
+                    if debug_control_scope_capture_enabled() {
+                        eprintln!(
+                            "fs_meta_source: control_scope_capture node={} unit={} route={} generation={} scopes={:?}",
+                            self.node_id.0,
+                            unit.unit_id(),
+                            route_key,
+                            generation,
+                            summarize_bound_scopes(bound_scopes)
+                        );
+                    }
                     self.apply_activate_signal(*unit, route_key, *generation, bound_scopes)?;
                     refresh_runtime_topology = true;
                 }

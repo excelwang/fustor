@@ -80,6 +80,17 @@ fn lock_or_recover<'a, T>(m: &'a Mutex<T>, context: &str) -> std::sync::MutexGua
     }
 }
 
+fn debug_control_scope_capture_enabled() -> bool {
+    std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn summarize_bound_scopes(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
+    bound_scopes
+        .iter()
+        .map(|scope| format!("{}=>{}", scope.scope_id, scope.resource_ids.join("|")))
+        .collect()
+}
+
 fn build_error_marker_event(node_id: &NodeId, correlation_id: Option<u64>, message: &str) -> Event {
     Event::new(
         EventMetadata {
@@ -196,6 +207,8 @@ pub struct SinkStatusSnapshot {
     pub shadow_time_us: u64,
     pub estimated_heap_bytes: u64,
     pub groups: Vec<SinkGroupStatusSnapshot>,
+    pub scheduled_groups_by_node: BTreeMap<String, Vec<String>>,
+    pub last_control_frame_signals_by_node: BTreeMap<String, Vec<String>>,
 }
 
 fn sample_visibility_lag(
@@ -433,6 +446,7 @@ impl SinkStateCell {
 /// - `recv()` / `req()` + query handlers take read lock (shared)
 #[derive(Clone)]
 pub struct SinkFileMeta {
+    node_id: NodeId,
     state: SinkStateCell,
     root_specs: Arc<RwLock<Vec<RootSpec>>>,
     host_object_grants: Arc<RwLock<Vec<GrantedMountRoot>>>,
@@ -512,6 +526,7 @@ impl SinkFileMeta {
             RuntimeUnitGate::new("sink-file-meta", SINK_RUNTIME_UNITS)
         });
         let sink = Self {
+            node_id: node_id.clone(),
             state: state.clone(),
             root_specs: root_specs.clone(),
             host_object_grants: host_object_grants.clone(),
@@ -553,6 +568,8 @@ impl SinkFileMeta {
                     route,
                     format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
                     sink.shutdown.clone(),
+                    {
+                    let query_node_id = node_id_cloned.clone();
                     move |requests| {
                         let query_state = query_state.clone();
                         let query_root_specs = query_root_specs.clone();
@@ -561,6 +578,7 @@ impl SinkFileMeta {
                         let query_pending_stream_events = query_pending_stream_events.clone();
                         let query_stream_receive_enabled = query_stream_receive_enabled.clone();
                         let query_unit_control = query_unit_control.clone();
+                        let query_node_id = query_node_id.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
@@ -574,6 +592,7 @@ impl SinkFileMeta {
                                         String::from_utf8_lossy(&params.scope.path)
                                     );
                                     let sink_impl = SinkFileMeta {
+                                        node_id: query_node_id.clone(),
                                         state: query_state.clone(),
                                         root_specs: query_root_specs.clone(),
                                         host_object_grants: query_host_object_grants.clone(),
@@ -605,6 +624,7 @@ impl SinkFileMeta {
                             }
                             responses
                         }
+                    }
                     },
                 );
                 lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
@@ -639,6 +659,8 @@ impl SinkFileMeta {
                         ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY
                     ),
                     sink.shutdown.clone(),
+                    {
+                    let internal_query_node_id = node_id_cloned.clone();
                     move |requests| {
                         let internal_query_state = internal_query_state.clone();
                         let internal_query_root_specs = internal_query_root_specs.clone();
@@ -650,6 +672,7 @@ impl SinkFileMeta {
                         let internal_query_stream_receive_enabled =
                             internal_query_stream_receive_enabled.clone();
                         let internal_query_unit_control = internal_query_unit_control.clone();
+                        let internal_query_node_id = internal_query_node_id.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
@@ -663,6 +686,7 @@ impl SinkFileMeta {
                                         String::from_utf8_lossy(&params.scope.path)
                                     );
                                     let sink_impl = SinkFileMeta {
+                                        node_id: internal_query_node_id.clone(),
                                         state: internal_query_state.clone(),
                                         root_specs: internal_query_root_specs.clone(),
                                         host_object_grants: internal_query_host_object_grants
@@ -696,6 +720,7 @@ impl SinkFileMeta {
                             }
                             responses
                         }
+                    }
                     },
                 );
                 lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
@@ -819,6 +844,7 @@ impl SinkFileMeta {
             let stream_unit_control = unit_control.clone();
             if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM) {
                 let stream_sink = Arc::new(SinkFileMeta {
+                    node_id: node_id.clone(),
                     state: stream_state,
                     root_specs: stream_root_specs,
                     host_object_grants: stream_host_object_grants,
@@ -923,6 +949,8 @@ impl SinkFileMeta {
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
                 self.shutdown.clone(),
+                {
+                let query_node_id = node_id_cloned.clone();
                 move |requests| {
                     let query_state = query_state.clone();
                     let query_root_specs = query_root_specs.clone();
@@ -931,6 +959,7 @@ impl SinkFileMeta {
                     let query_pending_stream_events = query_pending_stream_events.clone();
                     let query_stream_receive_enabled = query_stream_receive_enabled.clone();
                     let query_unit_control = query_unit_control.clone();
+                    let query_node_id = query_node_id.clone();
                     async move {
                         let mut responses = Vec::new();
                         for req in requests {
@@ -938,6 +967,7 @@ impl SinkFileMeta {
                                 rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
                             {
                                 let sink_impl = SinkFileMeta {
+                                    node_id: query_node_id.clone(),
                                     state: query_state.clone(),
                                     root_specs: query_root_specs.clone(),
                                     host_object_grants: query_host_object_grants.clone(),
@@ -964,6 +994,7 @@ impl SinkFileMeta {
                         }
                         responses
                     }
+                }
                 },
             );
             eprintln!(
@@ -1006,6 +1037,8 @@ impl SinkFileMeta {
                     ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY
                 ),
                 self.shutdown.clone(),
+                {
+                let internal_query_node_id = node_id_cloned.clone();
                 move |requests| {
                     let internal_query_state = internal_query_state.clone();
                     let internal_query_root_specs = internal_query_root_specs.clone();
@@ -1017,6 +1050,7 @@ impl SinkFileMeta {
                     let internal_query_stream_receive_enabled =
                         internal_query_stream_receive_enabled.clone();
                     let internal_query_unit_control = internal_query_unit_control.clone();
+                    let internal_query_node_id = internal_query_node_id.clone();
                     async move {
                         let mut responses = Vec::new();
                         for req in requests {
@@ -1024,6 +1058,7 @@ impl SinkFileMeta {
                                 rmp_serde::from_slice::<InternalQueryRequest>(req.payload_bytes())
                             {
                                 let sink_impl = SinkFileMeta {
+                                    node_id: internal_query_node_id.clone(),
                                     state: internal_query_state.clone(),
                                     root_specs: internal_query_root_specs.clone(),
                                     host_object_grants: internal_query_host_object_grants.clone(),
@@ -1052,6 +1087,7 @@ impl SinkFileMeta {
                         }
                         responses
                     }
+                }
                 },
             );
             eprintln!(
@@ -1173,6 +1209,7 @@ impl SinkFileMeta {
                 start.elapsed().as_millis()
             );
             let stream_sink = Arc::new(SinkFileMeta {
+                node_id: node_id.clone(),
                 state: stream_state,
                 root_specs: stream_root_specs,
                 host_object_grants: stream_host_object_grants,
@@ -1221,6 +1258,7 @@ impl SinkFileMeta {
             );
             let roots_control_stream_receive_enabled = self.stream_receive_enabled.clone();
             let sink = Arc::new(SinkFileMeta {
+                node_id: self.node_id.clone(),
                 state: self.state.clone(),
                 root_specs: self.root_specs.clone(),
                 host_object_grants: self.host_object_grants.clone(),
@@ -1329,6 +1367,7 @@ impl SinkFileMeta {
                 node_id.0
             );
             let stream_sink = Arc::new(SinkFileMeta {
+                node_id: self.node_id.clone(),
                 state: stream_state,
                 root_specs: stream_root_specs,
                 host_object_grants: stream_host_object_grants,
@@ -1534,6 +1573,16 @@ impl SinkFileMeta {
                     bound_scopes,
                     ..
                 } => {
+                    if debug_control_scope_capture_enabled() {
+                        eprintln!(
+                            "fs_meta_sink: control_scope_capture node={} unit={} route={} generation={} scopes={:?}",
+                            self.node_id.0,
+                            unit.unit_id(),
+                            route_key,
+                            generation,
+                            summarize_bound_scopes(bound_scopes)
+                        );
+                    }
                     self.apply_activate_signal(*unit, route_key, *generation, bound_scopes)?;
                     validated += 1;
                     refresh_runtime_groups = true;
@@ -1727,6 +1776,11 @@ impl SinkFileMeta {
         }
         groups.sort_by(|a, b| a.group_id.cmp(&b.group_id));
         snapshot.groups = groups;
+        if let Some(groups) = self.scheduled_group_ids()? && !groups.is_empty() {
+            snapshot
+                .scheduled_groups_by_node
+                .insert(self.node_id.0.clone(), groups.into_iter().collect());
+        }
         Ok(snapshot)
     }
 
