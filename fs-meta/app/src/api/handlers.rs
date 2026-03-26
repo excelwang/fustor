@@ -727,6 +727,8 @@ fn status_source_from_observability(
         last_published_at_us_by_node,
         last_published_origins_by_node,
         published_origin_counts_by_node,
+        published_path_capture_target,
+        published_path_origin_counts_by_node,
     } = source;
     let crate::source::SourceStatusSnapshot {
         logical_roots: status_logical_roots,
@@ -779,6 +781,8 @@ fn status_source_from_observability(
                 emitted_event_count: entry.emitted_event_count,
                 emitted_control_event_count: entry.emitted_control_event_count,
                 emitted_data_event_count: entry.emitted_data_event_count,
+                emitted_path_capture_target: entry.emitted_path_capture_target,
+                emitted_path_event_count: entry.emitted_path_event_count,
                 last_emitted_at_us: entry.last_emitted_at_us,
                 last_emitted_origins: entry.last_emitted_origins,
             })
@@ -798,6 +802,8 @@ fn status_source_from_observability(
             last_published_at_us_by_node,
             last_published_origins_by_node,
             published_origin_counts_by_node,
+            published_path_capture_target,
+            published_path_origin_counts_by_node,
         },
     }
 }
@@ -866,6 +872,8 @@ fn merge_source_observability(
             || !snapshot.last_published_at_us_by_node.is_empty()
             || !snapshot.last_published_origins_by_node.is_empty()
             || !snapshot.published_origin_counts_by_node.is_empty()
+            || snapshot.published_path_capture_target.is_some()
+            || !snapshot.published_path_origin_counts_by_node.is_empty()
     }
 
     let (mut merged, fallback) = if has_live_data(&aggregated) {
@@ -1004,6 +1012,15 @@ fn merge_source_observability(
             .entry(node_id)
             .or_insert(origins);
     }
+    if merged.published_path_capture_target.is_none() {
+        merged.published_path_capture_target = fallback.published_path_capture_target;
+    }
+    for (node_id, origins) in fallback.published_path_origin_counts_by_node {
+        merged
+            .published_path_origin_counts_by_node
+            .entry(node_id)
+            .or_insert(origins);
+    }
 
     let mut inflight = merged
         .force_find_inflight_groups
@@ -1038,6 +1055,8 @@ fn merge_source_observability_snapshots(
             last_published_at_us_by_node: BTreeMap::new(),
             last_published_origins_by_node: BTreeMap::new(),
             published_origin_counts_by_node: BTreeMap::new(),
+            published_path_capture_target: None,
+            published_path_origin_counts_by_node: BTreeMap::new(),
         };
     };
 
@@ -1119,6 +1138,12 @@ fn merge_source_observability_snapshots(
         merged
             .published_origin_counts_by_node
             .extend(snapshot.published_origin_counts_by_node);
+        if merged.published_path_capture_target.is_none() {
+            merged.published_path_capture_target = snapshot.published_path_capture_target;
+        }
+        merged
+            .published_path_origin_counts_by_node
+            .extend(snapshot.published_path_origin_counts_by_node);
         inflight.extend(snapshot.force_find_inflight_groups);
         for grant in snapshot.grants {
             grant_map.entry(grant.object_ref.clone()).or_insert(grant);
@@ -1351,6 +1376,8 @@ mod tests {
                     emitted_event_count: 0,
                     emitted_control_event_count: 0,
                     emitted_data_event_count: 0,
+                    emitted_path_capture_target: None,
+                    emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
                     current_revision: Some(1),
@@ -1383,6 +1410,8 @@ mod tests {
             last_published_at_us_by_node: BTreeMap::new(),
             last_published_origins_by_node: BTreeMap::new(),
             published_origin_counts_by_node: BTreeMap::new(),
+            published_path_capture_target: None,
+            published_path_origin_counts_by_node: BTreeMap::new(),
         }
     }
 
@@ -1578,6 +1607,8 @@ mod tests {
             last_published_at_us_by_node: BTreeMap::new(),
             last_published_origins_by_node: BTreeMap::new(),
             published_origin_counts_by_node: BTreeMap::new(),
+            published_path_capture_target: None,
+            published_path_origin_counts_by_node: BTreeMap::new(),
         };
         let aggregated = SourceObservabilitySnapshot {
             lifecycle_state: "ready".to_string(),
@@ -1630,6 +1661,8 @@ mod tests {
                     emitted_event_count: 0,
                     emitted_control_event_count: 0,
                     emitted_data_event_count: 0,
+                    emitted_path_capture_target: None,
+                    emitted_path_event_count: 0,
                     last_emitted_at_us: None,
                     last_emitted_origins: Vec::new(),
                     current_revision: Some(1),
@@ -1671,6 +1704,8 @@ mod tests {
                 "node-b".to_string(),
                 vec!["node-b::nfs2=77".to_string()],
             )]),
+            published_path_capture_target: None,
+            published_path_origin_counts_by_node: BTreeMap::new(),
         };
 
         let merged = merge_source_observability(local, aggregated);
@@ -1755,6 +1790,8 @@ mod tests {
                 "node-a".to_string(),
                 vec!["node-a::nfs1=111".to_string()],
             )]),
+            published_path_capture_target: None,
+            published_path_origin_counts_by_node: BTreeMap::new(),
         };
         let node_b = SourceObservabilitySnapshot {
             lifecycle_state: "ready".to_string(),
@@ -1790,6 +1827,8 @@ mod tests {
                 "node-b".to_string(),
                 vec!["node-b::nfs2=222".to_string()],
             )]),
+            published_path_capture_target: None,
+            published_path_origin_counts_by_node: BTreeMap::new(),
         };
 
         let merged = merge_source_observability_snapshots(vec![node_a, node_b]);

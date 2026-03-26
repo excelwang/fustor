@@ -302,17 +302,20 @@ fn summarize_sink_groups(groups: &[crate::sink::SinkGroupStatusSnapshot]) -> Vec
 
 fn summarize_sink_status_endpoint(snapshot: &crate::sink::SinkStatusSnapshot) -> String {
     format!(
-        "groups={} group_details={:?} scheduled={:?} received_batches={:?} received_events={:?} received_origin_counts={:?} stream_received_batches={:?} stream_received_events={:?} stream_received_origin_counts={:?} stream_ready_origin_counts={:?} stream_deferred_origin_counts={:?} stream_dropped_origin_counts={:?} stream_applied_batches={:?} stream_applied_events={:?} stream_applied_control_events={:?} stream_applied_data_events={:?} stream_applied_origin_counts={:?} stream_last_applied_at_us={:?}",
+        "groups={} group_details={:?} scheduled={:?} received_batches={:?} received_events={:?} received_origin_counts={:?} stream_path_capture_target={:?} stream_received_batches={:?} stream_received_events={:?} stream_received_origin_counts={:?} stream_received_path_origin_counts={:?} stream_ready_origin_counts={:?} stream_ready_path_origin_counts={:?} stream_deferred_origin_counts={:?} stream_dropped_origin_counts={:?} stream_applied_batches={:?} stream_applied_events={:?} stream_applied_control_events={:?} stream_applied_data_events={:?} stream_applied_origin_counts={:?} stream_applied_path_origin_counts={:?} stream_last_applied_at_us={:?}",
         snapshot.groups.len(),
         summarize_sink_groups(&snapshot.groups),
         summarize_groups_by_node(&snapshot.scheduled_groups_by_node),
         summarize_counts_by_node(&snapshot.received_batches_by_node),
         summarize_counts_by_node(&snapshot.received_events_by_node),
         summarize_groups_by_node(&snapshot.received_origin_counts_by_node),
+        snapshot.stream_path_capture_target,
         summarize_counts_by_node(&snapshot.stream_received_batches_by_node),
         summarize_counts_by_node(&snapshot.stream_received_events_by_node),
         summarize_groups_by_node(&snapshot.stream_received_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.stream_received_path_origin_counts_by_node),
         summarize_groups_by_node(&snapshot.stream_ready_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.stream_ready_path_origin_counts_by_node),
         summarize_groups_by_node(&snapshot.stream_deferred_origin_counts_by_node),
         summarize_groups_by_node(&snapshot.stream_dropped_origin_counts_by_node),
         summarize_counts_by_node(&snapshot.stream_applied_batches_by_node),
@@ -320,6 +323,7 @@ fn summarize_sink_status_endpoint(snapshot: &crate::sink::SinkStatusSnapshot) ->
         summarize_counts_by_node(&snapshot.stream_applied_control_events_by_node),
         summarize_counts_by_node(&snapshot.stream_applied_data_events_by_node),
         summarize_groups_by_node(&snapshot.stream_applied_origin_counts_by_node),
+        summarize_groups_by_node(&snapshot.stream_applied_path_origin_counts_by_node),
         summarize_counts_by_node(&snapshot.stream_last_applied_at_us_by_node),
     )
 }

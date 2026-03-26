@@ -193,6 +193,9 @@ struct SourceWorkerSnapshotCache {
         Option<std::collections::BTreeMap<String, Vec<String>>>,
     published_origin_counts_by_node:
         Option<std::collections::BTreeMap<String, Vec<String>>>,
+    published_path_capture_target: Option<String>,
+    published_path_origin_counts_by_node:
+        Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -307,6 +310,10 @@ impl SourceWorkerClientHandle {
                 Some(snapshot.last_published_origins_by_node.clone());
             cache.published_origin_counts_by_node =
                 Some(snapshot.published_origin_counts_by_node.clone());
+            cache.published_path_capture_target =
+                snapshot.published_path_capture_target.clone();
+            cache.published_path_origin_counts_by_node =
+                Some(snapshot.published_path_origin_counts_by_node.clone());
         });
     }
 
@@ -898,6 +905,9 @@ pub struct SourceObservabilitySnapshot {
     pub last_published_at_us_by_node: std::collections::BTreeMap<String, u64>,
     pub last_published_origins_by_node: std::collections::BTreeMap<String, Vec<String>>,
     pub published_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_path_capture_target: Option<String>,
+    pub published_path_origin_counts_by_node:
+        std::collections::BTreeMap<String, Vec<String>>,
 }
 
 fn scheduled_groups_by_node(
@@ -969,6 +979,11 @@ fn build_degraded_worker_observability_snapshot(
             .unwrap_or_default(),
         published_origin_counts_by_node: cache
             .published_origin_counts_by_node
+            .clone()
+            .unwrap_or_default(),
+        published_path_capture_target: cache.published_path_capture_target.clone(),
+        published_path_origin_counts_by_node: cache
+            .published_path_origin_counts_by_node
             .clone()
             .unwrap_or_default(),
     }
@@ -1216,6 +1231,8 @@ impl SourceFacade {
                 last_published_at_us_by_node: std::collections::BTreeMap::new(),
                 last_published_origins_by_node: std::collections::BTreeMap::new(),
                 published_origin_counts_by_node: std::collections::BTreeMap::new(),
+                published_path_capture_target: None,
+                published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
             }),
             Self::Worker(client) => {
                 let worker_client = client.client().await?;
@@ -1256,6 +1273,8 @@ impl SourceFacade {
                 last_published_at_us_by_node: std::collections::BTreeMap::new(),
                 last_published_origins_by_node: std::collections::BTreeMap::new(),
                 published_origin_counts_by_node: std::collections::BTreeMap::new(),
+                published_path_capture_target: None,
+                published_path_origin_counts_by_node: std::collections::BTreeMap::new(),
             },
             Self::Worker(client) => client.observability_snapshot_nonblocking().await,
         }

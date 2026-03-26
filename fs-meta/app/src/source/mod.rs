@@ -34,7 +34,7 @@ use capanix_runtime_entry_sdk::control::{
 };
 
 use crate::LogicalClock;
-use crate::query::path::{path_buf_from_bytes, path_to_bytes};
+use crate::query::path::{is_under_query_path, path_buf_from_bytes, path_to_bytes};
 use crate::query::request::{
     ForceFindQueryPayload, InternalQueryRequest, LiveScanRequest, QueryOp, QueryTransport,
 };
@@ -62,6 +62,7 @@ use crate::source::sentinel::{HealthSignal, Sentinel, SentinelAction, SentinelCo
 use crate::source::watcher::WatchManager;
 use crate::state::cell::{AuthorityJournal, SignalCell};
 use crate::state::commit_boundary::CommitBoundary;
+use crate::FileMetaRecord;
 
 #[cfg(test)]
 use crate::runtime::routes::ROUTE_KEY_QUERY;
@@ -113,6 +114,25 @@ fn lock_or_recover<'a, T>(m: &'a Mutex<T>, context: &str) -> MutexGuard<'a, T> {
 
 fn debug_control_scope_capture_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
+    static TARGET: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    TARGET
+        .get_or_init(|| match std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE") {
+            Ok(value) if value.trim().is_empty() => Some(b"/force-find-stress".to_vec()),
+            Ok(value) => Some(value.into_bytes()),
+            Err(_) => None,
+        })
+        .clone()
+}
+
+fn count_events_under_query_path(events: &[Event], query_path: &[u8]) -> u64 {
+    events
+        .iter()
+        .filter_map(|event| rmp_serde::from_slice::<FileMetaRecord>(event.payload_bytes()).ok())
+        .filter(|record| is_under_query_path(&record.path, query_path))
+        .count() as u64
 }
 
 fn summarize_bound_scopes(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
@@ -243,6 +263,8 @@ pub struct SourceConcreteRootHealthSnapshot {
     pub emitted_event_count: u64,
     pub emitted_control_event_count: u64,
     pub emitted_data_event_count: u64,
+    pub emitted_path_capture_target: Option<String>,
+    pub emitted_path_event_count: u64,
     pub last_emitted_at_us: Option<u64>,
     pub last_emitted_origins: Vec<String>,
     pub current_revision: Option<u64>,
@@ -455,6 +477,7 @@ struct ConcreteRootHealthEntry {
     emitted_event_count: u64,
     emitted_control_event_count: u64,
     emitted_data_event_count: u64,
+    emitted_path_event_count: u64,
     last_emitted_at_us: Option<u64>,
     last_emitted_origins: Vec<String>,
     current_revision: Option<u64>,
@@ -501,6 +524,7 @@ impl ConcreteRootHealthEntry {
             emitted_event_count: 0,
             emitted_control_event_count: 0,
             emitted_data_event_count: 0,
+            emitted_path_event_count: 0,
             last_emitted_at_us: None,
             last_emitted_origins: Vec::new(),
             current_revision: None,
@@ -1552,8 +1576,25 @@ impl FSMetaSource {
         detail.emitted_data_event_count = detail
             .emitted_data_event_count
             .saturating_add(data);
+        let capture_target = debug_stream_path_capture_target();
+        if let Some(target) = capture_target.as_deref() {
+            detail.emitted_path_event_count = detail
+                .emitted_path_event_count
+                .saturating_add(count_events_under_query_path(batch, target));
+        }
         detail.last_emitted_at_us = last_emitted_at_us;
         detail.last_emitted_origins = Self::summarize_emitted_origins(batch);
+        if let Some(target) = capture_target {
+            let matching = count_events_under_query_path(batch, &target);
+            eprintln!(
+                "fs_meta_source: emitted_path_capture root_key={} target={} matching_events={} batch_events={} origins={:?}",
+                root_key,
+                String::from_utf8_lossy(&target),
+                matching,
+                batch.len(),
+                detail.last_emitted_origins,
+            );
+        }
     }
 
     fn request_rescan_on_primary_roots(
@@ -2414,6 +2455,9 @@ impl FSMetaSource {
                 emitted_event_count: entry.emitted_event_count,
                 emitted_control_event_count: entry.emitted_control_event_count,
                 emitted_data_event_count: entry.emitted_data_event_count,
+                emitted_path_capture_target: debug_stream_path_capture_target()
+                    .map(|target| String::from_utf8_lossy(&target).into_owned()),
+                emitted_path_event_count: entry.emitted_path_event_count,
                 last_emitted_at_us: entry.last_emitted_at_us,
                 last_emitted_origins: entry.last_emitted_origins.clone(),
                 current_revision: entry.current_revision,

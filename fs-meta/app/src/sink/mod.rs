@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 #[cfg(test)]
 use crate::EventKind;
 use crate::query::models::{HealthStats, QueryNode};
+use crate::query::path::is_under_query_path;
 use crate::query::request::{InternalQueryRequest, MaterializedQueryPayload, QueryOp};
 #[cfg(test)]
 use crate::query::result_ops::{
@@ -88,6 +89,17 @@ fn debug_stream_delivery_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_STREAM_DELIVERY").is_some()
 }
 
+fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
+    static TARGET: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    TARGET
+        .get_or_init(|| match std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE") {
+            Ok(value) if value.trim().is_empty() => Some(b"/force-find-stress".to_vec()),
+            Ok(value) => Some(value.into_bytes()),
+            Err(_) => None,
+        })
+        .clone()
+}
+
 fn summarize_bound_scopes(bound_scopes: &[RuntimeBoundScope]) -> Vec<String> {
     bound_scopes
         .iter()
@@ -99,6 +111,22 @@ fn collect_event_origin_counts(events: &[Event]) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::<String, u64>::new();
     for event in events {
         *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+    }
+    counts
+}
+
+fn collect_event_origin_counts_for_query_path(
+    events: &[Event],
+    query_path: &[u8],
+) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::<String, u64>::new();
+    for event in events {
+        let Ok(record) = rmp_serde::from_slice::<FileMetaRecord>(event.payload_bytes()) else {
+            continue;
+        };
+        if is_under_query_path(&record.path, query_path) {
+            *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+        }
     }
     counts
 }
@@ -248,7 +276,10 @@ pub struct SinkStatusSnapshot {
     pub stream_received_batches_by_node: BTreeMap<String, u64>,
     pub stream_received_events_by_node: BTreeMap<String, u64>,
     pub stream_received_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub stream_path_capture_target: Option<String>,
+    pub stream_received_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_ready_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub stream_ready_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_deferred_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_dropped_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_applied_batches_by_node: BTreeMap<String, u64>,
@@ -256,6 +287,7 @@ pub struct SinkStatusSnapshot {
     pub stream_applied_control_events_by_node: BTreeMap<String, u64>,
     pub stream_applied_data_events_by_node: BTreeMap<String, u64>,
     pub stream_applied_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub stream_applied_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
     pub stream_last_applied_at_us_by_node: BTreeMap<String, u64>,
 }
 
@@ -264,7 +296,9 @@ struct StreamDeliveryStats {
     received_batches: u64,
     received_events: u64,
     received_origin_counts: BTreeMap<String, u64>,
+    received_path_origin_counts: BTreeMap<String, u64>,
     ready_origin_counts: BTreeMap<String, u64>,
+    ready_path_origin_counts: BTreeMap<String, u64>,
     deferred_origin_counts: BTreeMap<String, u64>,
     dropped_origin_counts: BTreeMap<String, u64>,
     applied_batches: u64,
@@ -272,6 +306,7 @@ struct StreamDeliveryStats {
     applied_control_events: u64,
     applied_data_events: u64,
     applied_origin_counts: BTreeMap<String, u64>,
+    applied_path_origin_counts: BTreeMap<String, u64>,
     last_applied_at_us: u64,
 }
 
@@ -1874,6 +1909,8 @@ impl SinkFileMeta {
                 .scheduled_groups_by_node
                 .insert(self.node_id.0.clone(), groups.into_iter().collect());
         }
+        snapshot.stream_path_capture_target =
+            debug_stream_path_capture_target().map(|target| String::from_utf8_lossy(&target).into_owned());
         if let Ok(stats) = self.stream_delivery_stats.lock() {
             if stats.received_batches > 0 {
                 snapshot
@@ -1891,10 +1928,22 @@ impl SinkFileMeta {
                     format_origin_counts(&stats.received_origin_counts),
                 );
             }
+            if !stats.received_path_origin_counts.is_empty() {
+                snapshot.stream_received_path_origin_counts_by_node.insert(
+                    self.node_id.0.clone(),
+                    format_origin_counts(&stats.received_path_origin_counts),
+                );
+            }
             if !stats.ready_origin_counts.is_empty() {
                 snapshot.stream_ready_origin_counts_by_node.insert(
                     self.node_id.0.clone(),
                     format_origin_counts(&stats.ready_origin_counts),
+                );
+            }
+            if !stats.ready_path_origin_counts.is_empty() {
+                snapshot.stream_ready_path_origin_counts_by_node.insert(
+                    self.node_id.0.clone(),
+                    format_origin_counts(&stats.ready_path_origin_counts),
                 );
             }
             if !stats.deferred_origin_counts.is_empty() {
@@ -1934,6 +1983,12 @@ impl SinkFileMeta {
                 snapshot.stream_applied_origin_counts_by_node.insert(
                     self.node_id.0.clone(),
                     format_origin_counts(&stats.applied_origin_counts),
+                );
+            }
+            if !stats.applied_path_origin_counts.is_empty() {
+                snapshot.stream_applied_path_origin_counts_by_node.insert(
+                    self.node_id.0.clone(),
+                    format_origin_counts(&stats.applied_path_origin_counts),
                 );
             }
             if stats.last_applied_at_us > 0 {
@@ -2029,6 +2084,11 @@ impl SinkFileMeta {
         let configured = self.configured_stream_object_refs()?;
         let scheduled = self.scheduled_stream_object_refs()?.unwrap_or_default();
         let incoming_counts = collect_event_origin_counts(events);
+        let capture_target = debug_stream_path_capture_target();
+        let incoming_path_counts = capture_target
+            .as_deref()
+            .map(|target| collect_event_origin_counts_for_query_path(events, target))
+            .unwrap_or_default();
         let mut ready = Vec::new();
         let mut deferred = VecDeque::new();
         let mut dropped = 0usize;
@@ -2045,6 +2105,10 @@ impl SinkFileMeta {
         }
 
         let ready_counts = collect_event_origin_counts(&ready);
+        let ready_path_counts = capture_target
+            .as_deref()
+            .map(|target| collect_event_origin_counts_for_query_path(&ready, target))
+            .unwrap_or_default();
         let ready_control_count = ready
             .iter()
             .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok())
@@ -2070,7 +2134,12 @@ impl SinkFileMeta {
             stats.received_batches = stats.received_batches.saturating_add(1);
             stats.received_events = stats.received_events.saturating_add(events.len() as u64);
             accumulate_origin_counts(&mut stats.received_origin_counts, &incoming_counts);
+            accumulate_origin_counts(
+                &mut stats.received_path_origin_counts,
+                &incoming_path_counts,
+            );
             accumulate_origin_counts(&mut stats.ready_origin_counts, &ready_counts);
+            accumulate_origin_counts(&mut stats.ready_path_origin_counts, &ready_path_counts);
             accumulate_origin_counts(&mut stats.deferred_origin_counts, &deferred_counts);
             accumulate_origin_counts(&mut stats.dropped_origin_counts, &dropped_counts);
         }
@@ -2086,6 +2155,15 @@ impl SinkFileMeta {
                 format_origin_counts(&deferred_counts),
                 dropped
             );
+            if let Some(target) = capture_target.as_deref() {
+                eprintln!(
+                    "fs_meta_sink: ingest_stream_events path_capture node={} target={} received={:?} ready={:?}",
+                    self.node_id.0,
+                    String::from_utf8_lossy(target),
+                    format_origin_counts(&incoming_path_counts),
+                    format_origin_counts(&ready_path_counts),
+                );
+            }
             eprintln!(
                 "fs_meta_sink: ingest_stream_events counts node={} ready={} deferred={} dropped={}",
                 self.node_id.0,
@@ -2127,6 +2205,7 @@ impl SinkFileMeta {
             stats.applied_data_events =
                 stats.applied_data_events.saturating_add(ready_data_count);
             accumulate_origin_counts(&mut stats.applied_origin_counts, &ready_counts);
+            accumulate_origin_counts(&mut stats.applied_path_origin_counts, &ready_path_counts);
             stats.last_applied_at_us = now_us();
         }
         Ok(())
@@ -2167,6 +2246,10 @@ impl SinkFileMeta {
         if !ready.is_empty() {
             self.apply_events(&ready)?;
             let ready_counts = collect_event_origin_counts(&ready);
+            let ready_path_counts = debug_stream_path_capture_target()
+                .as_deref()
+                .map(|target| collect_event_origin_counts_for_query_path(&ready, target))
+                .unwrap_or_default();
             let ready_control_count = ready
                 .iter()
                 .filter(|event| rmp_serde::from_slice::<ControlEvent>(event.payload_bytes()).is_ok())
@@ -2184,6 +2267,7 @@ impl SinkFileMeta {
             stats.applied_data_events =
                 stats.applied_data_events.saturating_add(ready_data_count);
             accumulate_origin_counts(&mut stats.applied_origin_counts, &ready_counts);
+            accumulate_origin_counts(&mut stats.applied_path_origin_counts, &ready_path_counts);
             stats.last_applied_at_us = now_us();
         }
         Ok(())

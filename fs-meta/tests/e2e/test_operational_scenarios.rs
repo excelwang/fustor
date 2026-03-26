@@ -424,12 +424,22 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
     let mut node_a_source_published_data = 0u64;
     let mut node_a_source_published_origins = Vec::<String>::new();
     let mut node_a_source_published_origin_counts = Vec::<String>::new();
+    let mut node_a_source_published_path_origin_counts = Vec::<String>::new();
     let mut node_a_sink_received_batches = 0u64;
     let mut node_a_sink_received_events = 0u64;
     let mut node_a_sink_received_control = 0u64;
     let mut node_a_sink_received_data = 0u64;
     let mut node_a_sink_received_origins = Vec::<String>::new();
     let mut node_a_sink_received_origin_counts = Vec::<String>::new();
+    let mut nfs2_selected_root_nodes = 0u64;
+    let mut nfs2_selected_root_exists = false;
+    let mut nfs2_selected_root_entries = 0usize;
+    let mut nfs2_selected_root_paths = Vec::<String>::new();
+    let mut nfs2_selected_root_has_force_find = false;
+    let mut nfs2_selected_root_has_force_find_child = false;
+    let mut nfs2_selected_force_find_nodes = 0u64;
+    let mut nfs2_selected_force_find_exists = false;
+    let mut nfs2_selected_force_find_entries = 0usize;
     let mut node_a_nfs1_concrete = Vec::<String>::new();
     let mut nfs2_primary = None::<String>;
     let mut nfs2_logical = None::<String>;
@@ -444,6 +454,33 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
             ])?;
             nfs1_nodes = group_total_nodes(&tree, "nfs1");
             nfs2_nodes = group_total_nodes(&tree, "nfs2");
+            let nfs2_selected_root = harness.session.tree(&[
+                ("path", "/".to_string()),
+                ("recursive", "true".to_string()),
+                ("group", "nfs2".to_string()),
+            ])?;
+            (
+                nfs2_selected_root_exists,
+                nfs2_selected_root_entries,
+                nfs2_selected_root_nodes,
+            ) = group_root_exists_entries_and_total(&nfs2_selected_root, "nfs2");
+            nfs2_selected_root_paths = group_entry_paths(&nfs2_selected_root, "nfs2");
+            nfs2_selected_root_has_force_find = nfs2_selected_root_paths
+                .iter()
+                .any(|path| path == "/force-find-stress");
+            nfs2_selected_root_has_force_find_child = nfs2_selected_root_paths
+                .iter()
+                .any(|path| path.starts_with("/force-find-stress/"));
+            let nfs2_selected_force_find = harness.session.tree(&[
+                ("path", "/force-find-stress".to_string()),
+                ("recursive", "true".to_string()),
+                ("group", "nfs2".to_string()),
+            ])?;
+            (
+                nfs2_selected_force_find_exists,
+                nfs2_selected_force_find_entries,
+                nfs2_selected_force_find_nodes,
+            ) = group_root_exists_entries_and_total(&nfs2_selected_force_find, "nfs2");
             let status = harness.session.status()?;
             node_a_source = status_debug_groups_by_node(
                 &status,
@@ -511,6 +548,12 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 "published_origin_counts_by_node",
                 &node_a_id,
             );
+            node_a_source_published_path_origin_counts = status_debug_strings_by_node(
+                &status,
+                "source",
+                "published_path_origin_counts_by_node",
+                &node_a_id,
+            );
             node_a_sink_received_batches = status_debug_u64_by_node(
                 &status,
                 "sink",
@@ -566,13 +609,13 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 return Ok(true);
             }
             Err(format!(
-                "nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
+                "nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
             ))
         },
     )?;
 
     eprintln!(
-        "[fs-meta-api-ops] activation-scope-preserved nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
+        "[fs-meta-api-ops] activation-scope-preserved nfs1_nodes={nfs1_nodes} nfs2_nodes={nfs2_nodes} nfs2_selected_root_exists={nfs2_selected_root_exists} nfs2_selected_root_entries={nfs2_selected_root_entries} nfs2_selected_root_nodes={nfs2_selected_root_nodes} nfs2_selected_root_has_force_find={nfs2_selected_root_has_force_find} nfs2_selected_root_has_force_find_child={nfs2_selected_root_has_force_find_child} nfs2_selected_root_paths={nfs2_selected_root_paths:?} nfs2_selected_force_find_exists={nfs2_selected_force_find_exists} nfs2_selected_force_find_entries={nfs2_selected_force_find_entries} nfs2_selected_force_find_nodes={nfs2_selected_force_find_nodes} source={node_a_source:?} scan={node_a_scan:?} sink={node_a_sink:?} source_control={node_a_source_control:?} sink_control={node_a_sink_control:?} source_published_batches={node_a_source_published_batches} source_published_events={node_a_source_published_events} source_published_control={node_a_source_published_control} source_published_data={node_a_source_published_data} source_published_origins={node_a_source_published_origins:?} source_published_origin_counts={node_a_source_published_origin_counts:?} source_published_path_origin_counts={node_a_source_published_path_origin_counts:?} sink_received_batches={node_a_sink_received_batches} sink_received_events={node_a_sink_received_events} sink_received_control={node_a_sink_received_control} sink_received_data={node_a_sink_received_data} sink_received_origins={node_a_sink_received_origins:?} sink_received_origin_counts={node_a_sink_received_origin_counts:?} node_a_nfs1_concrete={node_a_nfs1_concrete:?} nfs2_primary={nfs2_primary:?} nfs2_logical={nfs2_logical:?} node_a_nfs2_concrete={node_a_nfs2_concrete:?}"
     );
     assert!(
         node_a_sink.contains("nfs2"),
@@ -1352,7 +1395,7 @@ fn source_concrete_root_summaries(
             })
         {
             summaries.push(format!(
-                "object_ref={} status={} coverage_mode={} watch_enabled={} scan_enabled={} is_group_primary={} active={} rescan_pending={} overflow_pending={} last_rescan_reason={:?} last_audit_started_at_us={:?} last_audit_completed_at_us={:?} emitted_batch_count={:?} emitted_event_count={:?} emitted_control_event_count={:?} emitted_data_event_count={:?} last_emitted_at_us={:?} last_emitted_origins={:?} current_revision={:?} candidate_revision={:?} draining_revision={:?} last_error={:?}",
+                "object_ref={} status={} coverage_mode={} watch_enabled={} scan_enabled={} is_group_primary={} active={} rescan_pending={} overflow_pending={} last_rescan_reason={:?} last_audit_started_at_us={:?} last_audit_completed_at_us={:?} emitted_batch_count={:?} emitted_event_count={:?} emitted_control_event_count={:?} emitted_data_event_count={:?} emitted_path_capture_target={:?} emitted_path_event_count={:?} last_emitted_at_us={:?} last_emitted_origins={:?} current_revision={:?} candidate_revision={:?} draining_revision={:?} last_error={:?}",
                 object_ref,
                 root.get("status").and_then(Value::as_str).unwrap_or("<missing>"),
                 root.get("coverage_mode")
@@ -1385,6 +1428,12 @@ fn source_concrete_root_summaries(
                     .cloned()
                     .unwrap_or(Value::Null),
                 root.get("emitted_data_event_count")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                root.get("emitted_path_capture_target")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                root.get("emitted_path_event_count")
                     .cloned()
                     .unwrap_or(Value::Null),
                 root.get("last_emitted_at_us").cloned().unwrap_or(Value::Null),
@@ -1574,6 +1623,11 @@ fn first_mount_for_fs_source(grants: &Value, fs_source: &str) -> Result<PathBuf,
 }
 
 fn group_total_nodes(payload: &Value, group_key: &str) -> u64 {
+    let (_, _, total) = group_root_exists_entries_and_total(payload, group_key);
+    total
+}
+
+fn group_root_exists_entries_and_total(payload: &Value, group_key: &str) -> (bool, usize, u64) {
     let Some(group) = payload
         .get("groups")
         .and_then(Value::as_array)
@@ -1583,7 +1637,7 @@ fn group_total_nodes(payload: &Value, group_key: &str) -> u64 {
                 .find(|group| group.get("group").and_then(Value::as_str) == Some(group_key))
         })
     else {
-        return 0;
+        return (false, 0, 0);
     };
     let root_exists = group
         .get("root")
@@ -1593,9 +1647,31 @@ fn group_total_nodes(payload: &Value, group_key: &str) -> u64 {
     let entries = group
         .get("entries")
         .and_then(Value::as_array)
-        .map(|rows| rows.len() as u64)
+        .map(|rows| rows.len())
         .unwrap_or(0);
-    entries + if root_exists { 1 } else { 0 }
+    let total = entries as u64 + if root_exists { 1 } else { 0 };
+    (root_exists, entries, total)
+}
+
+fn group_entry_paths(payload: &Value, group_key: &str) -> Vec<String> {
+    payload
+        .get("groups")
+        .and_then(Value::as_array)
+        .and_then(|groups| {
+            groups
+                .iter()
+                .find(|group| group.get("group").and_then(Value::as_str) == Some(group_key))
+        })
+        .and_then(|group| group.get("entries"))
+        .and_then(Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|entry| entry.get("path").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn unique_suffix() -> u128 {

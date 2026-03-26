@@ -93,6 +93,8 @@ pub struct StatusSourceConcreteRoot {
     pub emitted_event_count: u64,
     pub emitted_control_event_count: u64,
     pub emitted_data_event_count: u64,
+    pub emitted_path_capture_target: Option<String>,
+    pub emitted_path_event_count: u64,
     pub last_emitted_at_us: Option<u64>,
     pub last_emitted_origins: Vec<String>,
 }
@@ -125,6 +127,8 @@ pub struct StatusSourceDebug {
     pub last_published_at_us_by_node: BTreeMap<String, u64>,
     pub last_published_origins_by_node: BTreeMap<String, Vec<String>>,
     pub published_origin_counts_by_node: BTreeMap<String, Vec<String>>,
+    pub published_path_capture_target: Option<String>,
+    pub published_path_origin_counts_by_node: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize)]

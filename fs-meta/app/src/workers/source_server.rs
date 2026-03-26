@@ -19,10 +19,12 @@ use tokio::task::JoinHandle;
 
 use crate::source::FSMetaSource;
 use crate::source::config::SourceConfig;
+use crate::query::path::is_under_query_path;
 use crate::runtime::orchestration::{SourceControlSignal, source_control_signals_from_envelopes};
 use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
 use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
+use crate::FileMetaRecord;
 
 const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
 const SOURCE_WORKER_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -45,6 +47,7 @@ struct PublishedBatchStats {
     last_published_at_us: Option<u64>,
     last_published_origins: Vec<String>,
     published_origin_counts: std::collections::BTreeMap<String, u64>,
+    published_path_origin_counts: std::collections::BTreeMap<String, u64>,
 }
 
 struct PublishedBatchUpdate {
@@ -54,6 +57,7 @@ struct PublishedBatchUpdate {
     last_published_at_us: Option<u64>,
     last_published_origins: Vec<String>,
     published_origin_counts: std::collections::BTreeMap<String, u64>,
+    published_path_origin_counts: std::collections::BTreeMap<String, u64>,
 }
 
 enum SourceWorkerAction {
@@ -106,6 +110,33 @@ fn debug_control_scope_capture_enabled() -> bool {
 
 fn debug_source_batch_flow_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_SOURCE_BATCH_FLOW").is_some()
+}
+
+fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
+    static TARGET: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    TARGET
+        .get_or_init(|| match std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE") {
+            Ok(value) if value.trim().is_empty() => Some(b"/force-find-stress".to_vec()),
+            Ok(value) => Some(value.into_bytes()),
+            Err(_) => None,
+        })
+        .clone()
+}
+
+fn summarize_published_batch_path_counts(batch: &[Event], query_path: &[u8]) -> Vec<String> {
+    let mut counts = std::collections::BTreeMap::<String, u64>::new();
+    for event in batch {
+        let Ok(record) = rmp_serde::from_slice::<FileMetaRecord>(event.payload_bytes()) else {
+            continue;
+        };
+        if is_under_query_path(&record.path, query_path) {
+            *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+        }
+    }
+    counts
+        .into_iter()
+        .map(|(origin, count)| format!("{origin}={count}"))
+        .collect()
 }
 
 fn summarize_bound_scopes(
@@ -234,6 +265,18 @@ fn summarize_published_batch(batch: &[Event]) -> PublishedBatchUpdate {
                 acc
             },
         ),
+        published_path_origin_counts: debug_stream_path_capture_target()
+            .as_deref()
+            .map(|target| {
+                summarize_published_batch_path_counts(batch, target)
+                    .into_iter()
+                    .filter_map(|entry| {
+                        let (origin, count) = entry.rsplit_once('=')?;
+                        Some((origin.to_string(), count.parse::<u64>().ok()?))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
@@ -254,6 +297,12 @@ fn update_published_stats(
     guard.last_published_origins = update.last_published_origins.clone();
     for (origin, count) in &update.published_origin_counts {
         *guard.published_origin_counts.entry(origin.clone()).or_default() += *count;
+    }
+    for (origin, count) in &update.published_path_origin_counts {
+        *guard
+            .published_path_origin_counts
+            .entry(origin.clone())
+            .or_default() += *count;
     }
 }
 
@@ -319,6 +368,14 @@ where
                 eprintln!(
                     "fs_meta_source_worker_server: publish_batch begin origin={} {}",
                     origin, summary
+                );
+            }
+            if let Some(target) = debug_stream_path_capture_target() {
+                eprintln!(
+                    "fs_meta_source_worker_server: publish_batch path_capture origin={} target={} matches={:?}",
+                    origin,
+                    String::from_utf8_lossy(&target),
+                    summarize_published_batch_path_counts(&batch, &target),
                 );
             }
             if let Err(err) = boundary
@@ -436,6 +493,20 @@ fn source_observability_snapshot(
                     node_id.0.clone(),
                     published
                         .published_origin_counts
+                        .iter()
+                        .map(|(origin, count)| format!("{origin}={count}"))
+                        .collect::<Vec<_>>(),
+                )])
+            })
+            .unwrap_or_default(),
+        published_path_capture_target: debug_stream_path_capture_target()
+            .map(|target| String::from_utf8_lossy(&target).into_owned()),
+        published_path_origin_counts_by_node: (!published.published_path_origin_counts.is_empty())
+            .then(|| {
+                std::collections::BTreeMap::from([(
+                    node_id.0.clone(),
+                    published
+                        .published_path_origin_counts
                         .iter()
                         .map(|(origin, count)| format!("{origin}={count}"))
                         .collect::<Vec<_>>(),
