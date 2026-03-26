@@ -66,7 +66,15 @@ pub fn source_rescan_route_key_for(node_id: &str) -> String {
     scoped_internal_route_key(ROUTE_KEY_SOURCE_RESCAN_INTERNAL, node_id)
 }
 
-pub fn default_route_bindings() -> Arc<PostBindDispatchTable> {
+pub fn sink_query_route_key_for(node_id: &str) -> String {
+    scoped_internal_route_key(ROUTE_KEY_SINK_QUERY_INTERNAL, node_id)
+}
+
+pub fn sink_query_request_route_for(node_id: &str) -> RouteKey {
+    request_reply_route_key(&sink_query_route_key_for(node_id))
+}
+
+fn build_route_bindings(sink_query_route_key: &str) -> Arc<PostBindDispatchTable> {
     Arc::new(PostBindDispatchTable::new([
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_EVENTS.into(),
@@ -86,7 +94,7 @@ pub fn default_route_bindings() -> Arc<PostBindDispatchTable> {
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
             use_port: METHOD_SINK_QUERY.into(),
-            route: request_reply_route_key(ROUTE_KEY_SINK_QUERY_INTERNAL),
+            route: request_reply_route_key(sink_query_route_key),
         },
         PostBindDispatch {
             route_token: ROUTE_TOKEN_FS_META_INTERNAL.into(),
@@ -134,4 +142,13 @@ pub fn default_route_bindings() -> Arc<PostBindDispatchTable> {
             route: request_reply_route_key(ROUTE_KEY_HOST_OBJECT_PASSTHROUGH),
         },
     ]))
+}
+
+pub fn default_route_bindings() -> Arc<PostBindDispatchTable> {
+    build_route_bindings(ROUTE_KEY_SINK_QUERY_INTERNAL)
+}
+
+pub fn sink_query_route_bindings_for(node_id: &str) -> Arc<PostBindDispatchTable> {
+    let route_key = sink_query_route_key_for(node_id);
+    build_route_bindings(&route_key)
 }

@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 
 use capanix_app_sdk::runtime::{
-    ControlEnvelope, EventMetadata, NodeId, RecvOpts, in_memory_state_boundary,
+    ControlEnvelope, EventMetadata, NodeId, RecvOpts, RouteKey, in_memory_state_boundary,
 };
 use capanix_app_sdk::{CnxError, Event, Result};
 use capanix_host_adapter_fs::HostAdapter;
@@ -47,7 +47,7 @@ use crate::runtime::orchestration::{
 use crate::runtime::routes::{
     METHOD_FIND, METHOD_QUERY, METHOD_SINK_QUERY, METHOD_SINK_ROOTS_CONTROL, METHOD_SOURCE_FIND,
     METHOD_STREAM, ROUTE_TOKEN_FS_META, ROUTE_TOKEN_FS_META_EVENTS, ROUTE_TOKEN_FS_META_INTERNAL,
-    default_route_bindings,
+    default_route_bindings, sink_query_request_route_for,
 };
 use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::unit_gate::RuntimeUnitGate;
@@ -751,13 +751,33 @@ impl SinkFileMeta {
             let internal_query_pending_stream_events = pending_stream_events.clone();
             let internal_query_stream_receive_enabled = stream_receive_enabled.clone();
             let internal_query_unit_control = unit_control.clone();
+            let mut internal_query_routes = Vec::<RouteKey>::new();
             if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
-                log::info!(
-                    "bound route listening on {}.{} for sink {}",
+                internal_query_routes.push(route);
+            } else {
+                log::error!(
+                    "failed to resolve route lookup for {}.{}",
                     ROUTE_TOKEN_FS_META_INTERNAL,
-                    METHOD_SINK_QUERY,
-                    node_id_cloned.0
+                    METHOD_SINK_QUERY
                 );
+            }
+            internal_query_routes.push(sink_query_request_route_for(&node_id_cloned.0));
+            for route in internal_query_routes {
+                let internal_query_state_for_route = internal_query_state.clone();
+                let internal_query_root_specs_for_route = internal_query_root_specs.clone();
+                let internal_query_host_object_grants_for_route =
+                    internal_query_host_object_grants.clone();
+                let internal_query_visibility_lag_for_route =
+                    internal_query_visibility_lag.clone();
+                let internal_query_stream_delivery_stats_for_route =
+                    internal_query_stream_delivery_stats.clone();
+                let internal_query_pending_stream_events_for_route =
+                    internal_query_pending_stream_events.clone();
+                let internal_query_stream_receive_enabled_for_route =
+                    internal_query_stream_receive_enabled.clone();
+                let internal_query_unit_control_for_route =
+                    internal_query_unit_control.clone();
+                log::info!("bound route listening on {} for sink {}", route.0, node_id_cloned.0);
                 let endpoint = ManagedEndpointTask::spawn(
                     sys.clone(),
                     route,
@@ -769,18 +789,20 @@ impl SinkFileMeta {
                     {
                     let internal_query_node_id = node_id_cloned.clone();
                     move |requests| {
-                        let internal_query_state = internal_query_state.clone();
-                        let internal_query_root_specs = internal_query_root_specs.clone();
+                        let internal_query_state = internal_query_state_for_route.clone();
+                        let internal_query_root_specs = internal_query_root_specs_for_route.clone();
                         let internal_query_host_object_grants =
-                            internal_query_host_object_grants.clone();
-                        let internal_query_visibility_lag = internal_query_visibility_lag.clone();
+                            internal_query_host_object_grants_for_route.clone();
+                        let internal_query_visibility_lag =
+                            internal_query_visibility_lag_for_route.clone();
                         let internal_query_stream_delivery_stats =
-                            internal_query_stream_delivery_stats.clone();
+                            internal_query_stream_delivery_stats_for_route.clone();
                         let internal_query_pending_stream_events =
-                            internal_query_pending_stream_events.clone();
+                            internal_query_pending_stream_events_for_route.clone();
                         let internal_query_stream_receive_enabled =
-                            internal_query_stream_receive_enabled.clone();
-                        let internal_query_unit_control = internal_query_unit_control.clone();
+                            internal_query_stream_receive_enabled_for_route.clone();
+                        let internal_query_unit_control =
+                            internal_query_unit_control_for_route.clone();
                         let internal_query_node_id = internal_query_node_id.clone();
                         async move {
                             let mut responses = Vec::new();
@@ -836,12 +858,6 @@ impl SinkFileMeta {
                 );
                 lock_or_recover(&sink.endpoint_tasks, "sink.with_boundaries.endpoint_tasks")
                     .push(endpoint);
-            } else {
-                log::error!(
-                    "failed to resolve route lookup for {}.{}",
-                    ROUTE_TOKEN_FS_META_INTERNAL,
-                    METHOD_SINK_QUERY
-                );
             }
 
             // 2. Fresh find path: proxy to source live-scan endpoint through host-adapter SDK.
@@ -1134,19 +1150,31 @@ impl SinkFileMeta {
         let internal_query_pending_stream_events = self.pending_stream_events.clone();
         let internal_query_stream_receive_enabled = self.stream_receive_enabled.clone();
         let internal_query_unit_control = self.unit_control.clone();
+        let mut internal_query_routes = Vec::<RouteKey>::new();
         if let Ok(route) = routes.resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY) {
+            internal_query_routes.push(route);
+        }
+        internal_query_routes.push(sink_query_request_route_for(&node_id_cloned.0));
+        for route in internal_query_routes {
+            let internal_query_state_for_route = internal_query_state.clone();
+            let internal_query_root_specs_for_route = internal_query_root_specs.clone();
+            let internal_query_host_object_grants_for_route =
+                internal_query_host_object_grants.clone();
+            let internal_query_visibility_lag_for_route = internal_query_visibility_lag.clone();
+            let internal_query_stream_delivery_stats_for_route =
+                internal_query_stream_delivery_stats.clone();
+            let internal_query_pending_stream_events_for_route =
+                internal_query_pending_stream_events.clone();
+            let internal_query_stream_receive_enabled_for_route =
+                internal_query_stream_receive_enabled.clone();
+            let internal_query_unit_control_for_route = internal_query_unit_control.clone();
             eprintln!(
                 "fs_meta_sink: start_runtime_endpoints internal_query spawn begin node={} route={} elapsed_ms={}",
                 node_id_cloned.0,
                 route.0,
                 start.elapsed().as_millis()
             );
-            log::info!(
-                "bound route listening on {}.{} for sink {}",
-                ROUTE_TOKEN_FS_META_INTERNAL,
-                METHOD_SINK_QUERY,
-                node_id_cloned.0
-            );
+            log::info!("bound route listening on {} for sink {}", route.0, node_id_cloned.0);
             let endpoint = ManagedEndpointTask::spawn(
                 boundary.clone(),
                 route,
@@ -1158,18 +1186,20 @@ impl SinkFileMeta {
                 {
                 let internal_query_node_id = node_id_cloned.clone();
                 move |requests| {
-                    let internal_query_state = internal_query_state.clone();
-                    let internal_query_root_specs = internal_query_root_specs.clone();
+                    let internal_query_state = internal_query_state_for_route.clone();
+                    let internal_query_root_specs = internal_query_root_specs_for_route.clone();
                     let internal_query_host_object_grants =
-                        internal_query_host_object_grants.clone();
-                    let internal_query_visibility_lag = internal_query_visibility_lag.clone();
+                        internal_query_host_object_grants_for_route.clone();
+                    let internal_query_visibility_lag =
+                        internal_query_visibility_lag_for_route.clone();
                     let internal_query_stream_delivery_stats =
-                        internal_query_stream_delivery_stats.clone();
+                        internal_query_stream_delivery_stats_for_route.clone();
                     let internal_query_pending_stream_events =
-                        internal_query_pending_stream_events.clone();
+                        internal_query_pending_stream_events_for_route.clone();
                     let internal_query_stream_receive_enabled =
-                        internal_query_stream_receive_enabled.clone();
-                    let internal_query_unit_control = internal_query_unit_control.clone();
+                        internal_query_stream_receive_enabled_for_route.clone();
+                    let internal_query_unit_control =
+                        internal_query_unit_control_for_route.clone();
                     let internal_query_node_id = internal_query_node_id.clone();
                     async move {
                         let mut responses = Vec::new();

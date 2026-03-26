@@ -1,5 +1,5 @@
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
 use capanix_app_sdk::runtime::{ControlEnvelope, NodeId, RuntimeWorkerBinding};
@@ -36,6 +36,28 @@ const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
 
 fn debug_control_scope_capture_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
+}
+
+fn debug_force_find_route_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_FORCE_FIND_ROUTE_CAPTURE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn summarize_event_counts_by_origin(events: &[Event]) -> Vec<String> {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for event in events {
+        *counts
+            .entry(event.metadata().origin_id.0.clone())
+            .or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(origin, count)| format!("{origin}={count}"))
+        .collect()
 }
 
 fn summarize_bound_scopes(
@@ -188,28 +210,20 @@ struct SourceWorkerSnapshotCache {
     force_find_inflight_groups: Option<Vec<String>>,
     scheduled_source_groups_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
     scheduled_scan_groups_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
-    last_control_frame_signals_by_node:
-        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    last_control_frame_signals_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
     published_batches_by_node: Option<std::collections::BTreeMap<String, u64>>,
     published_events_by_node: Option<std::collections::BTreeMap<String, u64>>,
     published_control_events_by_node: Option<std::collections::BTreeMap<String, u64>>,
     published_data_events_by_node: Option<std::collections::BTreeMap<String, u64>>,
     last_published_at_us_by_node: Option<std::collections::BTreeMap<String, u64>>,
-    last_published_origins_by_node:
-        Option<std::collections::BTreeMap<String, Vec<String>>>,
-    published_origin_counts_by_node:
-        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    last_published_origins_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    published_origin_counts_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
     published_path_capture_target: Option<String>,
-    enqueued_path_origin_counts_by_node:
-        Option<std::collections::BTreeMap<String, Vec<String>>>,
-    pending_path_origin_counts_by_node:
-        Option<std::collections::BTreeMap<String, Vec<String>>>,
-    yielded_path_origin_counts_by_node:
-        Option<std::collections::BTreeMap<String, Vec<String>>>,
-    summarized_path_origin_counts_by_node:
-        Option<std::collections::BTreeMap<String, Vec<String>>>,
-    published_path_origin_counts_by_node:
-        Option<std::collections::BTreeMap<String, Vec<String>>>,
+    enqueued_path_origin_counts_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    pending_path_origin_counts_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    yielded_path_origin_counts_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    summarized_path_origin_counts_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
+    published_path_origin_counts_by_node: Option<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Clone)]
@@ -218,7 +232,8 @@ pub struct SourceWorkerClientHandle {
     config: SourceConfig,
     worker_factory: RuntimeWorkerClientFactory,
     worker_binding: RuntimeWorkerBinding,
-    worker: TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>,
+    _shared: Arc<SharedSourceWorkerHandleState>,
+    worker: Arc<TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>>,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
     control_ops_inflight: Arc<AtomicUsize>,
 }
@@ -233,6 +248,58 @@ impl Drop for InflightControlOpGuard {
     }
 }
 
+struct SharedSourceWorkerHandleState {
+    worker: Arc<TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>>,
+    cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
+    control_ops_inflight: Arc<AtomicUsize>,
+}
+
+fn source_worker_handle_registry_key(
+    node_id: &NodeId,
+    worker_binding: &RuntimeWorkerBinding,
+) -> String {
+    format!(
+        "{}|{}|{:?}|{:?}|{}|{}",
+        node_id.0,
+        worker_binding.role_id,
+        worker_binding.mode,
+        worker_binding.launcher_kind,
+        worker_binding
+            .module_path
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default(),
+        worker_binding
+            .socket_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default()
+    )
+}
+
+fn source_worker_handle_registry()
+-> &'static Mutex<std::collections::BTreeMap<String, Weak<SharedSourceWorkerHandleState>>> {
+    static REGISTRY: std::sync::OnceLock<
+        Mutex<std::collections::BTreeMap<String, Weak<SharedSourceWorkerHandleState>>>,
+    > = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(std::collections::BTreeMap::new()))
+}
+
+fn lock_source_worker_handle_registry() -> std::sync::MutexGuard<
+    'static,
+    std::collections::BTreeMap<String, Weak<SharedSourceWorkerHandleState>>,
+> {
+    match source_worker_handle_registry().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            log::warn!(
+                "source worker handle registry lock poisoned; recovering shared handle state"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 impl SourceWorkerClientHandle {
     pub(crate) fn new(
         node_id: NodeId,
@@ -240,21 +307,37 @@ impl SourceWorkerClientHandle {
         worker_binding: RuntimeWorkerBinding,
         worker_factory: RuntimeWorkerClientFactory,
     ) -> Result<Self> {
+        let key = source_worker_handle_registry_key(&node_id, &worker_binding);
+        let shared = {
+            let mut registry = lock_source_worker_handle_registry();
+            if let Some(existing) = registry.get(&key).and_then(Weak::upgrade) {
+                existing
+            } else {
+                let shared = Arc::new(SharedSourceWorkerHandleState {
+                    worker: Arc::new(worker_factory.connect(
+                        node_id.clone(),
+                        config.clone(),
+                        worker_binding.clone(),
+                    )?),
+                    cache: Arc::new(Mutex::new(SourceWorkerSnapshotCache {
+                        grants: Some(config.host_object_grants.clone()),
+                        logical_roots: Some(config.roots.clone()),
+                        ..SourceWorkerSnapshotCache::default()
+                    })),
+                    control_ops_inflight: Arc::new(AtomicUsize::new(0)),
+                });
+                registry.insert(key, Arc::downgrade(&shared));
+                shared
+            }
+        };
         Ok(Self {
-            worker: worker_factory.connect(
-                node_id.clone(),
-                config.clone(),
-                worker_binding.clone(),
-            )?,
+            _shared: shared.clone(),
+            worker: shared.worker.clone(),
             node_id,
             worker_factory,
             worker_binding,
-            cache: Arc::new(Mutex::new(SourceWorkerSnapshotCache {
-                grants: Some(config.host_object_grants.clone()),
-                logical_roots: Some(config.roots.clone()),
-                ..SourceWorkerSnapshotCache::default()
-            })),
-            control_ops_inflight: Arc::new(AtomicUsize::new(0)),
+            cache: shared.cache.clone(),
+            control_ops_inflight: shared.control_ops_inflight.clone(),
             config,
         })
     }
@@ -324,8 +407,7 @@ impl SourceWorkerClientHandle {
                 Some(snapshot.last_published_origins_by_node.clone());
             cache.published_origin_counts_by_node =
                 Some(snapshot.published_origin_counts_by_node.clone());
-            cache.published_path_capture_target =
-                snapshot.published_path_capture_target.clone();
+            cache.published_path_capture_target = snapshot.published_path_capture_target.clone();
             cache.enqueued_path_origin_counts_by_node =
                 Some(snapshot.enqueued_path_origin_counts_by_node.clone());
             cache.pending_path_origin_counts_by_node =
@@ -725,20 +807,51 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn force_find(&self, params: InternalQueryRequest) -> Result<Vec<Event>> {
+        let target_node = self.node_id.clone();
         self.with_started_retry(|client| {
             let params = params.clone();
+            let target_node = target_node.clone();
             async move {
-                match Self::call_worker(
+                if debug_force_find_route_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_source_worker_client: force_find rpc begin target_node={} selected_group={:?} recursive={} max_depth={:?} path={}",
+                        target_node.0,
+                        params.scope.selected_group,
+                        params.scope.recursive,
+                        params.scope.max_depth,
+                        String::from_utf8_lossy(&params.scope.path)
+                    );
+                }
+                let response = Self::call_worker(
                     &client,
                     SourceWorkerRequest::ForceFind {
                         request: params.clone(),
                     },
                     SOURCE_WORKER_FORCE_FIND_TIMEOUT,
                 )
-                .await?
-                {
-                    SourceWorkerResponse::Events(events) => Ok(events),
-                    other => Err(CnxError::ProtocolViolation(format!(
+                .await;
+                match response {
+                    Err(err) => {
+                        if debug_force_find_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_source_worker_client: force_find rpc failed target_node={} err={}",
+                                target_node.0, err
+                            );
+                        }
+                        Err(err)
+                    }
+                    Ok(SourceWorkerResponse::Events(events)) => {
+                        if debug_force_find_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_source_worker_client: force_find rpc done target_node={} events={} origins={:?}",
+                                target_node.0,
+                                events.len(),
+                                summarize_event_counts_by_origin(&events)
+                            );
+                        }
+                        Ok(events)
+                    }
+                    Ok(other) => Err(CnxError::ProtocolViolation(format!(
                         "unexpected source worker response for force-find: {:?}",
                         other
                     ))),
@@ -889,10 +1002,9 @@ impl SourceWorkerClientHandle {
         match self.try_observability_snapshot_nonblocking().await {
             Ok(snapshot) => snapshot,
             Err(err) => {
-                let snapshot =
-                    self.degraded_observability_snapshot_from_cache(format!(
-                        "source worker unavailable: {err}"
-                    ));
+                let snapshot = self.degraded_observability_snapshot_from_cache(format!(
+                    "source worker unavailable: {err}"
+                ));
                 if debug_control_scope_capture_enabled() {
                     eprintln!(
                         "fs_meta_source_worker_client: observability_snapshot cache_fallback node={} reason=worker_unavailable err={} {}",
@@ -928,16 +1040,11 @@ pub struct SourceObservabilitySnapshot {
     pub last_published_origins_by_node: std::collections::BTreeMap<String, Vec<String>>,
     pub published_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
     pub published_path_capture_target: Option<String>,
-    pub enqueued_path_origin_counts_by_node:
-        std::collections::BTreeMap<String, Vec<String>>,
-    pub pending_path_origin_counts_by_node:
-        std::collections::BTreeMap<String, Vec<String>>,
-    pub yielded_path_origin_counts_by_node:
-        std::collections::BTreeMap<String, Vec<String>>,
-    pub summarized_path_origin_counts_by_node:
-        std::collections::BTreeMap<String, Vec<String>>,
-    pub published_path_origin_counts_by_node:
-        std::collections::BTreeMap<String, Vec<String>>,
+    pub enqueued_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub pending_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub yielded_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub summarized_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
+    pub published_path_origin_counts_by_node: std::collections::BTreeMap<String, Vec<String>>,
 }
 
 fn scheduled_groups_by_node(
@@ -950,10 +1057,7 @@ fn scheduled_groups_by_node(
     if groups.is_empty() {
         return std::collections::BTreeMap::new();
     }
-    std::collections::BTreeMap::from([(
-        node_id.0.clone(),
-        groups.into_iter().collect::<Vec<_>>(),
-    )])
+    std::collections::BTreeMap::from([(node_id.0.clone(), groups.into_iter().collect::<Vec<_>>())])
 }
 
 fn build_degraded_worker_observability_snapshot(
@@ -1429,7 +1533,9 @@ mod tests {
     use crate::query::models::QueryNode;
     use crate::query::path::is_under_query_path;
     use crate::query::path::root_file_name_bytes;
-    use crate::query::request::{MaterializedQueryPayload, QueryOp, QueryScope};
+    use crate::query::request::{
+        InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope,
+    };
     use crate::runtime::execution_units::{
         SINK_RUNTIME_UNIT_ID, SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID,
     };
@@ -1642,6 +1748,18 @@ mod tests {
         )
     }
 
+    fn selected_group_force_find_request(group_id: &str) -> InternalQueryRequest {
+        InternalQueryRequest::force_find(
+            QueryOp::Tree,
+            QueryScope {
+                path: b"/".to_vec(),
+                recursive: true,
+                max_depth: None,
+                selected_group: Some(group_id.to_string()),
+            },
+        )
+    }
+
     fn decode_exact_query_node(events: Vec<Event>, path: &[u8]) -> Result<Option<QueryNode>> {
         let mut selected = None::<QueryNode>;
         for event in &events {
@@ -1730,7 +1848,9 @@ mod tests {
                 continue;
             };
             if is_under_query_path(&record.path, target) {
-                *path_counts.entry(event.metadata().origin_id.0.clone()).or_insert(0) += 1;
+                *path_counts
+                    .entry(event.metadata().origin_id.0.clone())
+                    .or_insert(0) += 1;
             }
         }
     }
@@ -1852,10 +1972,8 @@ mod tests {
         let nfs2 = tmp.path().join("nfs2");
         std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
         std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
-        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
-            .expect("seed nfs1");
-        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
-            .expect("seed nfs2");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
 
         let cfg = SourceConfig {
             roots: vec![
@@ -1871,11 +1989,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let client = SourceWorkerClientHandle::new(
             NodeId("node-a".to_string()),
             cfg,
@@ -1894,11 +2009,9 @@ mod tests {
         let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < initial_deadline {
             match recv_loopback_events(&boundary, 250).await {
-                Ok(batch) => record_control_and_data_counts(
-                    &mut control_counts,
-                    &mut data_counts,
-                    batch,
-                ),
+                Ok(batch) => {
+                    record_control_and_data_counts(&mut control_counts, &mut data_counts, batch)
+                }
                 Err(CnxError::Timeout) => continue,
                 Err(err) => panic!("initial batch recv failed: {err}"),
             }
@@ -1928,19 +2041,20 @@ mod tests {
             b"bb",
         )
         .expect("append nfs2 file");
-        tokio::time::timeout(Duration::from_secs(8), client.publish_manual_rescan_signal())
-            .await
-            .expect("manual rescan publish timed out")
-            .expect("publish manual rescan");
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            client.publish_manual_rescan_signal(),
+        )
+        .await
+        .expect("manual rescan publish timed out")
+        .expect("publish manual rescan");
 
         let rescan_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         while tokio::time::Instant::now() < rescan_deadline {
             match recv_loopback_events(&boundary, 250).await {
-                Ok(batch) => record_control_and_data_counts(
-                    &mut control_counts,
-                    &mut data_counts,
-                    batch,
-                ),
+                Ok(batch) => {
+                    record_control_and_data_counts(&mut control_counts, &mut data_counts, batch)
+                }
                 Err(CnxError::Timeout) => continue,
                 Err(err) => panic!("manual rescan batch recv failed: {err}"),
             }
@@ -1974,17 +2088,189 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn external_source_worker_stream_batches_reach_sink_worker_for_each_scheduled_primary_root(
-    ) {
+    async fn external_source_worker_force_find_updates_last_runner_snapshot_and_observability() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let root_dir = std::env::temp_dir().join(format!("fs-meta-worker-force-find-{unique}"));
+        std::fs::create_dir_all(&root_dir).expect("create root dir");
+        std::fs::write(root_dir.join("file.txt"), b"ok").expect("seed file");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &root_dir)],
+            host_object_grants: vec![
+                worker_source_export("node-a::exp1", "node-a", "10.0.0.11", root_dir.clone()),
+                worker_source_export("node-a::exp2", "node-a", "10.0.0.12", root_dir.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = SourceWorkerClientHandle::new(
+            NodeId("node-a".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let params = selected_group_force_find_request("nfs1");
+        let first = client
+            .force_find(params.clone())
+            .await
+            .expect("first force-find over worker");
+        assert!(
+            !first.is_empty(),
+            "first worker force-find should return at least one response event"
+        );
+        let first_runner = client
+            .last_force_find_runner_by_group_snapshot()
+            .await
+            .expect("first last-runner snapshot");
+        assert_eq!(
+            first_runner.get("nfs1").map(String::as_str),
+            Some("node-a::exp1")
+        );
+
+        let second = client
+            .force_find(params.clone())
+            .await
+            .expect("second force-find over worker");
+        assert!(
+            !second.is_empty(),
+            "second worker force-find should return at least one response event"
+        );
+        let second_runner = client
+            .last_force_find_runner_by_group_snapshot()
+            .await
+            .expect("second last-runner snapshot");
+        assert_eq!(
+            second_runner.get("nfs1").map(String::as_str),
+            Some("node-a::exp2")
+        );
+
+        let third = client
+            .force_find(params)
+            .await
+            .expect("third force-find over worker");
+        assert!(
+            !third.is_empty(),
+            "third worker force-find should return at least one response event"
+        );
+        let third_runner = client
+            .last_force_find_runner_by_group_snapshot()
+            .await
+            .expect("third last-runner snapshot");
+        assert_eq!(
+            third_runner.get("nfs1").map(String::as_str),
+            Some("node-a::exp1")
+        );
+
+        let observability = SourceFacade::Worker(client.clone().into())
+            .observability_snapshot()
+            .await
+            .expect("worker observability snapshot after force-find");
+        assert_eq!(
+            observability
+                .last_force_find_runner_by_group
+                .get("nfs1")
+                .map(String::as_str),
+            Some("node-a::exp1")
+        );
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn force_find_via_node_shares_runner_state_with_existing_target_worker_handle() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_micros();
+        let root_dir =
+            std::env::temp_dir().join(format!("fs-meta-worker-force-find-share-{unique}"));
+        std::fs::create_dir_all(&root_dir).expect("create root dir");
+        std::fs::write(root_dir.join("file.txt"), b"ok").expect("seed file");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &root_dir)],
+            host_object_grants: vec![
+                worker_source_export("node-a::exp1", "node-a", "10.0.0.11", root_dir.clone()),
+                worker_source_export("node-a::exp2", "node-a", "10.0.0.12", root_dir.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let binding = external_source_worker_binding(worker_socket_dir.path());
+        let target_client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-a".to_string()),
+                cfg.clone(),
+                binding.clone(),
+                factory.clone(),
+            )
+            .expect("construct target source worker client"),
+        );
+        let routing_client = Arc::new(
+            SourceWorkerClientHandle::new(NodeId("node-d".to_string()), cfg, binding, factory)
+                .expect("construct routing source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), target_client.start())
+            .await
+            .expect("target source worker start timed out")
+            .expect("start target source worker");
+
+        let routed = SourceFacade::worker(routing_client);
+        let params = selected_group_force_find_request("nfs1");
+        let first = routed
+            .force_find_via_node(&NodeId("node-a".to_string()), &params)
+            .await
+            .expect("routed force-find via node");
+        assert!(
+            !first.is_empty(),
+            "routed force-find via target node should return at least one response event"
+        );
+
+        let shared_runner = target_client
+            .last_force_find_runner_by_group_snapshot()
+            .await
+            .expect("target handle last-runner snapshot");
+        assert_eq!(
+            shared_runner.get("nfs1").map(String::as_str),
+            Some("node-a::exp1"),
+            "force_find_via_node should update runner state visible through the already-started target worker handle"
+        );
+
+        target_client
+            .close()
+            .await
+            .expect("close target source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn external_source_worker_stream_batches_reach_sink_worker_for_each_scheduled_primary_root()
+     {
         let tmp = tempdir().expect("create temp dir");
         let nfs1 = tmp.path().join("nfs1");
         let nfs2 = tmp.path().join("nfs2");
         std::fs::create_dir_all(nfs1.join("force-find-stress")).expect("create nfs1 dir");
         std::fs::create_dir_all(nfs2.join("force-find-stress")).expect("create nfs2 dir");
-        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a")
-            .expect("seed nfs1");
-        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b")
-            .expect("seed nfs2");
+        std::fs::write(nfs1.join("force-find-stress").join("seed.txt"), b"a").expect("seed nfs1");
+        std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"b").expect("seed nfs2");
 
         let cfg = SourceConfig {
             roots: vec![
@@ -2129,7 +2415,9 @@ mod tests {
                         }
                     }
                     if control < batch.len() {
-                        sink.send(batch).await.expect("forward source batch to sink");
+                        sink.send(batch)
+                            .await
+                            .expect("forward source batch to sink");
                     }
                 }
                 Err(CnxError::Timeout) => continue,
@@ -2206,8 +2494,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
-    async fn external_source_worker_real_nfs_manual_rescan_publishes_newly_seeded_subtree_alongside_baseline_path(
-    ) {
+    async fn external_source_worker_real_nfs_manual_rescan_publishes_newly_seeded_subtree_alongside_baseline_path()
+     {
         let preflight = real_nfs_lab::RealNfsPreflight::detect();
         if !preflight.enabled {
             eprintln!(
@@ -2241,11 +2529,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let client = SourceWorkerClientHandle::new(
             NodeId("node-a".to_string()),
             cfg,
@@ -2301,10 +2586,13 @@ mod tests {
         lab.write_file("nfs2", "force-find-stress/seed.txt", "b\n")
             .expect("seed nfs2 force-find subtree");
 
-        tokio::time::timeout(Duration::from_secs(8), client.publish_manual_rescan_signal())
-            .await
-            .expect("manual rescan publish timed out")
-            .expect("publish manual rescan");
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            client.publish_manual_rescan_signal(),
+        )
+        .await
+        .expect("manual rescan publish timed out")
+        .expect("publish manual rescan");
 
         let force_find_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         while tokio::time::Instant::now() < force_find_deadline {
@@ -2334,8 +2622,8 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn external_source_worker_nonblocking_observability_can_serve_stale_published_path_counts_during_control_inflight(
-    ) {
+    async fn external_source_worker_nonblocking_observability_can_serve_stale_published_path_counts_during_control_inflight()
+     {
         let previous = std::env::var("FSMETA_DEBUG_STREAM_PATH_CAPTURE").ok();
         unsafe {
             std::env::set_var("FSMETA_DEBUG_STREAM_PATH_CAPTURE", "/force-find-stress");
@@ -2363,11 +2651,8 @@ mod tests {
         let boundary = Arc::new(LoopbackWorkerBoundary::default());
         let state_boundary = in_memory_state_boundary();
         let worker_socket_dir = tempdir().expect("create worker socket dir");
-        let factory = RuntimeWorkerClientFactory::new(
-            boundary.clone(),
-            boundary.clone(),
-            state_boundary,
-        );
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
         let client = SourceWorkerClientHandle::new(
             NodeId("node-a".to_string()),
             cfg,
@@ -2406,10 +2691,7 @@ mod tests {
 
         let primed_worker = client.client().await.expect("connect source worker");
         let primed = client
-            .observability_snapshot_with_timeout(
-                &primed_worker,
-                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-            )
+            .observability_snapshot_with_timeout(&primed_worker, SOURCE_WORKER_CONTROL_RPC_TIMEOUT)
             .await
             .expect("prime cached observability snapshot");
         assert_eq!(
@@ -2433,10 +2715,13 @@ mod tests {
         std::fs::write(nfs2.join("force-find-stress").join("seed.txt"), b"bb")
             .expect("seed nfs2 subtree");
 
-        tokio::time::timeout(Duration::from_secs(8), client.publish_manual_rescan_signal())
-            .await
-            .expect("manual rescan publish timed out")
-            .expect("publish manual rescan");
+        tokio::time::timeout(
+            Duration::from_secs(8),
+            client.publish_manual_rescan_signal(),
+        )
+        .await
+        .expect("manual rescan publish timed out")
+        .expect("publish manual rescan");
 
         let force_find_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         let force_find_target = b"/force-find-stress";
@@ -2467,8 +2752,7 @@ mod tests {
         let stale = client.observability_snapshot_nonblocking().await;
         drop(inflight);
         assert_eq!(
-            stale.lifecycle_state,
-            SOURCE_WORKER_DEGRADED_STATE,
+            stale.lifecycle_state, SOURCE_WORKER_DEGRADED_STATE,
             "control-inflight nonblocking snapshot should use cached fallback"
         );
         assert!(
@@ -2491,11 +2775,15 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert!(
-            live_counts.iter().any(|entry| entry.starts_with("node-a::nfs1=")),
+            live_counts
+                .iter()
+                .any(|entry| entry.starts_with("node-a::nfs1=")),
             "live worker snapshot should include nfs1 /force-find-stress path counts: {live_counts:?}"
         );
         assert!(
-            live_counts.iter().any(|entry| entry.starts_with("node-a::nfs2=")),
+            live_counts
+                .iter()
+                .any(|entry| entry.starts_with("node-a::nfs2=")),
             "live worker snapshot should include nfs2 /force-find-stress path counts after rescan: {live_counts:?}"
         );
 

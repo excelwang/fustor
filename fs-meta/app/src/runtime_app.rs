@@ -219,6 +219,15 @@ fn debug_source_status_lifecycle_enabled() -> bool {
     })
 }
 
+fn debug_force_find_runner_capture_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_FORCE_FIND_RUNNER_CAPTURE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
 fn next_source_status_endpoint_trace_id() -> u64 {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
@@ -274,6 +283,13 @@ fn summarize_groups_by_node(groups: &BTreeMap<String, Vec<String>>) -> Vec<Strin
     groups
         .iter()
         .map(|(node_id, groups)| format!("{node_id}={}", groups.join("|")))
+        .collect()
+}
+
+fn summarize_group_string_map(groups: &BTreeMap<String, String>) -> Vec<String> {
+    groups
+        .iter()
+        .map(|(group_id, value)| format!("{group_id}={value}"))
         .collect()
 }
 
@@ -984,6 +1000,7 @@ impl FSMetaApp {
                 // Not currently selected as query/query-peer source-status owner, or already running.
             } else {
                 let source = self.source.clone();
+                let node_id = self.node_id.clone();
                 eprintln!(
                     "fs_meta_runtime_app: spawning source status endpoint route={}",
                     route.0
@@ -998,6 +1015,7 @@ impl FSMetaApp {
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
                         let source = source.clone();
+                        let node_id = node_id.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
@@ -1022,12 +1040,25 @@ impl FSMetaApp {
                                 let snapshot = source.observability_snapshot_nonblocking().await;
                                 trace_guard.phase("after_source_snapshot_await");
                                 eprintln!(
-                                    "fs_meta_runtime_app: source status endpoint response groups={} runners={} correlation={:?} trace_id={}",
+                                    "fs_meta_runtime_app: source status endpoint response node={} groups={} runners={} correlation={:?} trace_id={}",
+                                    node_id.0,
                                     snapshot.source_primary_by_group.len(),
                                     snapshot.last_force_find_runner_by_group.len(),
                                     req.metadata().correlation_id,
                                     trace_id
                                 );
+                                if debug_force_find_runner_capture_enabled() {
+                                    eprintln!(
+                                        "fs_meta_runtime_app: source status endpoint runner_capture node={} correlation={:?} trace_id={} last_runner={:?} inflight={:?}",
+                                        node_id.0,
+                                        req.metadata().correlation_id,
+                                        trace_id,
+                                        summarize_group_string_map(
+                                            &snapshot.last_force_find_runner_by_group
+                                        ),
+                                        snapshot.force_find_inflight_groups
+                                    );
+                                }
                                 if let Ok(payload) = rmp_serde::to_vec_named(&snapshot) {
                                     responses.push(Event::new(
                                         EventMetadata {
@@ -1267,6 +1298,7 @@ impl FSMetaApp {
                     route.0
                 );
                 let source = self.source.clone();
+                let node_id = self.node_id.clone();
                 let endpoint = ManagedEndpointTask::spawn(
                     boundary.clone(),
                     route,
@@ -1277,6 +1309,7 @@ impl FSMetaApp {
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
                         let source = source.clone();
+                        let node_id = node_id.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
@@ -1297,6 +1330,30 @@ impl FSMetaApp {
                                             "fs_meta_runtime_app: source find proxy response events={}",
                                             events.len()
                                         );
+                                        if debug_force_find_runner_capture_enabled() {
+                                            let last_runner = source
+                                                .last_force_find_runner_by_group_snapshot()
+                                                .await
+                                                .unwrap_or_default();
+                                            let inflight = source
+                                                .force_find_inflight_groups_snapshot()
+                                                .await
+                                                .unwrap_or_default();
+                                            let response_origins = events
+                                                .iter()
+                                                .map(|event| event.metadata().origin_id.0.clone())
+                                                .collect::<Vec<_>>();
+                                            eprintln!(
+                                                "fs_meta_runtime_app: source find proxy runner_capture node={} selected_group={:?} path={} response_events={} response_origins={:?} last_runner={:?} inflight={:?}",
+                                                node_id.0,
+                                                params.scope.selected_group,
+                                                String::from_utf8_lossy(&params.scope.path),
+                                                events.len(),
+                                                response_origins,
+                                                summarize_group_string_map(&last_runner),
+                                                inflight
+                                            );
+                                        }
                                         for event in &mut events {
                                             let mut meta = event.metadata().clone();
                                             meta.correlation_id = req.metadata().correlation_id;
@@ -1313,6 +1370,25 @@ impl FSMetaApp {
                                             "fs_meta_runtime_app: source find proxy failed err={}",
                                             err
                                         );
+                                        if debug_force_find_runner_capture_enabled() {
+                                            let last_runner = source
+                                                .last_force_find_runner_by_group_snapshot()
+                                                .await
+                                                .unwrap_or_default();
+                                            let inflight = source
+                                                .force_find_inflight_groups_snapshot()
+                                                .await
+                                                .unwrap_or_default();
+                                            eprintln!(
+                                                "fs_meta_runtime_app: source find proxy runner_capture_failed node={} selected_group={:?} path={} err={} last_runner={:?} inflight={:?}",
+                                                node_id.0,
+                                                params.scope.selected_group,
+                                                String::from_utf8_lossy(&params.scope.path),
+                                                err,
+                                                summarize_group_string_map(&last_runner),
+                                                inflight
+                                            );
+                                        }
                                         responses.push(Event::new(
                                             EventMetadata {
                                                 origin_id: NodeId(

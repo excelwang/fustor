@@ -737,6 +737,7 @@ fn build_deploy_intent(
         api_facade_resource_id: product.api.facade_resource_id.clone(),
         auth,
         roots: Vec::new(),
+        route_plan_node_ids: Vec::new(),
         worker_module_path: Some(app_target.to_path_buf()),
         worker_modes,
     });

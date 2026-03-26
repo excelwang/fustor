@@ -9,6 +9,8 @@ use capanix_runtime_entry_sdk::advanced::boundary::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::runtime::routes::ROUTE_KEY_SINK_QUERY_INTERNAL;
+
 fn debug_source_status_lifecycle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
@@ -25,6 +27,19 @@ fn debug_stream_delivery_enabled() -> bool {
             .ok()
             .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
     })
+}
+
+fn debug_materialized_route_lifecycle_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_MATERIALIZED_ROUTE_LIFECYCLE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
+fn is_materialized_internal_query_route(route: &RouteKey) -> bool {
+    route.0 == format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)
 }
 
 fn summarize_event_origins(events: &[Event]) -> Vec<String> {
@@ -195,7 +210,9 @@ async fn run_endpoint_loop<F, Fut>(
     F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
 {
-    if debug_source_status_lifecycle_enabled() {
+    let debug_materialized_route = debug_materialized_route_lifecycle_enabled()
+        && is_materialized_internal_query_route(&route);
+    if debug_source_status_lifecycle_enabled() || debug_materialized_route {
         eprintln!(
             "fs_meta_runtime_endpoint: loop_start route={} task={} thread={:?}",
             route.0,
@@ -206,9 +223,11 @@ async fn run_endpoint_loop<F, Fut>(
     let ctx = BoundaryContext::default();
     let request_channel = ChannelKey(route.0.clone());
     let reply_channel = ChannelKey(format!("{}:reply", route.0));
+    let mut exit_reason = None::<String>;
 
     loop {
         if shutdown_for_task.is_cancelled() {
+            exit_reason = Some("shutdown_cancelled".into());
             break;
         }
         let requests = match boundary
@@ -228,6 +247,12 @@ async fn run_endpoint_loop<F, Fut>(
             | Err(err @ CnxError::TransportClosed(_))
             | Err(err @ CnxError::ChannelClosed)
             | Err(err @ CnxError::LinkError(_)) => {
+                if debug_materialized_route {
+                    eprintln!(
+                        "fs_meta_runtime_endpoint: materialized_route recv_retry route={} task={} err={}",
+                        route.0, join_name, err
+                    );
+                }
                 log::debug!(
                     "endpoint task {} recv retry for {} after transient error: {:?}",
                     join_name,
@@ -238,6 +263,7 @@ async fn run_endpoint_loop<F, Fut>(
                 continue;
             }
             Err(err) => {
+                exit_reason = Some(format!("recv_failed:{err}"));
                 log::warn!(
                     "endpoint task {} recv failed for {}: {:?}",
                     join_name,
@@ -292,17 +318,52 @@ async fn run_endpoint_loop<F, Fut>(
             )
             .await
         {
-            log::warn!(
-                "endpoint task {} send failed for {}: {:?}",
-                join_name,
-                route.0,
-                err
-            );
-            break;
+            match err {
+                err @ CnxError::Timeout
+                | err @ CnxError::NotSupported(_)
+                | err @ CnxError::NotReady(_)
+                | err @ CnxError::TransportClosed(_)
+                | err @ CnxError::ChannelClosed
+                | err @ CnxError::LinkError(_) => {
+                    if debug_materialized_route {
+                        eprintln!(
+                            "fs_meta_runtime_endpoint: materialized_route send_retry route={} task={} err={}",
+                            route.0, join_name, err
+                        );
+                    }
+                    log::debug!(
+                        "endpoint task {} send retry for {} after transient error: {:?}",
+                        join_name,
+                        route.0,
+                        err
+                    );
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                err => {
+                    log::warn!(
+                        "endpoint task {} send failed for {}: {:?}",
+                        join_name,
+                        route.0,
+                        err
+                    );
+                    exit_reason = Some(format!("send_failed:{err}"));
+                    break;
+                }
+            }
         }
         eprintln!(
             "fs_meta_runtime_endpoint: request batch replies sent route={} task={} events={}",
             reply_channel.0, join_name, response_count
+        );
+    }
+
+    if debug_materialized_route {
+        eprintln!(
+            "fs_meta_runtime_endpoint: materialized_route loop_exit route={} task={} reason={}",
+            route.0,
+            join_name,
+            exit_reason.unwrap_or_else(|| "loop_returned".into())
         );
     }
 }
@@ -398,6 +459,9 @@ async fn run_stream_loop<F, Fut, G>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
+    use capanix_app_sdk::runtime::{EventMetadata, NodeId};
+    use std::collections::VecDeque;
     use std::sync::Mutex;
 
     struct RecordingBoundary {
@@ -409,10 +473,27 @@ mod tests {
         thread_name_tx: Mutex<Option<std::sync::mpsc::SyncSender<Option<String>>>>,
     }
 
+    struct ReplyTimeoutThenRecoverBoundary {
+        recv_keys: Mutex<Vec<String>>,
+        send_keys: Mutex<Vec<String>>,
+        recv_steps: Mutex<VecDeque<RecvStep>>,
+        send_steps: Mutex<VecDeque<SendStep>>,
+    }
+
     #[derive(Clone, Copy)]
     enum FirstFailure {
         NotSupported,
         Timeout,
+    }
+
+    enum RecvStep {
+        Events(Vec<Event>),
+        InternalStop,
+    }
+
+    enum SendStep {
+        Timeout,
+        Ok,
     }
 
     impl RecordingBoundary {
@@ -442,6 +523,21 @@ mod tests {
         fn new(tx: std::sync::mpsc::SyncSender<Option<String>>) -> Self {
             Self {
                 thread_name_tx: Mutex::new(Some(tx)),
+            }
+        }
+    }
+
+    impl ReplyTimeoutThenRecoverBoundary {
+        fn new(first: Vec<Event>, second: Vec<Event>) -> Self {
+            Self {
+                recv_keys: Mutex::new(Vec::new()),
+                send_keys: Mutex::new(Vec::new()),
+                recv_steps: Mutex::new(VecDeque::from([
+                    RecvStep::Events(first),
+                    RecvStep::Events(second),
+                    RecvStep::InternalStop,
+                ])),
+                send_steps: Mutex::new(VecDeque::from([SendStep::Timeout, SendStep::Ok])),
             }
         }
     }
@@ -487,6 +583,65 @@ mod tests {
             }
             Err(CnxError::Internal("stop after first recv".into()))
         }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for ReplyTimeoutThenRecoverBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            self.send_keys
+                .lock()
+                .expect("send_keys lock")
+                .push(request.channel_key.0);
+            match self
+                .send_steps
+                .lock()
+                .expect("send_steps lock")
+                .pop_front()
+                .unwrap_or(SendStep::Ok)
+            {
+                SendStep::Timeout => Err(CnxError::Timeout),
+                SendStep::Ok => Ok(()),
+            }
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            self.recv_keys
+                .lock()
+                .expect("recv_keys lock")
+                .push(request.channel_key.0);
+            match self
+                .recv_steps
+                .lock()
+                .expect("recv_steps lock")
+                .pop_front()
+                .unwrap_or(RecvStep::InternalStop)
+            {
+                RecvStep::Events(events) => Ok(events),
+                RecvStep::InternalStop => Err(CnxError::Internal("stop after second batch".into())),
+            }
+        }
+    }
+
+    fn test_event(correlation_id: u64, payload: &'static [u8]) -> Event {
+        Event::new(
+            EventMetadata {
+                origin_id: NodeId("nfs-test".into()),
+                timestamp_us: 1,
+                logical_ts: None,
+                correlation_id: Some(correlation_id),
+                ingress_auth: None,
+                trace: None,
+            },
+            Bytes::from_static(payload),
+        )
     }
 
     #[test]
@@ -612,6 +767,31 @@ mod tests {
                 "sink-status:v1.req".to_string(),
                 "sink-status:v1.req".to_string()
             ]
+        );
+    }
+
+    #[test]
+    fn endpoint_loop_retries_transient_reply_send_timeout_and_handles_later_batches() {
+        let boundary = Arc::new(ReplyTimeoutThenRecoverBoundary::new(
+            vec![test_event(1, b"first")],
+            vec![test_event(2, b"second")],
+        ));
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("materialized-find:v1.req".into()),
+            "sink:fs-meta.internal:sink.query".into(),
+            CancellationToken::new(),
+            Arc::new(|events: Vec<Event>| std::future::ready(events)),
+        ));
+
+        let send_keys = boundary.send_keys.lock().expect("send_keys lock").clone();
+        assert_eq!(
+            send_keys,
+            vec![
+                "materialized-find:v1.req:reply".to_string(),
+                "materialized-find:v1.req:reply".to_string()
+            ],
+            "endpoint loop should keep serving later materialized batches after a transient reply send timeout"
         );
     }
 

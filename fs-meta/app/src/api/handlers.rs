@@ -54,6 +54,15 @@ fn debug_status_route_fanin_enabled() -> bool {
     })
 }
 
+fn debug_force_find_runner_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_FORCE_FIND_RUNNER_CAPTURE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
 fn summarize_groups_by_node(
     groups: &BTreeMap<String, Vec<String>>,
 ) -> Vec<String> {
@@ -63,11 +72,20 @@ fn summarize_groups_by_node(
         .collect()
 }
 
+fn summarize_group_string_map(groups: &BTreeMap<String, String>) -> Vec<String> {
+    groups
+        .iter()
+        .map(|(group_id, value)| format!("{group_id}={value}"))
+        .collect()
+}
+
 fn summarize_source_status_route_snapshot(snapshot: &SourceObservabilitySnapshot) -> String {
     format!(
-        "primaries={} runners={} source={:?} scan={:?} control={:?} published_batches={:?} published_events={:?} published_origins={:?} published_origin_counts={:?} enqueued_path_counts={:?} pending_path_counts={:?} yielded_path_counts={:?} summarized_path_counts={:?} published_path_counts={:?}",
+        "primaries={} runners={} last_runner={:?} inflight={:?} source={:?} scan={:?} control={:?} published_batches={:?} published_events={:?} published_origins={:?} published_origin_counts={:?} enqueued_path_counts={:?} pending_path_counts={:?} yielded_path_counts={:?} summarized_path_counts={:?} published_path_counts={:?}",
         snapshot.source_primary_by_group.len(),
         snapshot.last_force_find_runner_by_group.len(),
+        summarize_group_string_map(&snapshot.last_force_find_runner_by_group),
+        snapshot.force_find_inflight_groups,
         summarize_groups_by_node(&snapshot.scheduled_source_groups_by_node),
         summarize_groups_by_node(&snapshot.scheduled_scan_groups_by_node),
         summarize_groups_by_node(&snapshot.last_control_frame_signals_by_node),
@@ -161,6 +179,16 @@ pub async fn status(
         runner_sets,
         merged_inflight
     );
+    if debug_force_find_runner_capture_enabled() {
+        eprintln!(
+            "fs_meta_api_status: runner_capture node={} source_route={} last_runner={:?} runner_sets={:?} inflight={:?}",
+            state.node_id.0,
+            source_outcome.as_str(),
+            summarize_group_string_map(&source.last_force_find_runner_by_group),
+            runner_sets,
+            merged_inflight
+        );
+    }
 
     Ok(Json(StatusResponse {
         source: status_source_from_observability(source, runner_sets, merged_inflight),
@@ -872,6 +900,18 @@ async fn route_source_observability_snapshot(
         );
     }
     let runner_sets = source_runner_sets(&snapshots);
+    if debug_force_find_runner_capture_enabled() {
+        let last_runners = snapshots
+            .iter()
+            .map(|snapshot| summarize_group_string_map(&snapshot.last_force_find_runner_by_group))
+            .collect::<Vec<_>>();
+        eprintln!(
+            "fs_meta_api_status: source_route_runner_capture snapshots={} last_runners={:?} runner_sets={:?}",
+            snapshots.len(),
+            last_runners,
+            runner_sets
+        );
+    }
     Ok((merge_source_observability_snapshots(snapshots), runner_sets))
 }
 
@@ -1581,6 +1621,40 @@ mod tests {
     }
 
     #[test]
+    fn status_source_from_observability_preserves_force_find_runner_fields() {
+        let source = SourceObservabilitySnapshot {
+            last_force_find_runner_by_group: BTreeMap::from([(
+                "nfs1".to_string(),
+                "node-a::nfs1".to_string(),
+            )]),
+            ..local_source_snapshot()
+        };
+        let runner_sets = BTreeMap::from([(
+            "nfs1".to_string(),
+            vec!["node-a::nfs1".to_string(), "node-b::nfs1".to_string()],
+        )]);
+
+        let status = status_source_from_observability(
+            source,
+            runner_sets.clone(),
+            vec!["nfs1".to_string()],
+        );
+
+        assert_eq!(
+            status.debug.last_force_find_runner_by_group.get("nfs1"),
+            Some(&"node-a::nfs1".to_string())
+        );
+        assert_eq!(
+            status.debug.last_force_find_runners_by_group.get("nfs1"),
+            runner_sets.get("nfs1")
+        );
+        assert_eq!(
+            status.debug.force_find_inflight_groups,
+            vec!["nfs1".to_string()]
+        );
+    }
+
+    #[test]
     fn status_source_from_observability_preserves_concrete_root_transition_fields() {
         let status = status_source_from_observability(local_source_snapshot(), BTreeMap::new(), Vec::new());
 
@@ -1673,6 +1747,67 @@ mod tests {
         assert_eq!(runner_sets, local_runner_sets(&local_source));
         assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
         assert_eq!(source_outcome, StatusRouteOutcome::Timeout);
+    }
+
+    #[tokio::test]
+    async fn status_remote_merge_preserves_remote_force_find_runner_fields() {
+        let local_sink = local_sink_snapshot();
+        let local_source = SourceObservabilitySnapshot {
+            last_force_find_runner_by_group: BTreeMap::new(),
+            ..local_source_snapshot()
+        };
+        let remote_source = SourceObservabilitySnapshot {
+            source_primary_by_group: BTreeMap::from([(
+                "nfs1".to_string(),
+                "node-b::nfs1".to_string(),
+            )]),
+            last_force_find_runner_by_group: BTreeMap::from([(
+                "nfs1".to_string(),
+                "node-b::nfs1".to_string(),
+            )]),
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..local_source_snapshot()
+        };
+        let remote_runner_sets = BTreeMap::from([(
+            "nfs1".to_string(),
+            vec!["node-a::nfs1".to_string(), "node-b::nfs1".to_string()],
+        )]);
+
+        let (_sink, source, runner_sets, sink_outcome, source_outcome) =
+            merge_remote_status_snapshots(
+                local_sink,
+                local_source,
+                Some(std::sync::Arc::new(NoopBoundary)),
+                NodeId("node-a".into()),
+                |_boundary, _origin_id| async move { Ok(SinkStatusSnapshot::default()) },
+                move |_boundary, _origin_id| {
+                    let remote_source = remote_source.clone();
+                    let remote_runner_sets = remote_runner_sets.clone();
+                    async move { Ok((remote_source, remote_runner_sets)) }
+                },
+            )
+            .await;
+
+        assert_eq!(
+            source.last_force_find_runner_by_group.get("nfs1"),
+            Some(&"node-b::nfs1".to_string())
+        );
+        assert_eq!(
+            runner_sets.get("nfs1"),
+            Some(&vec![
+                "node-a::nfs1".to_string(),
+                "node-b::nfs1".to_string(),
+            ])
+        );
+        assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
+        assert_eq!(source_outcome, StatusRouteOutcome::Ok);
     }
 
     #[tokio::test]

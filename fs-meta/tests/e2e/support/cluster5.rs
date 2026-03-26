@@ -15,7 +15,7 @@ use fs_meta::{
     api::config::{ApiAuthConfig, BootstrapAdminConfig},
     RootSpec,
 };
-use fs_meta_deploy::{build_release_doc_value, FsMetaReleaseSpec};
+use fs_meta_deploy::{build_release_doc_value, write_startup_manifest, FsMetaReleaseSpec};
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde_json::{json, Value};
@@ -605,21 +605,35 @@ impl Cluster5 {
                 shell: "/bin/bash".to_string(),
             });
         }
+        let route_plan_node_ids = NODE_NAMES
+            .iter()
+            .map(|node_name| self.node_id(node_name))
+            .collect::<Result<Vec<_>, _>>()?;
         let spec = FsMetaReleaseSpec {
             app_id: app_id.to_string(),
             api_facade_resource_id: facade_resource_id.to_string(),
             auth,
             roots,
+            route_plan_node_ids,
             worker_module_path: Some(worker_module_path),
             worker_modes: Default::default(),
+        };
+        let manifest_path = {
+            let dir = tmp_dir("fsmeta-manifest");
+            let path = dir.join("fs-meta.yaml");
+            write_startup_manifest(
+                &repo_root().join("fs-meta/fixtures/manifests/fs-meta.yaml"),
+                &spec,
+                &path,
+            )
+            .map_err(|e| format!("write fs-meta startup manifest failed: {e}"))?;
+            path
         };
         let mut value = build_release_doc_value(&spec);
         value["target_generation"] = json!(generation);
         value["units"][0]["startup"]["path"] = json!(app_path.to_string_lossy().to_string());
-        value["units"][0]["startup"]["manifest"] = json!(repo_root()
-            .join("fs-meta/fixtures/manifests/fs-meta.yaml")
-            .display()
-            .to_string());
+        value["units"][0]["startup"]["manifest"] =
+            json!(manifest_path.display().to_string());
         value["units"][0]["version"] = json!(format!("real-nfs-{generation}"));
         value["units"][0]["restart_policy"] = json!("Never");
         value["units"][0]["policy"]["generation"] = json!(generation);

@@ -1,6 +1,6 @@
 use std::path::Path;
-use std::sync::Mutex as StdMutex;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -17,14 +17,14 @@ use futures_util::StreamExt;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::source::FSMetaSource;
-use crate::source::config::SourceConfig;
+use crate::FileMetaRecord;
 use crate::query::path::is_under_query_path;
 use crate::runtime::orchestration::{SourceControlSignal, source_control_signals_from_envelopes};
+use crate::source::FSMetaSource;
+use crate::source::config::SourceConfig;
 use crate::workers::source::SourceObservabilitySnapshot;
 use crate::workers::source::SourceWorkerRpc;
 use crate::workers::source_ipc::{SourceWorkerRequest, SourceWorkerResponse};
-use crate::FileMetaRecord;
 
 const ROUTE_KEY_EVENTS: &str = "fs-meta.events:v1";
 const SOURCE_WORKER_STOP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -113,6 +113,15 @@ fn debug_source_batch_flow_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_SOURCE_BATCH_FLOW").is_some()
 }
 
+fn debug_force_find_route_capture_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("FSMETA_DEBUG_FORCE_FIND_ROUTE_CAPTURE")
+            .ok()
+            .is_some_and(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
+    })
+}
+
 fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
     static TARGET: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     TARGET
@@ -124,6 +133,26 @@ fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
         .clone()
 }
 
+fn summarize_event_counts_by_origin(events: &[Event]) -> Vec<String> {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for event in events {
+        *counts
+            .entry(event.metadata().origin_id.0.clone())
+            .or_default() += 1;
+    }
+    counts
+        .into_iter()
+        .map(|(origin, count)| format!("{origin}={count}"))
+        .collect()
+}
+
+fn summarize_group_string_map(groups: &std::collections::BTreeMap<String, String>) -> Vec<String> {
+    groups
+        .iter()
+        .map(|(group, value)| format!("{group}={value}"))
+        .collect()
+}
+
 fn summarize_published_batch_path_counts(batch: &[Event], query_path: &[u8]) -> Vec<String> {
     let mut counts = std::collections::BTreeMap::<String, u64>::new();
     for event in batch {
@@ -131,7 +160,9 @@ fn summarize_published_batch_path_counts(batch: &[Event], query_path: &[u8]) -> 
             continue;
         };
         if is_under_query_path(&record.path, query_path) {
-            *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+            *counts
+                .entry(event.metadata().origin_id.0.clone())
+                .or_default() += 1;
         }
     }
     counts
@@ -198,7 +229,9 @@ fn summarize_source_control_signals(signals: &[SourceControlSignal]) -> Vec<Stri
 fn summarize_event_origins(events: &[Event]) -> Vec<String> {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for event in events {
-        *counts.entry(event.metadata().origin_id.0.clone()).or_default() += 1;
+        *counts
+            .entry(event.metadata().origin_id.0.clone())
+            .or_default() += 1;
     }
     counts
         .into_iter()
@@ -313,7 +346,10 @@ fn update_published_stats(
     guard.last_published_at_us = update.last_published_at_us;
     guard.last_published_origins = update.last_published_origins.clone();
     for (origin, count) in &update.published_origin_counts {
-        *guard.published_origin_counts.entry(origin.clone()).or_default() += *count;
+        *guard
+            .published_origin_counts
+            .entry(origin.clone())
+            .or_default() += *count;
     }
     for (origin, count) in &update.published_path_origin_counts {
         *guard
@@ -477,7 +513,10 @@ fn source_observability_snapshot(
             .flatten()
             .filter(|groups| !groups.is_empty())
             .map(|groups| {
-                std::collections::BTreeMap::from([(node_id.0.clone(), groups.into_iter().collect())])
+                std::collections::BTreeMap::from([(
+                    node_id.0.clone(),
+                    groups.into_iter().collect(),
+                )])
             })
             .unwrap_or_default(),
         scheduled_scan_groups_by_node: source
@@ -486,7 +525,10 @@ fn source_observability_snapshot(
             .flatten()
             .filter(|groups| !groups.is_empty())
             .map(|groups| {
-                std::collections::BTreeMap::from([(node_id.0.clone(), groups.into_iter().collect())])
+                std::collections::BTreeMap::from([(
+                    node_id.0.clone(),
+                    groups.into_iter().collect(),
+                )])
             })
             .unwrap_or_default(),
         last_control_frame_signals_by_node: last_control_frame_signals_by_node(
@@ -568,18 +610,20 @@ fn source_observability_snapshot(
                 )])
             })
             .unwrap_or_default(),
-        summarized_path_origin_counts_by_node: (!published.summarized_path_origin_counts.is_empty())
-            .then(|| {
-                std::collections::BTreeMap::from([(
-                    node_id.0.clone(),
-                    published
-                        .summarized_path_origin_counts
-                        .iter()
-                        .map(|(origin, count)| format!("{origin}={count}"))
-                        .collect::<Vec<_>>(),
-                )])
-            })
-            .unwrap_or_default(),
+        summarized_path_origin_counts_by_node: (!published
+            .summarized_path_origin_counts
+            .is_empty())
+        .then(|| {
+            std::collections::BTreeMap::from([(
+                node_id.0.clone(),
+                published
+                    .summarized_path_origin_counts
+                    .iter()
+                    .map(|(origin, count)| format!("{origin}={count}"))
+                    .collect::<Vec<_>>(),
+            )])
+        })
+        .unwrap_or_default(),
         published_path_origin_counts_by_node: (!published.published_path_origin_counts.is_empty())
             .then(|| {
                 std::collections::BTreeMap::from([(
@@ -821,15 +865,52 @@ fn plan_worker_request(
             ),
         },
         SourceWorkerRequest::ForceFind { request } => match state.source.as_ref() {
-            Some(source) => match source.force_find(&request) {
-                Ok(events) => {
-                    SourceWorkerAction::Immediate(SourceWorkerResponse::Events(events), false)
+            Some(source) => {
+                if debug_force_find_route_capture_enabled() {
+                    eprintln!(
+                        "fs_meta_source_worker_server: force_find begin node={} selected_group={:?} recursive={} max_depth={:?} path={}",
+                        source.node_id().0,
+                        request.scope.selected_group,
+                        request.scope.recursive,
+                        request.scope.max_depth,
+                        String::from_utf8_lossy(&request.scope.path)
+                    );
                 }
-                Err(err) => SourceWorkerAction::Immediate(
-                    SourceWorkerResponse::Error(err.to_string()),
-                    false,
-                ),
-            },
+                match source.force_find(&request) {
+                    Ok(events) => {
+                        if debug_force_find_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_source_worker_server: force_find done node={} events={} origins={:?} last_runner={:?} inflight={:?}",
+                                source.node_id().0,
+                                events.len(),
+                                summarize_event_counts_by_origin(&events),
+                                summarize_group_string_map(
+                                    &source.last_force_find_runner_by_group_snapshot()
+                                ),
+                                source.force_find_inflight_groups_snapshot()
+                            );
+                        }
+                        SourceWorkerAction::Immediate(SourceWorkerResponse::Events(events), false)
+                    }
+                    Err(err) => {
+                        if debug_force_find_route_capture_enabled() {
+                            eprintln!(
+                                "fs_meta_source_worker_server: force_find failed node={} err={} last_runner={:?} inflight={:?}",
+                                source.node_id().0,
+                                err,
+                                summarize_group_string_map(
+                                    &source.last_force_find_runner_by_group_snapshot()
+                                ),
+                                source.force_find_inflight_groups_snapshot()
+                            );
+                        }
+                        SourceWorkerAction::Immediate(
+                            SourceWorkerResponse::Error(err.to_string()),
+                            false,
+                        )
+                    }
+                }
+            }
             None => SourceWorkerAction::Immediate(
                 SourceWorkerResponse::Error("worker not initialized".into()),
                 false,
@@ -1179,9 +1260,14 @@ mod tests {
             update_published_stats(&published_stats, &update);
 
             let guard = lock_publish_stats(&published_stats);
-            let ready = ["node-a::nfs1", "node-a::nfs2"]
-                .iter()
-                .all(|origin| guard.published_path_origin_counts.get(*origin).copied().unwrap_or(0) > 0);
+            let ready = ["node-a::nfs1", "node-a::nfs2"].iter().all(|origin| {
+                guard
+                    .published_path_origin_counts
+                    .get(*origin)
+                    .copied()
+                    .unwrap_or(0)
+                    > 0
+            });
             drop(guard);
             if ready {
                 break;
