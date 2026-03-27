@@ -637,7 +637,10 @@ fn run_activation_scope_capture_force_find_preserved_pre_force_find() -> Result<
                 &node_a_nfs2_object_ref,
             )?;
             if nfs1_nodes > 0
-                && nfs2_nodes == 0
+                && nfs2_nodes > 0
+                && nfs2_selected_root_exists
+                && nfs2_selected_root_has_force_find
+                && nfs2_selected_force_find_exists
                 && node_a_sink.contains("nfs2")
                 && !node_a_source_control.is_empty()
                 && !node_a_sink_control.is_empty()
@@ -1108,15 +1111,15 @@ fn scenario_sink_failover(
     session: &mut OperatorSession,
     app_id: &str,
 ) -> Result<(), String> {
-    let holder = current_sink_holder(cluster, app_id)?
+    let before = current_sink_failover_holder_snapshot(cluster, app_id)?
         .ok_or_else(|| "no current sink holder to fail over".to_string())?;
-    let pids = cluster.unit_active_pids_for_instance(&holder, app_id, "runtime.exec.sink")?;
-    let pid = pids
+    let pid = before
+        .active_pids
         .iter()
         .next()
         .copied()
-        .ok_or_else(|| format!("no sink pid found on holder {holder}"))?;
-    cluster.kill_pid(pid)?;
+        .ok_or_else(|| format!("no sink pid found on holder {}", before.node_name))?;
+    cluster.kill_pid(&before.node_name, pid)?;
 
     wait_until(
         Duration::from_secs(90),
@@ -1127,9 +1130,9 @@ fn scenario_sink_failover(
         },
     )?;
 
-    wait_until(Duration::from_secs(90), "new sink holder elected", || {
-        let next = current_sink_holder(cluster, app_id)?;
-        Ok(next.is_some() && next != Some(holder.clone()))
+    wait_until(Duration::from_secs(90), "new scoped sink holder elected", || {
+        let next = current_sink_failover_holder_snapshot(cluster, app_id)?;
+        Ok(sink_failover_successor_elected(&before, next.as_ref()))
     })?;
     Ok(())
 }
@@ -1317,9 +1320,7 @@ fn current_roots_payload(session: &mut OperatorSession) -> Result<Value, String>
     Ok(current.get("roots").cloned().unwrap_or_else(|| json!([])))
 }
 
-fn current_sink_holder(cluster: &Cluster5, app_id: &str) -> Result<Option<String>, String> {
-    current_sink_holder_for_scope(cluster, app_id, None)
-}
+const SINK_FAILOVER_GROUP_ID: &str = "nfs2";
 
 fn current_sink_holder_for_group(
     cluster: &Cluster5,
@@ -1343,14 +1344,7 @@ fn current_sink_holder_for_scope(
 ) -> Result<Option<String>, String> {
     let mut snapshots = Vec::new();
     for node_name in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
-        let pids = cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.sink")?;
-        let bound_scopes =
-            unit_bound_scope_ids_from_activation_status(cluster, node_name, "runtime.exec.sink")?;
-        snapshots.push(SinkHolderSnapshot {
-            node_name: node_name.to_string(),
-            active_pids: pids,
-            bound_scopes,
-        });
+        snapshots.push(sink_holder_snapshot_for_node(cluster, node_name, app_id)?);
     }
     unique_sink_holder_from_snapshots(&snapshots, group_id)
 }
@@ -1379,6 +1373,144 @@ fn unique_sink_holder_from_snapshots(
         ));
     }
     Ok(holders.into_iter().next())
+}
+
+fn unique_sink_failover_holder_from_snapshots(
+    snapshots: &[SinkHolderSnapshot],
+) -> Result<Option<String>, String> {
+    unique_sink_holder_from_snapshots(snapshots, Some(SINK_FAILOVER_GROUP_ID))
+}
+
+fn unique_sink_holder_snapshot_from_snapshots(
+    snapshots: &[SinkHolderSnapshot],
+    group_id: Option<&str>,
+) -> Result<Option<SinkHolderSnapshot>, String> {
+    let holder = unique_sink_holder_from_snapshots(snapshots, group_id)?;
+    Ok(holder.and_then(|node_name| {
+        snapshots
+            .iter()
+            .find(|snapshot| snapshot.node_name == node_name)
+            .cloned()
+    }))
+}
+
+fn current_sink_failover_holder_snapshot(
+    cluster: &Cluster5,
+    app_id: &str,
+) -> Result<Option<SinkHolderSnapshot>, String> {
+    let mut snapshots = Vec::new();
+    for node_name in ["node-a", "node-b", "node-c", "node-d", "node-e"] {
+        snapshots.push(sink_holder_snapshot_for_node(cluster, node_name, app_id)?);
+    }
+    unique_sink_holder_snapshot_from_snapshots(&snapshots, Some(SINK_FAILOVER_GROUP_ID))
+}
+
+fn sink_holder_snapshot_for_node(
+    cluster: &Cluster5,
+    node_name: &str,
+    app_id: &str,
+) -> Result<SinkHolderSnapshot, String> {
+    let status = cluster.status(node_name)?;
+    Ok(sink_holder_snapshot_from_status(&status, app_id, node_name))
+}
+
+fn sink_holder_snapshot_from_status(
+    status: &Value,
+    instance_id: &str,
+    node_name: &str,
+) -> SinkHolderSnapshot {
+    let managed_pids = status
+        .get("daemon")
+        .and_then(|v| v.get("managed_processes"))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter(|row| row.get("instance_id").and_then(Value::as_str) == Some(instance_id))
+                .filter_map(|row| row.get("pid").and_then(Value::as_u64).map(|v| v as u32))
+                .collect::<BTreeSet<_>>()
+        })
+        .unwrap_or_default();
+    let routes = status
+        .get("daemon")
+        .and_then(|v| v.get("activation"))
+        .and_then(|v| v.get("routes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut active_pids = BTreeSet::new();
+    let mut bound_scopes = BTreeSet::new();
+    for route in routes {
+        let Some(apps) = route.get("apps").and_then(Value::as_array) else {
+            continue;
+        };
+        let route_active_pids = route
+            .get("active_pids")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| row.as_u64().map(|v| v as u32))
+                    .filter(|pid| managed_pids.contains(pid))
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default();
+        let mut route_has_delivered_sink_activation = false;
+        for row in apps {
+            let active_unit = row
+                .get("unit_ids")
+                .and_then(Value::as_array)
+                .is_some_and(|units| units.iter().any(|v| v.as_str() == Some("runtime.exec.sink")));
+            if !active_unit {
+                continue;
+            }
+            if row.get("delivered").and_then(Value::as_bool) != Some(true) {
+                continue;
+            }
+            if row.get("gate").and_then(Value::as_str) != Some("activated") {
+                continue;
+            }
+            if row.get("op").and_then(Value::as_str) != Some("activate") {
+                continue;
+            }
+            route_has_delivered_sink_activation = true;
+            if let Some(scopes) = row
+                .get("bound_scopes_by_unit")
+                .and_then(|v| v.get("runtime.exec.sink"))
+                .and_then(Value::as_array)
+            {
+                for scope in scopes {
+                    if let Some(scope_id) = scope.get("scope_id").and_then(Value::as_str) {
+                        if !scope_id.trim().is_empty() {
+                            bound_scopes.insert(scope_id.to_string());
+                        }
+                    }
+                }
+            }
+            if let Some(pid) = row.get("pid").and_then(Value::as_u64).map(|v| v as u32) {
+                if managed_pids.contains(&pid) {
+                    active_pids.insert(pid);
+                }
+            }
+        }
+        if route_has_delivered_sink_activation {
+            active_pids.extend(route_active_pids);
+        }
+    }
+    SinkHolderSnapshot {
+        node_name: node_name.to_string(),
+        active_pids,
+        bound_scopes,
+    }
+}
+
+fn sink_failover_successor_elected(
+    before: &SinkHolderSnapshot,
+    after: Option<&SinkHolderSnapshot>,
+) -> bool {
+    matches!(
+        after,
+        Some(after)
+            if after.node_name != before.node_name || after.active_pids != before.active_pids
+    )
 }
 
 fn current_facade_holders(cluster: &Cluster5, app_id: &str) -> Result<Vec<(String, u32)>, String> {
@@ -2108,4 +2240,138 @@ fn sink_holder_selection_ignores_nodes_without_target_scope() {
         unique_sink_holder_from_snapshots(&snapshots, Some("nfs2")).expect("nfs2 holder"),
         Some("node-a".to_string())
     );
+}
+
+#[test]
+fn sink_failover_holder_selection_is_scoped_to_failover_group() {
+    let before = vec![
+        SinkHolderSnapshot {
+            node_name: "node-a".to_string(),
+            active_pids: BTreeSet::from([1]),
+            bound_scopes: BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+        },
+        SinkHolderSnapshot {
+            node_name: "node-b".to_string(),
+            active_pids: BTreeSet::from([2]),
+            bound_scopes: BTreeSet::from(["nfs3".to_string()]),
+        },
+    ];
+    assert_eq!(
+        unique_sink_failover_holder_from_snapshots(&before).expect("initial holder"),
+        Some("node-a".to_string())
+    );
+
+    let after = vec![
+        SinkHolderSnapshot {
+            node_name: "node-b".to_string(),
+            active_pids: BTreeSet::from([2]),
+            bound_scopes: BTreeSet::from(["nfs3".to_string()]),
+        },
+        SinkHolderSnapshot {
+            node_name: "node-c".to_string(),
+            active_pids: BTreeSet::from([3]),
+            bound_scopes: BTreeSet::from(["nfs2".to_string()]),
+        },
+    ];
+    assert_eq!(
+        unique_sink_failover_holder_from_snapshots(&after).expect("successor holder"),
+        Some("node-c".to_string())
+    );
+}
+
+#[test]
+fn sink_failover_successor_election_accepts_same_node_with_new_pid_set() {
+    let before = SinkHolderSnapshot {
+        node_name: "node-a".to_string(),
+        active_pids: BTreeSet::from([1]),
+        bound_scopes: BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+    };
+    let after = SinkHolderSnapshot {
+        node_name: "node-a".to_string(),
+        active_pids: BTreeSet::from([9]),
+        bound_scopes: BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+    };
+
+    assert!(
+        sink_failover_successor_elected(&before, Some(&after)),
+        "same-node restarted sink should count as successor"
+    );
+}
+
+#[test]
+fn sink_holder_snapshot_ignores_undelivered_route_level_active_pids() {
+    let status = json!({
+        "daemon": {
+            "managed_processes": [
+                { "instance_id": "app-1", "pid": 1 }
+            ],
+            "activation": {
+                "routes": [
+                    {
+                        "route_key": "sink-status:v1.req",
+                        "active_pids": [1],
+                        "apps": [
+                            {
+                                "unit_ids": ["runtime.exec.sink"],
+                                "bound_scopes_by_unit": {
+                                    "runtime.exec.sink": [
+                                        { "scope_id": "nfs2" }
+                                    ]
+                                },
+                                "delivered": false,
+                                "gate": "runtime_exposure_confirmed",
+                                "op": "activate"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    });
+
+    let snapshot = sink_holder_snapshot_from_status(&status, "app-1", "node-a");
+    assert!(
+        snapshot.active_pids.is_empty(),
+        "pending sink activation must not count as a live holder: {snapshot:?}"
+    );
+    assert!(
+        snapshot.bound_scopes.is_empty(),
+        "pending sink activation must not contribute live holder scopes: {snapshot:?}"
+    );
+}
+
+#[test]
+fn sink_holder_snapshot_accepts_delivered_route_level_active_pids() {
+    let status = json!({
+        "daemon": {
+            "managed_processes": [
+                { "instance_id": "app-1", "pid": 1 }
+            ],
+            "activation": {
+                "routes": [
+                    {
+                        "route_key": "sink-status:v1.req",
+                        "active_pids": [1],
+                        "apps": [
+                            {
+                                "unit_ids": ["runtime.exec.sink"],
+                                "bound_scopes_by_unit": {
+                                    "runtime.exec.sink": [
+                                        { "scope_id": "nfs2" }
+                                    ]
+                                },
+                                "delivered": true,
+                                "gate": "activated",
+                                "op": "activate"
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+    });
+
+    let snapshot = sink_holder_snapshot_from_status(&status, "app-1", "node-a");
+    assert_eq!(snapshot.active_pids, BTreeSet::from([1]));
+    assert_eq!(snapshot.bound_scopes, BTreeSet::from(["nfs2".to_string()]));
 }

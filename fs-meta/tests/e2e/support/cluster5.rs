@@ -147,6 +147,16 @@ pub struct Cluster5 {
     capanixd_bin: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedPidKillTransport {
+    HostKill,
+    NodeLocalProcessKill,
+}
+
+fn managed_pid_kill_transport() -> ManagedPidKillTransport {
+    ManagedPidKillTransport::NodeLocalProcessKill
+}
+
 impl Cluster5 {
     pub fn start() -> Result<Self, String> {
         let _guard = cluster_lock();
@@ -698,15 +708,32 @@ impl Cluster5 {
         self.unit_active_pids_for_instance(node_name, instance_id, "runtime.exec.facade")
     }
 
-    pub fn kill_pid(&self, pid: u32) -> Result<(), String> {
-        let status = Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status()
-            .map_err(|e| format!("kill -9 {pid} failed to start: {e}"))?;
-        if !status.success() {
-            return Err(format!("kill -9 {pid} failed with status {status}"));
+    pub fn kill_pid(&self, node_name: &str, pid: u32) -> Result<(), String> {
+        let node = self.node(node_name)?;
+        match managed_pid_kill_transport() {
+            ManagedPidKillTransport::HostKill => {
+                let status = Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .status()
+                    .map_err(|e| format!("kill -9 {pid} failed to start: {e}"))?;
+                if !status.success() {
+                    return Err(format!("kill -9 {pid} failed with status {status}"));
+                }
+                Ok(())
+            }
+            ManagedPidKillTransport::NodeLocalProcessKill => {
+                let cnxctl_bin = try_find_cnxctl_bin().ok_or_else(|| {
+                    "cnxctl binary not found; build capanix-cli or set CNXCTL_BIN".to_string()
+                })?;
+                let pid_arg = pid.to_string();
+                run_cnxctl_json_slice(
+                    &cnxctl_bin,
+                    &node.socket_path,
+                    &["process", "kill", pid_arg.as_str()],
+                )?;
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     pub fn runtime_target_state(&self, node_name: &str) -> Result<Value, String> {
@@ -992,6 +1019,14 @@ fn run_cnxctl_json<const N: usize>(
     cnxctl_bin: &Path,
     socket_path: &Path,
     args: [&str; N],
+) -> Result<Value, String> {
+    run_cnxctl_json_slice(cnxctl_bin, socket_path, &args)
+}
+
+fn run_cnxctl_json_slice(
+    cnxctl_bin: &Path,
+    socket_path: &Path,
+    args: &[&str],
 ) -> Result<Value, String> {
     let output = Command::new(cnxctl_bin)
         .arg("-s")
@@ -1950,6 +1985,14 @@ fn next_auth_seq_global() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_runtime_pids_use_node_local_process_kill_transport() {
+        assert_eq!(
+            managed_pid_kill_transport(),
+            ManagedPidKillTransport::NodeLocalProcessKill
+        );
+    }
 
     #[test]
     fn unit_active_pids_surfaces_route_level_active_pids_for_managed_instance() {

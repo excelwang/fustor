@@ -11,8 +11,11 @@ use capanix_app_sdk::runtime::{
 };
 use capanix_runtime_entry_sdk::advanced::boundary::{BoundaryContext, StateBoundary};
 
+use crate::source::config::RootSpec;
+
 const AUTHORITY_JOURNAL_MAX_ENTRIES: usize = 4_096;
 const AUTHORITY_SCHEMA_REV: u64 = 1;
+const LOGICAL_ROOTS_SCHEMA_REV: u64 = 1;
 const SIGNAL_SCHEMA_REV: u64 = 1;
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -65,6 +68,14 @@ fn signal_handle(scope: &str, signal: &str) -> StateCellHandle {
     StateCellHandle {
         cell_id: format!("fs-meta.signal.{signal}.{scope}"),
         schema_rev: SIGNAL_SCHEMA_REV,
+        state_class: StateClass::Authoritative,
+    }
+}
+
+fn logical_roots_handle(scope: &str) -> StateCellHandle {
+    StateCellHandle {
+        cell_id: format!("fs-meta.logical-roots.{scope}"),
+        schema_rev: LOGICAL_ROOTS_SCHEMA_REV,
         state_class: StateClass::Authoritative,
     }
 }
@@ -159,6 +170,31 @@ struct SignalWatchReply {
 #[derive(Debug, serde::Deserialize)]
 struct SignalWatchUpdate {
     payload_b64: String,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct LogicalRootsSnapshot {
+    scope: String,
+    seq: u64,
+    roots: Vec<RootSpec>,
+}
+
+impl LogicalRootsSnapshot {
+    fn new(scope: &str, roots: Vec<RootSpec>) -> Self {
+        Self {
+            scope: scope.to_string(),
+            seq: 1,
+            roots,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct LogicalRootsCell {
+    scope: Arc<str>,
+    handle: StateCellHandle,
+    state_boundary: Arc<dyn StateBoundary>,
+    state: Arc<Mutex<LogicalRootsSnapshot>>,
 }
 
 impl SignalCell {
@@ -308,6 +344,149 @@ impl SignalCell {
         }
         Ok((payload.next_offset, events))
     }
+}
+
+impl LogicalRootsCell {
+    pub(crate) fn from_state_boundary(
+        scope: &str,
+        initial_roots: Vec<RootSpec>,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> std::io::Result<Self> {
+        let handle = logical_roots_handle(scope);
+        let loaded = match statecell_read_blocking(
+            &state_boundary,
+            scope,
+            StateCellReadRequest {
+                handle: handle.clone(),
+            },
+        ) {
+            Ok(resp) => {
+                if resp.status != "ok" {
+                    return Err(std::io::Error::other(format!(
+                        "statecell_read failed for logical roots scope={scope}: status={}",
+                        resp.status
+                    )));
+                }
+                if resp.payload.is_empty() {
+                    let snapshot = LogicalRootsSnapshot::new(scope, initial_roots);
+                    write_logical_roots_snapshot_blocking(
+                        &state_boundary,
+                        scope,
+                        &handle,
+                        &snapshot,
+                    )?;
+                    snapshot
+                } else {
+                    let decoded: LogicalRootsSnapshot =
+                        rmp_serde::from_slice(&resp.payload).map_err(|err| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("decode logical roots snapshot failed: {err}"),
+                            )
+                        })?;
+                    if decoded.scope != scope {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "logical roots snapshot scope mismatch: expected {scope}, got {}",
+                                decoded.scope
+                            ),
+                        ));
+                    }
+                    decoded
+                }
+            }
+            Err(err) if is_statecell_not_found(&err) => {
+                let snapshot = LogicalRootsSnapshot::new(scope, initial_roots);
+                write_logical_roots_snapshot_blocking(&state_boundary, scope, &handle, &snapshot)?;
+                snapshot
+            }
+            Err(err) => {
+                return Err(std::io::Error::other(format!(
+                    "statecell_read failed for logical roots scope={scope}: {err}"
+                )));
+            }
+        };
+        Ok(Self {
+            scope: Arc::<str>::from(scope),
+            handle,
+            state_boundary,
+            state: Arc::new(Mutex::new(loaded)),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> Vec<RootSpec> {
+        match self.state.lock() {
+            Ok(state) => state.roots.clone(),
+            Err(poisoned) => poisoned.into_inner().roots.clone(),
+        }
+    }
+
+    pub(crate) async fn replace(&self, roots: Vec<RootSpec>) -> Result<(), CnxError> {
+        let (payload, lease_epoch) = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| CnxError::Internal("logical roots state lock poisoned".into()))?;
+            state.seq = state.seq.wrapping_add(1);
+            state.roots = roots;
+            let payload = rmp_serde::to_vec_named(&*state).map_err(|err| {
+                CnxError::Internal(format!("encode logical roots snapshot failed: {err}"))
+            })?;
+            (payload, state.seq)
+        };
+        let result = self
+            .state_boundary
+            .statecell_write(
+                local_state_boundary_bridge(&self.scope),
+                StateCellWriteRequest {
+                    handle: self.handle.clone(),
+                    payload,
+                    lease_epoch: Some(lease_epoch),
+                },
+            )
+            .await?;
+        if result.status != "committed" && result.status != "ok" {
+            return Err(CnxError::Internal(format!(
+                "statecell_write returned non-committed status for logical roots scope={}: {}",
+                self.scope, result.status
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn write_logical_roots_snapshot_blocking(
+    state_boundary: &Arc<dyn StateBoundary>,
+    scope: &str,
+    handle: &StateCellHandle,
+    snapshot: &LogicalRootsSnapshot,
+) -> std::io::Result<()> {
+    let payload = rmp_serde::to_vec_named(snapshot).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("encode logical roots snapshot failed: {err}"),
+        )
+    })?;
+    let result = statecell_write_blocking(
+        state_boundary,
+        scope,
+        StateCellWriteRequest {
+            handle: handle.clone(),
+            payload,
+            lease_epoch: Some(snapshot.seq),
+        },
+    )
+    .map_err(|err| std::io::Error::other(format!(
+        "statecell_write failed for logical roots scope={scope}: {err}"
+    )))?;
+    if result.status != "committed" && result.status != "ok" {
+        return Err(std::io::Error::other(format!(
+            "statecell_write returned non-committed status for logical roots scope={scope}: {}",
+            result.status
+        )));
+    }
+    Ok(())
 }
 
 impl AuthorityJournal {

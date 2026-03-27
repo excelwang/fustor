@@ -14,8 +14,9 @@ use fs_meta::product_model::execution_units::{
 use fs_meta::product_model::routes::{
     ROUTE_KEY_EVENTS, ROUTE_KEY_FACADE_CONTROL, ROUTE_KEY_FORCE_FIND, ROUTE_KEY_QUERY,
     ROUTE_KEY_SINK_QUERY_INTERNAL, ROUTE_KEY_SINK_QUERY_PROXY, ROUTE_KEY_SINK_STATUS_INTERNAL,
-    ROUTE_KEY_SOURCE_FIND_INTERNAL, ROUTE_KEY_SOURCE_RESCAN_CONTROL,
-    ROUTE_KEY_SOURCE_RESCAN_INTERNAL, ROUTE_KEY_SOURCE_STATUS_INTERNAL,
+    ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_FIND_INTERNAL,
+    ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+    ROUTE_KEY_SOURCE_ROOTS_CONTROL, ROUTE_KEY_SOURCE_STATUS_INTERNAL,
     sink_query_request_route_for, sink_query_route_key_for,
 };
 
@@ -363,6 +364,8 @@ fn build_route_plans_json(_spec: &FsMetaReleaseSpec) -> Vec<serde_json::Value> {
         );
     };
     push_plan(RouteKey(format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)));
+    push_plan(RouteKey(format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL)));
+    push_plan(RouteKey(format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL)));
     push_plan(RouteKey(format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)));
     for node_id in _spec.route_plan_node_ids.iter().cloned().collect::<std::collections::BTreeSet<_>>() {
         push_plan(sink_query_request_route_for(&node_id));
@@ -399,6 +402,14 @@ fn build_route_units_json(spec: &FsMetaReleaseSpec) -> serde_json::Value {
     route_units.insert(
         stream_activation_route_key(ROUTE_KEY_SOURCE_RESCAN_CONTROL),
         serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+    );
+    route_units.insert(
+        stream_activation_route_key(ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+        serde_json::json!([SOURCE_RUNTIME_UNIT_ID]),
+    );
+    route_units.insert(
+        stream_activation_route_key(ROUTE_KEY_SINK_ROOTS_CONTROL),
+        serde_json::json!([SINK_RUNTIME_UNIT_ID]),
     );
     route_units.insert(
         request_reply_activation_route_key(ROUTE_KEY_QUERY),
@@ -633,6 +644,34 @@ mod tests {
     }
 
     #[test]
+    fn route_plans_include_internal_logical_roots_control_streams() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let plans = build_route_plans_json(&spec);
+        for expected_route in [
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+        ] {
+            let has_route = plans.iter().any(|plan| {
+                plan.get("route_key").and_then(serde_json::Value::as_str)
+                    == Some(expected_route.as_str())
+            });
+            assert!(
+                has_route,
+                "release route_plans must include internal logical-roots control stream {expected_route}"
+            );
+        }
+    }
+
+    #[test]
     fn route_units_include_owner_scoped_internal_sink_query_for_known_nodes() {
         let spec = FsMetaReleaseSpec {
             app_id: "test-app".to_string(),
@@ -664,6 +703,63 @@ mod tests {
             assert!(
                 scoped_units.is_some(),
                 "release route_units must include owner-scoped internal sink-query route {expected_route} when runtime node ids are known"
+            );
+        }
+    }
+
+    #[test]
+    fn route_units_include_internal_logical_roots_control_streams() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let route_units = release_doc["units"][0]["runtime"]["route_units"]
+            .as_object()
+            .expect("route_units object");
+
+        for expected_route in [
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+        ] {
+            assert!(
+                route_units.contains_key(&expected_route),
+                "release route_units must include internal logical-roots control stream {expected_route}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_manifest_activation_routes_cover_internal_logical_roots_control_streams() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: Vec::new(),
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let manifest_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../fixtures/manifests/fs-meta.yaml");
+        let manifest = build_startup_manifest_value(&manifest_path, &spec)
+            .expect("load startup manifest");
+        let activation_routes = activation_routes_from_manifest(&manifest);
+
+        for expected_route in [
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+        ] {
+            assert!(
+                activation_routes.contains(&expected_route),
+                "startup manifest activation routes must cover internal logical-roots control stream {expected_route}"
             );
         }
     }

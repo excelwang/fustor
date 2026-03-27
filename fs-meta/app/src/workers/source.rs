@@ -29,10 +29,51 @@ const SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_FORCE_FIND_TIMEOUT: Duration = Duration::from_secs(60);
 const SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT: Duration = Duration::from_secs(30);
 const SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
+const SOURCE_WORKER_CLOSE_DRAIN_TIMEOUT: Duration = SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
+const SOURCE_WORKER_CLOSE_DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const SOURCE_WORKER_OBSERVABILITY_RPC_TIMEOUT: Duration = Duration::from_secs(5);
 const SOURCE_WORKER_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 const SOURCE_WORKER_DEGRADED_STATE: &str = "degraded_worker_unreachable";
 const SOURCE_WORKER_DEGRADED_ROOT_KEY: &str = "source-worker";
+
+fn can_use_cached_host_object_grants_snapshot(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::PeerError(message) if message == "worker not initialized"
+    ) || matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
+        || matches!(
+            err,
+            CnxError::AccessDenied(message) | CnxError::PeerError(message)
+                if message.contains("drained/fenced")
+                    && message.contains("grant attachments")
+        )
+}
+
+fn can_use_cached_logical_roots_snapshot(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::PeerError(message) if message == "worker not initialized"
+    ) || matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
+        || matches!(
+            err,
+            CnxError::AccessDenied(message) | CnxError::PeerError(message)
+                if message.contains("drained/fenced")
+                    && message.contains("grant attachments")
+        )
+}
+
+fn can_retry_update_logical_roots(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::PeerError(message) if message == "worker not initialized"
+    ) || matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
+        || matches!(
+            err,
+            CnxError::AccessDenied(message) | CnxError::PeerError(message)
+                if message.contains("drained/fenced")
+                    && message.contains("grant attachments")
+        )
+}
 
 fn debug_control_scope_capture_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
@@ -236,6 +277,7 @@ pub struct SourceWorkerClientHandle {
     worker: Arc<TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>>,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
     control_ops_inflight: Arc<AtomicUsize>,
+    control_ops_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 struct InflightControlOpGuard {
@@ -252,6 +294,7 @@ struct SharedSourceWorkerHandleState {
     worker: Arc<TypedRuntimeWorkerClient<SourceWorkerRpc, SourceConfig>>,
     cache: Arc<Mutex<SourceWorkerSnapshotCache>>,
     control_ops_inflight: Arc<AtomicUsize>,
+    control_ops_serial: Arc<tokio::sync::Mutex<()>>,
 }
 
 fn source_worker_handle_registry_key(
@@ -300,6 +343,235 @@ fn lock_source_worker_handle_registry() -> std::sync::MutexGuard<
     }
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SourceWorkerCloseHook {
+    pub entered: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SourceWorkerUpdateRootsHook {
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+pub(crate) struct SourceWorkerUpdateRootsErrorHook {
+    pub err: CnxError,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SourceWorkerControlFrameHook {
+    pub entered: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct SourceWorkerControlFramePauseHook {
+    pub entered: Arc<tokio::sync::Notify>,
+    pub release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+fn source_worker_close_hook_cell() -> &'static Mutex<Option<SourceWorkerCloseHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerCloseHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_update_roots_hook_cell() -> &'static Mutex<Option<SourceWorkerUpdateRootsHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerUpdateRootsHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_control_frame_hook_cell() -> &'static Mutex<Option<SourceWorkerControlFrameHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerControlFrameHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_control_frame_pause_hook_cell(
+) -> &'static Mutex<Option<SourceWorkerControlFramePauseHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerControlFramePauseHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_update_roots_error_hook_cell(
+) -> &'static Mutex<Option<SourceWorkerUpdateRootsErrorHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerUpdateRootsErrorHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_close_hook(hook: SourceWorkerCloseHook) {
+    let mut guard = match source_worker_close_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_control_frame_hook(hook: SourceWorkerControlFrameHook) {
+    let mut guard = match source_worker_control_frame_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_control_frame_pause_hook(
+    hook: SourceWorkerControlFramePauseHook,
+) {
+    let mut guard = match source_worker_control_frame_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_control_frame_hook() {
+    let mut guard = match source_worker_control_frame_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_control_frame_pause_hook() {
+    let mut guard = match source_worker_control_frame_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_close_hook() {
+    let mut guard = match source_worker_close_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_update_roots_hook(hook: SourceWorkerUpdateRootsHook) {
+    let mut guard = match source_worker_update_roots_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_update_roots_hook() {
+    let mut guard = match source_worker_update_roots_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn install_source_worker_update_roots_error_hook(
+    hook: SourceWorkerUpdateRootsErrorHook,
+) {
+    let mut guard = match source_worker_update_roots_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_update_roots_error_hook() {
+    let mut guard = match source_worker_update_roots_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn notify_source_worker_control_frame_started() {
+    let hook = {
+        let guard = match source_worker_control_frame_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+async fn maybe_pause_before_on_control_frame_rpc() {
+    let hook = {
+        let mut guard = match source_worker_control_frame_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.take()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+        hook.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn notify_source_worker_close_started() {
+    let hook = {
+        let guard = match source_worker_close_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+    }
+}
+
+#[cfg(test)]
+async fn maybe_pause_before_update_logical_roots_rpc() {
+    let hook = {
+        let mut guard = match source_worker_update_roots_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.take()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+        hook.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn take_update_logical_roots_error_hook() -> Option<CnxError> {
+    let mut guard = match source_worker_update_roots_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.take().map(|hook| hook.err)
+}
+
 impl SourceWorkerClientHandle {
     pub(crate) fn new(
         node_id: NodeId,
@@ -325,6 +597,7 @@ impl SourceWorkerClientHandle {
                         ..SourceWorkerSnapshotCache::default()
                     })),
                     control_ops_inflight: Arc::new(AtomicUsize::new(0)),
+                    control_ops_serial: Arc::new(tokio::sync::Mutex::new(())),
                 });
                 registry.insert(key, Arc::downgrade(&shared));
                 shared
@@ -338,6 +611,7 @@ impl SourceWorkerClientHandle {
             worker_binding,
             cache: shared.cache.clone(),
             control_ops_inflight: shared.control_ops_inflight.clone(),
+            control_ops_serial: shared.control_ops_serial.clone(),
             config,
         })
     }
@@ -351,6 +625,13 @@ impl SourceWorkerClientHandle {
 
     fn control_op_inflight(&self) -> bool {
         self.control_ops_inflight.load(Ordering::Relaxed) > 0
+    }
+
+    async fn wait_for_control_ops_to_drain(&self, timeout: Duration) {
+        let deadline = tokio::time::Instant::now() + timeout;
+        while self.control_op_inflight() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(SOURCE_WORKER_CLOSE_DRAIN_POLL_INTERVAL).await;
+        }
     }
 
     fn with_cache_mut<T>(&self, f: impl FnOnce(&mut SourceWorkerSnapshotCache) -> T) -> T {
@@ -485,69 +766,73 @@ impl SourceWorkerClientHandle {
 
     pub async fn update_logical_roots(&self, roots: Vec<RootSpec>) -> Result<()> {
         let _inflight = self.begin_control_op();
+        let _serial = self.control_ops_serial.lock().await;
         eprintln!(
             "fs_meta_source_worker_client: update_logical_roots begin node={} roots={}",
             self.node_id.0,
             roots.len()
         );
-        self.with_started_retry(|client| {
-            let roots = roots.clone();
-            async move {
-                let deadline = std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
-                loop {
-                    let attempt_timeout = std::cmp::min(
-                        SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
-                        deadline.saturating_duration_since(std::time::Instant::now()),
-                    );
-                    if attempt_timeout.is_zero() {
-                        return Err(CnxError::Timeout);
-                    }
-                    match Self::call_worker(
-                        &client,
-                        SourceWorkerRequest::UpdateLogicalRoots {
-                            roots: roots.clone(),
-                        },
-                        attempt_timeout,
-                    )
-                    .await
-                    {
-                        Ok(SourceWorkerResponse::Ack) => {
-                            self.with_cache_mut(|cache| {
-                                cache.logical_roots = Some(roots.clone());
-                            });
-                            eprintln!(
-                                "fs_meta_source_worker_client: update_logical_roots ok node={} roots={}",
-                                self.node_id.0,
-                                roots.len()
-                            );
-                            return Ok(());
-                        }
-                        Err(CnxError::PeerError(message))
-                            if message == "worker not initialized"
-                                && std::time::Instant::now() < deadline =>
-                        {
-                            tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
-                        }
-                        Err(CnxError::InvalidInput(message)) => {
-                            return Err(CnxError::InvalidInput(message));
-                        }
-                        Ok(other) => {
-                            return Err(CnxError::ProtocolViolation(format!(
-                                "unexpected source worker response for update roots: {:?}",
-                                other
-                            )));
-                        }
-                        Err(CnxError::Timeout) | Err(CnxError::TransportClosed(_))
-                            if std::time::Instant::now() < deadline =>
-                        {
-                            tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
-                        }
-                        Err(err) => return Err(err),
-                    }
-                }
+        let deadline = std::time::Instant::now() + SOURCE_WORKER_UPDATE_ROOTS_TOTAL_TIMEOUT;
+        loop {
+            let now = std::time::Instant::now();
+            let attempt_timeout = std::cmp::min(
+                SOURCE_WORKER_UPDATE_ROOTS_RPC_TIMEOUT,
+                deadline.saturating_duration_since(now),
+            );
+            if attempt_timeout.is_zero() {
+                return Err(CnxError::Timeout);
             }
-        })
-        .await
+            let rpc_result = self
+                .with_started_retry(|client| {
+                    let roots = roots.clone();
+                    async move {
+                        #[cfg(test)]
+                        maybe_pause_before_update_logical_roots_rpc().await;
+                        #[cfg(test)]
+                        if let Some(err) = take_update_logical_roots_error_hook() {
+                            return Err(err);
+                        }
+                        Self::call_worker(
+                            &client,
+                            SourceWorkerRequest::UpdateLogicalRoots {
+                                roots: roots.clone(),
+                            },
+                            attempt_timeout,
+                        )
+                        .await
+                    }
+                })
+                .await;
+            match rpc_result {
+                Ok(SourceWorkerResponse::Ack) => {
+                    self.with_cache_mut(|cache| {
+                        cache.logical_roots = Some(roots.clone());
+                    });
+                    eprintln!(
+                        "fs_meta_source_worker_client: update_logical_roots ok node={} roots={}",
+                        self.node_id.0,
+                        roots.len()
+                    );
+                    return Ok(());
+                }
+                Err(CnxError::InvalidInput(message)) => {
+                    return Err(CnxError::InvalidInput(message));
+                }
+                Ok(other) => {
+                    return Err(CnxError::ProtocolViolation(format!(
+                        "unexpected source worker response for update roots: {:?}",
+                        other
+                    )));
+                }
+                Err(err)
+                    if can_retry_update_logical_roots(&err)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                }
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     pub fn cached_logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
@@ -560,13 +845,16 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn logical_roots_snapshot(&self) -> Result<Vec<RootSpec>> {
-        match Self::call_worker(
-            &self.client().await?,
+        let Some(client) = self.existing_client().await? else {
+            return self.cached_logical_roots_snapshot();
+        };
+        let result = Self::call_worker(
+            &client,
             SourceWorkerRequest::LogicalRootsSnapshot,
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
         )
-        .await
-        {
+        .await;
+        match result {
             Ok(SourceWorkerResponse::LogicalRoots(roots)) => {
                 self.with_cache_mut(|cache| {
                     cache.logical_roots = Some(roots.clone());
@@ -577,6 +865,9 @@ impl SourceWorkerClientHandle {
                 "unexpected source worker response for logical roots: {:?}",
                 other
             ))),
+            Err(err) if can_use_cached_logical_roots_snapshot(&err) => {
+                self.cached_logical_roots_snapshot()
+            }
             Err(err) => Err(err),
         }
     }
@@ -591,13 +882,16 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn host_object_grants_snapshot(&self) -> Result<Vec<GrantedMountRoot>> {
-        match Self::call_worker(
-            &self.client().await?,
+        let Some(client) = self.existing_client().await? else {
+            return self.cached_host_object_grants_snapshot();
+        };
+        let result = Self::call_worker(
+            &client,
             SourceWorkerRequest::HostObjectGrantsSnapshot,
             SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
         )
-        .await
-        {
+        .await;
+        match result {
             Ok(SourceWorkerResponse::HostObjectGrants(grants)) => {
                 self.with_cache_mut(|cache| {
                     cache.grants = Some(grants.clone());
@@ -608,6 +902,9 @@ impl SourceWorkerClientHandle {
                 "unexpected source worker response for host object grants: {:?}",
                 other
             ))),
+            Err(err) if can_use_cached_host_object_grants_snapshot(&err) => {
+                self.cached_host_object_grants_snapshot()
+            }
             Err(err) => Err(err),
         }
     }
@@ -883,6 +1180,9 @@ impl SourceWorkerClientHandle {
 
     pub async fn on_control_frame(&self, envelopes: Vec<ControlEnvelope>) -> Result<()> {
         let _inflight = self.begin_control_op();
+        let _serial = self.control_ops_serial.lock().await;
+        #[cfg(test)]
+        notify_source_worker_control_frame_started();
         eprintln!(
             "fs_meta_source_worker_client: on_control_frame begin node={} envelopes={}",
             self.node_id.0,
@@ -902,6 +1202,8 @@ impl SourceWorkerClientHandle {
             }
         }
         self.start().await?;
+        #[cfg(test)]
+        maybe_pause_before_on_control_frame_rpc().await;
         let result = match Self::call_worker(
             &self.client().await?,
             SourceWorkerRequest::OnControlFrame { envelopes },
@@ -943,6 +1245,10 @@ impl SourceWorkerClientHandle {
     }
 
     pub async fn close(&self) -> Result<()> {
+        #[cfg(test)]
+        notify_source_worker_close_started();
+        self.wait_for_control_ops_to_drain(SOURCE_WORKER_CLOSE_DRAIN_TIMEOUT)
+            .await;
         self.worker.shutdown(Duration::from_secs(2)).await?;
         self.with_cache_mut(|cache| {
             cache.lifecycle_state = Some("closed".to_string());
@@ -1513,14 +1819,16 @@ mod tests {
         StateBoundary,
     };
     use capanix_app_sdk::runtime::{
-        LogLevel, RuntimeWorkerBinding, RuntimeWorkerLauncherKind, in_memory_state_boundary,
+        ControlFrame, LogLevel, RuntimeWorkerBinding, RuntimeWorkerLauncherKind,
+        in_memory_state_boundary,
     };
     use capanix_app_sdk::worker::WorkerMode;
     use capanix_runtime_entry_sdk::control::{
         RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
     };
-    use capanix_runtime_entry_sdk::worker_runtime::RuntimeWorkerClientFactory;
-    use capanix_runtime_entry_sdk::worker_runtime::TypedWorkerRpc;
+    use capanix_runtime_entry_sdk::worker_runtime::{
+        RuntimeWorkerClientFactory, TypedWorkerInit, TypedWorkerRpc,
+    };
     use std::collections::{HashMap, HashSet};
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex as StdMutex, OnceLock};
@@ -1541,7 +1849,6 @@ mod tests {
     };
     use crate::runtime::routes::ROUTE_KEY_QUERY;
     use crate::workers::sink::SinkWorkerClientHandle;
-
     #[cfg(target_os = "linux")]
     mod real_nfs_lab {
         include!(concat!(
@@ -1555,6 +1862,30 @@ mod tests {
         channels: AsyncMutex<HashMap<String, Vec<Event>>>,
         closed: StdMutex<HashSet<String>>,
         changed: Notify,
+    }
+
+    struct SourceWorkerUpdateRootsHookReset;
+
+    impl Drop for SourceWorkerUpdateRootsHookReset {
+        fn drop(&mut self) {
+            clear_source_worker_update_roots_hook();
+        }
+    }
+
+    struct SourceWorkerUpdateRootsErrorHookReset;
+
+    impl Drop for SourceWorkerUpdateRootsErrorHookReset {
+        fn drop(&mut self) {
+            clear_source_worker_update_roots_error_hook();
+        }
+    }
+
+    struct SourceWorkerControlFramePauseHookReset;
+
+    impl Drop for SourceWorkerControlFramePauseHookReset {
+        fn drop(&mut self) {
+            clear_source_worker_control_frame_pause_hook();
+        }
     }
 
     #[async_trait]
@@ -1626,6 +1957,22 @@ mod tests {
     }
 
     impl StateBoundary for LoopbackWorkerBoundary {}
+
+    const WORKER_BOOTSTRAP_CONTROL_FRAME_KIND: &str = "capanix.worker.bootstrap:v1";
+
+    #[derive(Debug, Clone, serde::Serialize)]
+    enum TestWorkerBootstrapEnvelope<P> {
+        Init { node_id: String, payload: P },
+    }
+
+    fn bootstrap_envelope<P: serde::Serialize>(
+        message: &TestWorkerBootstrapEnvelope<P>,
+    ) -> ControlEnvelope {
+        ControlEnvelope::Frame(ControlFrame {
+            kind: WORKER_BOOTSTRAP_CONTROL_FRAME_KIND.to_string(),
+            payload: rmp_serde::to_vec_named(message).expect("encode bootstrap envelope"),
+        })
+    }
 
     fn fs_meta_runtime_lib_filename() -> &'static str {
         #[cfg(target_os = "macos")]
@@ -2185,6 +2532,601 @@ mod tests {
                 .get("nfs1")
                 .map(String::as_str),
             Some("node-a::exp1")
+        );
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn logical_roots_snapshot_uses_cached_roots_when_worker_resets_mid_handoff() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![worker_source_export(
+                "node-d::nfs1",
+                "node-d",
+                "10.0.0.41",
+                nfs1.clone(),
+            )],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = SourceWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let initial_roots = client
+            .logical_roots_snapshot()
+            .await
+            .expect("initial logical roots snapshot");
+        assert_eq!(
+            initial_roots
+                .iter()
+                .map(|root| root.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nfs1"],
+            "initial worker snapshot should expose the configured root"
+        );
+
+        client.close().await.expect("close source worker");
+
+        let cached_roots = client
+            .logical_roots_snapshot()
+            .await
+            .expect("cached logical roots snapshot after worker reset");
+        assert_eq!(
+            cached_roots
+                .iter()
+                .map(|root| root.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["nfs1"],
+            "logical_roots_snapshot should fall back to cached roots during restart handoff"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn host_object_grants_snapshot_uses_cached_grants_when_worker_resets_mid_handoff() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![worker_source_export(
+                "node-d::nfs1",
+                "node-d",
+                "10.0.0.41",
+                nfs1.clone(),
+            )],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = SourceWorkerClientHandle::new(
+            NodeId("node-d".to_string()),
+            cfg,
+            external_source_worker_binding(worker_socket_dir.path()),
+            factory,
+        )
+        .expect("construct source worker client");
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let initial_grants = client
+            .host_object_grants_snapshot()
+            .await
+            .expect("initial host-object grants snapshot");
+        assert_eq!(
+            initial_grants
+                .iter()
+                .map(|grant| grant.object_ref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node-d::nfs1"],
+            "initial worker snapshot should expose the configured grant"
+        );
+
+        client.close().await.expect("close source worker");
+
+        let cached_grants = client
+            .host_object_grants_snapshot()
+            .await
+            .expect("cached host-object grants snapshot after worker reset");
+        assert_eq!(
+            cached_grants
+                .iter()
+                .map(|grant| grant.object_ref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node-d::nfs1"],
+            "host_object_grants_snapshot should fall back to cached grants during restart handoff"
+        );
+    }
+
+    #[test]
+    fn cached_host_object_grants_snapshot_is_used_for_stale_drained_pid_errors() {
+        let err = CnxError::AccessDenied(
+            "source worker unavailable: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                .to_string(),
+        );
+        assert!(
+            can_use_cached_host_object_grants_snapshot(&err),
+            "host_object_grants_snapshot should fall back to cached grants when a stale drained/fenced worker pid rejects new grant attachments"
+        );
+    }
+
+    #[test]
+    fn cached_logical_roots_snapshot_is_used_for_stale_drained_pid_errors() {
+        let err = CnxError::AccessDenied(
+            "source worker unavailable: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                .to_string(),
+        );
+        assert!(
+            can_use_cached_logical_roots_snapshot(&err),
+            "logical_roots_snapshot should fall back to cached roots when a stale drained/fenced worker pid rejects new grant attachments"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn close_waits_for_inflight_update_logical_roots_control_op_before_shutting_down_worker()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![worker_source_export(
+                "node-d::nfs1",
+                "node-d",
+                "10.0.0.41",
+                nfs1.clone(),
+            )],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        // update_logical_roots holds this same client-side control-op guard
+        // while the worker RPC is in flight; close must not tear down the worker
+        // bridge until that guard has drained.
+        let inflight = client.begin_control_op();
+        let close_task = tokio::spawn({
+            let client = client.clone();
+            async move { client.close().await }
+        });
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            !close_task.is_finished(),
+            "source worker close must wait for in-flight update_logical_roots before tearing down the worker bridge"
+        );
+
+        drop(inflight);
+        close_task
+            .await
+            .expect("join close task")
+            .expect("close source worker after update");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_logical_roots_replays_start_after_runtime_reverts_to_initialized_without_worker_receipt(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![
+                worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let primed_worker = client.client().await.expect("connect source worker");
+        primed_worker
+            .control_frames(
+                &[bootstrap_envelope(&TestWorkerBootstrapEnvelope::Init {
+                    node_id: client.node_id.0.clone(),
+                    payload: SourceWorkerRpc::init_payload(&client.node_id, &client.config)
+                        .expect("source worker init payload"),
+                })],
+                Duration::from_secs(5),
+            )
+            .await
+            .expect("reinitialize worker without replaying Start");
+
+        let not_ready = SourceWorkerClientHandle::call_worker(
+            &primed_worker,
+            SourceWorkerRequest::LogicalRootsSnapshot,
+            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+        )
+        .await
+        .expect_err("raw worker should require Start after direct Init replay");
+        assert!(
+            matches!(&not_ready, CnxError::PeerError(message) if message == "worker not initialized"),
+            "direct bootstrap Init should leave the worker runtime unstarted until Start is replayed: {not_ready:?}"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.update_logical_roots(vec![
+                worker_source_root("nfs1", &nfs1),
+                worker_source_root("nfs2", &nfs2),
+            ]),
+        )
+        .await
+        .expect("update_logical_roots should not hang after raw Init replay")
+        .expect("update_logical_roots should replay Start and reach the live worker");
+
+        let roots = client
+            .logical_roots_snapshot()
+            .await
+            .expect("logical roots snapshot after bootstrap replay");
+        assert_eq!(
+            roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(),
+            vec!["nfs1", "nfs2"],
+            "logical roots should reflect the post-bootstrap-replay update"
+        );
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_logical_roots_reacquires_worker_client_after_transport_closes_mid_handoff() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![
+                worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _reset = SourceWorkerUpdateRootsHookReset;
+        install_source_worker_update_roots_hook(SourceWorkerUpdateRootsHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let update_task = tokio::spawn({
+            let client = client.clone();
+            let nfs1 = nfs1.clone();
+            let nfs2 = nfs2.clone();
+            async move {
+                client
+                    .update_logical_roots(vec![
+                        worker_source_root("nfs1", &nfs1),
+                        worker_source_root("nfs2", &nfs2),
+                    ])
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        client
+            .worker
+            .shutdown(Duration::from_secs(2))
+            .await
+            .expect("shutdown stale worker bridge");
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker restart timed out")
+            .expect("restart source worker");
+        release.notify_waiters();
+
+        tokio::time::timeout(Duration::from_secs(4), update_task)
+            .await
+            .expect("update_logical_roots should reacquire a live worker client after handoff")
+            .expect("join update_logical_roots task")
+            .expect("update_logical_roots after worker restart");
+
+        let roots = client
+            .logical_roots_snapshot()
+            .await
+            .expect("logical roots snapshot after update");
+        assert_eq!(
+            roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(),
+            vec!["nfs1", "nfs2"],
+            "logical roots should reflect the post-handoff update"
+        );
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_logical_roots_waits_for_shared_control_frame_handoff_before_dispatching_to_worker(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![
+                worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let binding = external_source_worker_binding(worker_socket_dir.path());
+        let control_client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg.clone(),
+                binding.clone(),
+                factory.clone(),
+            )
+            .expect("construct control source worker client"),
+        );
+        let update_client = Arc::new(
+            SourceWorkerClientHandle::new(NodeId("node-d".to_string()), cfg, binding, factory)
+                .expect("construct update source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), control_client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let control_entered = Arc::new(Notify::new());
+        let control_release = Arc::new(Notify::new());
+        let _control_reset = SourceWorkerControlFramePauseHookReset;
+        install_source_worker_control_frame_pause_hook(SourceWorkerControlFramePauseHook {
+            entered: control_entered.clone(),
+            release: control_release.clone(),
+        });
+
+        let update_entered = Arc::new(Notify::new());
+        let update_release = Arc::new(Notify::new());
+        let _update_reset = SourceWorkerUpdateRootsHookReset;
+        install_source_worker_update_roots_hook(SourceWorkerUpdateRootsHook {
+            entered: update_entered.clone(),
+            release: update_release.clone(),
+        });
+
+        let control_task = tokio::spawn({
+            let control_client = control_client.clone();
+            async move {
+                control_client
+                    .on_control_frame(vec![
+                        encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                            RuntimeExecActivate {
+                                route_key: ROUTE_KEY_QUERY.to_string(),
+                                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                                lease: None,
+                                generation: 2,
+                                expires_at_ms: 1,
+                                bound_scopes: vec![
+                                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                                ],
+                            },
+                        ))
+                        .expect("encode source activate"),
+                        encode_runtime_exec_control(&RuntimeExecControl::Activate(
+                            RuntimeExecActivate {
+                                route_key: ROUTE_KEY_QUERY.to_string(),
+                                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                                lease: None,
+                                generation: 2,
+                                expires_at_ms: 1,
+                                bound_scopes: vec![
+                                    bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                                    bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                                ],
+                            },
+                        ))
+                        .expect("encode source-scan activate"),
+                    ])
+                    .await
+            }
+        });
+
+        control_entered.notified().await;
+
+        let update_task = tokio::spawn({
+            let update_client = update_client.clone();
+            let nfs1 = nfs1.clone();
+            let nfs2 = nfs2.clone();
+            async move {
+                update_client
+                    .update_logical_roots(vec![
+                        worker_source_root("nfs1", &nfs1),
+                        worker_source_root("nfs2", &nfs2),
+                    ])
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), update_entered.notified())
+                .await
+                .is_err(),
+            "shared source update_logical_roots must not start dispatch while another handle is still mid-control-frame handoff on the same worker"
+        );
+
+        control_release.notify_waiters();
+        control_task
+            .await
+            .expect("join control task")
+            .expect("apply shared source control frame");
+
+        update_entered.notified().await;
+        update_release.notify_waiters();
+        update_task
+            .await
+            .expect("join update task")
+            .expect("update logical roots after shared control handoff");
+
+        let roots = update_client
+            .logical_roots_snapshot()
+            .await
+            .expect("logical roots snapshot after shared handoff");
+        assert_eq!(
+            roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(),
+            vec!["nfs1", "nfs2"],
+            "logical roots should reflect the post-handoff update"
+        );
+
+        update_client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn update_logical_roots_retries_stale_drained_fenced_pid_errors() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![
+                worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let _reset = SourceWorkerUpdateRootsErrorHookReset;
+        install_source_worker_update_roots_error_hook(SourceWorkerUpdateRootsErrorHook {
+            err: CnxError::AccessDenied(
+                "source worker unavailable: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                    .to_string(),
+            ),
+        });
+
+        client
+            .update_logical_roots(vec![
+                worker_source_root("nfs1", &nfs1),
+                worker_source_root("nfs2", &nfs2),
+            ])
+            .await
+            .expect(
+                "update_logical_roots should retry a stale drained/fenced pid error and reach the live worker",
+            );
+
+        let roots = client
+            .logical_roots_snapshot()
+            .await
+            .expect("logical roots snapshot after stale-pid retry");
+        assert_eq!(
+            roots.iter().map(|root| root.id.as_str()).collect::<Vec<_>>(),
+            vec!["nfs1", "nfs2"],
+            "logical roots should reflect the post-retry update"
         );
 
         client.close().await.expect("close source worker");

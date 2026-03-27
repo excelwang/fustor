@@ -96,3 +96,21 @@ ports:
     roles:
       - serve
       - use
+  - route_token: fs-meta.internal
+    use_port: source.roots.control
+    dispatch_tag: source_roots_control
+    pattern: stream
+    route_key: source-logical-roots-control:v1
+    visibility: internal
+    roles:
+      - serve
+      - use
+  - route_token: fs-meta.internal
+    use_port: sink.roots.control
+    dispatch_tag: sink_roots_control
+    pattern: stream
+    route_key: sink-logical-roots-control:v1
+    visibility: internal
+    roles:
+      - serve
+      - use

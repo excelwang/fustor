@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::path::PathBuf;
+#[cfg(test)]
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -15,6 +17,8 @@ use capanix_host_adapter_fs::HostAdapter;
 use capanix_runtime_entry_sdk::advanced::boundary::{
     BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest,
 };
+#[cfg(test)]
+use tokio::sync::Notify;
 
 use crate::query::api::{
     internal_status_request_payload, merge_sink_status_snapshots,
@@ -99,6 +103,52 @@ fn summarize_source_status_route_snapshot(snapshot: &SourceObservabilitySnapshot
         summarize_groups_by_node(&snapshot.summarized_path_origin_counts_by_node),
         summarize_groups_by_node(&snapshot.published_path_origin_counts_by_node),
     )
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct RootsPutPauseHook {
+    pub entered: std::sync::Arc<Notify>,
+    pub release: std::sync::Arc<Notify>,
+}
+
+#[cfg(test)]
+fn roots_put_pause_hook_cell() -> &'static StdMutex<Option<RootsPutPauseHook>> {
+    static CELL: OnceLock<StdMutex<Option<RootsPutPauseHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+pub(crate) fn install_roots_put_pause_hook(hook: RootsPutPauseHook) {
+    let mut guard = match roots_put_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+pub(crate) fn clear_roots_put_pause_hook() {
+    let mut guard = match roots_put_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+async fn maybe_pause_roots_put_after_previous_source_roots() {
+    let hook = {
+        let guard = match roots_put_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+        hook.release.notified().await;
+    }
 }
 
 pub async fn login(
@@ -489,6 +539,8 @@ pub async fn roots_put(
         "fs_meta_api: roots_put previous source roots ok roots={}",
         previous_source_roots.len()
     );
+    #[cfg(test)]
+    maybe_pause_roots_put_after_previous_source_roots().await;
     let previous_grants = grants.clone();
     // roots apply updates app-owned authoritative root/group definitions and
     // refreshes source/sink state against current runtime grants and bound
@@ -556,7 +608,7 @@ pub async fn roots_put(
                 route_key,
                 roots.len()
             );
-            boundary
+            match boundary
                 .channel_send(
                     BoundaryContext::default(),
                     ChannelSendRequest {
@@ -579,16 +631,26 @@ pub async fn roots_put(
                     },
                 )
                 .await
-                .map_err(|err| {
-                    ApiError::internal(format!(
+            {
+                Ok(()) => {
+                    eprintln!(
+                        "fs_meta_api: roots_put control send ok route={} roots={}",
+                        route_key,
+                        roots.len()
+                    );
+                }
+                Err(err) if is_stale_drained_pid_control_send_error(&err) => {
+                    eprintln!(
+                        "fs_meta_api: roots_put control send tolerated stale drained pid route={} err={}",
+                        route_key, err
+                    );
+                }
+                Err(err) => {
+                    return Err(ApiError::internal(format!(
                         "logical roots control send failed route={route_key}: {err}"
-                    ))
-                })?;
-            eprintln!(
-                "fs_meta_api: roots_put control send ok route={} roots={}",
-                route_key,
-                roots.len()
-            );
+                    )));
+                }
+            }
         }
     }
     refresh_policy_from_host_object_grants(&state.projection_policy, &grants);
@@ -626,7 +688,7 @@ pub async fn rescan(
         let payload = rmp_serde::to_vec_named(&envelope).map_err(|err| {
             ApiError::internal(format!("manual rescan envelope serialize failed: {err}"))
         })?;
-        boundary
+        match boundary
             .channel_send(
                 BoundaryContext::default(),
                 ChannelSendRequest {
@@ -646,9 +708,22 @@ pub async fn rescan(
                 },
             )
             .await
-            .map_err(|err| {
-                ApiError::internal(format!("manual rescan control send failed: {err}"))
-            })?;
+        {
+            Ok(()) => {}
+            Err(err) if is_stale_drained_pid_control_send_error(&err) => {
+                eprintln!(
+                    "fs_meta_api: rescan control send tolerated stale drained pid route={} err={}",
+                    ROUTE_KEY_SOURCE_RESCAN_CONTROL,
+                    err
+                );
+                state.source.trigger_rescan_when_ready().await?;
+            }
+            Err(err) => {
+                return Err(ApiError::internal(format!(
+                    "manual rescan control send failed: {err}"
+                )));
+            }
+        }
     } else {
         eprintln!(
             "fs_meta_api: rescan via local source node={}",
@@ -1422,19 +1497,115 @@ fn authorize_management(
     Ok(principal)
 }
 
+fn is_stale_drained_pid_control_send_error(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::AccessDenied(message)
+            if message.contains("drained/fenced")
+                && message.contains("grant attachments")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::auth::AuthService;
+    use crate::api::config::ApiAuthConfig;
+    use crate::api::facade_status::shared_facade_pending_status_cell;
+    use crate::query::api::ProjectionPolicy;
     use crate::RootSpec;
+    use crate::sink::SinkFileMeta;
     use crate::source::SourceStatusSnapshot;
     use crate::source::config::GrantedMountRoot;
+    use crate::source::config::SourceConfig;
+    use crate::source::FSMetaSource;
     use crate::source::{SourceConcreteRootHealthSnapshot, SourceLogicalRootHealthSnapshot};
+    use crate::workers::sink::SinkFacade;
+    use crate::workers::source::SourceFacade;
+    use axum::extract::State;
+    use axum::http::HeaderValue;
+    use axum::Json;
+    use capanix_app_sdk::CnxError;
+    use capanix_app_sdk::runtime::NodeId;
     use crate::workers::source::SourceObservabilitySnapshot;
     use capanix_runtime_entry_sdk::advanced::boundary::ChannelIoSubset;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex as StdMutex, RwLock};
+    use tempfile::tempdir;
 
     struct NoopBoundary;
 
     impl ChannelIoSubset for NoopBoundary {}
+
+    struct DeniedControlRouteBoundary {
+        sent_routes: Arc<StdMutex<Vec<String>>>,
+        denied_route: String,
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for DeniedControlRouteBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            let route = request.channel_key.0.clone();
+            let mut sent = match self.sent_routes.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            sent.push(route.clone());
+            drop(sent);
+            if route == self.denied_route {
+                return Err(CnxError::AccessDenied(
+                    "pid Pid(4) is drained/fenced and cannot obtain new grant attachments".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    fn write_auth_files(dir: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let passwd = dir.path().join("fs-meta.passwd");
+        let shadow = dir.path().join("fs-meta.shadow");
+        let query_keys = dir.path().join("fs-meta.query-keys.json");
+        std::fs::write(
+            &passwd,
+            "admin:1000:1000:fsmeta_management:/home/admin:/bin/bash:0\n",
+        )
+        .expect("write passwd");
+        std::fs::write(&shadow, "admin:plain$admin:0\n").expect("write shadow");
+        std::fs::write(&query_keys, "{\n  \"keys\": []\n}\n").expect("write query keys");
+        (passwd, shadow, query_keys)
+    }
+
+    fn management_headers(auth: &AuthService) -> HeaderMap {
+        let (token, _, _) = auth.login("admin", "admin").expect("login admin");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_str(&format!("Bearer {token}")).expect("header value"),
+        );
+        headers
+    }
+
+    fn granted_mount_root(object_ref: &str, mount_point: &Path) -> GrantedMountRoot {
+        GrantedMountRoot {
+            object_ref: object_ref.to_string(),
+            host_ref: "node-a".to_string(),
+            host_ip: "127.0.0.1".to_string(),
+            host_name: Some("node-a".to_string()),
+            site: None,
+            zone: None,
+            host_labels: BTreeMap::new(),
+            mount_point: mount_point.to_path_buf(),
+            fs_source: mount_point.display().to_string(),
+            fs_type: "nfs".to_string(),
+            mount_options: Vec::new(),
+            interfaces: vec!["posix-fs".to_string(), "inotify".to_string()],
+            active: true,
+        }
+    }
 
     fn local_source_snapshot() -> SourceObservabilitySnapshot {
         SourceObservabilitySnapshot {
@@ -1565,6 +1736,207 @@ mod tests {
             }],
             ..SinkStatusSnapshot::default()
         }
+    }
+
+    #[tokio::test]
+    async fn roots_put_succeeds_when_source_control_send_hits_drained_stale_pid_after_local_update()
+    {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![
+                granted_mount_root("node-a::nfs1", &nfs1),
+                granted_mount_root("node-a::nfs2", &nfs2),
+            ],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg.clone())
+                .expect("sink"),
+        )));
+        let sent_routes = Arc::new(StdMutex::new(Vec::new()));
+        let boundary = Arc::new(DeniedControlRouteBoundary {
+            sent_routes: sent_routes.clone(),
+            denied_route: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+        });
+        let headers = management_headers(auth.as_ref());
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(boundary),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source: source.clone(),
+            sink: sink.clone(),
+            query_sink: sink.clone(),
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            facade_pending: shared_facade_pending_status_cell(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let response = roots_put(
+            State(state),
+            headers,
+            Json(RootsUpdateRequest {
+                roots: vec![
+                    RootUpdateEntry {
+                        id: "nfs1".to_string(),
+                        selector: RootSelectorEntry {
+                            mount_point: Some(nfs1.display().to_string()),
+                            fs_source: None,
+                            fs_type: None,
+                            host_ip: None,
+                            host_ref: None,
+                        },
+                        subpath_scope: "/".to_string(),
+                        watch: true,
+                        scan: true,
+                        audit_interval_ms: None,
+                        source_locator_present: false,
+                        path_present: false,
+                    },
+                    RootUpdateEntry {
+                        id: "nfs2".to_string(),
+                        selector: RootSelectorEntry {
+                            mount_point: Some(nfs2.display().to_string()),
+                            fs_source: None,
+                            fs_type: None,
+                            host_ip: None,
+                            host_ref: None,
+                        },
+                        subpath_scope: "/".to_string(),
+                        watch: true,
+                        scan: true,
+                        audit_interval_ms: None,
+                        source_locator_present: false,
+                        path_present: false,
+                    },
+                ],
+            }),
+        )
+        .await
+        .expect("roots_put should succeed even if the old pid is already drained");
+
+        assert_eq!(response.0.roots_count, 2);
+        assert_eq!(
+            source
+                .logical_roots_snapshot()
+                .await
+                .expect("source roots snapshot")
+                .len(),
+            2
+        );
+        assert_eq!(
+            sink.cached_logical_roots_snapshot()
+                .expect("sink roots snapshot")
+                .len(),
+            2
+        );
+        let sent_routes = match sent_routes.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        assert_eq!(
+            sent_routes,
+            vec![
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                format!("{}.stream", ROUTE_KEY_SINK_ROOTS_CONTROL),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rescan_succeeds_when_manual_rescan_control_send_hits_drained_stale_pid() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let mut root = RootSpec::new("nfs1", &nfs1);
+        root.scan = false;
+        let source_cfg = SourceConfig {
+            roots: vec![root],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source_runtime =
+            Arc::new(FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"));
+        let source = Arc::new(SourceFacade::local(source_runtime.clone()));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg.clone())
+                .expect("sink"),
+        )));
+        let sent_routes = Arc::new(StdMutex::new(Vec::new()));
+        let boundary = Arc::new(DeniedControlRouteBoundary {
+            sent_routes: sent_routes.clone(),
+            denied_route: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+        });
+        let headers = management_headers(auth.as_ref());
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(boundary),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source: source.clone(),
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            facade_pending: shared_facade_pending_status_cell(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let response = rescan(State(state), headers)
+            .await
+            .expect("rescan should tolerate a stale drained control pid and fall back locally");
+        assert!(response.0.accepted);
+
+        let status = source_runtime.status_snapshot();
+        assert!(
+            status
+                .concrete_roots
+                .iter()
+                .any(|entry| entry.rescan_pending
+                    && entry.last_rescan_reason.as_deref() == Some("manual")),
+            "local source should mark a manual rescan pending after stale drained control send fallback: {:?}",
+            status.concrete_roots
+        );
+
+        let sent_routes = match sent_routes.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        assert_eq!(
+            sent_routes,
+            vec![format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL)]
+        );
     }
 
     #[test]

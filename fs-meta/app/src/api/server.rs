@@ -28,9 +28,10 @@ use crate::workers::source::SourceFacade;
 
 use super::auth::AuthService;
 use super::config::ResolvedApiConfig;
+use super::errors::ApiError;
 use super::facade_status::SharedFacadePendingStatusCell;
 use super::handlers;
-use super::state::ApiState;
+use super::state::{ApiControlGate, ApiRequestTracker, ApiState};
 
 enum ApiServerJoin {
     Thread(std::thread::JoinHandle<()>),
@@ -77,6 +78,8 @@ pub async fn spawn(
     query_sink: Arc<SinkFacade>,
     query_runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
     facade_pending: SharedFacadePendingStatusCell,
+    request_tracker: Arc<ApiRequestTracker>,
+    control_gate: Arc<ApiControlGate>,
 ) -> Result<ApiServerHandle> {
     eprintln!(
         "fs_meta_api_server: spawn begin bind_addr={}",
@@ -116,6 +119,8 @@ pub async fn spawn(
         auth,
         projection_policy,
         facade_pending,
+        request_tracker,
+        control_gate,
     };
     refresh_policy_from_host_object_grants(
         &state.projection_policy,
@@ -271,16 +276,51 @@ fn router(state: ApiState) -> Result<Router> {
             "/api/fs-meta/v1/query-api-keys/:key_id",
             delete(handlers::query_api_keys_revoke),
         )
-        .with_state(state);
+        .with_state(state.clone());
     Ok(management
         .nest("/api/fs-meta/v1", projection_router)
-        .layer(middleware::from_fn(request_logging))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_logging,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            request_control_readiness_guard,
+        ))
         .layer(cors))
 }
 
-async fn request_logging(request: Request, next: Next) -> Response {
+fn request_requires_control_readiness(method: &Method, path: &str) -> bool {
+    matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots"
+}
+
+async fn request_control_readiness_guard(
+    State(state): State<ApiState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !request_requires_control_readiness(request.method(), request.uri().path()) {
+        return next.run(request).await;
+    }
+    if state.control_gate.is_ready() {
+        return next.run(request).await;
+    }
+    if tokio::time::timeout(Duration::from_secs(15), state.control_gate.wait_ready())
+        .await
+        .is_err()
+    {
+        return ApiError::service_unavailable(
+            "fs-meta management request handling is unavailable until runtime control initializes the app",
+        )
+        .into_response();
+    }
+    next.run(request).await
+}
+
+async fn request_logging(State(state): State<ApiState>, request: Request, next: Next) -> Response {
     static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
+    let _request_guard = state.request_tracker.begin();
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = request.method().clone();
     let path = request.uri().path().to_string();

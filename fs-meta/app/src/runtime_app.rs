@@ -7,6 +7,7 @@ use crate::api::facade_status::{
     FacadePendingReason, SharedFacadePendingStatus, SharedFacadePendingStatusCell,
     shared_facade_pending_status_cell,
 };
+use crate::api::{ApiControlGate, ApiRequestTracker};
 use crate::query::TreeGroupPayload;
 #[cfg(test)]
 use crate::query::observation::{
@@ -63,6 +64,7 @@ use crate::source::config::SourceConfig;
 // Top-level fs-meta runtime-entry/bootstrap glue lowers through
 // `service-sdk -> runtime-entry-sdk -> app-sdk`; lower runtime mirror/control
 // carriers stay behind the sanctioned helper layer.
+const ACTIVE_FACADE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
 
 struct FacadeActivation {
     route_key: String,
@@ -493,6 +495,33 @@ fn process_facade_claim_cell() -> &'static StdMutex<BTreeMap<String, ProcessFaca
     CELL.get_or_init(|| StdMutex::new(BTreeMap::new()))
 }
 
+fn shared_api_request_tracker_for_config(config: &api::ApiConfig) -> Arc<ApiRequestTracker> {
+    let mut fixed_bind_addrs = config
+        .local_listener_resources
+        .iter()
+        .map(|resource| resource.bind_addr.clone())
+        .filter(|bind_addr| !facade_bind_addr_is_ephemeral(bind_addr))
+        .collect::<Vec<_>>();
+    fixed_bind_addrs.sort();
+    fixed_bind_addrs.dedup();
+    if fixed_bind_addrs.is_empty() {
+        return Arc::new(ApiRequestTracker::default());
+    }
+    static CELL: OnceLock<StdMutex<BTreeMap<Vec<String>, Arc<ApiRequestTracker>>>> =
+        OnceLock::new();
+    let mut guard = match CELL
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+    {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .entry(fixed_bind_addrs)
+        .or_insert_with(|| Arc::new(ApiRequestTracker::default()))
+        .clone()
+}
+
 fn next_app_instance_id() -> u64 {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
@@ -516,6 +545,50 @@ fn clear_process_facade_claim_for_tests() {
     guard.clear();
 }
 
+#[cfg(test)]
+#[derive(Clone)]
+struct FacadeShutdownStartHook {
+    entered: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+fn facade_shutdown_start_hook_cell() -> &'static StdMutex<Option<FacadeShutdownStartHook>> {
+    static CELL: OnceLock<StdMutex<Option<FacadeShutdownStartHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_facade_shutdown_start_hook(hook: FacadeShutdownStartHook) {
+    let mut guard = match facade_shutdown_start_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+fn clear_facade_shutdown_start_hook() {
+    let mut guard = match facade_shutdown_start_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn notify_facade_shutdown_started() {
+    let hook = {
+        let guard = match facade_shutdown_start_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+    }
+}
+
 pub struct FSMetaApp {
     instance_id: u64,
     config: FSMetaConfig,
@@ -530,6 +603,8 @@ pub struct FSMetaApp {
     api_task: Arc<Mutex<Option<FacadeActivation>>>,
     pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
     facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
+    api_request_tracker: Arc<ApiRequestTracker>,
+    api_control_gate: Arc<ApiControlGate>,
     control_frame_serial: Mutex<()>,
     facade_pending_status: SharedFacadePendingStatusCell,
     facade_gate: RuntimeUnitGate,
@@ -606,6 +681,8 @@ impl FSMetaApp {
     ) -> Result<Self> {
         let source_cfg = config.source.clone();
         let sink_source_cfg = config.source.clone();
+        let api_request_tracker = shared_api_request_tracker_for_config(&config.api);
+        let api_control_gate = Arc::new(ApiControlGate::new(false));
         let source = match source_worker_binding.mode {
             WorkerMode::Embedded => Arc::new(SourceFacade::local(Arc::new(
                 source::FSMetaSource::with_boundaries_and_state(
@@ -695,6 +772,8 @@ impl FSMetaApp {
             api_task: Arc::new(Mutex::new(None)),
             pending_facade: Arc::new(Mutex::new(None)),
             facade_spawn_in_progress: Arc::new(Mutex::new(None)),
+            api_request_tracker,
+            api_control_gate,
             control_frame_serial: Mutex::new(()),
             facade_pending_status: shared_facade_pending_status_cell(),
             facade_gate: RuntimeUnitGate::new(
@@ -801,6 +880,7 @@ impl FSMetaApp {
         self.ensure_runtime_proxy_endpoints_started().await?;
         eprintln!("fs_meta_runtime_app: initialize_from_control endpoints ok");
         self.control_initialized.store(true, Ordering::Release);
+        self.api_control_gate.set_ready(true);
         eprintln!("fs_meta_runtime_app: initialize_from_control done");
 
         Ok(())
@@ -1529,6 +1609,8 @@ impl FSMetaApp {
             self.pending_facade.clone(),
             self.facade_spawn_in_progress.clone(),
             self.facade_pending_status.clone(),
+            self.api_request_tracker.clone(),
+            self.api_control_gate.clone(),
             self.node_id.clone(),
             self.runtime_boundary.clone(),
             self.source.clone(),
@@ -1545,6 +1627,8 @@ impl FSMetaApp {
         pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
         facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
         facade_pending_status: SharedFacadePendingStatusCell,
+        api_request_tracker: Arc<ApiRequestTracker>,
+        api_control_gate: Arc<ApiControlGate>,
         node_id: NodeId,
         runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
         source: Arc<SourceFacade>,
@@ -1558,6 +1642,8 @@ impl FSMetaApp {
             pending_facade,
             facade_spawn_in_progress,
             facade_pending_status,
+            api_request_tracker,
+            api_control_gate,
             node_id,
             runtime_boundary,
             source,
@@ -1571,7 +1657,9 @@ impl FSMetaApp {
              sink,
              query_sink,
              query_runtime_boundary,
-             facade_pending_status| async move {
+             facade_pending_status,
+             api_request_tracker,
+             api_control_gate| async move {
                 api::spawn(
                     resolved,
                     node_id,
@@ -1581,6 +1669,8 @@ impl FSMetaApp {
                     query_sink,
                     query_runtime_boundary,
                     facade_pending_status,
+                    api_request_tracker,
+                    api_control_gate,
                 )
                 .await
             },
@@ -1594,6 +1684,8 @@ impl FSMetaApp {
         pending_facade: Arc<Mutex<Option<PendingFacadeActivation>>>,
         facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
         facade_pending_status: SharedFacadePendingStatusCell,
+        api_request_tracker: Arc<ApiRequestTracker>,
+        api_control_gate: Arc<ApiControlGate>,
         node_id: NodeId,
         runtime_boundary: Option<Arc<dyn ChannelIoSubset>>,
         source: Arc<SourceFacade>,
@@ -1612,6 +1704,8 @@ impl FSMetaApp {
             Arc<SinkFacade>,
             Option<Arc<dyn ChannelIoSubset>>,
             SharedFacadePendingStatusCell,
+            Arc<ApiRequestTracker>,
+            Arc<ApiControlGate>,
         ) -> SpawnFut,
         SpawnFut: std::future::Future<Output = Result<api::ApiServerHandle>>,
     {
@@ -1730,6 +1824,8 @@ impl FSMetaApp {
             query_sink,
             query_runtime_boundary,
             facade_pending_status.clone(),
+            api_request_tracker.clone(),
+            api_control_gate.clone(),
         )
         .await;
         {
@@ -1774,7 +1870,7 @@ impl FSMetaApp {
                 "fs_meta_runtime_app: shutting down stale facade handle generation={} route_key={}",
                 pending.generation, pending.route_key
             );
-            handle.shutdown(Duration::from_secs(2)).await;
+            handle.shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT).await;
             let mut guard = match process_facade_claim_cell().lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -1811,7 +1907,7 @@ impl FSMetaApp {
                 "fs_meta_runtime_app: shutting down previous active facade generation={}",
                 current.generation
             );
-            current.handle.shutdown(Duration::from_secs(2)).await;
+            current.handle.shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT).await;
         }
         Ok(true)
     }
@@ -2073,13 +2169,16 @@ impl FSMetaApp {
     }
 
     async fn shutdown_active_facade(&self) {
+        self.api_request_tracker.wait_for_drain().await;
+        #[cfg(test)]
+        notify_facade_shutdown_started();
         eprintln!("fs_meta_runtime_app: shutdown_active_facade");
         if let Some(current) = self.api_task.lock().await.take() {
             eprintln!(
                 "fs_meta_runtime_app: shutting down previous active facade generation={}",
                 current.generation
             );
-            current.handle.shutdown(Duration::from_secs(2)).await;
+            current.handle.shutdown(ACTIVE_FACADE_SHUTDOWN_TIMEOUT).await;
         }
         clear_owned_process_facade_claim(self.instance_id);
     }
@@ -2145,6 +2244,12 @@ impl FSMetaApp {
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let _serial_guard = self.control_frame_serial.lock().await;
         let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
+        let request_sensitive = !source_signals.is_empty()
+            || !sink_signals.is_empty()
+            || !facade_signals.is_empty();
+        if request_sensitive && self.api_request_tracker.inflight() > 0 {
+            self.api_request_tracker.wait_for_drain().await;
+        }
         eprintln!(
             "fs_meta_runtime_app: on_control_frame begin source_signals={} sink_signals={} facade_signals={} initialized={}",
             source_signals.len(),
@@ -2251,7 +2356,9 @@ impl FSMetaApp {
     }
 
     async fn service_close(&self) -> Result<()> {
+        self.api_request_tracker.wait_for_drain().await;
         self.control_initialized.store(false, Ordering::Release);
+        self.api_control_gate.set_ready(false);
         *self.pending_facade.lock().await = None;
         *self.facade_spawn_in_progress.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
@@ -2523,7 +2630,8 @@ mod tests {
     };
     use capanix_host_fs_types::UnixStat;
     use capanix_runtime_entry_sdk::control::{
-        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeHostDescriptor,
+        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate,
+        RuntimeHostDescriptor,
         RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType,
         RuntimeObjectDescriptor, RuntimeUnitExposure, RuntimeUnitTick, encode_runtime_exec_control,
         encode_runtime_host_grant_change, encode_runtime_unit_exposure, encode_runtime_unit_tick,
@@ -2648,6 +2756,17 @@ mod tests {
             }],
         }))
         .expect("encode activate envelope with scopes")
+    }
+
+    fn deactivate_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
+        encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
+            route_key: facade_control_stream_route(),
+            unit_id: unit_id.to_string(),
+            lease: None,
+            generation,
+            reason: "test deactivate".to_string(),
+        }))
+        .expect("encode deactivate envelope")
     }
 
     fn activate_envelope_with_scope_rows(
@@ -3876,6 +3995,8 @@ mod tests {
             app.query_sink.clone(),
             app.runtime_boundary.clone(),
             app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
         )
         .await
         {
@@ -3984,6 +4105,8 @@ mod tests {
             app.query_sink.clone(),
             app.runtime_boundary.clone(),
             app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
         )
         .await
         {
@@ -4100,6 +4223,8 @@ mod tests {
             let sink = app.sink.clone();
             let query_sink = app.query_sink.clone();
             let query_runtime_boundary = app.runtime_boundary.clone();
+            let api_request_tracker = app.api_request_tracker.clone();
+            let api_control_gate = app.api_control_gate.clone();
             let spawn_started = spawn_started.clone();
             let release_spawn = release_spawn.clone();
             let spawn_calls = spawn_calls.clone();
@@ -4110,6 +4235,8 @@ mod tests {
                     pending_facade,
                     facade_spawn_in_progress,
                     facade_pending_status,
+                    api_request_tracker,
+                    api_control_gate,
                     node_id,
                     runtime_boundary,
                     source,
@@ -4123,7 +4250,9 @@ mod tests {
                           sink,
                           query_sink,
                           query_runtime_boundary,
-                          facade_pending_status| {
+                          facade_pending_status,
+                          api_request_tracker,
+                          api_control_gate| {
                         let spawn_started = spawn_started.clone();
                         let release_spawn = release_spawn.clone();
                         let spawn_calls = spawn_calls.clone();
@@ -4140,6 +4269,8 @@ mod tests {
                                 query_sink,
                                 query_runtime_boundary,
                                 facade_pending_status,
+                                api_request_tracker,
+                                api_control_gate,
                             )
                             .await
                         }
@@ -4161,13 +4292,15 @@ mod tests {
             app.pending_facade.clone(),
             app.facade_spawn_in_progress.clone(),
             app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
             app.node_id.clone(),
             app.runtime_boundary.clone(),
             app.source.clone(),
             app.sink.clone(),
             app.query_sink.clone(),
             app.runtime_boundary.clone(),
-            move |_, _, _, _, _, _, _, _| async move {
+            move |_, _, _, _, _, _, _, _, _, _| async move {
                 panic!("duplicate facade spawn must be suppressed while same-resource spawn is in progress");
                 #[allow(unreachable_code)]
                 Err(CnxError::Internal("unreachable".into()))
@@ -4397,6 +4530,8 @@ mod tests {
             app.query_sink.clone(),
             app.runtime_boundary.clone(),
             app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
         )
         .await
         {
@@ -4519,6 +4654,8 @@ mod tests {
             app.query_sink.clone(),
             app.runtime_boundary.clone(),
             app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
         )
         .await
         {
@@ -4601,6 +4738,2078 @@ mod tests {
                 .is_some_and(|msg| msg.contains("fs-meta api bind failed"))
         );
         app.close().await.expect("close fs-meta app");
+    }
+
+    struct RootsPutPauseHookReset;
+
+    impl Drop for RootsPutPauseHookReset {
+        fn drop(&mut self) {
+            crate::api::clear_roots_put_pause_hook();
+        }
+    }
+
+    struct SourceWorkerCloseHookReset;
+
+    impl Drop for SourceWorkerCloseHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_close_hook();
+        }
+    }
+
+    struct SourceWorkerControlFrameHookReset;
+
+    impl Drop for SourceWorkerControlFrameHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_control_frame_hook();
+        }
+    }
+
+    struct SourceWorkerUpdateRootsHookReset;
+
+    impl Drop for SourceWorkerUpdateRootsHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_update_roots_hook();
+        }
+    }
+
+    struct SinkWorkerUpdateRootsHookReset;
+
+    impl Drop for SinkWorkerUpdateRootsHookReset {
+        fn drop(&mut self) {
+            crate::workers::sink::clear_sink_worker_update_roots_hook();
+        }
+    }
+
+    struct SinkWorkerCloseHookReset;
+
+    impl Drop for SinkWorkerCloseHookReset {
+        fn drop(&mut self) {
+            crate::workers::sink::clear_sink_worker_close_hook();
+        }
+    }
+
+    struct FacadeShutdownStartHookReset;
+
+    impl Drop for FacadeShutdownStartHookReset {
+        fn drop(&mut self) {
+            clear_facade_shutdown_start_hook();
+        }
+    }
+
+    #[tokio::test]
+    async fn closing_app_waits_for_inflight_roots_put_before_tearing_down_facade() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _reset = RootsPutPauseHookReset;
+        crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let close_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.close().await }
+        });
+        tokio::time::sleep(Duration::from_millis(2200)).await;
+        assert!(
+            !close_task.is_finished(),
+            "app.close() must wait for the in-flight roots_put to finish before tearing down the facade"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before facade teardown: status={status} body={body}"
+        );
+        close_task
+            .await
+            .expect("join app close")
+            .expect("close app after in-flight roots_put");
+    }
+
+    #[tokio::test]
+    async fn closing_app_does_not_start_source_close_before_inflight_roots_put_reaches_worker_dispatch(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _roots_reset = RootsPutPauseHookReset;
+        crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let close_started = Arc::new(Notify::new());
+        let _close_reset = SourceWorkerCloseHookReset;
+        crate::workers::source::install_source_worker_close_hook(
+            crate::workers::source::SourceWorkerCloseHook {
+                entered: close_started.clone(),
+            },
+        );
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let close_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.close().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), close_started.notified())
+                .await
+                .is_err(),
+            "source close must not start while roots_put is still in flight before source worker dispatch"
+        );
+
+        release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before source close starts: status={status} body={body}"
+        );
+        close_task
+            .await
+            .expect("join app close")
+            .expect("close app after roots_put");
+    }
+
+    #[tokio::test]
+    async fn closing_app_does_not_start_facade_shutdown_while_inflight_roots_put_is_dispatching_to_source_worker(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let update_entered = Arc::new(Notify::new());
+        let update_release = Arc::new(Notify::new());
+        let _update_reset = SourceWorkerUpdateRootsHookReset;
+        crate::workers::source::install_source_worker_update_roots_hook(
+            crate::workers::source::SourceWorkerUpdateRootsHook {
+                entered: update_entered.clone(),
+                release: update_release.clone(),
+            },
+        );
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        update_entered.notified().await;
+        let close_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.close().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), shutdown_started.notified())
+                .await
+                .is_err(),
+            "facade shutdown must not start while roots_put is still dispatching update_logical_roots to the source worker"
+        );
+
+        update_release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before facade shutdown starts: status={status} body={body}"
+        );
+        close_task
+            .await
+            .expect("join app close")
+            .expect("close app after roots_put");
+    }
+
+    #[tokio::test]
+    async fn roots_put_waits_for_control_initialization_before_source_update_dispatch() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let update_entered = Arc::new(Notify::new());
+        let update_release = Arc::new(Notify::new());
+        let _update_reset = SourceWorkerUpdateRootsHookReset;
+        crate::workers::source::install_source_worker_update_roots_hook(
+            crate::workers::source::SourceWorkerUpdateRootsHook {
+                entered: update_entered.clone(),
+                release: update_release.clone(),
+            },
+        );
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), update_entered.notified())
+                .await
+                .is_err(),
+            "roots_put must not dispatch source update_logical_roots before runtime control initializes the restarted app"
+        );
+
+        app.on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect("initialize app from runtime control");
+
+        update_entered.notified().await;
+        update_release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "roots_put should complete after runtime control initialization: status={status} body={body}"
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn control_frame_waits_for_inflight_roots_put_before_source_reconfiguration() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _roots_reset = RootsPutPauseHookReset;
+        crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let control_started = Arc::new(Notify::new());
+        let _control_reset = SourceWorkerControlFrameHookReset;
+        crate::workers::source::install_source_worker_control_frame_hook(
+            crate::workers::source::SourceWorkerControlFrameHook {
+                entered: control_started.clone(),
+            },
+        );
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let control_task = tokio::spawn({
+            let app = app.clone();
+            async move { app.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), control_started.notified())
+                .await
+                .is_err(),
+            "source control-frame reconfiguration must not start while roots_put is still in flight after previous source roots"
+        );
+
+        release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before source control reconfiguration starts: status={status} body={body}"
+        );
+        control_task
+            .await
+            .expect("join control-frame task")
+            .expect("handle control frame after roots_put");
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn closing_successor_app_waits_for_inflight_roots_put_before_shared_source_close() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let app_1 = make_app();
+        let app_2 = make_app();
+
+        if cfg!(target_os = "linux") {
+            match app_1.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app_1.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app_1
+                .config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app_1.node_id.clone(),
+            app_1.runtime_boundary.clone(),
+            app_1.source.clone(),
+            app_1.sink.clone(),
+            app_1.query_sink.clone(),
+            app_1.runtime_boundary.clone(),
+            app_1.facade_pending_status.clone(),
+            app_1.api_request_tracker.clone(),
+            app_1.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app_1.close().await.expect("close app after bind restriction");
+                app_2.close().await.expect("close second app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app_1.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _roots_reset = RootsPutPauseHookReset;
+        crate::api::install_roots_put_pause_hook(crate::api::RootsPutPauseHook {
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+
+        let close_started = Arc::new(Notify::new());
+        let _close_reset = SourceWorkerCloseHookReset;
+        crate::workers::source::install_source_worker_close_hook(
+            crate::workers::source::SourceWorkerCloseHook {
+                entered: close_started.clone(),
+            },
+        );
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        entered.notified().await;
+        let close_task = tokio::spawn({
+            let app_2 = app_2.clone();
+            async move { app_2.close().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), close_started.notified())
+                .await
+                .is_err(),
+            "successor app close must not start shared source worker shutdown while the active instance roots_put is still in flight after previous source roots"
+        );
+
+        release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before successor app closes the shared source worker: status={status} body={body}"
+        );
+        close_task
+            .await
+            .expect("join successor app close")
+            .expect("close successor app after roots_put");
+        app_1.close().await.expect("close first app");
+    }
+
+    #[tokio::test]
+    async fn closing_successor_app_waits_for_inflight_roots_put_before_shared_sink_close() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let app_1 = make_app();
+        let app_2 = make_app();
+
+        if cfg!(target_os = "linux") {
+            match app_1.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app_1.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app_1
+                .config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app_1.node_id.clone(),
+            app_1.runtime_boundary.clone(),
+            app_1.source.clone(),
+            app_1.sink.clone(),
+            app_1.query_sink.clone(),
+            app_1.runtime_boundary.clone(),
+            app_1.facade_pending_status.clone(),
+            app_1.api_request_tracker.clone(),
+            app_1.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app_1.close().await.expect("close app after bind restriction");
+                app_2.close().await.expect("close second app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app_1.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let update_entered = Arc::new(Notify::new());
+        let update_release = Arc::new(Notify::new());
+        let _update_reset = SinkWorkerUpdateRootsHookReset;
+        crate::workers::sink::install_sink_worker_update_roots_hook(
+            crate::workers::sink::SinkWorkerUpdateRootsHook {
+                entered: update_entered.clone(),
+                release: update_release.clone(),
+            },
+        );
+
+        let close_started = Arc::new(Notify::new());
+        let _close_reset = SinkWorkerCloseHookReset;
+        crate::workers::sink::install_sink_worker_close_hook(
+            crate::workers::sink::SinkWorkerCloseHook {
+                entered: close_started.clone(),
+            },
+        );
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        update_entered.notified().await;
+        let close_task = tokio::spawn({
+            let app_2 = app_2.clone();
+            async move { app_2.close().await }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), close_started.notified())
+                .await
+                .is_err(),
+            "successor app close must not start shared sink worker shutdown while the active instance roots_put is still in flight during sink update"
+        );
+
+        update_release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before successor app closes the shared sink worker: status={status} body={body}"
+        );
+        close_task
+            .await
+            .expect("join successor app close")
+            .expect("close successor app after roots_put");
+        app_1.close().await.expect("close first app");
+    }
+
+    #[tokio::test]
+    async fn facade_reactivation_waits_for_inflight_roots_put_after_source_update_begins() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let update_entered = Arc::new(Notify::new());
+        let update_release = Arc::new(Notify::new());
+        let _update_reset = SourceWorkerUpdateRootsHookReset;
+        crate::workers::source::install_source_worker_update_roots_hook(
+            crate::workers::source::SourceWorkerUpdateRootsHook {
+                entered: update_entered.clone(),
+                release: update_release.clone(),
+            },
+        );
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        update_entered.notified().await;
+        let control_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[
+                    activate_envelope_with_scopes(
+                        execution_units::FACADE_RUNTIME_UNIT_ID,
+                        "test-root",
+                        &["listener-a"],
+                    ),
+                    trusted_exposure_confirmed_envelope(
+                        execution_units::FACADE_RUNTIME_UNIT_ID,
+                        1,
+                    ),
+                ])
+                .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), shutdown_started.notified())
+                .await
+                .is_err(),
+            "facade reactivation must not start shutdown while roots_put is still dispatching update_logical_roots to the source worker"
+        );
+
+        update_release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before facade reactivation shutdown starts: status={status} body={body}"
+        );
+        control_task
+            .await
+            .expect("join control-frame task")
+            .expect("handle facade reactivation after roots_put");
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn facade_reactivation_waits_for_inflight_roots_put_after_sink_update_begins() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let update_entered = Arc::new(Notify::new());
+        let update_release = Arc::new(Notify::new());
+        let _update_reset = SinkWorkerUpdateRootsHookReset;
+        crate::workers::sink::install_sink_worker_update_roots_hook(
+            crate::workers::sink::SinkWorkerUpdateRootsHook {
+                entered: update_entered.clone(),
+                release: update_release.clone(),
+            },
+        );
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        update_entered.notified().await;
+        let control_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[
+                    activate_envelope_with_scopes(
+                        execution_units::FACADE_RUNTIME_UNIT_ID,
+                        "test-root",
+                        &["listener-a"],
+                    ),
+                    trusted_exposure_confirmed_envelope(
+                        execution_units::FACADE_RUNTIME_UNIT_ID,
+                        1,
+                    ),
+                ])
+                .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), shutdown_started.notified())
+                .await
+                .is_err(),
+            "facade reactivation must not start shutdown while roots_put is still dispatching update_logical_roots to the sink worker"
+        );
+
+        update_release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before facade reactivation shutdown starts: status={status} body={body}"
+        );
+        control_task
+            .await
+            .expect("join control-frame task")
+            .expect("handle facade reactivation after roots_put");
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn facade_deactivate_waits_for_inflight_roots_put_after_sink_update_begins() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let update_entered = Arc::new(Notify::new());
+        let update_release = Arc::new(Notify::new());
+        let _update_reset = SinkWorkerUpdateRootsHookReset;
+        crate::workers::sink::install_sink_worker_update_roots_hook(
+            crate::workers::sink::SinkWorkerUpdateRootsHook {
+                entered: update_entered.clone(),
+                release: update_release.clone(),
+            },
+        );
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        update_entered.notified().await;
+        let control_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[deactivate_envelope(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    1,
+                )])
+                .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), shutdown_started.notified())
+                .await
+                .is_err(),
+            "facade deactivate must not start shutdown while roots_put is still dispatching update_logical_roots to the sink worker"
+        );
+
+        update_release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before facade deactivate shutdown starts: status={status} body={body}"
+        );
+        control_task
+            .await
+            .expect("join control-frame task")
+            .expect("handle facade deactivate after roots_put");
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_sink_update_begins(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary),
+                state_boundary,
+            )
+            .expect("init external-worker app"),
+        );
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        app.apply_facade_activate(
+            FacadeRuntimeUnit::Facade,
+            &facade_control_stream_route(),
+            2,
+            &[RuntimeBoundScope {
+                scope_id: "test-root".to_string(),
+                resource_ids: vec!["listener-a".to_string()],
+            }],
+        )
+        .await
+        .expect("queue pending facade replacement");
+
+        let client = Client::new();
+        let login = client
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+        let login_body: serde_json::Value = login.json().await.expect("decode login");
+        let token = login_body["token"].as_str().expect("token").to_string();
+
+        let update_entered = Arc::new(Notify::new());
+        let update_release = Arc::new(Notify::new());
+        let _update_reset = SinkWorkerUpdateRootsHookReset;
+        crate::workers::sink::install_sink_worker_update_roots_hook(
+            crate::workers::sink::SinkWorkerUpdateRootsHook {
+                entered: update_entered.clone(),
+                release: update_release.clone(),
+            },
+        );
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+
+        let roots_body = json!({
+            "roots": [{
+                "id": "test-root",
+                "selector": { "fs_source": fs_source },
+                "subpath_scope": "/",
+                "watch": false,
+                "scan": true,
+            }]
+        });
+        let request = tokio::spawn({
+            let client = client.clone();
+            let bind_addr = bind_addr.clone();
+            let token = token.clone();
+            async move {
+                client
+                    .put(format!("http://{bind_addr}/api/fs-meta/v1/monitoring/roots"))
+                    .bearer_auth(token)
+                    .json(&roots_body)
+                    .send()
+                    .await
+            }
+        });
+
+        update_entered.notified().await;
+        let control_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[trusted_exposure_confirmed_envelope(
+                    execution_units::FACADE_RUNTIME_UNIT_ID,
+                    2,
+                )])
+                .await
+            }
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), shutdown_started.notified())
+                .await
+                .is_err(),
+            "pending facade exposure confirmation must not start shutdown while roots_put is still dispatching update_logical_roots to the sink worker"
+        );
+
+        update_release.notify_waiters();
+
+        let response = request
+            .await
+            .expect("join roots_put request")
+            .expect("roots_put request should complete");
+        let status = response.status();
+        let body = response.text().await.expect("decode roots_put body");
+        assert!(
+            status.is_success(),
+            "in-flight roots_put should complete before pending facade replacement shutdown starts: status={status} body={body}"
+        );
+        control_task
+            .await
+            .expect("join control-frame task")
+            .expect("handle exposure confirmation after roots_put");
+        app.close().await.expect("close app");
     }
 
     #[test]

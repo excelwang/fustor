@@ -1491,6 +1491,37 @@ fn mounts_by_fs_source(grants: &Value) -> Result<BTreeMap<String, Vec<PathBuf>>,
     Ok(by_fs_source)
 }
 
+fn normalize_mount_candidate_for_group(group_id: &str, path: &std::path::Path) -> PathBuf {
+    if path.exists() {
+        return path.to_path_buf();
+    }
+    path.ancestors()
+        .skip(1)
+        .find(|ancestor| {
+            ancestor.exists()
+                && ancestor
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name == group_id)
+        })
+        .map(std::path::Path::to_path_buf)
+        .unwrap_or_else(|| path.to_path_buf())
+}
+
+fn representative_mount_for_group(group_id: &str, paths: &[PathBuf]) -> Option<PathBuf> {
+    let mut candidates = paths
+        .iter()
+        .map(|path| normalize_mount_candidate_for_group(group_id, path))
+        .collect::<Vec<_>>();
+    candidates.sort_by(|a, b| {
+        (!a.exists())
+            .cmp(&(!b.exists()))
+            .then_with(|| a.components().count().cmp(&b.components().count()))
+            .then_with(|| a.cmp(b))
+    });
+    candidates.into_iter().next()
+}
+
 fn group_mount_pairs_for_roots(
     grants: &Value,
     roots: &[(&str, &str)],
@@ -1501,12 +1532,55 @@ fn group_mount_pairs_for_roots(
         .map(|(group_id, fs_source)| {
             mount_map
                 .get(*fs_source)
-                .and_then(|paths| paths.first())
-                .cloned()
+                .and_then(|paths| representative_mount_for_group(group_id, paths))
                 .map(|path| (group_id.to_string(), path))
                 .ok_or_else(|| format!("missing representative mount for fs_source {fs_source}"))
         })
         .collect()
+}
+
+#[test]
+fn group_mount_pairs_for_roots_prefers_existing_root_mount_over_nested_child_path() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_mount = temp.path().join("mounts/node-b/nfs3");
+    std::fs::create_dir_all(&root_mount).expect("create root mount");
+    let nested_child = root_mount.join("baseline");
+    let grants = json!({
+        "grants": [
+            {
+                "fs_source": "nfs3-source",
+                "mount_point": nested_child.display().to_string()
+            },
+            {
+                "fs_source": "nfs3-source",
+                "mount_point": root_mount.display().to_string()
+            }
+        ]
+    });
+
+    let pairs = group_mount_pairs_for_roots(&grants, &[("nfs3", "nfs3-source")]).expect("pairs");
+
+    assert_eq!(pairs, vec![("nfs3".to_string(), root_mount)]);
+}
+
+#[test]
+fn group_mount_pairs_for_roots_recovers_existing_group_root_from_missing_nested_child_mount() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root_mount = temp.path().join("mounts/node-b/nfs3");
+    std::fs::create_dir_all(&root_mount).expect("create root mount");
+    let missing_nested_child = root_mount.join("baseline");
+    let grants = json!({
+        "grants": [
+            {
+                "fs_source": "nfs3-source",
+                "mount_point": missing_nested_child.display().to_string()
+            }
+        ]
+    });
+
+    let pairs = group_mount_pairs_for_roots(&grants, &[("nfs3", "nfs3-source")]).expect("pairs");
+
+    assert_eq!(pairs, vec![("nfs3".to_string(), root_mount)]);
 }
 
 fn normalize_tree_like_json(value: &mut Value) {

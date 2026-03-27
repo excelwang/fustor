@@ -60,7 +60,7 @@ use crate::source::drift::DriftEstimator;
 use crate::source::scanner::ParallelScanner;
 use crate::source::sentinel::{HealthSignal, Sentinel, SentinelAction, SentinelConfig};
 use crate::source::watcher::WatchManager;
-use crate::state::cell::{AuthorityJournal, SignalCell};
+use crate::state::cell::{AuthorityJournal, LogicalRootsCell, SignalCell};
 use crate::state::commit_boundary::CommitBoundary;
 use crate::FileMetaRecord;
 
@@ -607,6 +607,7 @@ struct FanoutHealthState {
 #[derive(Clone)]
 struct SourceStateCell {
     logical_roots: Arc<Mutex<Vec<RootSpec>>>,
+    logical_roots_cell: LogicalRootsCell,
     roots: Arc<Mutex<Vec<RootRuntime>>>,
     root_tasks: Arc<Mutex<HashMap<String, RootTaskEntry>>>,
     stream_binding: Arc<Mutex<Option<SourceStreamBinding>>>,
@@ -622,6 +623,7 @@ struct SourceStateCell {
 impl SourceStateCell {
     fn new(
         logical_roots: Vec<RootSpec>,
+        logical_roots_cell: LogicalRootsCell,
         roots: Vec<RootRuntime>,
         logical_root_fanout: HashMap<String, Vec<GrantedMountRoot>>,
         host_object_grants: Vec<GrantedMountRoot>,
@@ -630,6 +632,7 @@ impl SourceStateCell {
     ) -> Self {
         let cell = Self {
             logical_roots: Arc::new(Mutex::new(logical_roots)),
+            logical_roots_cell,
             roots: Arc::new(Mutex::new(roots)),
             root_tasks: Arc::new(Mutex::new(HashMap::new())),
             stream_binding: Arc::new(Mutex::new(None)),
@@ -1887,7 +1890,21 @@ impl FSMetaSource {
         _defer_authority_read: bool,
     ) -> Result<Self> {
         let initial_host_object_grants = config.host_object_grants.clone();
-        let root_specs = config.effective_roots().map_err(CnxError::InvalidInput)?;
+        let configured_root_specs = config.effective_roots().map_err(CnxError::InvalidInput)?;
+        let authority =
+            AuthorityJournal::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, state_boundary.clone())
+                .map_err(|err| {
+                CnxError::InvalidInput(format!("source statecell authority init failed: {err}"))
+            })?;
+        let logical_roots_cell = LogicalRootsCell::from_state_boundary(
+            SOURCE_RUNTIME_UNIT_ID,
+            configured_root_specs,
+            state_boundary.clone(),
+        )
+        .map_err(|err| {
+            CnxError::InvalidInput(format!("source logical-roots state init failed: {err}"))
+        })?;
+        let root_specs = logical_roots_cell.snapshot();
         let drift_estimator = Arc::new(Mutex::new(DriftEstimator::new(
             config.drift_window_size,
             config.drift_graduation_threshold,
@@ -1906,11 +1923,6 @@ impl FSMetaSource {
         let logical_root_fanout =
             Self::compute_logical_root_fanout(&root_specs, &initial_host_object_grants);
         let fanout_health = Arc::new(Mutex::new(FanoutHealthState::default()));
-        let authority =
-            AuthorityJournal::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, state_boundary.clone())
-                .map_err(|err| {
-                CnxError::InvalidInput(format!("source statecell authority init failed: {err}"))
-            })?;
         let manual_rescan_signal = SignalCell::from_state_boundary(
             SOURCE_RUNTIME_UNIT_ID,
             MANUAL_RESCAN_SIGNAL_NAME,
@@ -1945,6 +1957,7 @@ impl FSMetaSource {
             shutdown: CancellationToken::new(),
             state_cell: SourceStateCell::new(
                 root_specs,
+                logical_roots_cell,
                 roots,
                 logical_root_fanout,
                 initial_host_object_grants,
@@ -2923,6 +2936,10 @@ impl FSMetaSource {
             "source.update.logical_root_fanout",
         ) = fanout;
         self.refresh_runtime_roots(true).await?;
+        self.state_cell
+            .logical_roots_cell
+            .replace(root_specs.clone())
+            .await?;
         self.state_cell.record_authoritative_commit(
             "source.update_logical_roots",
             format!("roots={} host_object_grants={}", root_count, grant_count),
@@ -4688,6 +4705,53 @@ mod tests {
             "runtime host object grants changed should append authority record (update={}, control={})",
             after_update,
             after_control
+        );
+    }
+
+    #[tokio::test]
+    async fn logical_roots_survive_restart_on_shared_state_boundary_after_update() {
+        let boundary = in_memory_state_boundary();
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![
+            root("nfs2", "/mnt/nfs2"),
+            root("nfs3", "/mnt/nfs3"),
+            root("nfs4", "/mnt/nfs4"),
+        ];
+        cfg.host_object_grants = vec![
+            test_export("node-a::nfs2", "node-a", "10.0.0.11", "/mnt/nfs2", true),
+            test_export("node-b::nfs3", "node-b", "10.0.0.12", "/mnt/nfs3", true),
+            test_export("node-c::nfs4", "node-c", "10.0.0.13", "/mnt/nfs4", true),
+        ];
+
+        let source = FSMetaSource::with_boundaries_and_state(
+            cfg.clone(),
+            NodeId("node-a".to_string()),
+            None,
+            boundary.clone(),
+        )
+        .expect("build source");
+        source
+            .update_logical_roots(vec![root("nfs2", "/mnt/nfs2"), root("nfs4", "/mnt/nfs4")])
+            .await
+            .expect("update logical roots");
+        source.close().await.expect("close source");
+
+        let restarted = FSMetaSource::with_boundaries_and_state(
+            cfg,
+            NodeId("node-a".to_string()),
+            None,
+            boundary,
+        )
+        .expect("restart source");
+        let restarted_root_ids = restarted
+            .logical_roots_snapshot()
+            .into_iter()
+            .map(|root| root.id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            restarted_root_ids,
+            vec!["nfs2".to_string(), "nfs4".to_string()],
+            "restart on the same state boundary must preserve the updated authoritative roots instead of reintroducing retired roots",
         );
     }
 

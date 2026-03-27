@@ -45,6 +45,13 @@ impl ApiError {
             message: msg.into(),
         }
     }
+
+    pub fn service_unavailable(msg: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: msg.into(),
+        }
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -64,6 +71,7 @@ impl From<CnxError> for ApiError {
         match value {
             CnxError::InvalidInput(msg) => Self::bad_request(msg),
             CnxError::NotSupported(msg) => Self::bad_request(msg),
+            CnxError::NotReady(msg) => Self::service_unavailable(msg),
             other => Self::internal(other.to_string()),
         }
     }
