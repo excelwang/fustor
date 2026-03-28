@@ -1111,8 +1111,20 @@ fn scenario_sink_failover(
     session: &mut OperatorSession,
     app_id: &str,
 ) -> Result<(), String> {
-    let before = current_sink_failover_holder_snapshot(cluster, app_id)?
-        .ok_or_else(|| "no current sink holder to fail over".to_string())?;
+    let mut before = None::<SinkHolderSnapshot>;
+    wait_until(
+        Duration::from_secs(90),
+        "initial scoped sink holder elected",
+        || {
+            before = current_sink_failover_holder_snapshot(cluster, app_id)?;
+            if before.is_some() {
+                Ok(true)
+            } else {
+                Err("no current sink holder to fail over".to_string())
+            }
+        },
+    )?;
+    let before = before.ok_or_else(|| "no current sink holder to fail over".to_string())?;
     let pid = before
         .active_pids
         .iter()

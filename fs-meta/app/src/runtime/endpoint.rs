@@ -42,6 +42,15 @@ fn is_materialized_internal_query_route(route: &RouteKey) -> bool {
     route.0 == format!("{}.req", ROUTE_KEY_SINK_QUERY_INTERNAL)
 }
 
+fn is_stale_grant_attachment_recv_gap(err: &CnxError) -> bool {
+    matches!(
+        err,
+        CnxError::AccessDenied(message) | CnxError::PeerError(message)
+            if message.contains("drained/fenced")
+                && message.contains("grant attachments")
+    )
+}
+
 fn summarize_event_origins(events: &[Event]) -> Vec<String> {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for event in events {
@@ -262,6 +271,16 @@ async fn run_endpoint_loop<F, Fut>(
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
+            Err(err) if is_stale_grant_attachment_recv_gap(&err) => {
+                log::debug!(
+                    "endpoint task {} recv retry for {} after stale grant-attachment gap: {:?}",
+                    join_name,
+                    route.0,
+                    err
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             Err(err) => {
                 exit_reason = Some(format!("recv_failed:{err}"));
                 log::warn!(
@@ -419,6 +438,14 @@ async fn run_stream_loop<F, Fut, G>(
                 tokio::time::sleep(Duration::from_millis(50)).await;
                 continue;
             }
+            Err(err) if is_stale_grant_attachment_recv_gap(&err) => {
+                eprintln!(
+                    "fs_meta_runtime_endpoint: stale grant-attachment recv gap task={} route={} err={:?}",
+                    join_name, stream_channel.0, err
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
             Err(err) => {
                 eprintln!(
                     "fs_meta_runtime_endpoint: terminal stream recv failure task={} route={} err={:?}",
@@ -484,6 +511,7 @@ mod tests {
     enum FirstFailure {
         NotSupported,
         Timeout,
+        StaleGrantAttachment,
     }
 
     enum RecvStep {
@@ -560,6 +588,10 @@ mod tests {
                         Err(CnxError::NotSupported("transient attach gap".into()))
                     }
                     FirstFailure::Timeout => Err(CnxError::Timeout),
+                    FirstFailure::StaleGrantAttachment => Err(CnxError::AccessDenied(
+                        "pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                            .into(),
+                    )),
                 };
             }
             Err(CnxError::Internal("stop after first recv".into()))
@@ -770,6 +802,31 @@ mod tests {
         );
     }
 
+
+    #[test]
+    fn endpoint_loop_retries_stale_drained_fenced_grant_attachment_errors() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::StaleGrantAttachment)),
+        });
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("sink-status:v1.req".into()),
+            "test-endpoint".into(),
+            CancellationToken::new(),
+            Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec![
+                "sink-status:v1.req".to_string(),
+                "sink-status:v1.req".to_string()
+            ]
+        );
+    }
+
     #[test]
     fn endpoint_loop_retries_transient_reply_send_timeout_and_handles_later_batches() {
         let boundary = Arc::new(ReplyTimeoutThenRecoverBoundary::new(
@@ -792,6 +849,32 @@ mod tests {
                 "materialized-find:v1.req:reply".to_string()
             ],
             "endpoint loop should keep serving later materialized batches after a transient reply send timeout"
+        );
+    }
+
+
+    #[test]
+    fn stream_loop_retries_stale_drained_fenced_grant_attachment_errors() {
+        let boundary = Arc::new(RecordingBoundary {
+            recv_keys: Mutex::new(Vec::new()),
+            first_failure: Mutex::new(Some(FirstFailure::StaleGrantAttachment)),
+        });
+        crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
+            boundary.clone(),
+            RouteKey("fs-meta.events:v1.stream".into()),
+            "test-stream".into(),
+            CancellationToken::new(),
+            Arc::new(|| true),
+            Arc::new(|_events: Vec<Event>| std::future::ready(())),
+        ));
+
+        let recv_keys = boundary.recv_keys.lock().expect("recv_keys lock").clone();
+        assert_eq!(
+            recv_keys,
+            vec![
+                "fs-meta.events:v1.stream".to_string(),
+                "fs-meta.events:v1.stream".to_string()
+            ]
         );
     }
 

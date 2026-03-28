@@ -340,6 +340,7 @@ fn scope_unit_intent_to_scope_worker_intent_value(
                 "startup": serde_json::Value::Object(startup),
                 "mode": mode,
                 "config": entry.get("config").cloned().unwrap_or(serde_json::Value::Null),
+                "runtime": entry.get("runtime").cloned().unwrap_or_else(|| serde_json::json!({})),
             })
         })
         .collect::<Vec<_>>();
@@ -795,6 +796,39 @@ mod tests {
                 "startup manifest activation routes must cover release runtime.route_units key {route_key}"
             );
         }
+    }
+
+    #[test]
+    fn compile_relation_target_intent_preserves_runtime_scopes_and_route_units() {
+        let spec = FsMetaReleaseSpec {
+            app_id: "test-app".to_string(),
+            api_facade_resource_id: "listener".to_string(),
+            auth: ApiAuthConfig::default(),
+            roots: vec![RootSpec::new("nfs1", "/mnt/nfs1")],
+            route_plan_node_ids: vec!["node-a".to_string(), "node-b".to_string()],
+            worker_module_path: None,
+            worker_modes: Default::default(),
+        };
+
+        let release_doc = build_release_doc_value(&spec);
+        let declaration = scope_unit_intent_to_scope_worker_intent_value(&release_doc)
+            .expect("convert scope-unit intent to scope-worker intent");
+        let worker_runtime = declaration["workers"][0]["runtime"]
+            .as_object()
+            .expect("worker runtime object");
+
+        assert!(
+            worker_runtime.contains_key("app_scopes"),
+            "compiled relation target intent must preserve runtime.app_scopes"
+        );
+        assert!(
+            worker_runtime.contains_key("route_units"),
+            "compiled relation target intent must preserve runtime.route_units"
+        );
+        assert!(
+            worker_runtime.contains_key("units"),
+            "compiled relation target intent must preserve runtime.units"
+        );
     }
 
     #[test]

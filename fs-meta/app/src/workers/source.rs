@@ -75,6 +75,10 @@ fn can_retry_update_logical_roots(err: &CnxError) -> bool {
         )
 }
 
+fn can_retry_on_control_frame(err: &CnxError) -> bool {
+    can_retry_update_logical_roots(err)
+}
+
 fn debug_control_scope_capture_enabled() -> bool {
     std::env::var_os("FSMETA_DEBUG_CONTROL_SCOPE_CAPTURE").is_some()
 }
@@ -362,6 +366,11 @@ pub(crate) struct SourceWorkerUpdateRootsErrorHook {
 }
 
 #[cfg(test)]
+pub(crate) struct SourceWorkerControlFrameErrorHook {
+    pub err: CnxError,
+}
+
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct SourceWorkerControlFrameHook {
     pub entered: Arc<tokio::sync::Notify>,
@@ -407,6 +416,14 @@ fn source_worker_control_frame_pause_hook_cell(
 fn source_worker_update_roots_error_hook_cell(
 ) -> &'static Mutex<Option<SourceWorkerUpdateRootsErrorHook>> {
     static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerUpdateRootsErrorHook>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+#[cfg(test)]
+fn source_worker_control_frame_error_hook_cell(
+) -> &'static Mutex<Option<SourceWorkerControlFrameErrorHook>> {
+    static CELL: std::sync::OnceLock<Mutex<Option<SourceWorkerControlFrameErrorHook>>> =
         std::sync::OnceLock::new();
     CELL.get_or_init(|| Mutex::new(None))
 }
@@ -497,8 +514,28 @@ pub(crate) fn install_source_worker_update_roots_error_hook(
 }
 
 #[cfg(test)]
+pub(crate) fn install_source_worker_control_frame_error_hook(
+    hook: SourceWorkerControlFrameErrorHook,
+) {
+    let mut guard = match source_worker_control_frame_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn clear_source_worker_update_roots_error_hook() {
     let mut guard = match source_worker_update_roots_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_source_worker_control_frame_error_hook() {
+    let mut guard = match source_worker_control_frame_error_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -566,6 +603,15 @@ async fn maybe_pause_before_update_logical_roots_rpc() {
 #[cfg(test)]
 fn take_update_logical_roots_error_hook() -> Option<CnxError> {
     let mut guard = match source_worker_update_roots_error_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.take().map(|hook| hook.err)
+}
+
+#[cfg(test)]
+fn take_on_control_frame_error_hook() -> Option<CnxError> {
+    let mut guard = match source_worker_control_frame_error_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -1201,28 +1247,70 @@ impl SourceWorkerClientHandle {
                 ),
             }
         }
-        self.start().await?;
-        #[cfg(test)]
-        maybe_pause_before_on_control_frame_rpc().await;
-        let result = match Self::call_worker(
-            &self.client().await?,
-            SourceWorkerRequest::OnControlFrame { envelopes },
-            SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
-        )
-        .await?
-        {
-            SourceWorkerResponse::Ack => Ok(()),
-            other => Err(CnxError::ProtocolViolation(format!(
-                "unexpected source worker response for on_control_frame: {:?}",
-                other
-            ))),
-        };
-        eprintln!(
-            "fs_meta_source_worker_client: on_control_frame done node={} ok={}",
-            self.node_id.0,
-            result.is_ok()
-        );
-        result
+        let deadline = std::time::Instant::now() + SOURCE_WORKER_CONTROL_TOTAL_TIMEOUT;
+        loop {
+            let now = std::time::Instant::now();
+            let attempt_timeout = std::cmp::min(
+                SOURCE_WORKER_CONTROL_RPC_TIMEOUT,
+                deadline.saturating_duration_since(now),
+            );
+            if attempt_timeout.is_zero() {
+                return Err(CnxError::Timeout);
+            }
+            let rpc_result = self
+                .with_started_retry(|client| {
+                    let envelopes = envelopes.clone();
+                    async move {
+                        #[cfg(test)]
+                        maybe_pause_before_on_control_frame_rpc().await;
+                        #[cfg(test)]
+                        if let Some(err) = take_on_control_frame_error_hook() {
+                            return Err(err);
+                        }
+                        Self::call_worker(
+                            &client,
+                            SourceWorkerRequest::OnControlFrame {
+                                envelopes: envelopes.clone(),
+                            },
+                            attempt_timeout,
+                        )
+                        .await
+                    }
+                })
+                .await;
+            match rpc_result {
+                Ok(SourceWorkerResponse::Ack) => {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=true",
+                        self.node_id.0
+                    );
+                    return Ok(());
+                }
+                Ok(other) => {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false",
+                        self.node_id.0
+                    );
+                    return Err(CnxError::ProtocolViolation(format!(
+                        "unexpected source worker response for on_control_frame: {:?}",
+                        other
+                    )));
+                }
+                Err(err)
+                    if can_retry_on_control_frame(&err)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(SOURCE_WORKER_RETRY_BACKOFF).await;
+                }
+                Err(err) => {
+                    eprintln!(
+                        "fs_meta_source_worker_client: on_control_frame done node={} ok=false",
+                        self.node_id.0
+                    );
+                    return Err(err);
+                }
+            }
+        }
     }
 
     pub async fn trigger_rescan_when_ready(&self) -> Result<()> {
@@ -1877,6 +1965,14 @@ mod tests {
     impl Drop for SourceWorkerUpdateRootsErrorHookReset {
         fn drop(&mut self) {
             clear_source_worker_update_roots_error_hook();
+        }
+    }
+
+    struct SourceWorkerControlFrameErrorHookReset;
+
+    impl Drop for SourceWorkerControlFrameErrorHookReset {
+        fn drop(&mut self) {
+            clear_source_worker_control_frame_error_hook();
         }
     }
 
@@ -3128,6 +3224,115 @@ mod tests {
             vec!["nfs1", "nfs2"],
             "logical roots should reflect the post-retry update"
         );
+
+        client.close().await.expect("close source worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn on_control_frame_retries_stale_drained_fenced_pid_errors() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![worker_source_root("nfs1", &nfs1)],
+            host_object_grants: vec![
+                worker_source_export("node-d::nfs1", "node-d", "10.0.0.41", nfs1.clone()),
+                worker_source_export("node-d::nfs2", "node-d", "10.0.0.42", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_dir = tempdir().expect("create worker socket dir");
+        let factory =
+            RuntimeWorkerClientFactory::new(boundary.clone(), boundary.clone(), state_boundary);
+        let client = Arc::new(
+            SourceWorkerClientHandle::new(
+                NodeId("node-d".to_string()),
+                cfg,
+                external_source_worker_binding(worker_socket_dir.path()),
+                factory,
+            )
+            .expect("construct source worker client"),
+        );
+
+        tokio::time::timeout(Duration::from_secs(8), client.start())
+            .await
+            .expect("source worker start timed out")
+            .expect("start source worker");
+
+        let _reset = SourceWorkerControlFrameErrorHookReset;
+        install_source_worker_control_frame_error_hook(SourceWorkerControlFrameErrorHook {
+            err: CnxError::AccessDenied(
+                "source worker unavailable: pid Pid(1) is drained/fenced and cannot obtain new grant attachments"
+                    .to_string(),
+            ),
+        });
+
+        client
+            .on_control_frame(vec![
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: ROUTE_KEY_QUERY.to_string(),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode source activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: ROUTE_KEY_QUERY.to_string(),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        bound_scope_with_resources("nfs1", &["node-d::nfs1"]),
+                        bound_scope_with_resources("nfs2", &["node-d::nfs2"]),
+                    ],
+                }))
+                .expect("encode source-scan activate"),
+            ])
+            .await
+            .expect(
+                "on_control_frame should retry a stale drained/fenced pid error and reach the live worker",
+            );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = client
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = client
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            if source_groups == std::collections::BTreeSet::from([
+                "nfs1".to_string(),
+                "nfs2".to_string(),
+            ]) && scan_groups == std::collections::BTreeSet::from([
+                "nfs1".to_string(),
+                "nfs2".to_string(),
+            ]) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "scheduled groups should reflect the post-retry activation: source={:?} scan={:?}",
+                source_groups,
+                scan_groups
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
 
         client.close().await.expect("close source worker");
     }
