@@ -229,6 +229,14 @@ fn coverage_mode_for_root(
     }
 }
 
+fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
+    host_ref == node_id.0
+        || node_id
+            .0
+            .strip_prefix(host_ref)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SourceLogicalRootHealthSnapshot {
     pub root_id: String,
@@ -1061,7 +1069,7 @@ impl FSMetaSource {
                 // locally bound host. Remote hosts participate through their own
                 // source realizations plus routed query fan-in, not by spawning
                 // local source tasks for foreign grants.
-                .filter(|grant| grant.host_ref == node_id.0 && root.selector.matches(grant))
+                .filter(|grant| host_ref_matches_node_id(&grant.host_ref, node_id) && root.selector.matches(grant))
                 .cloned()
                 .collect::<Vec<_>>();
             if members.is_empty() {
@@ -2000,13 +2008,14 @@ impl FSMetaSource {
                         METHOD_SOURCE_RESCAN,
                         node_id_rescan.0
                     );
-                    let endpoint_task = ManagedEndpointTask::spawn(
+                    let endpoint_task = ManagedEndpointTask::spawn_with_unit(
                         sys.clone(),
                         route,
                         format!(
                             "source:{}:{}",
                             ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
                         ),
+                        SOURCE_RUNTIME_UNIT_ID,
                         source.shutdown.clone(),
                         move |requests| {
                             let node_id_rescan = node_id_rescan.clone();
@@ -2110,10 +2119,11 @@ impl FSMetaSource {
                     route.0,
                     node_id_rescan_scoped.0
                 );
-                let endpoint_task = ManagedEndpointTask::spawn(
+                let endpoint_task = ManagedEndpointTask::spawn_with_unit(
                     sys,
                     route.clone(),
                     format!("source:{}", route.0),
+                    SOURCE_RUNTIME_UNIT_ID,
                     source.shutdown.clone(),
                     move |requests| {
                         let node_id_rescan_scoped = node_id_rescan_scoped.clone();
@@ -2227,13 +2237,14 @@ impl FSMetaSource {
                     METHOD_SOURCE_RESCAN,
                     node_id_rescan.0
                 );
-                let endpoint_task = ManagedEndpointTask::spawn(
+                let endpoint_task = ManagedEndpointTask::spawn_with_unit(
                     boundary.clone(),
                     route,
                     format!(
                         "source:{}:{}",
                         ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN
                     ),
+                    SOURCE_RUNTIME_UNIT_ID,
                     self.shutdown.clone(),
                     move |requests| {
                         let node_id_rescan = node_id_rescan.clone();
@@ -2343,6 +2354,7 @@ impl FSMetaSource {
                         "source:{}:{}",
                         ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_RESCAN_CONTROL
                     ),
+                    SOURCE_RUNTIME_UNIT_ID,
                     self.shutdown.clone(),
                     move || true,
                     move |events| {
@@ -2399,6 +2411,7 @@ impl FSMetaSource {
                         "source:{}:{}",
                         ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_ROOTS_CONTROL
                     ),
+                    SOURCE_RUNTIME_UNIT_ID,
                     self.shutdown.clone(),
                     move || true,
                     move |events| {
@@ -2460,10 +2473,11 @@ impl FSMetaSource {
                 route.0,
                 node_id_rescan_scoped.0
             );
-            let endpoint_task = ManagedEndpointTask::spawn(
+            let endpoint_task = ManagedEndpointTask::spawn_with_unit(
                 boundary,
                 route.clone(),
                 format!("source:{}", route.0),
+                SOURCE_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 move |requests| {
                     let node_id_rescan_scoped = node_id_rescan_scoped.clone();
@@ -5015,6 +5029,33 @@ mod tests {
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].object_ref, "node-a::exp1");
         assert!(runtimes[0].is_group_primary);
+    }
+
+    #[test]
+    fn build_root_runtimes_treats_instance_suffixed_node_id_as_local_member() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
+        cfg.host_object_grants = vec![
+            test_export("node-b::nfs1", "node-b", "10.0.0.21", "/mnt/nfs1", true),
+            test_export("node-b::nfs2", "node-b", "10.0.0.22", "/mnt/nfs2", true),
+        ];
+
+        let source = FSMetaSource::with_boundaries(
+            cfg,
+            NodeId("node-b-29775277610492238759985153".to_string()),
+            None,
+        )
+        .expect("init source");
+        let runtimes = lock_or_recover(&source.state_cell.roots, "test.instance_suffix_local_member")
+            .clone();
+        assert_eq!(
+            runtimes
+                .iter()
+                .map(|root| root.object_ref.as_str())
+                .collect::<Vec<_>>(),
+            vec!["node-b::nfs1", "node-b::nfs2"],
+            "instance-suffixed worker node ids must still match bare host_ref grants for local source scheduling"
+        );
     }
 
     #[test]

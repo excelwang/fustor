@@ -51,6 +51,35 @@ fn is_stale_grant_attachment_recv_gap(err: &CnxError) -> bool {
     )
 }
 
+async fn close_stale_recv_channel(
+    boundary: Arc<dyn ChannelIoSubset>,
+    ctx: BoundaryContext,
+    channel: ChannelKey,
+) {
+    let close_boundary = boundary.clone();
+    let close_ctx = ctx.clone();
+    let close_channel = channel.clone();
+    match tokio::task::spawn_blocking(move || close_boundary.channel_close(close_ctx, close_channel))
+        .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            log::debug!(
+                "runtime endpoint channel_close retry reset failed for {}: {:?}",
+                channel.0,
+                err
+            );
+        }
+        Err(err) => {
+            log::warn!(
+                "runtime endpoint channel_close retry reset join failed for {}: {:?}",
+                channel.0,
+                err
+            );
+        }
+    }
+}
+
 fn summarize_event_origins(events: &[Event]) -> Vec<String> {
     let mut counts = std::collections::BTreeMap::<String, usize>::new();
     for event in events {
@@ -121,11 +150,55 @@ impl ManagedEndpointTask {
         F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
     {
+        Self::spawn_with_context(
+            boundary,
+            route,
+            name,
+            BoundaryContext::default(),
+            shutdown,
+            handler,
+        )
+    }
+
+    pub(crate) fn spawn_with_unit<F, Fut>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        unit_id: impl Into<String>,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+    {
+        Self::spawn_with_context(
+            boundary,
+            route,
+            name,
+            BoundaryContext::for_unit(unit_id),
+            shutdown,
+            handler,
+        )
+    }
+
+    fn spawn_with_context<F, Fut>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        ctx: BoundaryContext,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+    {
         let name_owned = name.into();
         let join_name = name_owned.clone();
         let shutdown_for_task = shutdown.clone();
         let handler = Arc::new(handler);
-        let runner = run_endpoint_loop(boundary, route, join_name, shutdown_for_task, handler);
+        let runner = run_endpoint_loop(boundary, route, join_name, ctx, shutdown_for_task, handler);
         let (join, ready_rx) = Self::spawn_join_with_ready(runner);
         Self::wait_until_ready(&name_owned, ready_rx);
 
@@ -140,6 +213,7 @@ impl ManagedEndpointTask {
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
         name: impl Into<String>,
+        unit_id: impl Into<String>,
         shutdown: CancellationToken,
         should_recv: G,
         handler: F,
@@ -150,6 +224,7 @@ impl ManagedEndpointTask {
         G: Fn() -> bool + Send + Sync + 'static,
     {
         let name_owned = name.into();
+        let unit_id = unit_id.into();
         let join_name = name_owned.clone();
         let shutdown_for_task = shutdown.clone();
         let should_recv = Arc::new(should_recv);
@@ -158,6 +233,7 @@ impl ManagedEndpointTask {
             boundary,
             route,
             join_name,
+            unit_id,
             shutdown_for_task,
             should_recv,
             handler,
@@ -213,6 +289,7 @@ async fn run_endpoint_loop<F, Fut>(
     boundary: Arc<dyn ChannelIoSubset>,
     route: RouteKey,
     join_name: String,
+    ctx: BoundaryContext,
     shutdown_for_task: CancellationToken,
     handler: Arc<F>,
 ) where
@@ -229,7 +306,6 @@ async fn run_endpoint_loop<F, Fut>(
             std::thread::current().name()
         );
     }
-    let ctx = BoundaryContext::default();
     let request_channel = ChannelKey(route.0.clone());
     let reply_channel = ChannelKey(format!("{}:reply", route.0));
     let mut exit_reason = None::<String>;
@@ -272,6 +348,8 @@ async fn run_endpoint_loop<F, Fut>(
                 continue;
             }
             Err(err) if is_stale_grant_attachment_recv_gap(&err) => {
+                close_stale_recv_channel(boundary.clone(), ctx.clone(), request_channel.clone())
+                    .await;
                 log::debug!(
                     "endpoint task {} recv retry for {} after stale grant-attachment gap: {:?}",
                     join_name,
@@ -391,6 +469,7 @@ async fn run_stream_loop<F, Fut, G>(
     boundary: Arc<dyn ChannelIoSubset>,
     route: RouteKey,
     join_name: String,
+    unit_id: String,
     shutdown_for_task: CancellationToken,
     should_recv: Arc<G>,
     handler: Arc<F>,
@@ -399,7 +478,7 @@ async fn run_stream_loop<F, Fut, G>(
     Fut: std::future::Future<Output = ()> + Send + 'static,
     G: Fn() -> bool + Send + Sync + 'static,
 {
-    let ctx = BoundaryContext::default();
+    let ctx = BoundaryContext::for_unit(unit_id);
     let stream_channel = ChannelKey(route.0.clone());
 
     loop {
@@ -439,6 +518,8 @@ async fn run_stream_loop<F, Fut, G>(
                 continue;
             }
             Err(err) if is_stale_grant_attachment_recv_gap(&err) => {
+                close_stale_recv_channel(boundary.clone(), ctx.clone(), stream_channel.clone())
+                    .await;
                 eprintln!(
                     "fs_meta_runtime_endpoint: stale grant-attachment recv gap task={} route={} err={:?}",
                     join_name, stream_channel.0, err
@@ -493,6 +574,8 @@ mod tests {
 
     struct RecordingBoundary {
         recv_keys: Mutex<Vec<String>>,
+        recv_unit_ids: Mutex<Vec<Option<String>>>,
+        close_keys: Mutex<Vec<String>>,
         first_failure: Mutex<Option<FirstFailure>>,
     }
 
@@ -528,6 +611,8 @@ mod tests {
         fn new() -> Self {
             Self {
                 recv_keys: Mutex::new(Vec::new()),
+                recv_unit_ids: Mutex::new(Vec::new()),
+                close_keys: Mutex::new(Vec::new()),
                 first_failure: Mutex::new(None),
             }
         }
@@ -535,6 +620,8 @@ mod tests {
         fn fail_once() -> Self {
             Self {
                 recv_keys: Mutex::new(Vec::new()),
+                recv_unit_ids: Mutex::new(Vec::new()),
+                close_keys: Mutex::new(Vec::new()),
                 first_failure: Mutex::new(Some(FirstFailure::NotSupported)),
             }
         }
@@ -542,6 +629,8 @@ mod tests {
         fn timeout_once() -> Self {
             Self {
                 recv_keys: Mutex::new(Vec::new()),
+                recv_unit_ids: Mutex::new(Vec::new()),
+                close_keys: Mutex::new(Vec::new()),
                 first_failure: Mutex::new(Some(FirstFailure::Timeout)),
             }
         }
@@ -581,6 +670,10 @@ mod tests {
                 .lock()
                 .expect("recv_keys lock")
                 .push(request.channel_key.0);
+            self.recv_unit_ids
+                .lock()
+                .expect("recv_unit_ids lock")
+                .push(_ctx.unit_id.clone());
             let mut first_failure = self.first_failure.lock().expect("first_failure lock");
             if let Some(failure) = first_failure.take() {
                 return match failure {
@@ -595,6 +688,18 @@ mod tests {
                 };
             }
             Err(CnxError::Internal("stop after first recv".into()))
+        }
+
+        fn channel_close(
+            &self,
+            _ctx: BoundaryContext,
+            channel: ChannelKey,
+        ) -> capanix_app_sdk::Result<()> {
+            self.close_keys
+                .lock()
+                .expect("close_keys lock")
+                .push(channel.0);
+            Ok(())
         }
     }
 
@@ -723,12 +828,37 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_loop_uses_runtime_unit_context_for_recv() {
+        let boundary = Arc::new(RecordingBoundary::new());
+        crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
+            boundary.clone(),
+            RouteKey("materialized-find:v1.req".into()),
+            "test-endpoint".into(),
+            BoundaryContext::for_unit("runtime.exec.sink"),
+            CancellationToken::new(),
+            Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
+        ));
+
+        let recv_unit_ids = boundary
+            .recv_unit_ids
+            .lock()
+            .expect("recv_unit_ids lock")
+            .clone();
+        assert_eq!(
+            recv_unit_ids,
+            vec![Some("runtime.exec.sink".to_string())],
+            "endpoint recv must carry the owning runtime unit identity so request routes do not reattach against drained predecessors",
+        );
+    }
+
+    #[test]
     fn stream_loop_uses_exact_route_key_without_double_suffix() {
         let boundary = Arc::new(RecordingBoundary::new());
         crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
             boundary.clone(),
             RouteKey("fs-meta.events:v1.stream".into()),
             "test-stream".into(),
+            "runtime.exec.sink".to_string(),
             CancellationToken::new(),
             Arc::new(|| true),
             Arc::new(|_events: Vec<Event>| std::future::ready(())),
@@ -745,6 +875,7 @@ mod tests {
             boundary.clone(),
             RouteKey("fs-meta.events:v1.stream".into()),
             "test-stream".into(),
+            "runtime.exec.sink".to_string(),
             CancellationToken::new(),
             Arc::new(|| true),
             Arc::new(|_events: Vec<Event>| std::future::ready(())),
@@ -761,12 +892,38 @@ mod tests {
     }
 
     #[test]
+    fn stream_loop_uses_runtime_unit_context_for_recv() {
+        let boundary = Arc::new(RecordingBoundary::new());
+        crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
+            boundary.clone(),
+            RouteKey("sink-logical-roots-control:v1.stream".into()),
+            "test-stream".into(),
+            "runtime.exec.sink".into(),
+            CancellationToken::new(),
+            Arc::new(|| true),
+            Arc::new(|_events: Vec<Event>| std::future::ready(())),
+        ));
+
+        let recv_unit_ids = boundary
+            .recv_unit_ids
+            .lock()
+            .expect("recv_unit_ids lock")
+            .clone();
+        assert_eq!(
+            recv_unit_ids,
+            vec![Some("runtime.exec.sink".to_string())],
+            "stream recv must carry the owning runtime unit identity so grant attachment resolution stays on the live worker generation",
+        );
+    }
+
+    #[test]
     fn endpoint_loop_retries_timeout_recv_errors() {
         let boundary = Arc::new(RecordingBoundary::timeout_once());
         crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
             boundary.clone(),
             RouteKey("sink-status:v1.req".into()),
             "test-endpoint".into(),
+            BoundaryContext::default(),
             CancellationToken::new(),
             Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
         ));
@@ -788,6 +945,7 @@ mod tests {
             boundary.clone(),
             RouteKey("sink-status:v1.req".into()),
             "test-endpoint".into(),
+            BoundaryContext::default(),
             CancellationToken::new(),
             Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
         ));
@@ -807,12 +965,15 @@ mod tests {
     fn endpoint_loop_retries_stale_drained_fenced_grant_attachment_errors() {
         let boundary = Arc::new(RecordingBoundary {
             recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
             first_failure: Mutex::new(Some(FirstFailure::StaleGrantAttachment)),
         });
         crate::runtime_app::shared_tokio_runtime().block_on(run_endpoint_loop(
             boundary.clone(),
             RouteKey("sink-status:v1.req".into()),
             "test-endpoint".into(),
+            BoundaryContext::for_unit("runtime.exec.sink"),
             CancellationToken::new(),
             Arc::new(|_events: Vec<Event>| std::future::ready(Vec::new())),
         ));
@@ -825,6 +986,8 @@ mod tests {
                 "sink-status:v1.req".to_string()
             ]
         );
+        let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
+        assert_eq!(close_keys, vec!["sink-status:v1.req".to_string()]);
     }
 
     #[test]
@@ -837,6 +1000,7 @@ mod tests {
             boundary.clone(),
             RouteKey("materialized-find:v1.req".into()),
             "sink:fs-meta.internal:sink.query".into(),
+            BoundaryContext::for_unit("runtime.exec.sink"),
             CancellationToken::new(),
             Arc::new(|events: Vec<Event>| std::future::ready(events)),
         ));
@@ -857,12 +1021,15 @@ mod tests {
     fn stream_loop_retries_stale_drained_fenced_grant_attachment_errors() {
         let boundary = Arc::new(RecordingBoundary {
             recv_keys: Mutex::new(Vec::new()),
+            recv_unit_ids: Mutex::new(Vec::new()),
+            close_keys: Mutex::new(Vec::new()),
             first_failure: Mutex::new(Some(FirstFailure::StaleGrantAttachment)),
         });
         crate::runtime_app::shared_tokio_runtime().block_on(run_stream_loop(
             boundary.clone(),
             RouteKey("fs-meta.events:v1.stream".into()),
             "test-stream".into(),
+            "runtime.exec.sink".to_string(),
             CancellationToken::new(),
             Arc::new(|| true),
             Arc::new(|_events: Vec<Event>| std::future::ready(())),
@@ -876,6 +1043,8 @@ mod tests {
                 "fs-meta.events:v1.stream".to_string()
             ]
         );
+        let close_keys = boundary.close_keys.lock().expect("close_keys lock").clone();
+        assert_eq!(close_keys, vec!["fs-meta.events:v1.stream".to_string()]);
     }
 
     #[test]

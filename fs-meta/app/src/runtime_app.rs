@@ -65,6 +65,7 @@ use crate::source::config::SourceConfig;
 // `service-sdk -> runtime-entry-sdk -> app-sdk`; lower runtime mirror/control
 // carriers stay behind the sanctioned helper layer.
 const ACTIVE_FACADE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(15);
+const SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct FacadeActivation {
     route_key: String,
@@ -483,6 +484,25 @@ fn facade_route_key_matches(unit: FacadeRuntimeUnit, route_key: &str) -> bool {
     }
 }
 
+fn is_retryable_worker_control_reset(err: &CnxError) -> bool {
+    matches!(err, CnxError::TransportClosed(_) | CnxError::Timeout)
+        || matches!(
+            err,
+            CnxError::PeerError(message)
+                if message.contains("transport closed")
+                    && (message.contains("Connection reset by peer")
+                        || message.contains("early eof")
+                        || message.contains("Broken pipe")
+                        || message.contains("bridge stopped"))
+        )
+        || matches!(
+            err,
+            CnxError::AccessDenied(message) | CnxError::PeerError(message)
+                if message.contains("drained/fenced")
+                    && message.contains("grant attachments")
+        )
+}
+
 fn facade_bind_addr_is_ephemeral(bind_addr: &str) -> bool {
     bind_addr
         .rsplit_once(':')
@@ -522,6 +542,38 @@ fn shared_api_request_tracker_for_config(config: &api::ApiConfig) -> Arc<ApiRequ
         .clone()
 }
 
+fn runtime_worker_binding_serial_key(binding: &RuntimeWorkerBinding) -> String {
+    format!(
+        "{}|{:?}|{:?}",
+        binding.role_id, binding.mode, binding.launcher_kind
+    )
+}
+
+fn shared_control_frame_serial_for_runtime(
+    node_id: &NodeId,
+    source_worker_binding: &RuntimeWorkerBinding,
+    sink_worker_binding: &RuntimeWorkerBinding,
+) -> Arc<Mutex<()>> {
+    static CELL: OnceLock<StdMutex<BTreeMap<String, Arc<Mutex<()>>>>> = OnceLock::new();
+    let key = format!(
+        "{}|{}|{}",
+        node_id.0,
+        runtime_worker_binding_serial_key(source_worker_binding),
+        runtime_worker_binding_serial_key(sink_worker_binding)
+    );
+    let mut guard = match CELL
+        .get_or_init(|| StdMutex::new(BTreeMap::new()))
+        .lock()
+    {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(Mutex::new(())))
+        .clone()
+}
+
 fn next_app_instance_id() -> u64 {
     static NEXT_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_ID.fetch_add(1, Ordering::Relaxed)
@@ -548,6 +600,19 @@ fn clear_process_facade_claim_for_tests() {
 #[cfg(test)]
 #[derive(Clone)]
 struct FacadeShutdownStartHook {
+    entered: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RuntimeProxyRequestPauseHook {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct RuntimeControlFrameStartHook {
     entered: Arc<tokio::sync::Notify>,
 }
 
@@ -589,6 +654,89 @@ fn notify_facade_shutdown_started() {
     }
 }
 
+#[cfg(test)]
+fn runtime_proxy_request_pause_hook_cell(
+) -> &'static StdMutex<BTreeMap<&'static str, RuntimeProxyRequestPauseHook>> {
+    static CELL: OnceLock<StdMutex<BTreeMap<&'static str, RuntimeProxyRequestPauseHook>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn install_runtime_proxy_request_pause_hook(
+    label: &'static str,
+    hook: RuntimeProxyRequestPauseHook,
+) {
+    let mut guard = match runtime_proxy_request_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.insert(label, hook);
+}
+
+#[cfg(test)]
+fn clear_runtime_proxy_request_pause_hook(label: &'static str) {
+    let mut guard = match runtime_proxy_request_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    guard.remove(label);
+}
+
+#[cfg(test)]
+async fn maybe_pause_runtime_proxy_request(label: &'static str) {
+    let hook = {
+        let guard = match runtime_proxy_request_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.get(label).cloned()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+        hook.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn runtime_control_frame_start_hook_cell(
+) -> &'static StdMutex<Option<RuntimeControlFrameStartHook>> {
+    static CELL: OnceLock<StdMutex<Option<RuntimeControlFrameStartHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_runtime_control_frame_start_hook(hook: RuntimeControlFrameStartHook) {
+    let mut guard = match runtime_control_frame_start_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+fn clear_runtime_control_frame_start_hook() {
+    let mut guard = match runtime_control_frame_start_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn notify_runtime_control_frame_started() {
+    let hook = {
+        let guard = match runtime_control_frame_start_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+    }
+}
+
 pub struct FSMetaApp {
     instance_id: u64,
     config: FSMetaConfig,
@@ -605,11 +753,19 @@ pub struct FSMetaApp {
     facade_spawn_in_progress: Arc<Mutex<Option<FacadeSpawnInProgress>>>,
     api_request_tracker: Arc<ApiRequestTracker>,
     api_control_gate: Arc<ApiControlGate>,
-    control_frame_serial: Mutex<()>,
+    control_frame_serial: Arc<Mutex<()>>,
     facade_pending_status: SharedFacadePendingStatusCell,
     facade_gate: RuntimeUnitGate,
     control_initialized: AtomicBool,
+    retained_source_control_state: Mutex<RetainedSourceControlState>,
+    source_state_replay_required: AtomicBool,
     control_init_lock: Mutex<()>,
+}
+
+#[derive(Default, Clone)]
+struct RetainedSourceControlState {
+    latest_host_grant_change: Option<SourceControlSignal>,
+    active_by_route: std::collections::BTreeMap<(String, String), SourceControlSignal>,
 }
 
 impl FSMetaApp {
@@ -758,6 +914,11 @@ impl FSMetaApp {
             },
         };
         let query_sink = sink.clone();
+        let control_frame_serial = shared_control_frame_serial_for_runtime(
+            &node_id,
+            &source_worker_binding,
+            &sink_worker_binding,
+        );
         Ok(Self {
             instance_id: next_app_instance_id(),
             config,
@@ -774,7 +935,7 @@ impl FSMetaApp {
             facade_spawn_in_progress: Arc::new(Mutex::new(None)),
             api_request_tracker,
             api_control_gate,
-            control_frame_serial: Mutex::new(()),
+            control_frame_serial,
             facade_pending_status: shared_facade_pending_status_cell(),
             facade_gate: RuntimeUnitGate::new(
                 "fs-meta",
@@ -785,6 +946,8 @@ impl FSMetaApp {
                 ],
             ),
             control_initialized: AtomicBool::new(false),
+            retained_source_control_state: Mutex::new(RetainedSourceControlState::default()),
+            source_state_replay_required: AtomicBool::new(false),
             control_init_lock: Mutex::new(()),
         })
     }
@@ -1022,6 +1185,7 @@ impl FSMetaApp {
             if !internal_query_active || !spawned_routes.insert(route.0.clone()) {
                 // Not currently selected as query/query-peer sink-status owner, or already running.
             } else {
+                let api_request_tracker = self.api_request_tracker.clone();
                 let sink = self.sink.clone();
                 eprintln!(
                     "fs_meta_runtime_app: spawning sink status endpoint route={}",
@@ -1036,10 +1200,14 @@ impl FSMetaApp {
                     ),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
+                        let api_request_tracker = api_request_tracker.clone();
                         let sink = sink.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
+                                let _request_guard = api_request_tracker.begin();
+                                #[cfg(test)]
+                                maybe_pause_runtime_proxy_request("sink_status").await;
                                 match sink.status_snapshot_nonblocking().await {
                                     Ok(snapshot) => {
                                         eprintln!(
@@ -1079,6 +1247,7 @@ impl FSMetaApp {
             if !internal_query_active || !spawned_routes.insert(route.0.clone()) {
                 // Not currently selected as query/query-peer source-status owner, or already running.
             } else {
+                let api_request_tracker = self.api_request_tracker.clone();
                 let source = self.source.clone();
                 let node_id = self.node_id.clone();
                 eprintln!(
@@ -1094,11 +1263,13 @@ impl FSMetaApp {
                     ),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
+                        let api_request_tracker = api_request_tracker.clone();
                         let source = source.clone();
                         let node_id = node_id.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
+                                let _request_guard = api_request_tracker.begin();
                                 let trace_id = next_source_status_endpoint_trace_id();
                                 let route_name = format!(
                                     "{}:{}",
@@ -1117,6 +1288,8 @@ impl FSMetaApp {
                                         trace_id
                                     );
                                 }
+                                #[cfg(test)]
+                                maybe_pause_runtime_proxy_request("source_status").await;
                                 let snapshot = source.observability_snapshot_nonblocking().await;
                                 trace_guard.phase("after_source_snapshot_await");
                                 eprintln!(
@@ -1169,6 +1342,7 @@ impl FSMetaApp {
                     "fs_meta_runtime_app: spawning sink query proxy endpoint route={}",
                     route.0
                 );
+                let api_request_tracker = self.api_request_tracker.clone();
                 let boundary_for_calls = boundary.clone();
                 let sink = self.sink.clone();
                 let source = self.source.clone();
@@ -1182,6 +1356,7 @@ impl FSMetaApp {
                     ),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
+                        let api_request_tracker = api_request_tracker.clone();
                         let adapter = crate::runtime::seam::exchange_host_adapter(
                             boundary_for_calls.clone(),
                             node_id.clone(),
@@ -1193,6 +1368,7 @@ impl FSMetaApp {
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
+                                let _request_guard = api_request_tracker.begin();
                                 let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
                                     req.payload_bytes(),
                                 ) else {
@@ -1204,6 +1380,8 @@ impl FSMetaApp {
                                     params.scope.recursive,
                                     String::from_utf8_lossy(&params.scope.path)
                                 );
+                                #[cfg(test)]
+                                maybe_pause_runtime_proxy_request("sink_query_proxy").await;
                                 let result = sink.materialized_query_nonblocking(&params).await;
                                 match result {
                                     Ok(mut events) => {
@@ -1377,6 +1555,7 @@ impl FSMetaApp {
                     "fs_meta_runtime_app: spawning source find proxy endpoint route={}",
                     route.0
                 );
+                let api_request_tracker = self.api_request_tracker.clone();
                 let source = self.source.clone();
                 let node_id = self.node_id.clone();
                 let endpoint = ManagedEndpointTask::spawn(
@@ -1388,11 +1567,13 @@ impl FSMetaApp {
                     ),
                     tokio_util::sync::CancellationToken::new(),
                     move |requests| {
+                        let api_request_tracker = api_request_tracker.clone();
                         let source = source.clone();
                         let node_id = node_id.clone();
                         async move {
                             let mut responses = Vec::new();
                             for req in requests {
+                                let _request_guard = api_request_tracker.begin();
                                 let Ok(params) = rmp_serde::from_slice::<InternalQueryRequest>(
                                     req.payload_bytes(),
                                 ) else {
@@ -1404,6 +1585,8 @@ impl FSMetaApp {
                                     params.scope.recursive,
                                     String::from_utf8_lossy(&params.scope.path)
                                 );
+                                #[cfg(test)]
+                                maybe_pause_runtime_proxy_request("source_find").await;
                                 match source.force_find(&params).await {
                                     Ok(mut events) => {
                                         eprintln!(
@@ -2183,6 +2366,141 @@ impl FSMetaApp {
         clear_owned_process_facade_claim(self.instance_id);
     }
 
+    async fn wait_for_shared_worker_control_handoff(&self) {
+        self.source.wait_for_control_ops_to_drain_for_handoff().await;
+        self.sink.wait_for_control_ops_to_drain_for_handoff().await;
+    }
+
+    async fn reinitialize_after_control_reset(&self) -> Result<()> {
+        self.control_initialized.store(false, Ordering::Release);
+        self.api_control_gate.set_ready(false);
+        self.source_state_replay_required
+            .store(true, Ordering::Release);
+        self.initialize_from_control().await
+    }
+
+    fn mark_control_uninitialized_after_failure(&self) {
+        self.control_initialized.store(false, Ordering::Release);
+        self.api_control_gate.set_ready(false);
+        self.source_state_replay_required
+            .store(true, Ordering::Release);
+    }
+
+    async fn source_signals_with_replay(
+        &self,
+        source_signals: &[SourceControlSignal],
+    ) -> Vec<SourceControlSignal> {
+        if !self
+            .source_state_replay_required
+            .load(Ordering::Acquire)
+        {
+            return source_signals.to_vec();
+        }
+
+        let retained = self.retained_source_control_state.lock().await.clone();
+        let mut merged = Vec::new();
+        let current_has_host_grant = source_signals
+            .iter()
+            .any(|signal| matches!(signal, SourceControlSignal::RuntimeHostGrantChange { .. }));
+        if !current_has_host_grant {
+            if let Some(changed) = retained.latest_host_grant_change {
+                merged.push(changed);
+            }
+        }
+
+        let current_routes = source_signals
+            .iter()
+            .filter_map(|signal| match signal {
+                SourceControlSignal::Activate {
+                    unit, route_key, ..
+                }
+                | SourceControlSignal::Deactivate { unit, route_key, .. } => {
+                    Some((unit.unit_id().to_string(), route_key.clone()))
+                }
+                // Tick-only followups cannot rebuild fresh worker state after a restart.
+                // Keep replaying retained active routes unless a new activate/deactivate
+                // for that route is actually present in the current batch.
+                SourceControlSignal::Tick { .. } => None,
+                SourceControlSignal::RuntimeHostGrantChange { .. }
+                | SourceControlSignal::ManualRescan { .. }
+                | SourceControlSignal::Passthrough(_) => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        for (route_id, signal) in retained.active_by_route {
+            if !current_routes.contains(&route_id) {
+                merged.push(signal);
+            }
+        }
+        merged.extend_from_slice(source_signals);
+        merged
+    }
+
+    async fn record_retained_source_control_state(&self, source_signals: &[SourceControlSignal]) {
+        let mut retained = self.retained_source_control_state.lock().await;
+        for signal in source_signals {
+            match signal {
+                SourceControlSignal::Activate {
+                    unit, route_key, ..
+                } => {
+                    retained
+                        .active_by_route
+                        .insert((unit.unit_id().to_string(), route_key.clone()), signal.clone());
+                }
+                SourceControlSignal::Deactivate {
+                    unit, route_key, ..
+                } => {
+                    retained
+                        .active_by_route
+                        .remove(&(unit.unit_id().to_string(), route_key.clone()));
+                }
+                SourceControlSignal::RuntimeHostGrantChange { .. } => {
+                    retained.latest_host_grant_change = Some(signal.clone());
+                }
+                SourceControlSignal::Tick { .. }
+                | SourceControlSignal::ManualRescan { .. }
+                | SourceControlSignal::Passthrough(_) => {}
+            }
+        }
+    }
+
+    async fn apply_source_signals_with_recovery(
+        &self,
+        source_signals: &[SourceControlSignal],
+    ) -> Result<()> {
+        let deadline = tokio::time::Instant::now() + SOURCE_CONTROL_RECOVERY_TOTAL_TIMEOUT;
+        loop {
+            let effective_source_signals = self.source_signals_with_replay(source_signals).await;
+            match self
+                .source
+                .apply_orchestration_signals(&effective_source_signals)
+                .await
+            {
+                Ok(()) => {
+                    self.record_retained_source_control_state(&effective_source_signals)
+                        .await;
+                    self.source_state_replay_required
+                        .store(false, Ordering::Release);
+                    return Ok(());
+                }
+                Err(err)
+                    if is_retryable_worker_control_reset(&err)
+                        && tokio::time::Instant::now() < deadline =>
+                {
+                    eprintln!(
+                        "fs_meta_runtime_app: source control replay after retryable reset err={}",
+                        err
+                    );
+                    self.reinitialize_after_control_reset().await?;
+                }
+                Err(err) => {
+                    self.mark_control_uninitialized_after_failure();
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     async fn apply_facade_deactivate(
         &self,
         unit: FacadeRuntimeUnit,
@@ -2210,8 +2528,17 @@ impl FSMetaApp {
             );
             return Ok(());
         }
+        let facade_control_route_key = format!("{}.stream", ROUTE_KEY_FACADE_CONTROL);
+        if matches!(unit, FacadeRuntimeUnit::Query | FacadeRuntimeUnit::QueryPeer) {
+            self.wait_for_shared_worker_control_handoff().await;
+            return Ok(());
+        }
+        if !matches!(unit, FacadeRuntimeUnit::Facade) || route_key != facade_control_route_key {
+            return Ok(());
+        }
         *self.pending_facade.lock().await = None;
         Self::clear_pending_facade_status(&self.facade_pending_status);
+        self.wait_for_shared_worker_control_handoff().await;
         self.shutdown_active_facade().await;
         Ok(())
     }
@@ -2243,6 +2570,8 @@ impl FSMetaApp {
 
     async fn service_on_control_frame(&self, envelopes: &[ControlEnvelope]) -> Result<()> {
         let _serial_guard = self.control_frame_serial.lock().await;
+        #[cfg(test)]
+        notify_runtime_control_frame_started();
         let (source_signals, sink_signals, facade_signals) = split_app_control_signals(envelopes)?;
         let request_sensitive = !source_signals.is_empty()
             || !sink_signals.is_empty()
@@ -2332,8 +2661,7 @@ impl FSMetaApp {
             eprintln!(
                 "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals begin"
             );
-            self.source
-                .apply_orchestration_signals(&source_signals)
+            self.apply_source_signals_with_recovery(&source_signals)
                 .await?;
             eprintln!(
                 "fs_meta_runtime_app: on_control_frame source.apply_orchestration_signals ok"
@@ -2619,6 +2947,10 @@ mod tests {
     use super::*;
     use crate::{ControlEvent, FileMetaRecord};
     use crate::{FSMetaConfig, FSMetaProductConfig, api, query, source};
+    use crate::runtime::routes::{
+        ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+        ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+    };
     use bytes::Bytes;
     use capanix_app_sdk::raw::{
         BoundaryContext, ChannelBoundary, ChannelKey, ChannelRecvRequest, ChannelSendRequest,
@@ -2759,8 +3091,16 @@ mod tests {
     }
 
     fn deactivate_envelope(unit_id: &str, generation: u64) -> ControlEnvelope {
+        deactivate_envelope_with_route_key(unit_id, facade_control_stream_route(), generation)
+    }
+
+    fn deactivate_envelope_with_route_key(
+        unit_id: &str,
+        route_key: String,
+        generation: u64,
+    ) -> ControlEnvelope {
         encode_runtime_exec_control(&RuntimeExecControl::Deactivate(RuntimeExecDeactivate {
-            route_key: facade_control_stream_route(),
+            route_key,
             unit_id: unit_id.to_string(),
             lease: None,
             generation,
@@ -2885,6 +3225,20 @@ mod tests {
             at_ms: 1,
         })
         .expect("encode unit tick envelope")
+    }
+
+    fn tick_envelope_with_route_key(
+        unit_id: &str,
+        route_key: impl Into<String>,
+        generation: u64,
+    ) -> ControlEnvelope {
+        encode_runtime_unit_tick(&RuntimeUnitTick {
+            route_key: route_key.into(),
+            unit_id: unit_id.to_string(),
+            generation,
+            at_ms: 1,
+        })
+        .expect("encode route-specific unit tick envelope")
     }
 
     #[allow(dead_code)]
@@ -3043,6 +3397,26 @@ mod tests {
         )
         .await?;
         decode_tree_group_payloads(events)
+    }
+
+    async fn internal_sink_status_request(
+        boundary: Arc<dyn ChannelIoSubset>,
+        caller_node: NodeId,
+    ) -> Result<Vec<Event>> {
+        let adapter = crate::runtime::seam::exchange_host_adapter(
+            boundary,
+            caller_node,
+            crate::runtime::routes::default_route_bindings(),
+        );
+        capanix_host_adapter_fs::HostAdapter::call_collect(
+            &adapter,
+            ROUTE_TOKEN_FS_META_INTERNAL,
+            METHOD_SINK_STATUS,
+            Bytes::new(),
+            Duration::from_secs(5),
+            Duration::from_millis(250),
+        )
+        .await
     }
 
     fn reserve_bind_addr() -> String {
@@ -3850,6 +4224,113 @@ mod tests {
             .expect("join serialized control task")
             .expect("run serialized control frame");
         app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn successor_control_frame_waits_for_predecessor_source_control_handoff_across_shared_runtime_instances(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        let control_entered = Arc::new(Notify::new());
+        let control_release = Arc::new(Notify::new());
+        let _control_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: control_entered.clone(),
+                release: control_release.clone(),
+            },
+        );
+
+        let predecessor_control = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move { predecessor.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+        });
+
+        control_entered.notified().await;
+
+        let successor_started = Arc::new(Notify::new());
+        let _start_hook_reset = RuntimeControlFrameStartHookReset;
+        install_runtime_control_frame_start_hook(RuntimeControlFrameStartHook {
+            entered: successor_started.clone(),
+        });
+
+        let successor_control = tokio::spawn({
+            let successor = successor.clone();
+            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), successor_started.notified())
+                .await
+                .is_err(),
+            "successor control frame must not begin while predecessor source control is still mid-handoff on the shared worker"
+        );
+
+        control_release.notify_waiters();
+        predecessor_control
+            .await
+            .expect("join predecessor control")
+            .expect("predecessor source-only control");
+        successor_control
+            .await
+            .expect("join successor control")
+            .expect("successor source-only control after predecessor handoff");
+
+        predecessor.close().await.expect("close predecessor app");
+        successor.close().await.expect("close successor app");
     }
 
     #[tokio::test]
@@ -4764,6 +5245,22 @@ mod tests {
         }
     }
 
+    struct SourceWorkerControlFramePauseHookReset;
+
+    impl Drop for SourceWorkerControlFramePauseHookReset {
+        fn drop(&mut self) {
+            crate::workers::source::clear_source_worker_control_frame_pause_hook();
+        }
+    }
+
+    struct SinkWorkerControlFramePauseHookReset;
+
+    impl Drop for SinkWorkerControlFramePauseHookReset {
+        fn drop(&mut self) {
+            crate::workers::sink::clear_sink_worker_control_frame_pause_hook();
+        }
+    }
+
     struct SourceWorkerUpdateRootsHookReset;
 
     impl Drop for SourceWorkerUpdateRootsHookReset {
@@ -4793,6 +5290,24 @@ mod tests {
     impl Drop for FacadeShutdownStartHookReset {
         fn drop(&mut self) {
             clear_facade_shutdown_start_hook();
+        }
+    }
+
+    struct RuntimeProxyRequestPauseHookReset {
+        label: &'static str,
+    }
+
+    impl Drop for RuntimeProxyRequestPauseHookReset {
+        fn drop(&mut self) {
+            clear_runtime_proxy_request_pause_hook(self.label);
+        }
+    }
+
+    struct RuntimeControlFrameStartHookReset;
+
+    impl Drop for RuntimeControlFrameStartHookReset {
+        fn drop(&mut self) {
+            clear_runtime_control_frame_start_hook();
         }
     }
 
@@ -6614,6 +7129,1781 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn facade_deactivate_waits_for_successor_source_control_handoff_on_shared_worker() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            predecessor
+                .config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            predecessor.node_id.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.source.clone(),
+            predecessor.sink.clone(),
+            predecessor.query_sink.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.facade_pending_status.clone(),
+            predecessor.api_request_tracker.clone(),
+            predecessor.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                predecessor
+                    .close()
+                    .await
+                    .expect("close predecessor after bind restriction");
+                successor
+                    .close()
+                    .await
+                    .expect("close successor after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *predecessor.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let control_entered = Arc::new(Notify::new());
+        let control_release = Arc::new(Notify::new());
+        let _control_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: control_entered.clone(),
+                release: control_release.clone(),
+            },
+        );
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+
+        let successor_control = tokio::spawn({
+            let successor = successor.clone();
+            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+        });
+
+        control_entered.notified().await;
+
+        let mut deactivate_task = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[deactivate_envelope(
+                        execution_units::FACADE_RUNTIME_UNIT_ID,
+                        1,
+                    )])
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), shutdown_started.notified())
+                .await
+                .is_err(),
+            "facade deactivate must not start shutdown_active_facade while successor source control is still mid-handoff on the shared worker"
+        );
+
+        control_release.notify_waiters();
+        successor_control
+            .await
+            .expect("join successor control")
+            .expect("successor source control after predecessor facade deactivate");
+        deactivate_task
+            .await
+            .expect("join predecessor deactivate")
+            .expect("predecessor facade deactivate after successor control");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_recovery_waits_for_predecessor_source_start_across_runtime_instances_with_distinct_worker_bindings(
+    ) {
+        struct SourceControlErrorHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        struct SourceWorkerStartPauseHookReset;
+
+        impl Drop for SourceWorkerStartPauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+
+        let make_app =
+            |source_socket_dir: &Path, sink_socket_dir: &Path| {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", source_socket_dir),
+                    external_runtime_worker_binding("sink", sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor_socket_root = tempdir().expect("create predecessor worker socket dir");
+        let predecessor_source_socket_dir = predecessor_socket_root.path().join("source");
+        let predecessor_sink_socket_dir = predecessor_socket_root.path().join("sink");
+        fs::create_dir_all(&predecessor_source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&predecessor_sink_socket_dir).expect("create sink socket dir");
+        let predecessor = make_app(
+            &predecessor_source_socket_dir,
+            &predecessor_sink_socket_dir,
+        );
+
+        predecessor
+            .on_control_frame(&[
+                activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+                activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("predecessor initial source control should succeed");
+
+        let _err_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated predecessor source-only failure".to_string(),
+                ),
+            },
+        );
+        let err = predecessor
+            .on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect_err("predecessor follow-up source-only control should fail");
+        assert!(
+            err.to_string()
+                .contains("simulated predecessor source-only failure"),
+            "unexpected predecessor source-only failure: {err}"
+        );
+        assert!(
+            !predecessor.control_initialized(),
+            "predecessor failure should leave the runtime uninitialized before recovery"
+        );
+
+        let successor_socket_root = tempdir().expect("create successor worker socket dir");
+        let successor_source_socket_dir = successor_socket_root.path().join("source");
+        let successor_sink_socket_dir = successor_socket_root.path().join("sink");
+        fs::create_dir_all(&successor_source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&successor_sink_socket_dir).expect("create sink socket dir");
+        let successor = make_app(&successor_source_socket_dir, &successor_sink_socket_dir);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let _pause_reset = SourceWorkerStartPauseHookReset;
+        crate::workers::source::install_source_worker_start_pause_hook(
+            crate::workers::source::SourceWorkerStartPauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let predecessor_recovery = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[
+                        activate_envelope_with_scope_rows(
+                            execution_units::SOURCE_RUNTIME_UNIT_ID,
+                            &[("test-root", &["single-app-node::root-1"])],
+                            4,
+                        ),
+                        activate_envelope_with_scope_rows(
+                            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                            &[("test-root", &["single-app-node::root-1"])],
+                            4,
+                        ),
+                    ])
+                    .await
+            }
+        });
+
+        entered.notified().await;
+
+        let successor_recovery = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                successor
+                    .on_control_frame(&[
+                        activate_envelope_with_scope_rows(
+                            execution_units::SOURCE_RUNTIME_UNIT_ID,
+                            &[("test-root", &["single-app-node::root-1"])],
+                            4,
+                        ),
+                        activate_envelope_with_scope_rows(
+                            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                            &[("test-root", &["single-app-node::root-1"])],
+                            4,
+                        ),
+                    ])
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !successor_recovery.is_finished(),
+            "successor recovery on the same node must wait while predecessor recovery is still paused in source.start, even when the two runtime instances use distinct worker bindings"
+        );
+
+        release.notify_waiters();
+
+        predecessor_recovery
+            .await
+            .expect("join predecessor recovery task")
+            .expect("predecessor recovery should succeed");
+        successor_recovery
+            .await
+            .expect("join successor recovery task")
+            .expect("successor recovery should succeed");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_recovery_waits_for_predecessor_source_start_across_runtime_instances_with_distinct_worker_module_paths(
+    ) {
+        struct SourceControlErrorHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        struct SourceWorkerStartPauseHookReset;
+
+        impl Drop for SourceWorkerStartPauseHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_start_pause_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_module_path = runtime_test_worker_module_path();
+        let worker_module_link = tmp.path().join("worker-module-link");
+        #[cfg(target_family = "unix")]
+        std::os::unix::fs::symlink(&worker_module_path, &worker_module_link)
+            .expect("symlink worker module path");
+
+        let make_app = |source_socket_dir: &Path,
+                        sink_socket_dir: &Path,
+                        source_module_path: &Path,
+                        sink_module_path: &Path| {
+            let mut source_binding =
+                external_runtime_worker_binding("source", source_socket_dir);
+            source_binding.module_path = Some(source_module_path.to_path_buf());
+            let mut sink_binding = external_runtime_worker_binding("sink", sink_socket_dir);
+            sink_binding.module_path = Some(sink_module_path.to_path_buf());
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    source_binding,
+                    sink_binding,
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor_socket_root = tempdir().expect("create predecessor worker socket dir");
+        let predecessor_source_socket_dir = predecessor_socket_root.path().join("source");
+        let predecessor_sink_socket_dir = predecessor_socket_root.path().join("sink");
+        fs::create_dir_all(&predecessor_source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&predecessor_sink_socket_dir).expect("create sink socket dir");
+        let predecessor = make_app(
+            &predecessor_source_socket_dir,
+            &predecessor_sink_socket_dir,
+            &worker_module_path,
+            &worker_module_path,
+        );
+
+        predecessor
+            .on_control_frame(&[
+                activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+                activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("predecessor initial source control should succeed");
+
+        let _err_reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated predecessor source-only failure".to_string(),
+                ),
+            },
+        );
+        predecessor
+            .on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect_err("predecessor follow-up source-only control should fail");
+
+        let successor_socket_root = tempdir().expect("create successor worker socket dir");
+        let successor_source_socket_dir = successor_socket_root.path().join("source");
+        let successor_sink_socket_dir = successor_socket_root.path().join("sink");
+        fs::create_dir_all(&successor_source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&successor_sink_socket_dir).expect("create sink socket dir");
+        let successor = make_app(
+            &successor_source_socket_dir,
+            &successor_sink_socket_dir,
+            &worker_module_link,
+            &worker_module_link,
+        );
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let _pause_reset = SourceWorkerStartPauseHookReset;
+        crate::workers::source::install_source_worker_start_pause_hook(
+            crate::workers::source::SourceWorkerStartPauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let predecessor_recovery = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[
+                        activate_envelope_with_scope_rows(
+                            execution_units::SOURCE_RUNTIME_UNIT_ID,
+                            &[("test-root", &["single-app-node::root-1"])],
+                            4,
+                        ),
+                        activate_envelope_with_scope_rows(
+                            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                            &[("test-root", &["single-app-node::root-1"])],
+                            4,
+                        ),
+                    ])
+                    .await
+            }
+        });
+
+        entered.notified().await;
+
+        let successor_recovery = tokio::spawn({
+            let successor = successor.clone();
+            async move {
+                successor
+                    .on_control_frame(&[
+                        activate_envelope_with_scope_rows(
+                            execution_units::SOURCE_RUNTIME_UNIT_ID,
+                            &[("test-root", &["single-app-node::root-1"])],
+                            4,
+                        ),
+                        activate_envelope_with_scope_rows(
+                            execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                            &[("test-root", &["single-app-node::root-1"])],
+                            4,
+                        ),
+                    ])
+                    .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !successor_recovery.is_finished(),
+            "successor recovery on the same node must wait while predecessor recovery is still paused in source.start, even when the two runtime instances use distinct worker module paths"
+        );
+
+        release.notify_waiters();
+
+        predecessor_recovery
+            .await
+            .expect("join predecessor recovery task")
+            .expect("predecessor recovery should succeed");
+        successor_recovery
+            .await
+            .expect("join successor recovery task")
+            .expect("successor recovery should succeed");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn facade_deactivate_waits_for_successor_sink_control_handoff_on_shared_worker() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            predecessor
+                .config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            predecessor.node_id.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.source.clone(),
+            predecessor.sink.clone(),
+            predecessor.query_sink.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.facade_pending_status.clone(),
+            predecessor.api_request_tracker.clone(),
+            predecessor.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                predecessor
+                    .close()
+                    .await
+                    .expect("close predecessor after bind restriction");
+                successor
+                    .close()
+                    .await
+                    .expect("close successor after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *predecessor.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let control_entered = Arc::new(Notify::new());
+        let control_release = Arc::new(Notify::new());
+        let _control_pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: control_entered.clone(),
+                release: control_release.clone(),
+            },
+        );
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+
+        let successor_control = tokio::spawn({
+            let successor = successor.clone();
+            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.sink")]).await }
+        });
+
+        control_entered.notified().await;
+
+        let mut deactivate_task = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[deactivate_envelope(
+                        execution_units::FACADE_RUNTIME_UNIT_ID,
+                        1,
+                    )])
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), shutdown_started.notified())
+                .await
+                .is_err(),
+            "facade deactivate must not start shutdown_active_facade while successor sink control is still mid-handoff on the shared worker"
+        );
+
+        control_release.notify_waiters();
+        successor_control
+            .await
+            .expect("join successor control")
+            .expect("successor sink control after predecessor facade deactivate");
+        deactivate_task
+            .await
+            .expect("join predecessor deactivate")
+            .expect("predecessor facade deactivate after successor sink control");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn query_peer_deactivate_waits_for_successor_source_control_handoff_on_shared_worker() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        predecessor
+            .apply_facade_activate(
+                FacadeRuntimeUnit::QueryPeer,
+                &format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                1,
+                &[RuntimeBoundScope {
+                    scope_id: "test-root".to_string(),
+                    resource_ids: vec!["listener-a".to_string()],
+                }],
+            )
+            .await
+            .expect("activate predecessor query-peer route");
+
+        let control_entered = Arc::new(Notify::new());
+        let control_release = Arc::new(Notify::new());
+        let _control_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: control_entered.clone(),
+                release: control_release.clone(),
+            },
+        );
+
+        let successor_control = tokio::spawn({
+            let successor = successor.clone();
+            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.source")]).await }
+        });
+
+        control_entered.notified().await;
+
+        let mut deactivate_task = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[deactivate_envelope_with_route_key(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                        1,
+                    )])
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), &mut deactivate_task)
+                .await
+                .is_err(),
+            "query-peer deactivate must not complete while successor source control is still mid-handoff on the shared worker"
+        );
+
+        control_release.notify_waiters();
+        successor_control
+            .await
+            .expect("join successor control")
+            .expect("successor source control after predecessor query-peer deactivate");
+        deactivate_task
+            .await
+            .expect("join predecessor deactivate")
+            .expect("predecessor query-peer deactivate after successor control");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn query_peer_deactivate_waits_for_successor_sink_control_handoff_on_shared_worker() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        predecessor
+            .apply_facade_activate(
+                FacadeRuntimeUnit::QueryPeer,
+                &format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                1,
+                &[RuntimeBoundScope {
+                    scope_id: "test-root".to_string(),
+                    resource_ids: vec!["listener-a".to_string()],
+                }],
+            )
+            .await
+            .expect("activate predecessor query-peer sink-status route");
+
+        let control_entered = Arc::new(Notify::new());
+        let control_release = Arc::new(Notify::new());
+        let _control_pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: control_entered.clone(),
+                release: control_release.clone(),
+            },
+        );
+
+        let successor_control = tokio::spawn({
+            let successor = successor.clone();
+            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.sink")]).await }
+        });
+
+        control_entered.notified().await;
+
+        let mut deactivate_task = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[deactivate_envelope_with_route_key(
+                        execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                        format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                        1,
+                    )])
+                    .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), &mut deactivate_task)
+                .await
+                .is_err(),
+            "query-peer deactivate must not complete while successor sink control is still mid-handoff on the shared worker"
+        );
+
+        control_release.notify_waiters();
+        successor_control
+            .await
+            .expect("join successor control")
+            .expect("successor sink control after predecessor query-peer deactivate");
+        deactivate_task
+            .await
+            .expect("join predecessor deactivate")
+            .expect("predecessor query-peer deactivate after successor control");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_sink_control_recovers_after_predecessor_facade_deactivate_resets_shared_worker(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            predecessor
+                .config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            predecessor.node_id.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.source.clone(),
+            predecessor.sink.clone(),
+            predecessor.query_sink.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.facade_pending_status.clone(),
+            predecessor.api_request_tracker.clone(),
+            predecessor.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                predecessor
+                    .close()
+                    .await
+                    .expect("close predecessor after bind restriction");
+                successor
+                    .close()
+                    .await
+                    .expect("close successor after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *predecessor.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                1,
+            )])
+            .await
+            .expect("predecessor facade deactivate should complete");
+
+        successor
+            .on_control_frame(&[activate_envelope("runtime.exec.sink")])
+            .await
+            .expect(
+                "successor sink control should recover after predecessor facade deactivate reset the shared worker bridge",
+            );
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_second_sink_control_survives_late_predecessor_facade_deactivate() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            predecessor
+                .config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            predecessor.node_id.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.source.clone(),
+            predecessor.sink.clone(),
+            predecessor.query_sink.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.facade_pending_status.clone(),
+            predecessor.api_request_tracker.clone(),
+            predecessor.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                predecessor
+                    .close()
+                    .await
+                    .expect("close predecessor after bind restriction");
+                successor
+                    .close()
+                    .await
+                    .expect("close successor after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *predecessor.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        successor
+            .on_control_frame(&[
+                activate_envelope("runtime.exec.source"),
+                activate_envelope("runtime.exec.sink"),
+            ])
+            .await
+            .expect("initial successor source/sink control should succeed");
+
+        predecessor
+            .on_control_frame(&[deactivate_envelope(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                1,
+            )])
+            .await
+            .expect("late predecessor facade deactivate should complete");
+
+        successor
+            .on_control_frame(&[activate_envelope("runtime.exec.sink")])
+            .await
+            .expect(
+                "successor second sink-only control must survive late predecessor facade deactivate after the first batch already succeeded",
+            );
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_second_sink_control_handoff_survives_late_predecessor_facade_deactivate() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            predecessor
+                .config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            predecessor.node_id.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.source.clone(),
+            predecessor.sink.clone(),
+            predecessor.query_sink.clone(),
+            predecessor.runtime_boundary.clone(),
+            predecessor.facade_pending_status.clone(),
+            predecessor.api_request_tracker.clone(),
+            predecessor.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                predecessor
+                    .close()
+                    .await
+                    .expect("close predecessor after bind restriction");
+                successor
+                    .close()
+                    .await
+                    .expect("close successor after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *predecessor.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        successor
+            .on_control_frame(&[
+                activate_envelope("runtime.exec.source"),
+                activate_envelope("runtime.exec.sink"),
+            ])
+            .await
+            .expect("initial successor source/sink control should succeed");
+
+        let control_entered = Arc::new(Notify::new());
+        let control_release = Arc::new(Notify::new());
+        let _control_pause_reset = SinkWorkerControlFramePauseHookReset;
+        crate::workers::sink::install_sink_worker_control_frame_pause_hook(
+            crate::workers::sink::SinkWorkerControlFramePauseHook {
+                entered: control_entered.clone(),
+                release: control_release.clone(),
+            },
+        );
+
+        let successor_control = tokio::spawn({
+            let successor = successor.clone();
+            async move { successor.on_control_frame(&[activate_envelope("runtime.exec.sink")]).await }
+        });
+
+        control_entered.notified().await;
+
+        let deactivate_task = tokio::spawn({
+            let predecessor = predecessor.clone();
+            async move {
+                predecessor
+                    .on_control_frame(&[deactivate_envelope(
+                        execution_units::FACADE_RUNTIME_UNIT_ID,
+                        1,
+                    )])
+                    .await
+            }
+        });
+
+        control_release.notify_waiters();
+        successor_control
+            .await
+            .expect("join successor control")
+            .expect(
+                "successor second sink-only control must survive late predecessor facade deactivate after the first batch already succeeded",
+            );
+        deactivate_task
+            .await
+            .expect("join predecessor deactivate")
+            .expect("late predecessor facade deactivate");
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_second_source_control_survives_late_predecessor_query_peer_sink_route_deactivates(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        predecessor
+            .on_control_frame(&[
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    &[("test-root", &["listener-a"])],
+                    1,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    &[("test-root", &["listener-a"])],
+                    1,
+                ),
+            ])
+            .await
+            .expect("activate predecessor query-peer sink routes");
+
+        successor
+            .on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect("initial successor source-only control should succeed");
+
+        predecessor
+            .on_control_frame(&[
+                deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    2,
+                ),
+                deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    2,
+                ),
+            ])
+            .await
+            .expect("late predecessor query-peer sink route deactivates should complete");
+
+        successor
+            .on_control_frame(&[activate_envelope("runtime.exec.source")])
+            .await
+            .expect(
+                "successor second source-only control must survive late predecessor query-peer sink route deactivates after the first batch already succeeded",
+            );
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
+    async fn successor_second_source_control_survives_late_predecessor_all_query_peer_route_deactivates(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let make_app = || {
+            Arc::new(
+                FSMetaApp::with_boundaries_and_state(
+                    FSMetaConfig {
+                        source: SourceConfig {
+                            roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                            host_object_grants: vec![worker_export_with_fs_source(
+                                "single-app-node::root-1",
+                                "single-app-node",
+                                "127.0.0.1",
+                                &fs_source,
+                                tmp.path().to_path_buf(),
+                            )],
+                            ..SourceConfig::default()
+                        },
+                        api: api::ApiConfig {
+                            enabled: true,
+                            facade_resource_id: "listener-a".to_string(),
+                            local_listener_resources: vec![api::config::ApiListenerResource {
+                                resource_id: "listener-a".to_string(),
+                                bind_addr: bind_addr.clone(),
+                            }],
+                            auth: api::ApiAuthConfig {
+                                passwd_path: passwd_path.clone(),
+                                shadow_path: shadow_path.clone(),
+                                ..api::ApiAuthConfig::default()
+                            },
+                        },
+                    },
+                    external_runtime_worker_binding("source", &source_socket_dir),
+                    external_runtime_worker_binding("sink", &sink_socket_dir),
+                    NodeId("single-app-node".into()),
+                    Some(boundary.clone()),
+                    Some(boundary.clone()),
+                    state_boundary.clone(),
+                )
+                .expect("init external-worker app"),
+            )
+        };
+
+        let predecessor = make_app();
+        let successor = make_app();
+
+        if cfg!(target_os = "linux") {
+            match predecessor.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start predecessor app: {err}"),
+            }
+        } else {
+            let err = predecessor
+                .start()
+                .await
+                .expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        predecessor
+            .on_control_frame(&[
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    &[("test-root", &["listener-a"])],
+                    1,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    &[("test-root", &["listener-a"])],
+                    1,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    &[("test-root", &["listener-a"])],
+                    1,
+                ),
+                activate_envelope_with_route_key_and_scope_rows(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    &[("test-root", &["listener-a"])],
+                    1,
+                ),
+            ])
+            .await
+            .expect("activate predecessor all query-peer routes");
+
+        successor
+            .on_control_frame(&[
+                activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+                activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    2,
+                ),
+            ])
+            .await
+            .expect("initial successor source/source-scan control should succeed");
+
+        predecessor
+            .on_control_frame(&[
+                deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    2,
+                ),
+                deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    2,
+                ),
+                deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                    2,
+                ),
+                deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                    2,
+                ),
+            ])
+            .await
+            .expect("late predecessor all query-peer route deactivates should complete");
+
+        successor
+            .on_control_frame(&[
+                activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    3,
+                ),
+                activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    3,
+                ),
+            ])
+            .await
+            .expect(
+                "successor second source-only control batch must survive late predecessor all query-peer route deactivates after the first batch already succeeded",
+            );
+
+        successor.close().await.expect("close successor app");
+        predecessor.close().await.expect("close predecessor app");
+    }
+
+    #[tokio::test]
     async fn pending_facade_exposure_confirmed_waits_for_inflight_roots_put_after_sink_update_begins(
     ) {
         let tmp = tempdir().expect("create temp dir");
@@ -6810,6 +9100,1990 @@ mod tests {
             .expect("join control-frame task")
             .expect("handle exposure confirmation after roots_put");
         app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn query_peer_deactivate_does_not_shutdown_active_facade_listener() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let root = tmp.path().join("root-a");
+        fs::create_dir_all(&root).expect("create root");
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let cfg = FSMetaConfig {
+            source: SourceConfig {
+                roots: vec![source::config::RootSpec::new("root-a", &root)],
+                host_object_grants: vec![granted_mount_root("single-app-node::root-a-1", &root)],
+                ..local_source_config()
+            },
+            api: api::ApiConfig {
+                enabled: true,
+                facade_resource_id: "listener-a".to_string(),
+                local_listener_resources: vec![api::config::ApiListenerResource {
+                    resource_id: "listener-a".to_string(),
+                    bind_addr: bind_addr.clone(),
+                }],
+                auth: api::ApiAuthConfig {
+                    passwd_path,
+                    shadow_path,
+                    ..api::ApiAuthConfig::default()
+                },
+            },
+        };
+        let app = FSMetaApp::with_boundaries(
+            cfg,
+            NodeId("single-app-node".into()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init app");
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        let query_peer_route = format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL);
+        app.apply_facade_activate(
+            FacadeRuntimeUnit::QueryPeer,
+            &query_peer_route,
+            1,
+            &[RuntimeBoundScope {
+                scope_id: "root-a".to_string(),
+                resource_ids: vec!["listener-a".to_string()],
+            }],
+        )
+        .await
+        .expect("activate query-peer route");
+
+        let shutdown_started = Arc::new(Notify::new());
+        let _shutdown_reset = FacadeShutdownStartHookReset;
+        install_facade_shutdown_start_hook(FacadeShutdownStartHook {
+            entered: shutdown_started.clone(),
+        });
+        let shutdown_wait = shutdown_started.notified();
+
+        app.apply_facade_deactivate(FacadeRuntimeUnit::QueryPeer, &query_peer_route, 1)
+            .await
+            .expect("deactivate query-peer route");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), shutdown_wait)
+                .await
+                .is_err(),
+            "query-peer deactivation must not start active facade shutdown"
+        );
+        assert!(
+            app.api_task.lock().await.is_some(),
+            "query-peer deactivation must leave the active facade task installed"
+        );
+
+        let login = Client::new()
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(
+            login.status().is_success(),
+            "query-peer deactivation must leave the listener serving login: status={}",
+            login.status()
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn query_peer_deactivate_waits_for_inflight_internal_sink_status_request() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("activate sink + query-peer sink-status");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = RuntimeProxyRequestPauseHookReset {
+            label: "sink_status",
+        };
+        install_runtime_proxy_request_pause_hook(
+            "sink_status",
+            RuntimeProxyRequestPauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let request_task = tokio::spawn({
+            let boundary = boundary.clone();
+            async move {
+                internal_sink_status_request(boundary, NodeId("single-app-node".into())).await
+            }
+        });
+
+        entered.notified().await;
+
+        let mut deactivate_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                    3,
+                )])
+                .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), &mut deactivate_task)
+                .await
+                .is_err(),
+            "query-peer sink-status deactivate must wait for an in-flight internal sink-status request"
+        );
+
+        release.notify_waiters();
+        request_task
+            .await
+            .expect("join sink-status request")
+            .expect("internal sink-status request");
+        deactivate_task
+            .await
+            .expect("join sink-status deactivate")
+            .expect("deactivate query-peer sink-status after request drain");
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn query_peer_deactivate_waits_for_inflight_internal_sink_query_proxy_request() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SINK_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("activate source/sink + query-peer sink query proxy");
+
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let _pause_reset = RuntimeProxyRequestPauseHookReset {
+            label: "sink_query_proxy",
+        };
+        install_runtime_proxy_request_pause_hook(
+            "sink_query_proxy",
+            RuntimeProxyRequestPauseHook {
+                entered: entered.clone(),
+                release: release.clone(),
+            },
+        );
+
+        let request_task = tokio::spawn({
+            let boundary = boundary.clone();
+            async move {
+                selected_group_proxy_tree(
+                    boundary,
+                    NodeId("single-app-node".into()),
+                    &selected_group_dir_request(b"/", "test-root"),
+                )
+                .await
+            }
+        });
+
+        entered.notified().await;
+
+        let mut deactivate_task = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[deactivate_envelope_with_route_key(
+                    execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                    format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                    3,
+                )])
+                .await
+            }
+        });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), &mut deactivate_task)
+                .await
+                .is_err(),
+            "query-peer materialized-find-proxy deactivate must wait for an in-flight internal sink query proxy request"
+        );
+
+        release.notify_waiters();
+        request_task
+            .await
+            .expect("join sink query proxy request")
+            .expect("internal sink query proxy request");
+        deactivate_task
+            .await
+            .expect("join sink query proxy deactivate")
+            .expect("deactivate query-peer sink query proxy after request drain");
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn route_peer_deactivate_and_facade_shutdown_do_not_break_followup_source_control() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial route-peer control wave should succeed");
+
+        let login = Client::new()
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+        ])
+        .await
+        .expect("route-peer and facade deactivates should complete");
+
+        app.on_control_frame(&[activate_envelope_with_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            3,
+        )])
+        .await
+        .expect("follow-up source-only control should survive prior route-peer/facade turnover");
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn route_peer_deactivate_and_facade_shutdown_replays_followup_source_control_after_bridge_reset(
+    ) {
+        struct SourceControlErrorHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial route-peer control wave should succeed");
+
+        let login = Client::new()
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+        ])
+        .await
+        .expect("route-peer and facade deactivates should complete");
+
+        let _reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::PeerError("transport closed: sidecar control bridge stopped".to_string()),
+            },
+        );
+
+        app.on_control_frame(&[activate_envelope_with_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            3,
+        )])
+        .await
+        .expect(
+            "follow-up source-only control should replay after a retryable bridge reset during prior route-peer/facade turnover",
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn route_peer_deactivate_and_facade_shutdown_followup_source_control_survives_mid_handoff_shared_source_worker_shutdown(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial route-peer control wave should succeed");
+
+        let login = Client::new()
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+        ])
+        .await
+        .expect("route-peer and facade deactivates should complete");
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        let control_entered = Arc::new(Notify::new());
+        let control_release = Arc::new(Notify::new());
+        let _control_pause_reset = SourceWorkerControlFramePauseHookReset;
+        crate::workers::source::install_source_worker_control_frame_pause_hook(
+            crate::workers::source::SourceWorkerControlFramePauseHook {
+                entered: control_entered.clone(),
+                release: control_release.clone(),
+            },
+        );
+
+        let control = tokio::spawn({
+            let app = app.clone();
+            async move {
+                app.on_control_frame(&[activate_envelope_with_scope_rows(
+                    execution_units::SOURCE_RUNTIME_UNIT_ID,
+                    &[("test-root", &["single-app-node::root-1"])],
+                    3,
+                )])
+                .await
+            }
+        });
+
+        control_entered.notified().await;
+        source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown stale source worker bridge before replay");
+        control_release.notify_waiters();
+
+        control
+            .await
+            .expect("join follow-up source-only control")
+            .expect(
+                "follow-up source-only control should recover after a mid-handoff shared source worker shutdown",
+            );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn route_peer_deactivate_and_facade_shutdown_replays_followup_source_control_after_repeated_retryable_resets(
+    ) {
+        use std::collections::VecDeque;
+
+        struct SourceControlErrorHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let active_facade = match api::spawn(
+            app.config
+                .api
+                .resolve_for_candidate_ids(&["listener-a".to_string()])
+                .expect("resolve facade config"),
+            app.node_id.clone(),
+            app.runtime_boundary.clone(),
+            app.source.clone(),
+            app.sink.clone(),
+            app.query_sink.clone(),
+            app.runtime_boundary.clone(),
+            app.facade_pending_status.clone(),
+            app.api_request_tracker.clone(),
+            app.api_control_gate.clone(),
+        )
+        .await
+        {
+            Ok(handle) => handle,
+            Err(CnxError::InvalidInput(msg))
+                if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+            {
+                app.close().await.expect("close app after bind restriction");
+                return;
+            }
+            Err(err) => panic!("spawn active facade: {err}"),
+        };
+        *app.api_task.lock().await = Some(FacadeActivation {
+            route_key: facade_control_stream_route(),
+            generation: 1,
+            resource_ids: vec!["listener-a".to_string()],
+            handle: active_facade,
+        });
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_FIND_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_STATUS_INTERNAL),
+                &[("test-root", &["listener-a"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial route-peer control wave should succeed");
+
+        let login = Client::new()
+            .post(format!("http://{bind_addr}/api/fs-meta/v1/session/login"))
+            .json(&json!({"username":"admin","password":"admin"}))
+            .send()
+            .await
+            .expect("login request");
+        assert!(login.status().is_success(), "login failed: {}", login.status());
+
+        app.on_control_frame(&[
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_QUERY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::FACADE_RUNTIME_UNIT_ID,
+                facade_control_stream_route(),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_QUERY_PROXY),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+            deactivate_envelope_with_route_key(
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SINK_STATUS_INTERNAL),
+                3,
+            ),
+        ])
+        .await
+        .expect("route-peer and facade deactivates should complete");
+
+        let _reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_queue_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorQueueHook {
+                errs: VecDeque::from([
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge stopped".to_string(),
+                    ),
+                    CnxError::PeerError(
+                        "transport closed: sidecar control bridge stopped".to_string(),
+                    ),
+                ]),
+            },
+        );
+
+        app.on_control_frame(&[activate_envelope_with_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            3,
+        )])
+        .await
+        .expect(
+            "follow-up source-only control should replay through repeated retryable resets during prior route-peer/facade turnover",
+        );
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn failed_followup_source_control_marks_runtime_uninitialized_for_same_node_recovery() {
+        struct SourceControlErrorHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial source control wave should succeed");
+
+        let _reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated source control failure after ok=false".to_string(),
+                ),
+            },
+        );
+
+        let err = app
+            .on_control_frame(&[activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                3,
+            )])
+            .await
+            .expect_err("follow-up source-only control should fail");
+        assert!(
+            err.to_string()
+                .contains("simulated source control failure after ok=false"),
+            "unexpected follow-up source-only error: {err}"
+        );
+        assert!(
+            !app.control_initialized(),
+            "failed follow-up source-only control must leave runtime uninitialized for same-node recovery"
+        );
+
+        app.on_control_frame(&[activate_envelope_with_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            3,
+        )])
+        .await
+        .expect("same-node follow-up source-only control should recover after failure");
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn same_node_recovery_replays_retained_source_and_scan_scope_after_worker_restart() {
+        struct SourceControlErrorHookReset;
+
+        impl Drop for SourceControlErrorHookReset {
+            fn drop(&mut self) {
+                crate::workers::source::clear_source_worker_control_frame_error_hook();
+            }
+        }
+
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = Arc::new(
+            FSMetaApp::with_boundaries_and_state(
+                FSMetaConfig {
+                    source: SourceConfig {
+                        roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                        host_object_grants: vec![worker_export_with_fs_source(
+                            "single-app-node::root-1",
+                            "single-app-node",
+                            "127.0.0.1",
+                            &fs_source,
+                            tmp.path().to_path_buf(),
+                        )],
+                        ..SourceConfig::default()
+                    },
+                    api: api::ApiConfig {
+                        enabled: true,
+                        facade_resource_id: "listener-a".to_string(),
+                        local_listener_resources: vec![api::config::ApiListenerResource {
+                            resource_id: "listener-a".to_string(),
+                            bind_addr: bind_addr.clone(),
+                        }],
+                        auth: api::ApiAuthConfig {
+                            passwd_path,
+                            shadow_path,
+                            ..api::ApiAuthConfig::default()
+                        },
+                    },
+                },
+                external_runtime_worker_binding("source", &source_socket_dir),
+                external_runtime_worker_binding("sink", &sink_socket_dir),
+                NodeId("single-app-node".into()),
+                Some(boundary.clone()),
+                Some(boundary.clone()),
+                state_boundary,
+            )
+            .expect("init app"),
+        );
+
+        if cfg!(target_os = "linux") {
+            match app.start().await {
+                Ok(()) => {}
+                Err(CnxError::InvalidInput(msg))
+                    if msg.contains("fs-meta api bind failed: Operation not permitted") =>
+                {
+                    return;
+                }
+                Err(err) => panic!("start app: {err}"),
+            }
+        } else {
+            let err = app.start().await.expect_err("non-linux should fail fast");
+            assert!(matches!(err, CnxError::NotSupported(_)));
+            return;
+        }
+
+        let source_client = match &*app.source {
+            SourceFacade::Worker(client) => client.clone(),
+            SourceFacade::Local(_) => panic!("expected external source worker client"),
+        };
+
+        app.on_control_frame(&[
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+        ])
+        .await
+        .expect("initial source+scan control wave should succeed");
+
+        let expected_groups = std::collections::BTreeSet::from(["test-root".to_string()]);
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < initial_deadline,
+                "timed out waiting for initial scheduled groups: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        let _reset = SourceControlErrorHookReset;
+        crate::workers::source::install_source_worker_control_frame_error_hook(
+            crate::workers::source::SourceWorkerControlFrameErrorHook {
+                err: CnxError::ProtocolViolation(
+                    "simulated source control failure after ok=false".to_string(),
+                ),
+            },
+        );
+
+        let err = app
+            .on_control_frame(&[activate_envelope_with_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                &[("test-root", &["single-app-node::root-1"])],
+                3,
+            )])
+            .await
+            .expect_err("follow-up source-only control should fail");
+        assert!(
+            err.to_string()
+                .contains("simulated source control failure after ok=false"),
+            "unexpected follow-up source-only error: {err}"
+        );
+        assert!(
+            !app.control_initialized(),
+            "failed follow-up source-only control must leave runtime uninitialized"
+        );
+        crate::workers::source::clear_source_worker_control_frame_error_hook();
+
+        source_client
+            .shutdown_shared_worker_for_tests()
+            .await
+            .expect("shutdown source worker before same-node recovery");
+
+        app.on_control_frame(&[activate_envelope_with_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            &[("test-root", &["single-app-node::root-1"])],
+            3,
+        )])
+        .await
+        .expect("same-node source-only recovery should replay retained source/scan scope");
+
+        let recovery_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups after recovery")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups after recovery")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < recovery_deadline,
+                "same-node recovery must preserve source+scan schedule after worker restart: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        app.close().await.expect("close app");
+    }
+
+    #[tokio::test]
+    async fn replay_required_source_control_retains_active_routes_per_unit_not_just_last_route() {
+        let tmp = tempdir().expect("create temp dir");
+        let bind_addr = reserve_bind_addr();
+        let (passwd_path, shadow_path) = write_auth_files(&tmp);
+        let fs_source = tmp.path().display().to_string();
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket dir");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_fs_source_root("test-root", &fs_source)],
+                    host_object_grants: vec![worker_export_with_fs_source(
+                        "single-app-node::root-1",
+                        "single-app-node",
+                        "127.0.0.1",
+                        &fs_source,
+                        tmp.path().to_path_buf(),
+                    )],
+                    ..SourceConfig::default()
+                },
+                api: api::ApiConfig {
+                    enabled: true,
+                    facade_resource_id: "listener-a".to_string(),
+                    local_listener_resources: vec![api::config::ApiListenerResource {
+                        resource_id: "listener-a".to_string(),
+                        bind_addr,
+                    }],
+                    auth: api::ApiAuthConfig {
+                        passwd_path,
+                        shadow_path,
+                        ..api::ApiAuthConfig::default()
+                    },
+                },
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("single-app-node".into()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init app");
+
+        let initial = vec![
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[("test-root", &["single-app-node::root-1"])],
+                2,
+            ),
+        ];
+        let (initial_source, _, _) =
+            split_app_control_signals(&initial).expect("split initial source control");
+        app.record_retained_source_control_state(&initial_source).await;
+        app.source_state_replay_required
+            .store(true, Ordering::Release);
+
+        let followup = vec![activate_envelope_with_route_key_and_scope_rows(
+            execution_units::SOURCE_RUNTIME_UNIT_ID,
+            format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+            &[("test-root", &["single-app-node::root-1"])],
+            3,
+        )];
+        let (followup_source, _, _) =
+            split_app_control_signals(&followup).expect("split followup source control");
+        let replayed = app.source_signals_with_replay(&followup_source).await;
+        let replayed_routes = replayed
+            .iter()
+            .filter_map(|signal| match signal {
+                SourceControlSignal::Activate { unit, route_key, .. }
+                | SourceControlSignal::Deactivate { unit, route_key, .. }
+                | SourceControlSignal::Tick { unit, route_key, .. } => {
+                    Some((unit.unit_id().to_string(), route_key.clone()))
+                }
+                SourceControlSignal::RuntimeHostGrantChange { .. }
+                | SourceControlSignal::ManualRescan { .. }
+                | SourceControlSignal::Passthrough(_) => None,
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            replayed_routes,
+            std::collections::BTreeSet::from([
+                (
+                    execution_units::SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                ),
+                (
+                    execution_units::SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                ),
+                (
+                    execution_units::SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                ),
+                (
+                    execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                ),
+            ]),
+            "route-level replay must preserve every still-active source route across recovery, not just the last retained route per unit"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tick_only_followup_replays_retained_source_activate_scopes_after_worker_restart() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let boundary = Arc::new(LoopbackWorkerBoundary::default());
+        let state_boundary = in_memory_state_boundary();
+        let worker_socket_root = tempdir().expect("create worker socket root");
+        let source_socket_dir = worker_socket_root.path().join("source");
+        let sink_socket_dir = worker_socket_root.path().join("sink");
+        fs::create_dir_all(&source_socket_dir).expect("create source socket dir");
+        fs::create_dir_all(&sink_socket_dir).expect("create sink socket dir");
+
+        let app = FSMetaApp::with_boundaries_and_state(
+            FSMetaConfig {
+                source: SourceConfig {
+                    roots: vec![worker_root("nfs1", &nfs1), worker_root("nfs2", &nfs2)],
+                    host_object_grants: vec![
+                        worker_export(
+                            "single-app-node::nfs1",
+                            "single-app-node",
+                            "10.0.0.11",
+                            nfs1.clone(),
+                        ),
+                        worker_export(
+                            "single-app-node::nfs2",
+                            "single-app-node",
+                            "10.0.0.12",
+                            nfs2.clone(),
+                        ),
+                    ],
+                    ..SourceConfig::default()
+                },
+                ..FSMetaConfig::default()
+            },
+            external_runtime_worker_binding("source", &source_socket_dir),
+            external_runtime_worker_binding("sink", &sink_socket_dir),
+            NodeId("single-app-node".to_string()),
+            Some(boundary.clone()),
+            Some(boundary),
+            state_boundary,
+        )
+        .expect("init external-worker runtime app");
+
+        app.on_control_frame(&[
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                &[
+                    ("nfs1", &["single-app-node::nfs1"]),
+                    ("nfs2", &["single-app-node::nfs2"]),
+                ],
+                2,
+            ),
+            activate_envelope_with_route_key_and_scope_rows(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                &[
+                    ("nfs1", &["single-app-node::nfs1"]),
+                    ("nfs2", &["single-app-node::nfs2"]),
+                ],
+                2,
+            ),
+        ])
+        .await
+        .expect("apply initial source+scan control");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let source_groups = app
+                .source
+                .scheduled_source_group_ids()
+                .await
+                .expect("source groups")
+                .unwrap_or_default();
+            let scan_groups = app
+                .source
+                .scheduled_scan_group_ids()
+                .await
+                .expect("scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for initial source/scan schedule convergence: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        app.source.close().await.expect("close source worker");
+        app.mark_control_uninitialized_after_failure();
+
+        app.on_control_frame(&[
+            tick_envelope_with_route_key(
+                execution_units::SOURCE_RUNTIME_UNIT_ID,
+                format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                3,
+            ),
+            tick_envelope_with_route_key(
+                execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID,
+                format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                3,
+            ),
+        ])
+        .await
+        .expect("apply tick-only followup after worker restart");
+
+        let source_groups = app
+            .source
+            .scheduled_source_group_ids()
+            .await
+            .expect("source groups after tick replay")
+            .unwrap_or_default();
+        let scan_groups = app
+            .source
+            .scheduled_scan_group_ids()
+            .await
+            .expect("scan groups after tick replay")
+            .unwrap_or_default();
+
+        assert_eq!(
+            source_groups, expected_groups,
+            "tick-only recovery must replay retained source activate scopes after worker restart"
+        );
+        assert_eq!(
+            scan_groups, expected_groups,
+            "tick-only recovery must replay retained scan activate scopes after worker restart"
+        );
     }
 
     #[test]

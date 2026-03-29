@@ -22,6 +22,9 @@ enum UpgradeMode {
     Smoke,
     RootsPersistAcrossUpgrade,
     TreeStatsStableAcrossUpgrade,
+    TreeMaterializationAfterUpgrade,
+    SinkControlRolesAfterUpgrade,
+    SourceControlRolesAfterUpgrade,
     UpgradeWindowJoin,
     CpuBudget,
 }
@@ -32,6 +35,9 @@ impl UpgradeMode {
             Self::Smoke => "fs-meta-api-upgrade-smoke",
             Self::RootsPersistAcrossUpgrade => "fs-meta-api-upgrade-roots",
             Self::TreeStatsStableAcrossUpgrade => "fs-meta-api-upgrade-tree-stats",
+            Self::TreeMaterializationAfterUpgrade => "fs-meta-api-upgrade-tree-materialization",
+            Self::SinkControlRolesAfterUpgrade => "fs-meta-api-upgrade-sink-control-roles",
+            Self::SourceControlRolesAfterUpgrade => "fs-meta-api-upgrade-source-control-roles",
             Self::UpgradeWindowJoin => "fs-meta-api-upgrade-window",
             Self::CpuBudget => "fs-meta-api-upgrade-cpu",
         }
@@ -61,6 +67,18 @@ pub fn run_tree_stats_stable_across_upgrade() -> Result<(), String> {
     run_mode(UpgradeMode::TreeStatsStableAcrossUpgrade)
 }
 
+pub fn run_tree_materialization_after_upgrade() -> Result<(), String> {
+    run_mode(UpgradeMode::TreeMaterializationAfterUpgrade)
+}
+
+pub fn run_sink_control_roles_after_upgrade() -> Result<(), String> {
+    run_mode(UpgradeMode::SinkControlRolesAfterUpgrade)
+}
+
+pub fn run_source_control_roles_after_upgrade() -> Result<(), String> {
+    run_mode(UpgradeMode::SourceControlRolesAfterUpgrade)
+}
+
 pub fn run_upgrade_window_join() -> Result<(), String> {
     run_mode(UpgradeMode::UpgradeWindowJoin)
 }
@@ -87,6 +105,15 @@ fn run_mode(mode: UpgradeMode) -> Result<(), String> {
         }
         UpgradeMode::TreeStatsStableAcrossUpgrade => {
             scenario_tree_stats_stable_across_upgrade(&mut harness)?
+        }
+        UpgradeMode::TreeMaterializationAfterUpgrade => {
+            scenario_tree_materialization_after_upgrade(&mut harness)?
+        }
+        UpgradeMode::SinkControlRolesAfterUpgrade => {
+            scenario_sink_control_roles_after_upgrade(&mut harness)?
+        }
+        UpgradeMode::SourceControlRolesAfterUpgrade => {
+            scenario_source_control_roles_after_upgrade(&mut harness)?
         }
         UpgradeMode::UpgradeWindowJoin => scenario_upgrade_window_join(&mut harness)?,
         UpgradeMode::CpuBudget => scenario_cpu_budget(&mut harness)?,
@@ -250,6 +277,56 @@ fn scenario_tree_stats_stable_across_upgrade(harness: &mut UpgradeHarness) -> Re
     Ok(())
 }
 
+fn scenario_tree_materialization_after_upgrade(
+    harness: &mut UpgradeHarness,
+) -> Result<(), String> {
+    upgrade_to_generation_two(harness)?;
+    harness.session.rescan()?;
+    wait_for_primary_tree_materialization(
+        &mut harness.session,
+        "tree materializes after generation-two upgrade",
+    )?;
+    Ok(())
+}
+
+fn scenario_sink_control_roles_after_upgrade(
+    harness: &mut UpgradeHarness,
+) -> Result<(), String> {
+    let upgrade_result = upgrade_to_generation_two(harness);
+    let convergence_result = wait_for_node_a_sink_control_convergence(
+        &harness.cluster,
+        &harness.app_id,
+        Duration::from_secs(15),
+    );
+    match (upgrade_result, convergence_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (upgrade, converge) => Err(format!(
+            "generation-two sink-role convergence failed: upgrade={}; convergence={}",
+            upgrade.err().unwrap_or_else(|| "ok".to_string()),
+            converge.err().unwrap_or_else(|| "ok".to_string()),
+        )),
+    }
+}
+
+fn scenario_source_control_roles_after_upgrade(
+    harness: &mut UpgradeHarness,
+) -> Result<(), String> {
+    let upgrade_result = upgrade_to_generation_two(harness);
+    let convergence_result = wait_for_peer_source_control_convergence(
+        &harness.cluster,
+        &harness.app_id,
+        Duration::from_secs(15),
+    );
+    match (upgrade_result, convergence_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (upgrade, converge) => Err(format!(
+            "generation-two peer-source convergence failed: upgrade={}; convergence={}",
+            upgrade.err().unwrap_or_else(|| "ok".to_string()),
+            converge.err().unwrap_or_else(|| "ok".to_string()),
+        )),
+    }
+}
+
 fn scenario_upgrade_window_join(harness: &mut UpgradeHarness) -> Result<(), String> {
     upgrade_to_generation_two(harness)?;
 
@@ -316,6 +393,68 @@ fn wait_for_generation(cluster: &Cluster5, generation: i64) -> Result<(), String
                 .contains(&format!("\"generation\":{generation}")))
         },
     )
+}
+
+fn wait_for_node_a_sink_control_convergence(
+    cluster: &Cluster5,
+    app_id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_until(timeout, "node-a sink control converges after generation-two upgrade", || {
+        let sink_active = cluster.unit_active_pids_for_instance("node-a", app_id, "runtime.exec.sink")?;
+        let status = cluster.status("node-a")?;
+        let scheduled_sink =
+            status_debug_groups_by_node(&status, "sink", "scheduled_groups_by_node", "node-a");
+        let expected = BTreeMap::from([(
+            "node-a".to_string(),
+            vec!["nfs1".to_string(), "nfs2".to_string()],
+        )]);
+        if !sink_active.is_empty() && scheduled_sink == expected {
+            Ok(true)
+        } else {
+            Err(format!(
+                "node-a sink not converged: active_pids={sink_active:?}; scheduled_sink={scheduled_sink:?}; routes={:?}",
+                activation_route_summaries(&status)
+            ))
+        }
+    })
+}
+
+fn wait_for_peer_source_control_convergence(
+    cluster: &Cluster5,
+    app_id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    wait_until(timeout, "node-b/c/d source control converges after generation-two upgrade", || {
+        let mut failures = Vec::new();
+        for (node_name, expected_groups) in [
+            ("node-b", vec!["nfs1".to_string()]),
+            ("node-c", vec!["nfs1".to_string(), "nfs2".to_string()]),
+            ("node-d", vec!["nfs2".to_string()]),
+        ] {
+            let source_active =
+                cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.source")?;
+            let scan_active =
+                cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.scan")?;
+            let status = cluster.status(node_name)?;
+            let scheduled_source =
+                status_debug_groups_by_node(&status, "source", "scheduled_source_groups_by_node", node_name);
+            let scheduled_scan =
+                status_debug_groups_by_node(&status, "source", "scheduled_scan_groups_by_node", node_name);
+            let expected = BTreeMap::from([(node_name.to_string(), expected_groups.clone())]);
+            if source_active.is_empty() || scan_active.is_empty() || scheduled_source != expected || scheduled_scan != expected {
+                failures.push(format!(
+                    "{node_name}: source_active={source_active:?} scan_active={scan_active:?} scheduled_source={scheduled_source:?} scheduled_scan={scheduled_scan:?} routes={:?}",
+                    activation_route_summaries(&status)
+                ));
+            }
+        }
+        if failures.is_empty() {
+            Ok(true)
+        } else {
+            Err(failures.join(" || "))
+        }
+    })
 }
 
 fn measure_baseline_cpu(cluster: &Cluster5) -> Result<BTreeMap<String, Vec<u32>>, String> {
@@ -452,6 +591,59 @@ fn group_total_nodes(payload: &Value, group_key: &str) -> u64 {
         .map(|rows| rows.len() as u64)
         .unwrap_or(0);
     entries + if root_exists { 1 } else { 0 }
+}
+
+fn status_debug_groups_by_node(
+    status: &Value,
+    section: &str,
+    field: &str,
+    node_name: &str,
+) -> BTreeMap<String, Vec<String>> {
+    let groups = status
+        .get(section)
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get(field))
+        .and_then(|v| v.get(node_name))
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if groups.is_empty() {
+        BTreeMap::new()
+    } else {
+        BTreeMap::from([(node_name.to_string(), groups)])
+    }
+}
+
+fn activation_route_summaries(status: &Value) -> Vec<String> {
+    let routes = status
+        .get("daemon")
+        .and_then(|v| v.get("activation"))
+        .and_then(|v| v.get("routes"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut summaries = Vec::new();
+    for route in routes {
+        let route_key = route
+            .get("route_key")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let state = route
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown>");
+        let active_pids = route
+            .get("active_pids")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        summaries.push(format!("{route_key}:{state}:active_pids={active_pids}"));
+    }
+    summaries
 }
 
 fn unique_suffix() -> u128 {

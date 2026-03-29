@@ -97,6 +97,25 @@ fn fs_meta_release_upgrade_tree_stats_stable_real_nfs() {
 
 #[test]
 #[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_release_upgrade_tree_materialization_real_nfs() {
+    test_release_upgrade::run_tree_materialization_after_upgrade()
+        .unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_release_upgrade_sink_control_roles_real_nfs() {
+    test_release_upgrade::run_sink_control_roles_after_upgrade().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
+fn fs_meta_release_upgrade_source_control_roles_real_nfs() {
+    test_release_upgrade::run_source_control_roles_after_upgrade().unwrap();
+}
+
+#[test]
+#[ignore = "requires Linux + CAPANIX_REAL_NFS_E2E=1 + passwordless sudo"]
 fn fs_meta_release_upgrade_window_join_real_nfs() {
     test_release_upgrade::run_upgrade_window_join().unwrap();
 }

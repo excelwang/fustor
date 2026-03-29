@@ -666,10 +666,11 @@ impl SinkFileMeta {
                     METHOD_QUERY,
                     node_id_cloned.0
                 );
-                let endpoint = ManagedEndpointTask::spawn(
+                let endpoint = ManagedEndpointTask::spawn_with_unit(
                     sys.clone(),
                     route,
                     format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
+                    SINK_RUNTIME_UNIT_ID,
                     sink.shutdown.clone(),
                     {
                     let query_node_id = node_id_cloned.clone();
@@ -778,13 +779,14 @@ impl SinkFileMeta {
                 let internal_query_unit_control_for_route =
                     internal_query_unit_control.clone();
                 log::info!("bound route listening on {} for sink {}", route.0, node_id_cloned.0);
-                let endpoint = ManagedEndpointTask::spawn(
+                let endpoint = ManagedEndpointTask::spawn_with_unit(
                     sys.clone(),
                     route,
                     format!(
                         "sink:{}:{}",
                         ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY
                     ),
+                    SINK_RUNTIME_UNIT_ID,
                     sink.shutdown.clone(),
                     {
                     let internal_query_node_id = node_id_cloned.clone();
@@ -876,10 +878,11 @@ impl SinkFileMeta {
                     METHOD_FIND,
                     node_id_proxy.0
                 );
-                let endpoint = ManagedEndpointTask::spawn(
+                let endpoint = ManagedEndpointTask::spawn_with_unit(
                     sys.clone(),
                     route,
                     format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_FIND),
+                    SINK_RUNTIME_UNIT_ID,
                     sink.shutdown.clone(),
                     move |requests| {
                         let node_id_proxy = node_id_proxy.clone();
@@ -990,6 +993,7 @@ impl SinkFileMeta {
                     sys,
                     route,
                     format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+                    SINK_RUNTIME_UNIT_ID,
                     sink.shutdown.clone(),
                     move || stream_sink_ready.should_receive_stream_events(),
                     move |events| {
@@ -1074,10 +1078,11 @@ impl SinkFileMeta {
                 METHOD_QUERY,
                 node_id_cloned.0
             );
-            let endpoint = ManagedEndpointTask::spawn(
+            let endpoint = ManagedEndpointTask::spawn_with_unit(
                 boundary.clone(),
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_QUERY),
+                SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 {
                 let query_node_id = node_id_cloned.clone();
@@ -1175,13 +1180,14 @@ impl SinkFileMeta {
                 start.elapsed().as_millis()
             );
             log::info!("bound route listening on {} for sink {}", route.0, node_id_cloned.0);
-            let endpoint = ManagedEndpointTask::spawn(
+            let endpoint = ManagedEndpointTask::spawn_with_unit(
                 boundary.clone(),
                 route,
                 format!(
                     "sink:{}:{}",
                     ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_QUERY
                 ),
+                SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 {
                 let internal_query_node_id = node_id_cloned.clone();
@@ -1271,10 +1277,11 @@ impl SinkFileMeta {
                 METHOD_FIND,
                 node_id_proxy.0
             );
-            let endpoint = ManagedEndpointTask::spawn(
+            let endpoint = ManagedEndpointTask::spawn_with_unit(
                 boundary.clone(),
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META, METHOD_FIND),
+                SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 move |requests| {
                     let node_id_proxy = node_id_proxy.clone();
@@ -1380,6 +1387,7 @@ impl SinkFileMeta {
                 boundary.clone(),
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+                SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 move || stream_sink_ready.should_receive_stream_events(),
                 move |events| {
@@ -1431,6 +1439,7 @@ impl SinkFileMeta {
                     "sink:{}:{}",
                     ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_ROOTS_CONTROL
                 ),
+                SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 move || true,
                 move |events| {
@@ -1541,6 +1550,7 @@ impl SinkFileMeta {
                 boundary,
                 route,
                 format!("sink:{}:{}", ROUTE_TOKEN_FS_META_EVENTS, METHOD_STREAM),
+                SINK_RUNTIME_UNIT_ID,
                 self.shutdown.clone(),
                 move || stream_sink_ready.should_receive_stream_events(),
                 move |events| {

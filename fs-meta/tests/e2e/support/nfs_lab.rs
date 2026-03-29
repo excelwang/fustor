@@ -4,9 +4,212 @@
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
+use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use tempfile::TempDir;
+
+const LAB_MARKER_FILENAME: &str = ".fs_meta_nfs_lab";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StaleLabCleanupPlan {
+    root: PathBuf,
+    mount_targets: Vec<PathBuf>,
+}
+
+fn lab_marker_path(root: &Path) -> PathBuf {
+    root.join(LAB_MARKER_FILENAME)
+}
+
+fn decode_mountinfo_path(raw: &str) -> PathBuf {
+    let decoded = raw
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\");
+    PathBuf::from(decoded)
+}
+
+fn nfs_lab_root_for_mount_target(target: &Path) -> Option<PathBuf> {
+    let mut components = target.components();
+    match (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    ) {
+        (
+            Some(Component::RootDir),
+            Some(Component::Normal(tmp)),
+            Some(Component::Normal(root)),
+            Some(Component::Normal(mounts)),
+        ) if tmp == OsStr::new("tmp")
+            && mounts == OsStr::new("mounts")
+            && root.to_string_lossy().starts_with(".tmp") =>
+        {
+            Some(Path::new("/tmp").join(root))
+        }
+        _ => None,
+    }
+}
+
+fn discover_candidate_lab_roots_under(base_dir: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(base_dir) else {
+        return Vec::new();
+    };
+    let mut roots = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(".tmp"))
+        })
+        .filter(|path| {
+            lab_marker_path(path).exists()
+                || (path.join("mounts").exists() && path.join("exports").exists())
+        })
+        .collect::<Vec<_>>();
+    roots.sort();
+    roots
+}
+
+fn stale_lab_cleanup_plans_from_mountinfo(
+    mountinfo: &str,
+    filesystem_roots: &[PathBuf],
+) -> Vec<StaleLabCleanupPlan> {
+    let mut mounts_by_root = BTreeMap::<PathBuf, Vec<PathBuf>>::new();
+    for line in mountinfo.lines() {
+        let Some(raw_target) = line.split_whitespace().nth(4) else {
+            continue;
+        };
+        let target = decode_mountinfo_path(raw_target);
+        let Some(root) = nfs_lab_root_for_mount_target(&target) else {
+            continue;
+        };
+        mounts_by_root.entry(root).or_default().push(target);
+    }
+    for targets in mounts_by_root.values_mut() {
+        targets.sort_by(|a, b| {
+            let depth_a = a.components().count();
+            let depth_b = b.components().count();
+            depth_b.cmp(&depth_a).then_with(|| a.cmp(b))
+        });
+    }
+    let mut roots = mounts_by_root.keys().cloned().collect::<Vec<_>>();
+    for root in filesystem_roots {
+        if !roots.iter().any(|existing| existing == root) {
+            roots.push(root.clone());
+        }
+    }
+    roots.sort();
+    roots.dedup();
+    roots
+        .into_iter()
+        .map(|root| StaleLabCleanupPlan {
+            mount_targets: mounts_by_root.remove(&root).unwrap_or_default(),
+            root,
+        })
+        .collect()
+}
+
+fn join_cleanup_errors(context: &str, errors: &[String]) -> String {
+    format!("{context}: {}", errors.join("; "))
+}
+
+fn stale_lab_cleanup_plans() -> Result<Vec<StaleLabCleanupPlan>, String> {
+    let mountinfo = fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|e| format!("read /proc/self/mountinfo failed: {e}"))?;
+    let filesystem_roots = discover_candidate_lab_roots_under(Path::new("/tmp"));
+    Ok(stale_lab_cleanup_plans_from_mountinfo(
+        &mountinfo,
+        &filesystem_roots,
+    ))
+}
+
+fn cleanup_stale_lab_mount_target(target: &Path) -> Result<(), String> {
+    let status = sudo_status(["umount", target.to_string_lossy().as_ref()])?;
+    if !status.success() {
+        let fallback = sudo_status(["umount", "-f", "-l", target.to_string_lossy().as_ref()])?;
+        if !fallback.success() {
+            return Err(format!(
+                "umount {} failed with status {}; fallback umount -f -l failed with status {}",
+                target.display(),
+                status,
+                fallback
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn unexport_dir_path(dir: &Path) -> Result<(), String> {
+    let status = sudo_status(["exportfs", "-u", &format!("127.0.0.1:{}", dir.display())])?;
+    if !status.success() {
+        return Err(format!(
+            "exportfs remove {} failed with status {}",
+            dir.display(),
+            status
+        ));
+    }
+    Ok(())
+}
+
+fn cleanup_stale_lab_plan(plan: &StaleLabCleanupPlan) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for target in &plan.mount_targets {
+        if let Err(err) = cleanup_stale_lab_mount_target(target) {
+            errors.push(err);
+        }
+    }
+    let exports_dir = plan.root.join("exports");
+    if let Ok(entries) = fs::read_dir(&exports_dir) {
+        for dir in entries
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.is_dir())
+        {
+            if let Err(err) = unexport_dir_path(&dir) {
+                errors.push(err);
+            }
+        }
+    }
+    if let Err(err) = fs::remove_dir_all(&plan.root) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            errors.push(format!(
+                "remove stale lab root {} failed: {err}",
+                plan.root.display()
+            ));
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(join_cleanup_errors(
+            &format!("cleanup stale NFS lab root {}", plan.root.display()),
+            &errors,
+        ))
+    }
+}
+
+fn cleanup_stale_labs_before_start() -> Result<(), String> {
+    let plans = stale_lab_cleanup_plans()?;
+    let mut errors = Vec::new();
+    for plan in plans {
+        if let Err(err) = cleanup_stale_lab_plan(&plan) {
+            errors.push(err);
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(join_cleanup_errors(
+            "cleanup stale NFS labs before start",
+            &errors,
+        ))
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct RealNfsPreflight {
@@ -96,12 +299,15 @@ impl NfsLab {
                 .reason
                 .unwrap_or_else(|| "real NFS preflight failed".to_string()));
         }
+        cleanup_stale_labs_before_start()?;
         let temp =
             tempfile::tempdir().map_err(|e| format!("create NFS lab tempdir failed: {e}"))?;
         let exports_dir = temp.path().join("exports");
         let mounts_dir = temp.path().join("mounts");
         fs::create_dir_all(&exports_dir).map_err(|e| format!("create exports dir failed: {e}"))?;
         fs::create_dir_all(&mounts_dir).map_err(|e| format!("create mounts dir failed: {e}"))?;
+        fs::write(lab_marker_path(temp.path()), b"fs-meta nfs lab\n")
+            .map_err(|e| format!("create NFS lab marker failed: {e}"))?;
 
         let mut lab = Self {
             temp,
@@ -134,20 +340,33 @@ impl NfsLab {
 
     pub fn retire_export(&mut self, export_name: &str) -> Result<(), String> {
         let export_dir = self.exports_dir.join(export_name);
+        let mut errors = Vec::new();
         if export_dir.exists() {
-            self.unexport_dir(&export_dir)?;
+            if let Err(err) = self.unexport_dir(&export_dir) {
+                errors.push(err);
+            }
         }
         let keys = self.mounted.keys().cloned().collect::<Vec<_>>();
         for (node, export) in keys {
             if export == export_name {
-                let _ = self.unmount_export(&node, &export);
+                if let Err(err) = self.unmount_export(&node, &export) {
+                    errors.push(err);
+                }
             }
         }
         if export_dir.exists() {
-            fs::remove_dir_all(&export_dir)
-                .map_err(|e| format!("remove export dir {export_name} failed: {e}"))?;
+            if let Err(err) = fs::remove_dir_all(&export_dir) {
+                errors.push(format!("remove export dir {export_name} failed: {err}"));
+            }
         }
-        Ok(())
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(join_cleanup_errors(
+                &format!("retire export {export_name}"),
+                &errors,
+            ))
+        }
     }
 
     pub fn append_file(
@@ -290,6 +509,60 @@ impl NfsLab {
             .cloned()
     }
 
+    fn cleanup(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        let mounts = self.mounted.keys().cloned().collect::<Vec<_>>();
+        for (node, export) in mounts {
+            if let Err(err) = self.unmount_export(&node, &export) {
+                errors.push(err);
+            }
+        }
+        let exports = fs::read_dir(&self.exports_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|rows| rows.flatten())
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        for dir in exports {
+            if let Err(err) = self.unexport_dir(&dir) {
+                errors.push(err);
+            }
+        }
+        if let Some(child) = &mut self.started_mountd {
+            if let Err(err) = child.kill() {
+                errors.push(format!("kill rpc.mountd failed: {err}"));
+            }
+            if let Err(err) = child.wait() {
+                errors.push(format!("wait rpc.mountd failed: {err}"));
+            }
+        }
+        if self.started_rpcbind {
+            match sudo_status(["pkill", "-x", "rpcbind"]) {
+                Ok(status) if status.success() => {}
+                Ok(status) => errors.push(format!("pkill rpcbind failed with status {}", status)),
+                Err(err) => errors.push(err),
+            }
+        }
+        if self.mounted_nfsd {
+            match sudo_status(["umount", "/proc/fs/nfsd"]) {
+                Ok(status) if status.success() => {}
+                Ok(status) => errors.push(format!(
+                    "umount /proc/fs/nfsd failed with status {}",
+                    status
+                )),
+                Err(err) => errors.push(err),
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(join_cleanup_errors(
+                &format!("cleanup NFS lab {}", self.temp.path().display()),
+                &errors,
+            ))
+        }
+    }
+
     fn seed_export_tree(&self, export_dir: &Path, export_name: &str) -> Result<(), String> {
         let root = export_dir.join("root.txt");
         fs::write(&root, format!("root-{export_name}\n"))
@@ -388,28 +661,8 @@ impl NfsLab {
 
 impl Drop for NfsLab {
     fn drop(&mut self) {
-        let mounts = self.mounted.keys().cloned().collect::<Vec<_>>();
-        for (node, export) in mounts {
-            let _ = self.unmount_export(&node, &export);
-        }
-        let exports = fs::read_dir(&self.exports_dir)
-            .ok()
-            .into_iter()
-            .flat_map(|rows| rows.flatten())
-            .map(|entry| entry.path())
-            .collect::<Vec<_>>();
-        for dir in exports {
-            let _ = self.unexport_dir(&dir);
-        }
-        if let Some(child) = &mut self.started_mountd {
-            let _ = child.kill();
-            let _ = child.wait();
-        }
-        if self.started_rpcbind {
-            let _ = sudo_status(["pkill", "-x", "rpcbind"]);
-        }
-        if self.mounted_nfsd {
-            let _ = sudo_status(["umount", "/proc/fs/nfsd"]);
+        if let Err(err) = self.cleanup() {
+            eprintln!("fs-meta nfs lab cleanup failed: {err}");
         }
     }
 }
@@ -441,4 +694,66 @@ where
         .args(args)
         .output()
         .map_err(|e| format!("sudo output failed: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nfs_lab_root_for_mount_target_requires_tmp_mounts_path() {
+        assert_eq!(
+            nfs_lab_root_for_mount_target(Path::new("/tmp/.tmpabc123/mounts/node-a/nfs1")),
+            Some(PathBuf::from("/tmp/.tmpabc123"))
+        );
+        assert_eq!(
+            nfs_lab_root_for_mount_target(Path::new("/tmp/.tmpabc123/exports/nfs1")),
+            None
+        );
+        assert_eq!(
+            nfs_lab_root_for_mount_target(Path::new("/var/tmp/.tmpabc123/mounts/node-a/nfs1")),
+            None
+        );
+    }
+
+    #[test]
+    fn discover_candidate_lab_roots_under_finds_marker_and_structured_roots() {
+        let base = tempfile::tempdir().expect("base tempdir");
+        let marker_root = base.path().join(".tmp-lab-marker");
+        let structured_root = base.path().join(".tmp-lab-structured");
+        let unrelated_root = base.path().join("unrelated");
+        fs::create_dir_all(&marker_root).expect("marker root");
+        fs::write(lab_marker_path(&marker_root), b"marker\n").expect("marker file");
+        fs::create_dir_all(structured_root.join("mounts")).expect("structured mounts");
+        fs::create_dir_all(structured_root.join("exports")).expect("structured exports");
+        fs::create_dir_all(&unrelated_root).expect("unrelated root");
+
+        let roots = discover_candidate_lab_roots_under(base.path());
+        assert_eq!(roots, vec![marker_root, structured_root]);
+    }
+
+    #[test]
+    fn stale_lab_cleanup_plans_merge_mountinfo_and_filesystem_roots() {
+        let mountinfo = concat!(
+            "101 100 0:42 / /tmp/.tmpabc123/mounts/node-a/nfs1 rw,relatime - nfs4 127.0.0.1:/tmp/.tmpabc123/exports/nfs1 rw\n",
+            "102 100 0:43 / /tmp/.tmpabc123/mounts/node-a/nfs1/child rw,relatime - nfs4 127.0.0.1:/tmp/.tmpabc123/exports/nfs1 rw\n",
+            "103 100 0:44 / /tmp/.tmpabc123/mounts/node-b/nfs2\\040space rw,relatime - nfs4 127.0.0.1:/tmp/.tmpabc123/exports/nfs2 rw\n"
+        );
+        let filesystem_roots = vec![PathBuf::from("/tmp/.tmpdef456")];
+
+        let plans = stale_lab_cleanup_plans_from_mountinfo(mountinfo, &filesystem_roots);
+        assert_eq!(plans.len(), 2);
+        assert_eq!(plans[0].root, PathBuf::from("/tmp/.tmpabc123"));
+        assert_eq!(plans[0].mount_targets.len(), 3);
+        assert_eq!(
+            plans[0].mount_targets[0],
+            PathBuf::from("/tmp/.tmpabc123/mounts/node-a/nfs1/child")
+        );
+        assert_eq!(
+            plans[0].mount_targets[2],
+            PathBuf::from("/tmp/.tmpabc123/mounts/node-b/nfs2 space")
+        );
+        assert_eq!(plans[1].root, PathBuf::from("/tmp/.tmpdef456"));
+        assert!(plans[1].mount_targets.is_empty());
+    }
 }
