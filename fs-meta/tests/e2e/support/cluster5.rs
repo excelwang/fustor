@@ -1768,10 +1768,16 @@ fn layered_local_status_from_parts(cluster: Value, metrics: Value) -> Value {
             daemon_obj.insert("activation".to_string(), activation);
         }
     }
+    let source = metrics.get("source").cloned().unwrap_or(Value::Null);
+    let sink = metrics.get("sink").cloned().unwrap_or(Value::Null);
+    let facade = metrics.get("facade").cloned().unwrap_or(Value::Null);
     json!({
         "cluster": cluster,
         "metrics": metrics,
         "daemon": daemon,
+        "source": source,
+        "sink": sink,
+        "facade": facade,
     })
 }
 
@@ -2151,6 +2157,68 @@ mod tests {
         assert_eq!(
             unit_active_pids_for_instance_from_status(&status, "app-1", "runtime.exec.source"),
             BTreeSet::from([1]),
+        );
+    }
+
+    #[test]
+    fn layered_status_preserves_top_level_source_and_sink_debug_sections() {
+        let status = layered_local_status_from_parts(
+            json!({ "nodes": [] }),
+            json!({
+                "uptime_secs": 1,
+                "health": "ok",
+                "source": {
+                    "debug": {
+                        "scheduled_source_groups_by_node": {
+                            "node-b": ["nfs1"]
+                        },
+                        "scheduled_scan_groups_by_node": {
+                            "node-b": ["nfs1"]
+                        }
+                    }
+                },
+                "sink": {
+                    "debug": {
+                        "scheduled_groups_by_node": {
+                            "node-a": ["nfs1", "nfs2"]
+                        }
+                    }
+                }
+            }),
+        );
+
+        assert_eq!(
+            status
+                .get("source")
+                .and_then(|value| value.get("debug"))
+                .and_then(|value| value.get("scheduled_source_groups_by_node"))
+                .and_then(|value| value.get("node-b"))
+                .and_then(Value::as_array)
+                .cloned(),
+            Some(vec![Value::String("nfs1".to_string())])
+        );
+        assert_eq!(
+            status
+                .get("source")
+                .and_then(|value| value.get("debug"))
+                .and_then(|value| value.get("scheduled_scan_groups_by_node"))
+                .and_then(|value| value.get("node-b"))
+                .and_then(Value::as_array)
+                .cloned(),
+            Some(vec![Value::String("nfs1".to_string())])
+        );
+        assert_eq!(
+            status
+                .get("sink")
+                .and_then(|value| value.get("debug"))
+                .and_then(|value| value.get("scheduled_groups_by_node"))
+                .and_then(|value| value.get("node-a"))
+                .and_then(Value::as_array)
+                .cloned(),
+            Some(vec![
+                Value::String("nfs1".to_string()),
+                Value::String("nfs2".to_string())
+            ])
         );
     }
 }

@@ -11,11 +11,12 @@ use capanix_app_sdk::runtime::{
 };
 use capanix_runtime_entry_sdk::advanced::boundary::{BoundaryContext, StateBoundary};
 
-use crate::source::config::RootSpec;
+use crate::source::config::{GrantedMountRoot, RootSpec};
 
 const AUTHORITY_JOURNAL_MAX_ENTRIES: usize = 4_096;
 const AUTHORITY_SCHEMA_REV: u64 = 1;
 const LOGICAL_ROOTS_SCHEMA_REV: u64 = 1;
+const HOST_OBJECT_GRANTS_SCHEMA_REV: u64 = 1;
 const SIGNAL_SCHEMA_REV: u64 = 1;
 fn now_us() -> u64 {
     match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
@@ -76,6 +77,14 @@ fn logical_roots_handle(scope: &str) -> StateCellHandle {
     StateCellHandle {
         cell_id: format!("fs-meta.logical-roots.{scope}"),
         schema_rev: LOGICAL_ROOTS_SCHEMA_REV,
+        state_class: StateClass::Authoritative,
+    }
+}
+
+fn host_object_grants_handle(scope: &str) -> StateCellHandle {
+    StateCellHandle {
+        cell_id: format!("fs-meta.host-object-grants.{scope}"),
+        schema_rev: HOST_OBJECT_GRANTS_SCHEMA_REV,
         state_class: StateClass::Authoritative,
     }
 }
@@ -195,6 +204,31 @@ pub(crate) struct LogicalRootsCell {
     handle: StateCellHandle,
     state_boundary: Arc<dyn StateBoundary>,
     state: Arc<Mutex<LogicalRootsSnapshot>>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+struct HostObjectGrantsSnapshot {
+    scope: String,
+    version: u64,
+    grants: Vec<GrantedMountRoot>,
+}
+
+impl HostObjectGrantsSnapshot {
+    fn new(scope: &str, grants: Vec<GrantedMountRoot>) -> Self {
+        Self {
+            scope: scope.to_string(),
+            version: 0,
+            grants,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct HostObjectGrantsCell {
+    scope: Arc<str>,
+    handle: StateCellHandle,
+    state_boundary: Arc<dyn StateBoundary>,
+    state: Arc<Mutex<HostObjectGrantsSnapshot>>,
 }
 
 impl SignalCell {
@@ -456,6 +490,127 @@ impl LogicalRootsCell {
     }
 }
 
+impl HostObjectGrantsCell {
+    pub(crate) fn from_state_boundary(
+        scope: &str,
+        initial_grants: Vec<GrantedMountRoot>,
+        state_boundary: Arc<dyn StateBoundary>,
+    ) -> std::io::Result<Self> {
+        let handle = host_object_grants_handle(scope);
+        let loaded = match statecell_read_blocking(
+            &state_boundary,
+            scope,
+            StateCellReadRequest {
+                handle: handle.clone(),
+            },
+        ) {
+            Ok(resp) => {
+                if resp.status != "ok" {
+                    return Err(std::io::Error::other(format!(
+                        "statecell_read failed for host object grants scope={scope}: status={}",
+                        resp.status
+                    )));
+                }
+                if resp.payload.is_empty() {
+                    let snapshot = HostObjectGrantsSnapshot::new(scope, initial_grants);
+                    write_host_object_grants_snapshot_blocking(
+                        &state_boundary,
+                        scope,
+                        &handle,
+                        &snapshot,
+                    )?;
+                    snapshot
+                } else {
+                    let decoded: HostObjectGrantsSnapshot =
+                        rmp_serde::from_slice(&resp.payload).map_err(|err| {
+                            std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("decode host object grants snapshot failed: {err}"),
+                            )
+                        })?;
+                    if decoded.scope != scope {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!(
+                                "host object grants snapshot scope mismatch: expected {scope}, got {}",
+                                decoded.scope
+                            ),
+                        ));
+                    }
+                    decoded
+                }
+            }
+            Err(err) if is_statecell_not_found(&err) => {
+                let snapshot = HostObjectGrantsSnapshot::new(scope, initial_grants);
+                write_host_object_grants_snapshot_blocking(
+                    &state_boundary,
+                    scope,
+                    &handle,
+                    &snapshot,
+                )?;
+                snapshot
+            }
+            Err(err) => {
+                return Err(std::io::Error::other(format!(
+                    "statecell_read failed for host object grants scope={scope}: {err}"
+                )));
+            }
+        };
+        Ok(Self {
+            scope: Arc::<str>::from(scope),
+            handle,
+            state_boundary,
+            state: Arc::new(Mutex::new(loaded)),
+        })
+    }
+
+    pub(crate) fn snapshot(&self) -> (u64, Vec<GrantedMountRoot>) {
+        match self.state.lock() {
+            Ok(state) => (state.version, state.grants.clone()),
+            Err(poisoned) => {
+                let state = poisoned.into_inner();
+                (state.version, state.grants.clone())
+            }
+        }
+    }
+
+    pub(crate) async fn replace(
+        &self,
+        version: u64,
+        grants: Vec<GrantedMountRoot>,
+    ) -> Result<(), CnxError> {
+        let payload = {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| CnxError::Internal("host object grants state lock poisoned".into()))?;
+            state.version = version;
+            state.grants = grants;
+            rmp_serde::to_vec_named(&*state).map_err(|err| {
+                CnxError::Internal(format!("encode host object grants snapshot failed: {err}"))
+            })?
+        };
+        let result = self
+            .state_boundary
+            .statecell_write(
+                local_state_boundary_bridge(&self.scope),
+                StateCellWriteRequest {
+                    handle: self.handle.clone(),
+                    payload,
+                    lease_epoch: Some(version),
+                },
+            )
+            .await?;
+        if result.status != "committed" && result.status != "ok" {
+            return Err(CnxError::Internal(format!(
+                "statecell_write returned non-committed status for host object grants scope={}: {}",
+                self.scope, result.status
+            )));
+        }
+        Ok(())
+    }
+}
+
 fn write_logical_roots_snapshot_blocking(
     state_boundary: &Arc<dyn StateBoundary>,
     scope: &str,
@@ -483,6 +638,39 @@ fn write_logical_roots_snapshot_blocking(
     if result.status != "committed" && result.status != "ok" {
         return Err(std::io::Error::other(format!(
             "statecell_write returned non-committed status for logical roots scope={scope}: {}",
+            result.status
+        )));
+    }
+    Ok(())
+}
+
+fn write_host_object_grants_snapshot_blocking(
+    state_boundary: &Arc<dyn StateBoundary>,
+    scope: &str,
+    handle: &StateCellHandle,
+    snapshot: &HostObjectGrantsSnapshot,
+) -> std::io::Result<()> {
+    let payload = rmp_serde::to_vec_named(snapshot).map_err(|err| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("encode host object grants snapshot failed: {err}"),
+        )
+    })?;
+    let result = statecell_write_blocking(
+        state_boundary,
+        scope,
+        StateCellWriteRequest {
+            handle: handle.clone(),
+            payload,
+            lease_epoch: Some(snapshot.version),
+        },
+    )
+    .map_err(|err| std::io::Error::other(format!(
+        "statecell_write failed for host object grants scope={scope}: {err}"
+    )))?;
+    if result.status != "committed" && result.status != "ok" {
+        return Err(std::io::Error::other(format!(
+            "statecell_write returned non-committed status for host object grants scope={scope}: {}",
             result.status
         )));
     }

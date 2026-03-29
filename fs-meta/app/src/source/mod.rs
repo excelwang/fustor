@@ -60,7 +60,7 @@ use crate::source::drift::DriftEstimator;
 use crate::source::scanner::ParallelScanner;
 use crate::source::sentinel::{HealthSignal, Sentinel, SentinelAction, SentinelConfig};
 use crate::source::watcher::WatchManager;
-use crate::state::cell::{AuthorityJournal, LogicalRootsCell, SignalCell};
+use crate::state::cell::{AuthorityJournal, HostObjectGrantsCell, LogicalRootsCell, SignalCell};
 use crate::state::commit_boundary::CommitBoundary;
 use crate::FileMetaRecord;
 
@@ -616,6 +616,7 @@ struct FanoutHealthState {
 struct SourceStateCell {
     logical_roots: Arc<Mutex<Vec<RootSpec>>>,
     logical_roots_cell: LogicalRootsCell,
+    host_object_grants_cell: HostObjectGrantsCell,
     roots: Arc<Mutex<Vec<RootRuntime>>>,
     root_tasks: Arc<Mutex<HashMap<String, RootTaskEntry>>>,
     stream_binding: Arc<Mutex<Option<SourceStreamBinding>>>,
@@ -632,6 +633,7 @@ impl SourceStateCell {
     fn new(
         logical_roots: Vec<RootSpec>,
         logical_roots_cell: LogicalRootsCell,
+        host_object_grants_cell: HostObjectGrantsCell,
         roots: Vec<RootRuntime>,
         logical_root_fanout: HashMap<String, Vec<GrantedMountRoot>>,
         host_object_grants: Vec<GrantedMountRoot>,
@@ -641,6 +643,7 @@ impl SourceStateCell {
         let cell = Self {
             logical_roots: Arc::new(Mutex::new(logical_roots)),
             logical_roots_cell,
+            host_object_grants_cell,
             roots: Arc::new(Mutex::new(roots)),
             root_tasks: Arc::new(Mutex::new(HashMap::new())),
             stream_binding: Arc::new(Mutex::new(None)),
@@ -859,8 +862,6 @@ impl FSMetaSource {
                     if changed.version <= current {
                         continue;
                     }
-                    self.host_object_grants_version
-                        .store(changed.version, Ordering::Relaxed);
                     let grants = changed
                         .grants
                         .into_iter()
@@ -881,6 +882,12 @@ impl FSMetaSource {
                             active: matches!(row.grant_state, RuntimeHostGrantState::Active),
                         })
                         .collect::<Vec<_>>();
+                    self.state_cell
+                        .host_object_grants_cell
+                        .replace(changed.version, grants.clone())
+                        .await?;
+                    self.host_object_grants_version
+                        .store(changed.version, Ordering::Relaxed);
                     if changed.version > current.saturating_add(1) {
                         log::warn!(
                             "host object grants version jump detected: current={}, incoming={}; rebuilding full fanout",
@@ -990,10 +997,29 @@ impl FSMetaSource {
             return Ok(None);
         }
         let groups = match self.unit_control.unit_state(unit.unit_id())? {
-            Some((true, rows)) => rows
-                .into_iter()
-                .map(|row| row.scope_id)
-                .collect::<BTreeSet<_>>(),
+            Some((true, rows)) => {
+                let active_groups = rows.into_iter().map(|row| row.scope_id).collect::<BTreeSet<_>>();
+                let logical_roots = self.logical_roots_snapshot();
+                let host_object_grants = self.host_object_grants_snapshot();
+                let runnable_local_groups = logical_roots
+                    .iter()
+                    .filter(|root| match unit {
+                        SourceRuntimeUnit::Source => root.watch,
+                        SourceRuntimeUnit::Scan => root.scan,
+                    })
+                    .filter(|root| {
+                        host_object_grants.iter().any(|grant| {
+                            host_ref_matches_node_id(&grant.host_ref, &self.node_id)
+                                && root.selector.matches(grant)
+                        })
+                    })
+                    .map(|root| root.id.clone())
+                    .collect::<BTreeSet<_>>();
+                active_groups
+                    .intersection(&runnable_local_groups)
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+            }
             Some((false, _)) | None => BTreeSet::new(),
         };
         Ok(Some(groups))
@@ -1897,7 +1923,7 @@ impl FSMetaSource {
         state_boundary: Arc<dyn StateBoundary>,
         _defer_authority_read: bool,
     ) -> Result<Self> {
-        let initial_host_object_grants = config.host_object_grants.clone();
+        let configured_host_object_grants = config.host_object_grants.clone();
         let configured_root_specs = config.effective_roots().map_err(CnxError::InvalidInput)?;
         let authority =
             AuthorityJournal::from_state_boundary(SOURCE_RUNTIME_UNIT_ID, state_boundary.clone())
@@ -1913,6 +1939,16 @@ impl FSMetaSource {
             CnxError::InvalidInput(format!("source logical-roots state init failed: {err}"))
         })?;
         let root_specs = logical_roots_cell.snapshot();
+        let host_object_grants_cell = HostObjectGrantsCell::from_state_boundary(
+            SOURCE_RUNTIME_UNIT_ID,
+            configured_host_object_grants,
+            state_boundary.clone(),
+        )
+        .map_err(|err| {
+            CnxError::InvalidInput(format!("source host-object-grants state init failed: {err}"))
+        })?;
+        let (initial_host_object_grants_version, initial_host_object_grants) =
+            host_object_grants_cell.snapshot();
         let drift_estimator = Arc::new(Mutex::new(DriftEstimator::new(
             config.drift_window_size,
             config.drift_graduation_threshold,
@@ -1966,6 +2002,7 @@ impl FSMetaSource {
             state_cell: SourceStateCell::new(
                 root_specs,
                 logical_roots_cell,
+                host_object_grants_cell,
                 roots,
                 logical_root_fanout,
                 initial_host_object_grants,
@@ -1974,7 +2011,9 @@ impl FSMetaSource {
             ),
             manual_rescan_signal,
             manual_rescan_watch_task: Arc::new(Mutex::new(None)),
-            host_object_grants_version: Arc::new(AtomicU64::new(0)),
+            host_object_grants_version: Arc::new(AtomicU64::new(
+                initial_host_object_grants_version,
+            )),
             unit_control,
             endpoint_tasks: Arc::new(Mutex::new(Vec::new())),
             sentinel,
@@ -4431,7 +4470,9 @@ mod tests {
     use super::*;
     use crate::ControlEvent;
     use crate::query::{InternalQueryRequest, MaterializedQueryPayload, QueryOp, QueryScope};
+    use crate::runtime::execution_units::SOURCE_SCAN_RUNTIME_UNIT_ID;
     use crate::sink::SinkFileMeta;
+    use capanix_app_sdk::runtime::ControlEnvelope;
     use capanix_runtime_entry_sdk::control::{
         RuntimeExecActivate, RuntimeExecControl, RuntimeExecDeactivate, RuntimeHostDescriptor,
         RuntimeHostGrant, RuntimeHostGrantChange, RuntimeHostGrantState, RuntimeHostObjectType,
@@ -4439,6 +4480,11 @@ mod tests {
         encode_runtime_host_grant_change, encode_runtime_unit_tick,
     };
     use std::collections::BTreeSet;
+
+    struct NoopBoundary;
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for NoopBoundary {}
 
     fn root(id: &str, path: &str) -> RootSpec {
         RootSpec::new(id, std::path::PathBuf::from(path))
@@ -4770,6 +4816,167 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_host_object_grants_changed_survives_restart_on_shared_state_boundary_for_runtime_managed_schedule_recovery(
+    ) {
+        let boundary = in_memory_state_boundary();
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
+        cfg.host_object_grants = Vec::new();
+
+        let node_id = NodeId("node-c-29775351239650530581020673".to_string());
+        let source = FSMetaSource::with_boundaries_and_state(
+            cfg.clone(),
+            node_id.clone(),
+            Some(Arc::new(NoopBoundary)),
+            boundary.clone(),
+        )
+        .expect("build runtime-managed source");
+
+        source
+            .on_control_frame(&[
+                encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+                    version: 1,
+                    grants: vec![
+                        route_export("node-c::nfs1", "node-c", "10.0.0.31", "/mnt/nfs1", true),
+                        route_export("node-c::nfs2", "node-c", "10.0.0.32", "/mnt/nfs2", true),
+                    ],
+                })
+                .expect("encode runtime host grants changed"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-c::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-c::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: METHOD_SOURCE_RESCAN.to_string(),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-c::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-c::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode scan activate"),
+            ])
+            .await
+            .expect("apply initial grants+source control");
+
+        let expected_groups = BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let initial_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = source
+                .scheduled_source_group_ids()
+                .expect("initial source groups")
+                .unwrap_or_default();
+            let scan_groups = source
+                .scheduled_scan_group_ids()
+                .expect("initial scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < initial_deadline,
+                "timed out waiting for initial runtime-managed source schedule convergence: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        source.close().await.expect("close source");
+
+        let restarted = FSMetaSource::with_boundaries_and_state(
+            cfg,
+            node_id,
+            Some(Arc::new(NoopBoundary)),
+            boundary,
+        )
+        .expect("restart runtime-managed source");
+
+        restarted
+            .on_control_frame(&[
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 3,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-c::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-c::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode restarted source activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: METHOD_SOURCE_RESCAN.to_string(),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 3,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-c::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-c::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode restarted scan activate"),
+            ])
+            .await
+            .expect("apply restarted source control");
+
+        let restart_deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = restarted
+                .scheduled_source_group_ids()
+                .expect("restarted source groups")
+                .unwrap_or_default();
+            let scan_groups = restarted
+                .scheduled_scan_group_ids()
+                .expect("restarted scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < restart_deadline,
+                "restart on the same state boundary must preserve runtime host grants for runtime-managed schedule recovery: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    #[tokio::test]
     async fn runtime_host_object_grants_changed_ignores_stale_versions() {
         let source = build_source(vec![test_export(
             "node-a",
@@ -5055,6 +5262,77 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["node-b::nfs1", "node-b::nfs2"],
             "instance-suffixed worker node ids must still match bare host_ref grants for local source scheduling"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_groups_publish_only_runnable_local_roots_after_mixed_scope_activate() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
+        cfg.host_object_grants = vec![
+            test_export("node-b::nfs1", "node-b", "10.0.0.21", "/mnt/nfs1", true),
+            test_export("node-d::nfs2", "node-d", "10.0.0.41", "/mnt/nfs2", true),
+        ];
+        let source = FSMetaSource::with_boundaries(
+            cfg,
+            NodeId("node-b-29775332298115179545100289".to_string()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init source");
+
+        let envelopes: Vec<ControlEnvelope> = vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["node-b::nfs1".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["node-d::nfs2".to_string()],
+                    },
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_RESCAN.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["node-b::nfs1".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["node-d::nfs2".to_string()],
+                    },
+                ],
+            }))
+            .expect("encode scan activate"),
+        ];
+
+        source
+            .on_control_frame(&envelopes)
+            .await
+            .expect("apply mixed local+remote control");
+
+        assert_eq!(
+            source.scheduled_source_group_ids().expect("source groups"),
+            Some(BTreeSet::from(["nfs1".to_string()])),
+            "scheduled source groups must reflect runnable local roots, not every activated remote scope",
+        );
+        assert_eq!(
+            source.scheduled_scan_group_ids().expect("scan groups"),
+            Some(BTreeSet::from(["nfs1".to_string()])),
+            "scheduled scan groups must reflect runnable local roots, not every activated remote scope",
         );
     }
 

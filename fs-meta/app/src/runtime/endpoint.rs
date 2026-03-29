@@ -95,8 +95,17 @@ enum EndpointJoin {
     Thread(std::thread::JoinHandle<()>),
 }
 
+impl EndpointJoin {
+    fn is_finished(&self) -> bool {
+        match self {
+            Self::Thread(join) => join.is_finished(),
+        }
+    }
+}
+
 pub(crate) struct ManagedEndpointTask {
     name: String,
+    route_key: String,
     shutdown: CancellationToken,
     join: Option<EndpointJoin>,
 }
@@ -195,6 +204,7 @@ impl ManagedEndpointTask {
         Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
     {
         let name_owned = name.into();
+        let route_key = route.0.clone();
         let join_name = name_owned.clone();
         let shutdown_for_task = shutdown.clone();
         let handler = Arc::new(handler);
@@ -204,6 +214,7 @@ impl ManagedEndpointTask {
 
         Self {
             name: name_owned,
+            route_key,
             shutdown,
             join: Some(join),
         }
@@ -224,6 +235,7 @@ impl ManagedEndpointTask {
         G: Fn() -> bool + Send + Sync + 'static,
     {
         let name_owned = name.into();
+        let route_key = route.0.clone();
         let unit_id = unit_id.into();
         let join_name = name_owned.clone();
         let shutdown_for_task = shutdown.clone();
@@ -243,9 +255,18 @@ impl ManagedEndpointTask {
 
         Self {
             name: name_owned,
+            route_key,
             shutdown,
             join: Some(join),
         }
+    }
+
+    pub(crate) fn route_key(&self) -> &str {
+        &self.route_key
+    }
+
+    pub(crate) fn is_finished(&self) -> bool {
+        self.join.as_ref().is_none_or(EndpointJoin::is_finished)
     }
 
     pub(crate) async fn shutdown(&mut self, wait_timeout: Duration) {

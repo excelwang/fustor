@@ -122,6 +122,26 @@ fn debug_force_find_route_capture_enabled() -> bool {
     })
 }
 
+fn host_ref_matches_node_id(host_ref: &str, node_id: &NodeId) -> bool {
+    host_ref == node_id.0
+        || node_id
+            .0
+            .strip_prefix(host_ref)
+            .is_some_and(|suffix| suffix.starts_with('-'))
+}
+
+fn stable_host_ref_for_node_id(node_id: &NodeId, grants: &[crate::source::config::GrantedMountRoot]) -> String {
+    let host_refs = grants
+        .iter()
+        .filter(|grant| host_ref_matches_node_id(&grant.host_ref, node_id))
+        .map(|grant| grant.host_ref.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    match host_refs.len() {
+        1 => host_refs.into_iter().next().unwrap_or_else(|| node_id.0.clone()),
+        _ => node_id.0.clone(),
+    }
+}
+
 fn debug_stream_path_capture_target() -> Option<Vec<u8>> {
     static TARGET: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
     TARGET
@@ -494,6 +514,8 @@ fn source_observability_snapshot(
     published_stats: &Arc<StdMutex<PublishedBatchStats>>,
 ) -> SourceObservabilitySnapshot {
     let node_id = source.node_id();
+    let grants = source.host_object_grants_snapshot();
+    let stable_host_ref = stable_host_ref_for_node_id(&node_id, &grants);
     let published = lock_publish_stats(published_stats);
     let enqueued_path_origin_counts = source.enqueued_path_origin_counts_snapshot();
     let pending_path_origin_counts = source.pending_path_origin_counts_snapshot();
@@ -501,7 +523,7 @@ fn source_observability_snapshot(
     SourceObservabilitySnapshot {
         lifecycle_state: format!("{:?}", source.state()).to_ascii_lowercase(),
         host_object_grants_version: source.host_object_grants_version_snapshot(),
-        grants: source.host_object_grants_snapshot(),
+        grants,
         logical_roots: source.logical_roots_snapshot(),
         status: source.status_snapshot(),
         source_primary_by_group: source.source_primary_by_group_snapshot(),
@@ -514,7 +536,7 @@ fn source_observability_snapshot(
             .filter(|groups| !groups.is_empty())
             .map(|groups| {
                 std::collections::BTreeMap::from([(
-                    node_id.0.clone(),
+                    stable_host_ref.clone(),
                     groups.into_iter().collect(),
                 )])
             })
@@ -526,7 +548,7 @@ fn source_observability_snapshot(
             .filter(|groups| !groups.is_empty())
             .map(|groups| {
                 std::collections::BTreeMap::from([(
-                    node_id.0.clone(),
+                    stable_host_ref.clone(),
                     groups.into_iter().collect(),
                 )])
             })
@@ -1146,6 +1168,10 @@ impl TypedWorkerBootstrapSession<SourceConfig> for SourceWorkerSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use capanix_app_sdk::runtime::in_memory_state_boundary;
+    use capanix_runtime_entry_sdk::control::{
+        RuntimeBoundScope, RuntimeExecActivate, RuntimeExecControl, encode_runtime_exec_control,
+    };
     use std::path::PathBuf;
 
     use futures_util::StreamExt;
@@ -1153,12 +1179,26 @@ mod tests {
 
     use crate::source::config::GrantedMountRoot;
     use crate::source::config::RootSpec;
+    use crate::runtime::execution_units::{SOURCE_RUNTIME_UNIT_ID, SOURCE_SCAN_RUNTIME_UNIT_ID};
+    use crate::runtime::routes::{
+        ROUTE_KEY_SOURCE_RESCAN_CONTROL, ROUTE_KEY_SOURCE_RESCAN_INTERNAL,
+        ROUTE_KEY_SOURCE_ROOTS_CONTROL,
+    };
+
+    struct NoopBoundary;
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for NoopBoundary {}
 
     fn test_root(id: &str, path: PathBuf) -> RootSpec {
         let mut root = RootSpec::new(id, path);
         root.watch = false;
         root.scan = true;
         root
+    }
+
+    fn test_watch_scan_root(id: &str, path: PathBuf) -> RootSpec {
+        RootSpec::new(id, path)
     }
 
     fn test_export(object_ref: &str, mount_point: PathBuf) -> GrantedMountRoot {
@@ -1177,6 +1217,244 @@ mod tests {
             interfaces: vec![],
             active: true,
         }
+    }
+
+    #[tokio::test]
+    async fn bootstrap_start_builds_runtime_managed_source_for_real_source_route_wave() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1 dir");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![
+                test_watch_scan_root("nfs1", nfs1.clone()),
+                test_watch_scan_root("nfs2", nfs2.clone()),
+            ],
+            host_object_grants: vec![
+                test_export("node-a::nfs1", nfs1.clone()),
+                test_export("node-a::nfs2", nfs2.clone()),
+            ],
+            ..SourceConfig::default()
+        };
+
+        let mut state = SourceWorkerState {
+            source: None,
+            pending_init: Some((
+                NodeId("node-a-29775285406139598021591041".to_string()),
+                cfg,
+            )),
+            pump_task: None,
+            last_control_frame_signals: Vec::new(),
+            published_stats: Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        };
+
+        bootstrap_start_source_runtime(
+            &mut state,
+            Arc::new(NoopBoundary),
+            in_memory_state_boundary(),
+        )
+        .await
+        .expect("bootstrap start source runtime");
+
+        let source = state
+            .source
+            .as_ref()
+            .cloned()
+            .expect("source should be initialized");
+        source
+            .on_control_frame(&[
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-a::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-a::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source roots activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_RESCAN_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-a::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-a::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan-control activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-a::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-a::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source rescan activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![
+                        RuntimeBoundScope {
+                            scope_id: "nfs1".to_string(),
+                            resource_ids: vec!["node-a::nfs1".to_string()],
+                        },
+                        RuntimeBoundScope {
+                            scope_id: "nfs2".to_string(),
+                            resource_ids: vec!["node-a::nfs2".to_string()],
+                        },
+                    ],
+                }))
+                .expect("encode source scan activate"),
+            ])
+            .await
+            .expect("apply real source route wave");
+
+        let expected_groups =
+            std::collections::BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let source_groups = source
+                .scheduled_source_group_ids()
+                .expect("scheduled source groups")
+                .unwrap_or_default();
+            let scan_groups = source
+                .scheduled_scan_group_ids()
+                .expect("scheduled scan groups")
+                .unwrap_or_default();
+            if source_groups == expected_groups && scan_groups == expected_groups {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for runtime-managed source schedule after bootstrap: source={source_groups:?} scan={scan_groups:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        stop_source_runtime(&mut state).await;
+    }
+
+    #[tokio::test]
+    async fn observability_snapshot_normalizes_instance_suffixed_node_id_to_host_ref() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs2 = tmp.path().join("nfs2");
+        std::fs::create_dir_all(&nfs2).expect("create nfs2 dir");
+
+        let cfg = SourceConfig {
+            roots: vec![test_watch_scan_root("nfs2", nfs2.clone())],
+            host_object_grants: vec![GrantedMountRoot {
+                object_ref: "node-d::nfs2".to_string(),
+                host_ref: "node-d".to_string(),
+                host_ip: "10.0.0.41".to_string(),
+                host_name: None,
+                site: None,
+                zone: None,
+                host_labels: Default::default(),
+                mount_point: nfs2.clone(),
+                fs_source: "node-d::nfs2".to_string(),
+                fs_type: "nfs".to_string(),
+                mount_options: vec![],
+                interfaces: vec![],
+                active: true,
+            }],
+            ..SourceConfig::default()
+        };
+        let source = FSMetaSource::with_boundaries(
+            cfg,
+            NodeId("node-d-29775443922859927994892289".to_string()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init source");
+        source
+            .on_control_frame(&[
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.stream", ROUTE_KEY_SOURCE_ROOTS_CONTROL),
+                    unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["node-d::nfs2".to_string()],
+                    }],
+                }))
+                .expect("encode source activate"),
+                encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                    route_key: format!("{}.req", ROUTE_KEY_SOURCE_RESCAN_INTERNAL),
+                    unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                    lease: None,
+                    generation: 2,
+                    expires_at_ms: 1,
+                    bound_scopes: vec![RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["node-d::nfs2".to_string()],
+                    }],
+                }))
+                .expect("encode scan activate"),
+            ])
+            .await
+            .expect("apply control");
+
+        let snapshot = source_observability_snapshot(
+            &source,
+            &[],
+            &Arc::new(StdMutex::new(PublishedBatchStats::default())),
+        );
+        let expected = vec!["nfs2".to_string()];
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-d"),
+            Some(&expected)
+        );
+        assert_eq!(
+            snapshot.scheduled_scan_groups_by_node.get("node-d"),
+            Some(&expected)
+        );
+        assert!(
+            !snapshot
+                .scheduled_source_groups_by_node
+                .contains_key("node-d-29775443922859927994892289"),
+            "instance-suffixed node id should not leak into scheduled source groups: {:?}",
+            snapshot.scheduled_source_groups_by_node
+        );
+        assert!(
+            !snapshot
+                .scheduled_scan_groups_by_node
+                .contains_key("node-d-29775443922859927994892289"),
+            "instance-suffixed node id should not leak into scheduled scan groups: {:?}",
+            snapshot.scheduled_scan_groups_by_node
+        );
     }
 
     #[tokio::test]

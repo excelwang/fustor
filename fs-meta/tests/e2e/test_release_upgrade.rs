@@ -295,6 +295,7 @@ fn scenario_sink_control_roles_after_upgrade(
     let upgrade_result = upgrade_to_generation_two(harness);
     let convergence_result = wait_for_node_a_sink_control_convergence(
         &harness.cluster,
+        &harness.candidate_base_urls,
         &harness.app_id,
         Duration::from_secs(15),
     );
@@ -314,6 +315,7 @@ fn scenario_source_control_roles_after_upgrade(
     let upgrade_result = upgrade_to_generation_two(harness);
     let convergence_result = wait_for_peer_source_control_convergence(
         &harness.cluster,
+        &harness.candidate_base_urls,
         &harness.app_id,
         Duration::from_secs(15),
     );
@@ -397,14 +399,21 @@ fn wait_for_generation(cluster: &Cluster5, generation: i64) -> Result<(), String
 
 fn wait_for_node_a_sink_control_convergence(
     cluster: &Cluster5,
+    candidate_base_urls: &[String],
     app_id: &str,
     timeout: Duration,
 ) -> Result<(), String> {
     wait_until(timeout, "node-a sink control converges after generation-two upgrade", || {
         let sink_active = cluster.unit_active_pids_for_instance("node-a", app_id, "runtime.exec.sink")?;
-        let status = cluster.status("node-a")?;
-        let scheduled_sink =
-            status_debug_groups_by_node(&status, "sink", "scheduled_groups_by_node", "node-a");
+        let node_status = cluster.status("node-a")?;
+        let mut status_session = probe_status_session(cluster, candidate_base_urls)?;
+        let app_status = status_session.status()?;
+        let scheduled_sink = status_debug_groups_by_node(
+            &app_status,
+            "sink",
+            "scheduled_groups_by_node",
+            "node-a",
+        );
         let expected = BTreeMap::from([(
             "node-a".to_string(),
             vec!["nfs1".to_string(), "nfs2".to_string()],
@@ -414,7 +423,7 @@ fn wait_for_node_a_sink_control_convergence(
         } else {
             Err(format!(
                 "node-a sink not converged: active_pids={sink_active:?}; scheduled_sink={scheduled_sink:?}; routes={:?}",
-                activation_route_summaries(&status)
+                activation_route_summaries(&node_status)
             ))
         }
     })
@@ -422,11 +431,14 @@ fn wait_for_node_a_sink_control_convergence(
 
 fn wait_for_peer_source_control_convergence(
     cluster: &Cluster5,
+    candidate_base_urls: &[String],
     app_id: &str,
     timeout: Duration,
 ) -> Result<(), String> {
     wait_until(timeout, "node-b/c/d source control converges after generation-two upgrade", || {
         let mut failures = Vec::new();
+        let mut status_session = probe_status_session(cluster, candidate_base_urls)?;
+        let app_status = status_session.status()?;
         for (node_name, expected_groups) in [
             ("node-b", vec!["nfs1".to_string()]),
             ("node-c", vec!["nfs1".to_string(), "nfs2".to_string()]),
@@ -436,16 +448,28 @@ fn wait_for_peer_source_control_convergence(
                 cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.source")?;
             let scan_active =
                 cluster.unit_active_pids_for_instance(node_name, app_id, "runtime.exec.scan")?;
-            let status = cluster.status(node_name)?;
-            let scheduled_source =
-                status_debug_groups_by_node(&status, "source", "scheduled_source_groups_by_node", node_name);
-            let scheduled_scan =
-                status_debug_groups_by_node(&status, "source", "scheduled_scan_groups_by_node", node_name);
+            let node_status = cluster.status(node_name)?;
+            let scheduled_source = status_debug_groups_by_node(
+                &app_status,
+                "source",
+                "scheduled_source_groups_by_node",
+                node_name,
+            );
+            let scheduled_scan = status_debug_groups_by_node(
+                &app_status,
+                "source",
+                "scheduled_scan_groups_by_node",
+                node_name,
+            );
+            let raw_scheduled_source =
+                status_debug_groups_field(&app_status, "source", "scheduled_source_groups_by_node");
+            let raw_scheduled_scan =
+                status_debug_groups_field(&app_status, "source", "scheduled_scan_groups_by_node");
             let expected = BTreeMap::from([(node_name.to_string(), expected_groups.clone())]);
             if source_active.is_empty() || scan_active.is_empty() || scheduled_source != expected || scheduled_scan != expected {
                 failures.push(format!(
-                    "{node_name}: source_active={source_active:?} scan_active={scan_active:?} scheduled_source={scheduled_source:?} scheduled_scan={scheduled_scan:?} routes={:?}",
-                    activation_route_summaries(&status)
+                    "{node_name}: source_active={source_active:?} scan_active={scan_active:?} scheduled_source={scheduled_source:?} scheduled_scan={scheduled_scan:?} raw_scheduled_source={raw_scheduled_source} raw_scheduled_scan={raw_scheduled_scan} routes={:?}",
+                    activation_route_summaries(&node_status)
                 ));
             }
         }
@@ -455,6 +479,19 @@ fn wait_for_peer_source_control_convergence(
             Err(failures.join(" || "))
         }
     })
+}
+
+fn probe_status_session(
+    cluster: &Cluster5,
+    candidate_base_urls: &[String],
+) -> Result<OperatorSession, String> {
+    let ready_base = cluster.wait_http_login_ready(
+        candidate_base_urls,
+        "operator",
+        "operator123",
+        Duration::from_secs(2),
+    )?;
+    OperatorSession::login_many(vec![ready_base], "operator", "operator123")
 }
 
 fn measure_baseline_cpu(cluster: &Cluster5) -> Result<BTreeMap<String, Vec<u32>>, String> {
@@ -617,6 +654,15 @@ fn status_debug_groups_by_node(
     } else {
         BTreeMap::from([(node_name.to_string(), groups)])
     }
+}
+
+fn status_debug_groups_field(status: &Value, section: &str, field: &str) -> Value {
+    status
+        .get(section)
+        .and_then(|v| v.get("debug"))
+        .and_then(|v| v.get(field))
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 fn activation_route_summaries(status: &Value) -> Vec<String> {
