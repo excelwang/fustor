@@ -5336,6 +5336,118 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn runtime_managed_schedule_preserves_non_empty_scopes_across_empty_followup_activate() {
+        let mut cfg = SourceConfig::default();
+        cfg.roots = vec![root("nfs1", "/mnt/nfs1"), root("nfs2", "/mnt/nfs2")];
+        cfg.host_object_grants = Vec::new();
+        let source = FSMetaSource::with_boundaries(
+            cfg,
+            NodeId("node-c-29776082501061843024347137".to_string()),
+            Some(Arc::new(NoopBoundary)),
+        )
+        .expect("init runtime-managed source");
+
+        let initial = vec![
+            encode_runtime_host_grant_change(&RuntimeHostGrantChange {
+                version: 1,
+                grants: vec![
+                    route_export("node-c::nfs1", "node-c", "10.0.0.31", "/mnt/nfs1", true),
+                    route_export("node-c::nfs2", "node-c", "10.0.0.32", "/mnt/nfs2", true),
+                ],
+            })
+            .expect("encode runtime host grants changed"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["node-c::nfs1".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["node-c::nfs2".to_string()],
+                    },
+                ],
+            }))
+            .expect("encode source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_RESCAN.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: vec![
+                    RuntimeBoundScope {
+                        scope_id: "nfs1".to_string(),
+                        resource_ids: vec!["node-c::nfs1".to_string()],
+                    },
+                    RuntimeBoundScope {
+                        scope_id: "nfs2".to_string(),
+                        resource_ids: vec!["node-c::nfs2".to_string()],
+                    },
+                ],
+            }))
+            .expect("encode scan activate"),
+        ];
+        source
+            .on_control_frame(&initial)
+            .await
+            .expect("apply initial runtime-managed source wave");
+        assert_eq!(
+            source.scheduled_source_group_ids().expect("source groups after initial wave"),
+            Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
+        );
+        assert_eq!(
+            source.scheduled_scan_group_ids().expect("scan groups after initial wave"),
+            Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
+        );
+
+        let followup = vec![
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_ROOTS_CONTROL.to_string(),
+                unit_id: SOURCE_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode empty source activate"),
+            encode_runtime_exec_control(&RuntimeExecControl::Activate(RuntimeExecActivate {
+                route_key: METHOD_SOURCE_RESCAN.to_string(),
+                unit_id: SOURCE_SCAN_RUNTIME_UNIT_ID.to_string(),
+                lease: None,
+                generation: 2,
+                expires_at_ms: 1,
+                bound_scopes: Vec::new(),
+            }))
+            .expect("encode empty scan activate"),
+        ];
+        source
+            .on_control_frame(&followup)
+            .await
+            .expect("apply followup empty-scope activate wave");
+
+        assert_eq!(
+            source
+                .scheduled_source_group_ids()
+                .expect("source groups after empty-scope followup"),
+            Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
+            "runtime-managed source scheduling must preserve the last non-empty active scopes across followup activate rows that omit bound scopes",
+        );
+        assert_eq!(
+            source
+                .scheduled_scan_group_ids()
+                .expect("scan groups after empty-scope followup"),
+            Some(BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])),
+            "runtime-managed scan scheduling must preserve the last non-empty active scopes across followup activate rows that omit bound scopes",
+        );
+    }
+
     #[test]
     fn logical_root_fanout_can_group_by_host_ip_descriptor() {
         let mut cfg = SourceConfig::default();

@@ -291,7 +291,12 @@ fn router(state: ApiState) -> Result<Router> {
 }
 
 fn request_requires_control_readiness(method: &Method, path: &str) -> bool {
-    matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots"
+    (matches!(method, &Method::PUT) && path == "/api/fs-meta/v1/monitoring/roots")
+        || (matches!(method, &Method::GET) && path == "/api/fs-meta/v1/status")
+}
+
+fn request_counts_toward_control_drain(method: &Method, path: &str) -> bool {
+    !(matches!(method, &Method::GET) && path == "/api/fs-meta/v1/status")
 }
 
 async fn request_control_readiness_guard(
@@ -320,10 +325,11 @@ async fn request_control_readiness_guard(
 async fn request_logging(State(state): State<ApiState>, request: Request, next: Next) -> Response {
     static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-    let _request_guard = state.request_tracker.begin();
     let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    let _request_guard =
+        request_counts_toward_control_drain(&method, &path).then(|| state.request_tracker.begin());
     let started_at = std::time::Instant::now();
     eprintln!(
         "fs_meta_api_server: request begin id={} method={} path={}",

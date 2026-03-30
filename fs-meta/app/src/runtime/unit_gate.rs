@@ -28,15 +28,22 @@ impl UnitControlGate {
         route_key: &str,
         generation: u64,
         bound_scopes: &[RuntimeBoundScope],
+        preserve_active_scopes_on_empty_activate: bool,
     ) -> bool {
         let entry = self.units.entry(unit_id.to_string()).or_default();
         let route = entry.routes.entry(route_key.to_string()).or_default();
         if generation < route.generation {
             return false;
         }
+        let preserve_existing_scopes = preserve_active_scopes_on_empty_activate
+            && route.active
+            && !route.bound_scopes.is_empty()
+            && bound_scopes.is_empty();
         route.generation = generation;
         route.active = true;
-        route.bound_scopes = bound_scopes.to_vec();
+        if !preserve_existing_scopes {
+            route.bound_scopes = bound_scopes.to_vec();
+        }
         true
     }
 
@@ -69,6 +76,17 @@ impl UnitControlGate {
         for route in state.routes.values_mut().filter(|route| route.active) {
             route.bound_scopes = bound_scopes.to_vec();
         }
+    }
+
+    fn clear_route(&mut self, unit_id: &str, route_key: &str) {
+        let Some(state) = self.units.get_mut(unit_id) else {
+            return;
+        };
+        let Some(route) = state.routes.get_mut(route_key) else {
+            return;
+        };
+        route.active = false;
+        route.bound_scopes.clear();
     }
 }
 
@@ -136,7 +154,13 @@ impl RuntimeUnitGate {
             .gate
             .lock()
             .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
-        Ok(gate.apply_activate(unit_id, route_key, generation, bound_scopes))
+        Ok(gate.apply_activate(
+            unit_id,
+            route_key,
+            generation,
+            bound_scopes,
+            self.runtime_managed,
+        ))
     }
 
     pub(crate) fn apply_deactivate(
@@ -178,6 +202,16 @@ impl RuntimeUnitGate {
             .lock()
             .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
         gate.sync_active_scopes(unit_id, bound_scopes);
+        Ok(())
+    }
+
+    pub(crate) fn clear_route(&self, unit_id: &str, route_key: &str) -> Result<()> {
+        self.validate_runtime_unit(unit_id)?;
+        let mut gate = self
+            .gate
+            .lock()
+            .map_err(|_| CnxError::Internal("RuntimeUnitGate lock poisoned".into()))?;
+        gate.clear_route(unit_id, route_key);
         Ok(())
     }
 
@@ -284,6 +318,41 @@ mod tests {
         assert_eq!(
             scope_ids,
             BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()])
+        );
+    }
+
+    #[test]
+    fn runtime_managed_empty_activate_preserves_existing_active_scopes() {
+        let gate = RuntimeUnitGate::new_runtime_managed("test-gate", &["runtime.exec.source"]);
+
+        assert!(
+            gate.apply_activate(
+                "runtime.exec.source",
+                "source-status:v1.req",
+                2,
+                &[bound_scope("nfs1", "node-b::nfs1"), bound_scope("nfs2", "node-c::nfs2")]
+            )
+            .expect("initial activate")
+        );
+        assert!(
+            gate.apply_activate("runtime.exec.source", "source-status:v1.req", 2, &[])
+                .expect("empty followup activate")
+        );
+
+        let state = gate
+            .unit_state("runtime.exec.source")
+            .expect("unit_state")
+            .expect("unit should exist");
+        assert!(state.0, "unit should remain active");
+        let scope_ids = state
+            .1
+            .into_iter()
+            .map(|scope| scope.scope_id)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            scope_ids,
+            BTreeSet::from(["nfs1".to_string(), "nfs2".to_string()]),
+            "runtime-managed empty followup activates must not erase previously active scopes",
         );
     }
 

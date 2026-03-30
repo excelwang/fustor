@@ -24,6 +24,7 @@ pub struct ApiRequestTracker {
 pub struct ApiControlGate {
     ready: AtomicBool,
     changed: Notify,
+    facade_request_tracker: Arc<ApiRequestTracker>,
 }
 
 pub struct ApiRequestGuard {
@@ -57,6 +58,7 @@ impl ApiControlGate {
         Self {
             ready: AtomicBool::new(ready),
             changed: Notify::new(),
+            facade_request_tracker: Arc::new(ApiRequestTracker::default()),
         }
     }
 
@@ -80,6 +82,14 @@ impl ApiControlGate {
             }
             notified.await;
         }
+    }
+
+    pub fn begin_facade_request(self: &Arc<Self>) -> ApiRequestGuard {
+        self.facade_request_tracker.begin()
+    }
+
+    pub async fn wait_for_facade_request_drain(&self) {
+        self.facade_request_tracker.wait_for_drain().await;
     }
 }
 

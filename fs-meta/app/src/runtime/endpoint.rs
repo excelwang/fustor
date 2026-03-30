@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex as StdMutex};
-use std::sync::mpsc::{Receiver, TryRecvError, sync_channel};
+use std::sync::mpsc::{Receiver, sync_channel};
 use std::time::Duration;
 use std::panic::AssertUnwindSafe;
 
@@ -15,6 +15,8 @@ use futures_util::FutureExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::runtime::routes::ROUTE_KEY_SINK_QUERY_INTERNAL;
+
+const ENDPOINT_READY_WAIT_TIMEOUT: Duration = Duration::from_millis(50);
 
 fn debug_source_status_lifecycle_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -163,9 +165,9 @@ impl ManagedEndpointTask {
     }
 
     fn wait_until_ready(name: &str, ready_rx: Receiver<()>) {
-        match ready_rx.try_recv() {
-            Ok(()) | Err(TryRecvError::Disconnected) => {}
-            Err(TryRecvError::Empty) => {
+        match ready_rx.recv_timeout(ENDPOINT_READY_WAIT_TIMEOUT) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 log::debug!("endpoint task {} ready wait deferred", name);
             }
         }
@@ -214,11 +216,51 @@ impl ManagedEndpointTask {
         )
     }
 
+    pub(crate) fn spawn_with_units<F, Fut, I, S>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        unit_ids: I,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let contexts: Vec<BoundaryContext> = unit_ids
+            .into_iter()
+            .map(|unit_id| BoundaryContext::for_unit(unit_id.into()))
+            .collect();
+        assert!(
+            !contexts.is_empty(),
+            "spawn_with_units requires at least one endpoint recv context"
+        );
+        Self::spawn_with_contexts(boundary, route, name, contexts, shutdown, handler)
+    }
+
     fn spawn_with_context<F, Fut>(
         boundary: Arc<dyn ChannelIoSubset>,
         route: RouteKey,
         name: impl Into<String>,
         ctx: BoundaryContext,
+        shutdown: CancellationToken,
+        handler: F,
+    ) -> Self
+    where
+        F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+    {
+        Self::spawn_with_contexts(boundary, route, name, vec![ctx], shutdown, handler)
+    }
+
+    fn spawn_with_contexts<F, Fut>(
+        boundary: Arc<dyn ChannelIoSubset>,
+        route: RouteKey,
+        name: impl Into<String>,
+        contexts: Vec<BoundaryContext>,
         shutdown: CancellationToken,
         handler: F,
     ) -> Self
@@ -233,14 +275,16 @@ impl ManagedEndpointTask {
         let shutdown_for_task = shutdown.clone();
         let terminal_reason = Arc::new(StdMutex::new(None));
         let terminal_reason_for_runner = terminal_reason.clone();
+        let (ready_tx, ready_rx) = sync_channel(1);
         let handler = Arc::new(handler);
-        let runner = run_endpoint_loop(
+        let runner = run_endpoint_loop_with_contexts(
             boundary,
             route,
             join_name.clone(),
-            ctx,
+            contexts,
             shutdown_for_task,
             handler,
+            Some(ready_tx),
             terminal_reason_for_runner.clone(),
         );
         let runner = async move {
@@ -265,7 +309,7 @@ impl ManagedEndpointTask {
                 );
             }
         };
-        let (join, ready_rx) = Self::spawn_join_with_ready(runner);
+        let join = Self::spawn_join(runner);
         Self::wait_until_ready(&name_owned, ready_rx);
 
         Self {
@@ -410,8 +454,38 @@ async fn run_endpoint_loop<F, Fut>(
     F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
 {
+    run_endpoint_loop_with_contexts(
+        boundary,
+        route,
+        join_name,
+        vec![ctx],
+        shutdown_for_task,
+        handler,
+        None,
+        terminal_reason,
+    )
+    .await
+}
+
+async fn run_endpoint_loop_with_contexts<F, Fut>(
+    boundary: Arc<dyn ChannelIoSubset>,
+    route: RouteKey,
+    join_name: String,
+    contexts: Vec<BoundaryContext>,
+    shutdown_for_task: CancellationToken,
+    handler: Arc<F>,
+    ready_tx: Option<std::sync::mpsc::SyncSender<()>>,
+    terminal_reason: Arc<StdMutex<Option<String>>>,
+) where
+    F: Fn(Vec<Event>) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = Vec<Event>> + Send + 'static,
+{
     let debug_materialized_route = debug_materialized_route_lifecycle_enabled()
         && is_materialized_internal_query_route(&route);
+    #[cfg(test)]
+    if let Some(delay) = take_endpoint_loop_start_delay_hook() {
+        std::thread::sleep(delay);
+    }
     if debug_source_status_lifecycle_enabled() || debug_materialized_route {
         eprintln!(
             "fs_meta_runtime_endpoint: loop_start route={} task={} thread={:?}",
@@ -419,6 +493,9 @@ async fn run_endpoint_loop<F, Fut>(
             join_name,
             std::thread::current().name()
         );
+    }
+    if let Some(ready_tx) = ready_tx {
+        let _ = ready_tx.send(());
     }
     let request_channel = ChannelKey(route.0.clone());
     let reply_channel = ChannelKey(format!("{}:reply", route.0));
@@ -429,77 +506,113 @@ async fn run_endpoint_loop<F, Fut>(
             exit_reason = Some("shutdown_cancelled".into());
             break;
         }
-        let recv_result = AssertUnwindSafe(boundary.channel_recv(
-            ctx.clone(),
-            ChannelRecvRequest {
-                channel_key: request_channel.clone(),
-                timeout_ms: Some(Duration::from_millis(250).as_millis() as u64),
-            },
-        ))
-        .catch_unwind()
-        .await;
-        let requests = match recv_result {
-            Err(_) => {
-                log::warn!(
-                    "endpoint task {} recv panicked for {}; retrying",
-                    join_name,
-                    route.0
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            Ok(result) => match result {
-            Ok(events) => events,
-            Err(CnxError::Timeout) => continue,
-            Err(err) if is_retryable_worker_bridge_peer_error(&err) => {
-                if debug_materialized_route {
-                    eprintln!(
-                        "fs_meta_runtime_endpoint: materialized_route recv_retry route={} task={} err={}",
-                        route.0, join_name, err
-                    );
-                }
-                log::debug!(
-                    "endpoint task {} recv retry for {} after retryable worker-bridge error: {:?}",
-                    join_name,
-                    route.0,
-                    err
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            Err(err @ CnxError::NotSupported(_))
-            | Err(err @ CnxError::NotReady(_))
-            | Err(err @ CnxError::TransportClosed(_))
-            | Err(err @ CnxError::ChannelClosed)
-            | Err(err @ CnxError::LinkError(_)) => {
-                if debug_materialized_route {
-                    eprintln!(
-                        "fs_meta_runtime_endpoint: materialized_route recv_retry route={} task={} err={}",
-                        route.0, join_name, err
-                    );
-                }
-                log::debug!(
-                    "endpoint task {} recv retry for {} after transient error: {:?}",
-                    join_name,
-                    route.0,
-                    err
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            Err(err) if is_stale_grant_attachment_recv_gap(&err) => {
-                close_stale_recv_channel(boundary.clone(), ctx.clone(), request_channel.clone())
+        let mut received = None::<(BoundaryContext, Vec<Event>)>;
+        let mut fatal_err = None::<CnxError>;
+        let mut saw_retryable_gap = false;
+        let recv_timeout_ms = Duration::from_millis(250).as_millis() as u64;
+        let mut pending = contexts
+            .iter()
+            .cloned()
+            .map(|ctx| {
+                let boundary = boundary.clone();
+                let request_channel = request_channel.clone();
+                async move {
+                    let recv_result = AssertUnwindSafe(boundary.channel_recv(
+                        ctx.clone(),
+                        ChannelRecvRequest {
+                            channel_key: request_channel,
+                            timeout_ms: Some(recv_timeout_ms),
+                        },
+                    ))
+                    .catch_unwind()
                     .await;
-                log::debug!(
-                    "endpoint task {} recv retry for {} after stale grant-attachment gap: {:?}",
-                    join_name,
-                    route.0,
-                    err
-                );
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                continue;
-            }
-            Err(err) => {
+                    (ctx, recv_result)
+                }
+                .boxed()
+            })
+            .collect::<Vec<_>>();
+        while !pending.is_empty() {
+            let ((ctx, recv_result), _, rest) = futures_util::future::select_all(pending).await;
+            pending = rest;
+            let requests = match recv_result {
+                Err(_) => {
+                    log::warn!(
+                        "endpoint task {} recv panicked for {}; retrying",
+                        join_name,
+                        route.0
+                    );
+                    saw_retryable_gap = true;
+                    continue;
+                }
+                Ok(result) => match result {
+                    Ok(events) => events,
+                    Err(CnxError::Timeout) => continue,
+                    Err(err) if is_retryable_worker_bridge_peer_error(&err) => {
+                        if debug_materialized_route {
+                            eprintln!(
+                                "fs_meta_runtime_endpoint: materialized_route recv_retry route={} task={} err={}",
+                                route.0, join_name, err
+                            );
+                        }
+                        log::debug!(
+                            "endpoint task {} recv retry for {} after retryable worker-bridge error: {:?}",
+                            join_name,
+                            route.0,
+                            err
+                        );
+                        saw_retryable_gap = true;
+                        continue;
+                    }
+                    Err(err @ CnxError::NotSupported(_))
+                    | Err(err @ CnxError::NotReady(_))
+                    | Err(err @ CnxError::TransportClosed(_))
+                    | Err(err @ CnxError::ChannelClosed)
+                    | Err(err @ CnxError::LinkError(_)) => {
+                        if debug_materialized_route {
+                            eprintln!(
+                                "fs_meta_runtime_endpoint: materialized_route recv_retry route={} task={} err={}",
+                                route.0, join_name, err
+                            );
+                        }
+                        log::debug!(
+                            "endpoint task {} recv retry for {} after transient error: {:?}",
+                            join_name,
+                            route.0,
+                            err
+                        );
+                        saw_retryable_gap = true;
+                        continue;
+                    }
+                    Err(err) if is_stale_grant_attachment_recv_gap(&err) => {
+                        close_stale_recv_channel(
+                            boundary.clone(),
+                            ctx.clone(),
+                            request_channel.clone(),
+                        )
+                        .await;
+                        log::debug!(
+                            "endpoint task {} recv retry for {} after stale grant-attachment gap: {:?}",
+                            join_name,
+                            route.0,
+                            err
+                        );
+                        saw_retryable_gap = true;
+                        continue;
+                    }
+                    Err(err) => {
+                        if fatal_err.is_none() {
+                            fatal_err = Some(err);
+                        }
+                        continue;
+                    }
+                },
+            };
+            received = Some((ctx, requests));
+            break;
+        }
+
+        let Some((recv_ctx, requests)) = received else {
+            if let Some(err) = fatal_err {
                 exit_reason = Some(format!("recv_failed:{err}"));
                 log::warn!(
                     "endpoint task {} recv failed for {}: {:?}",
@@ -509,7 +622,11 @@ async fn run_endpoint_loop<F, Fut>(
                 );
                 break;
             }
-        }};
+            if saw_retryable_gap {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            continue;
+        };
 
         if requests.is_empty() {
             continue;
@@ -546,7 +663,7 @@ async fn run_endpoint_loop<F, Fut>(
         let response_count = responses.len();
         if let Err(err) = boundary
             .channel_send(
-                ctx.clone(),
+                recv_ctx.clone(),
                 ChannelSendRequest {
                     channel_key: reply_channel.clone(),
                     events: responses,
@@ -728,6 +845,28 @@ async fn run_stream_loop<F, Fut, G>(
 }
 
 #[cfg(test)]
+fn endpoint_loop_start_delay_hook_cell() -> &'static StdMutex<Option<Duration>> {
+    static CELL: std::sync::OnceLock<StdMutex<Option<Duration>>> = std::sync::OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn install_endpoint_loop_start_delay_hook(delay: Duration) {
+    let mut guard = endpoint_loop_start_delay_hook_cell()
+        .lock()
+        .expect("endpoint_loop_start_delay_hook lock");
+    *guard = Some(delay);
+}
+
+#[cfg(test)]
+fn take_endpoint_loop_start_delay_hook() -> Option<Duration> {
+    let mut guard = endpoint_loop_start_delay_hook_cell()
+        .lock()
+        .expect("endpoint_loop_start_delay_hook lock");
+    guard.take()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use bytes::Bytes;
@@ -756,6 +895,16 @@ mod tests {
     struct PanicOnceThenStopBoundary {
         recv_keys: Mutex<Vec<String>>,
         recv_panicked: AtomicBool,
+    }
+
+    struct ConcurrentFallbackRecvInterestBoundary {
+        recv_keys: Mutex<Vec<String>>,
+        recv_unit_ids: Mutex<Vec<Option<String>>>,
+        query_peer_recv_started: tokio::sync::Notify,
+        query_recv_armed: AtomicBool,
+        request_available: tokio::sync::Notify,
+        queued_requests: tokio::sync::Mutex<Vec<Event>>,
+        dropped_without_query_recv_interest: AtomicBool,
     }
 
     #[derive(Clone, Copy)]
@@ -835,6 +984,20 @@ mod tests {
             Self {
                 recv_keys: Mutex::new(Vec::new()),
                 recv_panicked: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl ConcurrentFallbackRecvInterestBoundary {
+        fn new() -> Self {
+            Self {
+                recv_keys: Mutex::new(Vec::new()),
+                recv_unit_ids: Mutex::new(Vec::new()),
+                query_peer_recv_started: tokio::sync::Notify::new(),
+                query_recv_armed: AtomicBool::new(false),
+                request_available: tokio::sync::Notify::new(),
+                queued_requests: tokio::sync::Mutex::new(Vec::new()),
+                dropped_without_query_recv_interest: AtomicBool::new(false),
             }
         }
     }
@@ -975,6 +1138,71 @@ mod tests {
         }
     }
 
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for ConcurrentFallbackRecvInterestBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            if request.channel_key.0 == "source-status:v1.req" {
+                if !self.query_recv_armed.load(Ordering::SeqCst) {
+                    self.dropped_without_query_recv_interest
+                        .store(true, Ordering::SeqCst);
+                    return Ok(());
+                }
+                let mut queued = self.queued_requests.lock().await;
+                queued.extend(request.events);
+                drop(queued);
+                self.request_available.notify_waiters();
+                return Ok(());
+            }
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            ctx: BoundaryContext,
+            request: ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            self.recv_keys
+                .lock()
+                .expect("recv_keys lock")
+                .push(request.channel_key.0.clone());
+            self.recv_unit_ids
+                .lock()
+                .expect("recv_unit_ids lock")
+                .push(ctx.unit_id.clone());
+            if request.channel_key.0 != "source-status:v1.req" {
+                return Err(CnxError::Timeout);
+            }
+            match ctx.unit_id.as_deref() {
+                Some("runtime.exec.query-peer") => {
+                    self.query_peer_recv_started.notify_waiters();
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    Err(CnxError::Timeout)
+                }
+                Some("runtime.exec.query") => {
+                    self.query_recv_armed.store(true, Ordering::SeqCst);
+                    let wait = self.request_available.notified();
+                    if let Some(timeout_ms) = request.timeout_ms {
+                        tokio::time::timeout(Duration::from_millis(timeout_ms), wait)
+                            .await
+                            .map_err(|_| CnxError::Timeout)?;
+                    } else {
+                        wait.await;
+                    }
+                    let mut queued = self.queued_requests.lock().await;
+                    if queued.is_empty() {
+                        return Err(CnxError::Timeout);
+                    }
+                    Ok(std::mem::take(&mut *queued))
+                }
+                _ => Err(CnxError::Timeout),
+            }
+        }
+    }
+
     fn test_event(correlation_id: u64, payload: &'static [u8]) -> Event {
         Event::new(
             EventMetadata {
@@ -1037,6 +1265,29 @@ mod tests {
             .block_on(endpoint.shutdown(Duration::from_secs(1)));
 
         assert_ne!(thread_name.as_deref(), Some("fs-meta-shared-runtime"));
+    }
+
+    #[test]
+    fn spawned_endpoint_waits_briefly_for_loop_start_before_returning() {
+        install_endpoint_loop_start_delay_hook(Duration::from_millis(40));
+        let boundary = Arc::new(RecordingBoundary::new());
+        let started = std::time::Instant::now();
+        let mut endpoint = ManagedEndpointTask::spawn(
+            boundary,
+            RouteKey("source-status:v1.req".into()),
+            "test-endpoint",
+            CancellationToken::new(),
+            |_events: Vec<Event>| std::future::ready(Vec::new()),
+        );
+        let elapsed = started.elapsed();
+
+        crate::runtime_app::shared_tokio_runtime()
+            .block_on(endpoint.shutdown(Duration::from_secs(1)));
+
+        assert!(
+            elapsed >= Duration::from_millis(30),
+            "endpoint spawn must wait for the recv loop to enter loop_start before returning; elapsed={elapsed:?}"
+        );
     }
 
     #[test]
@@ -1323,6 +1574,58 @@ mod tests {
                 "source-status:v1.req".to_string()
             ],
             "endpoint recv panic should be retried instead of letting the endpoint thread die and rely on respawn"
+        );
+    }
+
+    #[test]
+    fn endpoint_loop_arms_fallback_query_recv_concurrently_with_idle_query_peer_lane() {
+        let boundary = Arc::new(ConcurrentFallbackRecvInterestBoundary::new());
+        let handler_called = Arc::new(AtomicBool::new(false));
+        let mut endpoint = ManagedEndpointTask::spawn_with_units(
+            boundary.clone(),
+            RouteKey("source-status:v1.req".into()),
+            "test-endpoint",
+            [
+                "runtime.exec.query-peer".to_string(),
+                "runtime.exec.query".to_string(),
+            ],
+            CancellationToken::new(),
+            {
+                let handler_called = handler_called.clone();
+                move |_events: Vec<Event>| {
+                    handler_called.store(true, Ordering::SeqCst);
+                    std::future::ready(Vec::new())
+                }
+            },
+        );
+
+        crate::runtime_app::shared_tokio_runtime().block_on(async {
+            boundary.query_peer_recv_started.notified().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            boundary
+                .channel_send(
+                    BoundaryContext::default(),
+                    ChannelSendRequest {
+                        channel_key: ChannelKey("source-status:v1.req".into()),
+                        events: vec![test_event(1, b"request")],
+                        timeout_ms: Some(100),
+                    },
+                )
+                .await
+                .expect("queue source-status request");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            endpoint.shutdown(Duration::from_secs(1)).await;
+        });
+
+        assert!(
+            handler_called.load(Ordering::SeqCst),
+            "multi-unit source-status endpoint must keep the fallback query recv interest armed while the preferred query-peer lane is idle so peer-only requests can reach handler recv instead of being dropped before any request-batch recv evidence"
+        );
+        assert!(
+            !boundary
+                .dropped_without_query_recv_interest
+                .load(Ordering::SeqCst),
+            "source-status request must not be dropped before the fallback query recv interest is armed"
         );
     }
 

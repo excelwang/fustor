@@ -3,6 +3,7 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FacadePendingReason {
     AwaitingRuntimeExposure,
+    AwaitingObservationEligibility,
     RetryingAfterError,
 }
 
@@ -10,6 +11,7 @@ impl FacadePendingReason {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::AwaitingRuntimeExposure => "awaiting_runtime_exposure",
+            Self::AwaitingObservationEligibility => "awaiting_observation_eligibility",
             Self::RetryingAfterError => "retrying_after_error",
         }
     }

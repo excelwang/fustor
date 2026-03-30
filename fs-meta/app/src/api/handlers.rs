@@ -3,6 +3,8 @@ use std::future::Future;
 use std::path::PathBuf;
 #[cfg(test)]
 use std::sync::{Mutex as StdMutex, OnceLock};
+#[cfg(test)]
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
@@ -13,6 +15,7 @@ use axum::{
 use capanix_app_sdk::CnxError;
 use capanix_app_sdk::Event;
 use capanix_app_sdk::runtime::{EventMetadata, NodeId};
+use capanix_host_adapter_fs::HostAdapter;
 use capanix_runtime_entry_sdk::advanced::boundary::{
     BoundaryContext, ChannelIoSubset, ChannelKey, ChannelSendRequest,
 };
@@ -23,9 +26,15 @@ use crate::query::api::{
     internal_status_request_payload, merge_sink_status_snapshots,
     refresh_policy_from_host_object_grants, route_sink_status_snapshot,
 };
+use crate::query::ObservationState;
+use crate::query::observation::{
+    ObservationTrustPolicy, evaluate_observation_status, materialized_query_observation_evidence,
+    trusted_materialized_not_ready_message,
+};
 use crate::runtime::execution_units;
 use crate::runtime::orchestration::encode_logical_roots_control_payload;
 use crate::runtime::orchestration::encode_manual_rescan_envelope;
+use crate::runtime::seam::exchange_host_adapter;
 use crate::runtime::routes::ROUTE_KEY_SOURCE_RESCAN_CONTROL;
 use crate::runtime::routes::{
     METHOD_SOURCE_STATUS, ROUTE_KEY_SINK_ROOTS_CONTROL, ROUTE_KEY_SOURCE_ROOTS_CONTROL,
@@ -37,7 +46,7 @@ use crate::workers::source::SourceObservabilitySnapshot;
 
 use super::auth::SessionPrincipal;
 use super::errors::ApiError;
-use super::facade_status::SharedFacadePendingStatus;
+use super::facade_status::{FacadePendingReason, SharedFacadePendingStatus};
 use super::state::ApiState;
 use super::types::{
     CreateQueryApiKeyRequest, CreateQueryApiKeyResponse, DegradedRoot, LoginRequest, LoginResponse,
@@ -112,8 +121,33 @@ pub(crate) struct RootsPutPauseHook {
 }
 
 #[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct StatusPauseHook {
+    pub entered: std::sync::Arc<Notify>,
+    pub release: std::sync::Arc<Notify>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct StatusRouteTraceHook {
+    events: std::sync::Arc<StdMutex<Vec<String>>>,
+}
+
+#[cfg(test)]
 fn roots_put_pause_hook_cell() -> &'static StdMutex<Option<RootsPutPauseHook>> {
     static CELL: OnceLock<StdMutex<Option<RootsPutPauseHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn status_pause_hook_cell() -> &'static StdMutex<Option<StatusPauseHook>> {
+    static CELL: OnceLock<StdMutex<Option<StatusPauseHook>>> = OnceLock::new();
+    CELL.get_or_init(|| StdMutex::new(None))
+}
+
+#[cfg(test)]
+fn status_route_trace_hook_cell() -> &'static StdMutex<Option<StatusRouteTraceHook>> {
+    static CELL: OnceLock<StdMutex<Option<StatusRouteTraceHook>>> = OnceLock::new();
     CELL.get_or_init(|| StdMutex::new(None))
 }
 
@@ -127,8 +161,44 @@ pub(crate) fn install_roots_put_pause_hook(hook: RootsPutPauseHook) {
 }
 
 #[cfg(test)]
+pub(crate) fn install_status_pause_hook(hook: StatusPauseHook) {
+    let mut guard = match status_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
+fn install_status_route_trace_hook(hook: StatusRouteTraceHook) {
+    let mut guard = match status_route_trace_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = Some(hook);
+}
+
+#[cfg(test)]
 pub(crate) fn clear_roots_put_pause_hook() {
     let mut guard = match roots_put_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+pub(crate) fn clear_status_pause_hook() {
+    let mut guard = match status_pause_hook_cell().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    *guard = None;
+}
+
+#[cfg(test)]
+fn clear_status_route_trace_hook() {
+    let mut guard = match status_route_trace_hook_cell().lock() {
         Ok(guard) => guard,
         Err(poisoned) => poisoned.into_inner(),
     };
@@ -147,6 +217,53 @@ async fn maybe_pause_roots_put_after_previous_source_roots() {
     if let Some(hook) = hook {
         hook.entered.notify_waiters();
         hook.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+async fn maybe_pause_status_before_remote_collection() {
+    let hook = {
+        let guard = match status_pause_hook_cell().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        guard.clone()
+    };
+    if let Some(hook) = hook {
+        hook.entered.notify_waiters();
+        hook.release.notified().await;
+    }
+}
+
+fn next_status_trace_request_id() -> Option<u64> {
+    #[cfg(test)]
+    {
+        static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
+        Some(NEXT_REQUEST_ID.fetch_add(1, Ordering::SeqCst))
+    }
+    #[cfg(not(test))]
+    {
+        None
+    }
+}
+
+fn record_status_route_trace(_trace_id: Option<u64>, _stage: impl Into<String>) {
+    #[cfg(test)]
+    if let Some(trace_id) = _trace_id {
+        let hook = {
+            let guard = match status_route_trace_hook_cell().lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.clone()
+        };
+        if let Some(hook) = hook {
+            let mut events = match hook.events.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            events.push(format!("{trace_id}:{}", _stage.into()));
+        }
     }
 }
 
@@ -170,7 +287,30 @@ pub async fn status(
     headers: HeaderMap,
 ) -> Result<Json<StatusResponse>, ApiError> {
     let _ = authorize_management(&state, &headers)?;
+    let pending_external_worker_facade = {
+        let guard = state
+            .facade_pending
+            .read()
+            .map_err(|_| ApiError::internal("facade pending status lock poisoned"))?;
+        guard.clone()
+    };
+    if let Some(pending) = pending_external_worker_facade {
+        if pending.runtime_managed
+            && matches!(
+                pending.reason,
+                FacadePendingReason::AwaitingObservationEligibility
+            )
+            && (state.source.is_worker() || state.sink.is_worker())
+        {
+            return Err(ApiError::service_unavailable(format!(
+                "status pending until facade replacement becomes observation-eligible: {}",
+                pending.reason.as_str()
+            )));
+        }
+    }
     let started_at = Instant::now();
+    let trace_id = next_status_trace_request_id();
+    record_status_route_trace(trace_id, "status.enter");
 
     let local_sink = match state.sink.status_snapshot_nonblocking().await {
         Ok(snapshot) => snapshot,
@@ -182,27 +322,95 @@ pub async fn status(
             return Err(ApiError::internal(format!("sink status failed: {err}")));
         }
     };
+    if state.source.is_worker() || state.sink.is_worker() {
+        let source_status = state.source.status_snapshot().await.map_err(|err| {
+            ApiError::service_unavailable(format!(
+                "status pending until active facade observation becomes trusted-materialized: source status failed: {err}"
+            ))
+        })?;
+        let sink_status = state.sink.status_snapshot().await.map_err(|err| {
+            ApiError::service_unavailable(format!(
+                "status pending until active facade observation becomes trusted-materialized: sink status failed: {err}"
+            ))
+        })?;
+        let observation_status = evaluate_observation_status(
+            &materialized_query_observation_evidence(&source_status, &sink_status),
+            ObservationTrustPolicy::materialized_query(),
+        );
+        if observation_status.state != ObservationState::TrustedMaterialized {
+            return Err(ApiError::service_unavailable(format!(
+                "status pending until active facade observation becomes trusted-materialized: {}",
+                trusted_materialized_not_ready_message(&observation_status)
+            )));
+        }
+    }
     let local_source = state.source.observability_snapshot_nonblocking().await;
-    let (sink_status, source, runner_sets, sink_outcome, source_outcome) =
-        merge_remote_status_snapshots(
-            local_sink,
-            local_source,
-            state.query_runtime_boundary.clone(),
-            state.node_id.clone(),
-            |boundary, origin_id| async move {
-                route_sink_status_snapshot(boundary, origin_id, STATUS_ROUTE_TIMEOUT).await
-            },
-            |boundary, origin_id| async move {
-                route_source_observability_snapshot(
-                    boundary,
-                    origin_id,
-                    STATUS_ROUTE_TIMEOUT,
-                    STATUS_ROUTE_COLLECT_IDLE_GRACE,
-                )
-                .await
-            },
+    let _facade_request_guard = state.control_gate.begin_facade_request();
+    #[cfg(test)]
+    maybe_pause_status_before_remote_collection().await;
+    record_status_route_trace(trace_id, "status.remote.begin");
+    let status_collect = |boundary, origin_id| {
+        collect_remote_status_snapshots_on_shared_boundary(
+            local_sink.clone(),
+            local_source.clone(),
+            boundary,
+            origin_id,
+            trace_id,
         )
-        .await;
+    };
+    // Management /status should prefer the management/runtime boundary when present.
+    // The query boundary can churn independently during generation-two turnover,
+    // but it is still a valid second chance when the preferred runtime boundary
+    // fully transport-collapses before any remote status evidence arrives.
+    let runtime_boundary = state.runtime_boundary.clone();
+    let query_boundary = state.query_runtime_boundary.clone();
+    let (sink_status, source, runner_sets, sink_outcome, source_outcome) = match runtime_boundary {
+        Some(boundary) => {
+            let initial = status_collect(boundary, state.node_id.clone()).await;
+            let runtime_fully_unavailable = should_fail_closed_status_route_collection(
+                initial.3,
+                initial.4,
+            );
+            if runtime_fully_unavailable {
+                if let Some(query_boundary) = query_boundary {
+                    let different_boundary = state
+                        .runtime_boundary
+                        .as_ref()
+                        .is_none_or(|runtime_boundary| !std::sync::Arc::ptr_eq(runtime_boundary, &query_boundary));
+                    if different_boundary {
+                        status_collect(query_boundary, state.node_id.clone()).await
+                    } else {
+                        initial
+                    }
+                } else {
+                    initial
+                }
+            } else {
+                initial
+            }
+        }
+        None => {
+            if let Some(boundary) = query_boundary {
+                status_collect(boundary, state.node_id.clone()).await
+            } else {
+                (
+                    local_sink,
+                    local_source.clone(),
+                    local_runner_sets(&local_source),
+                    StatusRouteOutcome::Skipped,
+                    StatusRouteOutcome::Skipped,
+                )
+            }
+        }
+    };
+    record_status_route_trace(
+        trace_id,
+        format!(
+            "status.remote.done sink={} source={}",
+            sink_outcome.as_str(),
+            source_outcome.as_str()
+        ),
+    );
     let live_source_nodes = source
         .grants
         .iter()
@@ -228,6 +436,13 @@ pub async fn status(
         runner_sets,
         merged_inflight
     );
+    if should_fail_closed_status_route_collection(sink_outcome, source_outcome) {
+        return Err(ApiError::service_unavailable(format!(
+            "status remote route collection incomplete: sink_route={} source_route={}",
+            sink_outcome.as_str(),
+            source_outcome.as_str()
+        )));
+    }
     if debug_force_find_runner_capture_enabled() {
         eprintln!(
             "fs_meta_api_status: runner_capture node={} source_route={} last_runner={:?} runner_sets={:?} inflight={:?}",
@@ -374,10 +589,26 @@ where
         );
     };
 
-    let (sink_result, source_result) = tokio::join!(
+    let retry_boundary = boundary.clone();
+    let retry_node_id = node_id.clone();
+    let (mut sink_result, mut source_result) = tokio::join!(
         sink_collect(boundary.clone(), node_id.clone()),
         source_collect(boundary, node_id),
     );
+    let both_internal = matches!(sink_result, Err(CnxError::Internal(_)))
+        && matches!(source_result, Err(CnxError::Internal(_)));
+    let both_transport = sink_result
+        .as_ref()
+        .err()
+        .is_some_and(|err| classify_status_route_error(err) == StatusRouteOutcome::Transport)
+        && source_result
+            .as_ref()
+            .err()
+            .is_some_and(|err| classify_status_route_error(err) == StatusRouteOutcome::Transport);
+    if both_internal || both_transport {
+        sink_result = sink_collect(retry_boundary.clone(), retry_node_id.clone()).await;
+        source_result = source_collect(retry_boundary, retry_node_id).await;
+    }
     let local_source_runner_sets = local_runner_sets(&local_source);
 
     let (sink_status, sink_outcome) = match sink_result {
@@ -415,13 +646,124 @@ where
     )
 }
 
+async fn collect_remote_status_snapshots_on_shared_boundary(
+    local_sink: SinkStatusSnapshot,
+    local_source: SourceObservabilitySnapshot,
+    boundary: std::sync::Arc<dyn ChannelIoSubset>,
+    node_id: NodeId,
+    trace_id: Option<u64>,
+) -> (
+    SinkStatusSnapshot,
+    SourceObservabilitySnapshot,
+    BTreeMap<String, Vec<String>>,
+    StatusRouteOutcome,
+    StatusRouteOutcome,
+) {
+    record_status_route_trace(trace_id, "sink.collect.begin");
+    let sink_result =
+        route_sink_status_snapshot(boundary.clone(), node_id.clone(), STATUS_ROUTE_TIMEOUT).await;
+    record_status_route_trace(trace_id, "source.collect.begin");
+    let source_result = route_source_observability_snapshot(
+        boundary,
+        node_id,
+        STATUS_ROUTE_TIMEOUT,
+        STATUS_ROUTE_COLLECT_IDLE_GRACE,
+    )
+    .await;
+    let local_source_runner_sets = local_runner_sets(&local_source);
+
+    let (sink_status, sink_outcome) = match sink_result {
+        Ok(snapshot) => (
+            merge_sink_status_snapshots(vec![local_sink, snapshot]),
+            StatusRouteOutcome::Ok,
+        ),
+        Err(err) => {
+            log_status_route_fallback("sink", &err);
+            (local_sink, classify_status_route_error(&err))
+        }
+    };
+    record_status_route_trace(
+        trace_id,
+        format!("sink.collect.outcome={}", sink_outcome.as_str()),
+    );
+    let (source, runner_sets, source_outcome) = match source_result {
+        Ok((snapshot, runner_sets)) => (
+            merge_source_observability(local_source, snapshot),
+            merge_source_runner_sets(runner_sets, local_source_runner_sets.clone()),
+            StatusRouteOutcome::Ok,
+        ),
+        Err(err) => {
+            log_status_route_fallback("source", &err);
+            (
+                local_source,
+                local_source_runner_sets,
+                classify_status_route_error(&err),
+            )
+        }
+    };
+    record_status_route_trace(
+        trace_id,
+        format!("source.collect.outcome={}", source_outcome.as_str()),
+    );
+
+    (
+        sink_status,
+        source,
+        runner_sets,
+        sink_outcome,
+        source_outcome,
+    )
+}
+
 fn classify_status_route_error(err: &CnxError) -> StatusRouteOutcome {
     match err {
         CnxError::Timeout => StatusRouteOutcome::Timeout,
+        CnxError::ChannelClosed => StatusRouteOutcome::Transport,
         CnxError::TransportClosed(_) => StatusRouteOutcome::Transport,
         CnxError::ProtocolViolation(_) => StatusRouteOutcome::Protocol,
+        CnxError::AccessDenied(message)
+            if message.contains("drained/fenced")
+                && message.contains("grant attachments")
+                || message.contains("invalid or revoked grant attachment token") =>
+        {
+            StatusRouteOutcome::Transport
+        }
+        CnxError::PeerError(message)
+            if message.contains("transport closed")
+                || message.contains("bound route is closed")
+                || message.contains("sidecar control bridge")
+                || message.contains("sidecar data bridge")
+                || message.contains("ipc read len")
+                || message.contains("ipc write len")
+                || message.contains("Connection reset by peer")
+                || message.contains("Broken pipe")
+                || message.contains("early eof") =>
+        {
+            StatusRouteOutcome::Transport
+        }
+        CnxError::Internal(message)
+            if message.contains("transport closed")
+                || message.contains("bound route is closed")
+                || message.contains("sidecar control bridge")
+                || message.contains("sidecar data bridge")
+                || message.contains("ipc read len")
+                || message.contains("ipc write len")
+                || message.contains("Connection reset by peer")
+                || message.contains("Broken pipe")
+                || message.contains("early eof") =>
+        {
+            StatusRouteOutcome::Transport
+        }
         _ => StatusRouteOutcome::Internal,
     }
+}
+
+fn should_fail_closed_status_route_collection(
+    sink_outcome: StatusRouteOutcome,
+    source_outcome: StatusRouteOutcome,
+) -> bool {
+    !matches!(sink_outcome, StatusRouteOutcome::Skipped | StatusRouteOutcome::Ok)
+        && !matches!(source_outcome, StatusRouteOutcome::Skipped | StatusRouteOutcome::Ok)
 }
 
 fn log_status_route_fallback(label: &str, err: &CnxError) {
@@ -944,17 +1286,37 @@ async fn route_source_observability_snapshot(
     timeout: Duration,
     idle_after_first: Duration,
 ) -> Result<(SourceObservabilitySnapshot, BTreeMap<String, Vec<String>>), CnxError> {
-    let events = collect_internal_source_status_events(
-        boundary,
-        origin_id,
-        timeout,
-        idle_after_first,
-        &[
-            execution_units::QUERY_RUNTIME_UNIT_ID,
-            execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
-        ],
-    )
-    .await?;
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut last_err = None::<CnxError>;
+    let events = loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break Err(last_err.unwrap_or(CnxError::Timeout));
+        }
+        let attempt_timeout = remaining.min(Duration::from_secs(5));
+        match collect_internal_source_status_events(
+            boundary.clone(),
+            origin_id.clone(),
+            attempt_timeout,
+            idle_after_first,
+            &[
+                execution_units::QUERY_RUNTIME_UNIT_ID,
+                execution_units::QUERY_PEER_RUNTIME_UNIT_ID,
+            ],
+        )
+        .await
+        {
+            Ok(events) => break Ok(events),
+            Err(err @ CnxError::Timeout)
+            | Err(err @ CnxError::TransportClosed(_))
+            | Err(err @ CnxError::ProtocolViolation(_))
+            | Err(err @ CnxError::Internal(_)) => {
+                last_err = Some(err);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(err) => break Err(err),
+        }
+    }?;
     let snapshots = events
         .into_iter()
         .map(|event| {
@@ -995,133 +1357,18 @@ async fn collect_internal_source_status_events(
     origin_id: NodeId,
     timeout: Duration,
     idle_after_first: Duration,
-    unit_ids: &[&str],
+    _unit_ids: &[&str],
 ) -> Result<Vec<Event>, CnxError> {
-    let route = default_route_bindings()
-        .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
-        .map_err(|err| CnxError::Internal(format!("resolve source-status route failed: {err}")))?;
-    let request_channel = ChannelKey(route.0.clone());
-    let reply_channel = ChannelKey(format!("{}:reply", route.0));
-    let mut merged = Vec::new();
-    let mut last_err = None::<CnxError>;
-
-    for unit_id in unit_ids {
-        match collect_internal_status_events_with_unit(
-            boundary.clone(),
-            origin_id.clone(),
-            request_channel.clone(),
-            reply_channel.clone(),
+    let adapter = exchange_host_adapter(boundary, origin_id, default_route_bindings());
+    adapter
+        .call_collect(
+            ROUTE_TOKEN_FS_META_INTERNAL,
+            METHOD_SOURCE_STATUS,
             internal_status_request_payload(),
             timeout,
             idle_after_first,
-            unit_id,
         )
         .await
-        {
-            Ok(mut events) => merged.append(&mut events),
-            Err(err @ CnxError::Timeout)
-            | Err(err @ CnxError::TransportClosed(_))
-            | Err(err @ CnxError::ProtocolViolation(_)) => {
-                last_err = Some(err);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    if merged.is_empty() {
-        return Err(last_err.unwrap_or(CnxError::Timeout));
-    }
-    Ok(merged)
-}
-
-async fn collect_internal_status_events_with_unit(
-    boundary: std::sync::Arc<dyn ChannelIoSubset>,
-    origin_id: NodeId,
-    request_channel: ChannelKey,
-    reply_channel: ChannelKey,
-    payload: bytes::Bytes,
-    timeout: Duration,
-    idle_after_first: Duration,
-    unit_id: &str,
-) -> Result<Vec<Event>, CnxError> {
-    static SOURCE_STATUS_COLLECT_CORRELATION: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(1);
-
-    let correlation = SOURCE_STATUS_COLLECT_CORRELATION.fetch_add(
-        1,
-        std::sync::atomic::Ordering::Relaxed,
-    );
-    let request = Event::new(
-        EventMetadata {
-            origin_id,
-            timestamp_us: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_micros() as u64,
-            logical_ts: None,
-            correlation_id: Some(correlation),
-            ingress_auth: None,
-            trace: None,
-        },
-        payload,
-    );
-    boundary
-        .channel_send(
-            BoundaryContext::for_unit(unit_id),
-            ChannelSendRequest {
-                channel_key: request_channel,
-                events: vec![request],
-                timeout_ms: Some(timeout.as_millis() as u64),
-            },
-        )
-        .await?;
-
-    let deadline = tokio::time::Instant::now() + timeout;
-    let mut idle_deadline = None::<tokio::time::Instant>;
-    let mut collected = Vec::new();
-
-    loop {
-        let now = tokio::time::Instant::now();
-        let remaining = match idle_deadline {
-            Some(idle) => deadline.saturating_duration_since(now).min(idle.saturating_duration_since(now)),
-            None => deadline.saturating_duration_since(now),
-        };
-        if remaining.is_zero() {
-            if collected.is_empty() {
-                return Err(CnxError::Timeout);
-            }
-            return Ok(collected);
-        }
-        match boundary
-            .channel_recv(
-                BoundaryContext::for_unit(unit_id),
-                capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest {
-                    channel_key: reply_channel.clone(),
-                    timeout_ms: Some(remaining.as_millis() as u64),
-                },
-            )
-            .await
-        {
-            Ok(events) => {
-                let mut matched = events
-                    .into_iter()
-                    .filter(|event| event.metadata().correlation_id == Some(correlation))
-                    .collect::<Vec<_>>();
-                if matched.is_empty() {
-                    continue;
-                }
-                collected.append(&mut matched);
-                idle_deadline = Some(tokio::time::Instant::now() + idle_after_first);
-            }
-            Err(CnxError::Timeout) => {
-                if collected.is_empty() {
-                    return Err(CnxError::Timeout);
-                }
-                return Ok(collected);
-            }
-            Err(err) => return Err(err),
-        }
-    }
 }
 
 fn merge_source_observability(
@@ -1653,6 +1900,7 @@ mod tests {
     use crate::api::config::ApiAuthConfig;
     use crate::api::facade_status::shared_facade_pending_status_cell;
     use crate::query::api::ProjectionPolicy;
+    use crate::runtime::routes::METHOD_SINK_STATUS;
     use crate::RootSpec;
     use crate::sink::SinkFileMeta;
     use crate::source::SourceStatusSnapshot;
@@ -1690,11 +1938,74 @@ mod tests {
         delayed_snapshot: SourceObservabilitySnapshot,
     }
 
-    struct UnitScopedSourceStatusCollectBoundary {
+    struct RoutedSourceStatusCollectBoundary {
         request_channel: String,
         reply_channel: String,
         replies: tokio::sync::Mutex<Vec<Vec<Event>>>,
         sent_unit_ids: StdMutex<Vec<Option<String>>>,
+        recv_unit_ids: StdMutex<Vec<Option<String>>>,
+    }
+
+    struct SourceStatusInternalRetryThenReplyBoundary {
+        source_reply_channel: String,
+        source_status_payloads: Vec<Vec<u8>>,
+        send_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        first_source_recv_failed: std::sync::atomic::AtomicBool,
+    }
+
+    struct SourceStatusPeerTransportRetryThenReplyBoundary {
+        source_reply_channel: String,
+        source_status_payloads: Vec<Vec<u8>>,
+        send_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        first_source_recv_failed: std::sync::atomic::AtomicBool,
+    }
+
+    struct StatusTransportRouteBoundary;
+
+    struct StatusRemoteReplyBoundary {
+        source_request_channel: String,
+        source_reply_channel: String,
+        sink_request_channel: String,
+        sink_reply_channel: String,
+        source_status_payloads: Vec<(String, Vec<u8>)>,
+        sink_status_payloads: Vec<(String, Vec<u8>)>,
+        correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+    }
+
+    struct StatusOverlapPoisonBoundary {
+        source_request_channel: String,
+        source_reply_channel: String,
+        sink_request_channel: String,
+        sink_reply_channel: String,
+        source_status_payloads: Vec<(String, Vec<u8>)>,
+        sink_status_payloads: Vec<(String, Vec<u8>)>,
+        correlations_by_channel: StdMutex<std::collections::HashMap<String, u64>>,
+        recv_batches_by_channel: StdMutex<std::collections::HashMap<String, usize>>,
+        active_recvs: std::sync::atomic::AtomicUsize,
+        poisoned: std::sync::atomic::AtomicBool,
+    }
+
+    struct StatusInternalRouteBoundary;
+
+    #[derive(Default)]
+    struct ConcurrentInternalThenSequentialOkStatusBoundary {
+        in_flight: std::sync::atomic::AtomicUsize,
+        concurrent_fail_triggered: std::sync::atomic::AtomicBool,
+        sink_calls: std::sync::atomic::AtomicUsize,
+        source_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[derive(Default)]
+    struct ConcurrentTransportThenSequentialOkStatusBoundary {
+        in_flight: std::sync::atomic::AtomicUsize,
+        concurrent_fail_triggered: std::sync::atomic::AtomicBool,
+        sink_calls: std::sync::atomic::AtomicUsize,
+        source_calls: std::sync::atomic::AtomicUsize,
     }
 
     #[async_trait::async_trait]
@@ -1775,7 +2086,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl ChannelIoSubset for UnitScopedSourceStatusCollectBoundary {
+    impl ChannelIoSubset for RoutedSourceStatusCollectBoundary {
         async fn channel_send(
             &self,
             ctx: BoundaryContext,
@@ -1795,7 +2106,9 @@ mod tests {
                 .unwrap_or(1);
             let mut replies = self.replies.lock().await;
             match ctx.unit_id.as_deref() {
-                Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID) => {
+                // Routed collection via BoundRoute::call_collect uses default context and must
+                // reach all active peer handlers, including query-peer-owned peers.
+                None => {
                     replies.push(vec![
                         source_status_event(
                             "node-b-29775547640557521931862017",
@@ -1844,7 +2157,10 @@ mod tests {
                         ),
                     ]);
                 }
-                Some(execution_units::QUERY_RUNTIME_UNIT_ID) | None => {
+                // The current broken direct collector path uses unit-scoped raw boundary sends,
+                // which in preserved exact evidence only yields the mixed local/query owner.
+                Some(execution_units::QUERY_RUNTIME_UNIT_ID)
+                | Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID) => {
                     replies.push(vec![source_status_event(
                         "node-d-29775547640557521931862017",
                         correlation,
@@ -1868,17 +2184,561 @@ mod tests {
 
         async fn channel_recv(
             &self,
-            _ctx: BoundaryContext,
+            ctx: BoundaryContext,
             request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
         ) -> capanix_app_sdk::Result<Vec<Event>> {
             if request.channel_key.0 != self.reply_channel {
                 return Err(CnxError::Timeout);
             }
+            self.recv_unit_ids
+                .lock()
+                .expect("routed source-status recv unit ids lock")
+                .push(ctx.unit_id.clone());
             let mut replies = self.replies.lock().await;
             if replies.is_empty() {
                 return Err(CnxError::Timeout);
             }
             Ok(replies.remove(0))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for SourceStatusInternalRetryThenReplyBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            if let Some(correlation) = request
+                .events
+                .first()
+                .and_then(|event| event.metadata().correlation_id)
+            {
+                self.correlations_by_channel
+                    .lock()
+                    .expect("source internal retry boundary correlations lock")
+                    .insert(request.channel_key.0.clone(), correlation);
+            }
+            let mut send_batches = self
+                .send_batches_by_channel
+                .lock()
+                .expect("source internal retry boundary send batches lock");
+            *send_batches.entry(request.channel_key.0).or_default() += 1;
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("source internal retry boundary recv batches lock");
+            *recv_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+            drop(recv_batches);
+
+            if request.channel_key.0 != self.source_reply_channel {
+                return Err(CnxError::Timeout);
+            }
+
+            if !self
+                .first_source_recv_failed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CnxError::Internal(
+                    "transient internal source-status collect gap before peer handler recv"
+                        .to_string(),
+                ));
+            }
+
+            let request_channel = self.source_reply_channel.trim_end_matches(":reply");
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("source internal retry boundary correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            Ok(self
+                .source_status_payloads
+                .iter()
+                .enumerate()
+                .map(|(idx, payload)| {
+                    let origin = match idx {
+                        0 => "node-b-29776175872804197050089473",
+                        1 => "node-c-29776175872804197050089473",
+                        _ => "node-d-29776175872804197050089473",
+                    };
+                    Event::new(
+                        EventMetadata {
+                            origin_id: NodeId(origin.to_string()),
+                            timestamp_us: 1,
+                            logical_ts: None,
+                            correlation_id: Some(correlation),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        bytes::Bytes::from(payload.clone()),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for SourceStatusPeerTransportRetryThenReplyBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            if let Some(correlation) = request
+                .events
+                .first()
+                .and_then(|event| event.metadata().correlation_id)
+            {
+                self.correlations_by_channel
+                    .lock()
+                    .expect("source peer transport retry boundary correlations lock")
+                    .insert(request.channel_key.0.clone(), correlation);
+            }
+            let mut send_batches = self
+                .send_batches_by_channel
+                .lock()
+                .expect("source peer transport retry boundary send batches lock");
+            *send_batches.entry(request.channel_key.0).or_default() += 1;
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("source peer transport retry boundary recv batches lock");
+            *recv_batches.entry(request.channel_key.0.clone()).or_default() += 1;
+            drop(recv_batches);
+
+            if request.channel_key.0 != self.source_reply_channel {
+                return Err(CnxError::Timeout);
+            }
+
+            if !self
+                .first_source_recv_failed
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(CnxError::PeerError(
+                    "transport closed: sidecar control bridge stopped".to_string(),
+                ));
+            }
+
+            let request_channel = self.source_reply_channel.trim_end_matches(":reply");
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("source peer transport retry boundary correlations lock")
+                .get(request_channel)
+                .copied()
+                .unwrap_or(1);
+            Ok(self
+                .source_status_payloads
+                .iter()
+                .enumerate()
+                .map(|(idx, payload)| {
+                    let origin = match idx {
+                        0 => "node-b-29776275144172679041384449",
+                        1 => "node-c-29776275144172679041384449",
+                        _ => "node-d-29776275144172679041384449",
+                    };
+                    Event::new(
+                        EventMetadata {
+                            origin_id: NodeId(origin.to_string()),
+                            timestamp_us: 1,
+                            logical_ts: None,
+                            correlation_id: Some(correlation),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        bytes::Bytes::from(payload.clone()),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    impl StatusRemoteReplyBoundary {
+        fn new(
+            source_snapshots: Vec<(String, SourceObservabilitySnapshot)>,
+            sink_snapshots: Vec<(String, SinkStatusSnapshot)>,
+        ) -> Self {
+            let source_route = default_route_bindings()
+                .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+                .expect("resolve source-status route");
+            let sink_route = default_route_bindings()
+                .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+                .expect("resolve sink-status route");
+            Self {
+                source_request_channel: source_route.0.clone(),
+                source_reply_channel: format!("{}:reply", source_route.0),
+                sink_request_channel: sink_route.0.clone(),
+                sink_reply_channel: format!("{}:reply", sink_route.0),
+                source_status_payloads: source_snapshots
+                    .into_iter()
+                    .map(|(origin, snapshot)| {
+                        let payload =
+                            rmp_serde::to_vec_named(&snapshot).expect("encode source snapshot");
+                        (origin, payload)
+                    })
+                    .collect(),
+                sink_status_payloads: sink_snapshots
+                    .into_iter()
+                    .map(|(origin, snapshot)| {
+                        let payload =
+                            rmp_serde::to_vec_named(&snapshot).expect("encode sink snapshot");
+                        (origin, payload)
+                    })
+                    .collect(),
+                correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+                recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            }
+        }
+    }
+
+    impl StatusOverlapPoisonBoundary {
+        fn new(
+            source_snapshots: Vec<(String, SourceObservabilitySnapshot)>,
+            sink_snapshots: Vec<(String, SinkStatusSnapshot)>,
+        ) -> Self {
+            let source_route = default_route_bindings()
+                .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+                .expect("resolve source-status route");
+            let sink_route = default_route_bindings()
+                .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SINK_STATUS)
+                .expect("resolve sink-status route");
+            Self {
+                source_request_channel: source_route.0.clone(),
+                source_reply_channel: format!("{}:reply", source_route.0),
+                sink_request_channel: sink_route.0.clone(),
+                sink_reply_channel: format!("{}:reply", sink_route.0),
+                source_status_payloads: source_snapshots
+                    .into_iter()
+                    .map(|(origin, snapshot)| {
+                        let payload =
+                            rmp_serde::to_vec_named(&snapshot).expect("encode source snapshot");
+                        (origin, payload)
+                    })
+                    .collect(),
+                sink_status_payloads: sink_snapshots
+                    .into_iter()
+                    .map(|(origin, snapshot)| {
+                        let payload =
+                            rmp_serde::to_vec_named(&snapshot).expect("encode sink snapshot");
+                        (origin, payload)
+                    })
+                    .collect(),
+                correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+                recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+                active_recvs: std::sync::atomic::AtomicUsize::new(0),
+                poisoned: std::sync::atomic::AtomicBool::new(false),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for StatusTransportRouteBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            Err(CnxError::TransportClosed(
+                "simulated transport remote status route failure".to_string(),
+            ))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for StatusRemoteReplyBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            if let Some(correlation) = request
+                .events
+                .first()
+                .and_then(|event| event.metadata().correlation_id)
+            {
+                self.correlations_by_channel
+                    .lock()
+                    .expect("status remote reply correlations lock")
+                    .insert(request.channel_key.0.clone(), correlation);
+            }
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let mut recv_batches = self
+                .recv_batches_by_channel
+                .lock()
+                .expect("status remote reply recv batches lock");
+            let recv_count = recv_batches.entry(request.channel_key.0.clone()).or_default();
+            *recv_count += 1;
+            let first_recv = *recv_count == 1;
+            drop(recv_batches);
+
+            if request.channel_key.0 == self.source_reply_channel {
+                if !first_recv {
+                    return Err(CnxError::Timeout);
+                }
+                let correlation = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("status remote reply correlations lock")
+                    .get(&self.source_request_channel)
+                    .copied()
+                    .unwrap_or(1);
+                return Ok(self
+                    .source_status_payloads
+                    .iter()
+                    .map(|(origin, payload)| {
+                        Event::new(
+                            EventMetadata {
+                                origin_id: NodeId(origin.clone()),
+                                timestamp_us: 1,
+                                logical_ts: None,
+                                correlation_id: Some(correlation),
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            bytes::Bytes::from(payload.clone()),
+                        )
+                    })
+                    .collect());
+            }
+            if request.channel_key.0 == self.sink_reply_channel {
+                if !first_recv {
+                    return Err(CnxError::Timeout);
+                }
+                let correlation = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("status remote reply correlations lock")
+                    .get(&self.sink_request_channel)
+                    .copied()
+                    .unwrap_or(1);
+                return Ok(self
+                    .sink_status_payloads
+                    .iter()
+                    .map(|(origin, payload)| {
+                        Event::new(
+                            EventMetadata {
+                                origin_id: NodeId(origin.clone()),
+                                timestamp_us: 1,
+                                logical_ts: None,
+                                correlation_id: Some(correlation),
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            bytes::Bytes::from(payload.clone()),
+                        )
+                    })
+                    .collect());
+            }
+            Err(CnxError::Timeout)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for StatusOverlapPoisonBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            if let Some(correlation) = request
+                .events
+                .first()
+                .and_then(|event| event.metadata().correlation_id)
+            {
+                self.correlations_by_channel
+                    .lock()
+                    .expect("status overlap poison correlations lock")
+                    .insert(request.channel_key.0.clone(), correlation);
+            }
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            let first_recv = {
+                let mut recv_batches = self
+                    .recv_batches_by_channel
+                    .lock()
+                    .expect("status overlap poison recv batches lock");
+                let recv_count = recv_batches.entry(request.channel_key.0.clone()).or_default();
+                *recv_count += 1;
+                *recv_count == 1
+            };
+
+            if request.channel_key.0 != self.source_reply_channel
+                && request.channel_key.0 != self.sink_reply_channel
+            {
+                return Err(CnxError::Timeout);
+            }
+
+            let previous = self
+                .active_recvs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::task::yield_now().await;
+            if previous > 0
+                || self.active_recvs.load(std::sync::atomic::Ordering::SeqCst) > 1
+            {
+                self.poisoned
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let poisoned = self.poisoned.load(std::sync::atomic::Ordering::SeqCst);
+            self.active_recvs
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            if poisoned {
+                return Err(CnxError::TransportClosed(
+                    "simulated same-boundary concurrent source/sink status collect poison"
+                        .to_string(),
+                ));
+            }
+
+            if request.channel_key.0 == self.source_reply_channel {
+                if !first_recv {
+                    return Err(CnxError::Timeout);
+                }
+                let correlation = self
+                    .correlations_by_channel
+                    .lock()
+                    .expect("status overlap poison correlations lock")
+                    .get(&self.source_request_channel)
+                    .copied()
+                    .unwrap_or(1);
+                return Ok(self
+                    .source_status_payloads
+                    .iter()
+                    .map(|(origin, payload)| {
+                        Event::new(
+                            EventMetadata {
+                                origin_id: NodeId(origin.clone()),
+                                timestamp_us: 1,
+                                logical_ts: None,
+                                correlation_id: Some(correlation),
+                                ingress_auth: None,
+                                trace: None,
+                            },
+                            bytes::Bytes::from(payload.clone()),
+                        )
+                    })
+                    .collect());
+            }
+
+            if !first_recv {
+                return Err(CnxError::Timeout);
+            }
+            let correlation = self
+                .correlations_by_channel
+                .lock()
+                .expect("status overlap poison correlations lock")
+                .get(&self.sink_request_channel)
+                .copied()
+                .unwrap_or(1);
+            Ok(self
+                .sink_status_payloads
+                .iter()
+                .map(|(origin, payload)| {
+                    Event::new(
+                        EventMetadata {
+                            origin_id: NodeId(origin.clone()),
+                            timestamp_us: 1,
+                            logical_ts: None,
+                            correlation_id: Some(correlation),
+                            ingress_auth: None,
+                            trace: None,
+                        },
+                        bytes::Bytes::from(payload.clone()),
+                    )
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChannelIoSubset for StatusInternalRouteBoundary {
+        async fn channel_send(
+            &self,
+            _ctx: BoundaryContext,
+            _request: ChannelSendRequest,
+        ) -> capanix_app_sdk::Result<()> {
+            Ok(())
+        }
+
+        async fn channel_recv(
+            &self,
+            _ctx: BoundaryContext,
+            _request: capanix_runtime_entry_sdk::advanced::boundary::ChannelRecvRequest,
+        ) -> capanix_app_sdk::Result<Vec<Event>> {
+            Err(CnxError::Internal(
+                "simulated internal remote status route failure".to_string(),
+            ))
+        }
+    }
+
+    impl ConcurrentInternalThenSequentialOkStatusBoundary {
+        fn enter_call(&self) -> (usize, bool) {
+            let previous = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if previous > 0 {
+                self.concurrent_fail_triggered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            (previous, previous > 0)
+        }
+
+        fn leave_call(&self) {
+            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl ConcurrentTransportThenSequentialOkStatusBoundary {
+        fn enter_call(&self) -> (usize, bool) {
+            let previous = self
+                .in_flight
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if previous > 0 {
+                self.concurrent_fail_triggered
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            (previous, previous > 0)
+        }
+
+        fn leave_call(&self) {
+            self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -2507,12 +3367,13 @@ mod tests {
             source.last_force_find_runner_by_group.get("nfs1"),
             Some(&"node-b::nfs1".to_string())
         );
-        assert_eq!(
-            runner_sets.get("nfs1"),
-            Some(&vec![
-                "node-a::nfs1".to_string(),
-                "node-b::nfs1".to_string(),
-            ])
+        let merged_runner_set = runner_sets
+            .get("nfs1")
+            .expect("merged runner set for nfs1");
+        assert!(
+            merged_runner_set.contains(&"node-a::nfs1".to_string())
+                && merged_runner_set.contains(&"node-b::nfs1".to_string()),
+            "sequential retry should preserve merged local+remote runner evidence: {merged_runner_set:?}"
         );
         assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
         assert_eq!(source_outcome, StatusRouteOutcome::Ok);
@@ -2554,6 +3415,330 @@ mod tests {
         assert_eq!(started.load(std::sync::atomic::Ordering::SeqCst), 2);
         assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
         assert_eq!(source_outcome, StatusRouteOutcome::Ok);
+    }
+
+    #[test]
+    fn classify_status_route_error_treats_internal_transport_close_strings_as_transport() {
+        assert_eq!(
+            classify_status_route_error(&CnxError::Internal(
+                "transport closed: sidecar control bridge stopped".to_string(),
+            )),
+            StatusRouteOutcome::Transport
+        );
+        assert_eq!(
+            classify_status_route_error(&CnxError::Internal(
+                "bound route is closed".to_string(),
+            )),
+            StatusRouteOutcome::Transport
+        );
+        assert_eq!(
+            classify_status_route_error(&CnxError::ChannelClosed),
+            StatusRouteOutcome::Transport
+        );
+    }
+
+    #[test]
+    fn classify_status_route_error_treats_peer_transport_close_strings_as_transport() {
+        assert_eq!(
+            classify_status_route_error(&CnxError::PeerError(
+                "transport closed: sidecar control bridge stopped".to_string(),
+            )),
+            StatusRouteOutcome::Transport
+        );
+        assert_eq!(
+            classify_status_route_error(&CnxError::PeerError(
+                "transport closed: sidecar control bridge closed: internal error: ipc read len: early eof".to_string(),
+            )),
+            StatusRouteOutcome::Transport
+        );
+    }
+
+    #[test]
+    fn classify_status_route_error_treats_stale_grant_attachment_denials_as_transport() {
+        assert_eq!(
+            classify_status_route_error(&CnxError::AccessDenied(
+                "pid Pid(4) is drained/fenced and cannot obtain new grant attachments"
+                    .to_string(),
+            )),
+            StatusRouteOutcome::Transport
+        );
+        assert_eq!(
+            classify_status_route_error(&CnxError::AccessDenied(
+                "invalid or revoked grant attachment token".to_string(),
+            )),
+            StatusRouteOutcome::Transport
+        );
+    }
+
+    #[tokio::test]
+    async fn status_remote_merge_retries_sequentially_when_both_collectors_return_internal_concurrently(
+    ) {
+        let local_sink = local_sink_snapshot();
+        let local_source = local_source_snapshot();
+        let boundary = std::sync::Arc::new(ConcurrentInternalThenSequentialOkStatusBoundary::default());
+        let remote_sink = SinkStatusSnapshot {
+            live_nodes: 3,
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "obj-b".to_string(),
+                total_nodes: 2,
+                live_nodes: 2,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 21,
+                shadow_lag_us: 22,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+        let remote_source = SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            ..local_source_snapshot()
+        };
+        let remote_runner_sets = BTreeMap::from([(
+            "nfs1".to_string(),
+            vec!["node-a::nfs1".to_string(), "node-b::nfs1".to_string()],
+        )]);
+        let boundary_for_sink = boundary.clone();
+        let boundary_for_source = boundary.clone();
+
+        let (sink, source, runner_sets, sink_outcome, source_outcome) =
+            merge_remote_status_snapshots(
+                local_sink,
+                local_source,
+                Some(std::sync::Arc::new(NoopBoundary)),
+                NodeId("node-a".into()),
+                move |_boundary, _origin_id| {
+                    let boundary = boundary_for_sink.clone();
+                    let remote_sink = remote_sink.clone();
+                    async move {
+                        let call_idx = boundary
+                            .sink_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let (_previous, overlapped) = boundary.enter_call();
+                        tokio::task::yield_now().await;
+                        let first_round_conflict = call_idx == 0
+                            && boundary
+                                .concurrent_fail_triggered
+                                .load(std::sync::atomic::Ordering::SeqCst);
+                        boundary.leave_call();
+                        if overlapped || first_round_conflict {
+                            return Err(CnxError::Internal(
+                                "simulated concurrent internal sink status-route collect gap"
+                                    .to_string(),
+                            ));
+                        }
+                        Ok(remote_sink)
+                    }
+                },
+                move |_boundary, _origin_id| {
+                    let boundary = boundary_for_source.clone();
+                    let remote_source = remote_source.clone();
+                    let remote_runner_sets = remote_runner_sets.clone();
+                    async move {
+                        let call_idx = boundary
+                            .source_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let (_previous, overlapped) = boundary.enter_call();
+                        tokio::task::yield_now().await;
+                        let first_round_conflict = call_idx == 0
+                            && boundary
+                                .concurrent_fail_triggered
+                                .load(std::sync::atomic::Ordering::SeqCst);
+                        boundary.leave_call();
+                        if overlapped || first_round_conflict {
+                            return Err(CnxError::Internal(
+                                "simulated concurrent internal source status-route collect gap"
+                                    .to_string(),
+                            ));
+                        }
+                        Ok((remote_source, remote_runner_sets))
+                    }
+                },
+            )
+            .await;
+
+        assert!(
+            boundary
+                .concurrent_fail_triggered
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "fixture must prove the first concurrent merge attempt hit a shared internal collect gap"
+        );
+        assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
+        assert_eq!(source_outcome, StatusRouteOutcome::Ok);
+        assert_eq!(sink.groups.len(), 2);
+        assert_eq!(
+            source.scheduled_source_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
+        );
+        let merged_runner_set = runner_sets
+            .get("nfs1")
+            .expect("merged runner set for nfs1");
+        assert!(
+            merged_runner_set.contains(&"node-a::nfs1".to_string())
+                && merged_runner_set.contains(&"node-b::nfs1".to_string()),
+            "sequential retry should preserve merged local+remote runner evidence: {merged_runner_set:?}"
+        );
+        assert!(
+            boundary
+                .sink_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        );
+        assert!(
+            boundary
+                .source_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        );
+    }
+
+    #[tokio::test]
+    async fn status_remote_merge_retries_sequentially_when_both_collectors_return_transport_concurrently(
+    ) {
+        let local_sink = local_sink_snapshot();
+        let local_source = local_source_snapshot();
+        let boundary =
+            std::sync::Arc::new(ConcurrentTransportThenSequentialOkStatusBoundary::default());
+        let remote_sink = SinkStatusSnapshot {
+            live_nodes: 3,
+            groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                group_id: "nfs2".to_string(),
+                primary_object_ref: "obj-b".to_string(),
+                total_nodes: 2,
+                live_nodes: 2,
+                tombstoned_count: 0,
+                attested_count: 0,
+                suspect_count: 0,
+                blind_spot_count: 0,
+                shadow_time_us: 21,
+                shadow_lag_us: 22,
+                overflow_pending_audit: false,
+                initial_audit_completed: true,
+                materialized_revision: 1,
+                estimated_heap_bytes: 0,
+            }],
+            ..SinkStatusSnapshot::default()
+        };
+        let remote_source = SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            ..local_source_snapshot()
+        };
+        let remote_runner_sets = BTreeMap::from([(
+            "nfs1".to_string(),
+            vec!["node-a::nfs1".to_string(), "node-b::nfs1".to_string()],
+        )]);
+        let boundary_for_sink = boundary.clone();
+        let boundary_for_source = boundary.clone();
+
+        let (sink, source, runner_sets, sink_outcome, source_outcome) =
+            merge_remote_status_snapshots(
+                local_sink,
+                local_source,
+                Some(std::sync::Arc::new(NoopBoundary)),
+                NodeId("node-a".into()),
+                move |_boundary, _origin_id| {
+                    let boundary = boundary_for_sink.clone();
+                    let remote_sink = remote_sink.clone();
+                    async move {
+                        let call_idx = boundary
+                            .sink_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let (_previous, overlapped) = boundary.enter_call();
+                        tokio::task::yield_now().await;
+                        let first_round_conflict = call_idx == 0
+                            && boundary
+                                .concurrent_fail_triggered
+                                .load(std::sync::atomic::Ordering::SeqCst);
+                        boundary.leave_call();
+                        if overlapped || first_round_conflict {
+                            return Err(CnxError::TransportClosed(
+                                "simulated concurrent transport sink status-route collect gap"
+                                    .to_string(),
+                            ));
+                        }
+                        Ok(remote_sink)
+                    }
+                },
+                move |_boundary, _origin_id| {
+                    let boundary = boundary_for_source.clone();
+                    let remote_source = remote_source.clone();
+                    let remote_runner_sets = remote_runner_sets.clone();
+                    async move {
+                        let call_idx = boundary
+                            .source_calls
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        let (_previous, overlapped) = boundary.enter_call();
+                        tokio::task::yield_now().await;
+                        let first_round_conflict = call_idx == 0
+                            && boundary
+                                .concurrent_fail_triggered
+                                .load(std::sync::atomic::Ordering::SeqCst);
+                        boundary.leave_call();
+                        if overlapped || first_round_conflict {
+                            return Err(CnxError::TransportClosed(
+                                "simulated concurrent transport source status-route collect gap"
+                                    .to_string(),
+                            ));
+                        }
+                        Ok((remote_source, remote_runner_sets))
+                    }
+                },
+            )
+            .await;
+
+        assert!(
+            boundary
+                .concurrent_fail_triggered
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "fixture must prove the first concurrent merge attempt hit a shared transport collect gap"
+        );
+        assert_eq!(sink_outcome, StatusRouteOutcome::Ok);
+        assert_eq!(source_outcome, StatusRouteOutcome::Ok);
+        assert_eq!(sink.groups.len(), 2);
+        assert_eq!(
+            source.scheduled_source_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
+        );
+        let merged_runner_set = runner_sets
+            .get("nfs1")
+            .expect("merged runner set for nfs1");
+        assert!(
+            merged_runner_set.contains(&"node-a::nfs1".to_string())
+                && merged_runner_set.contains(&"node-b::nfs1".to_string()),
+            "sequential retry should preserve merged local+remote runner evidence: {merged_runner_set:?}"
+        );
+        assert!(
+            boundary
+                .sink_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        );
+        assert!(
+            boundary
+                .source_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 2
+        );
     }
 
     #[test]
@@ -3137,16 +4322,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn route_source_observability_snapshot_collects_query_peer_owned_peer_schedules_after_turnover(
+    async fn route_source_observability_snapshot_routes_query_peer_owned_peer_schedules_after_turnover(
     ) {
         let source_status_route = default_route_bindings()
             .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
             .expect("resolve source-status route");
-        let boundary = Arc::new(UnitScopedSourceStatusCollectBoundary {
+        let boundary = Arc::new(RoutedSourceStatusCollectBoundary {
             request_channel: source_status_route.0.clone(),
             reply_channel: format!("{}:reply", source_status_route.0),
             replies: tokio::sync::Mutex::new(Vec::new()),
             sent_unit_ids: StdMutex::new(Vec::new()),
+            recv_unit_ids: StdMutex::new(Vec::new()),
         });
 
         let (snapshot, _runner_sets) = route_source_observability_snapshot(
@@ -3180,8 +4366,659 @@ mod tests {
         assert!(
             sent_unit_ids
                 .iter()
-                .any(|unit_id| unit_id.as_deref() == Some(execution_units::QUERY_PEER_RUNTIME_UNIT_ID)),
-            "source-status collection must query query-peer-owned peers under runtime.exec.query-peer: {sent_unit_ids:?}"
+                .any(|unit_id| unit_id.is_none()),
+            "source-status collection must route query-peer-owned peer requests through the default bound-route path, not direct unit-scoped boundary sends: {sent_unit_ids:?}"
+        );
+        let recv_unit_ids = boundary
+            .recv_unit_ids
+            .lock()
+            .expect("routed source-status recv unit ids lock")
+            .clone();
+        assert!(
+            recv_unit_ids.iter().any(|unit_id| unit_id.is_none()),
+            "routed source-status collection replies must arrive on the default bound-route return lane: {recv_unit_ids:?}"
         );
     }
+
+    #[tokio::test]
+    async fn route_source_observability_snapshot_retries_transient_internal_collect_gap_before_fallback(
+    ) {
+        let source_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve source-status route");
+        let node_b_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..local_source_snapshot()
+        })
+        .expect("encode node-b source status");
+        let node_c_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-c".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-c".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            ..local_source_snapshot()
+        })
+        .expect("encode node-c source status");
+        let node_d_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-d".to_string(),
+                vec!["nfs2".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-d".to_string(),
+                vec!["nfs2".to_string()],
+            )]),
+            ..local_source_snapshot()
+        })
+        .expect("encode node-d source status");
+        let boundary = Arc::new(SourceStatusInternalRetryThenReplyBoundary {
+            source_reply_channel: format!("{}:reply", source_route.0.clone()),
+            source_status_payloads: vec![node_b_payload, node_c_payload, node_d_payload],
+            send_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            first_source_recv_failed: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let (snapshot, _runner_sets) = route_source_observability_snapshot(
+            boundary.clone(),
+            NodeId("node-a".into()),
+            Duration::from_secs(5),
+            STATUS_ROUTE_COLLECT_IDLE_GRACE,
+        )
+        .await
+        .expect("source-status collection should retry transient internal collect gap");
+
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string()])
+        );
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-c"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
+        );
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-d"),
+            Some(&vec!["nfs2".to_string()])
+        );
+        let send_batches = boundary
+            .send_batches_by_channel
+            .lock()
+            .expect("source internal retry boundary send batches lock");
+        assert_eq!(
+            send_batches.get(&source_route.0).copied().unwrap_or_default(),
+            2,
+            "transient internal collect gap must trigger a second routed source-status issuance before falling back"
+        );
+    }
+
+    #[tokio::test]
+    async fn route_source_observability_snapshot_retries_peer_transport_close_before_fallback() {
+        let source_route = default_route_bindings()
+            .resolve(ROUTE_TOKEN_FS_META_INTERNAL, METHOD_SOURCE_STATUS)
+            .expect("resolve source-status route");
+        let node_b_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-b".to_string(),
+                vec!["nfs1".to_string()],
+            )]),
+            ..local_source_snapshot()
+        })
+        .expect("encode node-b source status");
+        let node_c_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-c".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-c".to_string(),
+                vec!["nfs1".to_string(), "nfs2".to_string()],
+            )]),
+            ..local_source_snapshot()
+        })
+        .expect("encode node-c source status");
+        let node_d_payload = rmp_serde::to_vec_named(&SourceObservabilitySnapshot {
+            scheduled_source_groups_by_node: BTreeMap::from([(
+                "node-d".to_string(),
+                vec!["nfs2".to_string()],
+            )]),
+            scheduled_scan_groups_by_node: BTreeMap::from([(
+                "node-d".to_string(),
+                vec!["nfs2".to_string()],
+            )]),
+            ..local_source_snapshot()
+        })
+        .expect("encode node-d source status");
+        let boundary = Arc::new(SourceStatusPeerTransportRetryThenReplyBoundary {
+            source_reply_channel: format!("{}:reply", source_route.0.clone()),
+            source_status_payloads: vec![node_b_payload, node_c_payload, node_d_payload],
+            send_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            recv_batches_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            correlations_by_channel: StdMutex::new(std::collections::HashMap::new()),
+            first_source_recv_failed: std::sync::atomic::AtomicBool::new(false),
+        });
+
+        let (snapshot, _runner_sets) = route_source_observability_snapshot(
+            boundary.clone(),
+            NodeId("node-a".into()),
+            Duration::from_secs(5),
+            STATUS_ROUTE_COLLECT_IDLE_GRACE,
+        )
+        .await
+        .expect("source-status collection should retry peer transport close");
+
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string()])
+        );
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-c"),
+            Some(&vec!["nfs1".to_string(), "nfs2".to_string()])
+        );
+        assert_eq!(
+            snapshot.scheduled_source_groups_by_node.get("node-d"),
+            Some(&vec!["nfs2".to_string()])
+        );
+        let send_batches = boundary
+            .send_batches_by_channel
+            .lock()
+            .expect("source peer transport retry boundary send batches lock");
+        assert_eq!(
+            send_batches.get(&source_route.0).copied().unwrap_or_default(),
+            2,
+            "peer transport close must trigger a second routed source-status issuance before falling back"
+        );
+    }
+
+
+    #[tokio::test]
+    async fn status_fails_closed_when_both_remote_status_routes_are_internal() {
+        tokio::time::pause();
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg)
+                .expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(Arc::new(StatusInternalRouteBoundary)),
+            query_runtime_boundary: Some(Arc::new(StatusInternalRouteBoundary)),
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            facade_pending: shared_facade_pending_status_cell(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(12)).await;
+
+        let err = status_task
+            .await
+            .expect("status join")
+            .expect_err("status must fail closed when both remote status routes are internal");
+        assert_eq!(err.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            err.message.contains("source_route=")
+                && err.message.contains("sink_route="),
+            "status fail-closed message must preserve remote route outcomes: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn status_prefers_runtime_boundary_when_query_runtime_boundary_transports() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg)
+                .expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let runtime_boundary = Arc::new(StatusRemoteReplyBoundary::new(
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                SourceObservabilitySnapshot {
+                    scheduled_source_groups_by_node: BTreeMap::from([(
+                        "node-b".to_string(),
+                        vec!["nfs1".to_string()],
+                    )]),
+                    scheduled_scan_groups_by_node: BTreeMap::from([(
+                        "node-b".to_string(),
+                        vec!["nfs1".to_string()],
+                    )]),
+                    ..local_source_snapshot()
+                },
+            )],
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                SinkStatusSnapshot {
+                    live_nodes: 2,
+                    scheduled_groups_by_node: BTreeMap::from([(
+                        "node-b".to_string(),
+                        vec!["nfs1".to_string()],
+                    )]),
+                    groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                        group_id: "nfs1".to_string(),
+                        primary_object_ref: "obj-b".to_string(),
+                        total_nodes: 2,
+                        live_nodes: 2,
+                        tombstoned_count: 0,
+                        attested_count: 0,
+                        suspect_count: 0,
+                        blind_spot_count: 0,
+                        shadow_time_us: 21,
+                        shadow_lag_us: 22,
+                        overflow_pending_audit: false,
+                        initial_audit_completed: true,
+                        materialized_revision: 1,
+                        estimated_heap_bytes: 0,
+                    }],
+                    ..SinkStatusSnapshot::default()
+                },
+            )],
+        ));
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(runtime_boundary),
+            query_runtime_boundary: Some(Arc::new(StatusTransportRouteBoundary)),
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            facade_pending: shared_facade_pending_status_cell(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let response = status(State(state), headers)
+            .await
+            .expect("status should use runtime boundary when query boundary transport-fails")
+            .0;
+
+        assert_eq!(
+            response.source.debug.scheduled_source_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string()])
+        );
+        assert_eq!(
+            response.sink.debug.scheduled_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn status_falls_back_to_query_boundary_when_runtime_boundary_transports() {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg)
+                .expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let query_boundary = Arc::new(StatusRemoteReplyBoundary::new(
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                SourceObservabilitySnapshot {
+                    scheduled_source_groups_by_node: BTreeMap::from([(
+                        "node-b".to_string(),
+                        vec!["nfs1".to_string()],
+                    )]),
+                    scheduled_scan_groups_by_node: BTreeMap::from([(
+                        "node-b".to_string(),
+                        vec!["nfs1".to_string()],
+                    )]),
+                    ..local_source_snapshot()
+                },
+            )],
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                SinkStatusSnapshot {
+                    live_nodes: 2,
+                    scheduled_groups_by_node: BTreeMap::from([(
+                        "node-b".to_string(),
+                        vec!["nfs1".to_string()],
+                    )]),
+                    groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                        group_id: "nfs1".to_string(),
+                        primary_object_ref: "obj-b".to_string(),
+                        total_nodes: 2,
+                        live_nodes: 2,
+                        tombstoned_count: 0,
+                        attested_count: 0,
+                        suspect_count: 0,
+                        blind_spot_count: 0,
+                        shadow_time_us: 21,
+                        shadow_lag_us: 22,
+                        overflow_pending_audit: false,
+                        initial_audit_completed: true,
+                        materialized_revision: 1,
+                        estimated_heap_bytes: 0,
+                    }],
+                    ..SinkStatusSnapshot::default()
+                },
+            )],
+        ));
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(Arc::new(StatusTransportRouteBoundary)),
+            query_runtime_boundary: Some(query_boundary),
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            facade_pending: shared_facade_pending_status_cell(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let response = status(State(state), headers)
+            .await
+            .expect("status should fall back to live query boundary when runtime boundary transports")
+            .0;
+
+        assert_eq!(
+            response.source.debug.scheduled_source_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string()])
+        );
+        assert_eq!(
+            response.sink.debug.scheduled_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string()])
+        );
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn status_serializes_same_boundary_remote_source_and_sink_collects_when_overlap_would_transport_poison(
+    ) {
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg)
+                .expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let runtime_boundary = Arc::new(StatusOverlapPoisonBoundary::new(
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                SourceObservabilitySnapshot {
+                    scheduled_source_groups_by_node: BTreeMap::from([(
+                        "node-b".to_string(),
+                        vec!["nfs1".to_string()],
+                    )]),
+                    scheduled_scan_groups_by_node: BTreeMap::from([(
+                        "node-b".to_string(),
+                        vec!["nfs1".to_string()],
+                    )]),
+                    ..local_source_snapshot()
+                },
+            )],
+            vec![(
+                "node-b-29776275144172679041384449".to_string(),
+                SinkStatusSnapshot {
+                    live_nodes: 2,
+                    scheduled_groups_by_node: BTreeMap::from([(
+                        "node-b".to_string(),
+                        vec!["nfs1".to_string()],
+                    )]),
+                    groups: vec![crate::sink::SinkGroupStatusSnapshot {
+                        group_id: "nfs1".to_string(),
+                        primary_object_ref: "obj-b".to_string(),
+                        total_nodes: 2,
+                        live_nodes: 2,
+                        tombstoned_count: 0,
+                        attested_count: 0,
+                        suspect_count: 0,
+                        blind_spot_count: 0,
+                        shadow_time_us: 21,
+                        shadow_lag_us: 22,
+                        overflow_pending_audit: false,
+                        initial_audit_completed: true,
+                        materialized_revision: 1,
+                        estimated_heap_bytes: 0,
+                    }],
+                    ..SinkStatusSnapshot::default()
+                },
+            )],
+        ));
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(runtime_boundary.clone()),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            facade_pending: shared_facade_pending_status_cell(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let response = status(State(state), headers)
+            .await
+            .expect("status should avoid same-boundary source/sink collect overlap that would self-poison transport")
+            .0;
+
+        assert_eq!(
+            response.source.debug.scheduled_source_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string()])
+        );
+        assert_eq!(
+            response.sink.debug.scheduled_groups_by_node.get("node-b"),
+            Some(&vec!["nfs1".to_string()])
+        );
+        assert!(
+            !runtime_boundary
+                .poisoned
+                .load(std::sync::atomic::Ordering::SeqCst),
+            "status should not overlap source/sink remote collection on the same boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn status_traces_single_request_remote_collect_issuance_and_route_outcomes() {
+        tokio::time::pause();
+
+        let tmp = tempdir().expect("create temp dir");
+        let nfs1 = tmp.path().join("nfs1");
+        std::fs::create_dir_all(&nfs1).expect("create nfs1");
+        let (passwd_path, shadow_path, query_keys_path) = write_auth_files(&tmp);
+        let auth = Arc::new(
+            AuthService::new(ApiAuthConfig {
+                passwd_path,
+                shadow_path,
+                query_keys_path,
+                ..ApiAuthConfig::default()
+            })
+            .expect("auth"),
+        );
+        let source_cfg = SourceConfig {
+            roots: vec![RootSpec::new("nfs1", &nfs1)],
+            host_object_grants: vec![granted_mount_root("node-a::nfs1", &nfs1)],
+            ..SourceConfig::default()
+        };
+        let source = Arc::new(SourceFacade::local(Arc::new(
+            FSMetaSource::new(source_cfg.clone(), NodeId("node-a".into())).expect("source"),
+        )));
+        let sink = Arc::new(SinkFacade::local(Arc::new(
+            SinkFileMeta::with_boundaries(NodeId("node-a".into()), None, source_cfg)
+                .expect("sink"),
+        )));
+        let headers = management_headers(auth.as_ref());
+        let trace_events = Arc::new(StdMutex::new(Vec::new()));
+        install_status_route_trace_hook(StatusRouteTraceHook {
+            events: trace_events.clone(),
+        });
+        struct StatusRouteTraceHookReset;
+        impl Drop for StatusRouteTraceHookReset {
+            fn drop(&mut self) {
+                clear_status_route_trace_hook();
+            }
+        }
+        let _reset = StatusRouteTraceHookReset;
+        let state = ApiState {
+            node_id: NodeId("node-a".into()),
+            runtime_boundary: Some(Arc::new(StatusTransportRouteBoundary)),
+            query_runtime_boundary: None,
+            force_find_inflight: Arc::new(StdMutex::new(BTreeSet::new())),
+            source,
+            sink: sink.clone(),
+            query_sink: sink,
+            auth,
+            projection_policy: Arc::new(RwLock::new(ProjectionPolicy::default())),
+            facade_pending: shared_facade_pending_status_cell(),
+            request_tracker: Arc::new(crate::api::ApiRequestTracker::default()),
+            control_gate: Arc::new(crate::api::ApiControlGate::new(true)),
+        };
+
+        let status_task = tokio::spawn(async move { status(State(state), headers).await });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(25)).await;
+
+        let err = status_task
+            .await
+            .expect("status join")
+            .expect_err("transport-only remote status routes should fail closed");
+        assert_eq!(err.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+
+        let events = trace_events
+            .lock()
+            .expect("status route trace lock")
+            .clone();
+        assert!(
+            !events.is_empty(),
+            "status route trace must record one request lifecycle"
+        );
+        let request_id = events[0]
+            .split(':')
+            .next()
+            .expect("request id prefix")
+            .to_string();
+        let request_events = events
+            .into_iter()
+            .filter_map(|event| {
+                let (id, stage) = event.split_once(':')?;
+                (id == request_id).then_some(stage.to_string())
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            request_events,
+            vec![
+                "status.enter".to_string(),
+                "status.remote.begin".to_string(),
+                "sink.collect.begin".to_string(),
+                "source.collect.begin".to_string(),
+                "sink.collect.outcome=timeout".to_string(),
+                "source.collect.outcome=timeout".to_string(),
+                "status.remote.done sink=timeout source=timeout".to_string(),
+            ],
+            "one /status request must remain traceable through remote source/sink route classification"
+        );
+    }
+
 }

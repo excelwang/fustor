@@ -13,5 +13,6 @@ pub(crate) use server::spawn;
 pub(crate) use state::{ApiControlGate, ApiRequestTracker};
 #[cfg(test)]
 pub(crate) use handlers::{
-    RootsPutPauseHook, clear_roots_put_pause_hook, install_roots_put_pause_hook,
+    RootsPutPauseHook, StatusPauseHook, clear_roots_put_pause_hook,
+    clear_status_pause_hook, install_roots_put_pause_hook, install_status_pause_hook,
 };
